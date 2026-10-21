@@ -992,7 +992,13 @@ function parseCycleRecoveryOffer(
     return fail(`${path}.schema_version`, 'manyforge.cycle_recovery_offer.v4');
   }
   const policy = objectAt(record.policy, `${path}.policy`);
-  exactKeysAt(policy, ['allow_intervention', 'max_retries'], `${path}.policy`);
+  allowedKeysAt(policy, ['allow_intervention', 'max_retries'], ['intervention_stop_scope'], `${path}.policy`);
+  const interventionStopScope = Object.hasOwn(policy, 'intervention_stop_scope')
+    ? stringAt(policy.intervention_stop_scope, `${path}.policy.intervention_stop_scope`)
+    : undefined;
+  if (interventionStopScope !== undefined && interventionStopScope !== 'own_groups') {
+    return fail(`${path}.policy.intervention_stop_scope`, 'own_groups or omission (all)');
+  }
   const maxRetries = integerAt(policy.max_retries, `${path}.policy.max_retries`);
   if (maxRetries < 0 || maxRetries > 255) {
     return fail(`${path}.policy.max_retries`, 'an integer in 0..255 (0 is Unlimited)');
@@ -1122,6 +1128,7 @@ function parseCycleRecoveryOffer(
         `${path}.policy.allow_intervention`,
       ),
       maxRetries,
+      ...(interventionStopScope === undefined ? {} : { interventionStopScope }),
     },
     retriesUsed,
   };

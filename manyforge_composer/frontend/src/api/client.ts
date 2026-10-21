@@ -133,7 +133,6 @@ import type {
   HistorianDetail,
   HistorianCapturePage,
   HistorianDiscovery,
-  OperatorAlarmRecord,
 } from '../types/headless';
 import type {
   CapabilityCommandPreviewReceipt,
@@ -1698,7 +1697,7 @@ export const api = {
   },
   alarms: {
     acknowledge: (
-      alarm: OperatorAlarmRecord,
+      alarm: AlarmMembership,
       ownerEpoch: string,
       requestId: string,
       signal?: AbortSignal,

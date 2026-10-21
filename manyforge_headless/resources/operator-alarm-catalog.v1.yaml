@@ -1,6 +1,6 @@
 schema_version: manyforge.operator_alarm_catalog.v1
 catalog_version: 2.6.0
-descriptor_digest: sha256:eb5d5bdf48e06d8637a9f0d29eff24949f6fa7ff8ac10365375986b42d2616c8
+descriptor_digest: sha256:7cbf4060ee2b4e6790a4ee425c9b3e5c07eb4dcb91aa61395f3e759055ff6a7f
 definitions:
   - definition_id: manyforge.motion.runtime_collision
     version: 2
@@ -58,8 +58,8 @@ definitions:
 
   - definition_id: manyforge.program.operation_failure
     version: 1
-    title: Program operation requires attention
-    message_template: "Program operation failure requires attention"
+    title: Program operation failed
+    message_template: "Program operation failed"
     alarm_class: motion
     priority: high
     priority_rationale: >-

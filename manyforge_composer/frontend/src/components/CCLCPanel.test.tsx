@@ -130,7 +130,7 @@ describe('CCLC presentation', () => {
     const html = renderToStaticMarkup(createElement(CCLCPanelView, { enabled: true,
       mutationAvailable: true, mutationUnavailableReason: null, controller: current }));
     expect(html).toContain('No activation step · faulted');
-    expect(html).toContain('Fault — intervention required');
+    expect(html).toContain('Fault · intervention required');
     expect(html).toContain('Actual transport fault');
     expect(html).toContain('Transport unavailable');
     expect(html).toContain('external.fault_present: true');
@@ -140,13 +140,13 @@ describe('CCLC presentation', () => {
   });
   it('keeps Cancel available during readiness waiting and guards accepted unfinished work', () => {
     const waiting = controller();
-    waiting.busy = true; waiting.activationProgress = 'component.arm: Not ready — [missing_reference] Missing measured feed · actual_joint_missing';
+    waiting.busy = true; waiting.activationProgress = 'component.arm: Not ready · [missing_reference] Missing measured feed · actual_joint_missing';
     waiting.snapshot!.readiness = { ...waiting.snapshot!.readiness, ready: false,
       error: { code: 'missing_reference', message: 'Missing measured feed', details: {} } };
     let html = renderToStaticMarkup(createElement(CCLCPanelView, { enabled: true,
       mutationAvailable: true, mutationUnavailableReason: null, controller: waiting }));
     expect(html).toContain('Cancel remaining activation');
-    expect(html).toContain('component.arm: Not ready — [missing_reference] Missing measured feed · actual_joint_missing');
+    expect(html).toContain('component.arm: Not ready · [missing_reference] Missing measured feed · actual_joint_missing');
     expect(html).not.toMatch(/disabled=""[^>]*>Cancel remaining activation/);
     waiting.busy = false; waiting.activationUnresolved = true;
     html = renderToStaticMarkup(createElement(CCLCPanelView, { enabled: true,
@@ -229,7 +229,7 @@ describe('CCLC presentation', () => {
       mutationUnavailableReason: null,
       controller: waiting,
     }));
-    expect(html).toContain('Startup delayed — still waiting');
+    expect(html).toContain('Startup delayed · still waiting');
     expect(html).toContain('<dt>Requested target</dt><dd>active (requested by startup configuration, target 2)</dd>');
     expect(html).toContain('<dt>State</dt><dd>prepared · generation 4</dd>');
     expect(html).toContain('controller_manager not ready');

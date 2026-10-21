@@ -177,8 +177,7 @@ MotionInterruptStopProfileDTO make_profile(const TrajectoryDTO& trajectory) {
   profile.profile_id = "phase_4_5g_perf_soft_on_path";
   profile.stop_mode = MotionInterruptStopMode::kSoftOnPath;
   profile.deceleration_time_s = 0.25;
-  profile.recoverable_substitution_mode =
-      MotionInterruptStopMode::kSpringBackHold;
+  profile.fallback_stop_modes = {MotionInterruptStopMode::kSpringBackHold};
   for (const auto& joint : trajectory.joint_names) {
     profile.per_joint_max_deceleration[joint] =
         AngularAccelerationDTO{40.0};

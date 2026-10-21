@@ -397,7 +397,8 @@
   background: var(--mf-bg-neutral-11);
 }
 
-.deployment-target-limit .deployment-focused-field {
+.deployment-target-limit .deployment-focused-field,
+.deployment-stop-form .deployment-focused-field {
   grid-template-columns: minmax(0, 1fr) minmax(0, 2fr);
   gap: 0.6rem;
   padding: 0.45rem 0;
@@ -413,11 +414,59 @@
   border-top: 1px solid var(--mf-border-neutral-19);
 }
 
-.deployment-target-limit :is(.field-help, .deployment-applied-comparison, .muted) {
+.deployment-target-limit :is(.field-help, .deployment-applied-comparison, .muted),
+.deployment-stop-form > .field-help {
   margin: 0 0 0.45rem;
   color: var(--mf-text-neutral-63);
   font-size: var(--mf-font-size-068);
   line-height: 1.45;
+}
+
+/* Stop settings: the same label | field rows, one setting per row; a
+   checkbox row keeps its label beside the box, and a hint stays under its
+   row (no hairline above it). */
+.deployment-focused-form-grid.deployment-stop-form {
+  grid-template-columns: minmax(0, 1fr);
+  gap: 0;
+}
+
+.deployment-stop-form > * + :not(.field-help) {
+  border-top: 1px solid var(--mf-border-neutral-19);
+}
+
+.deployment-stop-form > .toggle-control {
+  padding: 0.45rem 0;
+}
+
+/* Stop fallbacks: one group row; its checkbox rows keep the same hairlines. */
+.deployment-stop-fallbacks {
+  display: grid;
+  padding: 0.45rem 0 0;
+  font-size: var(--mf-font-size-072);
+}
+
+.deployment-stop-fallbacks-heading {
+  padding-bottom: 0.2rem;
+  color: var(--mf-text-neutral-78);
+}
+
+.deployment-stop-fallbacks > .toggle-control {
+  padding: 0.35rem 0 0.35rem 0.75rem;
+}
+
+.deployment-stop-fallbacks > .toggle-control + .toggle-control {
+  border-top: 1px solid var(--mf-border-neutral-19);
+}
+
+.deployment-stop-fallbacks .field-help {
+  margin: 0 0 0.45rem;
+  color: var(--mf-text-neutral-63);
+  font-size: var(--mf-font-size-068);
+  line-height: 1.45;
+}
+
+.deployment-stop-fallbacks .toggle-control .field-help {
+  margin: 0;
 }
 
 .deployment-target-limit .deployment-joint-caps {
@@ -540,15 +589,6 @@
 
 .deployment-focused-field .deployment-field-error {
   grid-column: 2;
-}
-
-.deployment-focused-checkbox {
-  display: flex;
-  grid-column: 1 / -1;
-  align-items: center;
-  gap: 0.42rem;
-  color: var(--mf-text-neutral-68);
-  font-size: var(--mf-font-size-068);
 }
 
 .deployment-initial-joints {

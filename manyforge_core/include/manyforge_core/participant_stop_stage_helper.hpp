@@ -178,6 +178,17 @@ class ParticipantStopStageHelper final : public IControlDomainExecutionPort {
   [[nodiscard]] ParticipantStopStageResultDTO RunReplacement(
       Run& run, const SoftOnPathStopPlanDTO& plan, const ExecutionControllerSampleDTO& trip,
       double frozen_factor, TimePoint stop_deadline);
+  /// Q130: the fast spring-back, sent at once with no planning or checks.
+  [[nodiscard]] ParticipantStopStageResultDTO RunFastSpringBack(
+      Run& run, const ExecutionControllerSampleDTO& trip,
+      const std::vector<double>& trip_positions, double frozen_factor, TimePoint stop_deadline);
+  /// One dispatched Stop replacement, from its send result to its settlement.
+  [[nodiscard]] ParticipantStopStageResultDTO FinishReplacement(
+      Run& run, const ExecutionPortCommandResultDTO& sent, const ExecutionGoalKey& next,
+      TrajectoryDTO sent_trajectory, std::optional<StopReplacementCursorMapDTO> cursor_map,
+      const std::optional<ExecutionControllerSampleDTO>& baseline, TimePoint dispatched_at,
+      const ExecutionControllerSampleDTO& trip, const std::string& mode,
+      double initial_path_deviation_rad, TimePoint stop_deadline);
   [[nodiscard]] ParticipantStopStageResultDTO RunNaturalCompletion(Run& run,
                                                                    TimePoint stop_deadline,
                                                                    std::string basis);

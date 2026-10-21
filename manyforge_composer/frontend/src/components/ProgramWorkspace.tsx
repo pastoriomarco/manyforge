@@ -73,6 +73,8 @@ interface ProgramWorkspaceProps {
   environment: StructuralResourceState<NodeEnvironmentResponse>;
   sourceModel: StructuralResourceState<SourceModelProjection>;
   deploymentWorkspace?: DeploymentWorkspaceResponse | null;
+  /** The scenario's Program role assignment (authoring workspace project facts). */
+  programRoleAssignment?: Record<string, JsonValue> | null;
   motionDescriptors?: ManualControlMotionDescriptor[];
   /** Published motion targets' qualified Stop chains (SX-2167). */
   stopChains?: TargetStopChain[];
@@ -105,6 +107,7 @@ export function ProgramWorkspace({
   environment,
   sourceModel,
   deploymentWorkspace = null,
+  programRoleAssignment = null,
   motionDescriptors = [],
   stopChains,
   onRetryCatalog,
@@ -727,6 +730,7 @@ export function ProgramWorkspace({
                       ? null
                       : sourceModel.message}
                   deploymentWorkspace={deploymentWorkspace}
+                  programRoleAssignment={programRoleAssignment}
                   motionDescriptors={motionDescriptors}
                   stopChains={stopChains}
                   busy={authoringBusy}

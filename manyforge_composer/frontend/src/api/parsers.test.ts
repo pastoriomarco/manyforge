@@ -1292,6 +1292,37 @@ describe('Program product projections', () => {
       .toThrow(/supported recovery action/);
   });
 
+  it('preserves the captured recovery-offer own-group intervention scope', () => {
+    const scope = 'own_groups';
+    const offer = {
+      ...recoveryOffer(),
+      policy: { allow_intervention: true, max_retries: 0, intervention_stop_scope: scope },
+    };
+    const parsed = parseProgramRuntimeControlProjection({
+      ...runtimeControlsProjection(),
+      recovery_offer: offer,
+      recovery_offers: [{
+        motion_group_ids: ['robot'], intervention_stop_scope: scope, offer,
+      }],
+    });
+    const expected = { allowIntervention: true, maxRetries: 0, interventionStopScope: scope };
+    expect(parsed.recoveryOffer?.policy).toEqual(expected);
+    expect(parsed.recoveryHolds[0].offer.policy).toEqual(expected);
+  });
+
+  it.each([null, true, 1, [], {}, 'all', 'groups', undefined])(
+    'rejects malformed recovery-offer intervention scope %j',
+    (scope) => {
+      expect(() => parseProgramRuntimeControlProjection({
+        ...runtimeControlsProjection(),
+        recovery_offer: {
+          ...recoveryOffer(),
+          policy: { allow_intervention: true, max_retries: 0, intervention_stop_scope: scope },
+        },
+      })).toThrow(/intervention_stop_scope/);
+    },
+  );
+
   it('carries the held failure details and origin on the recovery offer', () => {
     const offer = parseProgramRuntimeControlProjection({
       ...runtimeControlsProjection(),
@@ -1327,7 +1358,7 @@ describe('Program product projections', () => {
       ...runtimeControlsProjection(),
       recovery_offer: { ...recoveryOffer(), schema_version: 'manyforge.cycle_recovery_offer.v3' },
     })).toThrow(/cycle_recovery_offer.v4/);
-    // The captured two-field policy: zero is Unlimited and the used count
+    // Omitted stop scope stays omitted: zero is Unlimited and the used count
     // may exceed the finite configured range.
     expect(offer?.policy).toEqual({ allowIntervention: true, maxRetries: 0 });
     expect(offer?.retriesUsed).toBe(300);
@@ -1335,6 +1366,7 @@ describe('Program product projections', () => {
       {},
       { allow_intervention: true, max_retries: 256 },
       { allow_intervention: true, max_retries: 1, intervention_delegate: 'forbidden' },
+      { allow_intervention: true, max_retries: 1, intervention_stop_scope: 'own_groups', extra: true },
     ]) {
       expect(() => parseProgramRuntimeControlProjection({
         ...runtimeControlsProjection(),

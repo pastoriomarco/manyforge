@@ -44,7 +44,7 @@ namespace {
       {"joint_2", AngularAccelerationDTO{2.0}},
   };
   profile.allow_natural_completion_on_short_path = true;
-  profile.recoverable_substitution_mode = MotionInterruptStopMode::kSpringBackHold;
+  profile.fallback_stop_modes = {MotionInterruptStopMode::kSpringBackHold};
   return profile;
 }
 
@@ -138,8 +138,9 @@ namespace {
 }
 
 [[nodiscard]] ControlledStopSubstitutionContractDTO Substitution() {
-  return {Contract(), MotionControlledStopMode::kSoftOnPath,
-          MotionControlledStopMode::kSpringBackHold};
+  return {Contract(),
+          MotionControlledStopMode::kSoftOnPath,
+          {MotionControlledStopMode::kSpringBackHold}};
 }
 
 [[nodiscard]] ResolvedStopEscalationStageDTO NominalStage() {
@@ -318,9 +319,9 @@ TEST(ResolvedStopBasePlanCodec, EmitsStableCanonicalBytesAndOwnIdentity) {
 
   // These two constants are the cross-language normalized-byte/ID golden.
   EXPECT_EQ(plan.resolved_stop_base_plan_id.value(),
-            "sha256:840a16b6b0860f5e838d109bd327685a8d354d48f119f493d6635101c693f0d5");
+            "sha256:7fce11a5a4d9b14157cfd341eeefd7c1f34a4ca88cdef384a2b517600a050662");
   EXPECT_EQ(content_identity::sha256_digest(encoded.value()),
-            "sha256:896dc7ef6c85eefeec67231a7b490889db491480448939b6bc4ee34036f48515");
+            "sha256:9d76981b81e07bf90cf983988df44250948fd45bf553057e7daa0b48674620fa");
 }
 
 TEST(ResolvedStopBasePlanCodec, OwnIdIsOmittedAndEverySemanticJoinRotatesIt) {
@@ -667,9 +668,34 @@ TEST(PreparedParticipantStopPlanCodec, FreezesProfileMappingAndDeploymentDefault
             std::string::npos);
   EXPECT_NE(encoded.value().find("\"parameter_source\":\"deployment_default\""), std::string::npos);
   EXPECT_EQ(content_identity::sha256_digest(encoded.value()),
-            "sha256:94398b22375ecc50ed1aa2c7699d75c27c5babca5dfbd996e4491c3b0fe3101a");
+            "sha256:d0504e766b1502b0cf6354d376eff3fe49ff4fe34b1b75e0191caa9151b74191");
   EXPECT_EQ(plan.participant_stop_invocation_plan_digest.value(),
-            "sha256:55223af5a643d2f24252cedc19d6691c375abeab66cce0dac464a8c3b29f14f3");
+            "sha256:73e6a728a8b9a0416f3a2d4151213bae1c135e2142bcaa9d8fffbe429beb917f");
+}
+
+TEST(PreparedParticipantStopPlanCodec, AcceptsFastFaultProfileAndPreservesClosedPlan) {
+  const auto base = PreparedBasePlan();
+  auto context = PreparedContext();
+  context.participant_stop_profile->profile_id = "fault_spring_back_fast";
+  context.participant_stop_profile->stop_mode = MotionInterruptStopMode::kSpringBackFast;
+  context.participant_stop_profile->fallback_stop_modes.clear();
+  context.participant_stop_profile->allow_natural_completion_on_short_path = false;
+  context.participant_stop_profile_purpose = ParticipantStopProfilePurposeDTO::kFault;
+  context.motion_interrupt_scope_id.reset();
+  const auto made = MakePreparedParticipantStopPlan(base, context, Resources(), DefaultLimits());
+  ASSERT_TRUE(made.ok()) << made.error().message;
+  EXPECT_EQ(made.value().participant_stop_profile, context.participant_stop_profile);
+  EXPECT_EQ(made.value().participant_stop_profile_purpose,
+            ParticipantStopProfilePurposeDTO::kFault);
+  const auto& parameters = *made.value().stage_commands.front().validated_contract_parameters;
+  EXPECT_EQ(parameters.at("stop_mode"), JsonValueDTO{std::string("spring_back_fast")});
+  const auto encoded = EncodePreparedParticipantStopPlan(
+      base, made.value(), Resources(), DefaultLimits(), MotionInterruptNodeCategory::kGeneric);
+  ASSERT_TRUE(encoded.ok()) << encoded.error().message;
+  const auto decoded = DecodePreparedParticipantStopPlan(
+      encoded.value(), base, Resources(), DefaultLimits(), MotionInterruptNodeCategory::kGeneric);
+  ASSERT_TRUE(decoded.ok()) << decoded.error().message;
+  EXPECT_EQ(decoded.value(), made.value());
 }
 
 TEST(PreparedParticipantStopPlanCodec, KeepsOrdinaryAndScopePlansDistinctAndRejectsForgery) {
@@ -867,6 +893,216 @@ TEST(ResolvedStopBasePlanCodec, ActuationKindWireIsClosedAndPositionKeepsHardFlo
   auto pneumatic_with_floor = Candidate();
   pneumatic_with_floor.gripper_actuation_kind = GripperActuationKind::kPneumatic;
   EXPECT_FALSE(MakeResolvedStopBasePlan(pneumatic_with_floor).ok());
+}
+
+TEST(ResolvedStopBasePlanCodec, ReadsExactLegacyIdentityAndWritesNewAuthoredListIdentity) {
+  const auto path = std::filesystem::path(__FILE__).parent_path() / "golden" /
+                    "resolved_stop_base_plan.legacy.v1.json";
+  std::ifstream input(path, std::ios::binary);
+  ASSERT_TRUE(input.is_open());
+  std::string old{std::istreambuf_iterator<char>(input), std::istreambuf_iterator<char>()};
+  if (old.ends_with('\n')) old.pop_back();
+  const auto decoded = DecodeResolvedStopBasePlan(old);
+  ASSERT_TRUE(decoded.ok()) << decoded.error().message;
+  const auto& qualification = decoded.value()
+                                  .escalation_stages.front()
+                                  .command_qualification.controlled_substitution_contract;
+  ASSERT_TRUE(qualification);
+  EXPECT_EQ(qualification->fallback_stop_modes,
+            (std::vector{MotionControlledStopMode::kSpringBackHold}));
+  EXPECT_EQ(EncodeResolvedStopBasePlan(decoded.value()).value(), old);
+  EXPECT_TRUE(DecodeResolvedStopBasePlan(EncodeResolvedStopBasePlan(decoded.value()).value()).ok());
+  const auto authored = MakeResolvedStopBasePlan(decoded.value());
+  ASSERT_TRUE(authored.ok());
+  EXPECT_NE(authored.value().resolved_stop_base_plan_id,
+            decoded.value().resolved_stop_base_plan_id);
+  const auto encoded = EncodeResolvedStopBasePlan(authored.value());
+  ASSERT_TRUE(encoded.ok());
+  EXPECT_NE(encoded.value().find("fallback_stop_modes"), std::string::npos);
+  EXPECT_EQ(encoded.value().find("executed_stop_mode"), std::string::npos);
+  EXPECT_EQ(DecodeResolvedStopBasePlan(encoded.value()).value(), authored.value());
+  auto forged = old;
+  const auto position = forged.find("spring_back_hold");
+  ASSERT_NE(position, std::string::npos);
+  forged.replace(position, std::string("spring_back_hold").size(), "spring_back_fast");
+  EXPECT_FALSE(DecodeResolvedStopBasePlan(forged).ok());
+}
+
+TEST(PreparedParticipantStopPlanCodec,
+     OrderedProfileReadsLegacyAndRejectsAmbiguousOrUnorderedFields) {
+  const auto profile = [](std::string extra) {
+    auto fields =
+        content_identity::parse_canonical_json(
+            R"({"allow_natural_completion_on_short_path":false,"deceleration_time_s":0.5,"jerk_limits_enabled":false,"per_joint_max_deceleration":{"joint_1":{"coordinate_kind":"angular_rad_s2","value_rad_s2":2}},"profile_id":"read.profile","require_backend_confirmation":true,"stop_mode":"soft_on_path"})")
+            .as_object();
+    extra.pop_back();
+    const auto additional = content_identity::parse_canonical_json("{" + extra + "}");
+    for (const auto& row : additional.as_object()) fields.push_back(row);
+    return content_identity::canonical_json(content_identity::CanonicalValue(std::move(fields)));
+  };
+  const auto canonical = [](const std::string& source) { return source; };
+  const auto legacy = DecodeMotionInterruptStopProfile(
+      canonical(profile("\"recoverable_substitution_mode\":\"spring_back_hold\",")));
+  ASSERT_TRUE(legacy.ok());
+  EXPECT_EQ(legacy.value().fallback_stop_modes,
+            (std::vector{MotionInterruptStopMode::kSpringBackHold}));
+  const auto current = DecodeMotionInterruptStopProfile(
+      canonical(profile("\"fallback_stop_modes\":[\"spring_back_hold\",\"spring_back_fast\"],")));
+  ASSERT_TRUE(current.ok());
+  EXPECT_EQ(current.value().fallback_stop_modes.size(), 2U);
+  for (const auto* invalid :
+       {"\"fallback_stop_modes\":[],\"recoverable_substitution_mode\":\"spring_back_hold\",",
+        "\"fallback_stop_modes\":[\"spring_back_fast\",\"spring_back_hold\"],",
+        "\"fallback_stop_modes\":[\"spring_back_hold\",\"spring_back_hold\"],",
+        "\"fallback_stop_modes\":[\"hard_deceleration\"],",
+        "\"fallback_stop_modes\":[\"unknown\"],",
+        "\"recoverable_substitution_mode\":\"spring_back_fast\","})
+    EXPECT_FALSE(DecodeMotionInterruptStopProfile(canonical(profile(invalid))).ok()) << invalid;
+}
+
+TEST(PreparedParticipantStopPlanCodec, OrderedFallbacksKeepNewBaseAndInvocationReferencesExact) {
+  auto candidate = PreparedBasePlan();
+  candidate.escalation_stages.front()
+      .command_qualification.controlled_substitution_contract->fallback_stop_modes = {
+      MotionControlledStopMode::kSpringBackHold, MotionControlledStopMode::kSpringBackFast};
+  const auto base = MakeResolvedStopBasePlan(std::move(candidate));
+  ASSERT_TRUE(base.ok());
+  auto context = PreparedContext();
+  context.participant_stop_profile->fallback_stop_modes = {
+      MotionInterruptStopMode::kSpringBackHold, MotionInterruptStopMode::kSpringBackFast};
+  const auto plan =
+      MakePreparedParticipantStopPlan(base.value(), context, Resources(), DefaultLimits());
+  ASSERT_TRUE(plan.ok()) << plan.error().message;
+  EXPECT_EQ(plan.value().resolved_stop_base_plan_id, base.value().resolved_stop_base_plan_id);
+  const auto encoded =
+      EncodePreparedParticipantStopPlan(base.value(), plan.value(), Resources(), DefaultLimits(),
+                                        MotionInterruptNodeCategory::kGeneric);
+  ASSERT_TRUE(encoded.ok());
+  EXPECT_EQ(encoded.value().find("recoverable_substitution_mode"), std::string::npos);
+  const auto decoded =
+      DecodePreparedParticipantStopPlan(encoded.value(), base.value(), Resources(), DefaultLimits(),
+                                        MotionInterruptNodeCategory::kGeneric);
+  ASSERT_TRUE(decoded.ok()) << decoded.error().message;
+  EXPECT_EQ(decoded.value(), plan.value());
+  auto unqualified = context;
+  auto limited_base = base.value();
+  limited_base.escalation_stages.front()
+      .command_qualification.controlled_substitution_contract->fallback_stop_modes = {
+      MotionControlledStopMode::kSpringBackHold};
+  const auto limited = MakeResolvedStopBasePlan(std::move(limited_base));
+  ASSERT_TRUE(limited.ok());
+  EXPECT_FALSE(
+      MakePreparedParticipantStopPlan(limited.value(), unqualified, Resources(), DefaultLimits())
+          .ok());
+}
+
+TEST(PreparedParticipantStopPlanCodec,
+     PreservesVerifiedHistoricalHashesAndNewWritesKeepExactReferences) {
+  using V = content_identity::CanonicalValue;
+  const auto set = [](const V& object, std::string key, V value) {
+    auto fields = object.as_object();
+    fields.erase(std::remove_if(fields.begin(), fields.end(),
+                                [&](const auto& row) { return row.first == key; }),
+                 fields.end());
+    fields.emplace_back(std::move(key), std::move(value));
+    return V(std::move(fields));
+  };
+  const auto legacy_field = [](const V& object, const char* old_key) {
+    auto fields = object.as_object();
+    const auto found = std::find_if(fields.begin(), fields.end(), [](const auto& row) {
+      return row.first == "fallback_stop_modes";
+    });
+    if (found == fields.end()) return object;
+    EXPECT_EQ(found->second, V(V::Array{V("spring_back_hold")}));
+    fields.erase(found);
+    fields.emplace_back(old_key, V("spring_back_hold"));
+    return V(std::move(fields));
+  };
+  const auto legacy_stage = [&](V stage) {
+    auto qualification = *stage.find_object_member("command_qualification");
+    if (const auto* contract = qualification.find_object_member("controlled_substitution_contract"))
+      qualification = set(qualification, "controlled_substitution_contract",
+                          legacy_field(*contract, "executed_stop_mode"));
+    stage = set(stage, "command_qualification", std::move(qualification));
+    if (const auto* parameters = stage.find_object_member("default_contract_parameters");
+        parameters && parameters->is_object())
+      stage = set(stage, "default_contract_parameters",
+                  legacy_field(*parameters, "recoverable_substitution_mode"));
+    return stage;
+  };
+  const auto identify = [&](V object, const char* key, std::string_view domain,
+                            std::string_view api) {
+    auto fields = object.as_object();
+    fields.erase(std::remove_if(fields.begin(), fields.end(),
+                                [&](const auto& row) { return row.first == key; }),
+                 fields.end());
+    const auto digest = content_identity::framed_sha256(domain, api, V(fields));
+    fields.emplace_back(key, V(digest));
+    return V(std::move(fields));
+  };
+  auto bytes = EncodeResolvedStopBasePlan(PreparedBasePlan()).value();
+  const std::string current(kMotionControlledStopContractSchemaRevision);
+  const std::string previous =
+      "sha256:f6ac4acc7a4aa33a30eb3180c917b3b60d1469fa6ed4820c5fe2d68c0c2a8f84";
+  for (std::size_t at = 0U; (at = bytes.find(current, at)) != std::string::npos;
+       at += previous.size())
+    bytes.replace(at, current.size(), previous);
+  auto base_wire = content_identity::parse_canonical_json(bytes);
+  auto base_stages = base_wire.find_object_member("escalation_stages")->as_array();
+  for (auto& stage : base_stages) stage = legacy_stage(std::move(stage));
+  base_wire = identify(set(base_wire, "escalation_stages", V(std::move(base_stages))),
+                       "resolved_stop_base_plan_id", kResolvedStopBasePlanIdentityDomain,
+                       kResolvedStopBasePlanApiVersion);
+  const auto historical_base_bytes = content_identity::canonical_json(base_wire);
+  const auto base = DecodeResolvedStopBasePlan(historical_base_bytes);
+  ASSERT_TRUE(base.ok()) << base.error().message;
+  EXPECT_EQ(EncodeResolvedStopBasePlan(base.value()).value(), historical_base_bytes);
+  const auto fresh = MakePreparedParticipantStopPlan(base.value(), PreparedContext(), Resources(),
+                                                     DefaultLimits());
+  ASSERT_TRUE(fresh.ok()) << fresh.error().message;
+  const auto fresh_bytes =
+      EncodePreparedParticipantStopPlan(base.value(), fresh.value(), Resources(), DefaultLimits(),
+                                        MotionInterruptNodeCategory::kGeneric);
+  ASSERT_TRUE(fresh_bytes.ok());
+  auto wire = content_identity::parse_canonical_json(fresh_bytes.value());
+  wire = set(wire, "participant_stop_profile",
+             legacy_field(*wire.find_object_member("participant_stop_profile"),
+                          "recoverable_substitution_mode"));
+  auto stages = wire.find_object_member("stage_commands")->as_array();
+  for (auto& stage : stages) {
+    stage = set(stage, "resolved_stage", legacy_stage(*stage.find_object_member("resolved_stage")));
+    if (const auto* parameters = stage.find_object_member("validated_contract_parameters"))
+      stage = set(stage, "validated_contract_parameters",
+                  legacy_field(*parameters, "recoverable_substitution_mode"));
+  }
+  wire = identify(
+      set(wire, "stage_commands", V(std::move(stages))), "participant_stop_invocation_plan_digest",
+      kParticipantStopInvocationPlanIdentityDomain, kPreparedParticipantStopPlanApiVersion);
+  const auto old = content_identity::canonical_json(wire);
+  const auto decoded = DecodePreparedParticipantStopPlan(
+      old, base.value(), Resources(), DefaultLimits(), MotionInterruptNodeCategory::kGeneric);
+  ASSERT_TRUE(decoded.ok()) << decoded.error().message;
+  EXPECT_EQ(decoded.value().resolved_stop_base_plan_id, base.value().resolved_stop_base_plan_id);
+  EXPECT_EQ(
+      EncodePreparedParticipantStopPlan(base.value(), decoded.value(), Resources(), DefaultLimits(),
+                                        MotionInterruptNodeCategory::kGeneric)
+          .value(),
+      old);
+  EXPECT_TRUE(DecodePreparedParticipantStopPlan(old, base.value(), Resources(), DefaultLimits(),
+                                                MotionInterruptNodeCategory::kGeneric)
+                  .ok());
+  EXPECT_NE(fresh.value().participant_stop_invocation_plan_digest,
+            decoded.value().participant_stop_invocation_plan_digest);
+  EXPECT_EQ(
+      DecodePreparedParticipantStopPlan(fresh_bytes.value(), base.value(), Resources(),
+                                        DefaultLimits(), MotionInterruptNodeCategory::kGeneric)
+          .value(),
+      fresh.value());
+  auto forged = decoded.value();
+  forged.participant_stop_invocation_plan_digest = ContentDigest(Digest('f'));
+  EXPECT_FALSE(VerifyPreparedParticipantStopPlan(base.value(), forged, Resources(), DefaultLimits(),
+                                                 MotionInterruptNodeCategory::kGeneric)
+                   .ok());
 }
 
 }  // namespace manyforge::core

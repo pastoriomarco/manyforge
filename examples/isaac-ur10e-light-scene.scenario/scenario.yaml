@@ -8,12 +8,12 @@
   "description": "Retained Isaac UR10e light-scene pick-and-place deployment using the separately retained ROS 2 control execution product, commanded state authority, and Robotiq bridge profile.",
   "members": {
     "assignment.yaml": "sha256:1d248020eb6772cc45e60b008e25548ed6aa146b8735be2c4035ec3a818257af",
-    "deployment.yaml": "sha256:5b7cac6f80ffc94f1239d68708da88a40fb26bd69ba80b01b91f9e3202b46a1d",
+    "deployment.yaml": "sha256:a997c80bf2706e3367e6bc7b1cc103659111104f9480bc871792ba143a821c57",
     "program.yaml": "sha256:51db879465f2372ce1eed550b0a3675b8399098dc813e5f6f670db08b37efcd6"
   },
   "name": "isaac_manipulator_scene_light_ros2_control",
   "saved_status": {
-    "checked_content_digest": "sha256:1b87661fc185c36a24d659c13732f848827df6ac619030bf4aaa162f5e17e4dd",
+    "checked_content_digest": "sha256:e89ae3f46e0876993747b3d65052c937406c09d9073352c513b07b64fd0a2195",
     "last_known_status": "ready",
     "manyforge_version": "0.1.0"
   },

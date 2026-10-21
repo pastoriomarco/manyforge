@@ -53,7 +53,7 @@ ROS2_CONTROL_RUNTIME_CONFIGURATION_SCHEMA_ID: Final = (
     "manyforge.value_schema.runtime.ros2_control_execution.v1"
 )
 ROS2_CONTROL_RUNTIME_CONFIGURATION_SCHEMA_REVISION: Final = (
-    "sha256:34fbeab889c274ca724eb992e7bcc4305229e8bcce484b0857c4ca5e9d35e379"
+    "sha256:775f7221ffc5433d18a7b794d3b26ab9993fa805ad5b83b6d1a3a0cb58bd1368"
 )
 EMPTY_PROVIDER_CONTRACT_SCHEMA_ID: Final = (
     "manyforge.value_schema.provider_contract.empty.v1"
@@ -65,7 +65,7 @@ MOTION_CONTROLLED_STOP_SCHEMA_ID: Final = (
     "manyforge.value_schema.provider_contract.motion_controlled_stop.v1"
 )
 MOTION_CONTROLLED_STOP_SCHEMA_REVISION: Final = (
-    "sha256:fa6d62df17f87b231e2002bc38de0ecac9c6aa4da23f29f572b2a2780b481c27"
+    "sha256:65e6f4462981225916834490d4e3cb4d42b70611a2287e1b76fdb1cbcabcb113"
 )
 LIFECYCLE_CATALOG_API_VERSION: Final = "manyforge.brand_lifecycle_plan_catalog.v1"
 LITE6_LIFECYCLE_PROVIDER_ID: Final = "lite6_arm_provider"
@@ -2294,8 +2294,9 @@ FAULT_STOP_PROFILE_FIELDS: Final = frozenset(
 def fault_stop_profile_row(occurrence: str, profile: dict[str, Any]) -> dict[str, Any]:
     """Project main's authored fault Stop profile into the ROS runtime row.
 
-    The fields are copied unchanged; only the source-joint map becomes sorted
-    rows because the closed runtime schema has no map form.
+    The fields, including the authored hold/fast mode and profile identity,
+    are copied unchanged; only the source-joint map becomes sorted rows because
+    the closed runtime schema has no map form.
     """
     unknown = set(profile) - FAULT_STOP_PROFILE_FIELDS
     if unknown:
@@ -2694,14 +2695,15 @@ def operator_stop_contract_parameters(
         fault_profile = runtime_restoration_profile["stop_profiles"][
             "default_fault_stop_profile"
         ]
-        # The native runtime still derives its fault profile from the
-        # operator profile, so its authored copy must equal that derivation.
-        # The ROS runtime reads the authored fault profile directly (Q37).
+        # Only the native fallback derives hold from the operator profile,
+        # so its authored copy must equal that derivation. All maintained arm
+        # profiles use ROS, which reads the authored hold/fast profile directly.
         fault_profile_derived = "ros2_control_runtime" not in runtime_restoration_profile
         if (
             profile.get("deceleration_time_s") != 1.0
             or profile.get("allow_natural_completion_on_short_path") is not True
             or "recoverable_substitution_mode" in profile
+            or bool(profile.get("fallback_stop_modes"))
             or acceleration != expected_acceleration
             or (
                 fault_profile_derived
@@ -2752,10 +2754,22 @@ def operator_stop_contract_parameters(
             "allow_natural_completion_on_short_path"
         ],
     }
-    if "recoverable_substitution_mode" in profile:
-        result["recoverable_substitution_mode"] = profile[
-            "recoverable_substitution_mode"
-        ]
+    legacy = profile.get("recoverable_substitution_mode")
+    fallbacks = profile.get("fallback_stop_modes", [])
+    if legacy is not None:
+        if "fallback_stop_modes" in profile or legacy != "spring_back_hold":
+            raise GenerationError("invalid or conflicting legacy Stop fallback")
+        fallbacks = [legacy]
+    rank = {"soft_on_path": 0, "spring_back_hold": 1, "spring_back_fast": 2}
+    previous = 0
+    if not isinstance(fallbacks, list) or len(fallbacks) > 2:
+        raise GenerationError("invalid controlled Stop fallback list")
+    for mode in fallbacks:
+        if mode not in rank or rank[mode] <= previous:
+            raise GenerationError("Stop fallbacks must be ordered below primary")
+        previous = rank[mode]
+    if fallbacks:
+        result["fallback_stop_modes"] = fallbacks
     return result
 
 

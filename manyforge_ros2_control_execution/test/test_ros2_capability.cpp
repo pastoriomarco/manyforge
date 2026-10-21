@@ -252,6 +252,9 @@ TEST(Ros2CapabilityTest,
       compute_ros2_control_motion_interrupt_stop_capability(cfg);
   EXPECT_TRUE(cap.supported_stop_modes.contains(
       MotionInterruptStopMode::kSpringBackHold));
+  // Q130: the fast spring-back shares the same (absent) preconditions.
+  EXPECT_TRUE(cap.supported_stop_modes.contains(
+      MotionInterruptStopMode::kSpringBackFast));
   EXPECT_FALSE(cap.supported_stop_modes.contains(
       MotionInterruptStopMode::kHardDeceleration));
   ASSERT_TRUE(cap.capability_profile_id.has_value());

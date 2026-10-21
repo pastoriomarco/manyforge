@@ -59,7 +59,7 @@ MotionInterruptStopProfileDTO soft_profile(double decel_s = 0.5) {
       {"joint_2", AngularAccelerationDTO{100.0}},
   };
   profile.allow_natural_completion_on_short_path = true;
-  profile.recoverable_substitution_mode = MotionInterruptStopMode::kSpringBackHold;
+  profile.fallback_stop_modes = {MotionInterruptStopMode::kSpringBackHold};
   return profile;
 }
 
@@ -68,7 +68,7 @@ MotionInterruptStopProfileDTO spring_back_profile(double decel_s = 1.0) {
   profile.profile_id = "spring_back_profile";
   profile.stop_mode = MotionInterruptStopMode::kSpringBackHold;
   profile.allow_natural_completion_on_short_path = false;
-  profile.recoverable_substitution_mode.reset();
+  profile.fallback_stop_modes.clear();
   return profile;
 }
 
@@ -1044,7 +1044,7 @@ TEST(SoftOnPathStopPlannerTest, MissingJerkIsDerivedPerPhaseFromTheLanesLeadIn) 
 
 TEST(SoftOnPathStopPlannerTest, RejectsRampThatWouldPassAcceptedTrajectoryEnd) {
   auto profile = soft_profile(0.5);
-  profile.recoverable_substitution_mode.reset();
+  profile.fallback_stop_modes.clear();
   profile.allow_natural_completion_on_short_path = false;
   auto state = measured_state_1d(0.9, 0.8);
   SoftOnPathPlannerConfig config;
@@ -1061,7 +1061,7 @@ TEST(SoftOnPathStopPlannerTest, RejectsRampThatWouldPassAcceptedTrajectoryEnd) {
 TEST(SoftOnPathStopPlannerTest, RecommendsNaturalCompletionWhenShortPathPolicyAllowsIt) {
   // main's predicate (item 2): the ramp overruns the accepted path end.
   auto profile = soft_profile(0.5);
-  profile.recoverable_substitution_mode.reset();
+  profile.fallback_stop_modes.clear();
   profile.allow_natural_completion_on_short_path = true;
   auto state = measured_state_1d(0.9, 0.8);
   SoftOnPathPlannerConfig config;

@@ -24,9 +24,9 @@
             "joint5": 10.0,
             "joint6": 10.0
           },
-          "profile_id": "fault_spring_back_hold",
+          "profile_id": "fault_spring_back_fast",
           "require_backend_confirmation": true,
-          "stop_mode": "spring_back_hold"
+          "stop_mode": "spring_back_fast"
         },
         "runtime_configuration": {
           "collision_monitor_period_ms": 50.0,
@@ -154,9 +154,9 @@
             "wrist_2_joint": 10.0,
             "wrist_3_joint": 10.0
           },
-          "profile_id": "fault_spring_back_hold",
+          "profile_id": "fault_spring_back_fast",
           "require_backend_confirmation": true,
-          "stop_mode": "spring_back_hold"
+          "stop_mode": "spring_back_fast"
         },
         "runtime_configuration": {
           "collision_monitor_period_ms": 50.0,

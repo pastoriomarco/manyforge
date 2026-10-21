@@ -1,4 +1,6 @@
-import { useEffect, useMemo, useRef, useState, type CSSProperties } from 'react';
+import {
+  useEffect, useMemo, useRef, useState, type CSSProperties, type RefObject,
+} from 'react';
 
 import {
   PROGRAM_RESET_READINESS_MESSAGE,
@@ -67,11 +69,66 @@ import {
   humanizeReasonCode,
   structuredErrorText,
 } from '../state/structuredError';
+import { useExactAlarmAcknowledgement } from '../hooks/useExactAlarmAcknowledgement';
 
+
+/** One recovery command as the Motion or Program panel offers it. */
+export interface ProgramRecoveryCommand {
+  label: string;
+  enabled: boolean;
+  /** Why it is disabled, shown next to it. */
+  reason: string | null;
+  run: () => void;
+}
+
+/**
+ * The held offer's commands for the Recovery block: the Motion panel's Retry
+ * and Continue and the Program panel's Reset, with their handlers and
+ * enabled state, plus acknowledgement of the alarms that block them.
+ */
+export interface ProgramRecoveryCommands {
+  acknowledge: { busy: boolean; error: string | null; run: () => void } | null;
+  retry: ProgramRecoveryCommand | null;
+  continue: ProgramRecoveryCommand | null;
+  reset: ProgramRecoveryCommand;
+}
 
 interface ProgramRuntimePanelProps {
   enabled: boolean;
   controller: ProgramRuntimeController;
+  recovery?: ProgramRecoveryCommands | null;
+  recoveryRef?: RefObject<HTMLElement | null>;
+}
+
+const RECOVERY_COMMAND_MEANING = {
+  retry: 'Re-run the node.',
+  continue: 'Fail the node; the Program tree handles the FAILURE.',
+  reset: 'End the run.',
+} as const;
+
+function RecoveryCommandRow({
+  command,
+  meaning,
+  className,
+}: {
+  command: ProgramRecoveryCommand;
+  meaning: string;
+  className?: string;
+}) {
+  return (
+    <div className="program-recovery-command">
+      <button
+        type="button"
+        className={className}
+        disabled={!command.enabled}
+        onClick={command.run}
+      >{command.label}</button>
+      <span>{meaning}</span>
+      {command.reason !== null && (
+        <span className="inline-message severity-error">{command.reason}</span>
+      )}
+    </div>
+  );
 }
 
 function shortIdentity(value: string | null): string {
@@ -127,7 +184,7 @@ function automaticRetryCauseLabel(cause: string): string {
 }
 
 /**
- * The failed attempt, as its Kernel failure: "Collision Stop on move: <code> —
+ * The failed attempt, as its Kernel failure: "Collision Stop on move: <code> ·
  * <message>", or the cause alone when the owner has no Kernel failure. Shown in
  * red before the retry line. Null for another event.
  */
@@ -137,7 +194,7 @@ export function automaticRetryFailureText(event: RuntimeControlAuditEvent): stri
   const head = `${actionLabel(automaticRetryCauseLabel(cause))} on ${nodeInstanceId}`;
   if (failure === null) return head;
   const { title, message } = formatStructuredError(failure);
-  return `${head}: ${title} — ${message}`;
+  return `${head}: ${title} · ${message}`;
 }
 
 /** "Attempt 2 of 4 for move after collision Stop" (an automatic retry), or null for another event. */
@@ -149,7 +206,7 @@ export function automaticRetryText(event: RuntimeControlAuditEvent): string | nu
   return `Attempt ${attempt} of ${maxAttempts} for ${nodeInstanceId} after ${automaticRetryCauseLabel(cause)}`;
 }
 
-/** The brief warning for one automatic retry: "Collision Stop on move — attempt 2 of 4". */
+/** The brief warning for one automatic retry: "Collision Stop on move · attempt 2 of 4". */
 function automaticRetryBriefNotice(
   programRunId: string | null,
   event: AutomaticRetryAuditEvent,
@@ -161,7 +218,7 @@ function automaticRetryBriefNotice(
     id: `program.automatic-retry.${programRunId}.${event.eventRevision}`,
     severity: 'warning',
     domain: 'runtime',
-    title: `${actionLabel(automaticRetryCauseLabel(cause))} on ${nodeInstanceId} — attempt ${attempt} of ${maxAttempts}`,
+    title: `${actionLabel(automaticRetryCauseLabel(cause))} on ${nodeInstanceId} · attempt ${attempt} of ${maxAttempts}`,
     message: 'Recorded in the runtime-control events.',
   };
 }
@@ -173,7 +230,7 @@ function newestAutomaticRetry(
 }
 
 /**
- * "Spring-back fallback on move — planning timeout during <stage> (prep 534 of
+ * "Spring-back fallback on move · planning timeout during <stage> (prep 534 of
  * 500 ms)", the stage only when the Kernel names it: a motion
  * takeover that did not complete as a moving replacement. Null for another event.
  */
@@ -187,7 +244,7 @@ export function takeoverFallbackText(event: RuntimeControlAuditEvent): string | 
     code === null ? null : humanizeReasonCode(code),
     failureStage === null ? null : `during ${failureStage}`,
   ].filter((part) => part !== null).join(' ');
-  const reason = label === '' ? '' : ` — ${label}`;
+  const reason = label === '' ? '' : ` · ${label}`;
   return `${head} on ${nodeInstanceId}${reason} (prep ${Math.round(preparationMs)} of ${Math.round(budgetMs)} ms)`;
 }
 
@@ -233,14 +290,14 @@ function ioSourceTransition(event: RuntimeControlAuditEvent): IoSourceTransition
 }
 
 /**
- * "Input source unavailable for wait_part (stale) — still waiting" /
+ * "Input source unavailable for wait_part (stale) · still waiting" /
  * "Input source available again for wait_part", or null for another event.
  */
 export function ioSourceAuditText(event: RuntimeControlAuditEvent): string | null {
   const transition = ioSourceTransition(event);
   if (transition === null) return null;
   return transition.unavailable
-    ? `Input source unavailable for ${transition.nodeInstanceId}${transition.quality === null ? '' : ` (${transition.quality})`} — still waiting`
+    ? `Input source unavailable for ${transition.nodeInstanceId}${transition.quality === null ? '' : ` (${transition.quality})`} · still waiting`
     : `Input source available again for ${transition.nodeInstanceId}`;
 }
 
@@ -281,7 +338,7 @@ function ioSourceBriefNotice(
     id: `program.io-source-unavailable.${programRunId}.${event.eventRevision}`,
     severity: 'warning',
     domain: 'runtime',
-    title: `Input source unavailable on ${transition.nodeInstanceId} — still waiting`,
+    title: `Input source unavailable on ${transition.nodeInstanceId} · still waiting`,
     message: 'Recorded in the runtime-control events.',
   };
 }
@@ -374,6 +431,8 @@ function cycleFailureMessage(failure: Record<string, JsonValue> | null): string 
 export function ProgramRuntimePanel({
   enabled,
   controller,
+  recovery = null,
+  recoveryRef,
 }: ProgramRuntimePanelProps) {
   const {
     state,
@@ -401,6 +460,11 @@ export function ProgramRuntimePanel({
     ? []
     : ioSourceUnavailableNodes(controls.audit, state.run.nodeStatuses);
   const runReason = state.run?.reason ? formatStructuredError(state.run.reason) : null;
+  // A held failure carries its cause on the offer; the run's failure is set
+  // only once the cycle itself requires recovery.
+  const failureHold = recoveryOffer !== null && !ordinaryMotionHeld;
+  const recoveryCause = cycleFailureMessage(cycleFailure)
+    ?? (failureHold ? recoveryOffer.reason.message || humanizeReasonCode(recoveryOffer.reason.code) : null);
   const declaredKeys = state.applied?.program.blackboard?.keys ?? [];
   // Operator writes follow the key's access and use its typed editor; a
   // computed key always holds its formula's result.
@@ -586,7 +650,7 @@ export function ProgramRuntimePanel({
       )}
 
       {cycleState === 'recovery_required' && cycleFailure !== null ? (
-        <div className="program-feedback" role="status">
+        <div className="program-feedback error-state" role="status">
           <span>{cycleFailureMessage(cycleFailure)}</span>
         </div>
       ) : ordinaryMotionHeld ? (
@@ -594,7 +658,7 @@ export function ProgramRuntimePanel({
           <span>Program motion stopped and held. Resume Motion replans from current state.</span>
         </div>
       ) : runReason !== null && (
-        <div className="program-feedback" role="status">
+        <div className={`program-feedback${failureHold ? ' error-state' : ''}`} role="status">
           <span>
             {runReason.title}
             {runReason.message ? `: ${runReason.message}` : ''}
@@ -614,7 +678,12 @@ export function ProgramRuntimePanel({
         </p>
       ))}
       {enabled && recoveryOffer !== null && (
-        <section className="runtime-control-section" aria-labelledby="runtime-recovery-title">
+        <section
+          ref={recoveryRef}
+          tabIndex={-1}
+          className={`runtime-control-section${recoveryCause === null ? '' : ' program-recovery-failed'}`}
+          aria-labelledby="runtime-recovery-title"
+        >
           <div className="runtime-control-heading">
             <div>
               <span>Current held attempt</span>
@@ -622,17 +691,63 @@ export function ProgramRuntimePanel({
             </div>
             <code>offer {recoveryOffer.offerRevision}</code>
           </div>
+          {recoveryCause !== null && <p className="program-recovery-cause">{recoveryCause}</p>}
           <p>
             {actionLabel(recoveryOffer.recoveryClass)} · node{' '}
             <code>{recoveryOffer.nodeInstanceId}</code>
           </p>
-          <p className="hint">
-            Use Retry in the Motion panel to retry this node and resume the
-            Program&apos;s motion, or Reset to end the run. To correct its
-            inputs first, change a runtime value for this run under Advanced
-            below, or edit the Draft: Apply then Resets the run, and Retry,
-            Resume and Execute wait until the edits are Applied or Discarded.
-          </p>
+          <ol className="program-recovery-steps">
+            {recovery?.acknowledge != null && (
+              <li>
+                <strong>Acknowledge the alarm.</strong>{' '}
+                Retry and Continue are blocked until it is acknowledged.
+                <div className="program-recovery-command">
+                  <button
+                    type="button"
+                    disabled={recovery.acknowledge.busy}
+                    title="Acknowledge these exact alarm activations and revisions. This does not clear the condition or resume motion."
+                    onClick={recovery.acknowledge.run}
+                  >{recovery.acknowledge.busy ? 'Acknowledging' : 'Acknowledge'}</button>
+                  {recovery.acknowledge.error !== null && (
+                    <span className="inline-message severity-error" role="alert">
+                      {recovery.acknowledge.error}
+                    </span>
+                  )}
+                </div>
+              </li>
+            )}
+            <li>
+              <strong>Fix the cause.</strong>{' '}
+              To correct its inputs, change a runtime value for this run under
+              Advanced below, or edit the Draft: Apply then Resets the run, and
+              Retry, Resume and Execute wait until the edits are Applied or
+              Discarded.
+            </li>
+            {recovery !== null && (
+              <li>
+                <strong>Go on.</strong>
+                {recovery.retry !== null && (
+                  <RecoveryCommandRow
+                    command={recovery.retry}
+                    meaning={RECOVERY_COMMAND_MEANING.retry}
+                    className="transport-group-resume"
+                  />
+                )}
+                {recovery.continue !== null && (
+                  <RecoveryCommandRow
+                    command={recovery.continue}
+                    meaning={RECOVERY_COMMAND_MEANING.continue}
+                    className="danger-button"
+                  />
+                )}
+                <RecoveryCommandRow
+                  command={recovery.reset}
+                  meaning={RECOVERY_COMMAND_MEANING.reset}
+                  className="transport-reset"
+                />
+              </li>
+            )}
+          </ol>
           <p className="hint">
             Retry limit {recoveryOffer.policy.maxRetries === 0
               ? 'Unlimited'
@@ -1000,6 +1115,7 @@ export function deriveTransportGuidance({
       severity: 'error',
       domain: 'recovery',
       title: 'Cell recovery required',
+      alarmDefinitionIds: ['manyforge.motion.stop_fault'],
       message: `${humanizeReasonCode(fault.reasonCode)} · ${
         fault.recoveryStatus.replaceAll('_', ' ')
       }. Motion remains blocked.${robot.componentIncidents.map(({ controllableComponentId, incident }) =>
@@ -1024,6 +1140,7 @@ export function deriveTransportGuidance({
       severity: 'error',
       domain: 'recovery',
       title: 'Program recovery required',
+      alarmDefinitionIds: ['manyforge.program.operation_failure'],
       message: facts.programRecoveryMessage,
       actions: [{
         id: 'review-program-recovery',
@@ -1396,15 +1513,18 @@ export function ProgramTransportControls({
     const retryAction = retryActions.find((action) => action.enabled)
       ?? retryActions[0]
       ?? null;
-    // A motion-producing Retry is refused by operator-alarm attention on the
-    // held operation's exact resources; Composer disables it with the remedy.
+    // Operator-alarm attention on the held operation's exact resources
+    // refuses a motion-producing Retry, and Continue, which releases the held
+    // groups; Composer disables both with the remedy.
+    const alarmBlock = program.motionAttentionBlock(recoveryOfferResourceIds(offer));
     const retryAlarmBlock = retryAction !== null
       && MOTION_PRODUCING_RECOVERY_ACTIONS.has(retryAction.actionId)
-      ? program.motionAttentionBlock(recoveryOfferResourceIds(offer))
+      ? alarmBlock
       : null;
     const continueAction = offer.actions.find(
       (action) => action.actionId === 'continue_with_failure',
     ) ?? null;
+    const continueAlarmBlock = continueAction === null ? null : alarmBlock;
     return {
       offer,
       interventionStopScope,
@@ -1416,7 +1536,10 @@ export function ProgramTransportControls({
       retryPending: retryAction !== null
         && state.controlPending === `recovery:${offer.offerId}:${retryAction.actionId}`,
       continueAction,
-      canContinue: recoveryCommandAllowed && continueAction?.enabled === true,
+      continueAlarmBlock,
+      canContinue: recoveryCommandAllowed
+        && continueAction?.enabled === true
+        && continueAlarmBlock === null,
       continuePending: state.controlPending === `recovery:${offer.offerId}:continue_with_failure`,
     };
   };
@@ -1466,6 +1589,7 @@ export function ProgramTransportControls({
       });
     } else {
       program.applyRecoveryAction(controls.offer, 'continue_with_failure');
+      setDetailsOpen(false);
     }
   };
   const canProgramHalt = enabled
@@ -1630,6 +1754,70 @@ export function ProgramTransportControls({
     program.state.run === null ? null : program.state.controls?.runtimeControls?.audit ?? null,
   );
   usePublishWorkbenchNotices('program-takeover', briefTakeover === null ? [] : [briefTakeover]);
+  const resetLabel = resetIntent === 'stopping' || resetIntent === 'automatic' ? 'Stopping'
+    : cycleState === 'resetting' || state.pending === 'reset'
+      || state.controlPending?.endsWith(':reset_cycle') ? 'Resetting' : 'Reset';
+  // The Recovery block in Program run details offers the focused offer's
+  // Motion-panel Retry and Continue and the Program-panel Reset: the same
+  // handlers and enabled state, each disabled one with its reason.
+  const alarmAcknowledgement = useExactAlarmAcknowledgement();
+  const focusedHoldControls = focusedOffer === null ? undefined : holdsControls.find(
+    (controls) => controls.offer.offerId === focusedOffer.offerId,
+  );
+  const focusedControls = focusedHoldControls ?? operatorControls;
+  const gatingBlock = focusedControls?.retryAlarmBlock ?? focusedControls?.continueAlarmBlock ?? null;
+  const unacknowledgedGating = gatingBlock?.members.filter(
+    (member) => member.lifecycleState !== 'active_acknowledged',
+  ) ?? [];
+  const gatingOwnerEpoch = gatingBlock?.ownerEpoch ?? null;
+  const recoveryCommands: ProgramRecoveryCommands | null = focusedControls === null ? null : {
+    acknowledge: unacknowledgedGating.length === 0 || gatingOwnerEpoch === null ? null : {
+      busy: alarmAcknowledgement.busyActivation !== null,
+      error: alarmAcknowledgement.error,
+      run: () => { void alarmAcknowledgement.acknowledge(unacknowledgedGating, gatingOwnerEpoch); },
+    },
+    retry: focusedControls.retryAction === null ? null : {
+      label: focusedControls.retryPending ? 'Retrying' : 'Retry',
+      enabled: focusedControls.canRetry,
+      reason: focusedControls.canRetry ? null : retryTitle(focusedControls),
+      run: () => {
+        if (focusedControls.canRetry && focusedControls.retryAction !== null) {
+          program.applyRecoveryAction(focusedControls.offer, focusedControls.retryAction.actionId);
+          // Close Program run details so the operator can follow the execution.
+          setDetailsOpen(false);
+        }
+      },
+    },
+    // Continue exists only for a failure hold, as in the Motion panel.
+    continue: focusedHoldControls?.continueAction == null ? null : {
+      label: focusedHoldControls.continuePending ? 'Continuing' : 'Continue',
+      enabled: focusedHoldControls.canContinue,
+      reason: focusedHoldControls.canContinue ? null
+        : focusedHoldControls.continueAlarmBlock?.message
+          ?? program.draftUnappliedReason
+          ?? (focusedHoldControls.continueAction.enabled ? null
+            : `Continue is unavailable: ${(focusedHoldControls.continueAction.disabledReasonCode ?? 'not allowed').replaceAll('_', ' ')}.`),
+      run: () => requestContinue(focusedHoldControls),
+    },
+    reset: {
+      label: resetLabel,
+      enabled: canReset && resetIntent === null,
+      reason: canReset ? null : 'Reset is unavailable in the current backend control state.',
+      run: () => { void requestProgramReset(); },
+    },
+  };
+  // "Review Program recovery" opens Program run details on the Recovery
+  // block, after the overlay has focused its close button.
+  const recoverySection = useRef<HTMLElement>(null);
+  const [focusRecovery, setFocusRecovery] = useState(false);
+  useEffect(() => {
+    if (!focusRecovery || !detailsOpen) return;
+    window.requestAnimationFrame(() => {
+      setFocusRecovery(false);
+      recoverySection.current?.scrollIntoView?.({ block: 'start' });
+      recoverySection.current?.focus({ preventScroll: true });
+    });
+  }, [detailsOpen, focusRecovery]);
   const globalRuleRecovery = useGlobalRuleRecovery(
     enabled,
     robot.currentStatus?.ownerEpoch ?? null,
@@ -1641,7 +1829,10 @@ export function ProgramTransportControls({
     observationTransport,
     motionActive,
     onOpenManualRecovery: onOpenRobotControls === undefined ? undefined : openManualRecovery,
-    onReviewProgramRecovery: () => setDetailsOpen(true),
+    onReviewProgramRecovery: () => {
+      setDetailsOpen(true);
+      setFocusRecovery(true);
+    },
     globalRuleLatches: globalRuleRecovery.latches,
     onClearGlobalRuleLatch: globalRuleRecovery.clear,
   }));
@@ -1790,9 +1981,9 @@ export function ProgramTransportControls({
                 {owner?.continueAction != null ? (
                   <button
                     type="button"
-                    className="danger-button transport-group-stop transport-group-continue"
+                    className="danger-button transport-group-stop"
                     disabled={!owner.canContinue}
-                    title="Continuing fails the node"
+                    title={owner.continueAlarmBlock?.message ?? 'Continuing fails the node'}
                     aria-label={`Continue ${group.groupId}: fail held node ${owner.offer.nodeInstanceId}`}
                     onClick={() => requestContinue(owner)}
                   >{owner.continuePending ? 'Continuing' : 'Continue'}</button>
@@ -1892,9 +2083,7 @@ export function ProgramTransportControls({
                     : 'Reset the current Program cycle using its exact owner evidence.'
               : 'Reset is unavailable in the current backend control state.'}
             onClick={() => { void requestProgramReset(); }}
-          >{resetIntent === 'stopping' || resetIntent === 'automatic' ? 'Stopping'
-            : cycleState === 'resetting' || state.pending === 'reset'
-              || state.controlPending?.endsWith(':reset_cycle') ? 'Resetting' : 'Reset'}</button>
+          >{resetLabel}</button>
           <div className="transport-unique-icons">
             <button
               ref={detailsButton}
@@ -1978,7 +2167,12 @@ export function ProgramTransportControls({
         onClose={() => setDetailsOpen(false)}
         returnFocusRef={detailsButton}
       >
-        <ProgramRuntimePanel enabled={enabled} controller={program} />
+        <ProgramRuntimePanel
+          enabled={enabled}
+          controller={program}
+          recovery={recoveryCommands}
+          recoveryRef={recoverySection}
+        />
         {fullCellStop?.fault && fullCellStop.fault.state !== 'cleared' && (
           <section className="runtime-detail-group" aria-labelledby="program-stop-fault-title">
             <h4 id="program-stop-fault-title">Stop fault: motion is blocked</h4>
@@ -2344,6 +2538,7 @@ export function ProgramTransportControls({
                 setContinueIntent(null);
                 if (continueTarget !== null) {
                   program.applyRecoveryAction(continueTarget.offer, 'continue_with_failure');
+                  setDetailsOpen(false);
                 }
               }}
             >Continue</button>

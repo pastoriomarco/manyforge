@@ -353,7 +353,7 @@ export function ProgramPolicyEditor({
                   ? [...resolvedGroups, groupId]
                   : resolvedGroups.filter((name) => name !== groupId))}
               />
-              {missing ? `${groupId} — missing` : groupId}
+              {missing ? `${groupId} · missing` : groupId}
             </label>
           );
         })}

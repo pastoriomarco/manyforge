@@ -116,6 +116,15 @@ JsonObjectDTO Parameters(std::string mode, bool natural = true,
   return parameters;
 }
 
+JsonObjectDTO FallbackParameters(std::string primary, std::vector<std::string> fallbacks,
+                                 double deceleration = 4.0) {
+  auto parameters = Parameters(std::move(primary), false, std::nullopt, deceleration);
+  JsonValueDTO::Array modes;
+  for (auto& mode : fallbacks) modes.push_back(JsonValueDTO{std::move(mode)});
+  parameters.emplace("fallback_stop_modes", JsonValueDTO{std::move(modes)});
+  return parameters;
+}
+
 /// One participant Stop plan: a nominal stage followed by the software-hard
 /// stage.
 ResolvedParticipantStopStageDTO Stage(std::size_t index, Nominal nominal = Nominal::kControlled,
@@ -1040,6 +1049,55 @@ TEST(ParticipantStopStageHelperTest, StopDeadlineIsTheProfilesAndIsNeverExtended
   EXPECT_GE(world.clock.now(), t0 + 1'500'000'000 - kTick);
 }
 
+TEST(ParticipantStopStageHelperTest, AConsumedPlanningLeadCanSelectAnEnabledImmediateFastStop) {
+  World world(false);
+  world.config.controller_state_max_age_ns = 1'000'000'000;
+  world.Build();
+  const auto stage =
+      Stage(0U, Nominal::kControlled, FallbackParameters("soft_on_path", {"spring_back_fast"}));
+  world.Dispatch(stage);
+  world.Sample(0.5, 0.5, 1.0);
+  std::size_t reads = 0U;
+  world.port.SetOnReadSample([&](auto&) {
+    if (++reads == 4U) world.clock.advance(100'000'000);
+  });
+  ScriptReplacement(world, kSecond, 5U, ExecutionGoalResult::kSucceeded);
+  const auto result = world.helper->TranslateStopStage(stage, Budget(stage), {});
+  ASSERT_EQ(result.outcome, ParticipantStopStageOutcomeDTO::kSucceeded) << result.error->message;
+  EXPECT_EQ(result.actual_provider_contract_mode, MotionControlledStopMode::kSpringBackFast);
+  EXPECT_EQ(result.recoverable_substitution_reason, "soft_on_path_stop_delta_budget_exceeded");
+  ASSERT_EQ(Replaces(world.port).size(), 1U);
+  EXPECT_EQ(Replaces(world.port).front().next_key, kSecond);
+  EXPECT_EQ(world.freezes, 1U);
+}
+
+TEST(ParticipantStopStageHelperTest, OrderedFallbacksKeepTheOriginalAbsoluteDeadline) {
+  World world(false);
+  world.config.controller_state_max_age_ns = 3'000'000'000;
+  world.Build();
+  const auto stage =
+      Stage(0U, Nominal::kControlled,
+            FallbackParameters("soft_on_path", {"spring_back_hold", "spring_back_fast"}));
+  world.Dispatch(stage);
+  world.Sample(0.5, 0.5, 1.0);
+  const auto started = world.clock.now();
+  std::size_t reads = 0U;
+  world.port.SetOnReadSample([&](auto&) {
+    // The pre-send baseline read after frozen trip capture. Model expensive
+    // preparation against the same clock; no extra wait/deadline is created.
+    if (++reads == 4U) world.clock.advance(1'600'000'000);
+  });
+  const auto result = world.helper->TranslateStopStage(stage, Budget(stage), {});
+  ASSERT_EQ(result.outcome, ParticipantStopStageOutcomeDTO::kFailed);
+  ASSERT_TRUE(result.error);
+  EXPECT_EQ(result.error->details.at("reason"), "controlled_stop_deadline_exceeded");
+  EXPECT_TRUE(result.error->details.at("fallback_attempt_1")
+                  .starts_with("soft_on_path:soft_on_path_stop_delta_budget_exceeded"));
+  EXPECT_EQ(world.clock.now(), started + 1'600'000'000);
+  EXPECT_TRUE(Replaces(world.port).empty());
+  EXPECT_EQ(world.freezes, 1U);
+}
+
 // --- Item 2, item 3/Q3, Q33 -------------------------------------------------------
 
 TEST(ParticipantStopStageHelperTest, NaturalCompletionLetsTheOriginalGoalFinish) {
@@ -1101,13 +1159,96 @@ TEST(ParticipantStopStageHelperTest, SpringBackSubstitutionUsesTheSameReplaceTim
   EXPECT_EQ(Text(diagnostics, "recoverable_substitution_pair"), "soft_on_path->spring_back_hold");
 }
 
+TEST(ParticipantStopStageHelperTest, OrderedFallbacksAdvanceOnlyThroughEnabledRefusedModes) {
+  struct Case {
+    std::string primary;
+    std::vector<std::string> fallbacks;
+    double cursor;
+    double deceleration;
+    MotionControlledStopMode expected;
+  };
+  for (const auto& row : std::vector<Case>{{"soft_on_path",
+                                            {"spring_back_hold"},
+                                            1.8,
+                                            4.0,
+                                            MotionControlledStopMode::kSpringBackHold},
+                                           {"spring_back_hold",
+                                            {"spring_back_fast"},
+                                            0.5,
+                                            0.01,
+                                            MotionControlledStopMode::kSpringBackFast},
+                                           {"soft_on_path",
+                                            {"spring_back_fast"},
+                                            0.5,
+                                            0.01,
+                                            MotionControlledStopMode::kSpringBackFast}}) {
+    SCOPED_TRACE(row.primary);
+    World world;
+    const auto stage = Stage(0U, Nominal::kControlled,
+                             FallbackParameters(row.primary, row.fallbacks, row.deceleration));
+    world.Dispatch(stage);
+    world.Sample(row.cursor, row.cursor, 1.0);
+    ScriptReplacement(world, kSecond, 5U, ExecutionGoalResult::kSucceeded);
+    const auto result = world.helper->TranslateStopStage(stage, Budget(stage), {});
+    ASSERT_EQ(result.outcome, ParticipantStopStageOutcomeDTO::kSucceeded) << result.error->message;
+    EXPECT_EQ(result.actual_provider_contract_mode, row.expected);
+    EXPECT_EQ(Replaces(world.port).size(), 1U);
+    EXPECT_EQ(world.freezes, 1U);
+    const auto& diagnostics =
+        std::get<JsonObjectDTO>(EvidenceObject(result).at("provider_diagnostics").value);
+    EXPECT_TRUE(Text(diagnostics, "fallback_attempt_1").starts_with(row.primary + ":"));
+  }
+}
+
+TEST(ParticipantStopStageHelperTest, FallbacksNeverMaskDriftOrAnEffectfulExecutionFailure) {
+  {
+    World world(false);
+    world.config.trip_authority = StateAuthorityClass::kMeasured;
+    world.config.max_initial_path_deviation_rad = 0.01;
+    world.Build();
+    const auto stage =
+        Stage(0U, Nominal::kControlled,
+              FallbackParameters("soft_on_path", {"spring_back_hold", "spring_back_fast"}));
+    world.Dispatch(stage);
+    world.Sample(0.5, 0.5, 1.0, 0.5, -0.5);
+    const auto result = world.helper->TranslateStopStage(stage, Budget(stage), {});
+    ASSERT_TRUE(result.error);
+    EXPECT_EQ(result.error->details.at("reason"), "initial_path_deviation_exceeds_limit");
+    EXPECT_TRUE(Replaces(world.port).empty());
+  }
+  for (const unsigned failure : {0U, 1U, 2U}) {
+    SCOPED_TRACE(failure);
+    World world;
+    const auto stage =
+        Stage(0U, Nominal::kControlled,
+              FallbackParameters("soft_on_path", {"spring_back_hold", "spring_back_fast"}));
+    world.Dispatch(stage);
+    world.Sample(0.5, 0.5, 1.0);
+    if (failure == 1U) {
+      world.port.QueueCommandResult({ExecutionPortDispatch::kEffectUncertain, std::nullopt,
+                                     ErrorDTO{"send_unknown", "effect unknown", {}}});
+    } else if (failure == 2U) {
+      world.port.QueueCommandResult(
+          {ExecutionPortDispatch::kNotDispatched, ExecutionPortRefusal::kStaleKey, std::nullopt});
+    } else {
+      ScriptReplacement(world, kSecond, 5U, ExecutionGoalResult::kAbortedPathTolerance);
+    }
+    const auto result = world.helper->TranslateStopStage(stage, Budget(stage), {});
+    EXPECT_EQ(result.outcome, ParticipantStopStageOutcomeDTO::kFailed);
+    EXPECT_EQ(result.attempt_disposition, failure == 2U
+                                              ? StopStageAttemptDispositionDTO::kNotDispatched
+                                              : StopStageAttemptDispositionDTO::kDispatched);
+    EXPECT_EQ(Replaces(world.port).size(), 1U);
+  }
+}
+
 class SpringPointObserver final : public IStopStageSpringReturnObserver {
  public:
   explicit SpringPointObserver(World& world, bool accept = true) : world_(world), accept_(accept) {}
   bool SpringReturnPointReady(const SpringBackReturnPointDTO& value) noexcept override {
     ++calls;
     try {
-      before_replace = Replaces(world_.port).empty();
+      after_replace = !Replaces(world_.port).empty();
       if (!accept_) return false;
       point = value;
       return true;
@@ -1117,14 +1258,15 @@ class SpringPointObserver final : public IStopStageSpringReturnObserver {
   }
   std::optional<SpringBackReturnPointDTO> point;
   unsigned calls{};
-  bool before_replace{};
+  bool after_replace{};
 
  private:
   World& world_;
   bool accept_;
 };
 
-TEST(ParticipantStopStageHelperTest, TakeoverUsesOnlySealedSpringPermissionAndPublishesBeforeSend) {
+TEST(ParticipantStopStageHelperTest,
+     TakeoverUsesOnlySealedSpringPermissionAndPublishesAfterRecognition) {
   for (const bool substituted : {false, true}) {
     World world;
     const auto stage =
@@ -1141,7 +1283,7 @@ TEST(ParticipantStopStageHelperTest, TakeoverUsesOnlySealedSpringPermissionAndPu
         << result.error->details.at("reason");
     EXPECT_EQ(result.actual_provider_contract_mode, MotionControlledStopMode::kSpringBackHold);
     EXPECT_EQ(observer.calls, 1U);
-    EXPECT_TRUE(observer.before_replace);
+    EXPECT_TRUE(observer.after_replace);
     ASSERT_TRUE(observer.point);
     EXPECT_EQ(observer.point->source_goal, kOriginal);
     EXPECT_EQ(observer.point->binding_epoch, ExecutionBindingEpoch(1U));
@@ -1157,6 +1299,30 @@ TEST(ParticipantStopStageHelperTest, TakeoverUsesOnlySealedSpringPermissionAndPu
                 1e-6);
     EXPECT_EQ(result.recoverable_substitution_reason.has_value(), substituted);
   }
+}
+
+TEST(ParticipantStopStageHelperTest, TakeoverHoldRefusalPublishesOnlyTheAcceptedFastReturnPoint) {
+  World world(false);
+  world.config.trip_authority = StateAuthorityClass::kMeasured;
+  world.Build();
+  const auto stage = Stage(0U, Nominal::kControlled,
+                           FallbackParameters("spring_back_hold", {"spring_back_fast"}, 0.01));
+  world.Dispatch(stage);
+  world.Sample(0.5, 0.5, 1.0, 0.5, 0.49);
+  ScriptReplacement(world, kSecond, 5U, ExecutionGoalResult::kSucceeded);
+  SpringPointObserver observer(world);
+  const auto result =
+      world.helper->TranslateStopStageForTakeover(stage, Budget(stage), {}, observer);
+  ASSERT_EQ(result.outcome, ParticipantStopStageOutcomeDTO::kSucceeded) << result.error->message;
+  EXPECT_EQ(result.actual_provider_contract_mode, MotionControlledStopMode::kSpringBackFast);
+  EXPECT_EQ(observer.calls, 1U);
+  EXPECT_TRUE(observer.after_replace);
+  ASSERT_TRUE(observer.point);
+  EXPECT_EQ(observer.point->initial.spring_back_return_point.positions_rad,
+            std::vector<double>{0.49});
+  ASSERT_EQ(Replaces(world.port).size(), 1U);
+  EXPECT_EQ(Replaces(world.port).front().trajectory.waypoints.back().positions_rad,
+            observer.point->initial.spring_back_return_point.positions_rad);
 }
 
 TEST(ParticipantStopStageHelperTest, TakeoverWithoutSpringPermissionKeepsOrdinaryStopAndNoAnchor) {
@@ -1192,7 +1358,7 @@ TEST(ParticipantStopStageHelperTest, SpringNotificationFailureNeverChangesContai
               1e-6);
 }
 
-TEST(ParticipantStopStageHelperTest, SpringPointDoesNotCertifyReturnFeasibility) {
+TEST(ParticipantStopStageHelperTest, RefusedSpringDoesNotPublishAnUncommittedReturnPoint) {
   World world;
   const auto stage =
       Stage(0U, Nominal::kControlled, Parameters("spring_back_hold", false, std::nullopt, 0.01));
@@ -1201,8 +1367,8 @@ TEST(ParticipantStopStageHelperTest, SpringPointDoesNotCertifyReturnFeasibility)
   SpringPointObserver observer(world);
   const auto result =
       world.helper->TranslateStopStageForTakeover(stage, Budget(stage), {}, observer);
-  EXPECT_EQ(observer.calls, 1U);
-  ASSERT_TRUE(observer.point);
+  EXPECT_EQ(observer.calls, 0U);
+  EXPECT_FALSE(observer.point);
   EXPECT_EQ(result.outcome, ParticipantStopStageOutcomeDTO::kFailed);
   EXPECT_TRUE(Replaces(world.port).empty());
 }
@@ -1221,6 +1387,84 @@ TEST(ParticipantStopStageHelperTest, DirectSpringBackProfileUsesTheSameReplaceTi
   const auto replaces = Replaces(world.port);
   ASSERT_EQ(replaces.size(), 1U);
   EXPECT_NEAR(replaces.front().trajectory.waypoints.back().positions_rad[0], 0.5, 1e-6);
+}
+
+// Q130: the fast spring-back sends the passed points plus one zero-velocity
+// point at the trip position, with no planner and no lead-in ramp.
+TEST(ParticipantStopStageHelperTest, FastSpringBackSendsPassedPointsAndOneTripPointAtOnce) {
+  World world;
+  const auto stage = Stage(0U, Nominal::kControlled, Parameters("spring_back_fast", false));
+  world.Dispatch(stage);
+  world.Sample(0.5, 0.5, 1.0);
+  ScriptReplacement(world, kSecond, 5U, ExecutionGoalResult::kSucceeded);
+  const auto result = world.helper->TranslateStopStage(stage, Budget(stage), {});
+  ASSERT_EQ(result.outcome, ParticipantStopStageOutcomeDTO::kSucceeded)
+      << result.error->message << " " << result.error->details.at("reason");
+  EXPECT_EQ(result.actual_provider_contract_mode, MotionControlledStopMode::kSpringBackFast);
+  const auto replaces = Replaces(world.port);
+  ASSERT_EQ(replaces.size(), 1U);
+  EXPECT_EQ(replaces.front().active_key, kOriginal);
+  const auto& evidence = EvidenceObject(result);
+  EXPECT_EQ(Text(evidence, "actual_stop_mode"), "spring_back_fast");
+  const auto& diagnostics = std::get<JsonObjectDTO>(evidence.at("provider_diagnostics").value);
+  const double elapsed = std::get<double>(diagnostics.at("join_elapsed_path_s").value);
+  const auto& points = replaces.front().trajectory.waypoints;
+  const auto original = Original();
+  std::size_t passed = 0U;
+  while (original.waypoints[passed].time_from_start_s < elapsed) ++passed;
+  ASSERT_EQ(points.size(), passed + 1U);
+  for (std::size_t index = 0U; index < passed; ++index) {
+    EXPECT_NEAR(points[index].time_from_start_s,
+                original.waypoints[index].time_from_start_s - elapsed, 1e-12);
+    EXPECT_LT(points[index].time_from_start_s, 0.0);
+    EXPECT_EQ(points[index].positions_rad, original.waypoints[index].positions_rad);
+  }
+  // Deceleration time 1.0 s in wall time at the frozen factor 0.5.
+  EXPECT_NEAR(points.back().time_from_start_s, 0.5, 1e-12);
+  EXPECT_NEAR(points.back().positions_rad[0], 0.5, 1e-12);
+  EXPECT_EQ(points.back().velocities_rad_s, std::vector<double>{0.0});
+  EXPECT_EQ(points.back().accelerations_rad_s2, std::vector<double>{0.0});
+}
+
+// With no point passed yet the message starts now, at the trip position, so
+// the controller takes it at once rather than as a splice.
+TEST(ParticipantStopStageHelperTest, FastSpringBackBeforeAnyPassedPointStartsNowAtTheTripPosition) {
+  World world;
+  const auto stage = Stage(0U, Nominal::kControlled, Parameters("spring_back_fast", false));
+  world.Dispatch(stage);
+  world.Sample(0.0, 0.0, 1.0);
+  ScriptReplacement(world, kSecond, 5U, ExecutionGoalResult::kSucceeded);
+  const auto result = world.helper->TranslateStopStage(stage, Budget(stage), {});
+  ASSERT_EQ(result.outcome, ParticipantStopStageOutcomeDTO::kSucceeded)
+      << result.error->message << " " << result.error->details.at("reason");
+  const auto& evidence = EvidenceObject(result);
+  const auto& diagnostics = std::get<JsonObjectDTO>(evidence.at("provider_diagnostics").value);
+  EXPECT_EQ(std::get<double>(diagnostics.at("passed_points").value), 0.0);
+  const auto replaces = Replaces(world.port);
+  ASSERT_EQ(replaces.size(), 1U);
+  const auto& points = replaces.front().trajectory.waypoints;
+  ASSERT_EQ(points.size(), 2U);
+  EXPECT_EQ(points.front().time_from_start_s, 0.0);
+  EXPECT_EQ(points.front().positions_rad, std::vector<double>{0.0});
+  EXPECT_EQ(points.front().velocities_rad_s, std::vector<double>{0.0});
+  EXPECT_NEAR(points.back().time_from_start_s, 0.5, 1e-12);
+  EXPECT_EQ(points.back().positions_rad, std::vector<double>{0.0});
+}
+
+TEST(ParticipantStopStageHelperTest, FastSpringBackLetsAShortRemainingMoveFinishWhenAllowed) {
+  World world;
+  const auto stage = Stage(0U, Nominal::kControlled, Parameters("spring_back_fast", true));
+  world.Dispatch(stage);
+  world.Sample(1.9, 1.9, 1.0);
+  world.on_tick = [&] {
+    if (world.ticks == 5U) world.Finish(kOriginal, ExecutionGoalResult::kSucceeded);
+    world.Sample(1.95, 1.95, world.ticks >= 5U ? 0.0 : 1.0);
+  };
+  const auto result = world.helper->TranslateStopStage(stage, Budget(stage), {});
+  ASSERT_EQ(result.outcome, ParticipantStopStageOutcomeDTO::kSucceeded);
+  EXPECT_TRUE(Replaces(world.port).empty());
+  const auto& evidence = EvidenceObject(result);
+  EXPECT_TRUE(std::get<bool>(evidence.at("completed_by_natural_completion").value));
 }
 
 /// §3.3: the replacement's cursor maps back to the original path through the
@@ -1401,6 +1645,40 @@ void ScriptBrake(World& world, const ExecutionGoalKey& key, std::size_t succeede
       world.Sample(0.0, world.BrakeEnd(), 0.0);  // success hold at the brake's end
     }
   };
+}
+
+TEST(ParticipantStopStageHelperTest, ExhaustedControlledFallbacksLeaveTheExistingHardStage) {
+  World world;
+  const auto stage =
+      Stage(0U, Nominal::kControlled,
+            FallbackParameters("soft_on_path", {"spring_back_hold", "spring_back_fast"}, 0.01));
+  world.Dispatch(stage);
+  world.Sample(0.5, 0.5, 1.0);
+  world.port.QueueCommandResult(
+      {ExecutionPortDispatch::kNotDispatched, ExecutionPortRefusal::kNotReady, std::nullopt});
+  const auto result = world.helper->TranslateStopStage(stage, Budget(stage), {});
+  ASSERT_EQ(result.outcome, ParticipantStopStageOutcomeDTO::kFailed);
+  EXPECT_EQ(result.attempt_disposition, StopStageAttemptDispositionDTO::kNotDispatched);
+  ASSERT_TRUE(result.error);
+  EXPECT_EQ(result.error->details.at("recommended_disposition"), "hard_stop");
+  EXPECT_TRUE(result.error->details.at("fallback_attempt_1").starts_with("soft_on_path:"));
+  EXPECT_TRUE(result.error->details.at("fallback_attempt_2").starts_with("spring_back_hold:"));
+  EXPECT_TRUE(result.error->details.at("fallback_attempt_3").starts_with("spring_back_fast:"));
+  EXPECT_EQ(Replaces(world.port).size(), 1U);
+  EXPECT_EQ(world.freezes, 1U);
+  EXPECT_EQ(stage.participant_stop_plan.stage_commands[1].resolved_stage.stage_kind,
+            StopEscalationStageKind::kSoftwareHard);
+  auto hard = stage;
+  hard.stage_index = 1U;
+  world.clock.advance(1);
+  world.Sample(0.5, 0.5, 1.0);
+  ScriptBrake(world, kSecond);
+  const auto contained = world.helper->TranslateStopStage(hard, Budget(hard), {});
+  ASSERT_EQ(contained.outcome, ParticipantStopStageOutcomeDTO::kSucceeded)
+      << contained.error->message;
+  ASSERT_EQ(Replaces(world.port).size(), 2U);
+  EXPECT_EQ(Replaces(world.port).back().next_key, kSecond);
+  EXPECT_TRUE(Cancels(world.port).empty());
 }
 
 TEST(ParticipantStopStageHelperTest, ControlledHardStopBrakesFromTheLatestCommandedState) {

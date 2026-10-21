@@ -523,7 +523,9 @@ def test_jerk_draft_choice_preserves_units_inactive_values_and_substitution(enab
     for row in result["policies"]["stop_stage_parameters"][:2]:
         parameters = row["default_contract_parameters"]
         assert parameters["jerk_limits_enabled"] is enabled
-        assert parameters["recoverable_substitution_mode"] == "spring_back_hold"
+        # Canonical write: the legacy substitution becomes the fallback list.
+        assert "recoverable_substitution_mode" not in parameters
+        assert parameters["fallback_stop_modes"] == ["spring_back_hold"]
         assert parameters["per_resource_limits"][0]["max_jerk"] == {
             "coordinate_kind": "angular_rad_s3",
             "value_rad_s3": 20.0,
@@ -535,6 +537,111 @@ def test_jerk_draft_choice_preserves_units_inactive_values_and_substitution(enab
     profile["per_resource_limits"][0]["max_jerk"]["coordinate_kind"] = "linear_m_s3"
     with pytest.raises(DeploymentDraftError, match="units"):
         _edit_controlled_stop_profile(source, profile, **selection)
+
+
+def _compiled_stop_profile(stop_mode: str, **extra: Any) -> dict[str, Any]:
+    return {
+        "stop_mode": stop_mode,
+        "deceleration_time_s": 1.0,
+        "allow_natural_completion_on_short_path": False,
+        "jerk_limits_enabled": False,
+        "per_resource_limits": [
+            {
+                "resource_id": "robot.arm.coordinate.000000",
+                "max_deceleration": {"coordinate_kind": "angular_rad_s2", "value": 4.0},
+                "settle_velocity_threshold": {
+                    "coordinate_kind": "angular_rad_s",
+                    "value": 0.01,
+                },
+            }
+        ],
+        **extra,
+    }
+
+
+def _compiled_stop_parameters(document: dict[str, Any]) -> list[dict[str, Any]]:
+    return [
+        row["default_contract_parameters"]
+        for row in document["policies"]["stop_stage_parameters"]
+        if row["stop_escalation_stage_id"] == "motion_controlled_stop"
+        and row["provider_contract_ref"]["provider_contract_role_id"]
+        == "stop_contract"
+    ]
+
+
+def test_compiled_stop_fallbacks_write_canonical_field_and_prune_on_mode_change():
+    selection = {"controllable_component_id": "robot", "command_target_id": "arm"}
+    legacy = _focused_document()
+    for parameters in _compiled_stop_parameters(legacy):
+        parameters["recoverable_substitution_mode"] = "spring_back_hold"
+    # Without the field: the legacy Soft substitution reads as [spring_back_hold]
+    # and is normalized on write; it is dropped once the primary is not Soft.
+    soft = _edit_controlled_stop_profile(
+        legacy, _compiled_stop_profile("soft_on_path"), **selection
+    )
+    for parameters in _compiled_stop_parameters(soft):
+        assert parameters["fallback_stop_modes"] == ["spring_back_hold"]
+        assert "recoverable_substitution_mode" not in parameters
+    hold = _edit_controlled_stop_profile(
+        legacy, _compiled_stop_profile("spring_back_hold"), **selection
+    )
+    for parameters in _compiled_stop_parameters(hold):
+        assert "fallback_stop_modes" not in parameters
+        assert "recoverable_substitution_mode" not in parameters
+    # Explicit lists are validated and written; [] writes nothing.
+    full = _edit_controlled_stop_profile(
+        legacy,
+        _compiled_stop_profile(
+            "soft_on_path",
+            fallback_stop_modes=["spring_back_hold", "spring_back_fast"],
+        ),
+        **selection,
+    )
+    for parameters in _compiled_stop_parameters(full):
+        assert parameters["fallback_stop_modes"] == [
+            "spring_back_hold",
+            "spring_back_fast",
+        ]
+    # Recorded new list, profile without the field, primary moves down: prune.
+    pruned = _edit_controlled_stop_profile(
+        full, _compiled_stop_profile("spring_back_hold"), **selection
+    )
+    for parameters in _compiled_stop_parameters(pruned):
+        assert parameters["fallback_stop_modes"] == ["spring_back_fast"]
+    cleared = _edit_controlled_stop_profile(
+        full, _compiled_stop_profile("soft_on_path", fallback_stop_modes=[]), **selection
+    )
+    for parameters in _compiled_stop_parameters(cleared):
+        assert "fallback_stop_modes" not in parameters
+    for invalid in (
+        ["soft_on_path"],
+        ["spring_back_fast", "spring_back_hold"],
+        ["spring_back_hold", "spring_back_hold"],
+        ["hard_deceleration"],
+        ["unknown"],
+    ):
+        with pytest.raises(DeploymentDraftError, match="fallback_stop_modes"):
+            _edit_controlled_stop_profile(
+                legacy,
+                _compiled_stop_profile("soft_on_path", fallback_stop_modes=invalid)
+                if invalid != ["soft_on_path"]
+                else _compiled_stop_profile(
+                    "spring_back_hold", fallback_stop_modes=invalid
+                ),
+                **selection,
+            )
+
+
+def test_compiled_stop_with_old_and_new_fallback_fields_is_ambiguous():
+    selection = {"controllable_component_id": "robot", "command_target_id": "arm"}
+    source = _focused_document()
+    for parameters in _compiled_stop_parameters(source):
+        parameters["recoverable_substitution_mode"] = "spring_back_hold"
+        parameters["fallback_stop_modes"] = ["spring_back_hold"]
+    with pytest.raises(DeploymentDraftError, match="both fallback_stop_modes"):
+        _edit_controlled_stop_profile(
+            source, _compiled_stop_profile("soft_on_path"), **selection
+        )
 
 
 def test_max_stop_time_edit_converges_all_bindings_for_one_authored_target():

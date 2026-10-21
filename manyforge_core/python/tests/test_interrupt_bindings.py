@@ -57,7 +57,7 @@ def test_typed_stop_profile_round_trip_and_validation() -> None:
             "slide_z": core.LinearAccelerationDTO(0.4),
         },
         allow_natural_completion_on_short_path=True,
-        recoverable_substitution_mode=(core.MotionInterruptStopMode.kSpringBackHold),
+        fallback_stop_modes=[core.MotionInterruptStopMode.kSpringBackHold],
         require_backend_confirmation=True,
         per_joint_settle_velocity_threshold={
             "joint_a": core.AngularVelocityDTO(0.01),
@@ -73,9 +73,7 @@ def test_typed_stop_profile_round_trip_and_validation() -> None:
     assert core.motion_interrupt_stop_profile_field_error(profile) == ""
     assert profile.profile_id == "soft.profile.v2"
     assert profile.stop_mode == core.MotionInterruptStopMode.kSoftOnPath
-    assert profile.recoverable_substitution_mode == (
-        core.MotionInterruptStopMode.kSpringBackHold
-    )
+    assert list(profile.fallback_stop_modes) == [core.MotionInterruptStopMode.kSpringBackHold]
     assert profile.per_joint_max_deceleration["joint_a"].value_rad_s2 == 2.0
     assert profile.per_joint_max_deceleration["slide_z"].value_m_s2 == 0.4
     assert profile.per_joint_settle_velocity_threshold is not None
@@ -116,7 +114,7 @@ def test_profile_and_closed_structured_value_fail_closed() -> None:
     invalid_substitution = core.MotionInterruptStopProfileDTO(
         profile_id="hard.profile",
         stop_mode=core.MotionInterruptStopMode.kHardDeceleration,
-        recoverable_substitution_mode=(core.MotionInterruptStopMode.kSpringBackHold),
+        fallback_stop_modes=[core.MotionInterruptStopMode.kSpringBackHold],
     )
     assert "only soft_on_path" in core.motion_interrupt_stop_profile_field_error(
         invalid_substitution

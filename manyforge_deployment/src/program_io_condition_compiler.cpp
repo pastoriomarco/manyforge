@@ -554,6 +554,8 @@ compile_program_io_conditions(const ProgramBindingContract &program,
           stop = core::MotionInterruptStopMode::kSoftOnPath;
         else if (mode == "spring_back_hold")
           stop = core::MotionInterruptStopMode::kSpringBackHold;
+        else if (mode == "spring_back_fast")
+          stop = core::MotionInterruptStopMode::kSpringBackFast;
         else if (mode == "hard_deceleration")
           stop = core::MotionInterruptStopMode::kHardDeceleration;
         else

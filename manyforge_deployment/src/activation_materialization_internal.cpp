@@ -1939,7 +1939,7 @@ void verify_scenarios(const std::filesystem::path &root,
              "maintained_deployment_sources.v1.json");
   if (deployment::sha256_digest(description_bytes) !=
       "sha256:"
-      "2e26d0d9dd7a194f14438af7bbe2e02d3d3f81291c6385bbc8e2fedd1f0ec6da") {
+      "69e413dba1da8b41197322a848c9bc99de718bf065d74f383ebdf5b111ed1163") {
     throw std::invalid_argument(
         "maintained runtime input source differs from its qualified source pin");
   }
@@ -2460,6 +2460,24 @@ void verify_scenarios(const std::filesystem::path &root,
           scenario.source == std::string_view("examples/assistant_modes_scene_"
                                               "authoring.deployment.yaml") ||
           scenario.family_id == std::string_view("ur5_roboplan");
+      const auto &source_fault_profile = require_member(
+          require_member(*source_profile, "stop_profiles", "source profile"),
+          "default_fault_stop_profile", "source Stop profiles");
+      const auto &fault_mode = require_text(
+          require_member(source_fault_profile, "stop_mode", "source fault profile"),
+          "source fault Stop mode");
+      if (fault_mode != "spring_back_hold" && fault_mode != "spring_back_fast") {
+        throw std::invalid_argument("maintained fault Stop mode is not qualified");
+      }
+      const std::string fault_profile_id =
+          fault_mode == "spring_back_fast" ? "fault_spring_back_fast"
+          : legacy_default_fault          ? "default_fault_spring_back"
+                                          : "fault_spring_back_hold";
+      if (require_text(require_member(source_fault_profile, "profile_id",
+                                      "source fault profile"),
+                       "source fault profile ID") != fault_profile_id) {
+        throw std::invalid_argument("maintained fault Stop identity differs from its mode");
+      }
       const bool ur10e_mock_with_fingers =
           scenario.source == std::string_view("examples/pick_and_place_ur10e_"
                                               "robotiq.deployment.yaml");
@@ -2494,10 +2512,8 @@ void verify_scenarios(const std::filesystem::path &root,
           {"per_joint_max_deceleration_rad_s2",
            core::JsonValueDTO{std::move(limits)}},
           {"profile_id",
-           core::JsonValueDTO{std::string(legacy_default_fault
-                                              ? "default_fault_spring_back"
-                                              : "fault_spring_back_hold")}},
-          {"stop_mode", core::JsonValueDTO{std::string("spring_back_hold")}}};
+           core::JsonValueDTO{fault_profile_id}},
+          {"stop_mode", core::JsonValueDTO{fault_mode}}};
       if (!legacy_default_fault) {
         fault_row.emplace("require_backend_confirmation",
                           core::JsonValueDTO{true});

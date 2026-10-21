@@ -96,6 +96,9 @@ enum class MotionInterruptStopMode {
   kSpringBackHold,
   kSoftOnPath,
   kHardDeceleration,
+  /// Q130: the active trajectory's passed points plus one zero-velocity point
+  /// at the trip position, sent at once with no planning or checks.
+  kSpringBackFast,
 };
 
 /// Which backend/controller surface actually issued the controlled

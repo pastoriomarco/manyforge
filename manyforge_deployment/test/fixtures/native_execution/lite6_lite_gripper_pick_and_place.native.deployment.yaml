@@ -1080,7 +1080,7 @@
     ]
   },
   "deployment_artifact_id": "lite6_lite_gripper_pick_and_place",
-  "deployment_revision": "sha256:a8aabb67e8eb93b5a14f82719112c6d2d0c01d520e1a1154c6fc9a1d45a7dada",
+  "deployment_revision": "sha256:70472a2e19b5b6cbcd7d11ecae3338ae46032bef843df1903f101cd36379f64d",
   "description": "Native ManyForge pick-and-place deployment for UFACTORY Lite6 with the lite pneumatic gripper. The model bundle is self-contained; xarm_ros2 is a generation-time and real-robot runtime dependency only.",
   "desired_control_configurations": [
     {
@@ -2039,7 +2039,7 @@
         },
         "provider_contract_ref": {
           "contract_schema_id": "manyforge.value_schema.provider_contract.motion_controlled_stop.v1",
-          "contract_schema_revision": "sha256:fa6d62df17f87b231e2002bc38de0ecac9c6aa4da23f29f572b2a2780b481c27",
+          "contract_schema_revision": "sha256:f6ac4acc7a4aa33a30eb3180c917b3b60d1469fa6ed4820c5fe2d68c0c2a8f84",
           "provider_contract_role_id": "stop_contract"
         },
         "stop_escalation_stage_id": "motion_controlled_stop",
@@ -2148,7 +2148,7 @@
         },
         "provider_contract_ref": {
           "contract_schema_id": "manyforge.value_schema.provider_contract.motion_controlled_stop.v1",
-          "contract_schema_revision": "sha256:fa6d62df17f87b231e2002bc38de0ecac9c6aa4da23f29f572b2a2780b481c27",
+          "contract_schema_revision": "sha256:f6ac4acc7a4aa33a30eb3180c917b3b60d1469fa6ed4820c5fe2d68c0c2a8f84",
           "provider_contract_role_id": "stop_contract"
         },
         "stop_escalation_stage_id": "motion_controlled_stop",
@@ -2257,7 +2257,7 @@
         },
         "provider_contract_ref": {
           "contract_schema_id": "manyforge.value_schema.provider_contract.motion_controlled_stop.v1",
-          "contract_schema_revision": "sha256:fa6d62df17f87b231e2002bc38de0ecac9c6aa4da23f29f572b2a2780b481c27",
+          "contract_schema_revision": "sha256:f6ac4acc7a4aa33a30eb3180c917b3b60d1469fa6ed4820c5fe2d68c0c2a8f84",
           "provider_contract_role_id": "stop_contract"
         },
         "stop_escalation_stage_id": "motion_controlled_stop",
@@ -2366,7 +2366,7 @@
         },
         "provider_contract_ref": {
           "contract_schema_id": "manyforge.value_schema.provider_contract.motion_controlled_stop.v1",
-          "contract_schema_revision": "sha256:fa6d62df17f87b231e2002bc38de0ecac9c6aa4da23f29f572b2a2780b481c27",
+          "contract_schema_revision": "sha256:f6ac4acc7a4aa33a30eb3180c917b3b60d1469fa6ed4820c5fe2d68c0c2a8f84",
           "provider_contract_role_id": "stop_contract"
         },
         "stop_escalation_stage_id": "motion_controlled_stop",
@@ -2475,7 +2475,7 @@
         },
         "provider_contract_ref": {
           "contract_schema_id": "manyforge.value_schema.provider_contract.motion_controlled_stop.v1",
-          "contract_schema_revision": "sha256:fa6d62df17f87b231e2002bc38de0ecac9c6aa4da23f29f572b2a2780b481c27",
+          "contract_schema_revision": "sha256:f6ac4acc7a4aa33a30eb3180c917b3b60d1469fa6ed4820c5fe2d68c0c2a8f84",
           "provider_contract_role_id": "stop_contract"
         },
         "stop_escalation_stage_id": "motion_controlled_stop",
@@ -2584,7 +2584,7 @@
         },
         "provider_contract_ref": {
           "contract_schema_id": "manyforge.value_schema.provider_contract.motion_controlled_stop.v1",
-          "contract_schema_revision": "sha256:fa6d62df17f87b231e2002bc38de0ecac9c6aa4da23f29f572b2a2780b481c27",
+          "contract_schema_revision": "sha256:f6ac4acc7a4aa33a30eb3180c917b3b60d1469fa6ed4820c5fe2d68c0c2a8f84",
           "provider_contract_role_id": "stop_contract"
         },
         "stop_escalation_stage_id": "motion_controlled_stop",
@@ -2693,7 +2693,7 @@
         },
         "provider_contract_ref": {
           "contract_schema_id": "manyforge.value_schema.provider_contract.motion_controlled_stop.v1",
-          "contract_schema_revision": "sha256:fa6d62df17f87b231e2002bc38de0ecac9c6aa4da23f29f572b2a2780b481c27",
+          "contract_schema_revision": "sha256:f6ac4acc7a4aa33a30eb3180c917b3b60d1469fa6ed4820c5fe2d68c0c2a8f84",
           "provider_contract_role_id": "stop_contract"
         },
         "stop_escalation_stage_id": "motion_controlled_stop",
@@ -2802,7 +2802,7 @@
         },
         "provider_contract_ref": {
           "contract_schema_id": "manyforge.value_schema.provider_contract.motion_controlled_stop.v1",
-          "contract_schema_revision": "sha256:fa6d62df17f87b231e2002bc38de0ecac9c6aa4da23f29f572b2a2780b481c27",
+          "contract_schema_revision": "sha256:f6ac4acc7a4aa33a30eb3180c917b3b60d1469fa6ed4820c5fe2d68c0c2a8f84",
           "provider_contract_role_id": "stop_contract"
         },
         "stop_escalation_stage_id": "motion_controlled_stop",
@@ -2911,7 +2911,7 @@
         },
         "provider_contract_ref": {
           "contract_schema_id": "manyforge.value_schema.provider_contract.motion_controlled_stop.v1",
-          "contract_schema_revision": "sha256:fa6d62df17f87b231e2002bc38de0ecac9c6aa4da23f29f572b2a2780b481c27",
+          "contract_schema_revision": "sha256:f6ac4acc7a4aa33a30eb3180c917b3b60d1469fa6ed4820c5fe2d68c0c2a8f84",
           "provider_contract_role_id": "stop_contract"
         },
         "stop_escalation_stage_id": "motion_controlled_stop",

@@ -19,7 +19,7 @@ import {
   acknowledgementFenceMatches,
 } from '../utils/alarmFences';
 import type { AlarmAcknowledgementFence } from '../utils/alarmFences';
-import { OperatorAlarmPanel } from './OperatorAlarmPanel';
+import { OperatorAlarmPanel, operatorAlarmCause } from './OperatorAlarmPanel';
 import type { OperatorAlarmView } from './OperatorAlarmPanel';
 import { ExecutionHistoryPanel } from './ExecutionHistoryPanel';
 import type {
@@ -29,6 +29,11 @@ import type {
 import { KernelErrorPanel } from './KernelErrorPanel';
 import { FailureCapturePanel } from './FailureCapturePanel';
 import { useOperationalErrorMirror } from '../state/operationalErrors';
+import {
+  alarmActionErrorMessage as actionErrorMessage,
+  alarmRequestId as requestId,
+  useExactAlarmAcknowledgement,
+} from '../hooks/useExactAlarmAcknowledgement';
 import type { WorkbenchNotice } from '../state/workbenchNotices';
 import { OverlayPanel } from './OverlayPanel';
 import { NoticeActions, NoticeItem, NotificationRail } from './WorkbenchNotifications';
@@ -48,15 +53,15 @@ export interface ClientOperationalError {
 function lifecycleLabel(alarm: OperatorAlarmRecord): string {
   switch (alarm.lifecycleState) {
     case 'active_unacknowledged':
-      return 'ACTIVE — ACKNOWLEDGEMENT REQUIRED';
+      return 'Active · Acknowledgement required';
     case 'active_acknowledged':
       return alarm.acknowledgementRequired
-        ? 'ACTIVE — ACKNOWLEDGED'
-        : 'ACTIVE — NO ACKNOWLEDGEMENT REQUIRED';
+        ? 'Active · Acknowledged'
+        : 'Active · No acknowledgement required';
     case 'returned_unacknowledged':
-      return 'RESOLVED — ACKNOWLEDGEMENT REQUIRED';
+      return 'Resolved · Acknowledgement required';
     case 'returned_acknowledged':
-      return 'RESOLVED — ACKNOWLEDGED';
+      return 'Resolved · Acknowledged';
   }
 }
 
@@ -82,8 +87,19 @@ export function attentionAlarmsNewestFirst(
  * acknowledgement cannot release it (spec 530 §4.2). */
 export function motionInterlockMessage(alarm: OperatorAlarmRecord): string | null {
   return alarm.active && alarm.requiresMotionAttention && !alarm.acknowledgementRequired
-    ? `Motion blocked by an active interlock: ${alarm.title}; resolve its cause — acknowledgement does not release it`
+    ? `Motion blocked by an active interlock: ${alarm.title}; resolve its cause. Acknowledgement does not release it`
     : null;
+}
+
+/** "<title> · Composer error · Dismissal required", under the cause. */
+function clientErrorStatus(clientError: ClientOperationalError): string {
+  return [
+    clientError.title,
+    `Composer ${clientError.severity}`,
+    ...(clientError.acknowledgementRequired
+      ? [...(clientError.active ? [] : ['Resolved']), 'Dismissal required']
+      : []),
+  ].join(' · ');
 }
 
 export function operatorAlarmView(alarm: OperatorAlarmRecord): OperatorAlarmView {
@@ -94,7 +110,7 @@ export function operatorAlarmView(alarm: OperatorAlarmRecord): OperatorAlarmView
     recordRevision: alarm.recordRevision,
     definitionId: alarm.definitionId,
     lifecycleLabel: lifecycleLabel(alarm),
-    priorityLabel: `${alarm.priority.toUpperCase()} PRIORITY`,
+    priorityLabel: `${alarm.priority.charAt(0).toUpperCase()}${alarm.priority.slice(1)} priority`,
     severity: alarmSeverity(alarm.priority),
     title: alarm.title,
     message: alarm.message,
@@ -143,17 +159,6 @@ export function historianEventView(
   };
 }
 
-function actionErrorMessage(reason: unknown): string {
-  return reason instanceof Error && reason.message.trim()
-    ? reason.message
-    : 'Headless request failed.';
-}
-
-function requestId(): string {
-  return globalThis.crypto?.randomUUID?.()
-    ?? `composer-${Date.now().toString(36)}-${Math.random().toString(36).slice(2)}`;
-}
-
 interface HeadlessRuntimeSurfacesProps {
   enabled: boolean;
   headlessStateSource: HeadlessStateSource;
@@ -197,21 +202,47 @@ function sameIdentities(left: string[], right: string[]): boolean {
   return expected.every((value, index) => value === current[index]);
 }
 
+/**
+ * One item per failure: each attention alarm whose definition a current
+ * notice represents goes inside that notice; the others stand alone.
+ */
+export function partitionRepresentedAlarms(
+  alarms: readonly OperatorAlarmRecord[],
+  conditions: readonly WorkbenchNotice[],
+): { standalone: OperatorAlarmRecord[]; represented: Map<string, OperatorAlarmRecord[]> } {
+  const standalone: OperatorAlarmRecord[] = [];
+  const represented = new Map<string, OperatorAlarmRecord[]>();
+  for (const alarm of alarms) {
+    const notice = conditions.find((condition) => (
+      condition.alarmDefinitionIds?.includes(alarm.definitionId) === true
+    ));
+    if (notice === undefined) standalone.push(alarm);
+    else represented.set(notice.id, [...(represented.get(notice.id) ?? []), alarm]);
+  }
+  return { standalone, represented };
+}
+
 export function runtimeAttentionSummary(
-  alarms: OperatorAlarmRecord[],
+  attentionAlarms: OperatorAlarmRecord[],
   clientErrors: ClientOperationalError[],
   conditions: readonly WorkbenchNotice[] = [],
 ): string {
+  const { standalone: alarms, represented } = partitionRepresentedAlarms(
+    attentionAlarms,
+    conditions,
+  );
   const count = alarms.length + clientErrors.length + conditions.length;
   if (count === 0) return 'No messages require attention';
   if (count > 1) return `${count} errors require attention · ${
     conditions[0]?.title ?? clientErrors[0]?.title ?? alarms[0]?.title}`;
   const condition = conditions[0];
   if (condition !== undefined) {
-    return condition.message ? `${condition.title} — ${condition.message}` : condition.title;
+    const alarm = represented.get(condition.id)?.[0];
+    if (alarm !== undefined) return `${condition.title} · ${operatorAlarmCause(alarm)}`;
+    return condition.message ? `${condition.title} · ${condition.message}` : condition.title;
   }
   const clientError = clientErrors[0];
-  if (clientError !== undefined) return `${clientError.title} — ${clientError.message}`;
+  if (clientError !== undefined) return `${clientError.title} · ${clientError.message}`;
   return alarms[0]?.definitionId === 'manyforge.runtime.previous_session_unclean'
     ? alarms[0].message
     : alarms[0]?.title ?? 'Attention required';
@@ -230,10 +261,14 @@ export function HeadlessRuntimeSurfacesView({
   reportClientIncident,
 }: HeadlessRuntimeSurfacesViewProps) {
   const { snapshot, error, reconnect } = headlessState;
-  const [busyActivation, setBusyActivation] = useState<string | null>(null);
+  const {
+    busyActivation,
+    error: actionError,
+    setError: setActionError,
+    acknowledge: acknowledgeExact,
+  } = useExactAlarmAcknowledgement();
   const [bulkBusy, setBulkBusy] = useState(false);
   const [bulkFence, setBulkFence] = useState<RuntimeAttentionFence | null>(null);
-  const [actionError, setActionError] = useState<string | null>(null);
   const [mode, setMode] = useState<'attention' | 'active' | 'history' | 'captures'>('attention');
   const [historyLoading, setHistoryLoading] = useState(false);
   const [historyError, setHistoryError] = useState<string | null>(null);
@@ -308,12 +343,17 @@ export function HeadlessRuntimeSurfacesView({
   const standing = snapshot?.alarms.alarms.filter((alarm) =>
     alarm.lifecycleState === 'active_acknowledged') ?? [];
   // Acknowledgeable/dismissible items keep their exact fence; conditions are
-  // counted and shown but never enter acknowledgement.
+  // counted and shown but never enter acknowledgement. An alarm a condition
+  // represents is shown and counted inside it.
+  const { standalone, represented } = useMemo(
+    () => partitionRepresentedAlarms(attention, conditions),
+    [attention, conditions],
+  );
   const attentionCount = attention.length + clientErrors.length;
-  const itemCount = attentionCount + conditions.length;
+  const itemCount = standalone.length + clientErrors.length + conditions.length;
   const attentionSummary = runtimeAttentionSummary(attention, clientErrors, conditions);
   const singleClientError = itemCount === 1 ? clientErrors[0] : undefined;
-  const singleAlarm = itemCount === 1 ? attention[0] : undefined;
+  const singleAlarm = itemCount === 1 ? standalone[0] : undefined;
   const singleCondition = itemCount === 1 ? conditions[0] : undefined;
   const attentionSeverity = conditions.length > 0
     || clientErrors.length > 0
@@ -399,19 +439,7 @@ export function HeadlessRuntimeSurfacesView({
         && candidate.recordRevision === view.recordRevision,
     );
     if (snapshot === null || alarm === undefined) return;
-    setBusyActivation(alarm.activationId);
-    setActionError(null);
-    try {
-      await api.alarms.acknowledge(
-        alarm,
-        snapshot.alarms.ownerEpoch,
-        requestId(),
-      );
-    } catch (reason) {
-      setActionError(actionErrorMessage(reason));
-    } finally {
-      setBusyActivation(null);
-    }
+    await acknowledgeExact([alarm], snapshot.alarms.ownerEpoch);
   };
 
   const requestBulkConfirmation = () => {
@@ -580,7 +608,16 @@ export function HeadlessRuntimeSurfacesView({
           </header>
           {itemCount === 0 && <p className="muted">Nothing currently requires attention.</p>}
           {conditions.map((condition) => (
-            <NoticeItem key={condition.id} notice={condition} />
+            <NoticeItem key={condition.id} notice={condition}>
+              {represented.get(condition.id)?.map((alarm) => (
+                <OperatorAlarmPanel
+                  key={alarm.activationId}
+                  alarm={operatorAlarmView(alarm)}
+                  busy={busyActivation === alarm.activationId}
+                  onAcknowledge={(value) => { void acknowledge(value); }}
+                />
+              ))}
+            </NoticeItem>
           ))}
           {clientErrors.map((clientError) => (
           <div
@@ -589,16 +626,14 @@ export function HeadlessRuntimeSurfacesView({
           >
             <details>
               <summary>
-                COMPOSER {clientError.severity.toUpperCase()}{
-                  clientError.acknowledgementRequired
-                  ? ` — ${clientError.active ? '' : 'RESOLVED · '}DISMISSAL REQUIRED`
-                  : ''} · {clientError.title}
+                {clientError.message || clientError.title} · {clientErrorStatus(clientError)}
               </summary>
               <KernelErrorPanel
                 error={{ code: clientError.id, message: clientError.message }}
                 presentation={{
-                  headline: clientError.title,
-                  hint: clientError.message,
+                  headline: clientError.message || clientError.title,
+                  status: clientErrorStatus(clientError),
+                  hint: '',
                   severity: clientError.severity,
                 }}
                 presentationKey={clientError.id}
@@ -617,7 +652,7 @@ export function HeadlessRuntimeSurfacesView({
             </div>
           </div>
         ))}
-          {attention.map((alarm) => (
+          {standalone.map((alarm) => (
           <OperatorAlarmPanel
             key={alarm.activationId}
             alarm={operatorAlarmView(alarm)}

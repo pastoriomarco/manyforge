@@ -415,7 +415,7 @@ it('forwards current activation health and the named wait without replacing the 
   expect(test.runtime.activationPending).toBe(true);
   expect(test.runtime.activationComponentHealth['robot.z'].snapshot?.lifecycleState).toBe('active');
   expect(test.runtime.activationComponentHealth['robot.a'].snapshot?.lifecycleState).toBe('disabled');
-  expect(test.runtime.activationProgress).toBe('robot.a: Not ready — [component_lifecycle_transition_missing] No lifecycle transition is satisfied · no_transition_satisfied');
+  expect(test.runtime.activationProgress).toBe('robot.a: Not ready · [component_lifecycle_transition_missing] No lifecycle transition is satisfied · no_transition_satisfied');
   expect(test.runtime.activationOffer).toBe(offer);
   expect(offer?.components.map((row) => row.lifecycleState)).toEqual(['disabled', 'disabled']);
   expect(test.effectOrder).toEqual(['robot.z:prepare', 'robot.z:enable']);

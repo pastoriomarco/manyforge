@@ -6,6 +6,7 @@
 #include <array>
 #include <cmath>
 #include <cstdio>
+#include <cstdlib>
 #include <fstream>
 #include <iterator>
 #include <optional>
@@ -436,7 +437,8 @@ std::string generate_mock_controllers_yaml(
     const std::map<std::string, double, std::less<>>
         &max_deceleration_on_cancel_rad_s2,
     const std::optional<std::string> &gripper_joint_name,
-    const core::GripperOutputMode gripper_output_mode) {
+    const core::GripperOutputMode gripper_output_mode,
+    const bool resident_timeline_replacement) {
   const auto &row = mock_row(profile.profile_id);
   const auto runtime_namespace =
       controller_runtime_namespace(controllable_component_id);
@@ -477,6 +479,13 @@ std::string generate_mock_controllers_yaml(
   if (!arm_joint_names.empty()) {
     arm_name = arm_yaml(row, arm_joint_names,
                        max_deceleration_on_cancel_rad_s2, manager, rest);
+    if (resident_timeline_replacement) {
+      const auto allow = std::find(rest.begin(), rest.end(),
+                                   "    allow_trajectory_replacement: true");
+      if (allow == rest.end()) fail("mock arm template has no replacement opt-in");
+      rest.insert(std::next(allow),
+                  "    replacement_time_reference: active_trajectory");
+    }
   } else {
     if (!max_deceleration_on_cancel_rad_s2.empty()) {
       fail("the operator Stop profile names arm joints without an arm binding");
@@ -601,10 +610,13 @@ write_controller_launch_artifacts(const ControllerLaunchArtifactsRequest &reques
                    "' has no gripper controller for the model-backed gripper "
                    "joint '" + *gripper_joint + "'");
             }
+            const auto *resident = std::getenv(
+                "MANYFORGE_EXPERIMENTAL_JTC_RESIDENT_TIMELINE");
             controllers = generate_mock_controllers_yaml(
                 profile, request.controllable_component_id,
                 request.arm_joint_names, lane.max_deceleration_on_cancel_rad_s2,
-                gripper_joint, lane.gripper_output_mode);
+                gripper_joint, lane.gripper_output_mode,
+                resident && std::string_view(resident) == "1");
             result.lane = ControllerLaunchLane::kMock;
             result.controller_profile = profile.profile_id;
             if (!request.arm_joint_names.empty()) {

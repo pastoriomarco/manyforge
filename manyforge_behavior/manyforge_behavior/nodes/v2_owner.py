@@ -531,6 +531,8 @@ def _close_decidable(task: OwnerTaskSnapshot) -> bool:
 # existing intervention handling instead (SX-1972..1974): never an
 # indefinite RUNNING wait.
 _ASSESSMENT_REREAD_LIMIT: Final = 100
+# A run's failure message bound (`FailureRecord`).
+_MAX_FAILURE_MESSAGE_BYTES: Final = 4_096
 
 
 def _is_stop_pause(task: OwnerTaskSnapshot) -> bool:
@@ -643,17 +645,35 @@ class OwnerTaskAdapter(_OwnerAdapter):
             )
             return py_trees.common.Status.FAILURE, task
         self._task = observed
+        if _close_decidable(observed):
+            # A decidable fact wins over any read problem beside it.
+            return None, observed
         read_failure = observed.metadata.get("recovery_assessment_failure")
         if isinstance(read_failure, Mapping):
-            # A malformed or unexpected read is not temporary absence.
-            self._record_owner_failure(
-                str(read_failure.get("reason_code") or "owner_recovery_assessment_invalid"),
-                str(read_failure.get("message") or "recovery assessment is invalid"),
-            )
+            # A malformed or unexpected read is not temporary absence. It
+            # never replaces the operation's own failure: that failure is the
+            # node's reason, the read problem is named in its message.
+            self._record_operation_failure_with_read_problem(observed, read_failure)
             return py_trees.common.Status.FAILURE, observed
-        if _close_decidable(observed):
-            return None, observed
         return self._reread_pending(observed)
+
+    def _record_operation_failure_with_read_problem(
+        self, task: OwnerTaskSnapshot, read_failure: Mapping[str, Any]
+    ) -> None:
+        read_reason = str(read_failure.get("reason_code") or "owner_recovery_assessment_invalid")
+        read_message = str(read_failure.get("message") or "recovery assessment is invalid")
+        problem = f"recovery assessment read failed: {read_reason[:256]}: {read_message[:256]}"
+        if not task.reason_code:
+            # Defensive: a failure always carries a reason.
+            self._record_owner_failure(read_reason, read_message)
+            return
+        # Details stay the task's bounded details (registered flat keys only);
+        # the read problem travels in the bounded human message.
+        message = f"{task.message} ({problem})" if task.message else problem
+        if len(message.encode("utf-8")) > _MAX_FAILURE_MESSAGE_BYTES:
+            message = task.message
+        self._record_owner_failure(task.reason_code, message, task.details)
+        self._note_operation_failure(task)
 
     def _reread_pending(
         self, task: OwnerTaskSnapshot

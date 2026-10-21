@@ -1654,7 +1654,7 @@ parse_motion_interrupt_stop_profile(const CanonicalValue &value,
   require_closed_fields(profile, {"profile_id", "stop_mode"},
                         {"deceleration_time_s", "per_joint_max_deceleration",
                          "allow_natural_completion_on_short_path",
-                         "recoverable_substitution_mode",
+                         "recoverable_substitution_mode", "fallback_stop_modes",
                          "require_backend_confirmation",
                          "per_joint_settle_velocity_threshold", "diagnostics",
                          "jerk_limits_enabled", "per_joint_max_jerk"},
@@ -1667,7 +1667,7 @@ parse_motion_interrupt_stop_profile(const CanonicalValue &value,
       require_string(require_member(profile, "stop_mode", path),
                      child_path(path, "stop_mode"));
   if (stop_mode != "soft_on_path" && stop_mode != "spring_back_hold" &&
-      stop_mode != "hard_deceleration") {
+      stop_mode != "spring_back_fast" && stop_mode != "hard_deceleration") {
     fail(child_path(path, "stop_mode"), "value is outside the closed enum");
   }
 
@@ -1677,8 +1677,12 @@ parse_motion_interrupt_stop_profile(const CanonicalValue &value,
       find_member(profile, "allow_natural_completion_on_short_path");
   const auto *substitution =
       find_member(profile, "recoverable_substitution_mode");
-  const bool controlled_profile =
-      stop_mode == "soft_on_path" || stop_mode == "spring_back_hold";
+  const auto *fallbacks = find_member(profile, "fallback_stop_modes");
+  if (substitution && fallbacks)
+    fail(path, "conflicting fallback fields");
+  const bool controlled_profile = stop_mode == "soft_on_path" ||
+                                  stop_mode == "spring_back_hold" ||
+                                  stop_mode == "spring_back_fast";
   if ((stop_mode == "soft_on_path" && deceleration == nullptr) ||
       (controlled_profile && limits == nullptr)) {
     fail(path,
@@ -1757,7 +1761,33 @@ parse_motion_interrupt_stop_profile(const CanonicalValue &value,
       fail(child_path(path, "recoverable_substitution_mode"),
            "only soft_on_path to spring_back_hold is qualified");
     }
-    normalized.emplace_back("recoverable_substitution_mode", *substitution);
+    normalized.emplace_back(
+        "fallback_stop_modes",
+        CanonicalValue(CanonicalValue::Array{CanonicalValue(mode)}));
+  }
+
+  if (fallbacks) {
+    const auto &modes =
+        require_array(*fallbacks, child_path(path, "fallback_stop_modes"));
+    if (modes.size() > 2U)
+      fail(path, "too many controlled Stop fallbacks");
+    int previous = stop_mode == "soft_on_path"       ? 0
+                   : stop_mode == "spring_back_hold" ? 1
+                   : stop_mode == "spring_back_fast" ? 2
+                                                     : 3;
+    for (const auto &item : modes) {
+      const auto &mode =
+          require_string(item, child_path(path, "fallback_stop_modes"));
+      const int current = mode == "spring_back_hold"   ? 1
+                          : mode == "spring_back_fast" ? 2
+                                                       : -1;
+      if (current <= previous)
+        fail(path, "fallbacks must be strictly ordered below the primary, "
+                   "excluding hard");
+      previous = current;
+    }
+    if (!modes.empty())
+      normalized.emplace_back("fallback_stop_modes", *fallbacks);
   }
 
   const auto *confirmation =
@@ -2415,7 +2445,9 @@ parse_interrupt_rules(const CanonicalValue::Object &policies) {
           "allowed_stop_modes",
           parse_ordered_enum_set(
               *allowed_stop_modes, child_path(path, "allowed_stop_modes"),
-              {"spring_back_hold", "soft_on_path", "hard_deceleration"}, values,
+              {"spring_back_hold", "soft_on_path", "hard_deceleration",
+               "spring_back_fast"},
+              values,
               true));
       if ((source != nullptr &&
            source->source_class != "fast_execution_relevant") ||

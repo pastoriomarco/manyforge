@@ -162,6 +162,9 @@ Result<void> ValidateIoRuleNominalStopMode(const JsonObjectDTO& parameters,
     case MotionInterruptStopMode::kHardDeceleration:
       requested = "hard_deceleration";
       break;
+    case MotionInterruptStopMode::kSpringBackFast:
+      requested = "spring_back_fast";
+      break;
   }
   if (!retained || !requested || *retained != requested)
     return Result<void>::Err(invalid("io_rule_nominal_mode_mismatch"));

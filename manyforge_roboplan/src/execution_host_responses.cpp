@@ -1145,6 +1145,8 @@ MotionInterruptStopModeName(const core::MotionInterruptStopMode mode) noexcept {
     return "spring_back_hold";
   case core::MotionInterruptStopMode::kHardDeceleration:
     return "hard_deceleration";
+  case core::MotionInterruptStopMode::kSpringBackFast:
+    return "spring_back_fast";
   }
   return "unknown";
 }
@@ -1319,11 +1321,13 @@ StopHistoryProfileValue(const core::MotionInterruptStopProfileDTO &profile) {
       {"per_joint_max_deceleration", CanonicalValue(std::move(deceleration))},
       {"per_joint_settle_velocity_threshold", std::move(settle)},
       {"profile_id", CanonicalValue(profile.profile_id)},
-      {"recoverable_substitution_mode",
-       profile.recoverable_substitution_mode.has_value()
-           ? CanonicalValue(std::string(MotionInterruptStopModeName(
-                 *profile.recoverable_substitution_mode)))
-           : CanonicalValue(nullptr)},
+      {"fallback_stop_modes",
+       [&] {
+         CanonicalValue::Array modes;
+         for (const auto mode : profile.fallback_stop_modes)
+           modes.emplace_back(std::string(MotionInterruptStopModeName(mode)));
+         return CanonicalValue(std::move(modes));
+       }()},
       {"require_backend_confirmation",
        CanonicalValue(profile.require_backend_confirmation)},
       {"stop_mode", CanonicalValue(std::string(

@@ -11,6 +11,8 @@
 #include <type_traits>
 #include <utility>
 
+#include "stop_fallback_codec_internal.hpp"
+
 namespace manyforge::core {
 namespace {
 
@@ -63,6 +65,8 @@ template <typename Value>
       return "soft_on_path";
     case MotionInterruptStopMode::kHardDeceleration:
       return "hard_deceleration";
+    case MotionInterruptStopMode::kSpringBackFast:
+      return "spring_back_fast";
   }
   return {};
 }
@@ -184,11 +188,12 @@ void require_identifier(std::string_view value, std::string reason) {
           result.emplace("allow_natural_completion_on_short_path",
                          JsonValueDTO{selected.allow_natural_completion_on_short_path});
         }
-        if constexpr (std::is_same_v<Selected, SoftOnPathStopParametersDTO>) {
-          if (selected.recoverable_substitution_mode.has_value()) {
-            result.emplace(
-                "recoverable_substitution_mode",
-                JsonValueDTO{std::string(to_string(*selected.recoverable_substitution_mode))});
+        if constexpr (!std::is_same_v<Selected, HardDecelerationStopParametersDTO>) {
+          if (!selected.fallback_stop_modes.empty()) {
+            JsonValueDTO::Array modes;
+            for (const auto mode : selected.fallback_stop_modes)
+              modes.push_back(JsonValueDTO{std::string(to_string(mode))});
+            result.emplace("fallback_stop_modes", JsonValueDTO{std::move(modes)});
           }
         }
         return result;
@@ -233,10 +238,11 @@ void require_identifier(std::string_view value, std::string reason) {
     }
     fields.emplace_back("per_joint_max_deceleration", CanonicalValue(std::move(limits)));
   }
-  if (profile.recoverable_substitution_mode.has_value()) {
-    fields.emplace_back(
-        "recoverable_substitution_mode",
-        CanonicalValue(std::string(interrupt_mode_string(*profile.recoverable_substitution_mode))));
+  if (!profile.fallback_stop_modes.empty()) {
+    CanonicalValue::Array modes;
+    for (const auto mode : profile.fallback_stop_modes)
+      modes.emplace_back(std::string(interrupt_mode_string(mode)));
+    fields.emplace_back("fallback_stop_modes", CanonicalValue(std::move(modes)));
   }
   if (profile.per_joint_settle_velocity_threshold.has_value()) {
     CanonicalValue::Object thresholds;
@@ -323,6 +329,9 @@ void require_closed_object(const CanonicalValue& value,
   if (value == "spring_back_hold") {
     return MotionInterruptStopMode::kSpringBackHold;
   }
+  if (value == "spring_back_fast") {
+    return MotionInterruptStopMode::kSpringBackFast;
+  }
   if (value == "soft_on_path") {
     return MotionInterruptStopMode::kSoftOnPath;
   }
@@ -381,8 +390,9 @@ void require_closed_object(const CanonicalValue& value,
                         {"profile_id", "stop_mode", "allow_natural_completion_on_short_path",
                          "require_backend_confirmation"},
                         {"deceleration_time_s", "max_stop_time_s", "per_joint_max_deceleration",
-                         "recoverable_substitution_mode", "per_joint_settle_velocity_threshold",
-                         "diagnostics", "per_joint_max_jerk", "jerk_limits_enabled"},
+                         "recoverable_substitution_mode", "fallback_stop_modes",
+                         "per_joint_settle_velocity_threshold", "diagnostics", "per_joint_max_jerk",
+                         "jerk_limits_enabled"},
                         "prepared Stop profile object is invalid");
 
   MotionInterruptStopProfileDTO profile;
@@ -439,12 +449,22 @@ void require_closed_object(const CanonicalValue& value,
       profile.per_joint_max_deceleration.emplace(joint, parse_acceleration(limit));
     }
   }
-  if (const auto* substitution = value.find_object_member("recoverable_substitution_mode");
-      substitution != nullptr) {
-    if (!substitution->is_string()) {
-      fail("prepared Stop profile substitution is invalid");
+  const auto* legacy = value.find_object_member("recoverable_substitution_mode");
+  const auto* fallbacks = value.find_object_member("fallback_stop_modes");
+  if (legacy && fallbacks) fail("prepared Stop profile has conflicting fallback fields");
+  if (legacy) {
+    if (!legacy->is_string() || profile.stop_mode != MotionInterruptStopMode::kSoftOnPath ||
+        legacy->as_string() != "spring_back_hold")
+      fail("invalid legacy Stop fallback");
+    profile.fallback_stop_modes = {MotionInterruptStopMode::kSpringBackHold};
+  }
+  if (fallbacks) {
+    if (!fallbacks->is_array() || fallbacks->as_array().size() > 2U)
+      fail("prepared Stop fallback list is invalid");
+    for (const auto& mode : fallbacks->as_array()) {
+      if (!mode.is_string()) fail("prepared Stop fallback mode is invalid");
+      profile.fallback_stop_modes.push_back(parse_profile_mode(mode.as_string()));
     }
-    profile.recoverable_substitution_mode = parse_profile_mode(substitution->as_string());
   }
   if (const auto* thresholds = value.find_object_member("per_joint_settle_velocity_threshold");
       thresholds != nullptr) {
@@ -549,7 +569,7 @@ struct BaseWireRows final {
     fields.emplace_back("participant_stop_invocation_plan_digest",
                         CanonicalValue(plan.participant_stop_invocation_plan_digest.value()));
   }
-  return CanonicalValue(std::move(fields));
+  return detail::stop_fallback_wire_fields(CanonicalValue(std::move(fields)), false);
 }
 
 [[nodiscard]] ContentDigest computed_digest(const PreparedParticipantStopPlanDTO& plan,
@@ -557,6 +577,19 @@ struct BaseWireRows final {
   return ContentDigest(content_identity::framed_sha256(kParticipantStopInvocationPlanIdentityDomain,
                                                        kPreparedParticipantStopPlanApiVersion,
                                                        plan_value(plan, base_plan, false)));
+}
+
+[[nodiscard]] bool legacy_digest(const PreparedParticipantStopPlanDTO& plan,
+                                 const ResolvedStopBasePlanDTO& base) {
+  try {
+    const auto wire = detail::stop_fallback_wire_fields(plan_value(plan, base, false), true);
+    return content_identity::digest_equal(
+        content_identity::framed_sha256(kParticipantStopInvocationPlanIdentityDomain,
+                                        kPreparedParticipantStopPlanApiVersion, wire),
+        plan.participant_stop_invocation_plan_digest.value());
+  } catch (const std::invalid_argument&) {
+    return false;
+  }
 }
 
 void validate_context(const PreparedParticipantStopPlanContextDTO& context) {
@@ -640,13 +673,24 @@ Result<PreparedParticipantStopPlanDTO> MakePreparedParticipantStopPlan(
           !nominal.containment_command.provider_contract_ref.has_value() ||
           nominal.containment_command.provider_contract_ref->contract_schema_id.value() !=
               kMotionControlledStopContractSchemaId ||
-          nominal.containment_command.provider_contract_ref->contract_schema_revision.value() !=
-              kMotionControlledStopContractSchemaRevision) {
+          (nominal.containment_command.provider_contract_ref->contract_schema_revision.value() !=
+               kMotionControlledStopContractSchemaRevision &&
+           nominal.containment_command.provider_contract_ref->contract_schema_revision.value() !=
+               "sha256:f6ac4acc7a4aa33a30eb3180c917b3b60d1469fa6ed4820c5fe2d68c0c2a8f84")) {
         fail("participant profile does not select the qualified motion contract");
       }
-      if (context.participant_stop_profile->recoverable_substitution_mode.has_value() &&
-          !nominal.command_qualification.controlled_substitution_contract.has_value()) {
-        fail("participant profile requests an unsupported substitution");
+      if (!context.participant_stop_profile->fallback_stop_modes.empty()) {
+        const auto& qualification = nominal.command_qualification.controlled_substitution_contract;
+        if (!qualification || interrupt_mode_string(context.participant_stop_profile->stop_mode) !=
+                                  to_string(qualification->requested_stop_mode))
+          fail("participant profile requests an unsupported fallback");
+        for (const auto mode : context.participant_stop_profile->fallback_stop_modes) {
+          if (std::none_of(qualification->fallback_stop_modes.begin(),
+                           qualification->fallback_stop_modes.end(), [&](const auto allowed) {
+                             return interrupt_mode_string(mode) == to_string(allowed);
+                           }))
+            fail("participant profile requests an unsupported fallback");
+        }
       }
       auto mapped = map_motion_interrupt_stop_profile_to_contract_parameters(
           *context.participant_stop_profile, context.node_category, resources,
@@ -689,8 +733,10 @@ Result<PreparedParticipantStopPlanDTO> MakePreparedParticipantStopPlan(
               StopContainmentCommandKind::kMotionControlledStop) {
             const auto& contract = *resolved.containment_command.provider_contract_ref;
             if (contract.contract_schema_id.value() != kMotionControlledStopContractSchemaId ||
-                contract.contract_schema_revision.value() !=
-                    kMotionControlledStopContractSchemaRevision)
+                (contract.contract_schema_revision.value() !=
+                     kMotionControlledStopContractSchemaRevision &&
+                 contract.contract_schema_revision.value() !=
+                     "sha256:f6ac4acc7a4aa33a30eb3180c917b3b60d1469fa6ed4820c5fe2d68c0c2a8f84"))
               fail("controlled default does not select the qualified motion contract");
             const auto profile = map_motion_controlled_stop_contract_parameters_to_profile(
                 *resolved.default_contract_parameters, resources, "deployment_default");
@@ -729,7 +775,13 @@ Result<void> VerifyPreparedParticipantStopPlan(
   if (!expected.ok()) {
     return Result<void>::Err(expected.error());
   }
-  if (expected.value() != plan) {
+  auto comparable = plan;
+  comparable.participant_stop_invocation_plan_digest =
+      expected.value().participant_stop_invocation_plan_digest;
+  if (expected.value() != comparable ||
+      (plan.participant_stop_invocation_plan_digest !=
+           expected.value().participant_stop_invocation_plan_digest &&
+       !legacy_digest(plan, verified_base_plan))) {
     return Result<void>::Err(
         ErrorDTO{"prepared_participant_stop_plan_digest_mismatch",
                  "the prepared participant Stop plan differs from its verified referents",
@@ -749,8 +801,11 @@ Result<std::string> EncodePreparedParticipantStopPlan(
     return Result<std::string>::Err(verified.error());
   }
   try {
-    return Result<std::string>::Ok(
-        content_identity::canonical_json(plan_value(plan, verified_base_plan, true)));
+    auto wire = plan_value(plan, verified_base_plan, true);
+    if (plan.participant_stop_invocation_plan_digest != computed_digest(plan, verified_base_plan) &&
+        legacy_digest(plan, verified_base_plan))
+      wire = detail::stop_fallback_wire_fields(wire, true);
+    return Result<std::string>::Ok(content_identity::canonical_json(wire));
   } catch (const std::exception&) {
     return reject<std::string>("canonical_encoding_failed");
   }
@@ -819,6 +874,15 @@ Result<PreparedParticipantStopPlanDTO> DecodePreparedParticipantStopPlan(
         node_category};
     auto expected = MakePreparedParticipantStopPlan(base, std::move(context), resources, defaults);
     if (!expected.ok()) return expected;
+    const auto supplied_digest =
+        ContentDigest(string_member(root, "participant_stop_invocation_plan_digest"));
+    if (supplied_digest != expected.value().participant_stop_invocation_plan_digest) {
+      auto historical = expected.value();
+      historical.participant_stop_invocation_plan_digest = supplied_digest;
+      if (!legacy_digest(historical, base))
+        return reject<PreparedParticipantStopPlanDTO>("prepared_stop_plan_canonical_mismatch");
+      expected.value() = std::move(historical);
+    }
     const auto encoded = EncodePreparedParticipantStopPlan(base, expected.value(), resources,
                                                            defaults, node_category);
     if (!encoded.ok() || encoded.value() != bytes) {

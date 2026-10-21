@@ -334,7 +334,7 @@ export function DeploymentDocumentControls({
               <p>This Apply changes these components, which must be inactive first:</p>
               <ul>{offer.components.map((row) => (
                 <li key={row.id}>
-                  {row.id} ({row.state}){row.reasons.length > 0 && ` — changed: ${row.reasons.join(', ')}`}
+                  {row.id} ({row.state}){row.reasons.length > 0 && ` · changed: ${row.reasons.join(', ')}`}
                 </li>
               ))}</ul>
               <p>

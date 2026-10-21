@@ -1603,7 +1603,7 @@ def test_public_stop_contract_dtos_are_typed_and_authority_rows_are_read_only():
         deceleration_time_s=0.25,
         per_resource_limits=[controlled_limit],
         allow_natural_completion_on_short_path=False,
-        recoverable_substitution_mode=(core.MotionControlledStopMode.kSpringBackHold),
+        fallback_stop_modes=[core.MotionControlledStopMode.kSpringBackHold],
     )
     spring = core.SpringBackHoldStopParametersDTO(
         stop_mode=core.MotionControlledStopMode.kSpringBackHold,
@@ -1633,10 +1633,7 @@ def test_public_stop_contract_dtos_are_typed_and_authority_rows_are_read_only():
     assert soft.per_resource_limits == (controlled_limit,)
     assert spring.per_resource_limits == (controlled_limit,)
     assert hard.per_resource_limits == (hard_limit,)
-    assert (
-        soft.recoverable_substitution_mode
-        == core.MotionControlledStopMode.kSpringBackHold
-    )
+    assert list(soft.fallback_stop_modes) == [core.MotionControlledStopMode.kSpringBackHold]
 
     definitions = core.registered_stop_command_definitions()
     assert isinstance(definitions, tuple)
@@ -1843,7 +1840,7 @@ target: 0.5
         ),
         (
             "manyforge.value_schema.provider_contract.motion_controlled_stop.v1",
-            "sha256:fa6d62df17f87b231e2002bc38de0ecac9c6aa4da23f29f572b2a2780b481c27",
+            "sha256:65e6f4462981225916834490d4e3cb4d42b70611a2287e1b76fdb1cbcabcb113",
         ),
         (
             "manyforge.value_schema.runtime.empty.v1",
@@ -1855,7 +1852,7 @@ target: 0.5
         ),
         (
             "manyforge.value_schema.runtime.ros2_control_execution.v1",
-            "sha256:34fbeab889c274ca724eb992e7bcc4305229e8bcce484b0857c4ca5e9d35e379",
+            "sha256:775f7221ffc5433d18a7b794d3b26ab9993fa805ad5b83b6d1a3a0cb58bd1368",
         ),
         (
             "manyforge.value_schema.runtime.io_provider_execution.v1",

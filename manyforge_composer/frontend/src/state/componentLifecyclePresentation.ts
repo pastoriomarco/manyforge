@@ -32,25 +32,25 @@ const INTERVENTION_MESSAGES: Partial<Record<CCLCBlockingCauseClass, string>> = {
   emergency_stop: 'Emergency stop engaged',
   protective_stop: 'Protective stop engaged',
   safeguard_stop: 'Safeguard stop engaged',
-  fault: 'Fault — intervention required',
+  fault: 'Fault · intervention required',
   configuration: 'Configuration mismatch',
-  unknown: 'Controller status unknown — intervention required',
-  collision: 'Collision detected — intervention required',
-  external_control: 'Robot moved from its own interface — intervention required',
-  provider_lost: 'Controller lost — motion held',
+  unknown: 'Controller status unknown · intervention required',
+  collision: 'Collision detected · intervention required',
+  external_control: 'Robot moved from its own interface · intervention required',
+  provider_lost: 'Controller lost · motion held',
 };
 
 /** Open incidents take precedence over every other message. */
 const INCIDENT_MESSAGES: Record<CCLCIncidentCauseClass, string> = {
-  emergency_stop: 'Emergency stop — acknowledgement required',
-  protective_stop: 'Protective stop — acknowledgement required',
-  safeguard_stop: 'Safeguard stop — acknowledgement required',
-  fault: 'Fault — acknowledgement required',
-  configuration: 'Configuration changed — acknowledgement required',
-  unknown: 'Controller status unknown — acknowledgement required',
-  collision: 'Collision detected — acknowledgement required',
-  external_control: 'Robot moved from its own interface — acknowledgement required',
-  provider_lost: 'Controller lost — incident, motion held',
+  emergency_stop: 'Emergency stop · acknowledgement required',
+  protective_stop: 'Protective stop · acknowledgement required',
+  safeguard_stop: 'Safeguard stop · acknowledgement required',
+  fault: 'Fault · acknowledgement required',
+  configuration: 'Configuration changed · acknowledgement required',
+  unknown: 'Controller status unknown · acknowledgement required',
+  collision: 'Collision detected · acknowledgement required',
+  external_control: 'Robot moved from its own interface · acknowledgement required',
+  provider_lost: 'Controller lost · incident, motion held',
 };
 
 const CAUSE_LABELS: Record<CCLCBlockingCauseClass, string> = {
@@ -164,14 +164,14 @@ function verdict(
   }
   if (progress?.phase === 'outcome_uncertain') {
     return {
-      message: 'Activation outcome uncertain — checking',
+      message: 'Activation outcome uncertain · checking',
       tone: 'held',
       consequence:
         'Motion is unavailable while the lifecycle owner reconciles the outcome from actual observation.',
     };
   }
   if (achieved === 'faulted' || snapshot.readiness.providerOccurrences.some((domain) => domain.health?.observedState === 'faulted')) {
-    return { message: 'Fault — intervention required', tone: 'intervention', consequence: INTERVENTION_CONSEQUENCE };
+    return { message: 'Fault · intervention required', tone: 'intervention', consequence: INTERVENTION_CONSEQUENCE };
   }
   if (
     cause === 'availability'
@@ -179,7 +179,7 @@ function verdict(
     && (achieved === 'active' || achieved === 'degraded')
   ) {
     return {
-      message: 'Controller lost — motion held',
+      message: 'Controller lost · motion held',
       tone: 'held',
       consequence:
         'Motion is held. Readiness returning re-admits the component, but interrupted '
@@ -197,7 +197,7 @@ function verdict(
   }
   if (progress !== null && progress.phase !== 'satisfied') {
     let message = 'Waiting for controller';
-    if (progress.delayed) message = 'Startup delayed — still waiting';
+    if (progress.delayed) message = 'Startup delayed · still waiting';
     else if (progress.phase === 'transition_in_progress') {
       message = progress.nextIntent === null
         ? 'Lifecycle step in progress'

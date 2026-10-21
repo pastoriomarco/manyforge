@@ -122,9 +122,23 @@
   line-height: 1.5;
 }
 
-.kernel-error-panel > code {
-  display: inline-block;
+.kernel-error-panel .kernel-error-status {
+  margin-top: 0.2rem;
+  font-size: var(--mf-font-size-072);
+}
+
+.kernel-error-technical {
   margin-top: 0.65rem;
+}
+
+.kernel-error-technical summary {
+  cursor: pointer;
+  font-size: var(--mf-font-size-072);
+}
+
+.kernel-error-technical > code {
+  display: inline-block;
+  margin-top: 0.5rem;
 }
 
 .kernel-error-panel dl {
@@ -225,7 +239,7 @@
   box-shadow: 0 0.75rem 2rem var(--mf-shadow-neutral-00-a28);
 }
 
-.operator-alarm-panel summary {
+.operator-alarm-panel > details > summary {
   cursor: pointer;
   color: var(--mf-text-danger-83);
   font-size: var(--mf-font-size-076);
@@ -233,7 +247,7 @@
   line-height: 1.45;
 }
 
-.operator-alarm-panel details[open] summary {
+.operator-alarm-panel > details[open] > summary {
   margin-bottom: 0.55rem;
 }
 
@@ -242,7 +256,7 @@
   background: var(--mf-bg-warning-11-a97);
 }
 
-.operator-alarm-panel.severity-warning summary {
+.operator-alarm-panel.severity-warning > details > summary {
   color: var(--mf-text-warning-79);
 }
 
@@ -335,6 +349,33 @@
   border: 1px solid var(--mf-border-neutral-23);
   border-radius: var(--mf-radius-md);
   background: var(--mf-bg-neutral-08);
+}
+
+/* The held attempt's what-to-do block, cause first; red for a failure hold. */
+.runtime-control-section.program-recovery-failed {
+  border-color: var(--mf-border-danger-38);
+}
+
+.program-recovery-cause {
+  color: var(--mf-text-danger-81);
+  font-weight: var(--mf-font-weight-bold);
+}
+
+.program-recovery-steps {
+  display: grid;
+  gap: 0.55rem;
+  margin: 0;
+  padding-left: 1.2rem;
+  font-size: var(--mf-font-size-072);
+  line-height: 1.45;
+}
+
+.program-recovery-command {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: baseline;
+  gap: 0.45rem;
+  margin-top: 0.35rem;
 }
 
 .runtime-control-section > :is(p, h3),

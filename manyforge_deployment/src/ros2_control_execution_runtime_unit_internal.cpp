@@ -1147,6 +1147,8 @@ decode_fault_stop_profile(const core::JsonValueDTO &encoded) {
     profile.stop_mode = core::MotionInterruptStopMode::kSoftOnPath;
   } else if (mode == "spring_back_hold") {
     profile.stop_mode = core::MotionInterruptStopMode::kSpringBackHold;
+  } else if (mode == "spring_back_fast") {
+    profile.stop_mode = core::MotionInterruptStopMode::kSpringBackFast;
   } else if (mode == "hard_deceleration") {
     profile.stop_mode = core::MotionInterruptStopMode::kHardDeceleration;
   } else {

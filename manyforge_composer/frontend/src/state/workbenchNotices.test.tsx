@@ -91,7 +91,7 @@ describe('workbench notification model', () => {
     expect(noticeRowSummary([], { one: 'warning', many: 'warnings' })).toBe('');
     expect(noticeRowSummary([notice({ id: 'one', severity: 'warning' })], {
       one: 'warning', many: 'warnings',
-    })).toBe('one — one detail');
+    })).toBe('one · one detail');
     expect(noticeRowSummary([
       notice({ id: 'first', severity: 'info' }),
       notice({ id: 'second', severity: 'info' }),
@@ -108,7 +108,7 @@ describe('workbench notification model', () => {
       }),
     ]} />);
     expect(warning).toContain('Warnings');
-    expect(warning).toContain('Point-cloud layer unavailable — Frame source offline.');
+    expect(warning).toContain('Point-cloud layer unavailable · Frame source offline.');
     expect(warning).toContain('>Retry layer</button>');
     expect(warning).not.toMatch(/Acknowledge|Dismiss/);
     const activity = renderToStaticMarkup(<NoticeRow severity="info" notices={[

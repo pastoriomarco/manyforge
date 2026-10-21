@@ -8,6 +8,7 @@ const char* stop_mode_string(MotionInterruptStopMode mode) {
     case kSpringBackHold: return "spring_back_hold";
     case kSoftOnPath: return "soft_on_path";
     case kHardDeceleration: return "hard_deceleration";
+    case kSpringBackFast: return "spring_back_fast";
   }
   return "unknown";
 }

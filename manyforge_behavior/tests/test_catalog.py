@@ -23,7 +23,7 @@ from manyforge_behavior.node_registry import build_node_registry
 
 
 CATALOG_PATH = Path(__file__).parent.parent / "resources" / "node_catalog.yaml"
-EXPECTED_CATALOG_DIGEST = "sha256:76cf8c7efdf959a132e9c33802c4c683cb3afddaf229cf06bb09605d609fdf36"
+EXPECTED_CATALOG_DIGEST = "sha256:4dfd2fcb507323ca8355cee098fd76187f26ca704edcf7b3a1ed65c3fc03b336"
 
 
 def _catalog_data() -> dict[str, object]:

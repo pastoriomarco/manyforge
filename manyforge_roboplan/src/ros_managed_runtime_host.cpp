@@ -3980,6 +3980,8 @@ BuildSingleProductComposition(CompositionBuildInput input) {
   composition->required_projection_pins = std::move(input.required_projection_pins);
   composition->scene_frame_resolver = std::move(direct_scene_frame_resolver);
   composition->target_resolver = std::move(target_resolver);
+  composition->candidate_participant_resolver_factory =
+      participant_resolver_factory;
   if (composition->planner_scene_projection != nullptr) {
     composition->scene_authority_proxy =
         std::make_shared<ManagerSceneAuthorityProxy>(
@@ -11315,6 +11317,50 @@ RunManagedRuntimeChild(const ManagedRuntimeChildConfig &config) {
       }
     };
 
+    const auto unchanged_provider_fence = [&](
+        const core::ResolvedLifecycleControlDomainScopeDTO &domain) {
+      const auto scoped = std::find_if(
+          request.configuration_fence_scope.domains.begin(),
+          request.configuration_fence_scope.domains.end(),
+          [&](const auto &value) {
+            return value.control_domain_id == domain.control_domain_id;
+          });
+      const auto *sides = scoped == request.configuration_fence_scope.domains.end()
+                              ? nullptr
+                              : std::get_if<core::ProviderConfigurationFenceDomainDTO>(
+                                    &scoped->payload);
+      const auto *provider = domain.provider();
+      if (!sides || !provider || !sides->predecessor_provider ||
+          !sides->candidate_provider ||
+          *sides->predecessor_provider != *sides->candidate_provider ||
+          scoped->predecessor_control_domain_revision !=
+              std::optional(domain.control_domain_revision) ||
+          scoped->candidate_control_domain_revision !=
+              std::optional(domain.control_domain_revision) ||
+          !std::binary_search(
+              request.configuration_fence_scope.controllable_component_ids.begin(),
+              request.configuration_fence_scope.controllable_component_ids.end(),
+              provider->provider.controllable_component_id))
+        return false;
+      const auto &proof = *sides->predecessor_provider;
+      return proof.controllable_component_id ==
+                 provider->provider.controllable_component_id &&
+             proof.provider_instance_id == provider->provider.provider_instance_id &&
+             proof.signal_configuration_digest ==
+                 provider->provider.signal_configuration_digest &&
+             proof.output_resources == domain.resource_ids();
+    };
+    const auto exact_predecessor = [&](
+        const CompositionIoResourcePredecessor &predecessor) {
+      return predecessor.bundle &&
+             predecessor.publication_generation ==
+                 request.expected_predecessor_publication_generation &&
+             predecessor.bundle->retained_bundle_id() ==
+                 request.predecessor_projection_revision.retained_bundle_id &&
+             predecessor.bundle->value().cell_graph.graph_revision ==
+                 request.predecessor_projection_revision.graph_revision;
+    };
+
     // Witness actual retained generic domains independently of whole-component
     // physical retention. Mixed components may replace their physical engine
     // while keeping the SAME concrete provider DriverRecord.
@@ -11333,12 +11379,21 @@ RunManagedRuntimeChild(const ManagedRuntimeChildConfig &config) {
               request.configuration_fence_scope.domains.end(), [&](const auto &scope) {
                 return scope.control_domain_id == driver->domain().control_domain_id;
               });
-          if (changed != request.configuration_fence_scope.domains.end()) continue;
+          if (changed != request.configuration_fence_scope.domains.end()) {
+            // Provider fence membership alone does not retain readiness. The
+            // two sides must prove the same provider and the actual record
+            // must still be owned by this exact predecessor publication.
+            if (!unchanged_provider_fence(driver->domain())) continue;
+          }
           bool same_actual_record = false;
-          for (const auto &predecessor : predecessors)
+          for (const auto &predecessor : predecessors) {
+            if (changed != request.configuration_fence_scope.domains.end() &&
+                !exact_predecessor(predecessor))
+              continue;
             for (const auto &group : predecessor.driver_groups)
               if (group && std::find(group->begin(), group->end(), driver) != group->end())
                 same_actual_record = true;
+          }
           if (!same_actual_record) continue;
           Require(paired.emplace(driver->domain().control_domain_id,
                       std::make_pair(driver->domain(), driver->occurrence())).second,

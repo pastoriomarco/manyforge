@@ -36,6 +36,7 @@ import {
   resetKeptMessage,
 } from './ProgramRuntimePanel';
 import { readStyleSource } from '../styles/readStyleSource';
+import { api } from '../api/client';
 
 function ordinaryMotionStopOffer(): CycleRecoveryOffer {
   return {
@@ -409,12 +410,12 @@ describe('Program runtime projection', () => {
       },
     };
     expect(takeoverFallbackText(fallback))
-      .toBe('Stop fallback on move — takeover preparation late (prep 12 of 30 ms)');
+      .toBe('Stop fallback on move · takeover preparation late (prep 12 of 30 ms)');
     expect(takeoverFallbackText({ eventRevision: 3, kind: 'program_node_retry', facts: {} })).toBeNull();
     expect(takeoverFallbackText({
       ...fallback,
       facts: { ...fallback.facts, code: null, message: null, failureStage: 'stop_planning' },
-    })).toBe('Stop fallback on move — during stop_planning (prep 12 of 30 ms)');
+    })).toBe('Stop fallback on move · during stop_planning (prep 12 of 30 ms)');
     const base = controller();
     type RuntimeControls = NonNullable<NonNullable<ProgramRuntimeController['state']['controls']>['runtimeControls']>;
     const withAudit: ProgramRuntimeController = {
@@ -428,7 +429,7 @@ describe('Program runtime projection', () => {
       },
     };
     expect(renderToStaticMarkup(<ProgramRuntimePanel enabled controller={withAudit} />))
-      .toContain('Stop fallback on move — takeover preparation late (prep 12 of 30 ms)');
+      .toContain('Stop fallback on move · takeover preparation late (prep 12 of 30 ms)');
   });
 
   it('shows a running io wait whose input source is unavailable in amber, and both transitions as events', () => {
@@ -437,7 +438,7 @@ describe('Program runtime projection', () => {
       kind: available ? 'program_node_io_source_available' : 'program_node_io_source_unavailable',
       facts: { node_instance_id: node, node_attempt_id: `${node}.1`, quality: available ? 'fresh' : 'stale' },
     });
-    expect(ioSourceAuditText(io(2, false))).toBe('Input source unavailable for wait_part (stale) — still waiting');
+    expect(ioSourceAuditText(io(2, false))).toBe('Input source unavailable for wait_part (stale) · still waiting');
     expect(ioSourceAuditText(io(3, true))).toBe('Input source available again for wait_part');
     expect(ioSourceAuditText({ eventRevision: 4, kind: 'program_node_retry', facts: {} })).toBeNull();
     // Only the newest transition per node counts, and only while the node runs.
@@ -462,7 +463,7 @@ describe('Program runtime projection', () => {
     });
     const waiting = renderToStaticMarkup(<ProgramRuntimePanel enabled controller={view([io(2, false)])} />);
     expect(waiting).toMatch(/class="inline-message severity-warning" role="status">Waiting on wait_part: input source unavailable \(stale\)/);
-    expect(waiting).toContain('<span class="inline-message severity-warning">Input source unavailable for wait_part (stale) — still waiting</span>');
+    expect(waiting).toContain('<span class="inline-message severity-warning">Input source unavailable for wait_part (stale) · still waiting</span>');
     const recovered = renderToStaticMarkup(
       <ProgramRuntimePanel enabled controller={view([io(2, false), io(3, true)])} />,
     );
@@ -486,9 +487,9 @@ describe('Program runtime projection', () => {
     };
     // The code is shown as the structured-error display humanises it.
     expect(automaticRetryFailureText(failed(kernel)))
-      .toBe('Collision Stop on move: kernel timeout — planner timed out');
+      .toBe('Collision Stop on move: kernel timeout · planner timed out');
     expect(automaticRetryFailureText(failed({ ...kernel, code: 'ik_failed' }, 'planning_no_effect')))
-      .toBe('Planning failed on move: ik failed — planner timed out');
+      .toBe('Planning failed on move: ik failed · planner timed out');
     // The cause alone when the owner has no Kernel failure.
     expect(automaticRetryFailureText(failed(null))).toBe('Collision Stop on move');
     expect(automaticRetryFailureText(failed(null, 'planning_no_effect'))).toBe('Planning failed on move');
@@ -508,7 +509,7 @@ describe('Program runtime projection', () => {
       },
     };
     const markup = renderToStaticMarkup(<ProgramRuntimePanel enabled controller={withAudit} />);
-    const red = 'Collision Stop on move: kernel timeout — planner timed out';
+    const red = 'Collision Stop on move: kernel timeout · planner timed out';
     const retry = 'Attempt 2 of 4 for move after collision Stop';
     expect(markup).toContain(`<p class="inline-message severity-error">${red}</p>`);
     expect(markup.indexOf(red)).toBeLessThan(markup.indexOf(retry));
@@ -1725,7 +1726,8 @@ it('shows a failed accepted start and native comparison facts while Reset remain
 
 /**
  * Mounts the transport controls on a stub DOM. `press` runs the onClick of the
- * last mounted control whose props match; `unmount` restores the globals.
+ * last mounted control whose props match; `mounted` says whether one was
+ * mounted; `unmount` restores the globals.
  */
 async function mountTransport(program: ProgramRuntimeController) {
   const created: Record<string, unknown>[] = [];
@@ -1773,6 +1775,10 @@ async function mountTransport(program: ProgramRuntimeController) {
       if (found === undefined) throw new Error('Mounted control not found');
       await act(() => { found.onClick!(); });
     },
+    /** Whether a control whose props match was ever mounted. */
+    mounted: (match: (props: Props) => boolean) => created.map(propsOf).some((candidate) => (
+      candidate !== undefined && match(candidate)
+    )),
     unmount: async () => {
       await act(() => { root.unmount(); });
       vi.unstubAllGlobals();
@@ -1828,7 +1834,7 @@ describe('Per-hold Retry and Continue', () => {
       /class="transport-group-resume"[^>]*disabled=""[^>]*title="middle waits for held nodes left.move, right.move: Retry or Continue them first."[^>]*>Resume<\/button>/,
     );
     expect(markup).toMatch(
-      /class="danger-button transport-group-stop transport-group-continue"(?![^>]*disabled)[^>]*title="Continuing fails the node"[^>]*aria-label="Continue left: fail held node left.move"[^>]*>Continue<\/button>/,
+      /class="danger-button transport-group-stop"(?![^>]*disabled)[^>]*title="Continuing fails the node"[^>]*aria-label="Continue left: fail held node left.move"[^>]*>Continue<\/button>/,
     );
     expect(markup).toContain('aria-label="Continue right: fail held node right.move"');
     // Groups no hold owns keep their ordinary Stop.
@@ -1850,7 +1856,7 @@ describe('Per-hold Retry and Continue', () => {
     };
     expect(renderToStaticMarkup(
       <ProgramTransportControls enabled program={disabled} robot={robotController()} />,
-    )).toMatch(/transport-group-continue"[^>]*disabled=""[^>]*title="Continuing fails the node"[^>]*aria-label="Continue left/);
+    )).toMatch(/class="danger-button transport-group-stop"[^>]*disabled=""[^>]*title="Continuing fails the node"[^>]*aria-label="Continue left/);
   });
 
   it('lets a hold in no named group own every group no other hold names (item 43)', () => {
@@ -1955,6 +1961,168 @@ describe('Per-hold Retry and Continue', () => {
       await transport.unmount();
     }
   });
+
+  /** Both holds reserve robot.joint_1; the alarm projection holds `members`. */
+  function heldWithAlarms(members: AlarmMotionAttentionMember[]): ProgramRuntimeController {
+    const program = twoHolds();
+    const controls = program.state.controls!;
+    for (const offer of [controls.recoveryOffer!, ...controls.recoveryHolds.map((hold) => hold.offer)]) {
+      offer.participants = [{ operation_participant_id: 'p1', resource_ids: ['robot.joint_1'] }];
+    }
+    return {
+      ...program,
+      motionAttentionBlock: (resourceIds) => motionAttentionBlock(
+        alarmSnapshot(members), resourceIds, ACTIVE_CONFIGURATION,
+      ),
+    };
+  }
+
+  it('disables Continue, like Retry, until the gating alarm is acknowledged', () => {
+    const render = (program: ProgramRuntimeController) => renderToStaticMarkup(
+      <ProgramTransportControls enabled program={program} robot={robotController()} />,
+    );
+    const blocked = render(heldWithAlarms([
+      gatingMember('arm', 'active_unacknowledged', ['robot.joint_1']),
+    ]));
+    const remedy = 'Motion is blocked by unacknowledged alarms. Acknowledge them, then try again.';
+    expect(blocked).toMatch(new RegExp(
+      `class="danger-button transport-group-stop"[^>]*disabled=""[^>]*title="${remedy}"[^>]*aria-label="Continue left`,
+    ));
+    expect(blocked).toMatch(new RegExp(
+      `class="transport-group-resume"[^>]*disabled=""[^>]*title="${remedy}"[^>]*>Retry</button>`,
+    ));
+    // Once acknowledged the record leaves the gating membership.
+    const acknowledged = render(heldWithAlarms([]));
+    expect(acknowledged).toMatch(
+      /class="danger-button transport-group-stop"(?![^>]*disabled)[^>]*title="Continuing fails the node"[^>]*aria-label="Continue left/,
+    );
+  });
+
+  it('shows the Recovery block cause first, with the blocking alarm and each command\'s reason', () => {
+    const program = heldWithAlarms([]);
+    program.cycleState = 'recovery_required';
+    program.cycleFailure = { code: 'ik_failed', message: 'RoboPlan could not resolve the pose goal' };
+    const command = (label: string, reason: string | null = null) => ({
+      label, enabled: reason === null, reason, run: vi.fn(),
+    });
+    const markup = renderToStaticMarkup(
+      <ProgramRuntimePanel
+        enabled
+        controller={program}
+        recovery={{
+          acknowledge: { busy: false, error: null, run: vi.fn() },
+          retry: command('Retry', 'Motion is blocked by unacknowledged alarms. Acknowledge them, then try again.'),
+          continue: command('Continue'),
+          reset: command('Reset'),
+        }}
+      />,
+    );
+    // The cycle failure is an error, not a green status line.
+    expect(markup).toContain(
+      '<div class="program-feedback error-state" role="status"><span>RoboPlan could not resolve the pose goal</span></div>',
+    );
+    expect(markup).toContain('class="runtime-control-section program-recovery-failed"');
+    expect(markup).toMatch(/<h3 id="runtime-recovery-title">Recovery<\/h3>.*<p class="program-recovery-cause">RoboPlan could not resolve the pose goal<\/p>/);
+    const order = [
+      'Acknowledge the alarm.',
+      'Retry and Continue are blocked until it is acknowledged.',
+      '>Acknowledge</button>',
+      'Fix the cause.',
+      'Apply then Resets the run',
+      '>Retry</button><span>Re-run the node.</span><span class="inline-message severity-error">Motion is blocked by unacknowledged alarms.',
+      '>Continue</button><span>Fail the node; the Program tree handles the FAILURE.</span></div>',
+      '>Reset</button><span>End the run.</span></div>',
+      'Retry limit',
+      'Stage a manual result (not available yet)',
+    ].map((text) => markup.indexOf(text));
+    expect(order.every((index) => index >= 0)).toBe(true);
+    expect([...order].sort((left, right) => left - right)).toEqual(order);
+    // Without a blocking alarm there is no acknowledgement step.
+    expect(renderToStaticMarkup(
+      <ProgramRuntimePanel enabled controller={program} recovery={{
+        acknowledge: null, retry: command('Retry'), continue: null, reset: command('Reset'),
+      }} />,
+    )).not.toContain('Acknowledge the alarm.');
+  });
+
+  it('takes a held failure\'s cause from its offer while the cycle is still running', () => {
+    // The live hold shape: the run waits for intervention, the cycle has no failure.
+    const render = (recoveryClass: string) => {
+      const program = heldWithAlarms([]);
+      program.cycleState = 'running';
+      program.cycleFailure = null;
+      const offer = program.state.controls!.recoveryOffer!;
+      offer.recoveryClass = recoveryClass;
+      offer.reason = {
+        code: 'ik_failed',
+        message: 'RoboPlan could not resolve the pose goal (native_ik_no_solution)',
+        details: null,
+        origin: null,
+      };
+      const command = (label: string) => ({ label, enabled: true, reason: null, run: vi.fn() });
+      return renderToStaticMarkup(<ProgramRuntimePanel enabled controller={program} recovery={{
+        acknowledge: null, retry: command('Retry'), continue: null, reset: command('Reset'),
+      }} />);
+    };
+    const failed = render('failed_validation');
+    expect(failed).toContain('class="runtime-control-section program-recovery-failed"');
+    expect(failed).toContain(
+      '<p class="program-recovery-cause">RoboPlan could not resolve the pose goal (native_ik_no_solution)</p>',
+    );
+    const stopped = render('ordinary_operator_stop');
+    expect(stopped).toContain('class="runtime-control-section" aria-labelledby="runtime-recovery-title"');
+    expect(stopped).not.toContain('program-recovery-cause');
+  });
+
+  it('runs the Recovery block commands through the Motion and Program panel handlers', async () => {
+    vi.spyOn(api.execution, 'admittedSpeeds').mockReturnValue(new Promise(() => undefined));
+    const acknowledge = vi.spyOn(api.alarms, 'acknowledge').mockResolvedValue({});
+    const member = gatingMember('arm', 'active_unacknowledged', ['robot.joint_1']);
+    const blocked = heldWithAlarms([member]);
+    const transport = await mountTransport(blocked);
+    try {
+      await transport.press((props) => props['aria-label'] === 'Program run information');
+      await transport.press((props) => props.children === 'Acknowledge'
+        && String(props.title).startsWith('Acknowledge these exact'));
+      expect(acknowledge).toHaveBeenCalledExactlyOnceWith(member, 'alarm.epoch.1', expect.any(String));
+    } finally {
+      await transport.unmount();
+      vi.restoreAllMocks();
+    }
+
+    vi.spyOn(api.execution, 'admittedSpeeds').mockReturnValue(new Promise(() => undefined));
+    const program = heldWithAlarms([]);
+    const [left] = program.state.controls!.recoveryHolds;
+    const open = await mountTransport(program);
+    try {
+      await open.press((props) => props['aria-label'] === 'Program run information');
+      await open.press((props) => props.type === 'button' && props.children === 'Retry'
+        && props.title === undefined);
+      expect(program.applyRecoveryAction).toHaveBeenLastCalledWith(
+        program.state.controls!.recoveryOffer, 'retry_motion_from_current_state',
+      );
+      // Retry closes Program run details so the execution can be followed.
+      const detailsShown = () => open.mounted((props) => props.id === 'program-run-details-title');
+      expect(detailsShown()).toBe(false);
+      await open.press((props) => props['aria-label'] === 'Program run information');
+      // Continue asks with the Motion panel's confirmation; only confirming closes the details.
+      await open.press((props) => props.type === 'button' && props.children === 'Continue'
+        && props.title === undefined && props.className === 'danger-button');
+      expect(program.applyRecoveryAction).toHaveBeenCalledTimes(1);
+      expect(detailsShown()).toBe(true);
+      await open.press((props) => props.className === 'danger-button' && props.children === 'Continue');
+      expect(program.applyRecoveryAction).toHaveBeenLastCalledWith(left.offer, 'continue_with_failure');
+      expect(detailsShown()).toBe(false);
+      await open.press((props) => props['aria-label'] === 'Program run information');
+      // Reset opens the Program panel's Reset confirmation.
+      expect(open.mounted((props) => props.id === 'program-reset-confirmation-title')).toBe(false);
+      await open.press((props) => props.children === 'Reset' && props.className === 'transport-reset');
+      expect(open.mounted((props) => props.id === 'program-reset-confirmation-title')).toBe(true);
+    } finally {
+      await open.unmount();
+      vi.restoreAllMocks();
+    }
+  });
 });
 
 function activationComponent(id: string): CCLCComponentSnapshot {
@@ -1979,7 +2147,7 @@ describe('Execute activation live presentation', () => {
       lite6_robot: { snapshot: { ...arm, lifecycleState: 'active', lifecycleGeneration: 3 }, error: null },
       plc_io: { snapshot: plc, error: null },
     };
-    program.activationProgress = 'plc_io: Not ready — [component_lifecycle_transition_missing] No lifecycle transition is satisfied · no_transition_satisfied';
+    program.activationProgress = 'plc_io: Not ready · [component_lifecycle_transition_missing] No lifecycle transition is satisfied · no_transition_satisfied';
     return program;
   }
   function render(program: ProgramRuntimeController) {

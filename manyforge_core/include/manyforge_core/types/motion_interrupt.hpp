@@ -128,10 +128,9 @@ struct MotionInterruptStopProfileDTO {
   /// Source decoding normalizes omission to true for soft_on_path and false
   /// for the other modes; this DTO stores that normalized value.
   bool allow_natural_completion_on_short_path = false;
-  /// Sole qualified nominal-contract substitution. Legal only for
-  /// soft_on_path and only as spring_back_hold; it is not a fallback list or
-  /// a Kernel escalation choice.
-  std::optional<MotionInterruptStopMode> recoverable_substitution_mode;
+  /// Strictly ordered enabled controlled modes below the primary:
+  /// soft_on_path -> spring_back_hold -> spring_back_fast. Hard is implicit.
+  std::vector<MotionInterruptStopMode> fallback_stop_modes;
   /// v1 production profiles MUST use `true`; `false` is reserved for
   /// diagnostic simulators and MUST NOT produce
   /// `terminal_cause=signal_trip`.
@@ -216,6 +215,31 @@ inline std::string motion_interrupt_deceleration_time_max_error() {
 /// every bound robot joint is checked by the load gate / planner, which hold
 /// the joint list; the planner re-checks these same fields at trip time as
 /// defense in depth.)
+[[nodiscard]] inline bool motion_interrupt_stop_fallbacks_valid(
+    MotionInterruptStopMode primary, const std::vector<MotionInterruptStopMode>& modes) noexcept {
+  const auto rank = [](MotionInterruptStopMode mode) {
+    switch (mode) {
+      case MotionInterruptStopMode::kSoftOnPath:
+        return 0;
+      case MotionInterruptStopMode::kSpringBackHold:
+        return 1;
+      case MotionInterruptStopMode::kSpringBackFast:
+        return 2;
+      case MotionInterruptStopMode::kHardDeceleration:
+        return 3;
+    }
+    return -1;
+  };
+  int previous = rank(primary);
+  if (previous < 0 || modes.size() > 2U) return false;
+  for (const auto mode : modes) {
+    const int current = rank(mode);
+    if (current <= previous || current >= 3) return false;
+    previous = current;
+  }
+  return true;
+}
+
 inline std::string motion_interrupt_stop_profile_field_error(
     const MotionInterruptStopProfileDTO& profile) {
   if (!motion_interrupt_stop_profile_id_valid(profile.profile_id)) {
@@ -227,7 +251,8 @@ inline std::string motion_interrupt_stop_profile_field_error(
     return "stop_profile.max_stop_time_s must be finite and > 0";
   }
   if (profile.stop_mode == MotionInterruptStopMode::kSoftOnPath ||
-      profile.stop_mode == MotionInterruptStopMode::kSpringBackHold) {
+      profile.stop_mode == MotionInterruptStopMode::kSpringBackHold ||
+      profile.stop_mode == MotionInterruptStopMode::kSpringBackFast) {
     if (profile.stop_mode == MotionInterruptStopMode::kSoftOnPath && !profile.deceleration_time_s) {
       return "soft_on_path requires a finite positive deceleration_time_s";
     }
@@ -289,12 +314,9 @@ inline std::string motion_interrupt_stop_profile_field_error(
       profile.allow_natural_completion_on_short_path) {
     return "natural completion is legal only for soft_on_path or spring_back_hold";
   }
-  if (profile.recoverable_substitution_mode.has_value() &&
-      (profile.stop_mode != MotionInterruptStopMode::kSoftOnPath ||
-       *profile.recoverable_substitution_mode != MotionInterruptStopMode::kSpringBackHold)) {
-    return "recoverable_substitution_mode is only soft_on_path to "
-           "spring_back_hold";
-  }
+  if (!motion_interrupt_stop_fallbacks_valid(profile.stop_mode, profile.fallback_stop_modes))
+    return "fallback_stop_modes must be a strict ordered subsequence below the primary, excluding "
+           "hard";
   if (profile.per_joint_settle_velocity_threshold.has_value()) {
     if (profile.per_joint_settle_velocity_threshold->empty()) {
       return "per_joint_settle_velocity_threshold must be omitted or non-empty";
@@ -402,6 +424,7 @@ struct ControlledStopResultDTO {
       case MotionInterruptStopMode::kSpringBackHold:
       case MotionInterruptStopMode::kSoftOnPath:
       case MotionInterruptStopMode::kHardDeceleration:
+      case MotionInterruptStopMode::kSpringBackFast:
         return true;
     }
     return false;
@@ -520,11 +543,10 @@ struct MotionInterruptScopeDTO {
   /// here is an arm-time rejection. Free-move / non-trip scopes (none
   /// in v1) MAY omit.
   std::optional<MotionInterruptStopProfileDTO> stop_profile;
-  /// Motion-node category metadata. Drives default fallback rules
-  /// at arm time (spec/210 §3.11). Default
-  /// `kGeneric` matches `MoveUntilSignal`-class nodes;
-  /// `kPrecisionContact` matches `ProbeSearchMove`-class nodes and rejects a
-  /// recoverable substitution at arm time.
+  /// Motion-node category metadata for authored Stop guidance (spec/210 §3.11).
+  /// `kGeneric` matches `MoveUntilSignal`-class nodes; `kPrecisionContact`
+  /// matches `ProbeSearchMove`-class nodes. Natural completion and qualified
+  /// recoverable substitution retain their authored choices in both categories.
   MotionInterruptNodeCategory node_category = MotionInterruptNodeCategory::kGeneric;
   InterruptStructuredValue metadata;
   friend bool operator==(const MotionInterruptScopeDTO&, const MotionInterruptScopeDTO&) = default;

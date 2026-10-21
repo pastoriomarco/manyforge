@@ -1027,21 +1027,48 @@ core::ResolvedStopBasePlanDTO resolve_verified_stop_base_plan(
       if (stage_kind == core::StopEscalationStageKind::kNominal &&
           command.command_kind ==
               core::StopContainmentCommandKind::kMotionControlledStop) {
-        const auto substitution_parameter =
-            parameters->find("recoverable_substitution_mode");
-        const bool requests_substitution =
-            substitution_parameter != parameters->end() &&
-            !std::holds_alternative<std::nullptr_t>(
-                substitution_parameter->second.value);
-        if (requests_substitution) {
-          if (!command.provider_contract_ref.has_value()) {
-            fail("nominal substitution has no provider contract");
-          }
+        const auto legacy = parameters->find("recoverable_substitution_mode");
+        const auto selected = parameters->find("fallback_stop_modes");
+        if (legacy != parameters->end() && selected != parameters->end())
+          fail("conflicting fallback fields");
+        std::vector<core::MotionControlledStopMode> fallbacks;
+        const auto parse_mode = [&](const core::JsonValueDTO &value) {
+          const auto *mode = std::get_if<std::string>(&value.value);
+          if (mode && *mode == "soft_on_path")
+            return core::MotionControlledStopMode::kSoftOnPath;
+          if (mode && *mode == "spring_back_hold")
+            return core::MotionControlledStopMode::kSpringBackHold;
+          if (mode && *mode == "spring_back_fast")
+            return core::MotionControlledStopMode::kSpringBackFast;
+          if (mode && *mode == "hard_deceleration")
+            return core::MotionControlledStopMode::kHardDeceleration;
+          fail("invalid Stop mode");
+        };
+        const auto primary = parse_mode(parameters->at("stop_mode"));
+        if (legacy != parameters->end()) {
+          if (primary != core::MotionControlledStopMode::kSoftOnPath ||
+              parse_mode(legacy->second) !=
+                  core::MotionControlledStopMode::kSpringBackHold)
+            fail("invalid legacy Stop substitution");
+          fallbacks = {core::MotionControlledStopMode::kSpringBackHold};
+        }
+        if (selected != parameters->end()) {
+          const auto *modes =
+              std::get_if<core::JsonValueDTO::Array>(&selected->second.value);
+          if (!modes || modes->size() > 2U)
+            fail("invalid Stop fallback list");
+          for (const auto &item : *modes)
+            fallbacks.push_back(parse_mode(item));
+        }
+        if (!core::motion_controlled_stop_fallbacks_valid(primary, fallbacks))
+          fail("invalid Stop fallback order");
+        if (!fallbacks.empty()) {
+          if (!command.provider_contract_ref)
+            fail("nominal fallback has no provider contract");
           qualification.controlled_substitution_contract =
               core::ControlledStopSubstitutionContractDTO{
-                  *command.provider_contract_ref,
-                  core::MotionControlledStopMode::kSoftOnPath,
-                  core::MotionControlledStopMode::kSpringBackHold};
+                  *command.provider_contract_ref, primary,
+                  std::move(fallbacks)};
         }
       }
     }

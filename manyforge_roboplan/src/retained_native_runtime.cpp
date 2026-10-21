@@ -467,10 +467,12 @@ retained_controlled_stop_profiles(
   }
   auto operator_profile = std::move(decoded.value());
   auto fault_profile = operator_profile;
+  // Native-only fallback. ROS/Mock composition replaces this with the exact
+  // Deployment-authored fault profile below, including spring_back_fast.
   fault_profile.profile_id = "fault_spring_back_hold";
   fault_profile.stop_mode = core::MotionInterruptStopMode::kSpringBackHold;
   fault_profile.allow_natural_completion_on_short_path = false;
-  fault_profile.recoverable_substitution_mode.reset();
+  fault_profile.fallback_stop_modes.clear();
   if (const auto error =
           core::motion_interrupt_stop_profile_field_error(fault_profile);
       !error.empty()) {
@@ -773,8 +775,9 @@ readiness_for(const std::vector<core::RuntimeParticipantExecutionRegistration>
     const bool permit_supporting_capability_expansion) noexcept {
   const auto &left = primary.value();
   const auto &right = alias.value();
-  return right.contact_grasp_bindings.empty() &&
-         left.retained_bundle_id == right.retained_bundle_id &&
+  // Contact policies belong to the verified Program view, not the physical
+  // owner. Keep them on the alias while matching every physical identity below.
+  return left.retained_bundle_id == right.retained_bundle_id &&
          left.graph_revision == right.graph_revision &&
          left.controllable_component_id == right.controllable_component_id &&
          left.component_type_id == right.component_type_id &&

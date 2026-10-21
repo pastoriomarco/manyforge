@@ -631,7 +631,8 @@ void register_deployment_candidate_bindings(py::module_& module) {
   py::enum_<MotionControlledStopMode>(module, "MotionControlledStopMode")
       .value("kSoftOnPath", MotionControlledStopMode::kSoftOnPath)
       .value("kSpringBackHold", MotionControlledStopMode::kSpringBackHold)
-      .value("kHardDeceleration", MotionControlledStopMode::kHardDeceleration);
+      .value("kHardDeceleration", MotionControlledStopMode::kHardDeceleration)
+      .value("kSpringBackFast", MotionControlledStopMode::kSpringBackFast);
 
   py::class_<ControlledStopResourceLimitDTO>(module, "ControlledStopResourceLimitDTO",
                                              py::is_final())
@@ -660,19 +661,19 @@ void register_deployment_candidate_bindings(py::module_& module) {
       .def(py::init([](MotionControlledStopMode stop_mode, double deceleration_time_s,
                        std::vector<ControlledStopResourceLimitDTO> per_resource_limits,
                        bool allow_natural_completion_on_short_path,
-                       std::optional<MotionControlledStopMode> recoverable_substitution_mode,
+                       std::vector<MotionControlledStopMode> fallback_stop_modes,
                        bool jerk_limits_enabled, std::optional<double> max_stop_time_s) {
              return SoftOnPathStopParametersDTO{stop_mode,
                                                 deceleration_time_s,
                                                 max_stop_time_s,
                                                 std::move(per_resource_limits),
                                                 allow_natural_completion_on_short_path,
-                                                recoverable_substitution_mode,
+                                                std::move(fallback_stop_modes),
                                                 jerk_limits_enabled};
            }),
            py::arg("stop_mode"), py::arg("deceleration_time_s"), py::arg("per_resource_limits"),
            py::arg("allow_natural_completion_on_short_path"),
-           py::arg("recoverable_substitution_mode") = std::nullopt,
+           py::arg("fallback_stop_modes") = std::vector<MotionControlledStopMode>{},
            py::arg("jerk_limits_enabled") = false, py::arg("max_stop_time_s") = std::nullopt)
       .def_readonly("stop_mode", &SoftOnPathStopParametersDTO::stop_mode)
       .def_readonly("deceleration_time_s", &SoftOnPathStopParametersDTO::deceleration_time_s)
@@ -683,8 +684,10 @@ void register_deployment_candidate_bindings(py::module_& module) {
                              })
       .def_readonly("allow_natural_completion_on_short_path",
                     &SoftOnPathStopParametersDTO::allow_natural_completion_on_short_path)
-      .def_readonly("recoverable_substitution_mode",
-                    &SoftOnPathStopParametersDTO::recoverable_substitution_mode)
+      .def_property_readonly("fallback_stop_modes",
+                             [](const SoftOnPathStopParametersDTO& value) {
+                               return immutable_snapshot(value.fallback_stop_modes);
+                             })
       .def_readonly("jerk_limits_enabled", &SoftOnPathStopParametersDTO::jerk_limits_enabled)
       .def(py::self == py::self)
       .def(py::self != py::self);
@@ -694,23 +697,30 @@ void register_deployment_candidate_bindings(py::module_& module) {
       .def(py::init([](MotionControlledStopMode stop_mode, double deceleration_time_s,
                        std::vector<ControlledStopResourceLimitDTO> per_resource_limits,
                        bool allow_natural_completion_on_short_path, bool jerk_limits_enabled,
-                       std::optional<double> max_stop_time_s) {
+                       std::optional<double> max_stop_time_s,
+                       std::vector<MotionControlledStopMode> fallback_stop_modes) {
              return SpringBackHoldStopParametersDTO{stop_mode,
                                                     deceleration_time_s,
                                                     max_stop_time_s,
                                                     std::move(per_resource_limits),
                                                     allow_natural_completion_on_short_path,
-                                                    jerk_limits_enabled};
+                                                    jerk_limits_enabled,
+                                                    std::move(fallback_stop_modes)};
            }),
            py::arg("stop_mode"), py::arg("deceleration_time_s"), py::arg("per_resource_limits"),
            py::arg("allow_natural_completion_on_short_path") = false,
-           py::arg("jerk_limits_enabled") = false, py::arg("max_stop_time_s") = std::nullopt)
+           py::arg("jerk_limits_enabled") = false, py::arg("max_stop_time_s") = std::nullopt,
+           py::arg("fallback_stop_modes") = std::vector<MotionControlledStopMode>{})
       .def_readonly("stop_mode", &SpringBackHoldStopParametersDTO::stop_mode)
       .def_readonly("deceleration_time_s", &SpringBackHoldStopParametersDTO::deceleration_time_s)
       .def_readonly("max_stop_time_s", &SpringBackHoldStopParametersDTO::max_stop_time_s)
       .def_readonly("allow_natural_completion_on_short_path",
                     &SpringBackHoldStopParametersDTO::allow_natural_completion_on_short_path)
       .def_readonly("jerk_limits_enabled", &SpringBackHoldStopParametersDTO::jerk_limits_enabled)
+      .def_property_readonly("fallback_stop_modes",
+                             [](const SpringBackHoldStopParametersDTO& value) {
+                               return immutable_snapshot(value.fallback_stop_modes);
+                             })
       .def_property_readonly("per_resource_limits",
                              [](const SpringBackHoldStopParametersDTO& value) {
                                return immutable_snapshot(value.per_resource_limits);
@@ -756,8 +766,10 @@ void register_deployment_candidate_bindings(py::module_& module) {
                     &ControlledStopSubstitutionContractDTO::provider_contract_ref)
       .def_readonly("requested_stop_mode",
                     &ControlledStopSubstitutionContractDTO::requested_stop_mode)
-      .def_readonly("executed_stop_mode",
-                    &ControlledStopSubstitutionContractDTO::executed_stop_mode)
+      .def_property_readonly("fallback_stop_modes",
+                             [](const ControlledStopSubstitutionContractDTO& value) {
+                               return immutable_snapshot(value.fallback_stop_modes);
+                             })
       .def(py::self == py::self)
       .def(py::self != py::self);
 

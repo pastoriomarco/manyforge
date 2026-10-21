@@ -204,7 +204,7 @@ export function CCLCPanelView({
           {controller.activationProgress !== null && <p role="status">{controller.activationProgress}</p>}
           {controller.activationRefusal !== null && <div role="status" className="notice severity-warning">
             <p>{controller.activationRefusal.controllableComponentId}: {
-              controller.activationRefusal.error.details.observed_fault_present === 'true' ? 'Fault — intervention required' : 'Not ready'
+              controller.activationRefusal.error.details.observed_fault_present === 'true' ? 'Fault · intervention required' : 'Not ready'
             }</p>
             {['reason', 'observed_state', 'observed_controller_loaded', 'observed_fault_present', 'observed_transport_ready'].map((field) => (
               <p className="muted" key={field}>{field}: {controller.activationRefusal!.error.details[field] ?? 'missing'}</p>

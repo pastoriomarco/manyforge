@@ -4425,7 +4425,9 @@ def _interrupt_inputs(node_id: str) -> OwnerNodeInputs:
         on_signal="success",
     )
     if node_id == "motion.probe_search":
-        parameters["contact_policy_id"] = "probe.contact"
+        # The same explicit contact-object selection as the plain motion nodes.
+        parameters["contact_policy_id"] = "pick.contact"
+        parameters["contact_scene_resource_id"] = "part.7"
     return OwnerNodeInputs(parameters=parameters)
 
 
@@ -4455,21 +4457,39 @@ def test_interrupt_move_submits_the_ordinary_motion_with_its_node_context(node_i
     for field in ("interrupt_condition", "stop_mode", "on_signal", "priority"):
         assert field not in repr(payload)
     if node_id == "motion.probe_search":
-        # The precision-contact policy is the Core's scene policy, no grasp.
-        assert payload["contact_policy_id"] == "probe.contact"
-        assert payload["runtime_object_bindings"] == []
+        # The Program contact grasp selects its object like any motion node.
+        assert payload["contact_policy_id"] == "pick.contact"
+        assert payload["runtime_object_bindings"] == [
+            {"runtime_object_id": "selected_object", "scene_resource_id": "part.7"}
+        ]
     else:
         assert payload["contact_policy_id"] is None
+        assert payload["runtime_object_bindings"] == []
 
 
-def test_probe_search_requires_its_contact_policy() -> None:
+@pytest.mark.parametrize("missing", ["contact_policy_id", "contact_scene_resource_id"])
+def test_probe_search_requires_its_contact_policy_and_object_together(missing) -> None:
     transport = _Transport()
     port = NativeKernelProgramPort(KernelClient(transport))
     port.bind(_context())
     parameters = dict(_interrupt_inputs("motion.probe_search").parameters)
-    parameters.pop("contact_policy_id")
+    parameters.pop(missing)
 
-    with pytest.raises(ProductionPortError, match="contact_policy_id"):
+    with pytest.raises(ProductionPortError, match="must be supplied together"):
+        port.operations.start(
+            "motion.probe_search", _identity("probe"), OwnerNodeInputs(parameters=parameters)
+        )
+    assert transport.submissions == []
+
+
+def test_probe_search_policy_without_a_program_grasp_is_refused() -> None:
+    transport = _Transport()
+    port = NativeKernelProgramPort(KernelClient(transport))
+    port.bind(_context())
+    parameters = dict(_interrupt_inputs("motion.probe_search").parameters)
+    parameters["contact_policy_id"] = "probe.unbound"
+
+    with pytest.raises(ProductionPortError, match="no exact motion contact-grasp policy"):
         port.operations.start(
             "motion.probe_search", _identity("probe"), OwnerNodeInputs(parameters=parameters)
         )

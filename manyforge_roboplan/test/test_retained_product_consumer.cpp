@@ -3934,6 +3934,7 @@ enum class Lite6AggregateCheck {
   kResealInventory,
   kRefreshCellModel,
   kDeploymentFaultStopProfile,
+  kDeploymentFastFaultStopProfile,
   kDeploymentFaultStopProfileWithExtraJoints,
   kDeploymentFaultStopProfileWithOnlyExtraSettleOverrides,
   kDeploymentFaultStopProfileWithSparseSettleOverrides,
@@ -4130,6 +4131,7 @@ void check_selected_core_lite6_aggregate(const Lite6AggregateCheck check) {
       check == Lite6AggregateCheck::kResealInventory;
   const bool authored_fault_check =
       check == Lite6AggregateCheck::kDeploymentFaultStopProfile ||
+      check == Lite6AggregateCheck::kDeploymentFastFaultStopProfile ||
       check == Lite6AggregateCheck::kDeploymentFaultStopProfileWithExtraJoints ||
       check == Lite6AggregateCheck::kDeploymentFaultStopProfileWithOnlyExtraSettleOverrides ||
       check == Lite6AggregateCheck::kDeploymentFaultStopProfileWithSparseSettleOverrides ||
@@ -4431,6 +4433,10 @@ void check_selected_core_lite6_aggregate(const Lite6AggregateCheck check) {
   core::MotionInterruptStopProfileDTO authored_fault;
   authored_fault.profile_id = "fault_spring_back_hold";
   authored_fault.stop_mode = core::MotionInterruptStopMode::kSpringBackHold;
+  if (check == Lite6AggregateCheck::kDeploymentFastFaultStopProfile) {
+    authored_fault.profile_id = "fault_spring_back_fast";
+    authored_fault.stop_mode = core::MotionInterruptStopMode::kSpringBackFast;
+  }
   authored_fault.jerk_limits_enabled = true;
   for (const auto &resource : arm_binding.value().resources)
     authored_fault.per_joint_max_deceleration.emplace(
@@ -4438,7 +4444,8 @@ void check_selected_core_lite6_aggregate(const Lite6AggregateCheck check) {
         core::CoordinateAccelerationDTO{core::AngularAccelerationDTO{7.0}});
   auto expected_arm_fault_limits = authored_fault.per_joint_max_deceleration;
   if (authored_fault_check) {
-    if (check != Lite6AggregateCheck::kDeploymentFaultStopProfile) {
+    if (check != Lite6AggregateCheck::kDeploymentFaultStopProfile &&
+        check != Lite6AggregateCheck::kDeploymentFastFaultStopProfile) {
       // The actual UR10e component profile has these six additional gripper
       // joints. This owning constructor fixture uses its real Lite6 arm
       // binding; it does not relabel that model as UR10e.
@@ -6074,6 +6081,12 @@ TEST(RetainedProductCrossConsumer,
      DeploymentAuthoredFaultStopProfileIsTheMotionFaultProfile) {
   check_selected_core_lite6_aggregate(
       Lite6AggregateCheck::kDeploymentFaultStopProfile);
+}
+
+TEST(RetainedProductCrossConsumer,
+     DeploymentAuthoredFastFaultProfileSurvivesRegistrationAndStopPreparation) {
+  check_selected_core_lite6_aggregate(
+      Lite6AggregateCheck::kDeploymentFastFaultStopProfile);
 }
 
 TEST(RetainedProductCrossConsumer,

@@ -827,7 +827,7 @@ describe('Apply while a run exists', () => {
     expect(await confirm('program')).toBeNull();
     const phase = hooks!.resetApply.sequence!.phase;
     expect(phase).toMatchObject({ kind: 'awaiting_idle', delivery: 'unconfirmed' });
-    expect(resetApplyPhaseText(phase)).toContain('unknown — reconciling');
+    expect(resetApplyPhaseText(phase)).toContain('unknown: reconciling');
     const correlationId = transport.sendExecutionCommand.mock.calls[0][2] as string;
     // The resynchronized snapshot still shows the held run.
     await render({ ...HELD, admissionGeneration: 10 });

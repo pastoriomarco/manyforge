@@ -24,6 +24,7 @@
 #include <manyforge_core/stop_fault_recovery.hpp>
 #include <manyforge_core/time/ischeduler.hpp>
 #include <manyforge_core/types/capability_definition.hpp>
+#include <manyforge_core/types/collision_world_snapshot.hpp>
 #include <manyforge_core/types/command_schema.hpp>
 #include <manyforge_roboplan/retained_native_cell_command_readiness_port.hpp>
 #include <manyforge_roboplan/retained_native_cell_runtime.hpp>
@@ -2100,6 +2101,84 @@ TEST(RetainedNativeCellRuntimeTest,
     EXPECT_TRUE(peer_lifetime.expired());
   }
   RemoveJournalFiles(journal_path);
+}
+
+TEST(RetainedNativeCellRuntimeTest,
+     ProgramResolverPreservesContactPoliciesAndFencesThePhysicalOwner) {
+  auto physical_value = qualification_fixture::make_binding().value();
+  physical_value.collision_body_bindings = {
+      {core::CollisionBodyRoleId("tool_collision"),
+       core::ModelInstanceId("robot.model"),
+       core::ModelRevision("model-revision"),
+       {"tool_body"}}};
+  const auto physical_binding =
+      core::verify_runtime_participant_binding(std::move(physical_value));
+  ASSERT_TRUE(physical_binding.ok()) << physical_binding.error().message;
+  auto program_value = physical_binding.value().value();
+  program_value.program_id = core::ProgramId("program.with-contact-policy");
+  program_value.program_revision =
+      core::ProgramRevision("contact-program-revision");
+  program_value.program_binding_id =
+      core::ProgramBindingId("contact-program-binding");
+  program_value.contact_grasp_bindings = {core::ProgramContactGraspBindingDTO{
+      core::ContactPolicyId("probe_contact_policy"),
+      core::ContactPolicyRevision("contact-policy-revision"),
+      core::RuntimeObjectId("trial.probe_object"),
+      {{program_value.component_role_id,
+        program_value.target_role_id,
+        program_value.controllable_component_id,
+        program_value.command_target_id,
+        core::ModelRoleId("body"),
+        core::CollisionBodyRoleId("tool_collision"),
+        core::ModelInstanceId("robot.model"),
+        core::ModelRevision("model-revision"),
+        {core::make_component_collision_body_id(
+            program_value.controllable_component_id,
+            core::ModelInstanceId("robot.model"),
+            core::CollisionBodyRoleId("tool_collision"), 0U)}}},
+      0.002,
+      0.8}};
+  const auto program_binding =
+      core::verify_runtime_participant_binding(std::move(program_value));
+  ASSERT_TRUE(program_binding.ok()) << program_binding.error().message;
+  CellTestExecutionEngine engine;
+  const auto physical = TestRegistration(physical_binding.value(), &engine);
+  const core::OperationIntentDTO intent{
+      {core::RequestId("request.contact-policy"),
+       core::RequestOwnerEpoch("owner.resolver"), "test", std::nullopt},
+      program_binding.value().value().program_id,
+      program_binding.value().value().program_revision,
+      program_binding.value().value().program_binding_id,
+      core::ProgramRunId("run.resolver"),
+      physical_binding.value().value().graph_revision,
+      physical_binding.value().value().retained_bundle_id,
+      std::nullopt,
+      {}};
+  const auto resolve = [&](const core::RuntimeParticipantBinding &selected) {
+    auto resolver = make_retained_cell_kernel_participant_resolver(
+        [selected](const core::OperationIntentDTO &, std::size_t) {
+          return core::Result<RetainedResolvedParticipant>::Ok(
+              {selected, false});
+        },
+        {physical});
+    return resolver(intent, 0U);
+  };
+  // The ordinary first node carries the Program's policy catalog even when
+  // that node does not select a contact policy. It must keep the same owner.
+  const auto resolved = resolve(program_binding.value());
+  ASSERT_TRUE(resolved.ok()) << resolved.error().message;
+  EXPECT_EQ(resolved.value().engine, &engine);
+  EXPECT_EQ(resolved.value().binding.value(), program_binding.value().value());
+
+  auto crossed = program_binding.value().value();
+  crossed.resources.front().compiled_resource_name = "another_robot_joint";
+  const auto crossed_binding =
+      core::verify_runtime_participant_binding(std::move(crossed));
+  ASSERT_TRUE(crossed_binding.ok()) << crossed_binding.error().message;
+  const auto rejected = resolve(crossed_binding.value());
+  ASSERT_FALSE(rejected.ok());
+  EXPECT_EQ(rejected.error().details.at("reason"),
+            "runtime_participant_stop_port_missing");
 }
 
 TEST(RetainedNativeCellRuntimeTest,

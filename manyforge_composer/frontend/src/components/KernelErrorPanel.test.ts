@@ -93,6 +93,21 @@ describe('Kernel diagnostic presentation shell', () => {
     expect(html).toContain('data-presentation-key="owner-issued-incident-7"');
   });
 
+  it('puts the status line under the cause and the code and details behind Technical details', () => {
+    const html = renderToStaticMarkup(createElement(KernelErrorPanel, {
+      error: { code: 'qualified_code', message: 'raw', details: { node: 'n1' } },
+      presentation: {
+        headline: 'Pose goal unreachable',
+        status: 'Program operation failed · Active',
+        hint: '',
+        severity: 'error',
+      },
+    }));
+    expect(html).toContain('<h2>Pose goal unreachable</h2><p class="kernel-error-status">Program operation failed · Active</p>');
+    expect(html).not.toContain('<p>raw</p>');
+    expect(html).toContain('<details class="kernel-error-technical"><summary>Technical details</summary><code>qualified_code</code><dl>');
+  });
+
   it('renders the retained dismiss control only when a callback is supplied', () => {
     const error = { code: 'route_failed', message: 'No route' };
     expect(renderToStaticMarkup(createElement(KernelErrorPanel, { error })))

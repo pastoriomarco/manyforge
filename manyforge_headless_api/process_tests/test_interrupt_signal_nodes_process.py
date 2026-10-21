@@ -43,6 +43,7 @@ from manyforge_headless_api.process_tests.test_process_stack import (
 )
 from manyforge_headless_api.process_tests.test_ui6i_grouped_execution import (
     _activate_loaded_components,
+    _disable_for_reload,
     _native_events,
     _start_motion,
     _start_run,
@@ -207,9 +208,13 @@ def _signal_stack(scenario_writer=_write_signal_scenario) -> Iterator[tuple[Proc
 
 
 def _load(
-    stack: ProcessStack, project: Path, *, scenario_id: str = SCENARIO_ID
+    stack: ProcessStack,
+    project: Path,
+    *,
+    scenario_id: str = SCENARIO_ID,
+    activate_components: bool = True,
 ) -> dict[str, Any]:
-    """One ordinary Composer Load, its Apply, then explicit activation."""
+    """One ordinary Composer Load and Apply, optionally followed by activation."""
 
     load_identity = uuid.uuid4().hex
     with (
@@ -252,13 +257,54 @@ def _load(
                 break
             assert time.monotonic() < deadline, status
             time.sleep(0.02)
-        component_ids = _activate_loaded_components(stack)
-        assert set(component_ids) == {"lite6_robot", "station_io"}, component_ids
-        _wait_components_reached_requested_target(stack, component_ids)
+        if activate_components:
+            component_ids = _activate_loaded_components(stack)
+            assert set(component_ids) == {"lite6_robot", "station_io"}, component_ids
+            _wait_components_reached_requested_target(stack, component_ids)
         stack.wait_authoring_admission(expected_allowed=True)
         applied = composer.program_applied()
         assert applied["scenario_id"] == scenario_id, applied
         return applied
+
+
+def _write_runtime_configuration_candidate(directory: Path, project: Path) -> Path:
+    """Write a new file for the same Scenario with one changed Lite6 setting."""
+
+    from manyforge_composer.backend.scenario_artifacts import (
+        build_scenario_document,
+        load_scenario_artifact,
+        save_scenario_artifact,
+    )
+
+    source, _ = load_scenario_artifact(str(project), allowed_roots=[str(directory)])
+    deployment = deepcopy(source["deployment_draft"])
+    lite6 = next(
+        row for row in deployment["components"]
+        if row["component_id"] == "lite6_robot"
+    )
+    runtime = lite6["configuration"]["runtime_configuration"]
+    runtime["initial_joint_positions_rad"][0] += 0.1
+    target = directory / f"{SCENARIO_ID}.runtime-apply.scenario"
+    candidate = build_scenario_document(
+        scenario_id=SCENARIO_ID,
+        name="Signal-move retained I/O Apply (process test)",
+        description="Changes Lite6 runtime configuration; preserves the Scenario identity.",
+        program_draft=source["program_draft"],
+        deployment_draft=deployment,
+        program_role_assignment=source["program_role_assignment"],
+        manyforge_version=(REPOSITORY_ROOT / "VERSION").read_text(
+            encoding="utf-8"
+        ).strip(),
+        last_known_status="unknown",
+    )
+    save_scenario_artifact(
+        candidate,
+        str(target),
+        allowed_roots=[str(directory)],
+        overwrite=False,
+        source_project_path=str(project),
+    )
+    return target
 
 
 def _node_operations(stack: ProcessStack, program_run_id: str) -> dict[str, list[str]]:
@@ -547,3 +593,33 @@ def test_trial_d_mock_script_retains_value_and_operator_ack_times_out_over_real_
         # Preserve actual durable artifacts at the assertion boundary even on success.
         stack.log.flush()
         keep_failure_evidence(stack.root.parent)
+
+
+@pytest.mark.skipif(_skip_reason() is not None, reason=str(_skip_reason()))
+def test_inactive_runtime_apply_rejoins_retained_io_component() -> None:
+    """Same-Scenario Load replaces disabled Lite6 and retains the exact I/O owner."""
+
+    with _signal_stack() as (stack, project):
+        before_apply = _load(stack, project)
+        with (
+            HeadlessHttpClient(stack.base_url, timeout_seconds=10.0) as headless,
+            HeadlessHttpClient(stack.composer_url, timeout_seconds=30.0) as composer,
+        ):
+            io_before = headless.cclc_component("station_io")
+            assert io_before["component_lifecycle_state"] == "active", io_before
+            selected_before = composer.request("GET", "/api/deployment/workspace")["managerApplied"]
+            assert selected_before["scenarioId"] == SCENARIO_ID, selected_before
+        _disable_for_reload(stack, "lite6_robot")
+        candidate = _write_runtime_configuration_candidate(project.parent, project)
+        _load(stack, candidate, activate_components=False)
+        with HeadlessHttpClient(stack.base_url, timeout_seconds=10.0) as headless:
+            motion_after = headless.cclc_component("lite6_robot")
+            io_after = headless.cclc_component("station_io")
+        with HeadlessHttpClient(stack.composer_url, timeout_seconds=30.0) as composer:
+            selected_after = composer.request("GET", "/api/deployment/workspace")["managerApplied"]
+        assert before_apply["scenario_id"] == SCENARIO_ID, before_apply
+        assert selected_after["scenarioId"] == SCENARIO_ID, selected_after
+        assert selected_after["deploymentRevision"] != selected_before["deploymentRevision"]
+        assert motion_after["component_lifecycle_state"] == "disabled", motion_after
+        assert io_after["component_lifecycle_state"] == "active", io_after
+        assert io_after["provider_occurrences"] == io_before["provider_occurrences"]

@@ -14,6 +14,11 @@ from manyforge_behavior.canonical_artifact import (
     canonical_json_bytes,
 )
 
+from .stop_fallback_sequence import (
+    FALLBACK_STOP_MODES_FIELD,
+    fallback_sequence_error,
+)
+
 
 DEPLOYMENT_INTENT_API_VERSION = "manyforge.deployment_intent.v2"
 _PORTABLE_ID = re.compile(r"^[a-z][a-z0-9._-]{0,127}$")
@@ -215,7 +220,7 @@ def _validate_controlled_stop(value: Any, label: str) -> dict[str, Any]:
             "deceleration_time_s",
             "per_joint_limits",
         },
-        optional={"max_stop_time_s"},
+        optional={"max_stop_time_s", FALLBACK_STOP_MODES_FIELD},
         label=label,
     )
     mode = profile["stop_mode"]
@@ -287,6 +292,15 @@ def _validate_controlled_stop(value: Any, label: str) -> dict[str, Any]:
         result["max_stop_time_s"] = _positive_finite(
             profile["max_stop_time_s"], f"{label}.max_stop_time_s"
         )
+    # Ordered fallbacks after the authored mode (stop_fallback_sequence.py).
+    # Absent and [] are equivalent (primary, then hard); [] is not emitted.
+    if FALLBACK_STOP_MODES_FIELD in profile:
+        fallbacks = profile[FALLBACK_STOP_MODES_FIELD]
+        error = fallback_sequence_error(mode, fallbacks)
+        if error is not None:
+            _fail(f"{label}.{FALLBACK_STOP_MODES_FIELD} {error}")
+        if fallbacks:
+            result[FALLBACK_STOP_MODES_FIELD] = list(fallbacks)
     return result
 
 

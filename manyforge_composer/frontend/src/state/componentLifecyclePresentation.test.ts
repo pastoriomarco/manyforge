@@ -113,7 +113,7 @@ describe('component lifecycle presentation', () => {
 
   it('uses only the owner-issued delayed flag for slower-than-expected startup', () => {
     expect(message(snapshot('declared', {}, { delayed: true }))).toBe(
-      'Startup delayed — still waiting',
+      'Startup delayed · still waiting',
     );
     expect(message(snapshot('prepared', {}, {
       phase: 'transition_in_progress', blockingCauseClass: 'none', nextIntent: 'enable',
@@ -124,7 +124,7 @@ describe('component lifecycle presentation', () => {
     const presented = componentLifecyclePresentation(snapshot('prepared', {}, {
       phase: 'outcome_uncertain', blockingCauseClass: 'none',
     }));
-    expect(presented.message).toBe('Activation outcome uncertain — checking');
+    expect(presented.message).toBe('Activation outcome uncertain · checking');
     expect(presented.tone).toBe('held');
   });
 
@@ -132,7 +132,7 @@ describe('component lifecycle presentation', () => {
     const lost = componentLifecyclePresentation(snapshot('active', {}, {
       phase: 'blocked', nextIntent: null,
     }));
-    expect(lost.message).toBe('Controller lost — motion held');
+    expect(lost.message).toBe('Controller lost · motion held');
     expect(lost.tone).toBe('held');
     expect(lost.consequence).toContain('interrupted work stays held');
     expect(message(snapshot('prepared', {}, {}))).toBe('Waiting for controller');
@@ -145,9 +145,9 @@ describe('component lifecycle presentation', () => {
     ['emergency_stop', 'Emergency stop engaged'],
     ['protective_stop', 'Protective stop engaged'],
     ['safeguard_stop', 'Safeguard stop engaged'],
-    ['fault', 'Fault — intervention required'],
+    ['fault', 'Fault · intervention required'],
     ['configuration', 'Configuration mismatch'],
-    ['unknown', 'Controller status unknown — intervention required'],
+    ['unknown', 'Controller status unknown · intervention required'],
   ] as const)('requires intervention for %s', (cause, expected) => {
     const presented = componentLifecyclePresentation(snapshot('active', {}, {
       phase: 'blocked', blockingCauseClass: cause, delayed: true,
@@ -158,10 +158,10 @@ describe('component lifecycle presentation', () => {
   });
 
   it.each([
-    ['collision', 'Collision detected — acknowledgement required'],
-    ['external_control', 'Robot moved from its own interface — acknowledgement required'],
-    ['provider_lost', 'Controller lost — incident, motion held'],
-    ['emergency_stop', 'Emergency stop — acknowledgement required'],
+    ['collision', 'Collision detected · acknowledgement required'],
+    ['external_control', 'Robot moved from its own interface · acknowledgement required'],
+    ['provider_lost', 'Controller lost · incident, motion held'],
+    ['emergency_stop', 'Emergency stop · acknowledgement required'],
   ] as const)('an open %s incident takes precedence and shows its facts', (cause, expected) => {
     const presented = componentLifecyclePresentation(snapshot('active', {
       requestedState: 'disabled', origin: 'operator',
@@ -188,9 +188,9 @@ describe('component lifecycle presentation', () => {
   });
 
   it.each([
-    ['collision', 'Collision detected — intervention required'],
-    ['external_control', 'Robot moved from its own interface — intervention required'],
-    ['provider_lost', 'Controller lost — motion held'],
+    ['collision', 'Collision detected · intervention required'],
+    ['external_control', 'Robot moved from its own interface · intervention required'],
+    ['provider_lost', 'Controller lost · motion held'],
   ] as const)('words the new %s blocking cause without an incident', (cause, expected) => {
     expect(message(snapshot('active', {}, {
       phase: 'blocked', blockingCauseClass: cause,
@@ -267,7 +267,7 @@ it('shows actual degraded readiness even for durable Active and keeps a real hea
     providerManifestId: 'manifest.1', providerManifestRevision: 'manifest.revision.1', providerRuntimeUnitId: 'runtime.1',
     providerRuntimeEpoch: 'epoch.1', lifecyclePlanCatalogDigest: 'catalog.1' },
     health: { observedState: 'faulted', facts: [], diagnostic: null }, decisionKind: null, error: current.readiness.error }];
-  expect(componentLifecyclePresentation(current).message).toBe('Fault — intervention required');
+  expect(componentLifecyclePresentation(current).message).toBe('Fault · intervention required');
 });
 
 

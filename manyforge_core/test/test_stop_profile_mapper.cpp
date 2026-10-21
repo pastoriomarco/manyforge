@@ -1,10 +1,12 @@
 #include <gtest/gtest.h>
 
 #include <limits>
+#include <manyforge_core/motion_interrupt/stop_profile_mapper.hpp>
 #include <optional>
 #include <string>
+#include <type_traits>
+#include <utility>
 #include <vector>
-#include <manyforge_core/motion_interrupt/stop_profile_mapper.hpp>
 
 namespace manyforge::core {
 namespace {
@@ -227,7 +229,7 @@ TEST(StopProfileMapper, MapsTypedMixedCoordinatesToCanonicalResources) {
   profile.per_joint_settle_velocity_threshold = {
       {"joint_1", AngularVelocityDTO{0.01}},
   };
-  profile.recoverable_substitution_mode = MotionInterruptStopMode::kSpringBackHold;
+  profile.fallback_stop_modes = {MotionInterruptStopMode::kSpringBackHold};
   const auto resource_rows = resources();
   const auto default_rows = defaults();
 
@@ -239,7 +241,7 @@ TEST(StopProfileMapper, MapsTypedMixedCoordinatesToCanonicalResources) {
   const auto& mapped = std::get<SoftOnPathStopParametersDTO>(result.value());
   EXPECT_DOUBLE_EQ(mapped.deceleration_time_s, 0.25);
   EXPECT_TRUE(mapped.allow_natural_completion_on_short_path);
-  EXPECT_EQ(mapped.recoverable_substitution_mode, MotionControlledStopMode::kSpringBackHold);
+  EXPECT_EQ(mapped.fallback_stop_modes, (std::vector{MotionControlledStopMode::kSpringBackHold}));
   ASSERT_EQ(mapped.per_resource_limits.size(), 2U);
   EXPECT_EQ(mapped.per_resource_limits[0].resource_id.value(), "resource.a");
   EXPECT_EQ(coordinate_kind(mapped.per_resource_limits[0].max_deceleration),
@@ -385,34 +387,45 @@ TEST(StopProfileMapper, RejectsUnknownLooseOrWrongUnitSettleOverride) {
   EXPECT_EQ(reason(result.error()), "motion_interrupt_stop_profile_invalid");
 }
 
-TEST(StopProfileMapper, RejectsUnqualifiedOrPrecisionSubstitution) {
-  const auto resource_rows = resources();
-  const auto default_rows = defaults();
-
+TEST(StopProfileMapper, RejectsUnqualifiedSubstitution) {
   auto wrong_pair = soft_profile();
-  wrong_pair.recoverable_substitution_mode = MotionInterruptStopMode::kHardDeceleration;
-  auto result = map_motion_interrupt_stop_profile_to_contract_parameters(
-      wrong_pair, MotionInterruptNodeCategory::kGeneric, resource_rows, default_rows);
+  wrong_pair.fallback_stop_modes = {MotionInterruptStopMode::kHardDeceleration};
+  const auto result = map_motion_interrupt_stop_profile_to_contract_parameters(
+      wrong_pair, MotionInterruptNodeCategory::kPrecisionContact, resources(), defaults());
   ASSERT_FALSE(result.ok());
   EXPECT_EQ(reason(result.error()), "motion_interrupt_stop_profile_invalid");
+}
 
+TEST(StopProfileMapper, PreservesPrecisionContactNaturalCompletionAndQualifiedSubstitution) {
   auto precision = soft_profile();
-  precision.allow_natural_completion_on_short_path = false;
-  precision.recoverable_substitution_mode = MotionInterruptStopMode::kSpringBackHold;
-  result = map_motion_interrupt_stop_profile_to_contract_parameters(
-      precision, MotionInterruptNodeCategory::kPrecisionContact, resource_rows, default_rows);
-  ASSERT_FALSE(result.ok());
-  EXPECT_EQ(reason(result.error()), "motion_interrupt_substitution_precision_contact_forbidden");
-  precision.recoverable_substitution_mode.reset();
-  precision.allow_natural_completion_on_short_path = true;
+  precision.fallback_stop_modes = {MotionInterruptStopMode::kSpringBackHold};
+  auto result = map_motion_interrupt_stop_profile_to_contract_parameters(
+      precision, MotionInterruptNodeCategory::kPrecisionContact, resources(), defaults());
+  ASSERT_TRUE(result.ok()) << result.error().message;
+  const auto& soft = std::get<SoftOnPathStopParametersDTO>(result.value());
+  EXPECT_TRUE(soft.allow_natural_completion_on_short_path);
+  EXPECT_EQ(soft.fallback_stop_modes, (std::vector{MotionControlledStopMode::kSpringBackHold}));
+
+  precision.fallback_stop_modes.clear();
   for (const auto mode :
-       {MotionInterruptStopMode::kSoftOnPath, MotionInterruptStopMode::kSpringBackHold}) {
+       {MotionInterruptStopMode::kSoftOnPath, MotionInterruptStopMode::kSpringBackHold,
+        MotionInterruptStopMode::kSpringBackFast}) {
     precision.stop_mode = mode;
     result = map_motion_interrupt_stop_profile_to_contract_parameters(
-        precision, MotionInterruptNodeCategory::kPrecisionContact, resource_rows, default_rows);
-    ASSERT_FALSE(result.ok());
-    EXPECT_EQ(reason(result.error()),
-              "motion_interrupt_natural_completion_precision_contact_forbidden");
+        precision, MotionInterruptNodeCategory::kPrecisionContact, resources(), defaults());
+    const auto generic = map_motion_interrupt_stop_profile_to_contract_parameters(
+        precision, MotionInterruptNodeCategory::kGeneric, resources(), defaults());
+    ASSERT_TRUE(result.ok()) << result.error().message;
+    ASSERT_TRUE(generic.ok()) << generic.error().message;
+    EXPECT_EQ(result.value(), generic.value());
+    if (mode == MotionInterruptStopMode::kSoftOnPath) {
+      EXPECT_TRUE(std::get<SoftOnPathStopParametersDTO>(result.value())
+                      .allow_natural_completion_on_short_path);
+    } else {
+      const auto& spring = std::get<SpringBackHoldStopParametersDTO>(result.value());
+      EXPECT_TRUE(spring.allow_natural_completion_on_short_path);
+      EXPECT_EQ(spring.stop_mode, provider_contract_stop_mode(mode));
+    }
   }
 }
 
@@ -542,4 +555,55 @@ TEST(StopProfileMapper, ProjectsOneCompleteLaneNeutralEvidenceObject) {
 }
 
 }  // namespace
+
+TEST(StopProfileMapper, OrderedFallbacksMapEveryStrictControlledSubsequence) {
+  using I = MotionInterruptStopMode;
+  using C = MotionControlledStopMode;
+  for (const auto& [primary, modes] : std::vector<std::pair<I, std::vector<I>>>{
+           {I::kSoftOnPath, {}},
+           {I::kSoftOnPath, {I::kSpringBackHold}},
+           {I::kSoftOnPath, {I::kSpringBackFast}},
+           {I::kSoftOnPath, {I::kSpringBackHold, I::kSpringBackFast}},
+           {I::kSpringBackHold, {}},
+           {I::kSpringBackHold, {I::kSpringBackFast}},
+           {I::kSpringBackFast, {}}}) {
+    auto profile = soft_profile();
+    profile.stop_mode = primary;
+    profile.fallback_stop_modes = modes;
+    const auto mapped = map_motion_interrupt_stop_profile_to_contract_parameters(
+        profile, MotionInterruptNodeCategory::kGeneric, resources(), defaults());
+    ASSERT_TRUE(mapped.ok()) << mapped.error().message;
+    std::vector<C> expected;
+    for (const auto mode : modes)
+      expected.push_back(mode == I::kSpringBackHold ? C::kSpringBackHold : C::kSpringBackFast);
+    std::visit(
+        [&](const auto& parameters) {
+          using T = std::decay_t<decltype(parameters)>;
+          if constexpr (!std::is_same_v<T, HardDecelerationStopParametersDTO>)
+            EXPECT_EQ(parameters.fallback_stop_modes, expected);
+          else
+            ADD_FAILURE();
+        },
+        mapped.value());
+  }
+  for (const auto& modes :
+       std::vector<std::vector<I>>{{I::kSoftOnPath},
+                                   {I::kHardDeceleration},
+                                   {I::kSpringBackFast, I::kSpringBackHold},
+                                   {I::kSpringBackHold, I::kSpringBackHold},
+                                   {I::kSpringBackHold, I::kSpringBackFast, I::kSpringBackFast}}) {
+    auto profile = soft_profile();
+    profile.fallback_stop_modes = modes;
+    EXPECT_FALSE(map_motion_interrupt_stop_profile_to_contract_parameters(
+                     profile, MotionInterruptNodeCategory::kGeneric, resources(), defaults())
+                     .ok());
+  }
+  auto hold = soft_profile();
+  hold.stop_mode = I::kSpringBackHold;
+  hold.fallback_stop_modes = {I::kSpringBackHold};
+  EXPECT_FALSE(map_motion_interrupt_stop_profile_to_contract_parameters(
+                   hold, MotionInterruptNodeCategory::kGeneric, resources(), defaults())
+                   .ok());
+}
+
 }  // namespace manyforge::core

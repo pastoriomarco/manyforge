@@ -509,6 +509,37 @@ Result<void> ResourceAddressedExecutionKernel::reconfigure_runtime_participants_
       if (retained_provider_domains.size() > runtime_route_configuration_readbacks_.size())
         return reject<void>("retained provider witnesses exceed the actual domain inventory",
                             "runtime_provider_reseal_witness_invalid", ErrorCode::kInvalidRequest);
+      const auto unchanged_fenced_provider = [&](
+          const ResolvedLifecycleControlDomainScopeDTO& domain) {
+        if (apply_scope == nullptr || retained_components == nullptr) return false;
+        const auto scoped = std::find_if(
+            apply_scope->domains.begin(), apply_scope->domains.end(),
+            [&](const auto& row) { return row.control_domain_id == domain.control_domain_id; });
+        const auto* sides = scoped == apply_scope->domains.end()
+                                ? nullptr
+                                : std::get_if<ProviderConfigurationFenceDomainDTO>(
+                                      &scoped->payload);
+        const auto* provider = domain.provider();
+        if (sides == nullptr || provider == nullptr ||
+            !sides->predecessor_provider || !sides->candidate_provider ||
+            *sides->predecessor_provider != *sides->candidate_provider ||
+            scoped->predecessor_control_domain_revision !=
+                std::optional(domain.control_domain_revision) ||
+            scoped->candidate_control_domain_revision !=
+                std::optional(domain.control_domain_revision) ||
+            !std::binary_search(retained_components->begin(), retained_components->end(),
+                                provider->provider.controllable_component_id) ||
+            !std::binary_search(apply_scope->controllable_component_ids.begin(),
+                                apply_scope->controllable_component_ids.end(),
+                                provider->provider.controllable_component_id))
+          return false;
+        const auto& proof = *sides->predecessor_provider;
+        return proof.controllable_component_id == provider->provider.controllable_component_id &&
+               proof.provider_instance_id == provider->provider.provider_instance_id &&
+               proof.signal_configuration_digest ==
+                   provider->provider.signal_configuration_digest &&
+               proof.output_resources == domain.resource_ids();
+      };
       try {
         for (std::size_t index = 0U; index < retained_provider_domains.size(); ++index) {
           const auto& domain = retained_provider_domains[index];
@@ -518,10 +549,15 @@ Result<void> ResourceAddressedExecutionKernel::reconfigure_runtime_participants_
           const auto* current = found == runtime_route_configuration_readbacks_.end()
                                     ? nullptr
                                     : found->second.provider();
+          const bool changed = changed_domains.contains(domain.control_domain_id);
+          // Apply provider domains are marked changed for fencing even when
+          // their exact predecessor and candidate provider are identical.
+          const bool retained_fenced_provider =
+              changed && unchanged_fenced_provider(domain);
           if (!domain.locally_valid() || !occurrence.locally_valid() || !provider ||
               (index != 0U && !(retained_provider_domains[index - 1U].control_domain_id <
                                 domain.control_domain_id)) ||
-              changed_domains.contains(domain.control_domain_id) ||
+              (changed && !retained_fenced_provider) ||
               !current || !current->locally_valid() || current->domain != domain ||
               current->provider_occurrence != occurrence ||
               current->retained_bundle_id != *stop_retained_bundle_id_ ||
@@ -2428,8 +2464,8 @@ ResourceAddressedExecutionKernel::bind_captured_node_io_rule(
   IoMotionRulePolicyBindingDTO policy{selected->policy_id, selected->condition,
       selected->required_signal_sources, {semantics.activation_mode}, {semantics.stop_mode},
       semantics.priority};
-  if (profile.value().recoverable_substitution_mode)
-    policy.allowed_stop_modes.insert(*profile.value().recoverable_substitution_mode);
+  for (const auto mode : profile.value().fallback_stop_modes)
+    policy.allowed_stop_modes.insert(mode);
   policy.semantics = IoMotionRulePolicySemanticsDTO{InterruptPolicyScopeKind::kMove,
       InterruptPreemptionAction::kCompleteMoveOnSignal, {OperationStateKind::kExecuting},
       InterruptPostLatchDisposition::kAutoClearAfterMotionOutcome, false, {}};

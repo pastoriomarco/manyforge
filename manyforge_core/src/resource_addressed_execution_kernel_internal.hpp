@@ -647,8 +647,9 @@ struct StopStaticFacts final {
       });
   if (policy == binding.contact_grasp_bindings.end() ||
       policy->contact_policy_id != *motion.contact_policy_id) {
-    // Other contact-policy modes remain selected from the retained scene
-    // policy. Only Program-owned contact_grasp requires this late binding.
+    // Not a Program-owned contact_grasp: no late runtime-object binding is
+    // needed here; collision validation resolves the id against the retained
+    // scene policy. Every Program-owned contact_grasp requires this binding.
     return Result<std::optional<ResolvedContactGraspBindingDTO>>::Ok(std::nullopt);
   }
   const auto object = std::lower_bound(

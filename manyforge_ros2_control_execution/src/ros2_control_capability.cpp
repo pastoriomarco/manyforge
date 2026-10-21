@@ -131,7 +131,9 @@ compute_ros2_control_motion_interrupt_stop_capability(
     return cap;
   }
 
-  cap.supported_stop_modes = {core::MotionInterruptStopMode::kSpringBackHold};
+  // Q130: the fast spring-back has the same (absent) controller preconditions.
+  cap.supported_stop_modes = {core::MotionInterruptStopMode::kSpringBackHold,
+                              core::MotionInterruptStopMode::kSpringBackFast};
 
   bool decelerate_evidence_complete = config.decelerate_on_cancel;
   if (decelerate_evidence_complete) {

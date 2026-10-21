@@ -616,7 +616,7 @@ def test_a_present_predecessor_assessment_is_not_taken_as_final(stale) -> None:
     assert len(adapter.audit_events) == 1
 
 
-def test_a_malformed_assessment_read_is_surfaced_as_the_owner_failure() -> None:
+def test_a_malformed_assessment_read_never_replaces_the_operation_failure() -> None:
     malformed = OwnerTaskSnapshot(
         task_id="task",
         state=OwnerTaskState.FAILED,
@@ -635,9 +635,164 @@ def test_a_malformed_assessment_read_is_surfaced_as_the_owner_failure() -> None:
     adapter = _motion(port, clock)
 
     assert _tick(adapter) is _FAILURE  # Not waited for: a permanent read failure.
-    assert adapter.failure_reason_code == "owner_recovery_assessment_invalid"
+    assert adapter.failure_reason_code == "planning_failed"  # The operation's own failure.
+    assert adapter.failure_message.startswith("no feasible path (")
+    assert "owner_recovery_assessment_invalid" in adapter.failure_message
+    assert "headless recovery assessment has no owner projection" in adapter.failure_message
     assert port.closes == []
     assert len(port.starts) == 1
+
+
+_LEAD_EXPIRED = "motion_replacement_recognition_lead_expired"
+_READ_FAILURE = {
+    "reason_code": "owner_recovery_assessment_invalid",
+    "message": "operation is no longer resident",
+}
+
+
+def _lead_expired(state: OwnerTaskState, **metadata: Any) -> OwnerTaskSnapshot:
+    return OwnerTaskSnapshot(
+        task_id="task",
+        state=state,
+        metadata={"operation_id": "op", "operation_failure": _FACT, **metadata},
+        reason_code=_LEAD_EXPIRED,
+        message="replacement recognition lead expired",
+        details={"reason": "lead_expired"},
+    )
+
+
+def _owner_task(port: _MotionPort) -> v2_owner.OwnerTaskAdapter:
+    """A plain owner task (no motion retry): its failure reaches the tree
+    first, then the close waits for the assessment (`_advance_close`)."""
+
+    return v2_owner.OwnerTaskAdapter(
+        name="owner",
+        node_id="motion.move_to_pose",
+        node_instance_id="owner",
+        attempt_source=_Attempts(),
+        parameters={},
+        value_sources={},
+        input_resolver=_Resolver(),
+        port=port,
+        owner_port_name="kernel_operations",
+        owner_api="kernel.operation",
+    )
+
+
+def _assert_operation_failure_kept(adapter) -> None:
+    assert adapter.failure_reason_code == _LEAD_EXPIRED
+    assert adapter.failure_message.startswith("replacement recognition lead expired (")
+    assert "owner_recovery_assessment_invalid" in adapter.failure_message
+    assert "operation is no longer resident" in adapter.failure_message
+    assert dict(adapter.failure_details) == {"reason": "lead_expired"}
+
+
+@pytest.mark.parametrize(
+    "state", [OwnerTaskState.FAILED, OwnerTaskState.INTERRUPTED], ids=["failed", "interrupted"]
+)
+def test_live_replay_a_read_failure_after_the_tree_failure_keeps_the_operation_reason(
+    state,
+) -> None:
+    port = _MotionPort(
+        [_lead_expired(state)],
+        observes=[_lead_expired(state, recovery_assessment_failure=_READ_FAILURE)],
+    )
+    adapter = _owner_task(port)
+
+    assert _tick(adapter) is _FAILURE
+    _assert_operation_failure_kept(adapter)
+    assert port.observations == 1
+    assert port.closes == []  # Retained: never closed on a failed read.
+
+
+@pytest.mark.parametrize(
+    "state", [OwnerTaskState.FAILED, OwnerTaskState.INTERRUPTED], ids=["failed", "interrupted"]
+)
+def test_a_read_failure_before_any_decision_reports_the_operation_reason(state) -> None:
+    port = _MotionPort(
+        [_lead_expired(state)],
+        observes=[_lead_expired(state, recovery_assessment_failure=_READ_FAILURE)],
+    )
+    _time, clock = _clocked()
+    adapter = _motion(port, clock)  # Decides first (`_settle`), before any record.
+
+    assert _tick(adapter) is _FAILURE
+    _assert_operation_failure_kept(adapter)
+    assert port.closes == []
+    assert len(port.starts) == 1
+    assert adapter.cached_control_state() == "unrecoverable"  # Retained for Reset.
+
+
+def test_a_decidable_reread_wins_over_a_read_failure_beside_it() -> None:
+    decidable = _failed(_assessment(eligible=False))
+    decidable = replace(
+        decidable,
+        metadata={**decidable.metadata, "recovery_assessment_failure": _READ_FAILURE},
+    )
+    port = _MotionPort([_failed(None)], observes=[decidable])
+    _time, clock = _clocked()
+    adapter = _motion(port, clock)
+
+    assert _tick(adapter) is _FAILURE
+    assert len(port.closes) == 1  # The exact close permission decided.
+    assert adapter.failure_reason_code == "planning_failed"
+    assert adapter.failure_message == "no feasible path"
+
+
+def test_a_retired_reread_wins_over_a_read_failure_beside_it() -> None:
+    retired = _failed(None)
+    retired = replace(
+        retired,
+        metadata={
+            **retired.metadata,
+            "resident": False,
+            "recovery_assessment_failure": _READ_FAILURE,
+        },
+    )
+    port = _MotionPort([_failed(None)], observes=[retired])
+    adapter = _owner_task(port)
+
+    assert _tick(adapter) is _FAILURE
+    assert port.closes == []  # Already retired: nothing to close.
+    assert adapter.failure_reason_code == "planning_failed"
+    assert adapter.cached_control_state() == "inactive"
+
+
+def test_a_resident_operation_with_an_eligible_close_still_closes() -> None:
+    resident = _failed(_assessment(eligible=False))
+    resident = replace(resident, metadata={**resident.metadata, "resident": True})
+    port = _MotionPort([_failed(None)], observes=[resident])
+    adapter = _owner_task(port)
+
+    assert _tick(adapter) is _FAILURE
+    assert len(port.closes) == 1
+    assert adapter.failure_reason_code == "planning_failed"
+    assert adapter.cached_control_state() == "inactive"
+
+
+def test_a_transient_absence_still_rereads() -> None:
+    port = _MotionPort(
+        [_lead_expired(OwnerTaskState.FAILED)],
+        observes=[_failed(_assessment(eligible=False))],
+    )
+    real_observe = port.observe
+    errors = [OwnerTaskObservationUnavailableError("owner absent")]
+
+    def observe(task_id):
+        if errors:
+            port.observations += 1
+            raise errors.pop(0)
+        return real_observe(task_id)
+
+    port.observe = observe
+    adapter = _owner_task(port)
+
+    assert _tick(adapter) is _RUNNING  # Temporary absence: read again.
+    assert port.closes == []
+    assert _tick(adapter) is _FAILURE  # Readable now: closed.
+    assert port.observations == 2
+    assert len(port.closes) == 1
+    assert adapter.failure_reason_code == _LEAD_EXPIRED
 
 
 def test_an_unknown_admission_is_never_closed_or_waited_for() -> None:

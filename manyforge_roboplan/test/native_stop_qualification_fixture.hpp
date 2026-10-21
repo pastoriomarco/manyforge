@@ -389,8 +389,8 @@ soft_profile(const core::RuntimeParticipantBinding &binding,
   profile.deceleration_time_s = deceleration_s;
   profile.jerk_limits_enabled = true;
   profile.allow_natural_completion_on_short_path = false;
-  profile.recoverable_substitution_mode =
-      core::MotionInterruptStopMode::kSpringBackHold;
+  profile.fallback_stop_modes = {
+      core::MotionInterruptStopMode::kSpringBackHold};
   for (const auto &resource : binding.value().resources) {
     if (!resource.source_joint_name.has_value() ||
         resource.coordinate_kind != core::CoordinateKind::kAngular) {

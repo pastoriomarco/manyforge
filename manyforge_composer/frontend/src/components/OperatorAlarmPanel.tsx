@@ -15,6 +15,36 @@ export interface OperatorAlarmView {
   details: Record<string, unknown>;
 }
 
+/**
+ * What went wrong, for the headline: the owner's failure message when the
+ * record carries one, else the alarm message. The definition title is the
+ * category and goes into the status line.
+ */
+export function operatorAlarmCause(
+  alarm: { message: string; details: Record<string, unknown> },
+): string {
+  const failure = alarm.details.failure;
+  const message = failure !== null && typeof failure === 'object' && !Array.isArray(failure)
+    ? (failure as Record<string, unknown>).message
+    : undefined;
+  return typeof message === 'string' && message.trim() !== '' ? message : alarm.message;
+}
+
+/** "<category> · node <id> · <lifecycle> · <priority> · <n> occurrences". */
+export function operatorAlarmStatus(alarm: OperatorAlarmView): string {
+  const node = alarm.details.node_instance_id;
+  const occurrenceCount = alarm.details.occurrence_count;
+  return [
+    alarm.title,
+    typeof node === 'string' ? `node ${node}` : null,
+    alarm.lifecycleLabel,
+    alarm.priorityLabel,
+    typeof occurrenceCount === 'number'
+      ? `${occurrenceCount} occurrence${occurrenceCount === 1 ? '' : 's'}`
+      : null,
+  ].filter((part) => part !== null).join(' · ');
+}
+
 interface OperatorAlarmPanelProps {
   alarm: OperatorAlarmView;
   busy?: boolean;
@@ -33,17 +63,12 @@ export function OperatorAlarmPanel({
   onAcknowledge,
   onMinimize,
 }: OperatorAlarmPanelProps) {
-  const occurrenceCount = alarm.details.occurrence_count;
-  const countLabel = typeof occurrenceCount === 'number'
-    ? ` · ${occurrenceCount} occurrence${occurrenceCount === 1 ? '' : 's'}`
-    : '';
+  const cause = operatorAlarmCause(alarm);
+  const status = operatorAlarmStatus(alarm);
   return (
     <div className="operator-alarm-panel">
       <details>
-        <summary>
-          {alarm.lifecycleLabel} · {alarm.priorityLabel} · {alarm.title}
-          {countLabel}
-        </summary>
+        <summary>{cause} · {status}</summary>
         <KernelErrorPanel
           error={{
             code: alarm.definitionId,
@@ -56,7 +81,8 @@ export function OperatorAlarmPanel({
             },
           }}
           presentation={{
-            headline: `${alarm.lifecycleLabel} · ${alarm.priorityLabel} · ${alarm.title}`,
+            headline: cause,
+            status,
             hint: alarm.operatorResponse,
             severity: alarm.severity,
           }}

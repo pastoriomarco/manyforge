@@ -11,6 +11,8 @@
 #include <utility>
 #include <vector>
 
+#include "stop_fallback_codec_internal.hpp"
+
 namespace manyforge::core {
 namespace {
 
@@ -226,6 +228,7 @@ template <typename Enum>
       value,
       {{"soft_on_path", MotionControlledStopMode::kSoftOnPath},
        {"spring_back_hold", MotionControlledStopMode::kSpringBackHold},
+       {"spring_back_fast", MotionControlledStopMode::kSpringBackFast},
        {"hard_deceleration", MotionControlledStopMode::kHardDeceleration}},
       "motion controlled Stop mode");
 }
@@ -352,13 +355,28 @@ template <typename Enum>
 
 [[nodiscard]] ControlledStopSubstitutionContractDTO decode_substitution(
     const CanonicalValue& value) {
-  exact_object(
-      value,
-      {"provider_contract_ref", "requested_stop_mode", "executed_stop_mode"},
-      {}, "controlled Stop substitution contract");
-  return {decode_contract(member(value, "provider_contract_ref", "substitution")),
-          motion_stop_mode(member(value, "requested_stop_mode", "substitution")),
-          motion_stop_mode(member(value, "executed_stop_mode", "substitution"))};
+  exact_object(value, {"provider_contract_ref", "requested_stop_mode"},
+               {"executed_stop_mode", "fallback_stop_modes"},
+               "controlled Stop substitution contract");
+  const auto primary = motion_stop_mode(member(value, "requested_stop_mode", "substitution"));
+  const auto* legacy = optional_member(value, "executed_stop_mode");
+  const auto* modes = optional_member(value, "fallback_stop_modes");
+  if ((legacy == nullptr) == (modes == nullptr))
+    fail_decode("substitution needs exactly one fallback field");
+  std::vector<MotionControlledStopMode> fallbacks;
+  if (legacy) {
+    if (primary != MotionControlledStopMode::kSoftOnPath ||
+        motion_stop_mode(*legacy) != MotionControlledStopMode::kSpringBackHold)
+      fail_decode("invalid legacy controlled Stop substitution");
+    fallbacks = {MotionControlledStopMode::kSpringBackHold};
+  } else {
+    if (!modes->is_array() || modes->as_array().empty() || modes->as_array().size() > 2U)
+      fail_decode("invalid controlled Stop fallback list");
+    for (const auto& mode : modes->as_array()) fallbacks.push_back(motion_stop_mode(mode));
+  }
+  if (!motion_controlled_stop_fallbacks_valid(primary, fallbacks)) fail_decode("invalid fallback order");
+  return {decode_contract(member(value, "provider_contract_ref", "substitution")), primary,
+          std::move(fallbacks)};
 }
 
 [[nodiscard]] ResolvedStopCommandQualificationDTO decode_qualification(
@@ -579,7 +597,9 @@ template <typename Enum>
   }
   std::size_t nodes = 0U;
   auto decoded = decode_parameter_value(value, 0U, nodes);
-  return std::get<JsonObjectDTO>(std::move(decoded.value));
+  auto parameters = std::get<JsonObjectDTO>(std::move(decoded.value));
+  detail::normalize_stop_fallback_parameters(parameters);
+  return parameters;
 }
 
 [[nodiscard]] ResolvedStopEscalationStageDTO decode_stage(const CanonicalValue& value) {

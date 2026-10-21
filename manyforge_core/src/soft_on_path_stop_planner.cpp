@@ -1622,7 +1622,7 @@ Result<SoftOnPathStopPlanDTO> plan_spring_back_on_path_stop(
   // floor decide; do not recursively fall back to spring_back_hold. Natural
   // completion was decided once, before spring-back (item 2): any forward
   // failure below, including a short path, ends in the hard stop.
-  forward_profile.recoverable_substitution_mode.reset();
+  forward_profile.fallback_stop_modes.clear();
   auto forward =
       plan_soft_on_path_stop(accepted_trajectory, forward_profile, initial_state, config);
   if (!forward.ok()) {

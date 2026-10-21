@@ -1,13 +1,16 @@
-#include "io_rule_outcome_fixture.hpp"
 #include <gtest/gtest.h>
 
+#include <algorithm>
 #include <filesystem>
 #include <fstream>
+#include <manyforge_content_identity/content_identity.hpp>
 #include <manyforge_core/prepared_participant_stop_plan_codec.hpp>
 #include <manyforge_core/resolved_stop_base_plan_codec.hpp>
 #include <manyforge_core/runtime_participant_binding.hpp>
 #include <manyforge_core/stop_journal_projection_codec.hpp>
 #include <sstream>
+
+#include "io_rule_outcome_fixture.hpp"
 
 namespace manyforge::core {
 namespace {
@@ -123,6 +126,18 @@ inline constexpr char kDigestB[] =
 [[nodiscard]] ParticipantStopStageResultDTO SuccessfulStage(
     std::optional<MotionInterruptStopProfileDTO> profile = std::nullopt) {
   auto base = BasePlan();
+  if (profile && !profile->fallback_stop_modes.empty()) {
+    auto& qualification =
+        base.escalation_stages.front().command_qualification.controlled_substitution_contract;
+    qualification->fallback_stop_modes.clear();
+    for (const auto mode : profile->fallback_stop_modes)
+      qualification->fallback_stop_modes.push_back(mode == MotionInterruptStopMode::kSpringBackHold
+                                                       ? MotionControlledStopMode::kSpringBackHold
+                                                       : MotionControlledStopMode::kSpringBackFast);
+    auto qualified = MakeResolvedStopBasePlan(std::move(base));
+    EXPECT_TRUE(qualified.ok());
+    base = std::move(qualified.value());
+  }
   auto binding = Binding(base);
   auto plan = MakePreparedParticipantStopPlan(
       base,
@@ -476,6 +491,30 @@ TEST(StopJournalProjectionCodecTest, RetainsExplicitOffAndOnJerkProfilesExactly)
     EXPECT_EQ(decoded.value(), projection);
     EXPECT_EQ(EncodeStopJournalTerminalProjection(decoded.value()).value(), encoded.value());
   }
+}
+
+TEST(StopJournalProjectionCodecTest, RoundTripsTheFastSpringBackModeAndItsActualProviderMode) {
+  // Q130: the appended mode is read back, as SQLite owner-epoch replay does.
+  MotionInterruptStopProfileDTO profile;
+  profile.profile_id = "journal.fast";
+  profile.stop_mode = MotionInterruptStopMode::kSpringBackFast;
+  profile.deceleration_time_s = 0.3;
+  profile.jerk_limits_enabled = false;
+  profile.per_joint_max_deceleration = {{"joint_1", AngularAccelerationDTO{2.0}},
+                                        {"joint_2", AngularAccelerationDTO{2.0}}};
+  auto projection = TerminalProjection(profile);
+  ASSERT_EQ(projection.certificate.attempted_stage_results.size(), 1U);
+  for (auto* attempted : {&projection.certificate.attempted_stage_results,
+                          &projection.stop_status.attempted_stage_results}) {
+    attempted->front().result.actual_provider_contract_mode =
+        MotionControlledStopMode::kSpringBackFast;
+  }
+  const auto encoded = EncodeStopJournalTerminalProjection(projection);
+  ASSERT_TRUE(encoded.ok()) << encoded.error().message;
+  const auto decoded = DecodeStopJournalTerminalProjection(encoded.value());
+  ASSERT_TRUE(decoded.ok()) << decoded.error().message;
+  EXPECT_EQ(decoded.value(), projection);
+  EXPECT_EQ(EncodeStopJournalTerminalProjection(decoded.value()).value(), encoded.value());
 }
 
 TEST(StopJournalProjectionCodecTest, RoundTripsInternalProgramRunSelectorCanonically) {
@@ -899,4 +938,136 @@ TEST(StopJournalProjectionCodecTest, ForensicTakeoverCandidateDoesNotExpandPhysi
   EXPECT_FALSE(EncodeStopJournalAcceptanceProjection(projection).ok());
 }
 }  // namespace
+
+TEST(StopJournalProjectionCodecTest, BoundedFallbackListsAndHistoricalSingleModeReplayExactly) {
+  for (const auto& modes : std::vector<std::vector<MotionInterruptStopMode>>{
+           {MotionInterruptStopMode::kSpringBackHold},
+           {MotionInterruptStopMode::kSpringBackHold, MotionInterruptStopMode::kSpringBackFast}}) {
+    MotionInterruptStopProfileDTO profile;
+    profile.profile_id = "journal.fallback";
+    profile.stop_mode = MotionInterruptStopMode::kSoftOnPath;
+    profile.deceleration_time_s = 0.5;
+    profile.jerk_limits_enabled = false;
+    profile.per_joint_max_deceleration = {{"joint_1", AngularAccelerationDTO{2.0}},
+                                          {"joint_2", AngularAccelerationDTO{2.0}}};
+    profile.fallback_stop_modes = modes;
+    const auto projection = TerminalProjection(profile);
+    const auto encoded = EncodeStopJournalTerminalProjection(projection);
+    ASSERT_TRUE(encoded.ok()) << encoded.error().message;
+    const auto decoded = DecodeStopJournalTerminalProjection(encoded.value());
+    ASSERT_TRUE(decoded.ok()) << decoded.error().message;
+    EXPECT_EQ(decoded.value(), projection);
+    EXPECT_EQ(EncodeStopJournalTerminalProjection(decoded.value()).value(), encoded.value());
+    if (modes.size() != 1U) continue;
+    using V = content_identity::CanonicalValue;
+    std::size_t replaced = 0U;
+    const auto old_profile = [&](const auto& self, const V& value) -> V {
+      if (!value.is_array()) return value;
+      auto fields = value.as_array();
+      if (fields.size() == 12U && fields.front().is_string() &&
+          fields.front().as_string() == "journal.fallback") {
+        fields[5] = V(static_cast<double>(MotionInterruptStopMode::kSpringBackHold));
+        ++replaced;
+      } else
+        for (auto& item : fields) item = self(self, item);
+      return V(std::move(fields));
+    };
+    const auto old = content_identity::canonical_json(
+        old_profile(old_profile, content_identity::parse_canonical_json(encoded.value())));
+    ASSERT_GT(replaced, 0U);
+    const auto replayed = DecodeStopJournalTerminalProjection(old);
+    ASSERT_TRUE(replayed.ok()) << replayed.error().message;
+    EXPECT_EQ(replayed.value(), projection);
+    EXPECT_EQ(EncodeStopJournalTerminalProjection(replayed.value()).value(), encoded.value());
+    // Reconstruct the complete prior encoding, including both parameter slots
+    // and qualification contracts, at their actual schema positions.
+    const auto old_parameters = [](const V& value) -> V {
+      if (value.is_null()) return value;
+      auto tagged = value.as_array();
+      EXPECT_EQ(tagged[0], V(5.0));
+      auto members = tagged[1].as_array();
+      for (auto& member : members) {
+        auto row = member.as_array();
+        if (row[0].as_string() != "fallback_stop_modes") continue;
+        row[0] = V("recoverable_substitution_mode");
+        row[1] = V(V::Array{V(3.0), V("spring_back_hold")});
+        member = V(std::move(row));
+      }
+      std::sort(members.begin(), members.end(), [](const V& lhs, const V& rhs) {
+        return lhs.as_array()[0].as_string() < rhs.as_array()[0].as_string();
+      });
+      tagged[1] = V(std::move(members));
+      return V(std::move(tagged));
+    };
+    const auto old_attempts = [&](const V& value) {
+      auto attempts = value.as_array();
+      for (auto& attempt_wire : attempts) {
+        auto attempt = attempt_wire.as_array();
+        auto result = attempt[4].as_array();
+        auto request = result[0].as_array();
+        auto plan = request[26].as_array();
+        auto stages = plan[12].as_array();
+        for (auto& stage_wire : stages) {
+          auto stage = stage_wire.as_array();
+          auto resolved = stage[0].as_array();
+          auto qualification = resolved[6].as_array();
+          if (!qualification[1].is_null()) {
+            auto contract = qualification[1].as_array();
+            EXPECT_EQ(contract[2], V(V::Array{V(1.0)}));
+            contract[2] = V(1.0);
+            qualification[1] = V(std::move(contract));
+            resolved[6] = V(std::move(qualification));
+          }
+          resolved[5] = old_parameters(resolved[5]);
+          stage[0] = V(std::move(resolved));
+          stage[1] = old_parameters(stage[1]);
+          stage_wire = V(std::move(stage));
+        }
+        plan[12] = V(std::move(stages));
+        request[26] = V(std::move(plan));
+        result[0] = V(std::move(request));
+        attempt[4] = V(std::move(result));
+        attempt_wire = V(std::move(attempt));
+      }
+      return V(std::move(attempts));
+    };
+    auto historical = content_identity::parse_canonical_json(old).as_array();
+    auto status = historical[1].as_array();
+    status[4] = old_attempts(status[4]);
+    historical[1] = V(std::move(status));
+    auto certificate = historical[2].as_array();
+    certificate[11] = old_attempts(certificate[11]);
+    historical[2] = V(std::move(certificate));
+    const auto complete_old = content_identity::canonical_json(V(std::move(historical)));
+    const auto complete_replayed = DecodeStopJournalTerminalProjection(complete_old);
+    ASSERT_TRUE(complete_replayed.ok()) << complete_replayed.error().details.at("reason");
+    EXPECT_EQ(complete_replayed.value(), projection);
+    EXPECT_EQ(EncodeStopJournalTerminalProjection(complete_replayed.value()).value(),
+              encoded.value());
+    for (const auto& canonical : {encoded.value(), old, complete_old}) {
+      EXPECT_FALSE(DecodeStopJournalTerminalProjection(" " + canonical).ok());
+      EXPECT_FALSE(DecodeStopJournalTerminalProjection(canonical + "\n").ok());
+    }
+    // Legacy compatibility is not permission for another enum or numeric shape.
+    for (const auto invalid_mode :
+         {0.5, static_cast<double>(MotionInterruptStopMode::kSoftOnPath),
+          static_cast<double>(MotionInterruptStopMode::kHardDeceleration),
+          static_cast<double>(MotionInterruptStopMode::kSpringBackFast)}) {
+      const auto malformed_profile = [&](const auto& self, const V& value) -> V {
+        if (!value.is_array()) return value;
+        auto fields = value.as_array();
+        if (fields.size() == 12U && fields.front().is_string() &&
+            fields.front().as_string() == "journal.fallback")
+          fields[5] = V(invalid_mode);
+        else
+          for (auto& item : fields) item = self(self, item);
+        return V(std::move(fields));
+      };
+      const auto malformed = content_identity::canonical_json(
+          malformed_profile(malformed_profile, content_identity::parse_canonical_json(old)));
+      EXPECT_FALSE(DecodeStopJournalTerminalProjection(malformed).ok()) << invalid_mode;
+    }
+  }
+}
+
 }  // namespace manyforge::core

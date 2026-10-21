@@ -37,7 +37,7 @@ describe('headless Composer presentation adapters', () => {
       message: 'Exact response mismatch.',
       active: true,
       acknowledgementRequired: false, severity: 'error' as const,
-    }])).toBe('Program command failed — Exact response mismatch.');
+    }])).toBe('Program command failed · Exact response mismatch.');
     expect(runtimeAttentionSummary([], [
       {
         id: 'composer.error.1', title: 'First', message: 'First detail',
@@ -53,7 +53,7 @@ describe('headless Composer presentation adapters', () => {
     expect(runtimeAttentionSummary([], [], [{
       id: 'recovery.cell', severity: 'error', domain: 'recovery',
       title: 'Cell recovery required', message: 'physical rest unproven.',
-    }])).toBe('Cell recovery required — physical rest unproven.');
+    }])).toBe('Cell recovery required · physical rest unproven.');
   });
 
   it('maps only the four-state owner record into alarm presentation', () => {
@@ -81,7 +81,7 @@ describe('headless Composer presentation adapters', () => {
 
     const view = operatorAlarmView(alarm);
 
-    expect(view.lifecycleLabel).toBe('RESOLVED — ACKNOWLEDGEMENT REQUIRED');
+    expect(view.lifecycleLabel).toBe('Resolved · Acknowledgement required');
     expect(view.severity).toBe('critical');
     expect(view.details.occurrence_count).toBe(2);
   });
@@ -110,15 +110,15 @@ describe('headless Composer presentation adapters', () => {
     };
 
     expect(operatorAlarmView(alarm).lifecycleLabel)
-      .toBe('ACTIVE — NO ACKNOWLEDGEMENT REQUIRED');
+      .toBe('Active · No acknowledgement required');
     expect(operatorAlarmView(alarm).operatorResponse).toBe(
       'Motion blocked by an active interlock: Fault alarm scope unavailable; '
-        + 'resolve its cause — acknowledgement does not release it. '
+        + 'resolve its cause. Acknowledgement does not release it. '
         + 'Resolve the refused faults.',
     );
     const acknowledgementGated = { ...alarm, acknowledgementRequired: true };
     expect(operatorAlarmView(acknowledgementGated).lifecycleLabel)
-      .toBe('ACTIVE — ACKNOWLEDGED');
+      .toBe('Active · Acknowledged');
     expect(motionInterlockMessage(acknowledgementGated)).toBeNull();
     expect(operatorAlarmView(acknowledgementGated).operatorResponse)
       .toBe('Resolve the refused faults.');
@@ -366,9 +366,9 @@ describe('headless Composer presentation adapters', () => {
     expect(html).toContain('Attention 2');
     expect(html).toContain('Active 1');
     expect(html).toContain('>History</button>');
-    expect(html).not.toContain('ACTIVE — ACKNOWLEDGED · Reduced capability');
+    expect(html).not.toContain('Reduced capability · Active · Acknowledged');
     expect(html).toContain('Reconnect headless projection');
-    expect(html).toContain('COMPOSER ERROR — RESOLVED · DISMISSAL REQUIRED');
+    expect(html).toContain('Program command or response failed · Composer error · Resolved · Dismissal required');
     expect(html).toContain('Invalid response from /api/program/runs/program-run.1');
     expect(html).toContain('Acknowledge message');
     expect(html).toContain('Acknowledge all');
@@ -429,7 +429,7 @@ describe('headless Composer presentation adapters', () => {
       expanded: false,
       onExpandedChange: vi.fn(),
     }));
-    expect(withCondition).toContain('Cell recovery required — physical rest unproven.');
+    expect(withCondition).toContain('Cell recovery required · physical rest unproven.');
     expect(withCondition).toContain('>Retry recovery</button>');
     expect(withCondition).not.toMatch(/>(Acknowledge|Dismiss|Acknowledge all)</);
     expect(withCondition).toContain('attention-error');
@@ -508,5 +508,44 @@ describe('headless Composer presentation adapters', () => {
     expect(detailed).toContain('<details><summary>');
     expect(detailed).not.toContain('<details open');
 
+    // One item per failure: the Program recovery notice represents the
+    // operation-failure alarm, shows it inside with its exact Acknowledge
+    // and counts once; without the notice the alarm stands alone.
+    const failureAlarm: OperatorAlarmRecord = {
+      ...attentionAlarm,
+      definitionId: 'manyforge.program.operation_failure',
+      title: 'Program operation failed',
+      message: 'Program operation failed',
+      details: {
+        failure: { code: 'ik_failed', message: 'RoboPlan could not resolve the pose goal' },
+        node_instance_id: 'unreachable_hold',
+      },
+    };
+    const failureState = {
+      ...previousState,
+      snapshot: { ...snapshot, alarms: { ...snapshot.alarms, alarms: [failureAlarm] } },
+    };
+    const programRecovery = {
+      id: 'recovery.program', severity: 'error' as const, domain: 'recovery' as const,
+      title: 'Program recovery required', message: 'Node unreachable_hold failed.',
+      alarmDefinitionIds: ['manyforge.program.operation_failure'],
+    };
+    expect(runtimeAttentionSummary([failureAlarm], [], [programRecovery]))
+      .toBe('Program recovery required · RoboPlan could not resolve the pose goal');
+    const merged = renderToStaticMarkup(createElement(HeadlessRuntimeSurfacesView, {
+      enabled: true, headlessState: failureState, conditions: [programRecovery], expanded: true,
+    }));
+    expect(merged).toContain('Program recovery required · RoboPlan could not resolve the pose goal');
+    expect(merged).toContain('Attention 1');
+    expect(merged).toMatch(
+      /data-notice-id="recovery.program".*<div class="workbench-notice-alarms"><div class="operator-alarm-panel">.*>Acknowledge alarm<\/button><\/div><\/div><\/div><\/div>/,
+    );
+    expect(merged.match(/class="operator-alarm-panel"/g)).toHaveLength(1);
+    const alone = renderToStaticMarkup(createElement(HeadlessRuntimeSurfacesView, {
+      enabled: true, headlessState: failureState, expanded: true,
+    }));
+    expect(alone).toContain('Attention 1');
+    expect(alone).not.toContain('workbench-notice-alarms');
+    expect(alone).toContain('<summary>RoboPlan could not resolve the pose goal · Program operation failed · node unreachable_hold');
   });
 });

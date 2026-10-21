@@ -131,6 +131,7 @@ def _program(
         }
         if node_id == "motion.probe_search":
             parameters["contact_policy_id"] = "probe_contact"
+            parameters["contact_scene_resource_id"] = "table"
     else:
         parameters = {"target_role": "arm", "resource_role": "part_present"}
         if node_id == "io.get_input":

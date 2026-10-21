@@ -886,11 +886,11 @@ export class HeadlessStateSource implements ExecutionObservationReader {
                 throw new Error('Run outcome could not be read; check the Program state before Reset.');
               }
               if (outcome.code === 'program_run_started_then_failed') {
-                throw new Error(`Run failed: ${structuredErrorText(outcome)} — Reset required.`);
+                throw new Error(`Run failed: ${structuredErrorText(outcome)}. Reset required.`);
               }
               const stopped = outcome.code === 'program_run_stopped_before_start'
                 ? 'Run stopped before start' : 'Run stopped';
-              throw new Error(`${stopped} — Reset required. ${structuredErrorText(outcome)}`);
+              throw new Error(`${stopped}. Reset required. ${structuredErrorText(outcome)}`);
             }
             throw new Error(
               operatorAlarmRefusalMessage(error?.code, error?.details)

@@ -208,10 +208,12 @@ Result<void> validate_motion_interrupt_scope_admission(
             : policy->allowed_activation_modes.contains(scope.activation_mode);
     if (!activation_allowed ||
         scope.activation_mode == MotionInterruptActivationMode::kMaintainLevelWithHysteresis ||
-        (desired && (!policy->allowed_stop_modes.contains(scope.stop_profile->stop_mode) ||
-                     (scope.stop_profile->recoverable_substitution_mode &&
-                      !policy->allowed_stop_modes.contains(
-                          *scope.stop_profile->recoverable_substitution_mode)))))
+        (desired &&
+         (!policy->allowed_stop_modes.contains(scope.stop_profile->stop_mode) ||
+          std::any_of(scope.stop_profile->fallback_stop_modes.begin(),
+                      scope.stop_profile->fallback_stop_modes.end(), [&](const auto mode) {
+                        return !policy->allowed_stop_modes.contains(mode);
+                      }))))
       return invalid<void>("motion interrupt mode is outside the sealed policy binding",
                            "motion_interrupt_mode_not_admitted");
   }

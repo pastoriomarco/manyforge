@@ -19,13 +19,14 @@ namespace manyforge::core {
 inline constexpr std::string_view kMotionControlledStopContractSchemaId =
     "manyforge.value_schema.provider_contract.motion_controlled_stop.v1";
 inline constexpr std::string_view kMotionControlledStopContractSchemaRevision =
-    "sha256:fa6d62df17f87b231e2002bc38de0ecac9c6aa4da23f29f572b2a2780b481c27";
+    "sha256:65e6f4462981225916834490d4e3cb4d42b70611a2287e1b76fdb1cbcabcb113";
 inline constexpr std::size_t kMaxMotionControlledStopResourceLimits = 256U;
 
 enum class MotionControlledStopMode : std::uint8_t {
   kSoftOnPath = 0,
   kSpringBackHold,
   kHardDeceleration,
+  kSpringBackFast,
 };
 
 [[nodiscard]] constexpr std::string_view to_string(MotionControlledStopMode value) noexcept {
@@ -36,8 +37,36 @@ enum class MotionControlledStopMode : std::uint8_t {
       return "spring_back_hold";
     case MotionControlledStopMode::kHardDeceleration:
       return "hard_deceleration";
+    case MotionControlledStopMode::kSpringBackFast:
+      return "spring_back_fast";
   }
   return {};
+}
+
+/// Hard containment is implicit and cannot appear in this bounded list.
+[[nodiscard]] inline bool motion_controlled_stop_fallbacks_valid(
+    MotionControlledStopMode primary, std::span<const MotionControlledStopMode> modes) noexcept {
+  const auto rank = [](MotionControlledStopMode mode) {
+    switch (mode) {
+      case MotionControlledStopMode::kSoftOnPath:
+        return 0;
+      case MotionControlledStopMode::kSpringBackHold:
+        return 1;
+      case MotionControlledStopMode::kSpringBackFast:
+        return 2;
+      case MotionControlledStopMode::kHardDeceleration:
+        return 3;
+    }
+    return -1;
+  };
+  int previous = rank(primary);
+  if (previous < 0 || modes.size() > 2U) return false;
+  for (const auto mode : modes) {
+    const int current = rank(mode);
+    if (current <= previous || current >= 3) return false;
+    previous = current;
+  }
+  return true;
 }
 
 struct ControlledStopResourceLimitDTO final {
@@ -66,13 +95,14 @@ struct SoftOnPathStopParametersDTO final {
   std::optional<double> max_stop_time_s;
   std::vector<ControlledStopResourceLimitDTO> per_resource_limits;
   bool allow_natural_completion_on_short_path{};
-  std::optional<MotionControlledStopMode> recoverable_substitution_mode;
+  std::vector<MotionControlledStopMode> fallback_stop_modes;
   bool jerk_limits_enabled{false};
 
   friend bool operator==(const SoftOnPathStopParametersDTO&,
                          const SoftOnPathStopParametersDTO&) = default;
 };
 
+/// Also carries `kSpringBackFast` (Q130): the same parameters, a different law.
 struct SpringBackHoldStopParametersDTO final {
   MotionControlledStopMode stop_mode{MotionControlledStopMode::kSpringBackHold};
   double deceleration_time_s{};
@@ -82,6 +112,7 @@ struct SpringBackHoldStopParametersDTO final {
   std::vector<ControlledStopResourceLimitDTO> per_resource_limits;
   bool allow_natural_completion_on_short_path{false};
   bool jerk_limits_enabled{false};
+  std::vector<MotionControlledStopMode> fallback_stop_modes;
 
   friend bool operator==(const SpringBackHoldStopParametersDTO&,
                          const SpringBackHoldStopParametersDTO&) = default;
@@ -180,13 +211,13 @@ inline constexpr std::string_view kStopInterfaceCommissioningArtifactRole =
 inline constexpr std::string_view kStopInterfaceCommissioningMediaType =
     "application/vnd.manyforge.stop-interface-commissioning-evidence.v1+json";
 
-/// The sole closed semantic controlled-mode substitution supported by v1.
+/// The closed ordered controlled-mode fallbacks supported by this command.
 /// This is runtime policy, not evidence that a binary or test report is
 /// qualified.
 struct ControlledStopSubstitutionContractDTO final {
   ProviderContractRefDTO provider_contract_ref;
   MotionControlledStopMode requested_stop_mode{MotionControlledStopMode::kSoftOnPath};
-  MotionControlledStopMode executed_stop_mode{MotionControlledStopMode::kSpringBackHold};
+  std::vector<MotionControlledStopMode> fallback_stop_modes;
 
   friend bool operator==(const ControlledStopSubstitutionContractDTO&,
                          const ControlledStopSubstitutionContractDTO&) = default;

@@ -99,7 +99,7 @@ describe('Apply after Reset sequence', () => {
     const lost: ResetApplySequence = {
       plan: plan(), phase: { kind: 'awaiting_idle', reset, delivery: 'unconfirmed' },
     };
-    expect(resetApplyPhaseText(lost.phase)).toContain('Reset delivery unknown — reconciling');
+    expect(resetApplyPhaseText(lost.phase)).toContain('Reset delivery unknown: reconciling');
     expect(nextResetApplyStep(lost, facts({
       cycle: { ...idle, state: 'recovery_required', cycleGeneration: 7, causalCorrelationId: null },
     }))).toEqual({ kind: 'wait' });

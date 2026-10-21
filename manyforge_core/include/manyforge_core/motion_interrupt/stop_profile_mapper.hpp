@@ -27,6 +27,8 @@ namespace manyforge::core {
       return MotionControlledStopMode::kSpringBackHold;
     case MotionInterruptStopMode::kHardDeceleration:
       return MotionControlledStopMode::kHardDeceleration;
+    case MotionInterruptStopMode::kSpringBackFast:
+      return MotionControlledStopMode::kSpringBackFast;
   }
   return MotionControlledStopMode::kHardDeceleration;
 }

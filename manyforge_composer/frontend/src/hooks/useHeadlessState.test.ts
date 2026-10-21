@@ -840,8 +840,8 @@ describe('zero-physical-component viewer demand', () => {
 describe('HeadlessStateSource delivery scheduling', () => {
   it.each([
     [422, 'program_run_started_then_failed', 'Run failed:', true, false],
-    [422, 'program_run_superseded_by_stop', 'Run stopped — Reset required', true, false],
-    [409, 'program_run_stopped_before_start', 'Run stopped before start — Reset required', true, false],
+    [422, 'program_run_superseded_by_stop', 'Run stopped. Reset required', true, false],
+    [409, 'program_run_stopped_before_start', 'Run stopped before start. Reset required', true, false],
     [503, 'program_cycle_reconciliation_required', 'Command delivery is unconfirmed', false, false],
     [500, 'program_runner_internal_error', 'Command delivery is unconfirmed', false, false],
     [422, 'program_run_started_then_failed', 'Run outcome could not be read', true, true],

@@ -174,7 +174,8 @@ struct ControllerLaunchArtifacts final {
     const std::map<std::string, double, std::less<>>
         &max_deceleration_on_cancel_rad_s2,
     const std::optional<std::string> &gripper_joint_name,
-    core::GripperOutputMode gripper_output_mode = core::GripperOutputMode::kCommanded);
+    core::GripperOutputMode gripper_output_mode = core::GripperOutputMode::kCommanded,
+    bool resident_timeline_replacement = false);
 
 /// The retained Isaac controller file of one Isaac profile, unchanged.
 [[nodiscard]] std::string_view retained_isaac_controllers_yaml(

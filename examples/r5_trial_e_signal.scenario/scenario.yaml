@@ -5,15 +5,15 @@
     "deployment_present": true,
     "program_present": true
   },
-  "description": "R5 trial (e): signal moves. search_trip scripts probe_contact false then true after 1000 ms -> signal_trip/success; search_no_trip scripts edge_sensor false with no change and completes without trip -> no_signal_trip (default success); probe_no_trip completes without trip with on_no_signal success -> no_signal_trip. The node_outcome keys are checked.",
+  "description": "R5 trial (e): signal moves. search_trip scripts probe_contact false then true after 1000 ms -> signal_trip/success; search_no_trip scripts edge_sensor false with no change and completes without trip -> no_signal_trip (default success); probe_no_trip approaches probe_block slowly (TCP speed limit 10 mm/s), scripts edge_sensor false with no change and completes without trip with on_no_signal success -> no_signal_trip. The node_outcome keys are checked.",
   "members": {
     "assignment.yaml": "sha256:d2aa4449ba8adad810aa543324202ee80a27583ef29cf93fb0feeb3ed67dff3c",
-    "deployment.yaml": "sha256:4d1fc510f482195156410c3c455a68e5ae11c0d56fc97c53e96e040693fda24f",
-    "program.yaml": "sha256:ba08672a7d5539e0051fa091f2bd244ebb63a3ccec81c12d84777ea4aa727097"
+    "deployment.yaml": "sha256:2a2ac12a7b12897cb84e1b15c18d3e9b28daf01bd08a011bea49d9b431166392",
+    "program.yaml": "sha256:2d4669b0d8c1ba7aebd0c3eb364784a1df4d4ad52a932a0eb32e838497d57f32"
   },
   "name": "R5 trial (e) signal moves",
   "saved_status": {
-    "checked_content_digest": "sha256:c86b79cc4d310c6fa96b6c8b95dda9f92f1b66469d789f2cec0d11708f66aa05",
+    "checked_content_digest": "sha256:df79cd57988f8a816a2fbc1bca71fcc951e37ab1b9a7e87d57ecff0eefe6bc7e",
     "last_known_status": "unknown",
     "manyforge_version": "0.1.0"
   },

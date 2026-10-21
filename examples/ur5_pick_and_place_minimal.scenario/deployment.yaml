@@ -25,8 +25,8 @@
             "wrist_2_joint": 10.0,
             "wrist_3_joint": 10.0
           },
-          "profile_id": "default_fault_spring_back",
-          "stop_mode": "spring_back_hold"
+          "profile_id": "fault_spring_back_fast",
+          "stop_mode": "spring_back_fast"
         },
         "runtime_configuration": {
           "collision_monitor_period_ms": 50.0,

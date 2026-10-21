@@ -163,7 +163,7 @@ Result<MotionInterruptStopProfileDTO> resolve_motion_interrupt_stop_jerk_limits(
 
 Result<MotionControlledStopContractParametersDTO>
 map_motion_interrupt_stop_profile_to_contract_parameters(
-    const MotionInterruptStopProfileDTO& source, MotionInterruptNodeCategory node_category,
+    const MotionInterruptStopProfileDTO& source, MotionInterruptNodeCategory /*node_category*/,
     std::span<const RuntimeResourceBindingDTO> resources,
     std::span<const HardStopResourceLimitDTO> retained_default_limits) {
   if (!motion_interrupt_stop_profile_id_valid(source.profile_id))
@@ -195,16 +195,6 @@ map_motion_interrupt_stop_profile_to_contract_parameters(
   if (retained_default_limits.size() != resources.size()) {
     return invalid("motion_interrupt_stop_default_coverage_mismatch",
                    "retained settle thresholds must cover the exact scope");
-  }
-  if (node_category == MotionInterruptNodeCategory::kPrecisionContact &&
-      profile.recoverable_substitution_mode.has_value()) {
-    return invalid("motion_interrupt_substitution_precision_contact_forbidden",
-                   "precision-contact profiles forbid recoverable substitution");
-  }
-  if (node_category == MotionInterruptNodeCategory::kPrecisionContact &&
-      profile.allow_natural_completion_on_short_path) {
-    return invalid("motion_interrupt_natural_completion_precision_contact_forbidden",
-                   "precision-contact profiles require a controlled stop, not natural completion");
   }
 
   std::map<std::string, const RuntimeResourceBindingDTO*, std::less<>> resource_by_source_joint;
@@ -315,19 +305,21 @@ map_motion_interrupt_stop_profile_to_contract_parameters(
     mapped.per_resource_limits = std::move(limits);
     mapped.allow_natural_completion_on_short_path = profile.allow_natural_completion_on_short_path;
     mapped.jerk_limits_enabled = profile.jerk_limits_enabled == true;
-    if (profile.recoverable_substitution_mode.has_value()) {
-      mapped.recoverable_substitution_mode = MotionControlledStopMode::kSpringBackHold;
-    }
+    for (const auto mode : profile.fallback_stop_modes)
+      mapped.fallback_stop_modes.push_back(provider_contract_stop_mode(mode));
     return Result<MotionControlledStopContractParametersDTO>::Ok(
         MotionControlledStopContractParametersDTO{std::move(mapped)});
   }
 
   SpringBackHoldStopParametersDTO mapped;
+  mapped.stop_mode = provider_contract_stop_mode(profile.stop_mode);
   mapped.deceleration_time_s = motion_interrupt_deceleration_time_or_default(profile);
   mapped.max_stop_time_s = profile.max_stop_time_s;
   mapped.per_resource_limits = std::move(limits);
   mapped.allow_natural_completion_on_short_path = profile.allow_natural_completion_on_short_path;
   mapped.jerk_limits_enabled = profile.jerk_limits_enabled == true;
+  for (const auto mode : profile.fallback_stop_modes)
+    mapped.fallback_stop_modes.push_back(provider_contract_stop_mode(mode));
   return Result<MotionControlledStopContractParametersDTO>::Ok(
       MotionControlledStopContractParametersDTO{std::move(mapped)});
 }
@@ -368,6 +360,8 @@ Result<MotionInterruptStopProfileDTO> map_motion_controlled_stop_contract_parame
     profile.stop_mode = MotionInterruptStopMode::kSoftOnPath;
   } else if (*mode == "spring_back_hold") {
     profile.stop_mode = MotionInterruptStopMode::kSpringBackHold;
+  } else if (*mode == "spring_back_fast") {
+    profile.stop_mode = MotionInterruptStopMode::kSpringBackFast;
   } else if (*mode == "hard_deceleration") {
     profile.stop_mode = MotionInterruptStopMode::kHardDeceleration;
     profile.jerk_limits_enabled = false;
@@ -404,14 +398,34 @@ Result<MotionInterruptStopProfileDTO> map_motion_controlled_stop_contract_parame
                              "Controlled Stop natural-completion policy is absent");
     }
     profile.allow_natural_completion_on_short_path = *natural;
-    if (const auto* substitute = text(member(parameters, "recoverable_substitution_mode"));
-        substitute != nullptr) {
-      if (profile.stop_mode != MotionInterruptStopMode::kSoftOnPath ||
-          *substitute != "spring_back_hold") {
+  }
+  const auto* legacy = member(parameters, "recoverable_substitution_mode");
+  const auto* fallbacks = member(parameters, "fallback_stop_modes");
+  if (legacy != nullptr && fallbacks != nullptr)
+    return invalid_profile("motion_controlled_stop_substitution_invalid",
+                           "conflicting fallback fields");
+  if (legacy != nullptr) {
+    const auto* substitute = text(legacy);
+    if (profile.stop_mode != MotionInterruptStopMode::kSoftOnPath || substitute == nullptr ||
+        *substitute != "spring_back_hold")
+      return invalid_profile("motion_controlled_stop_substitution_invalid",
+                             "invalid legacy fallback");
+    profile.fallback_stop_modes = {MotionInterruptStopMode::kSpringBackHold};
+  }
+  if (fallbacks != nullptr) {
+    const auto* modes = std::get_if<JsonValueDTO::Array>(&fallbacks->value);
+    if (modes == nullptr || modes->size() > 2U)
+      return invalid_profile("motion_controlled_stop_substitution_invalid",
+                             "invalid fallback list");
+    for (const auto& entry : *modes) {
+      const auto* mode = text(&entry);
+      if (mode != nullptr && *mode == "spring_back_hold")
+        profile.fallback_stop_modes.push_back(MotionInterruptStopMode::kSpringBackHold);
+      else if (mode != nullptr && *mode == "spring_back_fast")
+        profile.fallback_stop_modes.push_back(MotionInterruptStopMode::kSpringBackFast);
+      else
         return invalid_profile("motion_controlled_stop_substitution_invalid",
-                               "controlled Stop substitution is invalid");
-      }
-      profile.recoverable_substitution_mode = MotionInterruptStopMode::kSpringBackHold;
+                               "invalid fallback mode");
     }
   }
 
@@ -579,7 +593,8 @@ JsonValueDTO motion_controlled_stop_evidence(const MotionInterruptStopProfileDTO
 std::optional<Duration> controlled_stop_deadline_from_contract_parameters(
     const JsonObjectDTO& parameters) {
   const auto* mode = text(member(parameters, "stop_mode"));
-  if (mode == nullptr || (*mode != "soft_on_path" && *mode != "spring_back_hold")) {
+  if (mode == nullptr || (*mode != "soft_on_path" && *mode != "spring_back_hold" &&
+                          *mode != "spring_back_fast")) {
     return std::nullopt;
   }
   MotionInterruptStopProfileDTO profile;

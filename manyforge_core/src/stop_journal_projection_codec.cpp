@@ -1,15 +1,17 @@
-#include <manyforge_core/io_rule_outcome_codec.hpp>
 #include <algorithm>
 #include <cmath>
 #include <cstdint>
 #include <limits>
 #include <manyforge_content_identity/canonical_value.hpp>
+#include <manyforge_core/io_rule_outcome_codec.hpp>
 #include <manyforge_core/stop_journal_projection_codec.hpp>
 #include <stdexcept>
 #include <string>
 #include <string_view>
 #include <type_traits>
 #include <utility>
+
+#include "stop_fallback_codec_internal.hpp"
 
 namespace manyforge::core {
 namespace {
@@ -743,14 +745,28 @@ template <typename T, typename Decode>
 
 [[nodiscard]] V substitution_contract_value(const ControlledStopSubstitutionContractDTO& v) {
   return arr({contract_ref_value(v.provider_contract_ref), enc(v.requested_stop_mode),
-              enc(v.executed_stop_mode)});
+              vec(v.fallback_stop_modes, [](const auto mode) { return enc(mode); })});
 }
 
 [[nodiscard]] ControlledStopSubstitutionContractDTO substitution_contract_from(const V& v) {
   const auto& f = exact(v, 3U, "substitution contract");
-  return ControlledStopSubstitutionContractDTO{
-      contract_ref_from(f[0]), den<MotionControlledStopMode>(f[1], 2U, "requested Stop mode"),
-      den<MotionControlledStopMode>(f[2], 2U, "executed Stop mode")};
+  const auto primary = den<MotionControlledStopMode>(f[1], 3U, "requested Stop mode");
+  std::vector<MotionControlledStopMode> modes;
+  if (f[2].is_array()) {
+    if (f[2].as_array().empty() || f[2].as_array().size() > 2U) bad("invalid fallback count");
+    modes = dvec<MotionControlledStopMode>(
+        f[2],
+        [](const V& mode) { return den<MotionControlledStopMode>(mode, 3U, "fallback Stop mode"); },
+        "fallback modes");
+  } else {
+    const auto legacy = den<MotionControlledStopMode>(f[2], 2U, "executed Stop mode");
+    if (primary != MotionControlledStopMode::kSoftOnPath ||
+        legacy != MotionControlledStopMode::kSpringBackHold)
+      bad("invalid legacy fallback pair");
+    modes = {legacy};
+  }
+  if (!motion_controlled_stop_fallbacks_valid(primary, modes)) bad("invalid fallback order");
+  return {contract_ref_from(f[0]), primary, std::move(modes)};
 }
 
 [[nodiscard]] V command_qualification_value(const ResolvedStopCommandQualificationDTO& v) {
@@ -948,7 +964,9 @@ template <typename T, typename Decode>
     if (!std::holds_alternative<JsonObjectDTO>(decoded.value)) {
       bad("default contract parameters are not an object");
     }
-    return std::get<JsonObjectDTO>(std::move(decoded.value));
+    auto parameters = std::get<JsonObjectDTO>(std::move(decoded.value));
+    detail::normalize_stop_fallback_parameters(parameters);
+    return parameters;
   });
   return ResolvedStopEscalationStageDTO{
       u64(f[0], "stage index"),
@@ -1071,7 +1089,9 @@ template <typename T, typename Decode>
            opt(v.deceleration_time_s, [](const double item) { return V(item); }),
            V(std::move(acceleration)),
            V(v.allow_natural_completion_on_short_path),
-           opt(v.recoverable_substitution_mode, [](const auto item) { return enc(item); }),
+           v.fallback_stop_modes.empty()
+               ? V(nullptr)
+               : vec(v.fallback_stop_modes, [](const auto item) { return enc(item); }),
            V(v.require_backend_confirmation),
            opt(v.per_joint_settle_velocity_threshold,
                [](const auto& limits) {
@@ -1148,23 +1168,35 @@ template <typename T, typename Decode>
     }
     return result;
   });
-  return MotionInterruptStopProfileDTO{
+  auto result = MotionInterruptStopProfileDTO{
       str(f[0], "profile ID"),
-      den<MotionInterruptStopMode>(f[1], 2U, "interrupt Stop mode"),
+      den<MotionInterruptStopMode>(f[1], 3U, "interrupt Stop mode"),
       dopt<double>(f[2], [](const V& item) { return number(item, "deceleration time"); }),
       dopt<double>(f[11], [](const V& item) { return number(item, "maximum Stop time"); }),
       std::move(acceleration),
       boolean(f[4], "allow natural completion"),
-      dopt<MotionInterruptStopMode>(f[5],
-                                    [](const V& item) {
-                                      return den<MotionInterruptStopMode>(
-                                          item, 2U, "recoverable substitution mode");
-                                    }),
+      {},
       boolean(f[6], "require backend confirmation"),
       std::move(settle),
       structured_from(f[8]),
       enabled,
       std::move(jerk)};
+  if (f[5].is_array()) {
+    if (f[5].as_array().size() > 2U) bad("invalid fallback count");
+    result.fallback_stop_modes = dvec<MotionInterruptStopMode>(
+        f[5],
+        [](const V& mode) { return den<MotionInterruptStopMode>(mode, 3U, "fallback Stop mode"); },
+        "fallback modes");
+  } else if (!f[5].is_null()) {
+    const auto legacy = den<MotionInterruptStopMode>(f[5], 2U, "legacy fallback mode");
+    if (result.stop_mode != MotionInterruptStopMode::kSoftOnPath ||
+        legacy != MotionInterruptStopMode::kSpringBackHold)
+      bad("invalid legacy fallback pair");
+    result.fallback_stop_modes = {legacy};
+  }
+  if (!motion_interrupt_stop_fallbacks_valid(result.stop_mode, result.fallback_stop_modes))
+    bad("invalid fallback order");
+  return result;
 }
 
 [[nodiscard]] V prepared_stage_value(const PreparedStopStageCommandDTO& v) {
@@ -1181,7 +1213,9 @@ template <typename T, typename Decode>
     if (!std::holds_alternative<JsonObjectDTO>(decoded.value)) {
       bad("validated contract parameters are not an object");
     }
-    return std::get<JsonObjectDTO>(std::move(decoded.value));
+    auto parameters = std::get<JsonObjectDTO>(std::move(decoded.value));
+    detail::normalize_stop_fallback_parameters(parameters);
+    return parameters;
   });
   return PreparedStopStageCommandDTO{resolved_stage_from(f[0]), std::move(parameters),
                                      dopt<StopStageParameterSourceDTO>(f[2], [](const V& item) {
@@ -1342,7 +1376,7 @@ template <typename T, typename Decode>
       den<ParticipantStopStageOutcomeDTO>(f[2], 3U, "participant Stop outcome"),
       dopt<MotionControlledStopMode>(f[3],
                                      [](const V& item) {
-                                       return den<MotionControlledStopMode>(item, 2U,
+                                       return den<MotionControlledStopMode>(item, 3U,
                                                                             "actual provider mode");
                                      }),
       dopt<std::string>(f[4], [](const V& item) { return str(item, "substitution reason"); }),
@@ -2127,6 +2161,93 @@ template <typename T, typename Decode>
                                             certificate_from(fields[4])};
 }
 
+// Compatibility is restricted to the actual typed Stop-plan slots. Never
+// rewrite lookalike arrays in diagnostics, evidence, or arbitrary JSON values.
+[[nodiscard]] V normalized_legacy_stop_plan_wire(const V& value) {
+  auto plan = exact(value, 13U, "prepared participant Stop plan");
+  if (!plan[9].is_null()) {
+    auto profile = exact(plan[9], 12U, "motion interrupt Stop profile");
+    if (!profile[5].is_null() && !profile[5].is_array()) {
+      // The regular decoder already checked the exact soft->hold pair.
+      profile[5] = arr({profile[5]});
+      plan[9] = V(std::move(profile));
+    }
+  }
+  const auto normalize_parameters = [](const V& wire) -> V {
+    if (wire.is_null()) return wire;
+    auto decoded = json_from(wire);
+    if (!std::holds_alternative<JsonObjectDTO>(decoded.value)) return wire;
+    auto& parameters = std::get<JsonObjectDTO>(decoded.value);
+    if (!parameters.contains("recoverable_substitution_mode")) return wire;
+    // Do not accept another noncanonical map ordering or encoding merely
+    // because this object also contains the legacy field.
+    if (json_value(decoded) != wire) bad("legacy Stop parameters are not canonical");
+    detail::normalize_stop_fallback_parameters(parameters);
+    return json_value(decoded);
+  };
+  auto stages = plan[12].as_array();
+  for (auto& stage_wire : stages) {
+    auto stage = exact(stage_wire, 3U, "prepared stage command");
+    auto resolved = exact(stage[0], 11U, "resolved escalation stage");
+    auto qualification = exact(resolved[6], 6U, "command qualification");
+    if (!qualification[1].is_null()) {
+      auto contract = exact(qualification[1], 3U, "substitution contract");
+      if (!contract[2].is_array()) {
+        contract[2] = arr({contract[2]});
+        qualification[1] = V(std::move(contract));
+        resolved[6] = V(std::move(qualification));
+      }
+    }
+    resolved[5] = normalize_parameters(resolved[5]);
+    stage[0] = V(std::move(resolved));
+    stage[1] = normalize_parameters(stage[1]);
+    stage_wire = V(std::move(stage));
+  }
+  plan[12] = V(std::move(stages));
+  return V(std::move(plan));
+}
+
+[[nodiscard]] V normalized_legacy_attempts_wire(const V& value) {
+  auto attempts = value.as_array();
+  for (auto& attempt_wire : attempts) {
+    auto attempt = exact(attempt_wire, 5U, "attempted stage result");
+    auto result = exact(attempt[4], 11U, "participant Stop stage result");
+    auto request = exact(result[0], 29U, "resolved participant Stop stage");
+    request[26] = normalized_legacy_stop_plan_wire(request[26]);
+    result[0] = V(std::move(request));
+    attempt[4] = V(std::move(result));
+    attempt_wire = V(std::move(attempt));
+  }
+  return V(std::move(attempts));
+}
+
+[[nodiscard]] bool matches_normalized_legacy_projection(std::string_view original,
+                                                        std::string_view encoded) {
+  try {
+    auto root = content_identity::parse_canonical_json(
+                    original, content_identity::CanonicalJsonParseLimits{kMaxProjectionBytes, 32U,
+                                                                         1U * 1024U * 1024U})
+                    .as_array();
+    const auto version = str(root[0], "projection API version");
+    const bool terminal = version == kStopJournalTerminalProjectionApiVersion;
+    const bool cleared = version == kStopJournalFaultClearProjectionApiVersion;
+    if (!terminal && !cleared) return false;
+    // These are the only projection roots containing full participant plans.
+    const std::size_t status_index = terminal ? 1U : 3U;
+    const std::size_t certificate_index = terminal ? 2U : 4U;
+    auto status = exact(root[status_index], 14U, "Stop status");
+    status[4] = normalized_legacy_attempts_wire(status[4]);
+    root[status_index] = V(std::move(status));
+    auto certificate = root[certificate_index].as_array();
+    if (certificate.size() != 23U && certificate.size() != 24U) return false;
+    certificate[11] = normalized_legacy_attempts_wire(certificate[11]);
+    root[certificate_index] = V(std::move(certificate));
+    return content_identity::canonical_json(V(std::move(root))) == encoded;
+  } catch (const std::exception&) {
+    return false;
+  }
+}
+
 template <typename T, typename Root>
 [[nodiscard]] Result<std::string> encode_projection(const T& value, Root root) {
   try {
@@ -2207,7 +2328,8 @@ Result<StopJournalTerminalProjectionDTO> DecodeStopJournalTerminalProjection(
     return reject<StopJournalTerminalProjectionDTO>(*error);
   }
   const auto encoded = EncodeStopJournalTerminalProjection(decoded.value());
-  if (!encoded.ok() || encoded.value() != canonical_bytes) {
+  if (!encoded.ok() || (encoded.value() != canonical_bytes &&
+                        !matches_normalized_legacy_projection(canonical_bytes, encoded.value()))) {
     return reject<StopJournalTerminalProjectionDTO>("terminal projection is not canonical");
   }
   return decoded;
@@ -2263,7 +2385,8 @@ Result<StopJournalFaultClearProjectionDTO> DecodeStopJournalFaultClearProjection
       decode_projection<StopJournalFaultClearProjectionDTO>(canonical_bytes, fault_clear_root_from);
   if (!decoded.ok()) return decoded;
   const auto encoded = EncodeStopJournalFaultClearProjection(decoded.value());
-  if (!encoded.ok() || encoded.value() != canonical_bytes) {
+  if (!encoded.ok() || (encoded.value() != canonical_bytes &&
+                        !matches_normalized_legacy_projection(canonical_bytes, encoded.value()))) {
     return reject<StopJournalFaultClearProjectionDTO>("fault-clear projection is not canonical");
   }
   return decoded;

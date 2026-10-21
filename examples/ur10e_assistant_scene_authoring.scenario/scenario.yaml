@@ -8,12 +8,12 @@
   "description": "Local deployment fixture for assistant-mode catalog plumbing on the UR10e + Robotiq 2F-140 preview stack. It keeps the deterministic scene-authoring provider enabled while declaring the finite tools visible to query and composer-assistant requests.",
   "members": {
     "assignment.yaml": "sha256:fe4fe32b76167ec3c2593aa9afd6643f68b85b3676df142a20e31464eeb4e42e",
-    "deployment.yaml": "sha256:d8ad822295fe1ba9e4e178e77076d22250b36d0dd38e9caa4972ec6fc2d75ffd",
+    "deployment.yaml": "sha256:f59e2afd33bb26dcd07427d49d4e3369d39d6e5057fd5c753529c0af257174fb",
     "program.yaml": "sha256:e6cefe8d3166bd8f8684d576b6758dbd09e54c4cf9d1b5bc01b9e16de5eb82c9"
   },
   "name": "ur10e_robotiq_assistant_modes_scene_authoring",
   "saved_status": {
-    "checked_content_digest": "sha256:0fb03c308bc6de14139768e77f1880a3836596487272a2727798dd64858b34cd",
+    "checked_content_digest": "sha256:a8b0dd8363b16b10392e776be2fb3277514098a534251b740f860481260c6fb0",
     "last_known_status": "ready",
     "manyforge_version": "0.1.0"
   },

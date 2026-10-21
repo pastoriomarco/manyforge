@@ -104,7 +104,7 @@ TEST(OperatorAlarmCatalog, LoadsThePackagedDigestVerifiedClosedCatalog) {
   EXPECT_EQ(catalog.catalog_version(), "2.6.0");
   EXPECT_EQ(catalog.descriptor_digest(),
             "sha256:"
-            "eb5d5bdf48e06d8637a9f0d29eff24949f6fa7ff8ac10365375986b42d2616c8");
+            "7cbf4060ee2b4e6790a4ee425c9b3e5c07eb4dcb91aa61395f3e759055ff6a7f");
   ASSERT_EQ(catalog.definitions().size(), 12U);
   for (const auto name : {"manyforge.runtime.program_runner_loss",
                           "manyforge.runtime.operation_journal_write_fault"}) {

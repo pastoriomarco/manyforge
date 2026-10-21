@@ -7,7 +7,11 @@ export interface KernelErrorView {
 }
 
 export interface KernelErrorPresentation {
+  /** The cause: what went wrong. */
   headline: string;
+  /** Category, scope and lifecycle under the headline, joined with " · ". */
+  status?: string;
+  /** What to do; omitted when empty. */
   hint: string;
   severity: 'warning' | 'error' | 'critical';
 }
@@ -120,7 +124,7 @@ export function KernelErrorPanel({
 }: KernelErrorPanelProps) {
   const rows = detailRows(error.details);
   const headline = presentation?.headline || readableErrorCode(error.code);
-  const hint = presentation?.hint || error.message;
+  const hint = presentation === undefined ? error.message : presentation.hint;
   const severity = presentation?.severity ?? 'error';
   return (
     <section
@@ -132,23 +136,27 @@ export function KernelErrorPanel({
         <div>
           <p className="eyebrow">{eyebrow}</p>
           <h2>{headline}</h2>
+          {presentation?.status && <p className="kernel-error-status">{presentation.status}</p>}
         </div>
         {onDismiss && (
           <button type="button" onClick={onDismiss}>Dismiss</button>
         )}
       </header>
-      <p>{hint}</p>
-      <code>{error.code || 'unclassified'}</code>
-      {rows.length > 0 && (
-        <dl>
-          {rows.map((row) => (
-            <div key={row.key}>
-              <dt>{row.key.replaceAll('_', ' ')}</dt>
-              <dd>{row.value}</dd>
-            </div>
-          ))}
-        </dl>
-      )}
+      {hint && <p>{hint}</p>}
+      <details className="kernel-error-technical">
+        <summary>Technical details</summary>
+        <code>{error.code || 'unclassified'}</code>
+        {rows.length > 0 && (
+          <dl>
+            {rows.map((row) => (
+              <div key={row.key}>
+                <dt>{row.key.replaceAll('_', ' ')}</dt>
+                <dd>{row.value}</dd>
+              </div>
+            ))}
+          </dl>
+        )}
+      </details>
     </section>
   );
 }

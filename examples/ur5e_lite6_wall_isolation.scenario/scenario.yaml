@@ -8,12 +8,12 @@
   "description": "Two independent joint trajectories in the UR5e + Lite6 wall cell, in separate control groups for the isolation case.",
   "members": {
     "assignment.yaml": "sha256:f44d0d3f0adf5a93854e73a414393a779a4a5704a910f29b2500a491cf3a3ebe",
-    "deployment.yaml": "sha256:8ee865ad5288acac03e4ee3b5c5745af9a9524a8e8b26bbaaf6207d776a0391d",
+    "deployment.yaml": "sha256:c95037136eabbc315747163a9e68860c2d917aaf2d8b7565b256c86ab5aa0d4f",
     "program.yaml": "sha256:5ed2f10b735fadb6bb348e5f69cbee54b1a94aa180f69f3af038c7bd2532eb0e"
   },
   "name": "ur5e_lite6_wall_isolation",
   "saved_status": {
-    "checked_content_digest": "sha256:0329d54e8a73e01f1bf90f696e75c0d74150366d2fe6c63f9f37e8ef1d7664f4",
+    "checked_content_digest": "sha256:c7aeb98cedb148515c49c3b25cdbdf8934eac73a7c28b6d90c9b107f8565b489",
     "last_known_status": "ready",
     "manyforge_version": "0.1.0"
   },

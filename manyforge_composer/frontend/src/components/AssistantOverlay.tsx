@@ -506,7 +506,7 @@ export function AssistantOverlay({
                     <ul>
                       {item.response.toolCalls.map((call, index) => (
                         <li key={`${call.toolId}.${index}`}>
-                          <code>{call.toolId}</code> — {call.status}
+                          <code>{call.toolId}</code> · {call.status}
                           {call.draftMutated ? ' (Draft changed)' : ''}
                           {call.resultSummary ? `: ${call.resultSummary}` : ''}
                         </li>
@@ -520,7 +520,7 @@ export function AssistantOverlay({
                     <ul className="assistant-proposals">
                       {item.response.proposals.map((proposal, index) => (
                         <li key={`${proposal.toolId}.${index}`}>
-                          <div><code>{proposal.toolId}</code> — {proposal.effect}</div>
+                          <div><code>{proposal.toolId}</code> · {proposal.effect}</div>
                           <details>
                             <summary>Review proposed Draft input</summary>
                             <pre>{JSON.stringify(proposal.arguments, null, 2)}</pre>

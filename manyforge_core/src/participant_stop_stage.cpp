@@ -132,6 +132,7 @@ template <typename ProviderPath>
     case MotionControlledStopMode::kSoftOnPath:
     case MotionControlledStopMode::kSpringBackHold:
     case MotionControlledStopMode::kHardDeceleration:
+    case MotionControlledStopMode::kSpringBackFast:
       return true;
   }
   return false;
@@ -299,6 +300,9 @@ template <typename ProviderPath>
   }
   if (*text == "spring_back_hold") {
     return MotionControlledStopMode::kSpringBackHold;
+  }
+  if (*text == "spring_back_fast") {
+    return MotionControlledStopMode::kSpringBackFast;
   }
   if (*text == "hard_deceleration") {
     return MotionControlledStopMode::kHardDeceleration;
@@ -651,12 +655,18 @@ Result<void> ValidateParticipantStopStageResult(
           command->resolved_stage.command_qualification
               .controlled_substitution_contract;
       const auto& profile = result.request.participant_stop_plan.participant_stop_profile;
-      if (!result.recoverable_substitution_reason.has_value() ||
-          !contract.has_value() || !profile.has_value() ||
-          profile->stop_mode != MotionInterruptStopMode::kSoftOnPath ||
-          profile->recoverable_substitution_mode != MotionInterruptStopMode::kSpringBackHold ||
-          contract->requested_stop_mode != *expected_mode ||
-          contract->executed_stop_mode != *result.actual_provider_contract_mode) {
+      const auto actual = *result.actual_provider_contract_mode;
+      if (!result.recoverable_substitution_reason.has_value() || !contract.has_value() ||
+          !profile.has_value() || contract->requested_stop_mode != *expected_mode ||
+          std::find(contract->fallback_stop_modes.begin(), contract->fallback_stop_modes.end(),
+                    actual) == contract->fallback_stop_modes.end() ||
+          std::none_of(profile->fallback_stop_modes.begin(), profile->fallback_stop_modes.end(),
+                       [&](const auto mode) {
+                         return (mode == MotionInterruptStopMode::kSpringBackHold &&
+                                 actual == MotionControlledStopMode::kSpringBackHold) ||
+                                (mode == MotionInterruptStopMode::kSpringBackFast &&
+                                 actual == MotionControlledStopMode::kSpringBackFast);
+                       })) {
         return invalid("participant_stop_stage_substitution_unqualified");
       }
     }

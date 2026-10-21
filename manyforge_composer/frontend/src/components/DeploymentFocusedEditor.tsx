@@ -43,6 +43,8 @@ import {
 import { DraftTextInput } from './common/DraftInputs';
 import { InterruptConditionEditor } from './InterruptConditionEditor';
 import { StopStagePicker } from './StopStagePicker';
+import { StopFallbackSequence } from './StopFallbackSequence';
+import { pruneFallbacks, recordedFallbacks } from '../utils/stopFallbackSequence';
 import type {
   BlackboardKeyDeclaration,
   DeploymentControlledStopProfile,
@@ -373,6 +375,8 @@ function controlledStopTargets(document: Record<string, JsonValue> | null): Cont
         const maxStopTime = stop?.max_stop_time_s === undefined
           ? undefined : numberValue(stop.max_stop_time_s);
         if (maxStopTime === null) return [];
+        const fallbacks = recordedFallbacks(stop);
+        if (fallbacks === null) return [];
         return [{
           key: JSON.stringify([componentId, targetId]),
           componentId,
@@ -385,6 +389,7 @@ function controlledStopTargets(document: Record<string, JsonValue> | null): Cont
             jerk_limits_enabled: jerkEnabled,
             per_resource_limits: normalizedLimits,
             ...(maxStopTime === undefined ? {} : { max_stop_time_s: maxStopTime }),
+            fallback_stop_modes: pruneFallbacks(mode, fallbacks),
           },
           derivedRows: 1,
         } satisfies ControlledStopTarget];
@@ -503,6 +508,10 @@ function normalizedStopProfile(
     const maxStopTime = parameters?.max_stop_time_s === undefined
       ? undefined : numberValue(parameters.max_stop_time_s);
     if (maxStopTime === null) return [];
+    // Legacy `recoverable_substitution_mode` reads as [spring_back_hold];
+    // carrying both fields is ambiguous (the backend refuses it).
+    const fallbacks = recordedFallbacks(parameters);
+    if (fallbacks === null) return [];
     return [{
       stop_mode: mode,
       deceleration_time_s: deceleration,
@@ -511,6 +520,7 @@ function normalizedStopProfile(
         ? parameters.jerk_limits_enabled : null,
       per_resource_limits: normalizedLimits,
       ...(maxStopTime === undefined ? {} : { max_stop_time_s: maxStopTime }),
+      fallback_stop_modes: pruneFallbacks(mode, fallbacks),
     } satisfies DeploymentControlledStopProfile];
   });
   if (profiles.length === 0 || profiles.length !== rows.length) return null;
@@ -659,6 +669,65 @@ function NumberDraft({
       </span>
       {invalid && <small className="deployment-field-error inline-message severity-error">Value was rejected.</small>}
     </label>
+  );
+}
+
+// Bare number cell with the NumberDraft commit pattern: commits a valid value on
+// Enter/blur only, Escape restores; for table rows that carry no field label.
+function CommitNumberInput({
+  value,
+  min,
+  disabled,
+  ariaLabel,
+  onCommit,
+}: {
+  value: number;
+  min: number;
+  disabled: boolean;
+  ariaLabel: string;
+  onCommit: (value: number) => Promise<unknown> | unknown;
+}) {
+  const [draft, setDraft] = useState(String(value));
+  const [invalid, setInvalid] = useState(false);
+  useEffect(() => {
+    setDraft(String(value));
+    setInvalid(false);
+  }, [value]);
+  const commit = async () => {
+    const parsed = Number(draft);
+    if (draft.trim() === '' || !Number.isFinite(parsed) || parsed < min) {
+      setInvalid(true);
+      return;
+    }
+    if (parsed === value) return;
+    const result = await onCommit(parsed);
+    setInvalid(result === null);
+  };
+  return (
+    <input
+      type="number"
+      className={invalid ? 'draft-input-invalid' : undefined}
+      value={draft}
+      min={min}
+      step="any"
+      disabled={disabled}
+      aria-label={ariaLabel}
+      aria-invalid={invalid || undefined}
+      title={invalid ? 'Value was rejected.' : undefined}
+      onChange={(event) => {
+        setDraft(event.target.value);
+        setInvalid(false);
+      }}
+      onBlur={() => { void commit(); }}
+      onKeyDown={(event) => {
+        if (event.key === 'Enter') event.currentTarget.blur();
+        if (event.key === 'Escape') {
+          setDraft(String(value));
+          setInvalid(false);
+          event.currentTarget.blur();
+        }
+      }}
+    />
   );
 }
 
@@ -1234,40 +1303,44 @@ function ControlledStopEditor({ controller, target }: {
   controller: DeploymentWorkspaceController;
   target: ControlledStopTarget;
 }) {
-  const [draft, setDraft] = useState<DeploymentControlledStopProfile | null>(
-    target.profile,
-  );
-  useEffect(() => {
-    setDraft(target.profile);
-  }, [target.profile]);
+  // Each edit commits the full profile straight to the Deployment Draft, like
+  // the other Deployment fields; number inputs keep only their uncommitted text.
+  const draft = target.profile;
   const disabled = !controller.mutationAvailable || controller.busy
     || target.profile?.jerk_limits_enabled == null;
-  const changed = target.profile !== null && JSON.stringify(draft) !== JSON.stringify(target.profile);
   const requiresMigration = target.profile?.jerk_limits_enabled == null;
+  const commit = (profile: DeploymentControlledStopProfile) => (requiresMigration ? null
+    : controller.updateControlledStop({
+      controllable_component_id: target.componentId,
+      command_target_id: target.targetId,
+      profile,
+    }));
   const updateLimit = (
     index: number,
     field: 'max_deceleration' | 'settle_velocity_threshold',
     value: number,
-  ) => setDraft((current) => {
-    if (current === null) return current;
-    const next = structuredClone(current);
+  ) => {
+    if (draft === null) return null;
+    const next = structuredClone(draft);
     next.per_resource_limits[index][field].value = value;
-    return next;
-  });
+    return commit(next);
+  };
   return (
     <>
-        <div className="deployment-focused-form-grid">
+        <div className="deployment-focused-form-grid deployment-stop-form">
           {draft && <>
           <label className="deployment-focused-field">
             <span>Stop mode</span>
             <select
               value={draft.stop_mode}
               disabled={disabled}
-              onChange={(event) => setDraft({
+              onChange={(event) => { void commit({
                 ...draft,
                 stop_mode: event.target.value as DeploymentControlledStopProfile['stop_mode'],
                 allow_natural_completion_on_short_path: event.target.value === 'soft_on_path',
-              })}
+                // Only modes below the new primary stay fallbacks.
+                fallback_stop_modes: pruneFallbacks(event.target.value, draft.fallback_stop_modes ?? []),
+              }); }}
             >
               <option value="soft_on_path">Soft on path</option>
               <option value="spring_back_hold">Spring-back on path</option>
@@ -1282,6 +1355,9 @@ function ControlledStopEditor({ controller, target }: {
               stopped by an interrupt.
             </p>
           )}
+          <StopFallbackSequence primary={draft.stop_mode} value={draft.fallback_stop_modes ?? []}
+            disabled={disabled}
+            onChange={(fallbacks) => { void commit({ ...draft, fallback_stop_modes: fallbacks }); }} />
           <NumberDraft
             label={draft.stop_mode === 'soft_on_path' ? 'Deceleration time' : 'Brake + return time'}
             value={draft.deceleration_time_s}
@@ -1292,47 +1368,45 @@ function ControlledStopEditor({ controller, target }: {
             onCommit={(value) => {
               // As `main`: an explicit maximum Stop time never stays below the
               // deceleration time.
-              setDraft({
+              return commit({
                 ...draft,
                 deceleration_time_s: value,
                 ...(draft.max_stop_time_s !== undefined && draft.max_stop_time_s < value
                   ? { max_stop_time_s: value } : {}),
               });
-              return true;
             }}
           />
-          <label className="deployment-focused-checkbox" title="Unselected: this robot's controlled Stop must finish within its deceleration time plus 0.5 s. Selecting sets an explicit maximum Stop time for this profile (never below the deceleration time); Save and Apply are still required.">
+          <label className="toggle-control" title="Unselected: this robot's controlled Stop must finish within its deceleration time plus 0.5 s. Selecting sets an explicit maximum Stop time for this profile (never below the deceleration time); Save and Apply are still required.">
             <input type="checkbox" checked={draft.max_stop_time_s !== undefined} disabled={disabled}
               onChange={(event) => {
                 const next = { ...draft };
                 if (event.target.checked) next.max_stop_time_s = draft.deceleration_time_s + 0.5;
                 else delete next.max_stop_time_s;
-                setDraft(next);
+                void commit(next);
               }} />
             Explicit maximum Stop time
           </label>
           {draft.max_stop_time_s === undefined
-            ? <p className="muted">{`Automatic: ${Number((draft.deceleration_time_s + 0.5).toFixed(3))} s (deceleration time + 0.5 s).`}</p>
+            ? <p className="field-help">{`Automatic: ${Number((draft.deceleration_time_s + 0.5).toFixed(3))} s (deceleration time + 0.5 s).`}</p>
             : <NumberDraft label="Max Stop time" value={draft.max_stop_time_s}
               title="This robot's controlled Stop must finish within this time from the Stop request; on overrun its hard stop follows, bounded by the lane's stop-completion timeout."
               unit="s" min={0.001} max={9_007_199} disabled={disabled}
-              onCommit={(value) => {
-                setDraft({ ...draft, max_stop_time_s: Math.max(draft.deceleration_time_s, value) });
-                return true;
-              }} />}
+              onCommit={(value) => commit({
+                ...draft, max_stop_time_s: Math.max(draft.deceleration_time_s, value),
+              })} />}
           </>}
           {draft && <>
-          <label className="deployment-focused-checkbox" title={draft.stop_mode !== 'soft_on_path'
+          <label className="toggle-control" title={draft.stop_mode !== 'soft_on_path'
             ? 'Off by default: brake and return to the stop-trigger position. Enabling permits a short remaining move to finish at its endpoint instead; that is not a precision return.'
             : 'On by default: a sufficiently short remaining move may finish at its endpoint, with rest confirmed within the Stop deadline.'}>
             <input
               type="checkbox"
               checked={draft.allow_natural_completion_on_short_path}
               disabled={disabled}
-              onChange={(event) => setDraft({
+              onChange={(event) => { void commit({
                 ...draft,
                 allow_natural_completion_on_short_path: event.target.checked,
-              })}
+              }); }}
             />
             Allow natural completion on a short remaining path
           </label>
@@ -1342,9 +1416,9 @@ function ControlledStopEditor({ controller, target }: {
               aria-label="Controlled Stop jerk limits"
               value={draft.jerk_limits_enabled === null ? '' : draft.jerk_limits_enabled ? 'on' : 'off'}
               disabled={disabled || requiresMigration}
-              onChange={(event) => setDraft({ ...draft, jerk_limits_enabled: event.target.value === 'on' })}
+              onChange={(event) => { void commit({ ...draft, jerk_limits_enabled: event.target.value === 'on' }); }}
             >
-              <option value="" disabled>Review required — choose</option>
+              <option value="" disabled>Review required: choose</option>
               <option value="off">Off</option>
               <option value="on">Enforce jerk limits</option>
             </select>
@@ -1359,69 +1433,46 @@ function ControlledStopEditor({ controller, target }: {
           {draft.per_resource_limits.map((limit, index) => (
             <div className="deployment-stop-limit" key={limit.resource_id}>
               <strong title={limit.resource_id}>{limit.resource_id.split('.').at(-1)}</strong>
-              <input
-                type="number"
-                min="0.000001"
-                step="any"
+              <CommitNumberInput
+                min={0.000001}
                 value={limit.max_deceleration.value}
                 disabled={disabled}
-                aria-label={`${limit.resource_id} maximum deceleration`}
-                onChange={(event) => updateLimit(index, 'max_deceleration', Number(event.target.value))}
+                ariaLabel={`${limit.resource_id} maximum deceleration`}
+                onCommit={(value) => updateLimit(index, 'max_deceleration', value)}
               />
-              <input
-                type="number"
-                min="0"
-                step="any"
+              <CommitNumberInput
+                min={0}
                 value={limit.settle_velocity_threshold.value}
                 disabled={disabled}
-                aria-label={`${limit.resource_id} settle velocity threshold`}
-                onChange={(event) => updateLimit(index, 'settle_velocity_threshold', Number(event.target.value))}
+                ariaLabel={`${limit.resource_id} settle velocity threshold`}
+                onCommit={(value) => updateLimit(index, 'settle_velocity_threshold', value)}
               />
             </div>
           ))}
         </div>}
         {draft?.jerk_limits_enabled === true && (
-          <details>
+          <details title="Empty uses the ManyForge acceleration/ramp preset. Explicit values are saved with this Deployment.">
             <summary>Joint jerk limits</summary>
             {draft.per_resource_limits.map((limit, index) => (
-              <label className="deployment-focused-field" key={limit.resource_id}>
-                <span>{limit.resource_id.split('.').at(-1)} ({limit.max_deceleration.coordinate_kind === 'angular_rad_s2' ? 'rad/s³' : 'm/s³'})</span>
-                <input
-                  type="number" min="0.000001" step="any" disabled={disabled}
-                  aria-label={`${limit.resource_id} maximum jerk`}
-                  placeholder="ManyForge preset" value={limit.max_jerk?.value ?? ''}
-                  title="Empty uses the ManyForge acceleration/ramp preset. Explicit values are saved with this Deployment."
-                  onChange={(event) => {
-                    const next = structuredClone(draft);
-                    if (event.target.value === '') delete next.per_resource_limits[index].max_jerk;
-                    else next.per_resource_limits[index].max_jerk = {
-                      coordinate_kind: limit.max_deceleration.coordinate_kind === 'angular_rad_s2' ? 'angular_rad_s3' : 'linear_m_s3',
-                      value: Number(event.target.value),
-                    };
-                    setDraft(next);
-                  }}
-                />
-              </label>
+              <OptionalNumberDraft key={limit.resource_id}
+                label={limit.resource_id.split('.').at(-1) ?? limit.resource_id}
+                unit={limit.max_deceleration.coordinate_kind === 'angular_rad_s2' ? 'rad/s³' : 'm/s³'}
+                ariaLabel={`${limit.resource_id} maximum jerk`}
+                placeholder="ManyForge preset" value={limit.max_jerk?.value ?? null}
+                disabled={disabled}
+                onCommit={(value) => {
+                  const next = structuredClone(draft);
+                  if (value === null) delete next.per_resource_limits[index].max_jerk;
+                  else next.per_resource_limits[index].max_jerk = {
+                    coordinate_kind: limit.max_deceleration.coordinate_kind === 'angular_rad_s2' ? 'angular_rad_s3' : 'linear_m_s3',
+                    value,
+                  };
+                  return commit(next);
+                }}
+              />
             ))}
           </details>
         )}
-        <div className="button-row">
-          <button
-            type="button"
-            className="primary-action"
-            disabled={disabled || !changed || requiresMigration}
-            onClick={() => { void controller.updateControlledStop({
-              controllable_component_id: target.componentId,
-              command_target_id: target.targetId,
-              profile: draft,
-            }); }}
-          >Update Controlled Stop Draft</button>
-          <button
-            type="button"
-            disabled={disabled || !changed}
-            onClick={() => { setDraft(target.profile); }}
-          >Discard Stop edits</button>
-        </div>
         <p className="field-help" title={`Preparation expands this target profile to ${target.derivedRows} current route row(s). Each robot's controlled Stop is bounded by its own maximum Stop time; on overrun or nominal failure its hard stop follows.`}>
           Save records these choices; Apply activates them.
         </p>

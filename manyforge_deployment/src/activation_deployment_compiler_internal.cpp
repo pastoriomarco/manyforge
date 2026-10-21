@@ -724,13 +724,19 @@ struct ComponentProjection final {
 
 [[nodiscard]] CanonicalValue provider_contract_ref(bool hard) {
   return CanonicalValue(Object{
-      {"provider_contract_role_id", CanonicalValue(hard ? "software_hard_stop" : "stop_contract")},
-      {"contract_schema_id", CanonicalValue(hard
-          ? "manyforge.value_schema.provider_contract.empty.v1"
-          : "manyforge.value_schema.provider_contract.motion_controlled_stop.v1")},
-      {"contract_schema_revision", CanonicalValue(hard
-          ? "sha256:fb466dd341076cbdb6fc97558ad28bc46032d25daaf4d4bb9d548bf642b83270"
-          : "sha256:fa6d62df17f87b231e2002bc38de0ecac9c6aa4da23f29f572b2a2780b481c27")},
+      {"provider_contract_role_id",
+       CanonicalValue(hard ? "software_hard_stop" : "stop_contract")},
+      {"contract_schema_id",
+       CanonicalValue(hard ? "manyforge.value_schema.provider_contract.empty.v1"
+                           : "manyforge.value_schema.provider_contract.motion_"
+                             "controlled_stop.v1")},
+      {"contract_schema_revision",
+       CanonicalValue(hard ? "sha256:"
+                             "fb466dd341076cbdb6fc97558ad28bc46032d25daaf4d4bb9"
+                             "d548bf642b83270"
+                           : "sha256:"
+                             "65e6f4462981225916834490d4e3cb4d42b70611a2287e1b7"
+                             "6fdb1cbcabcb113")},
   });
 }
 
@@ -1320,6 +1326,47 @@ CanonicalValue compile_activation_deployment(
               {"per_resource_limits", CanonicalValue(std::move(resource_limits))},
               {"allow_natural_completion_on_short_path", member(controlled, "allow_natural_completion_on_short_path", "controlled stop")},
           };
+          const auto *legacy_fallback =
+              controlled.find_object_member("recoverable_substitution_mode");
+          const auto *fallback_modes =
+              controlled.find_object_member("fallback_stop_modes");
+          if (legacy_fallback && fallback_modes)
+            fail("controlled Stop has conflicting fallback fields");
+          if (legacy_fallback) {
+            if (text(member(controlled, "stop_mode", "controlled stop"),
+                     "stop mode") != "soft_on_path" ||
+                text(*legacy_fallback, "legacy fallback") != "spring_back_hold")
+              fail("invalid legacy Stop fallback");
+            controlled_parameters.emplace_back(
+                "fallback_stop_modes",
+                CanonicalValue(Array{CanonicalValue("spring_back_hold")}));
+          }
+          if (fallback_modes) {
+            const auto &modes =
+                array(*fallback_modes, "controlled Stop fallbacks");
+            if (modes.size() > 2U)
+              fail("too many Stop fallbacks");
+            const auto &primary =
+                text(member(controlled, "stop_mode", "controlled stop"),
+                     "stop mode");
+            int previous = primary == "soft_on_path"       ? 0
+                           : primary == "spring_back_hold" ? 1
+                           : primary == "spring_back_fast" ? 2
+                                                           : 3;
+            for (const auto &item : modes) {
+              const auto &mode = text(item, "Stop fallback");
+              const int current = mode == "spring_back_hold"   ? 1
+                                  : mode == "spring_back_fast" ? 2
+                                                               : -1;
+              if (current <= previous)
+                fail("Stop fallbacks must be ordered below primary, excluding "
+                     "hard");
+              previous = current;
+            }
+            if (!modes.empty())
+              controlled_parameters.emplace_back("fallback_stop_modes",
+                                                 *fallback_modes);
+          }
           // Q28/Q51 (`main`): the per-profile maximum Stop time, when authored.
           if (const auto *max_stop = controlled.find_object_member("max_stop_time_s");
               max_stop != nullptr) {

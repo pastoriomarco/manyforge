@@ -22,6 +22,7 @@ import {
   type IoLivenessMode,
 } from './ioSignalConfiguration';
 import { INTERRUPT_MOTION_NODE_IDS, programBlackboardKeys } from './programAuthoring';
+import { resolvedInputSignals, resolvedTargetRoles } from './targetRoleResolution';
 
 /**
  * Interrupt rule authoring (schema04): the closed condition grammar shared by
@@ -109,17 +110,27 @@ function keyChoice(key: BlackboardKeyDeclaration): ConditionOperandChoice | null
  * Node-rule operands: the input signals of every Program target role bound in
  * the current binding (`signal_role_bindings`, inputs only), with the
  * liveness the Deployment Draft declares for them, then every declared scalar
- * key incl. `node_outcome.*` and `interrupt_state.*`.
+ * key incl. `node_outcome.*` and `interrupt_state.*`. Without a binding, the
+ * target roles resolve through the scenario role assignment and their signals
+ * are the Deployment Draft's declared inputs (targetRoleResolution).
  */
 export function nodeConditionChoices(
   program: Pick<ProgramAuthoringDocument, 'blackboard' | 'forest' | 'target_roles'>,
   binding: ProgramBindingDocument | null | undefined,
   globalRuleIds: readonly string[],
   deploymentDocument: Record<string, JsonValue> | null = null,
+  roleAssignment: Record<string, JsonValue> | null = null,
 ): ConditionOperandChoice[] {
   const declared = declaredIoSources(deploymentDocument);
+  const targets = binding == null
+    ? resolvedTargetRoles(program, roleAssignment).map((target) => ({
+      ...target,
+      signal_role_bindings: resolvedInputSignals(program, target, deploymentDocument)
+        .map((row) => ({ ...row, direction: 'input' as const })),
+    }))
+    : binding.target_role_bindings;
   const signals: ConditionOperandChoice[] = [];
-  for (const target of binding?.target_role_bindings ?? []) {
+  for (const target of targets) {
     if (!Object.hasOwn(program.target_roles ?? {}, target.target_role_id)) continue;
     for (const row of target.signal_role_bindings ?? []) {
       if (row.direction !== 'input') continue;

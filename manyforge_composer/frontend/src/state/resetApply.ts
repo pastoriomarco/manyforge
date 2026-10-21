@@ -254,7 +254,7 @@ export function resetApplyPhaseText(phase: ResetApplyPhase): string {
     case 'resetting': return 'Sending Reset…';
     case 'awaiting_idle': return phase.delivery === 'confirmed'
       ? 'Reset sent; waiting for the run to end and the cycle to reach Idle.'
-      : 'Reset delivery unknown — reconciling from the observed cycle. Reset is not resent, and nothing is Applied until its settlement is observed.';
+      : 'Reset delivery unknown: reconciling from the observed cycle. Reset is not resent, and nothing is Applied until its settlement is observed.';
     case 'applying': return phase.sent ? 'Applying the Draft…' : 'Idle reached; waiting for authoring admission to Apply.';
     case 'awaiting_apply': return `Apply ${phase.apply.applyId} accepted; waiting for activation to settle.`;
     case 'confirmation_required': return 'Reset done. The Deployment change needs your confirmation of its impact before Apply.';

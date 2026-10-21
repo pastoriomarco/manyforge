@@ -80,7 +80,7 @@ it('shows a brief warning for each new automatic retry, and never re-shows one i
   expect(shown).toMatchObject({
     severity: 'warning',
     domain: 'runtime',
-    title: 'Planning failed on move — attempt 3 of 4',
+    title: 'Planning failed on move · attempt 3 of 4',
   });
   await act(() => { vi.advanceTimersByTime(BRIEF_NOTICE_MS - 1); });
   expect(shown).not.toBeNull();
@@ -93,15 +93,15 @@ it('shows a brief warning for each new automatic retry, and never re-shows one i
 
   // A newer retry re-triggers, and restarts the timer.
   await render('run.1', [...history, retry(3, 3, 'planning_no_effect'), retry(4, 4, 'collision_stop_nominal')]);
-  expect(shown?.title).toBe('Collision Stop on move — attempt 4 of 4');
+  expect(shown?.title).toBe('Collision Stop on move · attempt 4 of 4');
   await act(() => { vi.advanceTimersByTime(BRIEF_NOTICE_MS - 1); });
-  expect(shown?.title).toBe('Collision Stop on move — attempt 4 of 4');
+  expect(shown?.title).toBe('Collision Stop on move · attempt 4 of 4');
   await act(() => { vi.advanceTimersByTime(1); });
   expect(shown).toBeNull();
 
   // The first retry of a new run is new too.
   await render('run.2', [retry(2, 2, 'collision_stop_nominal')]);
-  expect(shown?.title).toBe('Collision Stop on move — attempt 2 of 4');
+  expect(shown?.title).toBe('Collision Stop on move · attempt 2 of 4');
   await act(() => root.unmount());
 });
 
@@ -128,7 +128,7 @@ it('shows the first retry of a run that started with none, and nothing before th
   expect(shown).toBeNull();
   // The first retry of the run is new, and is announced.
   await render('run.1', [retry(2, 2, 'planning_no_effect')]);
-  expect(shown?.title).toBe('Planning failed on move — attempt 2 of 4');
+  expect(shown?.title).toBe('Planning failed on move · attempt 2 of 4');
   await act(() => { vi.advanceTimersByTime(BRIEF_NOTICE_MS); });
   expect(shown).toBeNull();
   await act(() => root.unmount());
@@ -161,7 +161,7 @@ it('shows a brief warning when an io wait source becomes unavailable, not when i
   expect(shown).toMatchObject({
     severity: 'warning',
     domain: 'runtime',
-    title: 'Input source unavailable on wait_part — still waiting',
+    title: 'Input source unavailable on wait_part · still waiting',
   });
   await act(() => { vi.advanceTimersByTime(BRIEF_NOTICE_MS); });
   expect(shown).toBeNull();
@@ -202,7 +202,7 @@ it('shows a brief warning for a new takeover fallback on either path', async () 
   expect(shown).toMatchObject({
     severity: 'warning',
     domain: 'runtime',
-    title: 'Spring-back fallback on move — takeover preparation late (prep 41 of 30 ms)',
+    title: 'Spring-back fallback on move · takeover preparation late (prep 41 of 30 ms)',
     message: 'Recorded in the runtime-control events.',
   });
   await act(() => { vi.advanceTimersByTime(BRIEF_NOTICE_MS); });
@@ -222,7 +222,7 @@ it('shows a brief warning for a new takeover fallback on either path', async () 
     fallback(4, 'spring_back_hold', 'planning_timeout', 'spring_back_planning'),
   ]);
   expect(shown?.title).toBe(
-    'Spring-back fallback on move — planning timeout during spring_back_planning (prep 41 of 30 ms)',
+    'Spring-back fallback on move · planning timeout during spring_back_planning (prep 41 of 30 ms)',
   );
   await act(() => { vi.advanceTimersByTime(BRIEF_NOTICE_MS); });
   expect(shown).toBeNull();

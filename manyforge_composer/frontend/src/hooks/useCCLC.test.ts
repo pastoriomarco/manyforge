@@ -728,7 +728,7 @@ describe('mounted explicit activation API boundaries', () => {
     expect(apiMock.cclc.submitLifecycle).not.toHaveBeenCalled();
     expect(hook!.busy).toBe(true);
     expect(apiMock.cclc.component.mock.calls.length - readsBefore).toBe(82);
-    expect(hook!.activationProgress).toBe('component.arm: Not ready — [component_fault] Controller fault requires repair · fault_present');
+    expect(hook!.activationProgress).toBe('component.arm: Not ready · [component_fault] Controller fault requires repair · fault_present');
     await act(async () => { hook!.cancelActivation(); await activation; });
     expect(apiMock.cclc.submitLifecycle).not.toHaveBeenCalled();
     expect(hook!.activationUnresolved).toBe(false);

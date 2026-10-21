@@ -93,8 +93,11 @@ export function NoticeActions({ notice }: { notice: WorkbenchNotice }) {
   );
 }
 
-/** One notice with its source-supported actions; never an acknowledgement. */
-export function NoticeItem({ notice }: { notice: WorkbenchNotice }) {
+/**
+ * One notice with its source-supported actions; never an acknowledgement.
+ * `children` are the alarms it represents, each with its own acknowledgement.
+ */
+export function NoticeItem({ notice, children }: { notice: WorkbenchNotice; children?: ReactNode }) {
   return (
     <div
       className={`workbench-notice severity-${notice.severity}${notice.busy ? ' busy' : ''}`}
@@ -113,6 +116,7 @@ export function NoticeItem({ notice }: { notice: WorkbenchNotice }) {
           <NoticeActions notice={notice} />
         </div>
       )}
+      {children && <div className="workbench-notice-alarms">{children}</div>}
     </div>
   );
 }

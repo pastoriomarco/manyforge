@@ -69,9 +69,9 @@ TEST(IoRuleStopResponse, ActualNominalDefaultsCheckModeWithoutRewritingSubstitut
   JsonObjectDTO defaults{{"stop_mode", JsonValueDTO{std::string("soft_on_path")}}};
   MotionInterruptStopProfileDTO profile;
   profile.stop_mode = MotionInterruptStopMode::kSoftOnPath;
-  profile.recoverable_substitution_mode = MotionInterruptStopMode::kSpringBackHold;
+  profile.fallback_stop_modes = {MotionInterruptStopMode::kSpringBackHold};
   EXPECT_TRUE(ValidateIoRuleNominalStopMode(defaults, profile).ok());
-  EXPECT_EQ(profile.recoverable_substitution_mode, MotionInterruptStopMode::kSpringBackHold);
+  EXPECT_EQ(profile.fallback_stop_modes, (std::vector{MotionInterruptStopMode::kSpringBackHold}));
   profile.stop_mode = MotionInterruptStopMode::kSpringBackHold;
   EXPECT_FALSE(ValidateIoRuleNominalStopMode(defaults, profile).ok());
   EXPECT_FALSE(ValidateIoRuleNominalStopMode(JsonObjectDTO{}, profile).ok());

@@ -13,10 +13,14 @@ namespace {
   const auto profile = map_motion_controlled_stop_contract_parameters_to_profile(
       *command.validated_contract_parameters, participant.binding.value().resources,
       "motion_takeover_fallback");
-  return profile.ok() && (profile.value().stop_mode == MotionInterruptStopMode::kSpringBackHold ||
-                          (profile.value().stop_mode == MotionInterruptStopMode::kSoftOnPath &&
-                           profile.value().recoverable_substitution_mode ==
-                               MotionInterruptStopMode::kSpringBackHold));
+  if (!profile.ok()) return false;
+  const auto spring = [](const MotionInterruptStopMode mode) {
+    return mode == MotionInterruptStopMode::kSpringBackHold ||
+           mode == MotionInterruptStopMode::kSpringBackFast;
+  };
+  return spring(profile.value().stop_mode) ||
+         std::any_of(profile.value().fallback_stop_modes.begin(),
+                     profile.value().fallback_stop_modes.end(), spring);
 }
 }  // namespace
 

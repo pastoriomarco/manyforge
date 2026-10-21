@@ -281,28 +281,28 @@ _EXPECTED_RUNTIME_RESTORATION_PROFILE_DIGESTS: Final = {
         "28b47a00f2ae915e3281bc6a58c0927f164aaa8a8d4a4635a997a49e6436f6b1"
     ),
     "lite6_isaac_commanded_v0": (
-        "04b1228ba7445e40263b25c5b11f7b01c91f7e0488a0cf7676cf24bb0e43d1eb"
+        "28be83380ef33cb9db845c41774a7633d68af657c1dc83cee15b2f3115e8b034"
     ),
     "lite6_mock_commanded_v0": (
-        "bf2fc3cc208cec7b06b5f0d0ad51b480b714b2838db3369d5927668b2f45e0f2"
+        "6093a4058a33b59117b1cff8e3bcf4e1331cbe020c2bddd143927d2a2f8b653a"
     ),
     "ur10e_robotiq_assistant_isaac_commanded_v0": (
-        "ea331688311119f5a916d319217e59886311ce8eb552fe46a653e26acef2718e"
+        "09b9855179e247f2956d5559c37f9b252d3bdb2991bc5322f2c119f790415512"
     ),
     "ur10e_robotiq_assistant_mock_commanded_v0": (
-        "9d7d5c5b2251cad2aa03e01a8caf78e95fab8e6b4e28dfd2697e0b0fb2a26f83"
+        "9a8e4e5bafb2a3042e435a0611f0a6d0a6dfb0968003469de04bacb99f152412"
     ),
     "ur10e_robotiq_isaac_commanded_v0": (
-        "74191a954caf9ece5ebea937a818103bae155ca85c50085fd3f9ff3e11598bc3"
+        "2ac011899a66492599bcaed4fb8a0c0b8cc18f06180ca8990e6c11d491c9b4e0"
     ),
     "ur10e_robotiq_mock_commanded_v0": (
-        "570a0ad7edb3c35179e37cd0e2878c7479cc90cab73478c5e39446cb3734b1f4"
+        "50b4a0d3b03687b172aeacb1cb89ea914af483e222e22b4f20eb5fcf725f0c58"
     ),
     "ur5_mock_commanded_v0": (
-        "2d05adb391ce8fe9e2d59cc41d8a0ebba6e090e0395964afe303985e8612dee5"
+        "e4b832ee25720120dafb59ceffcc825d9818b6891c0aa4f23e2552b77c171c0a"
     ),
     "ur5e_robotiq_mock_commanded_v0": (
-        "090fcfe8c60a145b0a2e4e9346548bcde140aaea21846678069b2e16eeb2d014"
+        "e5ee9d2c728b3732ab8db5b0fb84f4df88d7a652c756fbac1ffe390281987a26"
     ),
 }
 _EXPECTED_RUNTIME_RESTORATION_PROFILE_FAMILIES: Final = {

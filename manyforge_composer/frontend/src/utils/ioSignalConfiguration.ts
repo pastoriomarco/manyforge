@@ -646,11 +646,8 @@ export interface DeclaredIoSource {
   liveness: IoLivenessMode;
 }
 
-/** Every declared input of a Deployment document, by component/target/resource role. */
-export function declaredIoSources(
-  document: Record<string, JsonValue> | null,
-): Map<string, DeclaredIoSource> {
-  const result = new Map<string, DeclaredIoSource>();
+/** Every declared input row of a Deployment document (intent components and compiled runtime units). */
+export function declaredIoInputs(document: Record<string, JsonValue> | null): IoSignalInputDraft[] {
   const configurations: Record<string, JsonValue>[] = [];
   const components = document?.components;
   if (Array.isArray(components)) {
@@ -666,17 +663,23 @@ export function declaredIoSources(
       if (configuration !== null) configurations.push(configuration);
     }
   }
-  for (const configuration of configurations) {
-    for (const row of ioSignalRows(ioSignalsConfiguration(configuration, []).configuration)) {
-      if (row.kind !== 'input') continue;
-      const { draft } = row;
-      result.set(ioSourceKey(draft.componentId, draft.targetId, draft.resourceRoleId), {
-        profile: draft.profile,
-        sourceId: draft.sourceId,
-        topic: draft.profile === 'mock' ? null : draft.topic,
-        liveness: inputLivenessMode(draft),
-      });
-    }
+  return configurations.flatMap((configuration) => ioSignalRows(
+    ioSignalsConfiguration(configuration, []).configuration,
+  ).flatMap((row) => (row.kind === 'input' ? [row.draft] : [])));
+}
+
+/** Every declared input of a Deployment document, by component/target/resource role. */
+export function declaredIoSources(
+  document: Record<string, JsonValue> | null,
+): Map<string, DeclaredIoSource> {
+  const result = new Map<string, DeclaredIoSource>();
+  for (const draft of declaredIoInputs(document)) {
+    result.set(ioSourceKey(draft.componentId, draft.targetId, draft.resourceRoleId), {
+      profile: draft.profile,
+      sourceId: draft.sourceId,
+      topic: draft.profile === 'mock' ? null : draft.topic,
+      liveness: inputLivenessMode(draft),
+    });
   }
   return result;
 }

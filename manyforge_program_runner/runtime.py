@@ -3739,39 +3739,58 @@ class ProgramRuntime:
                 self._starting_kernel_owner_epoch = kernel_epoch
                 abort_if_stop_won()
                 # Acquire Run only from the current owner admission generation.
-                owner_admission = admission_client.get()
-                generation = self._admission_generation(owner_admission)
-                claim_intent["expected_admission_generation"] = generation
-                try:
-                    journal.refresh_pending_acquire(
-                        expected_generation=cycle.cycle_generation,
-                        provisional_run_id=program_run_id,
-                        evidence=claim_intent,
-                    )
-                except RuntimeError:
-                    abort_if_stop_won()
-                    raise
-                try:
-                    acquire_attempted = True
-                    claim = admission_client.acquire(claim_intent)
-                    acquired_for_request = True
-                except CellAdmissionError as error:
-                    if error.outcome_unknown:
-                        journal.mark_acquire_unknown(
-                            expected_generation=cycle.cycle_generation
+                # A Manager heartbeat can publish this Run's own ``starting``
+                # readiness between the read and the claim; the Kernel then
+                # advances the generation (its semantics are unchanged) and
+                # definitely rejects the claim with no effect. Only that exact
+                # rejection is retried, once, from a fresh read.
+                for acquire_try in (1, 2):
+                    owner_admission = admission_client.get()
+                    generation = self._admission_generation(owner_admission)
+                    claim_intent["expected_admission_generation"] = generation
+                    try:
+                        journal.refresh_pending_acquire(
+                            expected_generation=cycle.cycle_generation,
+                            provisional_run_id=program_run_id,
+                            evidence=claim_intent,
                         )
-                    else:
+                    except RuntimeError:
                         abort_if_stop_won()
+                        raise
+                    try:
+                        acquire_attempted = True
+                        claim = admission_client.acquire(claim_intent)
+                        acquired_for_request = True
+                    except CellAdmissionError as error:
+                        if error.outcome_unknown:
+                            journal.mark_acquire_unknown(
+                                expected_generation=cycle.cycle_generation
+                            )
+                            raise
+                        abort_if_stop_won()
+                        if (
+                            acquire_try == 1
+                            and error.code == "stale_generation"
+                            and error.details.get("reason")
+                            == "expected_generation_stale"
+                        ):
+                            # A rejected claim records nothing in the Kernel,
+                            # so the same request identity stays acceptable
+                            # and a failure before the retry is pre-acquire.
+                            acquire_attempted = False
+                            self._verify_required_components_active(applied)
+                            continue
                         journal.cancel_rejected_acquire(
                             expected_generation=cycle.cycle_generation
                         )
                         starting_committed = False
-                    raise
-                except Exception:
-                    journal.mark_acquire_unknown(
-                        expected_generation=cycle.cycle_generation
-                    )
-                    raise
+                        raise
+                    except Exception:
+                        journal.mark_acquire_unknown(
+                            expected_generation=cycle.cycle_generation
+                        )
+                        raise
+                    break
                 try:
                     journal.remember_acquired_claim(
                         expected_generation=cycle.cycle_generation,

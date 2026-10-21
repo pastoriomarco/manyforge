@@ -1892,7 +1892,9 @@ TEST(RetainedBundleMaterializer,
       {"controllable_component_id",
        CanonicalValue(std::string(test::kLite6ControllableComponentId))},
       {"command_target_id", CanonicalValue(std::string(target_id))},
-      {"profile_id", CanonicalValue("fault_spring_back_hold")},
+      {"profile_id", CanonicalValue(stop_mode == "spring_back_fast"
+                                         ? "fault_spring_back_fast"
+                                         : "fault_spring_back_hold")},
       {"stop_mode", CanonicalValue(std::string(stop_mode))},
       {"require_backend_confirmation", CanonicalValue(true)},
   };
@@ -1955,7 +1957,16 @@ TEST(RetainedBundleMaterializer,
   EXPECT_EQ(profile.jerk_limits_enabled, std::optional<bool>(true));
   EXPECT_TRUE(profile.per_joint_max_jerk.empty());
   EXPECT_FALSE(profile.per_joint_settle_velocity_threshold.has_value());
-  EXPECT_FALSE(profile.recoverable_substitution_mode.has_value());
+  EXPECT_TRUE(profile.fallback_stop_modes.empty());
+
+  const auto fast = ros2_configuration_with_fault_rows(
+      authored_fault_stop_profile_rows(test::kLite6ArmTargetId,
+                                       "spring_back_fast"));
+  ASSERT_EQ(fast.default_fault_stop_profiles.size(), 1U);
+  auto expected_fast = profile;
+  expected_fast.profile_id = "fault_spring_back_fast";
+  expected_fast.stop_mode = core::MotionInterruptStopMode::kSpringBackFast;
+  EXPECT_EQ(fast.default_fault_stop_profiles.front().profile, expected_fast);
 
   const auto soft = ros2_configuration_with_fault_rows(
       authored_fault_stop_profile_rows(test::kLite6ArmTargetId,

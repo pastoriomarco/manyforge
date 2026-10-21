@@ -3555,7 +3555,7 @@ function StructuralViewerContent({
         {runtimeOverlay}
         {inspectorPanel === 'robot' && candidateTcpPose !== null && candidateTool === null && candidateRobot === null && (
           <div className="viewer-target-status" role="status">
-            <span>Target marker only — mapped tool geometry unavailable. Target is unvalidated.</span>
+            <span>Target marker only: mapped tool geometry unavailable. Target is unvalidated.</span>
           </div>
         )}
         {viewerActive && (

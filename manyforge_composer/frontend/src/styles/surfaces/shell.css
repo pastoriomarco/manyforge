@@ -922,6 +922,12 @@
   gap: 0.3rem;
 }
 
+.workbench-notice-alarms {
+  display: grid;
+  flex: 1 1 100%;
+  gap: 0.4rem;
+}
+
 .workbench-notice-actions button {
   font-size: inherit;
   white-space: normal;

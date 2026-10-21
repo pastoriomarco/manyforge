@@ -416,6 +416,90 @@ describe('DeploymentFocusedEditor', () => {
     } finally { await mounted.unmount(); }
   });
 
+  it('commits Controlled Stop selects and checkboxes directly with the full profile', async () => {
+    const value = controller();
+    const { host, find } = mountedHost();
+    const { createRoot } = await import('react-dom/client');
+    const root = createRoot(host as unknown as Element);
+    await act(() => root.render(<DeploymentFocusedEditor controller={value}
+      sourceModel={{ status: 'loading' }} motionDescriptors={[]} gripperDescriptors={[]} />));
+    try {
+      const profile = {
+        stop_mode: 'soft_on_path', deceleration_time_s: 1,
+        allow_natural_completion_on_short_path: true, jerk_limits_enabled: true,
+        per_resource_limits: [expect.objectContaining({
+          resource_id: 'robot.arm.coordinate.000000',
+          max_deceleration: expect.objectContaining({ value: 4 }),
+          settle_velocity_threshold: expect.objectContaining({ value: 0.01 }),
+        })],
+      };
+      const update = (changes: Record<string, unknown>) => ({
+        controllable_component_id: 'robot', command_target_id: 'arm',
+        profile: expect.objectContaining({ ...profile, ...changes }),
+      });
+      await act(() => find((props) => props.value === 'soft_on_path' && props.onChange !== undefined)
+        .onChange?.({ target: { value: 'spring_back_hold' } }));
+      expect(value.updateControlledStop).toHaveBeenLastCalledWith(update({
+        stop_mode: 'spring_back_hold', allow_natural_completion_on_short_path: false,
+      }));
+      const natural = find((props) => props.className === 'toggle-control' && Array.isArray(props.children)
+        && props.children.includes('Allow natural completion on a short remaining path'));
+      await act(() => (natural.children as Array<{ props: Props }>)[0].props
+        .onChange?.({ target: { checked: false } }));
+      expect(value.updateControlledStop).toHaveBeenLastCalledWith(update({
+        allow_natural_completion_on_short_path: false,
+      }));
+      await act(() => find((props) => props['aria-label'] === 'Controlled Stop jerk limits')
+        .onChange?.({ target: { value: 'off' } }));
+      expect(value.updateControlledStop).toHaveBeenLastCalledWith(update({ jerk_limits_enabled: false }));
+      expect(value.updateControlledStop).toHaveBeenCalledTimes(3);
+      expect(() => find((props) => props.children === 'Update Controlled Stop Draft'))
+        .toThrow('Mounted control not found');
+    } finally { await act(() => root.unmount()); }
+  });
+
+  it('commits a Controlled Stop number only on blur or Enter with a valid value', async () => {
+    const value = controller();
+    const { host, find } = mountedHost();
+    const { createRoot } = await import('react-dom/client');
+    const root = createRoot(host as unknown as Element);
+    await act(() => root.render(<DeploymentFocusedEditor controller={value}
+      sourceModel={{ status: 'loading' }} motionDescriptors={[]} gripperDescriptors={[]} />));
+    const deceleration = () => find((props) =>
+      props['aria-label'] === 'robot.arm.coordinate.000000 maximum deceleration');
+    const type = (text: string) => act(() => deceleration().onChange?.({ target: { value: text } }));
+    const blur = () => act(() => (deceleration().onBlur as () => void)());
+    try {
+      await type('');
+      await type('-');
+      await type('7');
+      expect(value.updateControlledStop).not.toHaveBeenCalled();
+      await type('-1');
+      await blur();
+      expect(value.updateControlledStop).not.toHaveBeenCalled();
+      expect(deceleration()['aria-invalid']).toBe(true);
+      await type('7');
+      await blur();
+      expect(value.updateControlledStop).toHaveBeenCalledExactlyOnceWith(expect.objectContaining({
+        controllable_component_id: 'robot', command_target_id: 'arm',
+        profile: expect.objectContaining({ per_resource_limits: [expect.objectContaining({
+          max_deceleration: expect.objectContaining({ value: 7 }),
+          settle_velocity_threshold: expect.objectContaining({ value: 0.01 }),
+        })] }),
+      }));
+      await type('8');
+      await act(() => (deceleration().onKeyDown as (event: unknown) => void)({
+        key: 'Enter', currentTarget: { blur: () => (deceleration().onBlur as () => void)() },
+      }));
+      expect(value.updateControlledStop).toHaveBeenCalledTimes(2);
+      expect(value.updateControlledStop).toHaveBeenLastCalledWith(expect.objectContaining({
+        profile: expect.objectContaining({ per_resource_limits: [expect.objectContaining({
+          max_deceleration: expect.objectContaining({ value: 8 }),
+        })] }),
+      }));
+    } finally { await act(() => root.unmount()); }
+  });
+
   it('renders authored intent without requiring a compiled graph projection', () => {
     const value = controller();
     value.workspace!.draft.document = {
@@ -704,7 +788,9 @@ describe('DeploymentFocusedEditor', () => {
       sourceModel={{ status: 'loading' }} motionDescriptors={[]} gripperDescriptors={[]} />);
     expect(markup).toContain('older Stop contract needs explicit migration');
     expect(markup).toMatch(/<select[^>]+aria-label="Controlled Stop jerk limits"[^>]+disabled/);
-    expect(markup).toMatch(/<button[^>]+disabled[^>]*>Update Controlled Stop Draft/);
+    expect(markup).toMatch(/<select[^>]+disabled[^>]*><option value="soft_on_path"/);
+    expect(markup).toMatch(/<input[^>]+disabled[^>]+aria-label="robot\.arm\.coordinate\.000000 maximum deceleration"/);
+    expect(markup).not.toContain('Update Controlled Stop Draft');
   });
 
   it('presents canonical target, native runtime, and normalized Stop inputs', () => {
@@ -767,7 +853,8 @@ describe('DeploymentFocusedEditor', () => {
     expect(markup).toContain('Joint jerk limits');
     expect(markup).toContain('ManyForge preset');
     expect(markup).toContain('Soft on path');
-    expect(markup).toContain('Update Controlled Stop Draft');
+    expect(markup).not.toContain('Update Controlled Stop Draft');
+    expect(markup).not.toContain('Discard Stop edits');
     expect(markup).toContain('No current addressed gripper descriptor is available.');
   });
 

@@ -1981,7 +1981,7 @@ public:
     fault_profile.profile_id = "fault_spring_back_hold";
     fault_profile.stop_mode = core::MotionInterruptStopMode::kSpringBackHold;
     fault_profile.allow_natural_completion_on_short_path = false;
-    fault_profile.recoverable_substitution_mode.reset();
+    fault_profile.fallback_stop_modes.clear();
     core::RuntimeParticipantExecutionRegistration registration{
         .binding = participants.front().participant_binding,
         .stop_readiness = participants.front().stop_readiness,
@@ -2220,11 +2220,12 @@ void ExpectExactControlledStopPlan(
   EXPECT_DOUBLE_EQ(*profile.deceleration_time_s, 1.0);
   EXPECT_EQ(profile.allow_natural_completion_on_short_path,
             expected_natural_completion);
-  ASSERT_EQ(profile.recoverable_substitution_mode.has_value(),
-            expected_recoverable_mode.has_value());
-  if (expected_recoverable_mode.has_value()) {
-    EXPECT_EQ(*profile.recoverable_substitution_mode, *expected_recoverable_mode);
-  }
+  const auto expected_fallbacks =
+      expected_recoverable_mode.has_value()
+          ? std::vector<
+                core::MotionInterruptStopMode>{*expected_recoverable_mode}
+          : std::vector<core::MotionInterruptStopMode>{};
+  EXPECT_EQ(profile.fallback_stop_modes, expected_fallbacks);
   EXPECT_TRUE(profile.require_backend_confirmation);
   ASSERT_EQ(profile.per_joint_max_deceleration.size(), 6U);
   for (const auto &[joint, limit] : profile.per_joint_max_deceleration) {

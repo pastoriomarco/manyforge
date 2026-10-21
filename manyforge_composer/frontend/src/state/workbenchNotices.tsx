@@ -57,6 +57,12 @@ export interface WorkbenchNotice {
   actions?: NoticeAction[];
   busy?: boolean;
   /**
+   * Operator-alarm definitions this notice represents. The Errors overlay
+   * shows their attention alarms inside the notice, as one item per failure;
+   * without the notice they are shown on their own.
+   */
+  alarmDefinitionIds?: readonly string[];
+  /**
    * The condition is the expected, related consequence of a known controlled
    * transition (the model or Scene being replaced). Only while such a
    * transition is active is an error of this kind presented as information.
@@ -230,7 +236,7 @@ export function noticeRowSummary(
   if (notices.length === 0) return '';
   if (notices.length === 1) {
     const [notice] = notices;
-    return notice.message ? `${notice.title} — ${notice.message}` : notice.title;
+    return notice.message ? `${notice.title} · ${notice.message}` : notice.title;
   }
   return `${notices.length} ${noun.many} · ${notices[0].title}`;
 }

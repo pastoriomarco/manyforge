@@ -8,12 +8,12 @@
   "description": "Local deployment for the semantic object-selection demo. A model selects one backend-authoritative scene object from a deterministic manifest plus an auxiliary viewer snapshot, and the backend computes the actual pick sequence deterministically from backend scene state.",
   "members": {
     "assignment.yaml": "sha256:97a61aed742ff302a7ccf3c68eedb6b9c5e80516ef145a131db5f27b51538a60",
-    "deployment.yaml": "sha256:f0db16d229b43f91bae78a6cb5cf09066a5dcf9c95dae7c0770aac3c9042102e",
+    "deployment.yaml": "sha256:dfaac98daad26fad5995ba740420d87adbebfe67e2f0ca9b24a4cab56819858c",
     "program.yaml": "sha256:2bbb2a928693984099677b318882f682ec93048dd3ea40438f0cec7cb3f08704"
   },
   "name": "ur5_roboplan_local_semantic_shape_pick",
   "saved_status": {
-    "checked_content_digest": "sha256:3395d813c4d3069c0c47a854d73193c4dfd80e0342e115aa83862688bf1c0abc",
+    "checked_content_digest": "sha256:b97a20ceb85bd56161bdc2df0c74a901fb3e860dfdcf3ccace3503b64c57a7fd",
     "last_known_status": "ready",
     "manyforge_version": "0.1.0"
   },

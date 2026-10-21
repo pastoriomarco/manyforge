@@ -63,7 +63,7 @@ describe('ProgramPolicyEditor', () => {
       <ProgramPolicyEditor node={{ ...node, execution_groups: ['ghost', 'robot_a'], children: [{ ...node, instance_id: 'child' }] }}
         availableGroups={['robot_a', 'robot_b']} busy={false} onUpdate={vi.fn()} />,
     );
-    expect(markup).toContain('type="checkbox" checked=""/>ghost — missing');
+    expect(markup).toContain('type="checkbox" checked=""/>ghost · missing');
     expect(markup).toContain('Draft memberships: All + ghost, robot_a.');
     expect(markup).toContain('Child nodes that inherit follow later changes here.');
     expect(markup.indexOf('<legend>Control groups</legend>'))

@@ -684,13 +684,6 @@ svg.viewer-camera-icon {
   background: var(--mf-bg-success-15);
 }
 
-/* Continue (in place of Stop while a failure hold owns the group) fails the node. */
-.transport-group-continue:not(:disabled) {
-  border-color: var(--mf-border-danger-53);
-  color: var(--mf-text-danger-81);
-  background: var(--mf-bg-danger-37);
-}
-
 .transport-group-scale {
   display: grid;
   grid-template-columns: minmax(0, 1fr) auto;

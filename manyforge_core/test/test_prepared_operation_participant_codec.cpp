@@ -925,7 +925,7 @@ TEST(PreparedOperationParticipantCodecTest,
   MotionInterruptStopProfileDTO profile;
   profile.stop_mode = MotionInterruptStopMode::kSoftOnPath;
   EXPECT_TRUE(ValidateIoRuleNominalStopMode(base, profile).ok());
-  profile.recoverable_substitution_mode = MotionInterruptStopMode::kSpringBackHold;
+  profile.fallback_stop_modes = {MotionInterruptStopMode::kSpringBackHold};
   EXPECT_TRUE(ValidateIoRuleNominalStopMode(base, profile).ok());
   profile.stop_mode = MotionInterruptStopMode::kSpringBackHold;
   EXPECT_FALSE(ValidateIoRuleNominalStopMode(base, profile).ok());

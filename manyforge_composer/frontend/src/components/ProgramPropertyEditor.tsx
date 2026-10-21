@@ -89,6 +89,8 @@ import {
 import { InterruptConditionEditor } from './InterruptConditionEditor';
 import { MockSimulationEditor } from './MockSimulationEditor';
 import { IO_LIVENESS_UNPROVEN_WARNING } from '../utils/ioSignalConfiguration';
+import { precisionContactStopWarnings } from '../utils/precisionContactStopWarnings';
+import { resolvedTargetRoles } from '../utils/targetRoleResolution';
 import { ProgramPolicyEditor } from './ProgramPolicyEditor';
 import { StopStagePicker } from './StopStagePicker';
 
@@ -102,6 +104,8 @@ interface ProgramPropertyEditorProps {
   sourceModel?: SourceModelProjection | null;
   sourceModelUnavailableReason?: string | null;
   deploymentWorkspace?: DeploymentWorkspaceResponse | null;
+  /** The scenario's Program role assignment: resolves target roles while the workspace has no binding. */
+  programRoleAssignment?: Record<string, JsonValue> | null;
   motionDescriptors?: ManualControlMotionDescriptor[];
   /** Published motion targets' qualified Stop chains (SX-2167); absent = "available after Apply". */
   stopChains?: TargetStopChain[];
@@ -257,6 +261,7 @@ export function ProgramPropertyEditor({
   sourceModel = null,
   sourceModelUnavailableReason = null,
   deploymentWorkspace = null,
+  programRoleAssignment = null,
   motionDescriptors = [],
   stopChains = [],
   busy,
@@ -279,8 +284,8 @@ export function ProgramPropertyEditor({
   const blackboardKeys = useMemo(() => programBlackboardKeys(program, ruleIds), [program, ruleIds]);
   const conditionChoices = useMemo(() => nodeConditionChoices(
     program, deploymentWorkspace?.binding, ruleIds,
-    deploymentDocument as Record<string, JsonValue> | null,
-  ), [deploymentDocument, deploymentWorkspace?.binding, program, ruleIds]);
+    deploymentDocument as Record<string, JsonValue> | null, programRoleAssignment,
+  ), [deploymentDocument, deploymentWorkspace?.binding, program, programRoleAssignment, ruleIds]);
   const motionConfiguration = useMemo(
     () => deriveProgramMotionConfiguration(program, catalogEntries),
     [catalogEntries, program],
@@ -332,6 +337,14 @@ export function ProgramPropertyEditor({
   const selectedDiagnostics = useMemo(() => diagnostics.filter((diagnostic) =>
     programDiagnosticNodeId(roots, diagnostic.path) === selectedId,
   ), [diagnostics, roots, selectedId]);
+  // Warnings only: never part of the node's validity or Apply gating.
+  const workspaceBinding = deploymentWorkspace?.binding;
+  const stopWarnings = useMemo(() => (selected === null ? [] : precisionContactStopWarnings(
+    selected, deploymentDocument as Record<string, JsonValue> | null,
+    workspaceBinding == null
+      ? resolvedTargetRoles(program, programRoleAssignment)
+      : workspaceBinding.target_role_bindings,
+  )), [deploymentDocument, workspaceBinding, program, programRoleAssignment, selected]);
   // The bound robot's qualified Stop chain; null keeps "available after Apply".
   const qualifiedStopStages = useMemo(() => (selected === null ? null : stopStagesForTargetRole(
     stopChains, deploymentWorkspace?.binding?.target_role_bindings, selected.parameters.target_role,
@@ -639,6 +652,9 @@ export function ProgramPropertyEditor({
           )}
         </div>
       )}
+      {stopWarnings.map((warning) => (
+        <p key={warning} className="inline-message severity-warning" role="note">{warning}</p>
+      ))}
       <section className="dcard" aria-label="Node">
           <h4>Node</h4>
           <label>

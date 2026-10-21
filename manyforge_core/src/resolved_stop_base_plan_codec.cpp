@@ -13,6 +13,8 @@
 #include <type_traits>
 #include <utility>
 
+#include "stop_fallback_codec_internal.hpp"
+
 namespace manyforge::core {
 namespace {
 
@@ -492,8 +494,9 @@ void validate_scope_widening(const ResolvedStopContainmentScopeDTO& previous,
 void validate_substitution(const ControlledStopSubstitutionContractDTO& contract,
                            const StopContainmentCommandDTO& command) {
   validate_contract_ref(contract.provider_contract_ref);
-  if (contract.requested_stop_mode != MotionControlledStopMode::kSoftOnPath ||
-      contract.executed_stop_mode != MotionControlledStopMode::kSpringBackHold ||
+  if (contract.fallback_stop_modes.empty() ||
+      !motion_controlled_stop_fallbacks_valid(contract.requested_stop_mode,
+                                              contract.fallback_stop_modes) ||
       !command.provider_contract_ref.has_value() ||
       contract.provider_contract_ref != *command.provider_contract_ref) {
     fail("controlled substitution contract does not match its command");
@@ -826,10 +829,13 @@ void validate_plan(const ResolvedStopBasePlanDTO& plan) {
 
 [[nodiscard]] CanonicalValue substitution_value(
     const ControlledStopSubstitutionContractDTO& value) {
+  CanonicalValue::Array modes;
+  for (const auto mode : value.fallback_stop_modes)
+    modes.emplace_back(std::string(to_string(mode)));
   return CanonicalValue(CanonicalValue::Object{
       {"provider_contract_ref", contract_value(value.provider_contract_ref)},
       {"requested_stop_mode", CanonicalValue(std::string(to_string(value.requested_stop_mode)))},
-      {"executed_stop_mode", CanonicalValue(std::string(to_string(value.executed_stop_mode)))}});
+      {"fallback_stop_modes", CanonicalValue(std::move(modes))}});
 }
 
 [[nodiscard]] CanonicalValue qualification_value(const ResolvedStopCommandQualificationDTO& value) {
@@ -1044,7 +1050,7 @@ void validate_plan(const ResolvedStopBasePlanDTO& plan) {
     fields.emplace_back("resolved_stop_base_plan_id",
                         CanonicalValue(plan.resolved_stop_base_plan_id.value()));
   }
-  return CanonicalValue(std::move(fields));
+  return detail::stop_fallback_wire_fields(CanonicalValue(std::move(fields)), false);
 }
 
 [[nodiscard]] ResolvedStopBasePlanId computed_id(const ResolvedStopBasePlanDTO& plan) {
@@ -1053,8 +1059,24 @@ void validate_plan(const ResolvedStopBasePlanDTO& plan) {
                                                                 plan_value(plan, false)));
 }
 
+[[nodiscard]] bool legacy_identity(const ResolvedStopBasePlanDTO& plan) {
+  try {
+    const auto legacy = detail::stop_fallback_wire_fields(plan_value(plan, false), true);
+    const auto id = content_identity::framed_sha256(kResolvedStopBasePlanIdentityDomain,
+                                                    kResolvedStopBasePlanApiVersion, legacy);
+    return content_identity::digest_equal(id, plan.resolved_stop_base_plan_id.value());
+  } catch (const std::invalid_argument&) {
+    return false;
+  }
+}
+
 [[nodiscard]] std::string checked_encoded_bytes(const ResolvedStopBasePlanDTO& plan) {
-  auto bytes = content_identity::canonical_json(plan_value(plan, true));
+  auto wire = plan_value(plan, true);
+  if (!content_identity::digest_equal(computed_id(plan).value(),
+                                      plan.resolved_stop_base_plan_id.value()) &&
+      legacy_identity(plan))
+    wire = detail::stop_fallback_wire_fields(wire, true);
+  auto bytes = content_identity::canonical_json(wire);
   if (bytes.size() > content_identity::kMaximumCanonicalJsonBytes) {
     fail("resolved Stop base-plan bytes exceed the canonical parser ceiling");
   }
@@ -1066,6 +1088,10 @@ void validate_plan(const ResolvedStopBasePlanDTO& plan) {
 
 Result<ResolvedStopBasePlanDTO> MakeResolvedStopBasePlan(ResolvedStopBasePlanDTO plan) {
   try {
+    for (auto& stage : plan.escalation_stages) {
+      if (stage.default_contract_parameters)
+        detail::normalize_stop_fallback_parameters(*stage.default_contract_parameters);
+    }
     validate_plan(plan);
     plan.resolved_stop_base_plan_id = computed_id(plan);
     static_cast<void>(checked_encoded_bytes(plan));
@@ -1085,8 +1111,9 @@ Result<void> VerifyResolvedStopBasePlan(const ResolvedStopBasePlanDTO& plan) {
   try {
     validate_plan(plan);
     if (!content_identity::is_sha256_digest(plan.resolved_stop_base_plan_id.value()) ||
-        !content_identity::digest_equal(computed_id(plan).value(),
-                                        plan.resolved_stop_base_plan_id.value())) {
+        (!content_identity::digest_equal(computed_id(plan).value(),
+                                         plan.resolved_stop_base_plan_id.value()) &&
+         !legacy_identity(plan))) {
       return Result<void>::Err(
           ErrorDTO{"resolved_stop_base_plan_id_mismatch",
                    "the resolved Stop base-plan ID does not match its canonical content",

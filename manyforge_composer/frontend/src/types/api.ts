@@ -642,6 +642,10 @@ export interface DeploymentControlledStopProfile {
   /** Q28/Q51 (`main`): this profile's controlled-Stop deadline from the Stop
    * request; absent uses the deceleration time + 0.5 s. */
   max_stop_time_s?: number;
+  /** Ordered fallbacks after `stop_mode`, strictly below it in the fixed order
+   * (utils/stopFallbackSequence.ts); hard deceleration always follows and is
+   * never listed. Absent is []. */
+  fallback_stop_modes?: Array<'spring_back_hold' | 'spring_back_fast'>;
   allow_natural_completion_on_short_path: boolean;
   /** null is an older Draft that still requires an explicit migration choice. */
   jerk_limits_enabled: boolean | null;
@@ -1053,7 +1057,11 @@ export interface CycleRecoveryOffer {
   reason: StructuredError;
   evidenceRefs: string[];
   /** The captured node policy; `maxRetries` 0 is Unlimited. */
-  policy: { allowIntervention: boolean; maxRetries: number };
+  policy: {
+    allowIntervention: boolean;
+    maxRetries: number;
+    interventionStopScope?: 'own_groups';
+  };
   /** Explicit failure retries of this node already used in the run. */
   retriesUsed: number;
 }

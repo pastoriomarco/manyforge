@@ -74,7 +74,7 @@
       ]
     }
   ],
-  "description": "R5 trial (e): signal moves. search_trip scripts probe_contact false then true after 1000 ms -> signal_trip/success; search_no_trip scripts edge_sensor false with no change and completes without trip -> no_signal_trip (default success); probe_no_trip completes without trip with on_no_signal success -> no_signal_trip. The node_outcome keys are checked.",
+  "description": "R5 trial (e): signal moves. search_trip scripts probe_contact false then true after 1000 ms -> signal_trip/success; search_no_trip scripts edge_sensor false with no change and completes without trip -> no_signal_trip (default success); probe_no_trip approaches probe_block slowly (TCP speed limit 10 mm/s), scripts edge_sensor false with no change and completes without trip with on_no_signal success -> no_signal_trip. The node_outcome keys are checked.",
   "forest": [
     {
       "children": [
@@ -259,6 +259,7 @@
           "parameters": {
             "base_frame_role": "base",
             "contact_policy_id": "probe_contact_policy",
+            "execution_timeout_s": 30.0,
             "goal": {
               "frame_ref": {
                 "frame_role": "base",
@@ -290,10 +291,26 @@
                 "value": true
               }
             },
+            "max_tcp_linear_speed_mps": 0.01,
+            "mock_simulation": [
+              {
+                "signal": {
+                  "resource_role": "edge_sensor",
+                  "target_role": "station"
+                },
+                "start_value": false
+              }
+            ],
             "on_no_signal": "success",
             "stop_mode": "soft_on_path",
             "target_role": "arm",
             "tcp_frame_role": "tcp"
+          },
+          "value_sources": {
+            "contact_scene_resource_id": {
+              "kind": "blackboard_key",
+              "reference": "trial.probe_object"
+            }
           }
         },
         {

@@ -891,11 +891,21 @@ class FakeParticipantEngine final : public IResolvedParticipantExecutionEngine,
       std::stop_token cancellation, IStopStageSpringReturnObserver& observer) override {
     ++takeover_stop_stage_calls;
     const auto& profile = stage.participant_stop_plan.participant_stop_profile;
-    const bool spring =
-        profile &&
-        (profile->stop_mode == MotionInterruptStopMode::kSpringBackHold ||
-         (profile->stop_mode == MotionInterruptStopMode::kSoftOnPath &&
-          profile->recoverable_substitution_mode == MotionInterruptStopMode::kSpringBackHold));
+    const auto is_spring = [](const MotionInterruptStopMode mode) {
+      return mode == MotionInterruptStopMode::kSpringBackHold ||
+             mode == MotionInterruptStopMode::kSpringBackFast;
+    };
+    std::optional<MotionInterruptStopMode> selected;
+    if (profile) {
+      if (is_spring(profile->stop_mode))
+        selected = profile->stop_mode;
+      else {
+        const auto found = std::find_if(profile->fallback_stop_modes.begin(),
+                                        profile->fallback_stop_modes.end(), is_spring);
+        if (found != profile->fallback_stop_modes.end()) selected = *found;
+      }
+    }
+    const bool spring = selected.has_value();
     if (spring) {
       std::optional<SpringBackReturnPointDTO> point;
       {
@@ -928,8 +938,10 @@ class FakeParticipantEngine final : public IResolvedParticipantExecutionEngine,
     // to hold the physical return while successor preparation proceeds.
     auto result = TranslateStopStage(stage, budget, cancellation);
     if (spring && result.outcome == ParticipantStopStageOutcomeDTO::kSucceeded) {
-      result.actual_provider_contract_mode = MotionControlledStopMode::kSpringBackHold;
-      if (profile->stop_mode == MotionInterruptStopMode::kSoftOnPath) {
+      result.actual_provider_contract_mode = *selected == MotionInterruptStopMode::kSpringBackHold
+                                                 ? MotionControlledStopMode::kSpringBackHold
+                                                 : MotionControlledStopMode::kSpringBackFast;
+      if (profile->stop_mode != *selected) {
         result.recoverable_substitution_reason = "takeover_spring_return";
       }
     }
@@ -2240,7 +2252,7 @@ ManagerLivenessRequiredSetDTO EmptyManagerLivenessSet() {
 }
 
 [[nodiscard]] ResolvedStopBasePlanDTO stop_base_plan_for(
-    const RuntimeParticipantBinding& participant) {
+    const RuntimeParticipantBinding& participant, const bool qualify_fast_fallback = false) {
   const auto path =
       std::filesystem::path(__FILE__).parent_path() / "golden" / "resolved_stop_base_plan.v1.json";
   std::ifstream stream(path, std::ios::binary);
@@ -2315,6 +2327,10 @@ ManagerLivenessRequiredSetDTO EmptyManagerLivenessSet() {
       if (stage.command_qualification.controlled_substitution_contract.has_value()) {
         select_controlled_stop_contract(
             stage.command_qualification.controlled_substitution_contract->provider_contract_ref);
+        if (qualify_fast_fallback) {
+          stage.command_qualification.controlled_substitution_contract->fallback_stop_modes
+              .push_back(MotionControlledStopMode::kSpringBackFast);
+        }
       }
       for (auto& requirement : stage.evidence_requirements) {
         if (requirement.requirement.provider_contract_ref.has_value()) {
@@ -2447,8 +2463,8 @@ ManagerLivenessRequiredSetDTO EmptyManagerLivenessSet() {
     const RuntimeParticipantBinding& participant, IResolvedParticipantExecutionEngine& engine,
     const bool include_controlled_fallback = false,
     std::vector<RuntimeParticipantBinding> domain_members = {},
-    const bool control_path_stop_targets = false) {
-  auto plan = stop_base_plan_for(participant);
+    const bool control_path_stop_targets = false, const bool qualify_fast_fallback = false) {
+  auto plan = stop_base_plan_for(participant, qualify_fast_fallback);
   if (control_path_stop_targets) {
     // Every stage and its evidence source on the participant's own control
     // path, as a deployment resolves them for a trajectory controller.
@@ -25549,19 +25565,31 @@ TEST(ResourceAddressedExecutionKernelTest,
 
 TEST(ResourceAddressedExecutionKernelTest,
      SpringFallbackCannotInventPermissionOrDispatchAfterFailedContainment) {
-  for (const bool spring_permitted : {false, true}) {
-    SCOPED_TRACE(spring_permitted);
+  for (const unsigned permission : {0U, 1U, 2U, 3U, 4U}) {
+    SCOPED_TRACE(permission);
+    const bool spring_permitted = permission != 0U;
     FakeClock clock;
     ManualScheduler scheduler;
     FakeParticipantEngine engine;
     FakeOperationJournal journal;
     engine.supports_motion_replacement = true;
+    // The historical golden qualifies hold only. These two new authored
+    // lists require an explicitly fast-capable sealed test base as well.
     auto row = registration(
-        make_binding("arm", "arm", "execution.trajectory.execute", CoordinateKind::kAngular), engine);
+        make_binding("arm", "arm", "execution.trajectory.execute", CoordinateKind::kAngular),
+        engine, false, {}, false, permission >= 3U);
     row.motion_takeover_preparation_budget_s = 10.0;
     if (spring_permitted) {
-      row.default_operator_stop_profile->stop_mode = MotionInterruptStopMode::kSpringBackHold;
-      row.default_operator_stop_profile->allow_natural_completion_on_short_path = false;
+      auto& profile = *row.default_operator_stop_profile;
+      profile.stop_mode = permission == 1U   ? MotionInterruptStopMode::kSpringBackHold
+                          : permission == 2U ? MotionInterruptStopMode::kSpringBackFast
+                                             : MotionInterruptStopMode::kSoftOnPath;
+      if (permission == 3U)
+        profile.fallback_stop_modes = {MotionInterruptStopMode::kSpringBackFast};
+      if (permission == 4U)
+        profile.fallback_stop_modes = {MotionInterruptStopMode::kSpringBackHold,
+                                       MotionInterruptStopMode::kSpringBackFast};
+      profile.allow_natural_completion_on_short_path = false;
     }
     ResourceAddressedExecutionKernelConfig config{RequestOwnerEpoch("kernel.epoch.1"),
                                                   CellId("cell.test"), 8U};
@@ -25621,6 +25649,8 @@ TEST(ResourceAddressedExecutionKernelTest,
                                                    : OperationStateKind::kStopped);
     if (!spring_permitted) {
       EXPECT_EQ(engine.takeover_stop_stage_calls.load(), 0);
+    } else {
+      EXPECT_GT(engine.takeover_stop_stage_calls.load(), 0);
     }
     engine.prepare_motion_hook = {};
   }
@@ -31406,7 +31436,7 @@ TEST(ResourceAddressedExecutionKernelTest,
 
 TEST(ResourceAddressedExecutionKernelTest,
      RetainedProviderProductResealRefusesIncompleteForeignAndLostAuthorityAtomically) {
-  for (unsigned scenario = 0U; scenario < 9U; ++scenario) {
+  for (unsigned scenario = 0U; scenario < 11U; ++scenario) {
     SCOPED_TRACE(scenario);
     ProviderCandidateClosedFixture fixture;
     ASSERT_TRUE(fixture.kernel
@@ -31445,6 +31475,26 @@ TEST(ResourceAddressedExecutionKernelTest,
       fixture.gate.before_exact_check = [&] {
         if (++checks > 1U) fixture.gate.actual.reject_reservation = false;
       };
+    if (scenario == 9U || scenario == 10U) {
+      scope = fixture.fence.expected_scope;
+      auto &domain_scope = scope.domains.front();
+      const auto &candidate =
+          std::get<ProviderConfigurationFenceDomainDTO>(domain_scope.payload)
+              .candidate_provider;
+      ASSERT_TRUE(candidate);
+      domain_scope.predecessor_control_domain_revision =
+          domain_scope.candidate_control_domain_revision;
+      if (scenario == 9U) {
+        auto foreign_candidate = *candidate;
+        foreign_candidate.signal_configuration_digest = ContentDigest(test_digest('a'));
+        domain_scope.payload = ProviderConfigurationFenceDomainDTO{
+            candidate, foreign_candidate};
+      } else {
+        domain_scope.payload = ProviderConfigurationFenceDomainDTO{candidate, candidate};
+        occurrences.front().provider_runtime_epoch = RuntimeEpoch("foreign.epoch");
+      }
+      fixture.gate.actual.held_scope = scope;
+    }
     const auto rejected = fixture.kernel->reconfigure_runtime_component_set(
         {}, {}, RetainedBundleId(test_digest('c')), GraphRevision(test_digest('d')),
         fixture.fence.configuration_fence_id, scope, retained, {}, domains, occurrences,
@@ -31453,6 +31503,64 @@ TEST(ResourceAddressedExecutionKernelTest,
     EXPECT_EQ(fixture.kernel->current_runtime_provider_configuration(id).value(), before);
     EXPECT_TRUE(fixture.kernel->resource_snapshot().empty());
   }
+}
+
+TEST(ResourceAddressedExecutionKernelTest,
+     RetainedFencedProviderProductResealPreservesExactActualReadback) {
+  ProviderCandidateClosedFixture fixture;
+  ASSERT_TRUE(fixture.kernel
+                  ->publish_installed_provider_candidate_closed(fixture.fence, fixture.parent,
+                                                                fixture.facts)
+                  .ok());
+  const auto snapshot = provider_domain_currentness_snapshot();
+  const ComponentCommandReadinessPublicationDTO authority{
+      ComponentReadinessAuthorityDTO::kParentApplyFence,
+      {},
+      fixture.fence.configuration_fence_id,
+      fixture.facts.controllable_component_id,
+      fixture.facts.component_lifecycle_generation,
+      true,
+      fixture.fence.expected_scope};
+  auto observations = provider_domain_driver_observations(snapshot);
+  observations.front().source_sequence = 7U;
+  observations.front().observation_generation = 9U;
+  const auto published = fixture.kernel->publish_runtime_provider_configuration(
+      authority, snapshot, observations);
+  ASSERT_TRUE(published.ok()) << published.error().message;
+  ASSERT_EQ(published.value().size(), 1U);
+  ASSERT_TRUE(published.value().front().operation_admission_open);
+  const auto before = published.value().front();
+
+  auto scope = fixture.fence.expected_scope;
+  auto &domain_scope = scope.domains.front();
+  const auto &candidate_side =
+      std::get<ProviderConfigurationFenceDomainDTO>(domain_scope.payload)
+          .candidate_provider;
+  ASSERT_TRUE(candidate_side);
+  domain_scope.predecessor_control_domain_revision =
+      domain_scope.candidate_control_domain_revision;
+  domain_scope.payload = ProviderConfigurationFenceDomainDTO{candidate_side, candidate_side};
+  fixture.gate.actual.held_scope = scope;
+
+  const RetainedBundleId next_bundle(test_digest('c'));
+  const GraphRevision next_graph(test_digest('d'));
+  const auto resealed = fixture.kernel->reconfigure_runtime_component_set(
+      {}, {}, next_bundle, next_graph, fixture.fence.configuration_fence_id, scope,
+      {fixture.facts.controllable_component_id}, {}, fixture.facts.domains,
+      fixture.facts.provider_occurrences, &fixture.parent);
+  ASSERT_TRUE(resealed.ok()) << resealed.error().message;
+
+  auto expected = before;
+  expected.retained_bundle_id = next_bundle;
+  expected.graph_revision = next_graph;
+  const auto after = fixture.kernel->current_runtime_provider_configuration(
+      fixture.facts.domains.front().control_domain_id);
+  ASSERT_TRUE(after.ok());
+  ASSERT_TRUE(after.value());
+  EXPECT_EQ(after.value(), std::optional(expected));
+  EXPECT_TRUE(after.value()->operation_admission_open);
+  EXPECT_EQ(after.value()->driver_source_sequence, 7U);
+  EXPECT_EQ(after.value()->driver_observation_generation, 9U);
 }
 
 TEST(ResourceAddressedExecutionKernelTest,

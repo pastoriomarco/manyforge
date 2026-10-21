@@ -23,6 +23,12 @@ from .deployment_intent import (
     validate_deployment_intent,
 )
 from .authoring_identity import freeze_json, thaw_json
+from .stop_fallback_sequence import (
+    FALLBACK_STOP_MODES_FIELD,
+    fallback_candidates,
+    fallback_sequence_error,
+    recorded_fallback_stop_modes,
+)
 
 
 _MAX_DOCUMENT_BYTES = 16 * 1024 * 1024
@@ -372,12 +378,22 @@ def _edit_compiled_controlled_stop_profile(
     if (
         not isinstance(profile, dict)
         or not expected <= set(profile)
-        or not set(profile) <= expected | {"max_stop_time_s"}
+        or not set(profile)
+        <= expected | {"max_stop_time_s", FALLBACK_STOP_MODES_FIELD}
     ):
         _fail(
             "deployment_controlled_stop_invalid",
             "Controlled Stop profile has an invalid shape",
         )
+    if FALLBACK_STOP_MODES_FIELD in profile:
+        fallback_error = fallback_sequence_error(
+            profile["stop_mode"], profile[FALLBACK_STOP_MODES_FIELD]
+        )
+        if fallback_error is not None:
+            _fail(
+                "deployment_controlled_stop_invalid",
+                f"Controlled Stop {FALLBACK_STOP_MODES_FIELD} {fallback_error}",
+            )
     max_stop_time = profile.get("max_stop_time_s")
     if max_stop_time is not None and (
         type(max_stop_time) not in {int, float}
@@ -579,15 +595,21 @@ def _edit_compiled_controlled_stop_profile(
         }
         if max_stop_time is not None:
             row["default_contract_parameters"]["max_stop_time_s"] = float(max_stop_time)
-        # This editor does not author provider substitution policy. Preserve an
-        # existing qualified Soft substitution while editing its other fields.
-        if (
-            profile["stop_mode"] == "soft_on_path"
-            and current.get("recoverable_substitution_mode") == "spring_back_hold"
-        ):
-            row["default_contract_parameters"][
-                "recoverable_substitution_mode"
-            ] = "spring_back_hold"
+        # Fallback sequence (stop_fallback_sequence.py).  Writes are canonical:
+        # only a non-empty `fallback_stop_modes`; a legacy Soft substitution
+        # is normalized to [spring_back_hold].  A profile without the field
+        # keeps the recorded sequence, minus modes no longer below the primary.
+        try:
+            recorded = recorded_fallback_stop_modes(current)
+        except ValueError as error:
+            _fail("deployment_controlled_stop_invalid", str(error))
+        if FALLBACK_STOP_MODES_FIELD in profile:
+            fallbacks = list(profile[FALLBACK_STOP_MODES_FIELD])
+        else:
+            below = fallback_candidates(profile["stop_mode"])
+            fallbacks = [mode for mode in recorded if mode in below]
+        if fallbacks:
+            row["default_contract_parameters"][FALLBACK_STOP_MODES_FIELD] = fallbacks
         updated += 1
     if updated == 0:
         _fail(
@@ -641,7 +663,8 @@ def _edit_controlled_stop_profile(
         if (
             not isinstance(profile, dict)
             or not expected <= set(profile)
-            or not set(profile) <= expected | {"max_stop_time_s"}
+            or not set(profile)
+            <= expected | {"max_stop_time_s", FALLBACK_STOP_MODES_FIELD}
         ):
             _fail(
                 "deployment_controlled_stop_invalid",
@@ -697,6 +720,10 @@ def _edit_controlled_stop_profile(
         }
         if "max_stop_time_s" in profile:
             current["max_stop_time_s"] = profile["max_stop_time_s"]
+        # Validated (fixed order, strictly below stop_mode) by the intent
+        # validator below; a stale entry after a mode change is refused there.
+        if FALLBACK_STOP_MODES_FIELD in profile:
+            current[FALLBACK_STOP_MODES_FIELD] = profile[FALLBACK_STOP_MODES_FIELD]
         matches[0]["controlled_stop"] = current
         try:
             return validate_deployment_intent(

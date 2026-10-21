@@ -9,6 +9,7 @@ import { DeploymentDocumentControls } from './components/DeploymentDocumentContr
 import {
   HeadlessRuntimeSurfaces,
   attentionAlarmsNewestFirst,
+  partitionRepresentedAlarms,
 } from './components/HeadlessRuntimeSurfaces';
 import {
   RuntimeAttentionAutoOpen,
@@ -847,7 +848,14 @@ export default function App() {
     headlessEnabled ? headlessStateSource.reportClientIncident : undefined,
   );
   const unacknowledgedAlarmCount = headlessSnapshot?.alarms.unacknowledgedCount ?? 0;
-  const errorItemCount = clientErrors.length + unacknowledgedAlarmCount
+  // An alarm a current notice represents is counted once, with the notice.
+  const representedAlarmCount = useMemo(() => [...partitionRepresentedAlarms(
+    attentionAlarmsNewestFirst(headlessSnapshot?.alarms.alarms ?? []),
+    errorConditions,
+  ).represented.values()].reduce((count, alarms) => count + alarms.length, 0),
+  [errorConditions, headlessSnapshot]);
+  const errorItemCount = clientErrors.length
+    + Math.max(0, unacknowledgedAlarmCount - representedAlarmCount)
     + errorConditions.length;
   const runtimeAttentionItems = useMemo(() => [
     ...errorConditions.map((condition) => ({
@@ -1079,7 +1087,7 @@ export default function App() {
               activeWorkspace === 'deployment' ? ' active' : ''
             }`}
             aria-pressed={activeWorkspace === 'deployment'}
-            aria-label={`Deployment — ${deploymentStatus.accessibleLabel}. Live status feed ${
+            aria-label={`Deployment · ${deploymentStatus.accessibleLabel}. Live status feed ${
               deploymentStatus.backendConnected ? 'connected' : 'unavailable'
             }. ${deploymentStatus.attentionCount > 0
               ? `${deploymentStatus.attentionCount} attention ${
@@ -1179,6 +1187,7 @@ export default function App() {
               environment={nodeEnvironment}
               sourceModel={sourceModel}
               deploymentWorkspace={deploymentController.workspace}
+              programRoleAssignment={authoringWorkspace.project?.programRoleAssignment ?? null}
               motionDescriptors={robotControl.motionTargets.map(
                 (target) => target.targetDescriptor,
               )}

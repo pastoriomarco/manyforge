@@ -2,7 +2,7 @@
 api_version: manyforge.node_catalog.v2
 content_version: 2.7.0
 catalog_id: manyforge_builtin
-catalog_digest: sha256:76cf8c7efdf959a132e9c33802c4c683cb3afddaf229cf06bb09605d609fdf36
+catalog_digest: sha256:4dfd2fcb507323ca8355cee098fd76187f26ca704edcf7b3a1ed65c3fc03b336
 schema_types:
   coordinate_position:
     type: object
@@ -1639,6 +1639,7 @@ entries:
       - spring_back_hold
       - soft_on_path
       - hard_deceleration
+      - spring_back_fast
   - id: activation_mode
     required: false
     default: require_inactive_at_arm
@@ -1857,6 +1858,11 @@ entries:
     required: true
     schema:
       type: string
+  - id: contact_scene_resource_id
+    required: true
+    schema:
+      type: string
+      semantic_type: scene_resource
   - id: stop_mode
     required: true
     schema:
@@ -1865,6 +1871,7 @@ entries:
       - spring_back_hold
       - soft_on_path
       - hard_deceleration
+      - spring_back_fast
   - id: interrupt_condition
     required: true
     schema:

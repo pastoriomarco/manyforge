@@ -445,6 +445,8 @@ core::Result<void> validate_program_io_stop_responses(
         requested.stop_mode = core::MotionInterruptStopMode::kSoftOnPath;
       else if (mode == "spring_back_hold")
         requested.stop_mode = core::MotionInterruptStopMode::kSpringBackHold;
+      else if (mode == "spring_back_fast")
+        requested.stop_mode = core::MotionInterruptStopMode::kSpringBackFast;
       else if (mode == "hard_deceleration")
         requested.stop_mode = core::MotionInterruptStopMode::kHardDeceleration;
       else

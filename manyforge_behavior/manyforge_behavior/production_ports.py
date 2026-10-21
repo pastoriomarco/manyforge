@@ -1126,11 +1126,7 @@ def program_motion_participant(
     contact_policy_id = parameters.get("contact_policy_id")
     contact_scene_resource_id = parameters.get("contact_scene_resource_id")
     runtime_object_bindings: list[dict[str, str]] = []
-    if node_id == "motion.probe_search":
-        # The search's precision-contact policy: the Core selects it from the
-        # retained scene policy; it names no grasped scene resource.
-        contact_policy_id = _text(contact_policy_id, field="contact_policy_id")
-    elif (contact_policy_id is None) != (contact_scene_resource_id is None):
+    if (contact_policy_id is None) != (contact_scene_resource_id is None):
         raise ProductionPortError(
             "contact policy and contact scene resource must be supplied together"
         )

@@ -30,6 +30,8 @@ export interface MotionAttentionBlock {
   message: string;
   /** The gating records that intersect the candidate resources. */
   members: AlarmMotionAttentionMember[];
+  /** The owner epoch the members were read in (null when unavailable). */
+  ownerEpoch: string | null;
 }
 
 function gates(member: AlarmMotionAttentionMember, resources: ReadonlySet<string>): boolean {
@@ -78,7 +80,12 @@ export function motionAttentionBlock(
     || !kernelAttentionAvailable(alarms, activeConfiguration)
   ) {
     const code = 'operator_alarm_state_unavailable';
-    return { code, message: operatorAlarmRefusalMessage(code) ?? code, members: [] };
+    return {
+      code,
+      message: operatorAlarmRefusalMessage(code) ?? code,
+      members: [],
+      ownerEpoch: null,
+    };
   }
   const resources = new Set(resourceIds);
   const members = alarms.motionAttentionMembership.filter((member) => gates(member, resources));
@@ -95,7 +102,7 @@ export function motionAttentionBlock(
       unacknowledged.map((member) => ({ condition_id: member.conditionId })),
     ),
   }) ?? code;
-  return { code, message, members };
+  return { code, message, members, ownerEpoch: alarms.ownerEpoch };
 }
 
 /** The exact resources a recovery offer's held operation reserves. */

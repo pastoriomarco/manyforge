@@ -937,8 +937,8 @@ TEST(ClosedSchema, BuildRegistryQualifiesOnlyTheCompleteAdmittedFamilies) {
                 core::SchemaId("manyforge.value_schema.provider_contract."
                                "motion_controlled_stop.v1"),
                 core::SchemaRevision("sha256:"
-                                     "fa6d62df17f87b231e2002bc38de0ecac9c6aa4da"
-                                     "23f29f572b2a2780b481c27")),
+                                     "65e6f4462981225916834490d4e3cb4d42b70611"
+                                     "a2287e1b76fdb1cbcabcb113")),
             nullptr);
   EXPECT_NE(registry.find_qualified_value_schema(
                 core::SchemaId("manyforge.value_schema.runtime.empty.v1"),

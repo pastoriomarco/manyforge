@@ -490,3 +490,178 @@ def test_io_device_component_has_no_model_source_closure(tmp_path: Path) -> None
         capture_deployment_model_sources(
             {"components": [_io_device(), _io_device()]}, project_root=tmp_path
         )
+
+
+def _with_fallbacks(primary: str, fallbacks: object) -> dict:
+    intent = _intent()
+    stop = intent["components"][0]["target_settings"]["arm"]["controlled_stop"]
+    stop["stop_mode"] = primary
+    stop["fallback_stop_modes"] = fallbacks
+    return intent
+
+
+def _normalized_stop(intent: dict) -> dict:
+    normalized = validate_deployment_intent(intent, source="test")
+    robot = next(
+        row for row in normalized["components"] if row["component_id"] == "robot_b"
+    )
+    return robot["target_settings"]["arm"]["controlled_stop"]
+
+
+@pytest.mark.parametrize(
+    ("primary", "fallbacks"),
+    [
+        ("soft_on_path", ["spring_back_hold"]),
+        ("soft_on_path", ["spring_back_fast"]),
+        ("soft_on_path", ["spring_back_hold", "spring_back_fast"]),
+        ("spring_back_hold", ["spring_back_fast"]),
+    ],
+)
+def test_intent_accepts_ordered_fallback_stop_modes(primary, fallbacks) -> None:
+    stop = _normalized_stop(_with_fallbacks(primary, fallbacks))
+    assert stop["stop_mode"] == primary
+    assert stop["fallback_stop_modes"] == fallbacks
+
+
+@pytest.mark.parametrize("primary", ["soft_on_path", "spring_back_hold", "spring_back_fast"])
+def test_intent_fallback_stop_modes_absent_or_empty_is_primary_then_hard(primary) -> None:
+    absent = _intent()
+    absent["components"][0]["target_settings"]["arm"]["controlled_stop"][
+        "stop_mode"
+    ] = primary
+    assert "fallback_stop_modes" not in _normalized_stop(absent)
+    # [] equals absent and is not emitted, so documents without fallbacks stay
+    # byte-identical.
+    assert "fallback_stop_modes" not in _normalized_stop(_with_fallbacks(primary, []))
+
+
+@pytest.mark.parametrize(
+    ("primary", "fallbacks", "message"),
+    [
+        ("spring_back_hold", ["soft_on_path"], "only list modes below"),
+        ("spring_back_fast", ["spring_back_hold"], "only list modes below"),
+        ("spring_back_hold", ["spring_back_hold"], "only list modes below"),
+        ("spring_back_fast", ["spring_back_fast"], "only list modes below"),
+        ("soft_on_path", ["spring_back_fast", "spring_back_hold"], "fixed order"),
+        ("soft_on_path", ["spring_back_hold", "spring_back_hold"], "duplicate"),
+        ("soft_on_path", ["hard_deceleration"], "always the final step"),
+        ("soft_on_path", ["spring_back_hold", "hard_deceleration"], "always the final step"),
+        ("soft_on_path", ["spring_back_slow"], "unknown Stop mode"),
+        ("soft_on_path", [1], "unknown Stop mode"),
+        ("soft_on_path", "spring_back_hold", "must be a list"),
+        ("soft_on_path", None, "must be a list"),
+    ],
+)
+def test_intent_rejects_invalid_fallback_stop_modes(primary, fallbacks, message) -> None:
+    with pytest.raises(DeploymentIntentError, match="fallback_stop_modes") as error:
+        validate_deployment_intent(_with_fallbacks(primary, fallbacks), source="test")
+    assert message in str(error.value)
+
+
+def _stop_update(stop_mode: str, **extra: object) -> dict:
+    return {
+        "stop_mode": stop_mode,
+        "allow_natural_completion_on_short_path": False,
+        "jerk_limits_enabled": False,
+        "deceleration_time_s": 1.0,
+        "per_resource_limits": [
+            {
+                "resource_id": "joint1",
+                "max_deceleration": {"coordinate_kind": "angular_rad_s2", "value": 4.0},
+                "settle_velocity_threshold": {
+                    "coordinate_kind": "angular_rad_s",
+                    "value": 0.01,
+                },
+            }
+        ],
+        **extra,
+    }
+
+
+def _opened_session() -> tuple[DeploymentDraftSession, dict]:
+    session = DeploymentDraftSession()
+    initial = session.retained_state()
+    opened = session.preview_source(json.dumps(_intent()))
+    session.commit_open(
+        opened,
+        "/tmp/cell/deployment.yaml",
+        draft_id=initial["draft_id"],
+        expected_revision=initial["draft_revision"],
+        confirm_discard=False,
+    )
+    return session, session.retained_state()
+
+
+def test_draft_stop_update_writes_validated_fallback_sequence() -> None:
+    from manyforge_composer.backend.deployment_draft import DeploymentDraftError
+
+    session, current = _opened_session()
+    fence = {
+        "controllable_component_id": "robot_b",
+        "command_target_id": "arm",
+        "draft_id": current["draft_id"],
+        "expected_revision": current["draft_revision"],
+    }
+
+    def stop_of(edited) -> dict:
+        return edited.document["components"][1]["target_settings"]["arm"][
+            "controlled_stop"
+        ]
+
+    edited = session.preview_controlled_stop_update(
+        _stop_update(
+            "soft_on_path",
+            fallback_stop_modes=["spring_back_hold", "spring_back_fast"],
+        ),
+        **fence,
+    )
+    assert stop_of(edited)["fallback_stop_modes"] == [
+        "spring_back_hold",
+        "spring_back_fast",
+    ]
+    cleared = session.preview_controlled_stop_update(
+        _stop_update("soft_on_path", fallback_stop_modes=[]), **fence
+    )
+    assert "fallback_stop_modes" not in stop_of(cleared)
+    # A profile without the field keeps today's behaviour: primary, then hard.
+    plain = session.preview_controlled_stop_update(_stop_update("soft_on_path"), **fence)
+    assert "fallback_stop_modes" not in stop_of(plain)
+    # A primary change must prune entries no longer below it (the GUI does);
+    # the backend refuses a stale list with a clear reason.
+    with pytest.raises(DeploymentDraftError, match="only list modes below") as error:
+        session.preview_controlled_stop_update(
+            _stop_update(
+                "spring_back_hold",
+                fallback_stop_modes=["spring_back_hold", "spring_back_fast"],
+            ),
+            **fence,
+        )
+    assert error.value.code == "deployment_controlled_stop_invalid"
+
+
+def test_recorded_fallbacks_read_legacy_substitution_and_refuse_both() -> None:
+    from manyforge_composer.backend.stop_fallback_sequence import (
+        fallback_candidates,
+        recorded_fallback_stop_modes,
+    )
+
+    legacy = {
+        "stop_mode": "soft_on_path",
+        "recoverable_substitution_mode": "spring_back_hold",
+    }
+    assert recorded_fallback_stop_modes(legacy) == ["spring_back_hold"]
+    # The old field keeps its Soft-only meaning.
+    assert (
+        recorded_fallback_stop_modes({**legacy, "stop_mode": "spring_back_hold"}) == []
+    )
+    assert recorded_fallback_stop_modes({"stop_mode": "soft_on_path"}) == []
+    assert recorded_fallback_stop_modes(None) == []
+    assert recorded_fallback_stop_modes(
+        {"stop_mode": "soft_on_path", "fallback_stop_modes": ["spring_back_fast"]}
+    ) == ["spring_back_fast"]
+    with pytest.raises(ValueError, match="both"):
+        recorded_fallback_stop_modes({**legacy, "fallback_stop_modes": []})
+    assert fallback_candidates("soft_on_path") == ("spring_back_hold", "spring_back_fast")
+    assert fallback_candidates("spring_back_hold") == ("spring_back_fast",)
+    assert fallback_candidates("spring_back_fast") == ()
+    assert fallback_candidates("hard_deceleration") == ()

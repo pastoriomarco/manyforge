@@ -130,12 +130,12 @@ it('shows an undeclared membership as missing and lets it be removed, not re-add
   const mounted = await mountPolicy({ ...move, execution_groups: ['ghost', 'left'] }, []);
   const { writes, group, change, find } = mounted;
   try {
-    expect(group('ghost — missing').checked).toBe(true);
-    expect(group('ghost — missing').disabled).toBe(false);
-    await change(group('ghost — missing'), false);
+    expect(group('ghost · missing').checked).toBe(true);
+    expect(group('ghost · missing').disabled).toBe(false);
+    await change(group('ghost · missing'), false);
     expect(writes).toEqual([['left']]);
     expect(() => find((p) => p.className === 'toggle-control' && Array.isArray(p.children)
-      && p.children.includes('ghost — missing'))).toThrow();
+      && p.children.includes('ghost · missing'))).toThrow();
   } finally { await mounted.unmount(); }
 });
 
