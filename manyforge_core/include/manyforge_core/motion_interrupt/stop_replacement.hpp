@@ -114,17 +114,29 @@ struct StopReplacementStartDTO final {
                                                                 double continuation_origin_s,
                                                                 double trip_path_s);
 
-/// Experimental resident-timeline realization of the unchanged checked join.
-/// Keep the full logical curve for subsequent Stops; send only an exact future
-/// attachment state followed by the prepared suffix. source_clock_offset_s maps
+/// Experimental resident-timeline realization of the unchanged checked join,
+/// for a controller that replaces its whole timeline at once on the resident
+/// clock origin (JTC `replacement_time_reference: active_trajectory`).
+/// `resident_trajectory` is the full logical curve on the resident clock:
+/// `joined` (time 0 at `elapsed_s` on the active path) shifted by
+/// `elapsed_s - source_clock_offset_s`, where source_clock_offset_s maps the
 /// native resident cursor to the active trajectory's canonical path time.
+/// `delivery_trajectory` is the complete remaining curve sent to the
+/// controller: `resident_trajectory` from its last knot at or before
+/// `resident_cursor_s` (the actual sample cursor on the resident clock; the
+/// first knot when none is), through the connector, into the new motion.
 struct ResidentTimelineReplacementDTO final {
   TrajectoryDTO resident_trajectory;
   TrajectoryDTO delivery_trajectory;
 };
 [[nodiscard]] Result<ResidentTimelineReplacementDTO> build_resident_timeline_replacement(
-    const TrajectoryDTO& active, const TrajectoryDTO& joined, double elapsed_s,
-    double source_clock_offset_s);
+    const TrajectoryDTO& joined, double elapsed_s, double source_clock_offset_s,
+    double resident_cursor_s);
+
+/// The delivery view alone: `resident` (already on the resident clock) from
+/// its last knot at or before `cursor_s`, or from its first knot.
+[[nodiscard]] TrajectoryDTO resident_timeline_delivery(const TrajectoryDTO& resident,
+                                                       double cursor_s);
 
 /// §3.3 cursor mapping of one on-path Stop replacement built by
 /// `build_stop_replacement_join`: the controller's cursor on the replacement

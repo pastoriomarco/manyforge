@@ -10648,6 +10648,171 @@ TEST_F(PortParticipantKernelTest, ScheduledMovingReplacementKeepsExistingEvolvin
   EXPECT_TRUE(Calls<testing::FakeExecutionPort::CancelCall>().empty());
 }
 
+// JTC `replacement_time_reference: active_trajectory` replaces the whole
+// timeline on its resident origin: the moving takeover sends the complete
+// remaining curve on the resident clock from the last knot at or before the
+// actual sample cursor, at every factor (0 included: no stock fallback).
+// The successive-goal sequence above on the resident-timeline lane: the
+// controller cursor stays on the native (first goal's) clock, the adopted
+// goal's canonical clock is offset from it, and the second takeover still
+// sends the complete remaining curve from the native knot covering the
+// actual cursor. At factor 0 the native clock is kept (no stock reset) and a
+// replay sends nothing more.
+TEST_F(PortParticipantKernelTest, ResidentMovingReplacementKeepsNativeClockAcrossSuccessiveGoals) {
+  for (const double factor : {1.0, 0.5, 0.0}) {
+    SCOPED_TRACE(factor);
+    auto lane = port->ReadLaneFacts();
+    lane.supports_resident_timeline_replacement = true;
+    port->SetLaneFacts(lane);
+    const auto product = DirectBackendProduct();
+    const auto& original = std::get<PreparedMotionExecutionDTO>(product.payload).trajectory;
+    const auto expect_original_curve = [&](const TrajectoryDTO& wire, double cursor,
+                                           double until) {
+      ASSERT_GE(wire.waypoints.size(), 2U);
+      EXPECT_LE(wire.waypoints.front().time_from_start_s, cursor);
+      EXPECT_GT(wire.waypoints[1].time_from_start_s, cursor);
+      for (double t = cursor; t < until; t += 0.01) {
+        const auto expected = sample_trajectory(original, t);
+        const auto actual = sample_trajectory(wire, t);
+        ASSERT_TRUE(expected.ok() && actual.ok());
+        for (std::size_t joint = 0; joint < 2U; ++joint) {
+          EXPECT_NEAR(actual.value().positions_rad[joint], expected.value().positions_rad[joint],
+                      1e-12);
+          EXPECT_NEAR(actual.value().velocities_rad_s[joint],
+                      expected.value().velocities_rad_s[joint], 1e-11);
+        }
+      }
+    };
+    participant->set_runtime_velocity_scale(factor);
+    Sample(0.0, 0.0, 0.0, factor);
+    const ExecutionGoalKey old{ControllerGoalId("resident.old"), ControllerGoalGeneration(1U)};
+    const auto handle =
+        participant->Dispatch(product, old.controller_goal_id, old.controller_goal_generation);
+    ASSERT_NE(handle.execution_generation, 0U);
+    pclock.advance(10'000'000);
+    Executing(old);
+    Sample(0.5, 0.25, 0.5, factor);
+    EXPECT_FALSE(handle.wait_for_completion(0));
+    pclock.advance(5'000'000);
+    const auto source = participant->CaptureReplacementSource(
+        1U, handle.execution_generation, old, product.prepared_contract_digest);
+    ASSERT_TRUE(source.ok());
+    const auto successor = DirectSuccessor(product, source.value());
+    ASSERT_EQ(participant->PrepareReplacement(successor, 2U, source.value()).state,
+              PrepareParticipantResultStateDTO::kPrepared);
+    const ExecutionGoalKey next{ControllerGoalId("resident.next"), ControllerGoalGeneration(2U)};
+    const auto scales_before = Calls<testing::FakeExecutionPort::SetScaleCall>().size();
+    const auto sent = participant->DispatchReplacement(
+        source.value(), 2U, successor, next, pclock.now() + 1'000'000'000);
+    ASSERT_EQ(sent.command.dispatch, ExecutionPortDispatch::kDispatched);
+    ASSERT_TRUE(sent.handle);
+    auto replacements = Calls<testing::FakeExecutionPort::ReplaceCall>();
+    ASSERT_EQ(replacements.size(), 1U);
+    EXPECT_FALSE(replacements.front().start);  // immediate, zero stamp
+    // Native clock at every factor: the original knot 0.5 covers the cursor.
+    EXPECT_DOUBLE_EQ(replacements.front().trajectory.waypoints.front().time_from_start_s, 0.5);
+    expect_original_curve(replacements.front().trajectory, 0.5, 1.5);
+    const auto replay = participant->DispatchReplacement(source.value(), 2U, successor, next, 0);
+    EXPECT_EQ(replay.submitted_at_ns, sent.submitted_at_ns);
+    EXPECT_EQ(Calls<testing::FakeExecutionPort::ReplaceCall>().size(), 1U);
+    EXPECT_EQ(Calls<testing::FakeExecutionPort::SetScaleCall>().size(), scales_before);
+    EXPECT_TRUE(Calls<testing::FakeExecutionPort::CancelCall>().empty());
+    if (factor == 0.0) {
+      Reset();
+      continue;
+    }
+    port->FinishGoal(old, ExecutionGoalResult::kPreemptedBy, next, pclock.now());
+    pclock.advance(30'000'000);
+    Executing(next);
+    // The resident controller keeps its clock: the cursor is NOT restarted.
+    const double native = 0.5 + factor * 0.045;
+    Sample(native, 0.5 * native, 0.5, factor);
+    ASSERT_EQ(participant->ObserveReplacement(source.value(), 2U).value().phase,
+              PreparedMotionReplacementPhaseDTO::kReadyToCommit);
+    ASSERT_TRUE(participant->AdoptReplacement(
+        source.value(), 2U, {nullptr, [](void*) noexcept { return Result<void>::Ok(); }}).ok());
+    ASSERT_TRUE(participant->RetirePreparedExecution(1U).ok());
+    const auto source2 = participant->CaptureReplacementSource(
+        2U, sent.handle->execution_generation, next, successor.prepared_contract_digest);
+    ASSERT_TRUE(source2.ok());
+    // Nonzero offset: the adopted goal's canonical time 0 is native 0.5.
+    EXPECT_NEAR(static_cast<double>(source2.value().progress.trajectory_time_ns) / 1e9,
+                native - 0.5, 1e-9);
+    EXPECT_DOUBLE_EQ(source2.value().controller_sample.cursor_s, native);
+    const auto third_product = DirectSuccessor(successor, source2.value());
+    ASSERT_EQ(participant->PrepareReplacement(third_product, 3U, source2.value()).state,
+              PrepareParticipantResultStateDTO::kPrepared);
+    const ExecutionGoalKey third{ControllerGoalId("resident.third"), ControllerGoalGeneration(3U)};
+    const auto sent2 = participant->DispatchReplacement(
+        source2.value(), 3U, third_product, third, pclock.now() + 1'000'000'000);
+    ASSERT_EQ(sent2.command.dispatch, ExecutionPortDispatch::kDispatched);
+    replacements = Calls<testing::FakeExecutionPort::ReplaceCall>();
+    ASSERT_EQ(replacements.size(), 2U);
+    EXPECT_FALSE(replacements.back().start);
+    // Still the native clock, from the native knot covering the actual cursor.
+    EXPECT_DOUBLE_EQ(replacements.back().trajectory.waypoints.front().time_from_start_s, 0.5);
+    expect_original_curve(replacements.back().trajectory, native, native + 1.0);
+    Reset();
+  }
+}
+
+TEST_F(PortParticipantKernelTest, ResidentLaneMovingTakeoverSendsCompleteCurveOnResidentClock) {
+  for (const double factor : {1.0, 0.5, 0.1, 0.0}) {
+    SCOPED_TRACE(factor);
+    auto lane = port->ReadLaneFacts();
+    lane.supports_resident_timeline_replacement = true;
+    port->SetLaneFacts(lane);
+    auto product = DirectBackendProduct();
+    const auto& motion = std::get<PreparedMotionExecutionDTO>(product.payload);
+    Sample(0.0, 0.0, 0.0);
+    const ExecutionGoalKey old{ControllerGoalId("resident.old"), ControllerGoalGeneration(1U)};
+    const auto handle =
+        participant->Dispatch(product, old.controller_goal_id, old.controller_goal_generation);
+    if (factor < 1.0) participant->set_runtime_velocity_scale(factor);
+    pclock.advance(10'000'000);
+    pscheduler.advance_to(pclock.now());
+    Executing(old);
+    const double cursor = 0.6;  // between the knots 0.5 and 0.75
+    Sample(cursor, 0.3, 0.5, factor);
+    EXPECT_FALSE(handle.wait_for_completion(0));
+    const auto source = participant->CaptureReplacementSource(
+        1U, handle.execution_generation, old, product.prepared_contract_digest);
+    ASSERT_TRUE(source.ok()) << source.error().message;
+    const auto successor = DirectSuccessor(product, source.value());
+    const auto prepared = participant->PrepareReplacement(successor, 2U, source.value());
+    ASSERT_EQ(prepared.state, PrepareParticipantResultStateDTO::kPrepared)
+        << (prepared.error ? ::testing::PrintToString(prepared.error->details) : "");
+    const ExecutionGoalKey next{ControllerGoalId("resident.next"), ControllerGoalGeneration(2U)};
+    const auto sent = participant->DispatchReplacement(source.value(), 2U, successor, next,
+                                                       pclock.now() + 1'000'000'000);
+    ASSERT_EQ(sent.command.dispatch, ExecutionPortDispatch::kDispatched);
+    const auto replaced = Calls<testing::FakeExecutionPort::ReplaceCall>();
+    ASSERT_EQ(replaced.size(), 1U);
+    EXPECT_FALSE(replaced.front().start);
+    const auto& wire = replaced.front().trajectory.waypoints;
+    ASSERT_GE(wire.size(), 2U);
+    // A past original knot covers the actual cursor; nothing synthetic before it.
+    EXPECT_DOUBLE_EQ(wire.front().time_from_start_s, 0.5);
+    EXPECT_EQ(wire.front().positions_rad, motion.trajectory.waypoints[2].positions_rad);
+    EXPECT_GT(wire[1].time_from_start_s, cursor);
+    // Unchanged actual curve on the resident clock (the original's own), from
+    // the cursor and its lookahead up to the divergence point.
+    const double divergence = cursor + 1.0;  // DirectSuccessor diverges 1 s later
+    for (double t = cursor; t < divergence - 1e-9; t += 0.01) {
+      const auto original = sample_trajectory(motion.trajectory, t);
+      const auto delivered = sample_trajectory(replaced.front().trajectory, t);
+      ASSERT_TRUE(original.ok() && delivered.ok());
+      for (std::size_t joint = 0; joint != 2U; ++joint) {
+        EXPECT_NEAR(delivered.value().positions_rad[joint], original.value().positions_rad[joint],
+                    1e-12);
+        EXPECT_NEAR(delivered.value().velocities_rad_s[joint],
+                    original.value().velocities_rad_s[joint], 1e-11);
+      }
+    }
+    Reset();
+  }
+}
+
 TEST_F(PortParticipantKernelTest,
        EstimatedRampJoinPreservesPolynomialsAndBoundsWithinExistingAllowance) {
   // Scripted phase evidence only. Actual JTC factor evolution, sample age and

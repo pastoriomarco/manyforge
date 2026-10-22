@@ -805,12 +805,13 @@ PreparedMotionReplacementDispatchDTO ExecutionPortParticipant::DispatchReplaceme
       build_stop_replacement_join(execution_->trajectory, elapsed, candidate->trajectory,
                                   pending.source_cursor_s, pending.divergence_cursor_s);
   if (!delivery.ok()) return reject("motion_replacement_delivery_join_failed");
-  const bool resident_timeline = lane_.supports_resident_timeline_replacement &&
-                                 (!lane_.supports_scale || baseline->applied_factor.value_or(0.0) > 0.0);
+  // The resident-timeline controller keeps its clock origin for every such
+  // message, at any factor (0 included).
+  const bool resident_timeline = lane_.supports_resident_timeline_replacement;
   std::optional<TrajectoryDTO> resident_wire;
   if (resident_timeline) {
     auto resident = build_resident_timeline_replacement(
-        execution_->trajectory, delivery.value(), elapsed, execution_->delivery_clock.elapsed_s);
+        delivery.value(), elapsed, execution_->delivery_clock.elapsed_s, baseline->cursor_s);
     if (!resident.ok()) return reject("motion_replacement_delivery_join_failed");
     delivery.value() = std::move(resident.value().resident_trajectory);
     resident_wire = std::move(resident.value().delivery_trajectory);

@@ -1096,8 +1096,8 @@ ParticipantStopStageResultDTO ParticipantStopStageHelper::RunReplacement(
   if (!joined.ok()) return Fail(run, stage_error(joined.error(), mode + "_join_failed"));
   std::optional<TrajectoryDTO> resident_wire;
   if (run.lane.supports_resident_timeline_replacement) {
-    auto resident = build_resident_timeline_replacement(run.goal.trajectory, joined.value(),
-                                                       elapsed, 0.0);
+    auto resident =
+        build_resident_timeline_replacement(joined.value(), elapsed, 0.0, trip.cursor_s);
     if (!resident.ok()) return Fail(run, stage_error(resident.error(), mode + "_join_failed"));
     joined.value() = std::move(resident.value().resident_trajectory);
     resident_wire = std::move(resident.value().delivery_trajectory);
@@ -1215,9 +1215,20 @@ ParticipantStopStageResultDTO ParticipantStopStageHelper::RunFastSpringBack(
   put(run.outcome->diagnostics, "frozen_factor", interrupt_structured_number(frozen_factor));
   put(run.outcome->diagnostics, "passed_points",
       interrupt_structured_number(static_cast<double>(passed_points)));
+  // The resident-timeline controller keeps its clock origin for this message
+  // too: the same literal curve on the resident clock, from the knot covering
+  // the trip cursor (the first point at 0 lands at `elapsed`).
+  std::optional<TrajectoryDTO> resident_wire;
+  if (run.lane.supports_resident_timeline_replacement) {
+    auto resident = build_resident_timeline_replacement(stop, elapsed, 0.0, trip.cursor_s);
+    if (!resident.ok())
+      return Fail(run, stage_error(resident.error(), "spring_back_fast_input_invalid"));
+    stop = std::move(resident.value().resident_trajectory);
+    resident_wire = std::move(resident.value().delivery_trajectory);
+  }
   const auto next = NextKey();
   const auto baseline = port_.ReadSample();
-  const auto sent = port_.Replace(run.goal.key, next, stop);
+  const auto sent = port_.Replace(run.goal.key, next, resident_wire ? *resident_wire : stop);
   return FinishReplacement(run, sent, next, std::move(stop), std::nullopt, baseline,
                            dispatched_at, trip, "spring_back_fast", 0.0, stop_deadline);
 }
@@ -1547,14 +1558,28 @@ std::optional<ParticipantStopStageResultDTO> ParticipantStopStageHelper::TryCont
     return std::nullopt;
   }
   // The brake leaves the path at the sample itself (no lead-in).
-  const auto joined = build_stop_replacement_join(live.trajectory, elapsed.value(),
-                                                  brake.value().trajectory, sample.cursor_s,
-                                                  sample.cursor_s);
+  auto joined = build_stop_replacement_join(live.trajectory, elapsed.value(),
+                                            brake.value().trajectory, sample.cursor_s,
+                                            sample.cursor_s);
   if (!joined.ok()) {
     fallback_reason = "controlled_hard_stop_join_failed";
     return std::nullopt;
   }
-  const auto sent = port_.Replace(live.key, next, joined.value());
+  // The resident-timeline controller keeps its clock origin: the same curve
+  // on the resident clock, from the knot covering the sample cursor.
+  std::optional<TrajectoryDTO> resident_wire;
+  if (run.lane.supports_resident_timeline_replacement) {
+    auto resident =
+        build_resident_timeline_replacement(joined.value(), elapsed.value(), 0.0, sample.cursor_s);
+    if (!resident.ok()) {
+      fallback_reason = "controlled_hard_stop_join_failed";
+      return std::nullopt;
+    }
+    joined.value() = std::move(resident.value().resident_trajectory);
+    resident_wire = std::move(resident.value().delivery_trajectory);
+  }
+  const auto sent =
+      port_.Replace(live.key, next, resident_wire ? *resident_wire : joined.value());
   if (sent.dispatch == ExecutionPortDispatch::kNotDispatched) {
     fallback_reason = "controlled_hard_stop_refused";
     return std::nullopt;

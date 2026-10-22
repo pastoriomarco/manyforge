@@ -8,8 +8,10 @@
 #include <manyforge_core/testing/fake_execution_port.hpp>
 #include <manyforge_core/time/fake_clock.hpp>
 #include <memory>
+#include <optional>
 #include <stdexcept>
 #include <string>
+#include <utility>
 #include <variant>
 #include <vector>
 
@@ -1724,6 +1726,100 @@ TEST(ParticipantStopStageHelperTest, NoLeadControlledHardStopKeepsImmediateDeliv
   EXPECT_NEAR(replacements.front().trajectory.waypoints.front().time_from_start_s, -0.51, 1e-12);
   EXPECT_EQ(Scales(world.port), std::vector<double>{0.5});
   EXPECT_TRUE(Cancels(world.port).empty());
+}
+
+// JTC `replacement_time_reference: active_trajectory` (whole-timeline
+// replacement): every zero-stamp Replace on the resident lane carries the
+// SAME curve the stock lane sends, on the resident clock (stock time + the
+// join's elapsed), from the last knot at or before the trip sample's cursor.
+// The stock lane keeps its relative times (checked by the tests above).
+TEST(ParticipantStopStageHelperTest, ResidentLaneSendsEveryStopCurveOnTheResidentClock) {
+  struct Case {
+    const char* name;
+    std::size_t stage;
+    const char* mode;
+    double cursor;
+    double factor;
+  };
+  for (const auto& c : {Case{"soft", 0U, "soft_on_path", 0.5, 0.5},
+                        Case{"soft_f1", 0U, "soft_on_path", 0.62, 1.0},
+                        Case{"soft_f01", 0U, "soft_on_path", 0.62, 0.1},
+                        Case{"spring_back", 0U, "spring_back_hold", 0.5, 0.5},
+                        Case{"fast", 0U, "spring_back_fast", 0.62, 0.5},
+                        Case{"fast_no_passed_point", 0U, "spring_back_fast", 0.0, 0.5},
+                        Case{"hard", 1U, nullptr, 0.62, 0.5}}) {
+    SCOPED_TRACE(c.name);
+    const auto run = [&](bool resident) {
+      World world;
+      world.frozen = c.factor;
+      auto lane = world.port.ReadLaneFacts();
+      lane.supports_resident_timeline_replacement = resident;
+      world.port.SetLaneFacts(lane);
+      const auto stage = c.mode == nullptr
+                             ? Stage(c.stage)
+                             : Stage(c.stage, Nominal::kControlled, Parameters(c.mode, false));
+      world.Dispatch(stage);
+      world.Sample(c.cursor, c.cursor, 1.0, c.factor);
+      if (c.mode == nullptr) {
+        ScriptBrake(world, kSecond);
+      } else {
+        ScriptReplacement(world, kSecond, 5U, ExecutionGoalResult::kSucceeded);
+      }
+      const auto result = world.helper->TranslateStopStage(
+          stage, c.mode == nullptr ? Budget(stage, 1'800'000'000) : Budget(stage), {});
+      EXPECT_EQ(result.outcome, ParticipantStopStageOutcomeDTO::kSucceeded)
+          << (result.error ? result.error->details.at("reason") : "");
+      const auto replaces = Replaces(world.port);
+      EXPECT_EQ(replaces.size(), 1U);
+      EXPECT_FALSE(replaces.empty() || replaces.front().start.has_value());
+      std::optional<double> joined_elapsed;
+      if (c.mode != nullptr && result.outcome == ParticipantStopStageOutcomeDTO::kSucceeded) {
+        const auto& evidence = EvidenceObject(result);
+        const auto& diagnostics =
+            std::get<JsonObjectDTO>(evidence.at("provider_diagnostics").value);
+        joined_elapsed = std::get<double>(diagnostics.at("join_elapsed_path_s").value);
+      }
+      return std::pair{replaces.empty() ? TrajectoryDTO{} : replaces.front().trajectory,
+                       joined_elapsed};
+    };
+    const auto [stock, stock_elapsed] = run(false);
+    const auto [wire, wire_elapsed] = run(true);
+    EXPECT_EQ(stock_elapsed, wire_elapsed);
+    if (stock.waypoints.empty() || wire.waypoints.empty()) {
+      ADD_FAILURE() << "no replacement sent";
+      continue;  // every case runs even when an earlier one fails
+    }
+    // The stock message's time 0 is the join's elapsed (the hard brake reports
+    // none: its first point is the original knot 0 at -elapsed).
+    const double elapsed = stock_elapsed.value_or(-stock.waypoints.front().time_from_start_s);
+    EXPECT_GE(elapsed, c.cursor);
+    std::size_t first = 0U;
+    while (first + 1U < stock.waypoints.size() &&
+           stock.waypoints[first + 1U].time_from_start_s + elapsed <= c.cursor)
+      ++first;
+    if (wire.waypoints.size() != stock.waypoints.size() - first) {
+      ADD_FAILURE() << "wire has " << wire.waypoints.size() << " points, expected "
+                    << stock.waypoints.size() - first << " (first point "
+                    << wire.waypoints.front().time_from_start_s << ")";
+      continue;
+    }
+    for (std::size_t i = 0; i < wire.waypoints.size(); ++i) {
+      const auto& expected = stock.waypoints[first + i];
+      EXPECT_NEAR(wire.waypoints[i].time_from_start_s, expected.time_from_start_s + elapsed,
+                  1e-12);
+      EXPECT_EQ(wire.waypoints[i].positions_rad, expected.positions_rad);
+      EXPECT_EQ(wire.waypoints[i].velocities_rad_s, expected.velocities_rad_s);
+      EXPECT_EQ(wire.waypoints[i].accelerations_rad_s2, expected.accelerations_rad_s2);
+    }
+    // The delivery covers the actual cursor with a past knot (JTC keeps its
+    // origin and seed; nothing is spliced inside the controller).
+    if (c.cursor > 0.0) {
+      EXPECT_LE(wire.waypoints.front().time_from_start_s, c.cursor);
+    } else {
+      // Fast spring-back with no passed point: the trip point lands at elapsed.
+      EXPECT_NEAR(wire.waypoints.front().time_from_start_s, elapsed, 1e-12);
+    }
+  }
 }
 
 TEST(ParticipantStopStageHelperTest, ControlledHardStopFinishesOnItsSuccessThenTheFollowingHold) {
