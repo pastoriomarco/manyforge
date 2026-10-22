@@ -9,11 +9,11 @@
   "members": {
     "assignment.yaml": "sha256:f4dd3bfffcc14e0cb446f820e79e2405f4477ecbc470ca9fdc127dce17086e06",
     "deployment.yaml": "sha256:ef85b0869231b3e11b16ab1d006d9c39f81bbc1df046e43ab1b938daf7ef0cc0",
-    "program.yaml": "sha256:79527ac7cea4de690e0a79762d29b9238e8da566a1215599ecff79f97ebc30e0"
+    "program.yaml": "sha256:cdd8315c8fc7f6b42e451a3bad3ebb13bfd8f8d4135cd61fac074dcd4d864299"
   },
-  "name": "R5 trial (f) global rule latch",
+  "name": "r5_trial_f_global_rule",
   "saved_status": {
-    "checked_content_digest": "sha256:73bf73332afd24e3869fb826ea7b61ebee59cd59d52b6b95dad27f0185f21ef8",
+    "checked_content_digest": "sha256:51f89f990c95129463af0facdedaba5156d17f436cf69eae7e9a63172346eb08",
     "last_known_status": "unknown",
     "manyforge_version": "0.1.0"
   },

@@ -7,7 +7,7 @@ import hashlib
 import json
 import logging
 from pathlib import Path
-from typing import Any, Literal, NoReturn
+from typing import Any, Callable, Literal, NoReturn
 
 from fastapi import APIRouter, HTTPException
 from manyforge_behavior.canonical_artifact import (
@@ -41,8 +41,11 @@ from .deployment_draft import DeploymentDraftError
 from .deployment_intent import DeploymentIntentError, rebase_deployment_intent_sources
 from .draft_session import DraftSessionError
 from .reset_apply_log import log_reset_apply_link
+from .routes_draft import _active_catalog
+from .scenario_restore import saved_deployment_differs, saved_program_restore
 from .state import ComposerState, _controllable_composition_change_kinds
 from .authoring_workspace import (
+    AuthoringOperationContext,
     AuthoringWorkspaceError,
     AuthoringWorkspaceIdentity,
     scenario_project_facts,
@@ -202,7 +205,45 @@ class DiscardDeploymentRequest(_LocalFence):
     pass
 
 
-class RevertDeploymentRequest(_Fence):
+class _ManagerConfirmation(BaseModel):
+    """Manager's disruptive-impact confirmation of one exact prepared input."""
+
+    model_config = _DTO
+
+    confirmation_token: str | None = Field(
+        default=None,
+        alias="confirmationToken",
+        min_length=71,
+        max_length=71,
+        pattern=r"^sha256:[0-9a-f]{64}$",
+    )
+    preparation_request_owner_epoch: str | None = Field(
+        default=None,
+        alias="preparationRequestOwnerEpoch",
+        min_length=1,
+        max_length=256,
+    )
+    preparation_request_id: str | None = Field(
+        default=None,
+        alias="preparationRequestId",
+        min_length=1,
+        max_length=256,
+    )
+
+    @model_validator(mode="after")
+    def require_preparation_identity(self) -> "_ManagerConfirmation":
+        if self.confirmation_token is not None and (
+            self.preparation_request_owner_epoch is None
+            or self.preparation_request_id is None
+        ):
+            raise ValueError(
+                "confirmationToken requires both "
+                "preparationRequestOwnerEpoch and preparationRequestId"
+            )
+        return self
+
+
+class RevertDeploymentRequest(_ManagerConfirmation, _Fence):
     pass
 
 
@@ -280,7 +321,7 @@ def _applied_program_revision(state: ComposerState) -> str | None:
     return revision if isinstance(revision, str) and revision else None
 
 
-class ApplyDeploymentCandidateRequest(_Fence):
+class ApplyDeploymentCandidateRequest(_ManagerConfirmation, _Fence):
     # The shared reference of an Apply that first Reset a held run; the
     # Manager record keeps it instead of this request's own identity.
     correlation_id: str | None = Field(
@@ -290,37 +331,6 @@ class ApplyDeploymentCandidateRequest(_Fence):
     expected_activation_scope: ActivationScope | None = Field(
         default=None, alias="expectedActivationScope"
     )
-    confirmation_token: str | None = Field(
-        default=None,
-        alias="confirmationToken",
-        min_length=71,
-        max_length=71,
-        pattern=r"^sha256:[0-9a-f]{64}$",
-    )
-    preparation_request_owner_epoch: str | None = Field(
-        default=None,
-        alias="preparationRequestOwnerEpoch",
-        min_length=1,
-        max_length=256,
-    )
-    preparation_request_id: str | None = Field(
-        default=None,
-        alias="preparationRequestId",
-        min_length=1,
-        max_length=256,
-    )
-
-    @model_validator(mode="after")
-    def require_preparation_identity(self) -> "ApplyDeploymentCandidateRequest":
-        if self.confirmation_token is not None and (
-            self.preparation_request_owner_epoch is None
-            or self.preparation_request_id is None
-        ):
-            raise ValueError(
-                "confirmationToken requires both "
-                "preparationRequestOwnerEpoch and preparationRequestId"
-            )
-        return self
 
 
 # Deployment Apply refusals raised before admission or any Manager submission
@@ -346,6 +356,17 @@ def _raise(error: Exception) -> NoReturn:
     ):
         raise HTTPException(
             status_code=503,
+            detail={"code": error.code, "message": str(error)},
+        ) from error
+    # Manager's definite refusal of the candidate (preview or Apply). The
+    # message names Manager's own code and message; claim settlement already
+    # happened under its code before this rendering.
+    if isinstance(error, AuthoringOperationError) and error.code in {
+        "manager_apply_rejected",
+        "deployment_candidate_rejected",
+    }:
+        raise HTTPException(
+            status_code=409,
             detail={"code": error.code, "message": str(error)},
         ) from error
     if isinstance(error, DeploymentDraftError):
@@ -455,6 +476,11 @@ def _workspace(state: ComposerState) -> dict[str, Any]:
         else None
     )
     run_ready = applied_document is not None and document == applied_document
+    # The same comparison the Revert guard makes, on the Saved this view
+    # captured with its authoring snapshot; unknown without both sides.
+    workspace["saved"]["differsFromApplied"] = saved_deployment_differs(
+        saved_document, applied_document
+    )
     # Catalog candidates were a legacy package-selection view. Authoring now
     # operates only on the open Scenario and its explicit Saved baseline.
     matching_scenarios: list[dict[str, Any]] = []
@@ -493,6 +519,92 @@ def _workspace(state: ComposerState) -> dict[str, Any]:
         }
     )
     return workspace
+
+
+def prepare_deployment_discard(
+    state: ComposerState, draft_id: str, expected_revision: int
+) -> tuple[Callable[[], None], Callable[[], bool]]:
+    """Prepare returning the Deployment Draft to the exact Manager Applied one.
+
+    Returns the under-commit validation and the no-I/O install, so the
+    Deployment Discard and the Scenario Discard commit it the same way.
+    """
+
+    # Discard restores only the captured authoring input whose exact
+    # candidate was published by Manager and Program binding.
+    def read_applied() -> tuple[dict[str, Any], str]:
+        current_projection = state.published_scenario()
+        current = current_projection.get("published_scenario")
+        if current_projection.get("ready") is not True or not isinstance(
+            current, dict
+        ):
+            raise DeploymentDraftError(
+                "deployment_applied_unavailable",
+                "Deployment Discard requires one exact Manager Applied Scenario",
+                status_code=409,
+            )
+        if state.headless_client is None:
+            raise DeploymentDraftError(
+                "deployment_applied_unavailable",
+                "Deployment Discard requires the configured Manager",
+                status_code=503,
+            )
+        applied = state.applied_deployment_for_publication(current)
+        if applied is None:
+            raise DeploymentDraftError(
+                "deployment_applied_projection_mismatch",
+                "this Composer process has no exact Applied Deployment baseline",
+                status_code=409,
+            )
+        identity = raw_sha256_digest(
+            canonical_json_bytes(
+                {
+                    "scenario_id": current["scenario_id"],
+                    "deployment": applied,
+                }
+            )
+        )
+        return applied, identity
+
+    applied, applied_identity = read_applied()
+    # The publication read and compilation stay outside owner locks.
+    # Once admission is claimed, re-read its exact identity before the
+    # local install; Manager publication is external to the workspace
+    # revision and therefore needs this explicit validation.
+    compiled = state.deployment_draft_session.preview_source(
+        json.dumps(applied, ensure_ascii=False, allow_nan=False)
+    )
+
+    def validate_applied_unchanged() -> None:
+        _current, current_identity = read_applied()
+        if current_identity != applied_identity:
+            raise DeploymentDraftError(
+                "deployment_applied_changed",
+                "Manager Applied Deployment changed before Discard committed",
+                status_code=409,
+            )
+
+    return validate_applied_unchanged, lambda: state.deployment_draft_session.commit_compiled(
+        compiled,
+        draft_id=draft_id,
+        expected_revision=expected_revision,
+    )
+
+
+def discard_deployment_draft(state: ComposerState, body: Any) -> None:
+    """Return the Deployment Draft to Applied (Draft-only, no Manager effect)."""
+
+    validate, install = prepare_deployment_discard(
+        state, body.draft_id, body.expected_draft_revision
+    )
+    commit_draft_edit(
+        state,
+        body,
+        operation_kind="discard_deployment_draft",
+        session="deployment",
+        validate=validate,
+        install=install,
+    )
 
 
 def create_deployment_draft_router(state: ComposerState) -> APIRouter:
@@ -550,6 +662,7 @@ def create_deployment_draft_router(state: ComposerState) -> APIRouter:
                 submit=effect,
                 commit_before_submit=commit_before_submit,
                 after_release=after_release,
+                workspace=state.authoring_workspace,
             )
             return {
                 "schemaVersion": "manyforge.composer_deployment_candidate_operation.v1",
@@ -841,72 +954,7 @@ def create_deployment_draft_router(state: ComposerState) -> APIRouter:
     @router.post("/api/deployment/discard")
     def discard(body: DiscardDeploymentRequest) -> dict[str, Any]:
         try:
-            # Discard restores only the captured authoring input whose exact
-            # candidate was published by Manager and Program binding.
-            def read_applied() -> tuple[dict[str, Any], str]:
-                current_projection = state.published_scenario()
-                current = current_projection.get("published_scenario")
-                if current_projection.get("ready") is not True or not isinstance(
-                    current, dict
-                ):
-                    raise DeploymentDraftError(
-                        "deployment_applied_unavailable",
-                        "Deployment Discard requires one exact Manager Applied Scenario",
-                        status_code=409,
-                    )
-                if state.headless_client is None:
-                    raise DeploymentDraftError(
-                        "deployment_applied_unavailable",
-                        "Deployment Discard requires the configured Manager",
-                        status_code=503,
-                    )
-                applied = state.applied_deployment_for_publication(current)
-                if applied is None:
-                    raise DeploymentDraftError(
-                        "deployment_applied_projection_mismatch",
-                        "this Composer process has no exact Applied Deployment baseline",
-                        status_code=409,
-                    )
-                identity = raw_sha256_digest(
-                    canonical_json_bytes(
-                        {
-                            "scenario_id": current["scenario_id"],
-                            "deployment": applied,
-                        }
-                    )
-                )
-                return applied, identity
-
-            applied, applied_identity = read_applied()
-            # The publication read and compilation stay outside owner locks.
-            # Once admission is claimed, re-read its exact identity before the
-            # local install; Manager publication is external to the workspace
-            # revision and therefore needs this explicit validation.
-            compiled = state.deployment_draft_session.preview_source(
-                json.dumps(applied, ensure_ascii=False, allow_nan=False)
-            )
-
-            def validate_applied_unchanged() -> None:
-                _current, current_identity = read_applied()
-                if current_identity != applied_identity:
-                    raise DeploymentDraftError(
-                        "deployment_applied_changed",
-                        "Manager Applied Deployment changed before Discard committed",
-                        status_code=409,
-                    )
-
-            commit_draft_edit(
-                state,
-                body,
-                operation_kind="discard_deployment_draft",
-                session="deployment",
-                validate=validate_applied_unchanged,
-                install=lambda: state.deployment_draft_session.commit_compiled(
-                    compiled,
-                    draft_id=body.draft_id,
-                    expected_revision=body.expected_draft_revision,
-                ),
-            )
+            discard_deployment_draft(state, body)
             # The Deployment workspace carries its own Draft-matched identity;
             # the composite snapshot must not replace it (it breaks that contract).
             return _workspace(state)
@@ -933,28 +981,45 @@ def create_deployment_draft_router(state: ComposerState) -> APIRouter:
                     status_code=404,
                 )
             )
-        program = state.draft_session.retained_state().get("program")
-        assignment = deepcopy(state.scenario_program_role_assignment)
+        # Revert restores the whole Scenario to Saved: the Saved Program is
+        # activated with the Saved Deployment and both Drafts return to Saved.
+        program_retained = state.draft_session.retained_state()
+        try:
+            program_restore = saved_program_restore(
+                state, program_retained, _active_catalog(state)
+            )
+        except Exception as error:
+            _raise(error)
+        saved_program = program_restore.saved_program
+        program = saved_program.to_dict() if saved_program is not None else None
+        assignment = (
+            deepcopy(state.scenario_program_role_assignment)
+            if program is not None
+            else {"component_roles": [], "target_roles": []}
+        )
         source_document_digest = state.scenario_source_document_digest
         scenario_id = state.scenario_document_id
+        project_path = state.scenario_project_path
         if (
-            not isinstance(program, dict)
-            or not isinstance(assignment, dict)
+            not isinstance(assignment, dict)
             or not isinstance(source_document_digest, str)
             or not isinstance(scenario_id, str)
+            or not isinstance(project_path, str)
         ):
             _raise(
                 DeploymentDraftError(
                     "activation_input_incomplete",
-                    "Deployment Revert requires a complete saved Scenario input",
+                    "Scenario Revert requires a complete saved Scenario input",
                     status_code=409,
                 )
             )
+        identity_at_request = state.authoring_workspace.identity()
         source_closure = _capture_model_sources(state, saved)
         captured_input_digest = raw_sha256_digest(
             canonical_json_bytes(
                 {
                     "scenario_id": scenario_id,
+                    "project_path": project_path,
                     "source_document_digest": source_document_digest,
                     "deployment": saved,
                     "model_source_closure": source_closure,
@@ -982,6 +1047,7 @@ def create_deployment_draft_router(state: ComposerState) -> APIRouter:
             "effect_class": "external",
             "external_kind": "revert_deployment",
             "scenario_id": scenario_id,
+            "project_path": project_path,
             "source_document_digest": source_document_digest,
             "captured_input_digest": captured_input_digest,
             "model_source_closure": source_closure,
@@ -997,7 +1063,20 @@ def create_deployment_draft_router(state: ComposerState) -> APIRouter:
             "draft_revision": body.expected_draft_revision,
             "manager_request_id": manager_request_id,
             "correlation_id": body.request_id,
+            "confirmation_token": body.confirmation_token,
+            "preparation_request_owner_epoch": (
+                body.preparation_request_owner_epoch
+                if body.confirmation_token is not None
+                else body.request_owner_epoch
+            ),
+            "preparation_request_id": (
+                body.preparation_request_id
+                if body.confirmation_token is not None
+                else body.request_id
+            ),
         }
+        if program is None:
+            intent["program_authoring"] = deepcopy(program_restore.saved_document)
 
         prepared_candidate: dict[str, Any] | None = None
 
@@ -1008,6 +1087,12 @@ def create_deployment_draft_router(state: ComposerState) -> APIRouter:
                 raise DeploymentDraftError(
                     "deployment_draft_stale",
                     "Deployment Draft changed before Revert",
+                    status_code=409,
+                )
+            if state.draft_session.retained_state() != program_retained:
+                raise DeploymentDraftError(
+                    "deployment_draft_stale",
+                    "Program Draft changed before Revert",
                     status_code=409,
                 )
             if (
@@ -1041,35 +1126,32 @@ def create_deployment_draft_router(state: ComposerState) -> APIRouter:
             return result
 
         def commit_saved_before_submit() -> None:
-            identity = state.authoring_workspace.identity()
-            state.authoring_workspace.commit_deployment(
-                draft_id=body.draft_id,
-                expected_identity=identity,
-                install=lambda: state.deployment_draft_session.commit_compiled(
+            # Both Drafts return to Saved in one whole-workspace commit fenced
+            # on the request identity: readers never see a mixed pair, and a
+            # failed install contains the workspace (no rollback, no no-effect).
+            def install() -> bool:
+                deployment_changed = state.deployment_draft_session.commit_compiled(
                     compiled_saved,
                     draft_id=body.draft_id,
                     expected_revision=body.expected_draft_revision,
-                ),
-                notify=False,
-            )
+                )
+                program_changed = state.draft_session.install_prepared_replacement(
+                    program_restore.replacement,
+                    expected_draft_id=identity_at_request.program_draft_id,
+                    expected_revision=identity_at_request.program_draft_revision,
+                )
+                return deployment_changed or program_changed
 
-        if not apply:
-            # Preview is an effect-free calculation. It uses the same exact
-            # input fence as Apply, but never acquires authoring admission or
-            # creates a Manager operation.
-            try:
-                identity = state.authoring_workspace.identity()
-                body.require_workspace_fence(identity)
-                validate(None)
-                body.require_workspace_fence(state.authoring_workspace.identity())
-                result = effect(None)
-                return {
-                    "schemaVersion": "manyforge.composer_deployment_candidate_operation.v1",
-                    "workspace": _workspace(state),
-                    "result": result,
-                }
-            except Exception as error:
-                _raise(error)
+            state.authoring_workspace.replace(
+                expected_identity=identity_at_request,
+                install=install,
+                notify=False,
+                context=AuthoringOperationContext(
+                    operation="revert_deployment",
+                    request_owner_epoch=body.request_owner_epoch,
+                    request_id=body.request_id,
+                ),
+            )
 
         return execute(
             body,
@@ -1128,11 +1210,13 @@ def create_deployment_draft_router(state: ComposerState) -> APIRouter:
         assignment = deepcopy(state.scenario_program_role_assignment)
         source_document_digest = state.scenario_source_document_digest
         scenario_id = state.scenario_document_id
+        project_path = state.scenario_project_path
         if (
             not isinstance(program, dict)
             or not isinstance(assignment, dict)
             or not isinstance(source_document_digest, str)
             or not isinstance(scenario_id, str)
+            or not isinstance(project_path, str)
         ):
             _raise(
                 DeploymentDraftError(
@@ -1173,6 +1257,7 @@ def create_deployment_draft_router(state: ComposerState) -> APIRouter:
                 and applied_context.get("program_role_assignment") == assignment
                 and applied_context.get("source_document_digest") == source_document_digest
                 and applied_context.get("scenario_id") == scenario_id
+                and applied_context.get("scenario_project_path") == project_path
                 and isinstance(program_revision, str)
                 and _applied_program_revision(state) == program_revision
             ):
@@ -1190,6 +1275,7 @@ def create_deployment_draft_router(state: ComposerState) -> APIRouter:
             canonical_json_bytes(
                 {
                     "scenario_id": scenario_id,
+                    "project_path": project_path,
                     "source_document_digest": source_document_digest,
                     "deployment": deployment,
                     "model_source_closure": source_closure,
@@ -1210,6 +1296,7 @@ def create_deployment_draft_router(state: ComposerState) -> APIRouter:
                 else "deployment_candidate_preview"
             ),
             "scenario_id": scenario_id,
+            "project_path": project_path,
             "source_document_digest": source_document_digest,
             "captured_input_digest": captured_input_digest,
             "model_source_closure": source_closure,

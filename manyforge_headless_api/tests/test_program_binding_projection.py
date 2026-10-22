@@ -2,14 +2,19 @@ from copy import deepcopy
 
 import pytest
 
-from manyforge_headless_api.program_binding_projection import validate_committed_scenario_activation
+from manyforge_headless_api.models import PreparedScenarioOrigin
+from manyforge_headless_api.program_binding_projection import (
+    validate_committed_scenario_activation,
+    validate_prepared_activation_origin,
+)
 from manyforge_headless_api.program_binding_transport import ProgramBindingTransportError
 
 
 def _origin(kind="scenario"):
     digest = "sha256:" + "a" * 64
     if kind == "scenario":
-        return {"kind": kind, "scenario_id": "scenario_a", "source_document_digest": digest}
+        return {"kind": kind, "scenario_id": "scenario_a", "source_document_digest": digest,
+                "project_path": "/projects/scenario_a.scenario"}
     return {"kind": kind, "cell_id": "cell_a", "deployment_artifact_id": "deployment_a",
             "deployment_revision": digest, "retained_bundle_id": digest,
             "graph_revision": digest, "admission_digest": digest}
@@ -91,3 +96,35 @@ def test_sealed_empty_cannot_request_scene_initialization():
     value["committed_applies"][-1]["scene_initialization"] = "initialize"
     with pytest.raises(ProgramBindingTransportError):
         validate_committed_scenario_activation(value)
+
+
+def test_scenario_origin_names_its_normalized_absolute_project_folder():
+    assert validate_prepared_activation_origin(_origin())["project_path"] == (
+        "/projects/scenario_a.scenario"
+    )
+    PreparedScenarioOrigin.model_validate(_origin())
+    assert validate_prepared_activation_origin({**_origin(), "project_path": "/"})
+    longest = "/" + "p" * 4095
+    assert validate_prepared_activation_origin({**_origin(), "project_path": longest})
+
+
+@pytest.mark.parametrize("project_path", [
+    None, "", "projects/a.scenario", "./a.scenario", "/projects/../a.scenario",
+    "/projects/./a.scenario", "/projects//a.scenario", "/projects/a.scenario/",
+    "//projects/a.scenario", "/projects/a\x00.scenario", "/" + "p" * 4096, 7,
+])
+def test_scenario_origin_refuses_a_relative_unnormalized_or_unbounded_folder(project_path):
+    origin = {**_origin(), "project_path": project_path}
+    with pytest.raises(ProgramBindingTransportError, match="project_path"):
+        validate_prepared_activation_origin(origin)
+    with pytest.raises(ValueError):
+        PreparedScenarioOrigin.model_validate(origin)
+
+
+def test_scenario_origin_requires_its_project_folder():
+    origin = _origin()
+    del origin["project_path"]
+    with pytest.raises(ProgramBindingTransportError, match="closed Scenario origin"):
+        validate_prepared_activation_origin(origin)
+    with pytest.raises(ValueError):
+        PreparedScenarioOrigin.model_validate(origin)

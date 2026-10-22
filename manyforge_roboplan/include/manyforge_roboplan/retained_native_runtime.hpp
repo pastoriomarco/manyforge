@@ -1,13 +1,11 @@
 #pragma once
 
 #include <cstddef>
-#include <manyforge_deployment/execution_runtime_contract.hpp>
 #include <cstdint>
 #include <filesystem>
 #include <functional>
 #include <manyforge_collision/manyforge_collision_engine.hpp>
 #include <manyforge_core/cache/trajectory_cache.hpp>
-#include <manyforge_core/types/component_lifecycle_readiness.hpp>
 #include <manyforge_core/execution_kernel.hpp>
 #include <manyforge_core/ports/iexecution_backend.hpp>
 #include <manyforge_core/ports/igripper_command_backend.hpp>
@@ -15,8 +13,11 @@
 #include <manyforge_core/ports/ireference_pose_resolver.hpp>
 #include <manyforge_core/resource_addressed_execution_kernel.hpp>
 #include <manyforge_core/sqlite_operation_journal.hpp>
+#include <manyforge_core/types/component_lifecycle_readiness.hpp>
+#include <manyforge_deployment/execution_runtime_contract.hpp>
 #include <manyforge_deployment/native_execution_runtime_contract.hpp>
 #include <manyforge_deployment/route_configuration_publication.hpp>
+#include <manyforge_deployment/verified_retained_bundle.hpp>
 #include <manyforge_roboplan/native_runtime_support.hpp>
 #include <manyforge_roboplan/retained_collision_world_publisher.hpp>
 #include <manyforge_roboplan/retained_focused_adapters.hpp>
@@ -28,8 +29,8 @@
 #include <mutex>
 #include <optional>
 #include <roboplan/core/scene.hpp>
-#include <utility>
 #include <span>
+#include <utility>
 #include <vector>
 
 namespace manyforge::core {
@@ -231,6 +232,14 @@ private:
 /// a planner whose worker model has the same projection revision, and a
 /// reference resolver backed by the logical-scene owner. No path, model name,
 /// robot default, or group selector is accepted here.
+/// Existing retained model-map exposures, restricted to the exact motion
+/// component/model, form the planner's frame inventory. Without a map the
+/// focused-runtime legacy inventory remains exactly the participant's frames.
+[[nodiscard]] std::vector<core::ResolvedFrameDTO>
+retained_motion_planner_frames(
+    const core::RuntimeParticipantBinding &runtime,
+    const deployment::VerifiedRetainedModelMap *model_map = nullptr);
+
 struct RetainedNativeRuntimeInput final {
   core::RuntimeParticipantBinding motion_binding;
   std::optional<core::RuntimeParticipantBinding> gripper_binding;
@@ -303,6 +312,9 @@ struct RetainedNativeRuntimeInput final {
   /// Optional actual producer staging. Empty preserves legacy construction;
   /// measured readiness then reports an unavailable source association.
   RetainedRobotMeasuredSourcePreparer prepare_measured_sources{};
+  /// Used only to verify the construction-time planner inventory; not a
+  /// separate endpoint registry or an operation frame-selection authority.
+  std::optional<deployment::VerifiedRetainedModelMap> planner_model_map{};
 };
 
 struct RetainedNativeRuntime;
@@ -501,6 +513,14 @@ struct RetainedNativeRuntime final
   [[nodiscard]] core::Result<std::vector<core::RuntimeParticipantBinding>>
   ReadCurrentPhysicalParticipants(
       const core::ActiveControlConfigurationDTO &configuration) const override;
+
+  /// Value snapshot of this component's current physical bindings: the motion
+  /// binding, then the embedded gripper binding when present. Route rebinds
+  /// replace both under the cell root's route_publication_mutex_; this read
+  /// takes the same mutex, so it never observes a staged or rolled-back
+  /// route. The caller must not hold that mutex.
+  [[nodiscard]] std::vector<core::RuntimeParticipantBinding>
+  CurrentPhysicalBindings() const;
 
   [[nodiscard]] core::Result<core::RuntimeRouteConfigurationReadbackDTO>
   PublishAndReadBackRouteConfiguration(

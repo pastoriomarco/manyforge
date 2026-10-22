@@ -804,6 +804,8 @@ require_fixture_one(const Range &values, Predicate predicate,
   value.component_role_id =
       binding.component_role_bindings.front().component_role_id;
   value.target_role_id = binding.target_role_bindings.front().target_role_id;
+  value.frame_bindings =
+      binding.target_role_bindings.front().frame_role_bindings;
   auto sealed = core::verify_runtime_participant_binding(std::move(value));
   if (!sealed.ok()) {
     throw std::logic_error(
@@ -1054,7 +1056,8 @@ make_motion_operation(const core::RuntimeParticipantBinding &binding,
           core::MotionParticipantIntentDTO{
               core::MoveId("move.native.retained-projection"),
               core::FrameRoleId("base"),
-              core::FrameRoleId("tcp"),
+              core::MotionEndpointReferenceDTO{value.target_role_id,
+                                               core::FrameRoleId("tcp")},
               core::TolerancesDTO{1.0e-4, 5.0e-3, 1.0e-2},
               core::SpeedProfileDTO{0.5, 0.5, std::nullopt},
               core::TimeoutsDTO{3.0, 5.0},
@@ -3947,6 +3950,9 @@ enum class Lite6AggregateCheck {
 #endif
   kSameRoutePredecessorQualification,
   kMeasuredPublication,
+  kResolverRebuildFailures,
+  kStopResponseFollowsRouteRebind,
+  kQualifiedEndpointPlannerFrames,
   kMovingBudgetPublication,
 #ifdef MANYFORGE_RETAINED_ROS2_CONTROL_TEST_FACTORY
   kMixedOutputPublication,
@@ -4212,6 +4218,131 @@ void check_selected_core_lite6_aggregate(const Lite6AggregateCheck check) {
       state_authority, command_schema, local_runtime_epoch,
       mixed_output_check ? std::optional(core::CapabilityId("tool.gripper.command"))
                          : std::nullopt);
+
+  if (check == Lite6AggregateCheck::kQualifiedEndpointPlannerFrames) {
+    const auto *tool = model_map.find_target(component_id, gripper_target_id);
+    ASSERT_NE(tool, nullptr);
+    // This fixture deliberately maps both physical targets' TCP to the same
+    // modeled frame. The full physical inventory therefore exercises exact
+    // deduplication, rather than providing a sibling-only frame by itself.
+    const auto full_legacy = retained_motion_planner_frames(arm_binding);
+    EXPECT_EQ(retained_motion_planner_frames(arm_binding, &model_map),
+              full_legacy);
+
+    // Compile an actual Program whose arm declares only its base while its
+    // sibling tool declares the TCP. The selected arm inventory is produced by
+    // the sealed compiler/runtime path, not by editing a verified binding.
+    auto program = deployment::parse_strict_json_model_yaml(R"({
+      "api_version":"manyforge.program.v2",
+      "program_id":"qualified_endpoint_inventory",
+      "program_revision":"sha256:0000000000000000000000000000000000000000000000000000000000000000",
+      "program_profile":"composable-cell-v1",
+      "name":"Qualified endpoint inventory",
+      "component_roles":{"robot":{}},
+      "target_roles":{
+        "arm":{"component_role":"robot",
+          "required_capabilities":[{"capability_id":"execution.trajectory.execute","parameters":{},"disposition":"required"}],
+          "required_frame_roles":["base"],"required_resource_roles":["joints"],
+          "required_collision_body_roles":[],"required_model_roles":["arm_model"]},
+        "tool":{"component_role":"robot",
+          "required_capabilities":[{"capability_id":"tool.gripper.command","parameters":{},"disposition":"required"}],
+          "required_frame_roles":["tcp"],"required_resource_roles":["fingers"],
+          "required_collision_body_roles":[],"required_model_roles":["arm_model"]}},
+      "tree":{"node_id":"sequence","instance_id":"root","parameters":{},"children":[]}
+    })")
+                       .root();
+    auto program_members = program.as_object();
+    program_members.emplace_back(
+        "catalog",
+        deployment::CanonicalValue(deployment::CanonicalValue::Object{
+            {"api_version",
+             deployment::CanonicalValue("manyforge.node_catalog.v2")},
+            {"content_version",
+             deployment::CanonicalValue(
+                 materialized.bundle->value()
+                     .catalogs.node_environment.content_version)}}));
+    program = deployment::normalize_program_authoring(
+        deployment::CanonicalValue(std::move(program_members)));
+    const auto program_revision = deployment::detail::compute_content_identity(
+        program,
+        {"program-revision", "manyforge.program.v2", "program_revision"});
+    program_members = program.as_object();
+    for (auto &[name, value] : program_members)
+      if (name == "program_revision")
+        value = deployment::CanonicalValue(program_revision);
+    const auto contract = deployment::verify_program_binding_contract(
+        deployment::canonical_json(
+            deployment::CanonicalValue(std::move(program_members))),
+        *materialized.bundle);
+    deployment::FilesystemCatalogArtifactStore catalog(package_root);
+    const auto compiled = deployment::compile_program_binding(
+        *contract,
+        {{{core::ComponentRoleId("robot"), component_id}},
+         {{core::TargetRoleId("arm"), arm_target_id},
+          {core::TargetRoleId("tool"), gripper_target_id}}},
+        *materialized.bundle, model_map, catalog);
+    ASSERT_NE(compiled, nullptr);
+    const auto selected_target = deployment::resolve_runtime_program_target(
+        *compiled, core::TargetRoleId("arm"),
+        core::CapabilityId("execution.trajectory.execute"),
+        *materialized.bundle, model_map);
+    const auto &physical = *arm_binding.value().control_path;
+    auto selected = core::verify_runtime_participant_binding(
+        deployment::build_runtime_participant_binding_dto(
+            selected_target,
+            {physical.control_route_id,
+             physical.active_control_configuration_id,
+             physical.active_control_configuration_generation,
+             arm_binding.value().runtime_unit_epochs,
+             {{physical.provider_instance_id, physical.provider_runtime_unit_id,
+               physical.provider_runtime_epoch}}}));
+    ASSERT_TRUE(selected.ok()) << selected.error().message;
+    ASSERT_EQ(selected.value().value().frame_bindings.size(), 1U);
+    EXPECT_EQ(selected.value().value().frame_bindings.front().frame_role_id,
+              core::FrameRoleId("base"));
+    const auto legacy = retained_motion_planner_frames(selected.value());
+    EXPECT_EQ(legacy,
+              make_candidate_binding(selected.value()).permitted_frames);
+    const auto frames =
+        retained_motion_planner_frames(selected.value(), &model_map);
+    EXPECT_EQ(frames,
+              retained_motion_planner_frames(selected.value(), &model_map));
+    std::size_t sibling_only = 0U;
+    for (const auto &exposed : tool->frames) {
+      const auto *frame =
+          std::get_if<deployment::CompositionComponentModelFrame>(
+              &exposed.frame);
+      ASSERT_NE(frame, nullptr);
+      const core::ResolvedFrameDTO exact = core::ResolvedComponentModelFrameDTO{
+          frame->controllable_component_id, frame->model_instance_id,
+          exposed.frame_role_id, frame->compiled_frame_name,
+          frame->model_revision};
+      EXPECT_EQ(std::count(frames.begin(), frames.end(), exact), 1);
+      if (std::find(legacy.begin(), legacy.end(), exact) == legacy.end())
+        ++sibling_only;
+    }
+    EXPECT_GT(sibling_only, 0U);
+    for (const auto &frame : frames) {
+      const auto *model =
+          std::get_if<core::ResolvedComponentModelFrameDTO>(&frame);
+      ASSERT_NE(model, nullptr);
+      EXPECT_EQ(model->controllable_component_id, component_id);
+      EXPECT_EQ(model->model_instance_id,
+                arm_binding.value().model_groups.front().model_instance_id);
+      EXPECT_EQ(model->model_revision,
+                arm_binding.value().model_bindings.front().model_revision);
+      EXPECT_EQ(std::count(frames.begin(), frames.end(), frame), 1);
+    }
+    auto wrong = arm_binding.value();
+    wrong.retained_bundle_id = core::RetainedBundleId("other-product");
+    const auto wrong_product =
+        core::verify_runtime_participant_binding(std::move(wrong));
+    ASSERT_TRUE(wrong_product.ok());
+    EXPECT_THROW(
+        retained_motion_planner_frames(wrong_product.value(), &model_map),
+        std::invalid_argument);
+    return;
+  }
 
   auto stage =
       RetainedPlanningModelStage::create_verified(retained, staging_parent);
@@ -4903,6 +5034,8 @@ void check_selected_core_lite6_aggregate(const Lite6AggregateCheck check) {
   ASSERT_NE(runtime->participant_engine, nullptr);
   ASSERT_TRUE(runtime->gripper_binding.has_value());
   if (check == Lite6AggregateCheck::kMeasuredPublication ||
+      check == Lite6AggregateCheck::kResolverRebuildFailures ||
+      check == Lite6AggregateCheck::kStopResponseFollowsRouteRebind ||
       moving_budget_check || mixed_output_check ||
       check == Lite6AggregateCheck::kMeasuredOptionalDomainRace ||
       check == Lite6AggregateCheck::kMeasuredNullOptionalDomainRace) {
@@ -5057,6 +5190,235 @@ void check_selected_core_lite6_aggregate(const Lite6AggregateCheck check) {
     auto installed = runtime->PublishAndReadBackRouteConfiguration(initial, std::move(initial_ready.value()));
     ASSERT_TRUE(installed.ok()) << installed.error().message;
     EXPECT_EQ(installed.value().active_configuration, initial);
+    if (check == Lite6AggregateCheck::kResolverRebuildFailures) {
+      auto *kernel = runtime->active_addressed_kernel();
+      ASSERT_TRUE(kernel->SetRouteRecoveryPending(true).ok());
+      const auto physical_before = runtime->motion_binding.value();
+      const auto channel_before =
+          runtime->motion_state_channel->binding().value();
+      const auto factory_before = runtime->participant_resolver_factory;
+      const auto resolver_before = runtime->participant_resolver;
+      const auto actual_rebind = runtime->rebind_motion_route;
+      std::size_t rebind_count = 0U;
+      runtime->rebind_motion_route = [&](auto binding, auto aliases) {
+        ++rebind_count;
+        return actual_rebind(std::move(binding), std::move(aliases));
+      };
+      const auto successor = make_configuration(
+          runtime->motion_binding,
+          core::ActiveControlConfigurationGeneration(
+              initial.active_control_configuration_generation.value() + 1U));
+      const auto successor_ready = ready(successor);
+      ASSERT_TRUE(successor_ready.ok()) << successor_ready.error().message;
+      struct Expected final {
+        const char *failed_reason;
+        const char *failed_message;
+        const char *missing_reason;
+        const char *missing_message;
+        const char *thrown_reason;
+      };
+      const Expected expected[]{
+          {"route_publication_resolver_factory_failed",
+           "native participant resolver factory returned no resolver",
+           "route_publication_resolver_factory_missing",
+           "dynamic native participant resolution cannot retain stale physical "
+           "facts",
+           "route_publication_native_composition_failed"},
+          {"component_readiness_resolver_factory_failed",
+           "native participant resolver factory returned no resolver",
+           "component_readiness_resolver_factory_missing",
+           "dynamic native participant resolution cannot retain stale "
+           "readiness",
+           "component_readiness_native_composition_failed"},
+          {"route_predecessor_resolver_factory_failed",
+           "native predecessor resolver factory returned no resolver",
+           "route_predecessor_resolver_factory_missing",
+           "native predecessor adoption cannot retain a stale resolver",
+           "route_predecessor_adoption_failed"}};
+      for (int purpose = 0; purpose < 3; ++purpose) {
+        for (int failure = 0; failure < 3; ++failure) {
+          SCOPED_TRACE(purpose);
+          SCOPED_TRACE(failure);
+          std::size_t factory_calls = 0U;
+          // Presence of the installed resolver is what makes losing a factory
+          // an error. This sentinel must never resolve or dispatch an
+          // operation.
+          runtime->participant_resolver = [](const auto &, std::size_t) {
+            ADD_FAILURE() << "failed rebuild used the installed resolver";
+            return core::Result<core::RuntimeParticipantExecutionRegistration>::
+                Err(core::ErrorCode::kInternalError);
+          };
+          runtime->participant_resolver_factory =
+              failure == 1
+                  ? RetainedRuntimeParticipantResolverFactory{}
+                  : RetainedRuntimeParticipantResolverFactory{[&](auto) {
+                      ++factory_calls;
+                      if (failure == 2)
+                        throw std::runtime_error("factory throw witness");
+                      return RetainedRuntimeParticipantResolver{};
+                    }};
+          const auto expect_refusal = [&](const auto &result) {
+            ASSERT_FALSE(result.ok());
+            EXPECT_EQ(result.error().code,
+                      core::to_string(core::ErrorCode::kInvariantViolation));
+            EXPECT_EQ(result.error().details.at("reason"),
+                      failure == 0   ? expected[purpose].failed_reason
+                      : failure == 1 ? expected[purpose].missing_reason
+                                     : expected[purpose].thrown_reason);
+            EXPECT_EQ(result.error().message,
+                      failure == 0   ? expected[purpose].failed_message
+                      : failure == 1 ? expected[purpose].missing_message
+                                     : "factory throw witness");
+          };
+          if (purpose == 0) {
+            expect_refusal(runtime->PublishAndReadBackRouteConfiguration(
+                successor, successor_ready.value()));
+          } else if (purpose == 1) {
+            expect_refusal(runtime->PublishComponentCommandReadiness(
+                {core::ComponentReadinessAuthorityDTO::kRestartExclusion,
+                 {},
+                 {},
+                 component_id,
+                 core::ComponentLifecycleGeneration(2U),
+                 false}));
+          } else {
+            expect_refusal(
+                runtime->AdoptAndReadBackRouteConfigurationPredecessor(
+                    initial));
+          }
+          EXPECT_EQ(factory_calls, failure == 1 ? 0U : 1U);
+          EXPECT_EQ(rebind_count, 0U);
+          EXPECT_EQ(runtime->motion_binding.value(), physical_before);
+          EXPECT_EQ(runtime->motion_state_channel->binding().value(),
+                    channel_before);
+          const auto readback = kernel->runtime_route_configuration_readback(
+              initial.control_domain_id,
+              initial.active_control_configuration_id,
+              initial.active_control_configuration_generation);
+          ASSERT_TRUE(readback.ok());
+          EXPECT_EQ(readback.value(), installed.value());
+        }
+      }
+      runtime->participant_resolver_factory = factory_before;
+      runtime->participant_resolver = resolver_before;
+      runtime->rebind_motion_route = actual_rebind;
+      return;
+    }
+    if (check == Lite6AggregateCheck::kStopResponseFollowsRouteRebind) {
+      // The composition keeps this construction-time copy as its
+      // direct-control binding and composes its first resolver from it.
+      const auto composed = runtime->CurrentPhysicalBindings();
+      ASSERT_EQ(composed.size(), 2U);
+      ASSERT_EQ(composed.front().value(), runtime->motion_binding.value());
+      ASSERT_EQ(composed.back().value(), runtime->gripper_binding->value());
+      const auto composed_resolver =
+          std::make_shared<ProductBackedRuntimeParticipantResolver>(
+              package_root, materialized.bundle, model_map, composed,
+              std::vector<core::ProgramBindingId>{});
+      const auto outside = [](const auto &reply) {
+        return !reply.ok() && reply.error().code == "invalid_request" &&
+               reply.error().message ==
+                   "Stop metadata is outside the exact composed binding";
+      };
+      const auto route_of = [](const deployment::CanonicalValue &value) {
+        const auto *route = value.find_object_member("control_route_id");
+        return route != nullptr ? route->as_string() : std::string{};
+      };
+      // Without a rebind the current rows are the composed rows.
+      const auto before =
+          composed_resolver->ReadQualifiedStopResponse(composed.front(), composed);
+      ASSERT_TRUE(before.ok()) << before.error().message;
+      EXPECT_EQ(route_of(before.value()),
+                composed.front().value().control_path->control_route_id.value());
+
+      // Route publication rebinds the runtime to a successor generation.
+      runtime->prepare_measured_sources = [](const auto &, const auto &, const auto &) {
+        return core::Result<std::shared_ptr<const RetainedPreparedRobotMeasuredSources>>::Ok(nullptr);
+      };
+      const auto successor = make_configuration(runtime->motion_binding,
+          core::ActiveControlConfigurationGeneration(
+              initial.active_control_configuration_generation.value() + 1U));
+      auto successor_ready = ready(successor);
+      ASSERT_TRUE(successor_ready.ok()) << successor_ready.error().message;
+      const auto published = runtime->PublishAndReadBackRouteConfiguration(
+          successor, successor_ready.value());
+      ASSERT_TRUE(published.ok()) << published.error().message;
+      const auto current = runtime->CurrentPhysicalBindings();
+      ASSERT_EQ(current.size(), composed.size());
+      ASSERT_EQ(current.front().value(), runtime->motion_binding.value());
+      EXPECT_EQ(current.front()
+                    .value()
+                    .control_path->active_control_configuration_generation,
+                successor.active_control_configuration_generation);
+      // Only the control path moved; the target identity is unchanged.
+      ASSERT_NE(current.front().value(), composed.front().value());
+      EXPECT_EQ(current.front().value().command_target_id,
+                composed.front().value().command_target_id);
+      EXPECT_EQ(current.front().value().capability_id,
+                composed.front().value().capability_id);
+      EXPECT_EQ(current.front().value().resources,
+                composed.front().value().resources);
+
+      // A Program-only Apply recomposes the resolver from current
+      // registrations; the stale composition copy is then outside it.
+      std::vector<core::RuntimeParticipantBinding> registered;
+      for (const auto &row : runtime->participant_registrations)
+        registered.push_back(row.binding);
+      const auto recomposed =
+          composed_resolver->WithComposedParticipants(std::move(registered));
+      EXPECT_TRUE(outside(
+          recomposed->ReadQualifiedStopResponse(composed.front(), current)));
+      // The current runtime binding is readable whether or not the resolver
+      // was recomposed after the rebind.
+      for (const auto *resolver : {composed_resolver.get(), recomposed.get()}) {
+        const auto reply =
+            resolver->ReadQualifiedStopResponse(current.front(), current);
+        ASSERT_TRUE(reply.ok()) << reply.error().message;
+        EXPECT_EQ(route_of(reply.value()),
+                  current.front().value().control_path->control_route_id.value());
+      }
+      // Exact identity stays mandatory: a binding off the current rows, or
+      // no current rows at all, is refused.
+      auto foreign = current.front().value();
+      foreign.control_path->active_control_configuration_generation =
+          core::ActiveControlConfigurationGeneration(
+              successor.active_control_configuration_generation.value() + 7U);
+      const auto foreign_binding =
+          core::verify_runtime_participant_binding(std::move(foreign));
+      ASSERT_TRUE(foreign_binding.ok()) << foreign_binding.error().message;
+      EXPECT_TRUE(outside(recomposed->ReadQualifiedStopResponse(
+          foreign_binding.value(), current)));
+      EXPECT_TRUE(outside(
+          recomposed->ReadQualifiedStopResponse(current.front(), {})));
+
+      // A later activation after the recomposition moves the runtime again;
+      // the recomposed resolver's rows are now stale but the read follows.
+      const auto later = make_configuration(runtime->motion_binding,
+          core::ActiveControlConfigurationGeneration(
+              successor.active_control_configuration_generation.value() + 1U));
+      auto later_ready = ready(later);
+      ASSERT_TRUE(later_ready.ok()) << later_ready.error().message;
+      const auto republished = runtime->PublishAndReadBackRouteConfiguration(
+          later, later_ready.value());
+      ASSERT_TRUE(republished.ok()) << republished.error().message;
+      const auto latest = runtime->CurrentPhysicalBindings();
+      ASSERT_EQ(latest.size(), composed.size());
+      EXPECT_EQ(latest.front()
+                    .value()
+                    .control_path->active_control_configuration_generation,
+                later.active_control_configuration_generation);
+      ASSERT_NE(latest.front().value(), current.front().value());
+      EXPECT_TRUE(outside(
+          recomposed->ReadQualifiedStopResponse(current.front(), latest)));
+      for (const auto *resolver : {composed_resolver.get(), recomposed.get()}) {
+        const auto reply =
+            resolver->ReadQualifiedStopResponse(latest.front(), latest);
+        ASSERT_TRUE(reply.ok()) << reply.error().message;
+        EXPECT_EQ(route_of(reply.value()),
+                  latest.front().value().control_path->control_route_id.value());
+      }
+      return;
+    }
     assert_budget();
     const auto absent =
         runtime->active_addressed_kernel()->current_runtime_route_configuration(
@@ -6044,6 +6406,24 @@ TEST(RetainedNativeMeasuredRoutePublication,
 }
 #endif
 
+TEST(RetainedProductCrossConsumer,
+     QualifiedEndpointPlannerFramesUseTheSealedSameModelInventory) {
+  check_selected_core_lite6_aggregate(
+      Lite6AggregateCheck::kQualifiedEndpointPlannerFrames);
+}
+
+TEST(RetainedNativeMeasuredRoutePublication,
+     ResolverRebuildRefusalsKeepExactErrorsAndDoNotRebindOrPublish) {
+  check_selected_core_lite6_aggregate(
+      Lite6AggregateCheck::kResolverRebuildFailures);
+}
+
+TEST(RetainedNativeMeasuredRoutePublication,
+     StopResponseReadsTheCurrentBindingAfterRouteRebind) {
+  check_selected_core_lite6_aggregate(
+      Lite6AggregateCheck::kStopResponseFollowsRouteRebind);
+}
+
 TEST(RetainedNativeMeasuredRoutePublication, ExactStagePrecedesRebindAndRealThenNullCommitPreserveKernelPublication) {
   check_selected_core_lite6_aggregate(Lite6AggregateCheck::kMeasuredPublication);
 }
@@ -6443,12 +6823,33 @@ TEST(RetainedProductCrossConsumer,
 
   RetainedRuntimeParticipantResolverFactory joined_resolver_factory =
       [](std::vector<core::RuntimeParticipantBinding> joined_bindings)
-          -> RetainedRuntimeParticipantResolver {
-        auto registry = std::make_shared<core::RuntimeParticipantRegistry>(
-            std::move(joined_bindings));
-        return [registry](const core::OperationIntentDTO &operation,
-                          const std::size_t participant_index)
-                   -> core::Result<RetainedResolvedParticipant> {
+      -> RetainedRuntimeParticipantResolver {
+    for (auto &binding : joined_bindings) {
+      if (binding.value().capability_id !=
+          core::CapabilityId("execution.trajectory.execute"))
+        continue;
+      auto value = binding.value();
+      const auto tcp =
+          std::find_if(value.frame_bindings.begin(), value.frame_bindings.end(),
+                       [](const auto &row) {
+                         return row.frame_role_id == core::FrameRoleId("tcp");
+                       });
+      if (tcp == value.frame_bindings.end())
+        throw std::logic_error("joined motion fixture has no exact TCP frame");
+      value.motion_endpoint = core::RuntimeMotionEndpointBindingDTO{
+          value.target_role_id, value.command_target_id, *tcp, {}};
+      auto captured =
+          core::verify_runtime_participant_binding(std::move(value));
+      if (!captured.ok())
+        throw std::logic_error(captured.error().message);
+      binding = std::move(captured.value());
+    }
+    auto registry = std::make_shared<core::RuntimeParticipantRegistry>(
+        std::move(joined_bindings));
+    return
+        [registry](const core::OperationIntentDTO &operation,
+                   const std::size_t participant_index)
+            -> core::Result<RetainedResolvedParticipant> {
           auto binding = registry->resolve(operation, participant_index);
           if (!binding.ok()) {
             return core::Result<RetainedResolvedParticipant>::Err(
@@ -6457,7 +6858,7 @@ TEST(RetainedProductCrossConsumer,
           return core::Result<RetainedResolvedParticipant>::Ok(
               {std::move(binding.value()), false});
         };
-      };
+  };
   join_retained_native_runtime_participants(
       primary, {peer}, joined_resolver_factory);
   attach_retained_native_addressed_owner(
@@ -8123,6 +8524,64 @@ TEST(RetainedProductCrossConsumer, ObservationSelectionMemoKeepsLiveChecksAndExa
 }
 
 TEST(RetainedProductCrossConsumer,
+     IntrinsicEndpointRetainsItsExactAssociatedBodyRows) {
+  ScopedTemporaryRoot temporary;
+  const auto package_root = temporary.path() / "retained-package";
+  ASSERT_TRUE(std::filesystem::create_directory(package_root));
+  const auto materialized = deployment::test::
+      materialize_lite6_ros2_control_observed_endpoint_retained_consumer_fixture(
+          package_root, false, true);
+  ASSERT_NE(materialized.bundle, nullptr);
+  const auto &bundle = *materialized.bundle;
+  const auto model_map = load_lite6_model_map(
+      package_root,
+      {bundle.retained_bundle_id(),
+       bundle.value().compiled_products.symbol_role_maps.front().product_id});
+  deployment::FilesystemCatalogArtifactStore catalog_store(package_root);
+  const auto inventory =
+      deployment::compile_direct_control_program_binding_inventory(
+          bundle, model_map, catalog_store);
+  ASSERT_EQ(inventory.motion.size(), 1U);
+  const auto &program_binding = *inventory.motion.front();
+  const auto &target = program_binding.value().target_role_bindings.front();
+  const auto physical = with_program_binding_identity(
+      make_fixture_runtime_participant(
+          bundle, model_map, target.controllable_component_id,
+          target.command_target_id, std::nullopt, std::nullopt, std::nullopt,
+          core::CapabilityId("execution.trajectory.execute")),
+      program_binding);
+  const auto tcp =
+      std::find_if(target.frame_role_bindings.begin(),
+                   target.frame_role_bindings.end(), [](const auto &frame) {
+                     return frame.frame_role_id == core::FrameRoleId("tcp");
+                   });
+  ASSERT_NE(tcp, target.frame_role_bindings.end());
+  ASSERT_EQ(tcp->contact_body_role_ids.size(), 1U);
+  ProductBackedRuntimeParticipantResolver resolver(
+      package_root, materialized.bundle, model_map, {physical},
+      {program_binding.program_binding_id()});
+  const auto scene = make_projection_runtime_shadow_snapshot(
+      bundle.value().cell_graph.cell_id);
+  const auto operation = make_motion_operation(
+      physical, core::RequestOwnerEpoch("kernel.endpoint"),
+      scene.shared()->revision);
+  const auto resolved = resolver.Resolve(operation, 0U);
+  ASSERT_TRUE(resolved.ok()) << resolved.error().message;
+  const auto &endpoint = resolved.value().value().motion_endpoint;
+  ASSERT_TRUE(endpoint);
+  EXPECT_EQ(endpoint->frame, *tcp);
+  ASSERT_EQ(endpoint->contact_body_bindings.size(), 1U);
+  const auto &body = endpoint->contact_body_bindings.front();
+  EXPECT_EQ(body.controllable_component_id,
+            physical.value().controllable_component_id);
+  EXPECT_EQ(body.model_instance_id, tcp->model_instance_id);
+  EXPECT_EQ(body.model_revision, tcp->model_revision);
+  EXPECT_EQ(body.collision_body_role_id, tcp->contact_body_role_ids.front());
+  EXPECT_FALSE(body.collision_body_ids.empty());
+  EXPECT_EQ(resolved.value().value().resources, physical.value().resources);
+}
+
+TEST(RetainedProductCrossConsumer,
      TwoSameTypeProgramsResolveDistinctPhysicalParticipantsWithoutAliasing) {
   ScopedTemporaryRoot temporary;
   const std::filesystem::path package_root =
@@ -8268,6 +8727,25 @@ TEST(RetainedProductCrossConsumer,
               physical_bindings[index].value().controllable_component_id);
     EXPECT_EQ(resolved.value().value().resources,
               physical_bindings[index].value().resources);
+    const auto &endpoint = resolved.value().value().motion_endpoint;
+    ASSERT_TRUE(endpoint);
+    EXPECT_EQ(endpoint->target_role_id,
+              physical_bindings[index].value().target_role_id);
+    EXPECT_EQ(endpoint->command_target_id,
+              physical_bindings[index].value().command_target_id);
+    EXPECT_EQ(endpoint->frame.frame_role_id, core::FrameRoleId("tcp"));
+    auto crossed_endpoint = operation;
+    std::get<core::MotionParticipantIntentDTO>(
+        crossed_endpoint.participants.front().payload)
+        .tcp_endpoint.target_role_id =
+        core::TargetRoleId("missing.endpoint.owner");
+    EXPECT_FALSE(resolver.Resolve(crossed_endpoint, 0U).ok());
+    crossed_endpoint = operation;
+    std::get<core::MotionParticipantIntentDTO>(
+        crossed_endpoint.participants.front().payload)
+        .tcp_endpoint.frame_role_id =
+        core::FrameRoleId("missing.endpoint.frame");
+    EXPECT_FALSE(resolver.Resolve(crossed_endpoint, 0U).ok());
     const auto &physical = physical_bindings[index];
     const auto &control = *physical.value().control_path;
     const auto context = core::make_observed_state_query_context(physical, 100);

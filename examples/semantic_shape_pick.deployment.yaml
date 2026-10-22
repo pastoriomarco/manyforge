@@ -1128,7 +1128,7 @@
         "record_kind": "component_type",
         "record_revision": "sha256:dce266914adb570342ad6a7f567ebae00f09de6c64b70e180af14ec9840c8dda",
         "schema_id": "manyforge.component_type.v1",
-        "schema_revision": "sha256:8e728ad4442d46b98f0d0534f8189df9b7982f982ab99cb656e6fdbeef231009"
+        "schema_revision": "sha256:2f26f97a7454e620bfb39e16eeccc0b23ae2de61c32e3e8210eff46945d01fc4"
       },
       {
         "content_addressed_store_key": "catalog/maintained/control_interface_contract/manyforge.ros2_control_arm_position/d951ffd368654ba9998355a4b12844014469753c3c21e05df3b61f6f669cbb4b",
@@ -1252,7 +1252,7 @@
     ]
   },
   "deployment_artifact_id": "ur5_roboplan_local_semantic_shape_pick",
-  "deployment_revision": "sha256:8f778519b0e97c2893eff705aa5b08d46d62ebb1cce3089721cfd964d0f695c1",
+  "deployment_revision": "sha256:6e3887f0ee265c8d8fa8eba736671cf8fbb4cb4d2ca1a53f6887cef7cc029d36",
   "description": "Local deployment for the semantic object-selection demo. A model selects one backend-authoritative scene object from a deterministic manifest plus an auxiliary viewer snapshot, and the backend computes the actual pick sequence deterministically from backend scene state.",
   "desired_control_configurations": [
     {

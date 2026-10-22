@@ -1,6 +1,6 @@
 api_version: manyforge.program.v2
 program_id: semantic_shape_pick
-program_revision: sha256:aa80cf45af56f515a790c5e5f3a88cd35169d3a8d70f57a6d1d8b3cf253e47cb
+program_revision: sha256:c6e18c4d95367e0c736b3f9ccc270f33a42bf347dfd0849af447e3361e4ac5ff
 program_profile: composable-cell-v1
 name: semantic_shape_pick
 description: >-
@@ -244,7 +244,7 @@ tree:
         target_role: arm
         tool_target_role: gripper
         base_frame_role: base
-        tcp_frame_role: tcp
+        tcp_endpoint: {target_role: arm, frame_role: tcp}
         carrier_frame_role: tcp
         synthesis:
           pick_offset_envelope:
@@ -279,7 +279,7 @@ tree:
       parameters:
         target_role: arm
         base_frame_role: base
-        tcp_frame_role: tcp
+        tcp_endpoint: {target_role: arm, frame_role: tcp}
         velocity_scale: 0.3
       value_sources:
         goal:
@@ -292,7 +292,7 @@ tree:
       parameters:
         target_role: arm
         base_frame_role: base
-        tcp_frame_role: tcp
+        tcp_endpoint: {target_role: arm, frame_role: tcp}
         velocity_scale: 0.2
       value_sources:
         goal:
@@ -323,7 +323,7 @@ tree:
       parameters:
         target_role: arm
         base_frame_role: base
-        tcp_frame_role: tcp
+        tcp_endpoint: {target_role: arm, frame_role: tcp}
         velocity_scale: 0.3
       value_sources:
         goal:
@@ -336,7 +336,7 @@ tree:
       parameters:
         target_role: arm
         base_frame_role: base
-        tcp_frame_role: tcp
+        tcp_endpoint: {target_role: arm, frame_role: tcp}
         target_mode: relative
         target_reference:
           type: pose
@@ -355,7 +355,7 @@ tree:
       parameters:
         target_role: arm
         base_frame_role: base
-        tcp_frame_role: tcp
+        tcp_endpoint: {target_role: arm, frame_role: tcp}
         goal:
           frame_ref: {kind: target_frame, target_role: arm, frame_role: base}
           position_m: [0.22, 0.0, 0.3]
@@ -383,7 +383,7 @@ tree:
       parameters:
         target_role: arm
         base_frame_role: base
-        tcp_frame_role: tcp
+        tcp_endpoint: {target_role: arm, frame_role: tcp}
         target_mode: relative
         target_reference:
           type: pose

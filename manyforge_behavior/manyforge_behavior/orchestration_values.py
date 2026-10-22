@@ -482,7 +482,7 @@ class ProgramValueStore:
         cls,
         program: Program,
         *,
-        scenario_id: str | None = None,
+        project_path: str | None = None,
         register: PersistentKeyRegisterPort | None = None,
         program_run_id: str | None = None,
     ) -> "ProgramValueStore":
@@ -493,7 +493,7 @@ class ProgramValueStore:
             for key, declaration in program.blackboard_keys.items()
             if declaration.persistence == "persistent"
         }
-        if register is None or scenario_id is None:
+        if register is None or project_path is None:
             if persistent:
                 raise ProgramValueError(
                     "persistent blackboard keys require the persistent-key register"
@@ -502,15 +502,15 @@ class ProgramValueStore:
         run = {} if program_run_id is None else {"program_run_id": program_run_id}
         return cls(
             program,
-            restored=register.restore(scenario_id, persistent),
+            restored=register.restore(project_path, persistent),
             persistent_commit=lambda declaration, value, metadata: register.commit(
-                scenario_id, declaration, value, edit={**run, **metadata}
+                project_path, declaration, value, edit={**run, **metadata}
             ),
             persistent_forget=lambda declaration, metadata: register.remove(
-                scenario_id, declaration.key, edit={**run, **metadata}
+                project_path, declaration.key, edit={**run, **metadata}
             ),
             persistent_drop=lambda declaration, reason, detail: register.drop(
-                scenario_id, declaration.key, reason=reason, detail=detail, edit=run
+                project_path, declaration.key, reason=reason, detail=detail, edit=run
             ),
         )
 

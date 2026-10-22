@@ -490,6 +490,7 @@ class ActivationPreparer:
         *,
         source_document_digest: str,
         scenario_id: str,
+        project_path: str,
         captured_input_digest: str,
         deployment: Mapping[str, Any],
         model_source_closure: Mapping[str, Any],
@@ -497,7 +498,8 @@ class ActivationPreparer:
         program_role_assignment: Mapping[str, Any],
     ) -> dict[str, Any]:
         origin = {"kind": "scenario", "scenario_id": scenario_id,
-                  "source_document_digest": source_document_digest}
+                  "source_document_digest": source_document_digest,
+                  "project_path": project_path}
 
         def request_value() -> dict[str, Any]:
             prepared_model_closure = _prepare_model_closure(
@@ -509,6 +511,7 @@ class ActivationPreparer:
                 "runtime_cell_id": self._runtime_cell_id,
                 "source_document_digest": source_document_digest,
                 "scenario_id": scenario_id,
+                "project_path": project_path,
                 "captured_input_digest": captured_input_digest,
                 "deployment": dict(deployment),
                 "model_source_closure": dict(model_source_closure),

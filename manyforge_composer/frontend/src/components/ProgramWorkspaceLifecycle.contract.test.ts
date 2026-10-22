@@ -83,7 +83,7 @@ describe('Program workspace lifecycle controls', () => {
 
   it('wires fenced New, Revert, and Discard with concrete prerequisites', () => {
     const source = readFileSync(
-      new URL('./ProgramDocumentControls.tsx', import.meta.url),
+      new URL('./ScenarioActionControls.tsx', import.meta.url),
       'utf8',
     );
     const scenarioSource = readFileSync(
@@ -95,12 +95,12 @@ describe('Program workspace lifecycle controls', () => {
     expect(scenarioSource).toContain('newScenarioDocument({');
     expect(source).toContain('Revert to saved');
     expect(source).toContain('Discard changes');
-    expect(source).toContain('return to the Applied Program');
-    expect(source).toContain(
-      'disabled={reasons.discard !== null}',
-    );
-    expect(source).toContain('disabled={reasons.revert !== null}');
+    expect(source).toContain('returns to Applied');
+    expect(source).toContain('disabled={routes.discard.target === null}');
+    expect(source).toContain('disabled={routes.revert.target === null}');
     expect(source).toContain('programActionUnavailableReason');
+    expect(source).toContain('deploymentActionUnavailableReason');
+    expect(source).toContain('program.discardScenario()');
     expect(source).not.toContain('localStorage');
     expect(source).not.toContain('sendBeacon');
   });
@@ -192,7 +192,7 @@ describe('Program workspace lifecycle controls', () => {
 
   it('loads a Scenario through one activation operation with only conditional dirty-work confirmation', () => {
     const source = readFileSync(
-      new URL('./ProgramDocumentControls.tsx', import.meta.url),
+      new URL('./ScenarioActionControls.tsx', import.meta.url),
       'utf8',
     );
     const scenarioSource = readFileSync(
@@ -207,7 +207,9 @@ describe('Program workspace lifecycle controls', () => {
     expect(source).not.toContain('applyDraft(selectedScenario');
     expect(source).not.toContain('Load and Apply Program');
     expect(scenarioSource).toContain('Load replaces the current Scenario and applies its Deployment, Scene and Program.');
-    expect(scenarioSource).toContain('Replace current unsaved or unapplied Draft changes');
+    // Every Load closes first; its dirty-work confirmation is the Close popup.
+    expect(scenarioSource).not.toContain('Replace current unsaved or unapplied Draft changes');
+    expect(scenarioSource).toContain('Discard the current Draft and continue?');
     expect(scenarioSource).not.toContain('Open as Draft only');
     expect(scenarioSource).not.toContain('confirmScenarioDeployment');
     expect(scenarioSource).toContain('The list shows saved metadata, not current readiness.');
@@ -221,7 +223,7 @@ describe('Program workspace lifecycle controls', () => {
       'utf8',
     );
     const controlsSource = readFileSync(
-      new URL('./ProgramDocumentControls.tsx', import.meta.url),
+      new URL('./ScenarioActionControls.tsx', import.meta.url),
       'utf8',
     );
     expect(workspaceSource).toContain(
@@ -244,8 +246,8 @@ describe('Program workspace lifecycle controls', () => {
     expect(workspaceSource).toContain('? mutationUnavailableReason');
     // Edits and Discard follow the Draft-edit gate; Apply with a run Resets
     // it first; every other document action requires Idle.
-    expect(controlsSource).toContain("busyReason ?? mutationUnavailableReason");
-    expect(controlsSource).toContain("resetApply.unavailableReason('program') : documentUnavailableReason");
+    expect(controlsSource).toContain("programBusyReason ?? program.mutationUnavailableReason");
+    expect(controlsSource).toContain("resetApply.unavailableReason('program') : program.documentUnavailableReason");
     expect(workspaceSource).not.toContain('affect only later runs');
   });
 });

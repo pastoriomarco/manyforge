@@ -9,6 +9,7 @@ import { awaitActivationCompletion, browserRequestIdentity, cclcRequestOwnerEpoc
 import type { JsonValue, ManagerActiveProjection, ProjectionRevision } from '../types/api';
 import type { ComponentProcessStopResult } from '../types/cclc';
 import type { ManagerApplyIdentity } from './managerApply';
+import { errorMessage } from './structuralResource';
 
 interface CloseInputs {
   expected: ManagerActiveProjection;
@@ -202,7 +203,7 @@ export async function prepareProgramCycleForClose(
     idleCycle ??= { programRunId: null, programRunnerOwnerEpoch: cycle.programRunnerOwnerEpoch, cycleGeneration: cycle.cycleGeneration };
     return { resetDone, idleCycle };
   } catch (error) {
-    throw new Error(`${error instanceof Error ? error.message : 'Close preparation is unresolved.'} ${resetDone
+    throw new Error(`${errorMessage(error, 'Close preparation is unresolved.')} ${resetDone
       ? 'Reset done; Close not completed.' : resetSubmitted ? 'Close not completed; Reset was submitted; its outcome is not confirmed.' : 'Close not completed.'} Detached objects confirmed: none. Editors were kept. Nothing was retried.`);
   }
 }
@@ -291,7 +292,7 @@ export async function prepareSceneForClose(input: CloseInputs): Promise<Prepared
       throw new Error('The logical Scene still has carried objects or changed outside this Close.');
     return { resetDone, detached, idleCycle, sceneProjection: expectedScene };
   } catch (error) {
-    throw new Error(`${error instanceof Error ? error.message : 'Close preparation is unresolved.'} ${resetDone
+    throw new Error(`${errorMessage(error, 'Close preparation is unresolved.')} ${resetDone
       ? 'Reset done; Close not completed.' : 'Close not completed.'} Detached objects confirmed: ${detached.join(', ') || 'none'}.${attempted
       ? ` Detach of ${attempted} was refused or is unconfirmed.` : ''} Editors were kept. Nothing was retried.`);
   }
@@ -477,7 +478,7 @@ export async function closeScenario({ expected, signal, admissionGeneration,
     }
   } catch (error) {
     if (preparedClose.resetDone || preparedClose.detached.length > 0)
-      throw new Error(`${error instanceof Error ? error.message : 'Close is unresolved.'} ${preparedClose.resetDone
+      throw new Error(`${errorMessage(error, 'Close is unresolved.')} ${preparedClose.resetDone
         ? 'Reset done; Close not completed.' : 'Close not completed.'} Detached objects confirmed: ${preparedClose.detached.join(', ') || 'none'}. Editors were kept. Nothing was retried.`);
     throw error;
   }

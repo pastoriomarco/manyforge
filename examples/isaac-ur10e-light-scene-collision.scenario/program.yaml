@@ -197,7 +197,10 @@
                       "type": "scene_resource"
                     },
                     "target_role": "arm",
-                    "tcp_frame_role": "tcp"
+                    "tcp_endpoint": {
+                      "frame_role": "tcp",
+                      "target_role": "arm"
+                    }
                   },
                   "value_sources": {
                     "velocity_scale": {
@@ -238,7 +241,10 @@
                       "type": "scene_resource"
                     },
                     "target_role": "arm",
-                    "tcp_frame_role": "tcp"
+                    "tcp_endpoint": {
+                      "frame_role": "tcp",
+                      "target_role": "arm"
+                    }
                   },
                   "value_sources": {
                     "velocity_scale": {

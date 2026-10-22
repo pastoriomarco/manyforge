@@ -1,10 +1,12 @@
-"""Pure expansion of legacy-shaped Pick/Place inputs into ordinary nodes."""
+"""Pure expansion of Pick/Place inputs into ordinary nodes."""
 
 from __future__ import annotations
 
 from collections.abc import Mapping
 from copy import deepcopy
 from typing import Any, Sequence
+
+from manyforge_behavior.program import ProgramValidationError, motion_tcp_selection
 
 
 class PickPlaceTemplateError(ValueError):
@@ -16,7 +18,7 @@ _COMMON_REQUIRED = frozenset(
         "target_role",
         "tool_target_role",
         "base_frame_role",
-        "tcp_frame_role",
+        "tcp_endpoint",
         "carrier_frame_role",
         "selected_object_id",
         "tool_position",
@@ -46,7 +48,7 @@ _STATIC_FIELDS = frozenset(
         "target_role",
         "tool_target_role",
         "base_frame_role",
-        "tcp_frame_role",
+        "tcp_endpoint",
         "carrier_frame_role",
         "contact_policy_id",
         "planning_profile",
@@ -95,6 +97,10 @@ def build_pick_place_subtree(
             "Deployment-captured Pick/Place selectors cannot be dynamic: "
             f"{dynamic_static}"
         )
+    try:
+        tcp_selection = motion_tcp_selection(values)
+    except ProgramValidationError as exc:
+        raise PickPlaceTemplateError(str(exc)) from exc
     if "motion_options" in sources:
         raise PickPlaceTemplateError(
             "dynamic legacy motion_options cannot be split safely across ordinary nodes"
@@ -129,7 +135,7 @@ def build_pick_place_subtree(
     common_motion = {
         "target_role": literal("target_role"),
         "base_frame_role": literal("base_frame_role"),
-        "tcp_frame_role": literal("tcp_frame_role"),
+        **deepcopy(tcp_selection),
         "planning_profile": planning_profile,
     }
     for name in (
@@ -151,10 +157,11 @@ def build_pick_place_subtree(
             "target_role",
             "tool_target_role",
             "base_frame_role",
-            "tcp_frame_role",
+            "tcp_endpoint",
             "carrier_frame_role",
         )
     }
+    plan_parameters.update(deepcopy(tcp_selection))
     plan_parameters.update(
         planning_profile=planning_profile,
         motion_options=deepcopy(motion_options),

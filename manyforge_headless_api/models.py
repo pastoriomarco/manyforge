@@ -11,6 +11,7 @@ from typing import Annotated, Any, Literal
 
 import rfc8785
 from pydantic import (
+    AfterValidator,
     BaseModel,
     ConfigDict,
     Discriminator,
@@ -38,11 +39,16 @@ from manyforge_behavior.json_scalars import (
     nonnegative_int64_value,
 )
 
+from .program_binding_projection import validate_project_path
+
 
 MAX_IDENTITY_BYTES = 256
 MAX_ACTIVATION_ID_BYTES = 2_048
 MAX_REASON_BYTES = 4096
 MAX_BULK_MEMBERS = 256
+# The Scenario project folder, resolved by the file-owning sender (Composer):
+# absolute, lexically normalized, at most 4096 bytes, no NUL.
+ProjectPath = Annotated[str, AfterValidator(validate_project_path)]
 MAX_SCENE_POSE_QUERY_RESOURCES = 128
 MAX_PROGRAM_RUN_REASON_BYTES = 4096
 MAX_STOP_IDENTITY_BYTES = 128
@@ -502,6 +508,7 @@ class ManagerDeploymentCandidatePreviewRequest(StrictRequest):
 class ActivationPreparationRequest(StrictRequest):
     source_document_digest: Annotated[str, Field(pattern=SHA256_PATTERN)]
     scenario_id: str
+    project_path: ProjectPath
     captured_input_digest: Annotated[str, Field(pattern=SHA256_PATTERN)]
     deployment: dict[str, Any]
     model_source_closure: dict[str, Any]
@@ -551,6 +558,7 @@ class PreparedScenarioOrigin(StrictRequest):
     kind: Literal["scenario"]
     scenario_id: str
     source_document_digest: Annotated[str, Field(pattern=SHA256_PATTERN)]
+    project_path: ProjectPath
 
     @field_validator("scenario_id")
     @classmethod
@@ -912,12 +920,6 @@ class RuntimeBlackboardWriteRequest(ProgramRunControlRequest):
         return _bounded_nfc(value, label="key", maximum_bytes=MAX_IDENTITY_BYTES)
 
 
-ScenarioId = Annotated[
-    str,
-    Field(min_length=1, max_length=128, pattern=r"^[a-z][a-z0-9_.-]*$"),
-]
-
-
 class PersistentKeyValuesClearRequest(CallerAttributionRequest):
     """Reset every writable persistent key of the Applied Scenario at once.
 
@@ -926,9 +928,10 @@ class PersistentKeyValuesClearRequest(CallerAttributionRequest):
     keys keep their stored values. Clearing is refused while a run holds the
     values. Without a run the last admitted edit wins; a request already
     applied is refused by its identity, never applied again.
+    `project_path` names the Applied Scenario project the operator saw.
     """
 
-    scenario_id: ScenarioId
+    project_path: ProjectPath
 
 
 class PersistentKeyValueResetRequest(CallerAttributionRequest):
@@ -939,9 +942,10 @@ class PersistentKeyValueResetRequest(CallerAttributionRequest):
     operator saw (`program_run_id` with `expected_run_revision`); without a
     run the last admitted edit wins. The Program runner refuses a changed
     Program or run, and a request already applied, by its identity.
+    `project_path` names the Applied Scenario project the operator saw.
     """
 
-    scenario_id: ScenarioId
+    project_path: ProjectPath
     key: str
     expected_program_revision: Annotated[str, Field(pattern=SHA256_PATTERN)]
     program_run_id: str | None = None
@@ -2698,11 +2702,27 @@ class RuntimeObjectReferenceBindingRequest(StrictRequest):
         )
 
 
+class MotionEndpointReferenceRequest(StrictRequest):
+    """One portable TCP selection; the native owner verifies its sealed binding."""
+
+    target_role_id: str
+    frame_role_id: str
+
+    @field_validator("target_role_id", "frame_role_id")
+    @classmethod
+    def validate_endpoint_identity(cls, value: str, info) -> str:
+        return _bounded_nfc(
+            value,
+            label=info.field_name,
+            maximum_bytes=MAX_IDENTITY_BYTES,
+        )
+
+
 class MotionParticipantRequest(StrictRequest):
     kind: Literal["motion"]
     move_id: str
     base_frame_role_id: str
-    tcp_frame_role_id: str
+    tcp_endpoint: MotionEndpointReferenceRequest
     tolerances: MotionTolerancesRequest
     speed_profile: MotionSpeedProfileRequest
     timeouts: MotionTimeoutsRequest
@@ -2729,7 +2749,7 @@ class MotionParticipantRequest(StrictRequest):
         return result
 
     @field_validator(
-        "move_id", "base_frame_role_id", "tcp_frame_role_id", "contact_policy_id"
+        "move_id", "base_frame_role_id", "contact_policy_id"
     )
     @classmethod
     def validate_motion_identity(cls, value: str | None, info) -> str | None:
@@ -2780,15 +2800,9 @@ class MotionParticipantRequest(StrictRequest):
             )
         is_joint = isinstance(self.motion, JointGoalRequest)
         if is_joint and (
-            self.contact_policy_id is not None
-            or self.runtime_object_bindings
-            or self.target_reference is not None
-            or self.offset_reference is not None
+            self.target_reference is not None or self.offset_reference is not None
         ):
-            raise ValueError(
-                "joint_goal cannot carry contact-policy, spatial references, or "
-                "runtime-object bindings"
-            )
+            raise ValueError("joint_goal cannot carry spatial references")
         if self.target_mode == "absolute" and (
             self.target_reference is not None or self.offset_reference is not None
         ):
@@ -3148,7 +3162,8 @@ def _validate_pick_place_operations(
             participant.target_role_id,
             participant.required_capability_id,
             participant.payload.base_frame_role_id,
-            participant.payload.tcp_frame_role_id,
+            participant.payload.tcp_endpoint.target_role_id,
+            participant.payload.tcp_endpoint.frame_role_id,
         )
         for participant in motion_participants
         if isinstance(participant.payload, MotionParticipantRequest)

@@ -1,6 +1,10 @@
 import { useMemo, useRef, useState } from 'react';
 
 import type { JsonValue, ProgramAuthoringDocument } from '../types/api';
+import {
+  motionEndpointChoiceKey,
+  programMotionEndpointChoices,
+} from '../utils/motionEndpointAuthoring';
 import { OverlayPanel } from './OverlayPanel';
 import { ProgramTemplateIcon } from './programNodeGlyphs';
 
@@ -86,11 +90,12 @@ export function ProgramAuthoringTemplate({
     [program.scene],
   );
   const policies = useMemo(() => contactPolicyIds(program), [program]);
+  const endpointChoices = useMemo(() => programMotionEndpointChoices(program), [program]);
   const [sceneId, setSceneId] = useState('');
   const [armTargetId, setArmTargetId] = useState('');
   const [toolTargetId, setToolTargetId] = useState('');
   const [baseFrame, setBaseFrame] = useState('');
-  const [tcpFrame, setTcpFrame] = useState('');
+  const [endpointKey, setEndpointKey] = useState('');
   const [carrierFrame, setCarrierFrame] = useState('');
   const [touchBody, setTouchBody] = useState('');
   const [policyId, setPolicyId] = useState('');
@@ -110,9 +115,13 @@ export function ProgramAuthoringTemplate({
   const effectiveBase = arm?.frames.includes(baseFrame)
     ? baseFrame
     : arm?.frames.find((frame) => frame === 'base') ?? arm?.frames[0] ?? '';
-  const effectiveTcp = arm?.frames.includes(tcpFrame)
-    ? tcpFrame
-    : arm?.frames.find((frame) => frame === 'tcp') ?? arm?.frames[0] ?? '';
+  const defaultEndpointKey = arm?.frames.includes('tcp')
+    ? motionEndpointChoiceKey(effectiveArm, 'tcp')
+    : arm?.frames[0] === undefined
+      ? '' : motionEndpointChoiceKey(effectiveArm, arm.frames[0]);
+  const effectiveEndpoint = endpointChoices.find((choice) => choice.key === endpointKey)
+    ?? endpointChoices.find((choice) => choice.key === defaultEndpointKey)
+    ?? endpointChoices[0];
   const effectiveCarrier = tool?.frames.includes(carrierFrame)
     ? carrierFrame
     : tool?.frames.find((frame) => frame === 'tcp') ?? tool?.frames[0] ?? '';
@@ -124,7 +133,7 @@ export function ProgramAuthoringTemplate({
     && arm !== undefined
     && tool !== undefined
     && effectiveBase !== ''
-    && effectiveTcp !== ''
+    && effectiveEndpoint !== undefined
     && effectiveCarrier !== ''
     && (operation === 'place' || effectiveTouch !== '')
     && (operation === 'place' || effectivePolicy !== '')
@@ -207,14 +216,17 @@ export function ProgramAuthoringTemplate({
           className="program-template-form"
           onSubmit={(event) => {
             event.preventDefault();
-            if (!available || busy) return;
+            if (!available || busy || effectiveEndpoint === undefined) return;
             onMutate('program_draft_expand_authoring_macro', {
               macro_id: `${operation}_subtree`,
               scene_resource_id: effectiveScene,
               target_role: effectiveArm,
               tool_target_role: effectiveTool,
               base_frame_role: effectiveBase,
-              tcp_frame_role: effectiveTcp,
+              tcp_endpoint: {
+                target_role: effectiveEndpoint.targetRole,
+                frame_role: effectiveEndpoint.frameRole,
+              },
               carrier_frame_role: effectiveCarrier,
               tool_position: coordinateKind === 'linear_m'
                 ? { kind: coordinateKind, value_m: toolPosition }
@@ -257,7 +269,7 @@ export function ProgramAuthoringTemplate({
           <label><span>Tool target</span><select value={effectiveTool} onChange={(event) => setToolTargetId(event.target.value)}>{toolTargets.map((row) => <option key={row.id}>{row.id}</option>)}</select></label>
           <div className="program-template-grid">
             <label><span>Base frame</span><select value={effectiveBase} onChange={(event) => setBaseFrame(event.target.value)}>{arm?.frames.map((id) => <option key={id}>{id}</option>)}</select></label>
-            <label><span>TCP frame</span><select value={effectiveTcp} onChange={(event) => setTcpFrame(event.target.value)}>{arm?.frames.map((id) => <option key={id}>{id}</option>)}</select></label>
+            <label><span>Motion TCP endpoint</span><select value={effectiveEndpoint?.key ?? ''} onChange={(event) => setEndpointKey(event.target.value)}>{endpointChoices.map((choice) => <option key={choice.key} value={choice.key}>{choice.label}</option>)}</select></label>
             <label><span>Carrier frame</span><select value={effectiveCarrier} onChange={(event) => setCarrierFrame(event.target.value)}>{tool?.frames.map((id) => <option key={id}>{id}</option>)}</select></label>
             {operation === 'pick' && <label><span>Touch body</span><select value={effectiveTouch} onChange={(event) => setTouchBody(event.target.value)}>{tool?.collisionBodies.map((id) => <option key={id}>{id}</option>)}</select></label>}
           </div>

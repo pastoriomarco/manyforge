@@ -615,6 +615,7 @@ def _fixture(
     )
     admission = ProgramRunAdmission(
         scenario_id="ur5-pick-place",
+        project_path="/projects/ur5-pick-place.scenario",
         applied_record_digest="sha256:" + "9" * 64,
         source_document_digest=_DIGEST_A,
         program=program,
@@ -3840,6 +3841,7 @@ def _scenario_selection(admission: ProgramRunAdmission) -> dict[str, Any]:
         "schema_version": "manyforge.program_run_input.v2",
         "applied_record_digest": admission.applied_record_digest,
         "scenario_id": admission.scenario_id,
+        "project_path": admission.project_path,
         "source_document_digest": admission.source_document_digest,
         "deployment_artifact_id": "cell_a",
         "deployment_revision": "sha256:" + "d" * 64,
@@ -3990,6 +3992,8 @@ def test_applied_program_publication_is_complete_run_input() -> None:
 
     assert joined.program_binding_id == admission.program_binding_id
     assert joined.owner_identities[0].owner_role == "headless_projection"
+    # The Applied Scenario project folder scopes the run's persistent values.
+    assert joined.project_path == admission.project_path
     applied["graph_revision"] = _DIGEST_A
     try:
         build_applied_program_run_admission(

@@ -45,8 +45,26 @@ function detailValue(value: string | number | boolean | null): string {
   return String(value);
 }
 
-/** Labelled rows for a failure's bounded details and origin. */
-export function structuredErrorRows({ details, origin }: FailureContext): StructuredErrorRow[] {
+/** Whether the producer's message already names this value as a whole token. */
+function messageNames(message: string, value: string): boolean {
+  let start = message.indexOf(value);
+  while (start >= 0) {
+    const before = message.charAt(start - 1);
+    const after = message.charAt(start + value.length);
+    if (!/[A-Za-z0-9_]/.test(before) && !/[A-Za-z0-9_]/.test(after)) return true;
+    start = message.indexOf(value, start + 1);
+  }
+  return false;
+}
+
+/**
+ * Labelled rows for a failure's bounded details and origin. A reason or
+ * reference the producer's `message` already names is not repeated.
+ */
+export function structuredErrorRows(
+  { details, origin }: FailureContext,
+  message = '',
+): StructuredErrorRow[] {
   const rows: StructuredErrorRow[] = [];
   const shown = new Set<string>();
   const text = (key: string): string | null => {
@@ -56,16 +74,14 @@ export function structuredErrorRows({ details, origin }: FailureContext): Struct
     return value;
   };
   const reason = text('reason');
-  if (reason !== null) rows.push({ label: 'Reason', value: reason });
+  if (reason !== null && !messageNames(message, reason)) rows.push({ label: 'Reason', value: reason });
   const referenceType = text('reference_type');
   if (referenceType !== null) {
     const referenceId = text('reference_id');
     const targetRoleId = text('target_role_id');
-    rows.push({
-      label: 'Reference',
-      value: `${referenceType}${referenceId === null ? '' : ` ${quoted(referenceId)}`}${
-        targetRoleId === null ? '' : ` of target role ${quoted(targetRoleId)}`}`,
-    });
+    const value = `${referenceType}${referenceId === null ? '' : ` ${quoted(referenceId)}`}${
+      targetRoleId === null ? '' : ` of target role ${quoted(targetRoleId)}`}`;
+    if (!messageNames(message, `reference ${value}`)) rows.push({ label: 'Reference', value });
   }
   const sourceKind = text('source_kind');
   if (sourceKind !== null) {
@@ -120,7 +136,7 @@ export function formatStructuredError(error: StructuredError): StructuredErrorDi
   return {
     title: humanizeReasonCode(error.code),
     message: error.message,
-    rows: structuredErrorRows(error),
+    rows: structuredErrorRows(error, error.message),
   };
 }
 

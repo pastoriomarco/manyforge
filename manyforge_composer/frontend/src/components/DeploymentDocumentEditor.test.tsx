@@ -3,7 +3,9 @@ import { describe, expect, it, vi } from 'vitest';
 
 import type { DeploymentWorkspaceController } from '../hooks/useDeploymentWorkspace';
 import { DeploymentDocumentEditor } from './DeploymentDocumentEditor';
-import { DeploymentDocumentControls } from './DeploymentDocumentControls';
+import type { ProgramRuntimeController } from '../hooks/useProgramRuntime';
+import type { ProgramWorkspaceController } from '../hooks/useProgramWorkspace';
+import { ScenarioActionControls } from './ScenarioActionControls';
 
 function controller(): DeploymentWorkspaceController {
   return {
@@ -32,7 +34,7 @@ function controller(): DeploymentWorkspaceController {
         graphRevision: `sha256:${'2'.repeat(64)}`,
         differsFromSaved: false,
       },
-      saved: { path: '/workspace/cell-a.deployment.yaml', deploymentRevision: null },
+      saved: { path: '/workspace/cell-a.deployment.yaml', deploymentRevision: null, differsFromApplied: null },
       managerApplied: { activationOrder: null, deploymentRevision: null, scenarioId: null },
       runAdmission: { ready: false, reason: 'not applied' },
       binding: null,
@@ -49,6 +51,8 @@ function controller(): DeploymentWorkspaceController {
     acceptedApplyCorrelationId: null,
     activationScope: null,
     pendingApplyConfirmation: null,
+    pendingConfirmationAction: null,
+    comparisonUnavailableReason: null,
     mutationAvailable: true,
     mutationUnavailableReason: null,
     documentUnavailableReason: null,
@@ -69,6 +73,31 @@ function controller(): DeploymentWorkspaceController {
   };
 }
 
+// A Program with nothing pending: Saved, Draft and Applied all match.
+const settledProgram = {
+  state: {
+    status: 'ready',
+    pendingAction: null,
+    workspace: {
+      draft: { program: {}, diagnostics: [] },
+      saved: { available: true, programRevision: 'program.1' },
+      applied: { available: true, programRevision: 'program.1', matchesDraft: true },
+      hasUnappliedChanges: false,
+      hasUnsavedChanges: false,
+      applicability: { applyReady: true, unavailableReason: null },
+    },
+  },
+  documentUnavailableReason: null,
+  mutationUnavailableReason: null,
+} as unknown as ProgramWorkspaceController;
+const runtime = { state: { currentScenario: null } } as unknown as ProgramRuntimeController;
+
+function scenarioActions(deployment: DeploymentWorkspaceController) {
+  return renderToStaticMarkup(
+    <ScenarioActionControls program={settledProgram} deployment={deployment} runtime={runtime} />,
+  );
+}
+
 describe('DeploymentDocumentEditor', () => {
   it('keeps generated identities read-only and exposes every authored section', () => {
     const markup = renderToStaticMarkup(
@@ -86,6 +115,7 @@ describe('DeploymentDocumentEditor', () => {
   it('enables Discard only for unapplied changes and keeps Revert for applied edits', () => {
     const postApply = controller();
     if (postApply.workspace === null) throw new Error('fixture workspace missing');
+    // Applied but never saved: the Draft is Applied, the file is older.
     postApply.workspace = {
       ...postApply.workspace,
       draft: {
@@ -94,8 +124,9 @@ describe('DeploymentDocumentEditor', () => {
         differsFromSaved: true,
       },
       saved: {
-        path: null,
+        path: '/workspace/cell-a.scenario/deployment.yaml',
         deploymentRevision: `sha256:${'1'.repeat(64)}`,
+        differsFromApplied: null,
       },
       managerApplied: { activationOrder: null,
         deploymentRevision: `sha256:${'2'.repeat(64)}`,
@@ -104,28 +135,18 @@ describe('DeploymentDocumentEditor', () => {
       // Publication identity, rather than the transient runtime admission
       // projection, owns the document buttons while Apply settles.
       runAdmission: { ready: false, reason: 'runtime still converging' },
-      savedScenarioCandidates: [{
-        scenarioId: 'cell-a',
-        sourceDocumentDigest: `sha256:${'3'.repeat(64)}`,
-        deploymentArtifactId: 'cell-a',
-        deploymentRevision: `sha256:${'1'.repeat(64)}`,
-        retainedBundleId: `sha256:${'4'.repeat(64)}`,
-        programId: 'program-a',
-        programRevision: `sha256:${'5'.repeat(64)}`,
-        programBindingId: `sha256:${'6'.repeat(64)}`,
-        description: null,
-      }],
     };
-    const appliedMarkup = renderToStaticMarkup(
-      <DeploymentDocumentControls controller={postApply} />,
+    const appliedMarkup = scenarioActions(postApply);
+    expect(appliedMarkup).toMatch(
+      /<button[^>]*disabled=""[^>]*title="Nothing to discard: the Scenario Drafts match Applied\."[^>]*>Discard<\/button>/,
     );
     expect(appliedMarkup).toMatch(
-      /<button[^>]*disabled=""[^>]*title="Nothing to apply: the Deployment Draft matches Manager Applied\."[^>]*>Discard<\/button>/,
+      /<button[^>]*disabled=""[^>]*title="Nothing to apply: the Scenario Drafts match Applied\."[^>]*>Apply<\/button>/,
     );
+    // The Saved Deployment differs from Applied: Revert restores it and the Program.
     expect(appliedMarkup).toMatch(
-      /<button[^>]*disabled=""[^>]*title="Nothing to apply: the Deployment Draft matches Manager Applied\."[^>]*>Apply<\/button>/,
+      /<button type="button" title="Restore Draft and Applied to Saved: the Deployment and the Program\.">Revert<\/button>/,
     );
-    expect(appliedMarkup).toMatch(/<button[^>]*>Revert<\/button>/);
 
     const unapplied = controller();
     if (unapplied.workspace === null) throw new Error('fixture workspace missing');
@@ -146,11 +167,21 @@ describe('DeploymentDocumentEditor', () => {
         reason: 'Deployment Draft differs from Manager Applied',
       },
     };
-    const unappliedMarkup = renderToStaticMarkup(
-      <DeploymentDocumentControls controller={unapplied} />,
+    const unappliedMarkup = scenarioActions(unapplied);
+    expect(unappliedMarkup).toMatch(
+      /<button type="button" title="Discard unapplied Draft changes and return to Applied\.">Discard<\/button>/,
     );
     expect(unappliedMarkup).toMatch(
-      /<button[^>]*title="Discard Draft changes and return to Manager Applied\."[^>]*>Discard<\/button>/,
+      /<button type="button" class="primary-action" title="Apply the Deployment and the Program\.">Apply<\/button>/,
+    );
+  });
+
+  it('keeps Revert unavailable when no Saved Deployment exists', () => {
+    const unsaved = controller();
+    if (unsaved.workspace === null) throw new Error('fixture workspace missing');
+    unsaved.workspace = { ...unsaved.workspace, saved: { path: null, deploymentRevision: null, differsFromApplied: null } };
+    expect(scenarioActions(unsaved)).toMatch(
+      /<button[^>]*disabled=""[^>]*title="Nothing to revert: the Saved Scenario matches Applied\."[^>]*>Revert<\/button>/,
     );
   });
 });

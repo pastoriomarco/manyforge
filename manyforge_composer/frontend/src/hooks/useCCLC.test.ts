@@ -716,6 +716,25 @@ describe('mounted explicit activation API boundaries', () => {
       await flushHook();
     },
   );
+  it('names the provider-domain blocker before the owner error while waiting for readiness', async () => {
+    await mountCCLC();
+    const blocked = readiness(state, false);
+    apiMock.cclc.component.mockImplementation(async (id: string) => ({ ...snapshot, controllableComponentId: id,
+      lifecycleState: state, readiness: { ...blocked, providerOccurrences: [{
+        providerOccurrence: { controlDomainId: 'domain.io', controlDomainRevision: 'revision.1',
+          lifecyclePlanCatalogDigest: 'catalog.1', providerInstanceId: 'provider.1', providerManifestId: 'manifest.1',
+          providerManifestRevision: 'revision.1', providerRuntimeEpoch: 'epoch.1', providerRuntimeUnitId: 'unit.1' },
+        health: { observedState: 'declared', facts: [], diagnostic: { code: 'io_provider_transport_unavailable',
+          message: 'ROS service /plc_io/start is not available', details: {} } },
+        decisionKind: null, error: null }] } }));
+    let activation!: Promise<void>;
+    await act(async () => { activation = hook!.activate(); });
+    await act(async () => { await vi.advanceTimersByTimeAsync(250); });
+    expect(apiMock.cclc.submitLifecycle).not.toHaveBeenCalled();
+    expect(hook!.activationProgress).toBe(
+      'component.arm: Not ready · ROS service /plc_io/start is not available · [missing_reference] Measured feed unavailable');
+    await act(async () => { hook!.cancelActivation(); await activation; });
+  });
   it('keeps indefinite missing-measurement or fault readiness waits effect-free and cancelable', async () => {
     await mountCCLC();
     const readsBefore = apiMock.cclc.component.mock.calls.length;

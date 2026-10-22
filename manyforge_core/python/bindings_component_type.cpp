@@ -190,19 +190,26 @@ void register_component_type_bindings(py::module_& module) {
       module, "ComponentTypeFrameRoleDTO", py::is_final())
       .def(py::init([](FrameRoleId frame_role_id,
                        ModelRoleId model_role_id,
-                       FrameRoleId asset_frame_role_id) {
+                       FrameRoleId asset_frame_role_id,
+                       std::vector<CollisionBodyRoleId>
+                           contact_body_role_ids) {
              return ComponentTypeFrameRoleDTO{
                  std::move(frame_role_id), std::move(model_role_id),
-                 std::move(asset_frame_role_id)};
+                 std::move(asset_frame_role_id),
+                 std::move(contact_body_role_ids)};
            }),
            py::arg("frame_role_id"), py::arg("model_role_id"),
-           py::arg("asset_frame_role_id"))
+           py::arg("asset_frame_role_id"),
+           py::arg("contact_body_role_ids") =
+               std::vector<CollisionBodyRoleId>{})
       .def_readonly("frame_role_id",
                     &ComponentTypeFrameRoleDTO::frame_role_id)
       .def_readonly("model_role_id",
                     &ComponentTypeFrameRoleDTO::model_role_id)
       .def_readonly("asset_frame_role_id",
                     &ComponentTypeFrameRoleDTO::asset_frame_role_id)
+      .def_readonly("contact_body_role_ids",
+                    &ComponentTypeFrameRoleDTO::contact_body_role_ids)
       .def(py::self == py::self)
       .def(py::self != py::self);
 

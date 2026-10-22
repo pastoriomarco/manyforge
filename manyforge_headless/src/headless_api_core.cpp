@@ -1578,20 +1578,20 @@ CanonicalValue HeadlessApiCore::ActiveProgramSelectionLocked(
       {"source_document_digest",
        RequiredMember(origin, "source_document_digest")},
       {"scenario_id", RequiredMember(origin, "scenario_id")},
+      {"project_path", RequiredMember(origin, "project_path")},
       {"schema_version",
        CanonicalValue(std::string(kAppliedProgramSelectionSchemaVersion))},
-      {"source",
-       CanonicalValue(CanonicalValue::Object{
-           {"record_digest", RequiredMember(record, "intent_digest")},
-           {"semantic_content_digest",
-            RequiredMember(prepared, "prepared_activation_id")},
-           {"source_generation",
-            CanonicalValue(static_cast<double>(apply_generation))},
-           {"source_owner_epoch",
-            RequiredMember(manager_section, "source_owner_epoch")},
-           {"source_owner_id",
-            RequiredMember(manager_section, "source_owner_id")},
-       })},
+      {"source", CanonicalValue(CanonicalValue::Object{
+                     {"record_digest", RequiredMember(record, "intent_digest")},
+                     {"semantic_content_digest",
+                      RequiredMember(prepared, "prepared_activation_id")},
+                     {"source_generation",
+                      CanonicalValue(static_cast<double>(apply_generation))},
+                     {"source_owner_epoch",
+                      RequiredMember(manager_section, "source_owner_epoch")},
+                     {"source_owner_id",
+                      RequiredMember(manager_section, "source_owner_id")},
+                 })},
   });
 }
 

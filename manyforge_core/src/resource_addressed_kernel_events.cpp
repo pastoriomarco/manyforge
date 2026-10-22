@@ -1316,7 +1316,7 @@ Result<void> ResourceAddressedExecutionKernel::release_prepared_dispatch_barrier
                                 ? dispatched.error().details.at("reason")
                                 : dispatched.error().code}}};
     std::vector<CancellationTarget> cancellations;
-    std::vector<ResourceSlotReservationOwnerDTO> undispatched_rows;
+    std::vector<OperationParticipantId> undispatched_participants;
     OperationRevision current_revision(0U);
     std::optional<OperationStateDTO> partial_state;
     {
@@ -1349,7 +1349,7 @@ Result<void> ResourceAddressedExecutionKernel::release_prepared_dispatch_barrier
         candidate.stop_cancelled_pre_dispatch = true;
         state_row->state = OperationStateKind::kCancelledPreDispatch;
         state_row->terminal_error.reset();
-        undispatched_rows.push_back({candidate.slot_owner, candidate.resources});
+        undispatched_participants.push_back(candidate.slot_owner.participant_id);
         if (candidate.prepared_motion_engine != nullptr && candidate.subordinate_id != 0U) {
           cancellations.push_back(CancellationTarget{
               candidate.prepared_motion_engine, candidate.payload_kind, candidate.subordinate_id});
@@ -1377,15 +1377,29 @@ Result<void> ResourceAddressedExecutionKernel::release_prepared_dispatch_barrier
       motion_admission_closed_ = true;
     }
 
-    std::sort(undispatched_rows.begin(), undispatched_rows.end(),
-              [](const auto& left, const auto& right) {
-                return std::tie(left.owner.operation_id, left.owner.participant_id) <
-                       std::tie(right.owner.operation_id, right.owner.participant_id);
-              });
-    if (!undispatched_rows.empty()) {
+    if (!undispatched_participants.empty()) {
       std::lock_guard state_lock(state_mutex_);
-      auto terminalized =
-          resource_slots_->transition_batch(undispatched_rows, ResourceSlotState::kTerminal);
+      // Stop advances every participant owner revision, including siblings
+      // outside its containment scope. Resolve the captured identities now.
+      std::vector<ResourceSlotReservationOwnerDTO> undispatched_rows;
+      if (const auto* operation = find_active_operation_locked(operation_id)) {
+        for (const auto& id : undispatched_participants) {
+          const auto participant = std::find_if(
+              operation->participants.begin(), operation->participants.end(),
+              [&](const auto& row) { return row.slot_owner.participant_id == id; });
+          if (participant != operation->participants.end())
+            undispatched_rows.push_back({participant->slot_owner, participant->resources});
+        }
+      }
+      std::sort(undispatched_rows.begin(), undispatched_rows.end(),
+                [](const auto& left, const auto& right) {
+                  return std::tie(left.owner.operation_id, left.owner.participant_id) <
+                         std::tie(right.owner.operation_id, right.owner.participant_id);
+                });
+      auto terminalized = undispatched_rows.size() == undispatched_participants.size()
+          ? resource_slots_->transition_batch(undispatched_rows, ResourceSlotState::kTerminal)
+          : reject<void>("partial dispatch cancellation lost its participant owner",
+                         "operation_participant_state_missing", ErrorCode::kInvariantViolation);
       auto released = terminalized.ok() ? resource_slots_->release_batch(undispatched_rows)
                                         : Result<void>::Err(terminalized.error());
       if (!released.ok()) {

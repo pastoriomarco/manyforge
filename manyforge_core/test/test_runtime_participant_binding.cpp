@@ -424,8 +424,7 @@ TEST(RuntimeParticipantBindingTest, ResolvesOverlappingSemanticBodyRolesToOnePhy
                                          ModelInstanceId("robot.model"),
                                          ModelRevision("model-revision"),
                                          {semantic}}},
-      0.002,
-      0.8}};
+      ContactGraspEnvelopeDTO{0.002, 0.8}}};
   auto sealed = verify_runtime_participant_binding(std::move(value));
   ASSERT_TRUE(sealed.ok()) << sealed.error().message;
 
@@ -454,6 +453,72 @@ TEST(RuntimeParticipantBindingTest, RejectsCollisionBodyAliasWithoutPhysicalFixe
 
   ASSERT_FALSE(resolved.ok());
   EXPECT_EQ(resolved.error().details.at("reason"), "runtime_collision_body_alias_table_invalid");
+}
+
+TEST(RuntimeParticipantBindingTest, MotionEndpointRetainsOneExactModelAndBodyAssociation) {
+  auto value = valid_binding();
+  const auto endpoint = [&](std::string role, std::string body_role) {
+    return RuntimeMotionEndpointBindingDTO{
+        TargetRoleId("tool"),
+        CommandTargetId("gripper"),
+        {FrameRoleId(role),
+         ModelInstanceId("robot.model"),
+         ModelRevision("model-revision"),
+         "mf2_robot_" + role,
+         {CollisionBodyRoleId(body_role)}},
+        {{ComponentRoleId("robot"),
+          TargetRoleId("tool"),
+          ControllableComponentId("robot.1"),
+          CommandTargetId("gripper"),
+          std::nullopt,
+          CollisionBodyRoleId(body_role),
+          ModelInstanceId("robot.model"),
+          ModelRevision("model-revision"),
+          {make_component_collision_body_id(ControllableComponentId("robot.1"),
+                                            ModelInstanceId("robot.model"),
+                                            CollisionBodyRoleId(body_role), 0U)}}}};
+  };
+  value.motion_endpoint = endpoint("left_tip", "left_finger");
+  const auto left = verify_runtime_participant_binding(value);
+  ASSERT_TRUE(left.ok()) << left.error().message;
+  value.motion_endpoint = endpoint("right_tip", "right_finger");
+  const auto right = verify_runtime_participant_binding(value);
+  ASSERT_TRUE(right.ok()) << right.error().message;
+  EXPECT_NE(left.value().value().motion_endpoint, right.value().value().motion_endpoint);
+  EXPECT_EQ(left.value().value().resources, right.value().value().resources);
+  EXPECT_EQ(left.value().value().command_target_id, CommandTargetId("arm"));
+  for (int invalid = 0; invalid < 6; ++invalid) {
+    SCOPED_TRACE(invalid);
+    auto wrong = value;
+    auto& selected = *wrong.motion_endpoint;
+    switch (invalid) {
+      case 0:
+        selected.frame.model_instance_id = ModelInstanceId("other.model");
+        break;
+      case 1:
+        selected.frame.model_revision = ModelRevision("other-revision");
+        break;
+      case 2:
+        selected.contact_body_bindings.front().controllable_component_id =
+            ControllableComponentId("other.robot");
+        break;
+      case 3:
+        selected.contact_body_bindings.front().target_role_id = TargetRoleId("other.tool");
+        break;
+      case 4:
+        selected.contact_body_bindings.front().collision_body_role_id =
+            CollisionBodyRoleId("other");
+        break;
+      case 5:
+        selected.contact_body_bindings.front().collision_body_ids.front() = "source-link-name";
+        break;
+    }
+    EXPECT_FALSE(verify_runtime_participant_binding(std::move(wrong)).ok());
+  }
+  // Endpoints without contact bodies remain valid for ordinary motion.
+  value.motion_endpoint->frame.contact_body_role_ids.clear();
+  value.motion_endpoint->contact_body_bindings.clear();
+  EXPECT_TRUE(verify_runtime_participant_binding(value).ok());
 }
 
 }  // namespace

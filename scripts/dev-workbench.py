@@ -101,9 +101,15 @@ def _project_scenario_id(raw_path: str, *, allowed_root: Path) -> str:
     if (
         value.get("api_version") != "manyforge.scenario.project.v2"
         or not isinstance(scenario_id, str)
-        or re.fullmatch(r"[a-z][a-z0-9._-]{0,127}", scenario_id) is None
+        # One name: folder `<name>.scenario`, scenario_id == name == <name>.
+        or re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9_-]{0,127}", scenario_id) is None
+        or value.get("name") != scenario_id
+        or project.name != f"{scenario_id}.scenario"
     ):
-        raise WorkbenchError("Scenario project manifest identity is invalid")
+        raise WorkbenchError(
+            "Scenario project identity is invalid: the folder must be "
+            "'<name>.scenario' and its scenario_id and name must both be <name>"
+        )
     return scenario_id
 
 
@@ -386,6 +392,7 @@ def _capture_ros_bootstrap_project(
         ScenarioArtifactError,
         capture_scenario_artifact,
     )
+    from manyforge_composer.backend.state import canonical_project_path
 
     try:
         scenario, source_path, source_digest = capture_scenario_artifact(
@@ -415,6 +422,7 @@ def _capture_ros_bootstrap_project(
             )
         captured = {
             "scenario_id": scenario["scenario_id"],
+            "project_path": canonical_project_path(source_path),
             "source_document_digest": source_digest,
             "deployment": deployment,
             "model_source_closure": capture_deployment_model_sources(

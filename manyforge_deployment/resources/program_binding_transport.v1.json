@@ -85,7 +85,8 @@
       "frame_role_id",
       "model_instance_id",
       "model_revision",
-      "compiled_frame_name"
+      "compiled_frame_name",
+      "contact_body_role_ids"
     ],
     "resource": [
       "resource_role_id",
@@ -133,7 +134,8 @@
       "runtime_object_id",
       "allowed_body_bindings",
       "max_penetration_m",
-      "terminal_window_start_fraction"
+      "terminal_window_start_fraction",
+      "bodies_from_motion_endpoint"
     ],
     "contact_body": [
       "component_role_id",
@@ -164,6 +166,22 @@
       "direction",
       "transition_capability",
       "signal_descriptor_digest"
+    ],
+    "contact_release": [
+      "contact_policy_id",
+      "contact_policy_revision",
+      "runtime_object_id",
+      "allowed_body_bindings",
+      "mode",
+      "release_evidence_mode",
+      "enforce_max_start_penetration",
+      "max_start_penetration_m",
+      "min_release_progress_m",
+      "release_tolerance_m",
+      "require_strictly_decreasing_penetration",
+      "require_separation_by_end",
+      "allow_recontact",
+      "bodies_from_motion_endpoint"
     ]
   },
   "optional_record_fields": {
@@ -172,6 +190,15 @@
     ],
     "target": [
       "signal_role_bindings"
+    ],
+    "frame": [
+      "contact_body_role_ids"
+    ],
+    "contact": [
+      "bodies_from_motion_endpoint"
+    ],
+    "contact_release": [
+      "bodies_from_motion_endpoint"
     ]
   },
   "catalog_record_kinds": [

@@ -3,7 +3,7 @@
   Regenerate with:
     cd <repository-root>
     python3 scripts/regen-public-contracts.py structural-rest
-  Last regenerated: 2026-10-16 11:06:16 UTC
+  Last regenerated: 2026-10-22 07:21:43 UTC
   Generator source: scripts/regen-public-contracts.py:gen_rest_api
 -->
 
@@ -84,6 +84,8 @@ OpenAPI version: `3.1.0`. Title: `ManyForge Composer (replaceable client)`.
 | `POST` | `/api/execution/history/reconcile` | headless-runtime-client | Historian Reconcile |
 | `GET` | `/api/execution/history/{sequence}` | headless-runtime-client | Historian Detail |
 | `GET` | `/api/execution/identity` | headless-runtime-client | Execution Identity |
+| `POST` | `/api/execution/io-signals/mock-input` | headless-runtime-client | Execution Set Mock Io Input |
+| `POST` | `/api/execution/io-signals/read` | headless-runtime-client | Execution Read Io Signal |
 | `POST` | `/api/execution/manual-handover` | headless-runtime-client | Execution Read Manual Handover |
 | `POST` | `/api/execution/motion-previews` | headless-runtime-client | Execution Preview Motion |
 | `POST` | `/api/execution/operations` | headless-runtime-client | Execution Submit |
@@ -123,6 +125,10 @@ OpenAPI version: `3.1.0`. Title: `ManyForge Composer (replaceable client)`.
 | `GET` | `/api/program/draft/scene-meshes/{asset_hash}.glb` | headless-scene-mesh-client | Get Program Draft Scene Mesh |
 | `POST` | `/api/program/new-draft` | composer-draft | New Draft |
 | `POST` | `/api/program/open-draft` | composer-draft | Open Draft |
+| `GET` | `/api/program/persistent-values` | headless-runtime-client | Program Persistent Values |
+| `POST` | `/api/program/persistent-values` | headless-runtime-client | Set Program Persistent Value |
+| `POST` | `/api/program/persistent-values/clear` | headless-runtime-client | Clear Program Persistent Values |
+| `POST` | `/api/program/persistent-values/reset` | headless-runtime-client | Reset Program Persistent Value |
 | `POST` | `/api/program/revert` | composer-draft | Revert Draft |
 | `GET` | `/api/program/runs` | headless-runtime-client | Program Runs |
 | `POST` | `/api/program/runs` | headless-runtime-client | Program Run Start |
@@ -140,14 +146,11 @@ OpenAPI version: `3.1.0`. Title: `ManyForge Composer (replaceable client)`.
 | `POST` | `/api/program/runs/{program_run_id}/stop` | headless-runtime-client | Program Run Stop |
 | `POST` | `/api/program/save` | composer-draft | Save Draft |
 | `POST` | `/api/program/save-as` | composer-draft | Save Draft As |
-| `GET` | `/api/program/scenarios/{scenario_id}/persistent-values` | headless-runtime-client | Program Persistent Values |
-| `POST` | `/api/program/scenarios/{scenario_id}/persistent-values` | headless-runtime-client | Set Program Persistent Value |
-| `POST` | `/api/program/scenarios/{scenario_id}/persistent-values/clear` | headless-runtime-client | Clear Program Persistent Values |
-| `POST` | `/api/program/scenarios/{scenario_id}/persistent-values/reset` | headless-runtime-client | Reset Program Persistent Value |
 | `POST` | `/api/program/validate` | composer-draft | Validate Program Source |
 | `GET` | `/api/program/workspace` | composer-draft | Read Workspace |
 | `GET` | `/api/runtime` | headless-runtime-client | Runtime |
 | `GET` | `/api/scenario-documents` | composer-scenario-documents | List Documents |
+| `POST` | `/api/scenario-documents/discard` | composer-scenario-documents | Discard Scenario |
 | `POST` | `/api/scenario-documents/export` | composer-scenario-documents | Export Document |
 | `POST` | `/api/scenario-documents/load` | composer-scenario-documents | Load Document |
 | `POST` | `/api/scenario-documents/new` | composer-scenario-documents | New Document |

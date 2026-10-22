@@ -1,6 +1,6 @@
 api_version: manyforge.program.v2
 program_id: isaac_manipulator_scene_light_collision
-program_revision: sha256:b5b281d0ccee8d1218ba349de652e89219091ad128b96b7f9e3803be8e4da149
+program_revision: sha256:5aef6285aef2636780794783d90506bcd9f4f9666416b6ddd65a2544f5d5e424
 program_profile: composable-cell-v1
 name: isaac_manipulator_scene_light_collision
 description: >-
@@ -201,7 +201,7 @@ tree:
               parameters:
                 target_role: arm
                 base_frame_role: base
-                tcp_frame_role: tcp
+                tcp_endpoint: {target_role: arm, frame_role: tcp}
                 target_mode: relative
                 target_reference: {type: scene_resource, scene_resource_id: isaac_cheese_box}
                 offset_reference: {type: frame_role, frame_role_id: base}
@@ -218,7 +218,7 @@ tree:
               parameters:
                 target_role: arm
                 base_frame_role: base
-                tcp_frame_role: tcp
+                tcp_endpoint: {target_role: arm, frame_role: tcp}
                 target_mode: relative
                 target_reference: {type: scene_resource, scene_resource_id: isaac_cheese_box}
                 offset_reference: {type: frame_role, frame_role_id: base}

@@ -1664,9 +1664,7 @@ export function useProgramRuntime(
       source_label: 'operator_ui',
     });
     return {
-      read: (scenarioId: string, signal?: AbortSignal) => (
-        api.programs.persistentValues(scenarioId, signal)
-      ),
+      read: (signal?: AbortSignal) => api.programs.persistentValues(signal),
       /** Set a stored value, or Reset it to `initial:` when value is omitted. */
       edit: (current: PersistentKeyValues, key: string, value?: JsonValue) => {
         const fence = persistentValuesFence(current, currentRun.current);
@@ -1675,18 +1673,17 @@ export function useProgramRuntime(
             'The run holding these values is not the run shown here. Refresh and try again.',
           ));
         }
-        return api.programs.editPersistentValue(current.scenarioId, {
+        return api.programs.editPersistentValue({
           ...requestIdentity(),
           ...fence,
-          scenario_id: current.scenarioId,
+          project_path: current.projectPath,
           key,
           expected_program_revision: current.programRevision,
           ...(value === undefined ? {} : { value }),
         });
       },
       clear: (current: PersistentKeyValues) => api.programs.clearPersistentValues(
-        current.scenarioId,
-        { ...requestIdentity(), scenario_id: current.scenarioId },
+        { ...requestIdentity(), project_path: current.projectPath },
       ),
     };
   }, []);

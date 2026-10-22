@@ -1,6 +1,6 @@
 api_version: manyforge.program.v2
 program_id: ur5e_lite6_wall_isolation
-program_revision: sha256:a60f45cdbf673643813c925953d176f7085731f8d86a6a98ec469eeb00ba5552
+program_revision: sha256:b6e4099d942c61541cca19e07a79c2ef859b9c0297ab24d9b4f8351db013bbe8
 program_profile: composable-cell-v1
 name: ur5e_lite6_wall_isolation
 description: Two independent joint trajectories in the UR5e + Lite6 wall cell, in separate control groups
@@ -189,7 +189,9 @@ tree:
     parameters:
       target_role: lite6_arm
       base_frame_role: base
-      tcp_frame_role: tcp
+      tcp_endpoint:
+        target_role: lite6_arm
+        frame_role: tcp
       goal:
       - joint_name: joint1
         position_rad: 0.3
@@ -226,7 +228,9 @@ tree:
     parameters:
       target_role: ur5e_arm
       base_frame_role: base
-      tcp_frame_role: tcp
+      tcp_endpoint:
+        target_role: ur5e_arm
+        frame_role: tcp
       goal:
       - joint_name: shoulder_pan_joint
         position_rad: -0.45

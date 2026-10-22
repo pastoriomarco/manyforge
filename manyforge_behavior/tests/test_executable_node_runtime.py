@@ -904,6 +904,10 @@ def _key(key: str, value_type: str, **extra: Any) -> dict[str, Any]:
     }
 
 
+# The Applied Scenario project folder that scopes persistent values.
+_PROJECT = "/projects/scenario.test.scenario"
+
+
 class _Register:
     def __init__(self, stored: Mapping[str, Any] | None = None) -> None:
         self.stored = dict(stored or {})
@@ -912,8 +916,8 @@ class _Register:
         self.drops: list[tuple[str, str, str, str | None]] = []
         self.fail = False
 
-    def restore(self, scenario_id: str, declarations: Mapping[str, Any]) -> Mapping[str, Any]:
-        assert scenario_id == "scenario.test"
+    def restore(self, project_path: str, declarations: Mapping[str, Any]) -> Mapping[str, Any]:
+        assert project_path == _PROJECT
         return {key: value for key, value in self.stored.items() if key in declarations}
 
     def drop(
@@ -958,6 +962,7 @@ def _run(
         readiness=_readiness(_DIGEST_A),
         ports=NodeAdapterPorts(persistent_keys=register),
         program_clock=program_clock,
+        project_path=_PROJECT,
     )
 
 
@@ -1040,7 +1045,7 @@ def test_persistent_key_restores_then_commits_only_changes_before_visibility() -
     store.write("index", 5)
     assert register.commits == []
     store.write("index", 6)
-    assert register.commits == [("scenario.test", "index", 6)]
+    assert register.commits == [(_PROJECT, "index", 6)]
     register.fail = True
     with pytest.raises(ProgramValueError, match="could not be stored: disk full"):
         store.write("index", 8)
@@ -1226,7 +1231,7 @@ def _relative_move(reference: dict[str, Any], **goal_frame: Any) -> dict[str, An
         "move",
         target_role="arm",
         base_frame_role="base",
-        tcp_frame_role="tcp",
+        tcp_endpoint={"target_role": "arm", "frame_role": "tcp"},
         goal={"position_m": [0.0, 0.0, 0.1], "orientation": {"rpy_deg": [0.0, 0.0, 0.0]}, **goal_frame},
         target_mode="relative",
         target_reference=reference,
@@ -1272,7 +1277,7 @@ def test_relative_goal_and_cartesian_waypoints_keep_one_owner_resolvable_frame()
         "path",
         target_role="arm",
         base_frame_role="base",
-        tcp_frame_role="tcp",
+        tcp_endpoint={"target_role": "arm", "frame_role": "tcp"},
         path=[{**pose, "frame_ref": {"kind": "cell_frame"}}, {**pose, "frame_ref": base}],
     )
     with pytest.raises(ProgramValidationError, match="waypoints must all use one frame"):
@@ -3527,7 +3532,7 @@ def test_key_writes_and_loads_use_the_full_declared_type_check() -> None:
         _idle(),
     )
     store = ProgramValueStore.from_program(
-        program, scenario_id="scenario.test", register=_Register()
+        program, project_path=_PROJECT, register=_Register()
     )
     with pytest.raises(ProgramValueError, match="does not name a declared scene resource"):
         store.write("object", "not_in_scene")
@@ -3548,11 +3553,11 @@ def test_key_writes_and_loads_use_the_full_declared_type_check() -> None:
         register = _Register({"stored": {**_cell_pose(), "frame_ref": {"kind": "moon"}}})
         register.fail = fail
         restored = ProgramValueStore.from_program(
-            program, scenario_id="scenario.test", register=register
+            program, project_path=_PROJECT, register=register
         )
         assert not restored.contains("stored")
         ((scenario, key, reason, detail),) = register.drops
-        assert (scenario, key, reason) == ("scenario.test", "stored", "value_invalid")
+        assert (scenario, key, reason) == (_PROJECT, "stored", "value_invalid")
         assert detail is not None and "(persistent_register)" in detail
         # A drop the register could not store still never loads the value.
         assert ("stored" in register.stored) is fail

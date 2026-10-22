@@ -357,6 +357,7 @@ TEST(ProgramContractTest,
 
   ASSERT_EQ(contract->value().contact_grasp_templates.size(), 1U);
   const auto &policy = contract->value().contact_grasp_templates.front();
+  EXPECT_FALSE(policy.bodies_from_motion_endpoint);
   EXPECT_EQ(policy.contact_policy_id.value(), "selected_object_grasp");
   EXPECT_EQ(policy.runtime_object_id.value(), "selected_object");
   ASSERT_EQ(policy.allowed_body_selectors.size(), 1U);
@@ -365,8 +366,75 @@ TEST(ProgramContractTest,
   EXPECT_EQ(
       policy.allowed_body_selectors.front().collision_body_role_id.value(),
       "arm_collision");
-  EXPECT_DOUBLE_EQ(policy.max_penetration_m, 0.002);
-  EXPECT_DOUBLE_EQ(policy.terminal_window_start_fraction, 0.8);
+  const auto &envelope = std::get<manyforge::core::ContactGraspEnvelopeDTO>(policy.envelope);
+  EXPECT_DOUBLE_EQ(envelope.max_penetration_m, 0.002);
+  EXPECT_DOUBLE_EQ(envelope.terminal_window_start_fraction, 0.8);
+}
+
+TEST(ProgramContractTest, MotionEndpointContactSelectorIsExclusiveAndHasNoIds) {
+  ScopedTrustedRoot root;
+  const auto bundle = make_bundle(root.path());
+  auto options = valid_options(*bundle);
+  options.include_contact_grasp = true;
+  const auto document = [&](CanonicalValue::Array pairs) {
+    auto policy =
+        manyforge::deployment::test::make_contact_grasp_policy().as_object();
+    for (auto &[name, value] : policy) {
+      if (name != "zones")
+        continue;
+      auto zones = value.as_array();
+      auto zone = zones.front().as_object();
+      replace_member(zone, "body_pairs", CanonicalValue(std::move(pairs)));
+      zones.front() = CanonicalValue(std::move(zone));
+      value = CanonicalValue(std::move(zones));
+    }
+    const auto revision = compute_content_identity(
+        CanonicalValue(policy),
+        ContentIdentitySpec{.identity_domain =
+                                "catalog-record-revision/contact_policy",
+                            .api_version = "manyforge.contact_policy.v1",
+                            .own_field = "version"});
+    replace_member(policy, "version", CanonicalValue(revision));
+    auto program = make_program_root(options).as_object();
+    replace_member(program, "contact_policies",
+                   CanonicalValue(CanonicalValue::Array{
+                       CanonicalValue(std::move(policy))}));
+    return canonical_json(
+        with_program_revision(CanonicalValue(std::move(program))));
+  };
+  const auto pair = [](CanonicalValue::Object robot) {
+    return CanonicalValue(CanonicalValue::Object{
+        {"body_a", CanonicalValue(std::move(robot))},
+        {"body_b",
+         CanonicalValue(CanonicalValue::Object{
+             {"kind", CanonicalValue("runtime_object")},
+             {"runtime_object_id", CanonicalValue("selected_object")}})}});
+  };
+  const auto endpoint = pair({{"kind", CanonicalValue("motion_endpoint")}});
+  const auto contract =
+      verify_program_binding_contract(document({endpoint}), *bundle);
+  ASSERT_EQ(contract->value().contact_grasp_templates.size(), 1U);
+  EXPECT_TRUE(contract->value()
+                  .contact_grasp_templates.front()
+                  .bodies_from_motion_endpoint);
+  EXPECT_TRUE(contract->value()
+                  .contact_grasp_templates.front()
+                  .allowed_body_selectors.empty());
+  EXPECT_THROW(
+      static_cast<void>(verify_program_binding_contract(
+          document(
+              {endpoint, pair({{"kind", CanonicalValue("component_model_body")},
+                               {"component_role_id", CanonicalValue("robot")},
+                               {"collision_body_role_id",
+                                CanonicalValue("arm_collision")}})}),
+          *bundle)),
+      ProgramContractError);
+  EXPECT_THROW(
+      static_cast<void>(verify_program_binding_contract(
+          document({pair({{"kind", CanonicalValue("motion_endpoint")},
+                          {"component_role_id", CanonicalValue("robot")}})}),
+          *bundle)),
+      ProgramContractError);
 }
 
 TEST(ProgramContractTest, ExtractsSparseCompleteNodePolicies) {
@@ -755,7 +823,9 @@ selection_node(std::string instance, CanonicalValue groups,
        CanonicalValue(CanonicalValue::Object{
            {"target_role", CanonicalValue("arm")},
            {"base_frame_role", CanonicalValue("base")},
-           {"tcp_frame_role", CanonicalValue("tcp")},
+           {"tcp_endpoint", CanonicalValue(CanonicalValue::Object{
+                                {"target_role", CanonicalValue("arm")},
+                                {"frame_role", CanonicalValue("tcp")}})},
            {"goal", CanonicalValue(CanonicalValue::Array{
                         CanonicalValue(CanonicalValue::Object{
                             {"joint_name", CanonicalValue("joint1")},
@@ -795,7 +865,9 @@ automatic_retry_program(const RetainedBundle &bundle,
   CanonicalValue::Object parameters{
       {"target_role", CanonicalValue("arm")},
       {"base_frame_role", CanonicalValue("base")},
-      {"tcp_frame_role", CanonicalValue("tcp")},
+      {"tcp_endpoint", CanonicalValue(CanonicalValue::Object{
+                           {"target_role", CanonicalValue("arm")},
+                           {"frame_role", CanonicalValue("tcp")}})},
   };
   if (node_id == "motion.move_to_joint_target") {
     parameters.emplace_back(
@@ -1553,7 +1625,9 @@ TEST(ProgramContractTest,
       CanonicalValue(CanonicalValue::Object{
           {"target_role", CanonicalValue("arm")},
           {"base_frame_role", CanonicalValue("base")},
-          {"tcp_frame_role", CanonicalValue("tcp")},
+          {"tcp_endpoint", CanonicalValue(CanonicalValue::Object{
+                               {"target_role", CanonicalValue("arm")},
+                               {"frame_role", CanonicalValue("tcp")}})},
           {"goal", CanonicalValue(CanonicalValue::Array{
                        CanonicalValue(CanonicalValue::Object{
                            {"joint_name", CanonicalValue("joint1")},
@@ -2274,7 +2348,6 @@ TEST(ProgramContractTest,
     replace_member(signal, "node_id", CanonicalValue(node_id));
     mutate_object_member(signal, "parameters", [&](auto &parameters) {
       erase_member(parameters, "base_frame_role");
-      erase_member(parameters, "tcp_frame_role");
       mutate_object_member(parameters, "goal", [](auto &goal) {
         goal.emplace_back("frame_ref",
                           CanonicalValue(CanonicalValue::Object{

@@ -20,6 +20,7 @@
 #include <limits>
 #include <iterator>
 #include <manyforge_core/geometry/pose_math.hpp>
+#include <manyforge_core/collision/collision_policy_evaluator.hpp>
 #include <manyforge_roboplan/process_contained_candidate_client.hpp>
 #include <map>
 #include <memory>
@@ -256,6 +257,21 @@ project_worker_model(const RoboPlanWorkerModelDTO &base,
   }
   for (const auto &contact : projection.policy->support_contacts) {
     add_allowed(contact.pair);
+  }
+  if (projection.contact_policy_id) {
+    const auto active = std::find_if(
+        projection.policy->contact_grasps.begin(),
+        projection.policy->contact_grasps.end(), [&](const auto &entry) {
+          return entry.policy_id == *projection.contact_policy_id;
+        });
+    if (active != projection.policy->contact_grasps.end()) {
+      // Only the bound operation's exact body/object pairs are relaxed for
+      // candidate generation; the final coordinator still checks window/depth.
+      for (const auto &pair : core::build_selected_collision_distance_pairs(
+               *projection.policy, *projection.world, *projection.contact_policy_id)) {
+        if (core::contact_grasp_pair_matches(pair, *active)) add_allowed(pair);
+      }
+    }
   }
   model.allowed_collision_pairs.assign(allowed.begin(), allowed.end());
   return model;
@@ -639,6 +655,7 @@ struct ProcessContainedRoboPlanCandidateClient::Impl final {
     core::ProjectionRevisionDTO projection_revision;
     core::CollisionWorldRevision world_revision;
     core::CollisionPolicyRevision policy_revision;
+    std::optional<std::string> contact_policy_id;
 
     [[nodiscard]] bool
     matches(const RoboPlanCandidateProjectionDTO &candidate) const noexcept {
@@ -649,7 +666,8 @@ struct ProcessContainedRoboPlanCandidateClient::Impl final {
                  candidate.world->revision.revision_id &&
              world_revision.content_hash ==
                  candidate.world->revision.content_hash &&
-             policy_revision == candidate.policy->revision;
+             policy_revision == candidate.policy->revision &&
+             contact_policy_id == candidate.contact_policy_id;
     }
   };
 
@@ -786,7 +804,8 @@ struct ProcessContainedRoboPlanCandidateClient::Impl final {
     selection.store(
         std::make_shared<const ProjectionSelection>(ProjectionSelection{
             projection.projection_binding.projection_revision,
-            projection.world->revision, projection.policy->revision}),
+            projection.world->revision, projection.policy->revision,
+            projection.contact_policy_id}),
         std::memory_order_release);
     return core::Result<void>::Ok();
   }

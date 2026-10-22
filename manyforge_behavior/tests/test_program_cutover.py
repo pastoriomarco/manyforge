@@ -974,3 +974,264 @@ def test_integer_literals_outside_the_exact_range_are_refused_at_parse(literal: 
     document["tree"]["children"][0].setdefault("parameters", {})["count"] = literal
     with pytest.raises(ProgramValidationError, match="safe range"):
         Program.from_dict(document, _catalog())
+
+
+def _endpoint_motion_document():
+    document = load_strict_json_yaml(_ROOT / _SCENE_PROGRAM)
+    pending = [document['tree']]
+    while pending:
+        node = pending.pop()
+        if node['node_id'] == 'motion.move_to_pose':
+            document['tree'] = deepcopy(node)
+            break
+        pending.extend(node.get('children', ()))
+    else:
+        raise AssertionError('fixture has no pose motion')
+    parameters = document['tree']['parameters']
+    parameters.pop('tcp_frame_role', None)  # Build only the new fixture form.
+    parameters['tcp_endpoint'] = {'target_role': 'gripper', 'frame_role': 'tcp'}
+    return document
+
+
+def test_motion_endpoint_uses_qualified_declared_target_frame() -> None:
+    document = _endpoint_motion_document()
+    program = Program.from_dict(_identified(document), _catalog())
+    assert program.to_dict()['tree']['parameters']['tcp_endpoint'] == {
+        'target_role': 'gripper', 'frame_role': 'tcp',
+    }
+    assert 'tcp_frame_role' not in program.to_dict()['tree']['parameters']
+
+
+@pytest.mark.parametrize('mutation', ['both', 'legacy_only', 'neither', 'unknown_target', 'wrong_frame', 'extra', 'null', 'dynamic'])
+def test_motion_endpoint_rejects_ambiguous_or_uncaptured_selection(mutation) -> None:
+    document = _endpoint_motion_document()
+    parameters = document['tree']['parameters']
+    if mutation == 'both':
+        parameters['tcp_frame_role'] = ''
+    elif mutation == 'legacy_only':
+        parameters.pop('tcp_endpoint')
+        parameters['tcp_frame_role'] = 'tcp'
+    elif mutation == 'neither':
+        parameters.pop('tcp_endpoint')
+    elif mutation == 'unknown_target':
+        parameters['tcp_endpoint']['target_role'] = 'missing'
+    elif mutation == 'wrong_frame':
+        parameters['tcp_endpoint']['frame_role'] = 'base'
+    elif mutation == 'extra':
+        parameters['tcp_endpoint']['collision_body_role'] = 'gripper_collision'
+    elif mutation == 'null':
+        parameters['tcp_endpoint'] = None
+    else:
+        document['tree']['value_sources'] = {'tcp_endpoint.frame_role': {'kind': 'parameter', 'parameter_id': 'endpoint'}}
+    with pytest.raises(ProgramValidationError):
+        Program.from_dict(_identified(document), _catalog())
+
+
+@pytest.mark.parametrize('reverse', [False, True])
+def test_contact_policy_motion_endpoint_is_one_exact_pair(reverse) -> None:
+    document = load_strict_json_yaml(_ROOT / _CONTACT_PROGRAM)
+    # Every user of endpoint-derived contact bodies must select its TCP.
+    for node in document['tree']['children']:
+        parameters = node.get('parameters', {})
+        if 'contact_policy_id' in parameters:
+            parameters['tcp_endpoint'] = {'target_role': 'gripper', 'frame_role': 'tcp'}
+    policy = document['contact_policies'][0]
+    old_pair = policy['zones'][0]['body_pairs'][0]
+    runtime = next(value for value in old_pair.values() if value['kind'] == 'runtime_object')
+    pair = {'body_a': {'kind': 'motion_endpoint'}, 'body_b': runtime}
+    if reverse:
+        pair = {'body_a': runtime, 'body_b': {'kind': 'motion_endpoint'}}
+    policy['zones'][0]['body_pairs'] = [pair]
+    policy['version'] = compute_content_identity(policy, own_field='version', identity_domain='catalog-record-revision/contact_policy', api_version='manyforge.contact_policy.v1')
+    assert Program.from_dict(_identified(document), _catalog()).to_dict()['contact_policies'][0]['zones'][0]['body_pairs'] == [pair]
+    for invalid_pairs in ([pair, old_pair], [{'body_a': {'kind': 'motion_endpoint', 'target_role': 'gripper'}, 'body_b': runtime}]):
+        policy['zones'][0]['body_pairs'] = invalid_pairs
+        policy['version'] = compute_content_identity(policy, own_field='version', identity_domain='catalog-record-revision/contact_policy', api_version='manyforge.contact_policy.v1')
+        with pytest.raises(ProgramValidationError):
+            Program.from_dict(_identified(document), _catalog())
+
+
+@pytest.mark.parametrize("node_kind", ["probe", "pick"])
+@pytest.mark.parametrize("selection", ["qualified_explicit", "missing_endpoint", "qualified_endpoint"])
+def test_endpoint_contact_policy_requires_qualified_tcp_at_authoring(node_kind, selection) -> None:
+    document = load_strict_json_yaml(_ROOT / _CONTACT_PROGRAM)
+    if node_kind == "probe":
+        document["tree"] = {
+            "node_id": "motion.probe_search", "instance_id": "probe", "children": [],
+            "parameters": {
+                "target_role": "arm", "base_frame_role": "base",
+                "tcp_endpoint": {"target_role": "arm", "frame_role": "tcp"},
+                "goal": {
+                    "frame_ref": {"kind": "target_frame", "target_role": "arm", "frame_role": "base"},
+                    "position_m": [0.4, 0.0, 0.2], "orientation": {"rpy_deg": [180.0, 0.0, 0.0]},
+                },
+                "contact_policy_id": "selected_object_grasp",
+                "contact_scene_resource_id": "cube_part",
+                "stop_mode": "soft_on_path",
+                "interrupt_condition": {"compare": {
+                    "op": "==", "operand": {"key": "gripper_closed"}, "value": True,
+                }},
+            },
+        }
+    pending = [document["tree"]]
+    users = []
+    while pending:
+        node = pending.pop()
+        if "contact_policy_id" in node.get("parameters", {}):
+            users.append(node)
+        pending.extend(node.get("children", ()))
+    assert len(users) == 1
+    parameters = users[0]["parameters"]
+    assert users[0]["node_id"] == (
+        "motion.probe_search" if node_kind == "probe" else "planning.plan_pick_sequence"
+    )
+    parameters["tcp_endpoint"] = {"target_role": parameters["target_role"], "frame_role": "tcp"}
+    policy = next(
+        row for row in document["contact_policies"]
+        if row["policy_id"] == parameters["contact_policy_id"]
+    )
+    if selection != "qualified_explicit":
+        old_pair = policy["zones"][0]["body_pairs"][0]
+        runtime = next(value for value in old_pair.values() if value["kind"] == "runtime_object")
+        policy["zones"][0]["body_pairs"] = [
+            {"body_a": {"kind": "motion_endpoint"}, "body_b": runtime}
+        ]
+        policy["version"] = compute_content_identity(
+            policy, own_field="version", identity_domain="catalog-record-revision/contact_policy",
+            api_version="manyforge.contact_policy.v1",
+        )
+    if selection == "missing_endpoint":
+        parameters.pop("tcp_endpoint")
+        with pytest.raises(ProgramValidationError, match="requires tcp_endpoint"):
+            Program.from_dict(_identified(document), _catalog())
+    else:
+        parsed = Program.from_dict(_identified(document), _catalog())
+        assert parsed.to_dict()["contact_policies"] == document["contact_policies"]
+
+
+def test_joint_goal_can_author_an_explicit_endpoint_withdrawal_policy() -> None:
+    authoring = load_strict_json_yaml(_ROOT / 'examples/r5_trial_e_signal.scenario/program.yaml')
+    assert len(authoring['forest']) == 1
+    document = {
+        key: deepcopy(value) for key, value in authoring.items()
+        if key not in {'schema_version', 'forest', 'positions'}
+    }
+    document['tree'] = deepcopy(authoring['forest'][0])
+    document['program_revision'] = 'sha256:' + '0' * 64
+    pending = [document['tree']]
+    while pending:
+        node = pending.pop()
+        if node['instance_id'] == 'end_rest':
+            assert node['node_id'] == 'motion.move_to_joint_target'
+            node['parameters']['contact_policy_id'] = 'withdrawal_contact_policy'
+            node['parameters']['contact_scene_resource_id'] = 'probe_block'
+            break
+        pending.extend(node.get('children', ()))
+    else:
+        raise AssertionError('Trial E has no withdrawal move')
+    program = Program.from_dict(_identified(document), _catalog())
+    pending = [program.to_dict()['tree']]
+    while pending:
+        node = pending.pop()
+        if node['instance_id'] == 'end_rest':
+            assert node['parameters']['contact_policy_id'] == 'withdrawal_contact_policy'
+            assert node['parameters']['contact_scene_resource_id'] == 'probe_block'
+            assert node['parameters']['tcp_endpoint'] == {'target_role': 'gripper', 'frame_role': 'tcp'}
+            break
+        pending.extend(node.get('children', ()))
+
+
+def _contact_release_document(*, evidence="signed_penetration", pick=False):
+    document = load_strict_json_yaml(_ROOT / _CONTACT_PROGRAM)
+    if not pick:
+        pending = [document["tree"]]
+        while pending:
+            node = pending.pop()
+            if node["node_id"] == "motion.move_to_pose":
+                document["tree"] = deepcopy(node)
+                break
+            pending.extend(node.get("children", ()))
+        else:
+            raise AssertionError("contact fixture has no pose move")
+        document["tree"]["parameters"].update(
+            tcp_endpoint={"target_role": "gripper", "frame_role": "tcp"},
+            contact_policy_id=document["contact_policies"][0]["policy_id"],
+            contact_scene_resource_id="cube_part",
+        )
+    policy = document["contact_policies"][0]
+    policy["mode"] = "contact_release"
+    zone = policy["zones"][0]
+    zone.pop("max_penetration_m")
+    zone.pop("terminal_window_start_fraction")
+    zone["release_evidence_mode"] = evidence
+    old_pair = zone["body_pairs"][0]
+    runtime = next(side for side in old_pair.values() if side["kind"] == "runtime_object")
+    zone["body_pairs"] = [{"body_a": {"kind": "motion_endpoint"}, "body_b": runtime}]
+    return document
+
+
+def _identify_contact_release(document):
+    policy = document["contact_policies"][0]
+    policy["version"] = compute_content_identity(
+        policy, own_field="version", identity_domain="catalog-record-revision/contact_policy",
+        api_version="manyforge.contact_policy.v1",
+    )
+    return _identified(document)
+
+
+@pytest.mark.parametrize("evidence", ["signed_penetration", "binary_contact"])
+@pytest.mark.parametrize("explicit", [False, True])
+def test_contact_release_keeps_exact_endpoint_policy_and_authored_envelope(evidence, explicit):
+    document = _contact_release_document(evidence=evidence)
+    if explicit:
+        document["contact_policies"][0]["zones"][0].update(
+            enforce_max_start_penetration=evidence == "signed_penetration",
+            max_start_penetration_m=0.002 if evidence == "signed_penetration" else 0.0,
+            min_release_progress_m=0.0,
+            release_tolerance_m=1e-5 if evidence == "signed_penetration" else 0.0,
+            require_strictly_decreasing_penetration=evidence == "signed_penetration",
+            require_separation_by_end=True,
+            allow_recontact=False,
+        )
+    identified = _identify_contact_release(document)
+    parsed = Program.from_dict(identified, _catalog())
+    assert parsed.to_dict()["contact_policies"] == identified["contact_policies"]
+    assert parsed.to_dict()["tree"]["parameters"]["tcp_endpoint"] == {
+        "target_role": "gripper", "frame_role": "tcp",
+    }
+
+
+@pytest.mark.parametrize("field,value", [
+    ("release_evidence_mode", None), ("release_evidence_mode", "distance"),
+    ("max_start_penetration_m", -0.001), ("min_release_progress_m", 1000.001),
+    ("release_tolerance_m", True), ("allow_recontact", 1),
+    ("max_penetration_m", 0.002), ("terminal_window_start_fraction", 0.9),
+    ("unknown_release_field", False),
+])
+def test_contact_release_rejects_crossed_or_malformed_envelope(field, value):
+    document = _contact_release_document()
+    zone = document["contact_policies"][0]["zones"][0]
+    if value is None:
+        zone.pop(field)
+    else:
+        zone[field] = value
+    with pytest.raises(ProgramValidationError):
+        Program.from_dict(_identify_contact_release(document), _catalog())
+
+
+@pytest.mark.parametrize("field,value", [
+    ("enforce_max_start_penetration", True), ("max_start_penetration_m", 0.002),
+    ("min_release_progress_m", 0.001), ("release_tolerance_m", 1e-5),
+    ("require_strictly_decreasing_penetration", True),
+])
+def test_binary_contact_release_rejects_non_neutral_metric_constraints(field, value):
+    document = _contact_release_document(evidence="binary_contact")
+    document["contact_policies"][0]["zones"][0][field] = value
+    with pytest.raises(ProgramValidationError, match="binary_contact forbids"):
+        Program.from_dict(_identify_contact_release(document), _catalog())
+
+
+def test_pick_rejects_a_contact_release_policy_before_runtime():
+    document = _contact_release_document(pick=True)
+    with pytest.raises(ProgramValidationError, match="pick requires a contact_grasp policy"):
+        Program.from_dict(_identify_contact_release(document), _catalog())

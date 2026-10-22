@@ -299,7 +299,7 @@
       "capability_definition_revision": "sha256:c99e2dc6d89129ca1d1d4a44d561d878b786df610d1ff241f6e09b5b100edb28",
       "capability_id": "model.kinematics.fk",
       "capability_provider_binding_id": "lite6_robot.arm.model-kinematics-fk.provider",
-      "capability_provider_binding_revision": "sha256:6be8d20f70465df6087517e0e64936b330545d6042d1083d73ed08a0cb0cbe76",
+      "capability_provider_binding_revision": "sha256:3ad8900613ada4ed9a89d3605a27a750a71b320a3e17100954795daeceb81866",
       "endpoint_bindings": [
         {
           "endpoint_role_id": "planner_scene_projection",
@@ -314,7 +314,7 @@
       "scope": "target_binding",
       "target": {
         "command_target_id": "arm",
-        "component_type_revision": "sha256:9d81923f574576ac97b402b525bfc916f8c41711bec6899b55b2309acd140dca",
+        "component_type_revision": "sha256:e5a765898651b9fd2599e9ac47c9cf71b6feda9e916e965d4b0ea3ab0a200351",
         "control_binding_id": "lite6_robot.arm.execution-trajectory-execute",
         "control_binding_revision": "sha256:ec3b75d3666161237b7de48dbe8b7826392c2b94e636f2d74043c15d099d0733",
         "controllable_component_id": "lite6_robot"
@@ -324,7 +324,7 @@
       "capability_definition_revision": "sha256:4212f32bfc7e9b04cb11db023da86b9a8f75531b5d775674d559631d93b65053",
       "capability_id": "model.limits.joint",
       "capability_provider_binding_id": "lite6_robot.arm.model-limits-joint.provider",
-      "capability_provider_binding_revision": "sha256:6d8158657dd3dabed2569c576f5c84bda74795d5fd09a234ded18aabe80110c9",
+      "capability_provider_binding_revision": "sha256:723bd022bf2138d43a1b18087da9e5c43a3cff50598741aecd0e43c4a8bfde39",
       "endpoint_bindings": [
         {
           "endpoint_role_id": "planner_scene_projection",
@@ -339,7 +339,7 @@
       "scope": "target_binding",
       "target": {
         "command_target_id": "arm",
-        "component_type_revision": "sha256:9d81923f574576ac97b402b525bfc916f8c41711bec6899b55b2309acd140dca",
+        "component_type_revision": "sha256:e5a765898651b9fd2599e9ac47c9cf71b6feda9e916e965d4b0ea3ab0a200351",
         "control_binding_id": "lite6_robot.arm.execution-trajectory-execute",
         "control_binding_revision": "sha256:ec3b75d3666161237b7de48dbe8b7826392c2b94e636f2d74043c15d099d0733",
         "controllable_component_id": "lite6_robot"
@@ -349,7 +349,7 @@
       "capability_definition_revision": "sha256:be53c54ff0aa662db108113e9273e847e790d1b6f0adbba591d50f2237134a00",
       "capability_id": "planning.motion.cartesian_path",
       "capability_provider_binding_id": "lite6_robot.arm.planning-motion-cartesian_path.provider",
-      "capability_provider_binding_revision": "sha256:c44f3550a8f97d635a68a88741087d423123d1cad7e9b98dab0ef072523e37fe",
+      "capability_provider_binding_revision": "sha256:d37d921a0d097ed960a49409f0130796888986521778bf0e50a9f7c3dd93e26e",
       "endpoint_bindings": [
         {
           "endpoint_role_id": "planner_scene_projection",
@@ -364,7 +364,7 @@
       "scope": "target_binding",
       "target": {
         "command_target_id": "arm",
-        "component_type_revision": "sha256:9d81923f574576ac97b402b525bfc916f8c41711bec6899b55b2309acd140dca",
+        "component_type_revision": "sha256:e5a765898651b9fd2599e9ac47c9cf71b6feda9e916e965d4b0ea3ab0a200351",
         "control_binding_id": "lite6_robot.arm.execution-trajectory-execute",
         "control_binding_revision": "sha256:ec3b75d3666161237b7de48dbe8b7826392c2b94e636f2d74043c15d099d0733",
         "controllable_component_id": "lite6_robot"
@@ -374,7 +374,7 @@
       "capability_definition_revision": "sha256:0f6cb2fda7e1d05f20a5867203b84c0e0427440f4b11657941a907c2e2a23dce",
       "capability_id": "planning.motion.joint_goal",
       "capability_provider_binding_id": "lite6_robot.arm.planning-motion-joint_goal.provider",
-      "capability_provider_binding_revision": "sha256:049fe651d01b78fba17fa2f2e17bf081c0e058a88ba10d613db5233c9be42bb2",
+      "capability_provider_binding_revision": "sha256:3b99d9747b9735c98250e676ea49073da6fe2286d1e310d3fc57450f74dd75d0",
       "endpoint_bindings": [
         {
           "endpoint_role_id": "planner_scene_projection",
@@ -389,7 +389,7 @@
       "scope": "target_binding",
       "target": {
         "command_target_id": "arm",
-        "component_type_revision": "sha256:9d81923f574576ac97b402b525bfc916f8c41711bec6899b55b2309acd140dca",
+        "component_type_revision": "sha256:e5a765898651b9fd2599e9ac47c9cf71b6feda9e916e965d4b0ea3ab0a200351",
         "control_binding_id": "lite6_robot.arm.execution-trajectory-execute",
         "control_binding_revision": "sha256:ec3b75d3666161237b7de48dbe8b7826392c2b94e636f2d74043c15d099d0733",
         "controllable_component_id": "lite6_robot"
@@ -399,7 +399,7 @@
       "capability_definition_revision": "sha256:422c7d9025d46e0fc660705a4f05171a235279872f91c820e952cf16792b8148",
       "capability_id": "planning.motion.pose_goal",
       "capability_provider_binding_id": "lite6_robot.arm.planning-motion-pose_goal.provider",
-      "capability_provider_binding_revision": "sha256:424de368b206f9b77c9f15ab666689ad945f2bee28396c72f8b9cae8f7cac18a",
+      "capability_provider_binding_revision": "sha256:a01d6afaddce1d892dfc7513cd8c418dea6b1b00deb1fbcdc72d6fbeaa9d6634",
       "endpoint_bindings": [
         {
           "endpoint_role_id": "planner_scene_projection",
@@ -414,7 +414,7 @@
       "scope": "target_binding",
       "target": {
         "command_target_id": "arm",
-        "component_type_revision": "sha256:9d81923f574576ac97b402b525bfc916f8c41711bec6899b55b2309acd140dca",
+        "component_type_revision": "sha256:e5a765898651b9fd2599e9ac47c9cf71b6feda9e916e965d4b0ea3ab0a200351",
         "control_binding_id": "lite6_robot.arm.execution-trajectory-execute",
         "control_binding_revision": "sha256:ec3b75d3666161237b7de48dbe8b7826392c2b94e636f2d74043c15d099d0733",
         "controllable_component_id": "lite6_robot"
@@ -424,7 +424,7 @@
       "capability_definition_revision": "sha256:14c53dad299a42d6604eac14240d015e22a4bc1adb363fb252111e62a2d2ad90",
       "capability_id": "planning.profile.balanced",
       "capability_provider_binding_id": "lite6_robot.arm.planning-profile-balanced.provider",
-      "capability_provider_binding_revision": "sha256:ba1fed3d0fc9ac3f8dbfa4275f24f00eace0b6506d53fc3b719a517ed1eec407",
+      "capability_provider_binding_revision": "sha256:5bd3ee5e094ab798e79acf495ca1fb5ddf26757b1252abd73f4171d3708a3e12",
       "endpoint_bindings": [
         {
           "endpoint_role_id": "planner_scene_projection",
@@ -439,7 +439,7 @@
       "scope": "target_binding",
       "target": {
         "command_target_id": "arm",
-        "component_type_revision": "sha256:9d81923f574576ac97b402b525bfc916f8c41711bec6899b55b2309acd140dca",
+        "component_type_revision": "sha256:e5a765898651b9fd2599e9ac47c9cf71b6feda9e916e965d4b0ea3ab0a200351",
         "control_binding_id": "lite6_robot.arm.execution-trajectory-execute",
         "control_binding_revision": "sha256:ec3b75d3666161237b7de48dbe8b7826392c2b94e636f2d74043c15d099d0733",
         "controllable_component_id": "lite6_robot"
@@ -449,7 +449,7 @@
       "capability_definition_revision": "sha256:e0f578ef9af205b3c7c184fb1124ffb4fe3c35874b5e993358b43a2dc43d2674",
       "capability_id": "planning.profile.first_feasible",
       "capability_provider_binding_id": "lite6_robot.arm.planning-profile-first_feasible.provider",
-      "capability_provider_binding_revision": "sha256:055a178b5436295581cf9cea208f5429550b3c6c509910ba36d3eb7cb936932c",
+      "capability_provider_binding_revision": "sha256:a037d51408dc02765df7e44bea0ebad16d6fa50035bb1a28413230b0d2ad5997",
       "endpoint_bindings": [
         {
           "endpoint_role_id": "planner_scene_projection",
@@ -464,7 +464,7 @@
       "scope": "target_binding",
       "target": {
         "command_target_id": "arm",
-        "component_type_revision": "sha256:9d81923f574576ac97b402b525bfc916f8c41711bec6899b55b2309acd140dca",
+        "component_type_revision": "sha256:e5a765898651b9fd2599e9ac47c9cf71b6feda9e916e965d4b0ea3ab0a200351",
         "control_binding_id": "lite6_robot.arm.execution-trajectory-execute",
         "control_binding_revision": "sha256:ec3b75d3666161237b7de48dbe8b7826392c2b94e636f2d74043c15d099d0733",
         "controllable_component_id": "lite6_robot"
@@ -474,7 +474,7 @@
       "capability_definition_revision": "sha256:7f570672270455207d5fb8eb210cd1dd22a99d7909421cf0dc8036c32e4beffb",
       "capability_id": "planning.profile.quality_bounded",
       "capability_provider_binding_id": "lite6_robot.arm.planning-profile-quality_bounded.provider",
-      "capability_provider_binding_revision": "sha256:f4eaa6070771b231d4ed507ef7272a7281c2fcf787acce343f08353da6173d37",
+      "capability_provider_binding_revision": "sha256:6dd13a2b6280bbd8ef1a2d60035e2219a930872f0db4201285e8609970405cf5",
       "endpoint_bindings": [
         {
           "endpoint_role_id": "planner_scene_projection",
@@ -489,7 +489,7 @@
       "scope": "target_binding",
       "target": {
         "command_target_id": "arm",
-        "component_type_revision": "sha256:9d81923f574576ac97b402b525bfc916f8c41711bec6899b55b2309acd140dca",
+        "component_type_revision": "sha256:e5a765898651b9fd2599e9ac47c9cf71b6feda9e916e965d4b0ea3ab0a200351",
         "control_binding_id": "lite6_robot.arm.execution-trajectory-execute",
         "control_binding_revision": "sha256:ec3b75d3666161237b7de48dbe8b7826392c2b94e636f2d74043c15d099d0733",
         "controllable_component_id": "lite6_robot"
@@ -499,7 +499,7 @@
       "capability_definition_revision": "sha256:1fde55ff59f977844d1e42a115df0e66305953803e7f2830fec4821e3cd36385",
       "capability_id": "planning.trajectory.time_parameterized",
       "capability_provider_binding_id": "lite6_robot.arm.planning-trajectory-time_parameterized.provider",
-      "capability_provider_binding_revision": "sha256:3859b3a108147e593bf3e0c6b87f2e18cf1ce58df3cea3527d0b266f0b0246c9",
+      "capability_provider_binding_revision": "sha256:f3d3a986946e2bcd0b7c4746a561334df951fbff8760fa20944085a3ad62f948",
       "endpoint_bindings": [
         {
           "endpoint_role_id": "planner_scene_projection",
@@ -514,7 +514,7 @@
       "scope": "target_binding",
       "target": {
         "command_target_id": "arm",
-        "component_type_revision": "sha256:9d81923f574576ac97b402b525bfc916f8c41711bec6899b55b2309acd140dca",
+        "component_type_revision": "sha256:e5a765898651b9fd2599e9ac47c9cf71b6feda9e916e965d4b0ea3ab0a200351",
         "control_binding_id": "lite6_robot.arm.execution-trajectory-execute",
         "control_binding_revision": "sha256:ec3b75d3666161237b7de48dbe8b7826392c2b94e636f2d74043c15d099d0733",
         "controllable_component_id": "lite6_robot"
@@ -524,7 +524,7 @@
       "capability_definition_revision": "sha256:3cd04895527038906ddcb9c6ca9fd87f4535eba41e5014b04917c66603f26653",
       "capability_id": "validation.trajectory.non_collision",
       "capability_provider_binding_id": "lite6_robot.arm.validation-trajectory-non_collision.provider",
-      "capability_provider_binding_revision": "sha256:7f4c07277b88e312e5e73057a2c2869d43524d9b9205c5da3bae5f8c02e8b050",
+      "capability_provider_binding_revision": "sha256:375d32c75368074b5ddcee3a243c84ff13b16febbe768552ac0faae135da3f82",
       "endpoint_bindings": [
         {
           "endpoint_role_id": "planner_scene_projection",
@@ -539,7 +539,7 @@
       "scope": "target_binding",
       "target": {
         "command_target_id": "arm",
-        "component_type_revision": "sha256:9d81923f574576ac97b402b525bfc916f8c41711bec6899b55b2309acd140dca",
+        "component_type_revision": "sha256:e5a765898651b9fd2599e9ac47c9cf71b6feda9e916e965d4b0ea3ab0a200351",
         "control_binding_id": "lite6_robot.arm.execution-trajectory-execute",
         "control_binding_revision": "sha256:ec3b75d3666161237b7de48dbe8b7826392c2b94e636f2d74043c15d099d0733",
         "controllable_component_id": "lite6_robot"
@@ -549,7 +549,7 @@
       "capability_definition_revision": "sha256:c99e2dc6d89129ca1d1d4a44d561d878b786df610d1ff241f6e09b5b100edb28",
       "capability_id": "model.kinematics.fk",
       "capability_provider_binding_id": "lite6_robot.gripper.model-kinematics-fk.provider",
-      "capability_provider_binding_revision": "sha256:5b1c19c0dd58f5abeabf955da112834ac2d86337836fcb8b9562916331cfe52b",
+      "capability_provider_binding_revision": "sha256:dc00561cd338d6185192edd554178427c5cff30a4f16aa9662ed8c8a8a25be8f",
       "endpoint_bindings": [
         {
           "endpoint_role_id": "planner_scene_projection",
@@ -564,7 +564,7 @@
       "scope": "target_binding",
       "target": {
         "command_target_id": "gripper",
-        "component_type_revision": "sha256:9d81923f574576ac97b402b525bfc916f8c41711bec6899b55b2309acd140dca",
+        "component_type_revision": "sha256:e5a765898651b9fd2599e9ac47c9cf71b6feda9e916e965d4b0ea3ab0a200351",
         "control_binding_id": "lite6_robot.gripper.tool-gripper-command",
         "control_binding_revision": "sha256:9c7624813dff3356fcede0ffeb6faa5735785df390108052ac2218bde9311745",
         "controllable_component_id": "lite6_robot"
@@ -574,7 +574,7 @@
       "capability_definition_revision": "sha256:4212f32bfc7e9b04cb11db023da86b9a8f75531b5d775674d559631d93b65053",
       "capability_id": "model.limits.joint",
       "capability_provider_binding_id": "lite6_robot.gripper.model-limits-joint.provider",
-      "capability_provider_binding_revision": "sha256:5a2b0733ef9404ece7976c6c6cbb8c506a46e3c3b0b459f22c4c5bb02251f6e5",
+      "capability_provider_binding_revision": "sha256:0957476b02583a10b2d4ba9b1ea2ad5397c822e0d33c2054f5f5c3323a9509c1",
       "endpoint_bindings": [
         {
           "endpoint_role_id": "planner_scene_projection",
@@ -589,7 +589,7 @@
       "scope": "target_binding",
       "target": {
         "command_target_id": "gripper",
-        "component_type_revision": "sha256:9d81923f574576ac97b402b525bfc916f8c41711bec6899b55b2309acd140dca",
+        "component_type_revision": "sha256:e5a765898651b9fd2599e9ac47c9cf71b6feda9e916e965d4b0ea3ab0a200351",
         "control_binding_id": "lite6_robot.gripper.tool-gripper-command",
         "control_binding_revision": "sha256:9c7624813dff3356fcede0ffeb6faa5735785df390108052ac2218bde9311745",
         "controllable_component_id": "lite6_robot"
@@ -959,13 +959,13 @@
         "schema_revision": "sha256:fdce9bb1facd259bde85f502197fd534dc05346a030605a55aa951d9e88c73dd"
       },
       {
-        "content_addressed_store_key": "catalog/maintained/component_type/lite6_lite_gripper.fixed_scale.component/9d81923f574576ac97b402b525bfc916f8c41711bec6899b55b2309acd140dca",
-        "content_digest": "sha256:60e68a22eafac67229cc6d447288acc8caae57f7a0852a6de3b2d42a8a380f15",
+        "content_addressed_store_key": "catalog/maintained/component_type/lite6_lite_gripper.fixed_scale.component/e5a765898651b9fd2599e9ac47c9cf71b6feda9e916e965d4b0ea3ab0a200351",
+        "content_digest": "sha256:43e5a9b609b07b0419d8f8fc6382b231758c66e4d59488bdb7742560df672af1",
         "record_id": "lite6_lite_gripper.fixed_scale.component",
         "record_kind": "component_type",
-        "record_revision": "sha256:9d81923f574576ac97b402b525bfc916f8c41711bec6899b55b2309acd140dca",
+        "record_revision": "sha256:e5a765898651b9fd2599e9ac47c9cf71b6feda9e916e965d4b0ea3ab0a200351",
         "schema_id": "manyforge.component_type.v1",
-        "schema_revision": "sha256:8e728ad4442d46b98f0d0534f8189df9b7982f982ab99cb656e6fdbeef231009"
+        "schema_revision": "sha256:2f26f97a7454e620bfb39e16eeccc0b23ae2de61c32e3e8210eff46945d01fc4"
       },
       {
         "content_addressed_store_key": "catalog/maintained/control_interface_contract/manyforge.ros2_control_arm_position/d951ffd368654ba9998355a4b12844014469753c3c21e05df3b61f6f669cbb4b",
@@ -1004,11 +1004,11 @@
         "schema_revision": "sha256:7415c5e2df17491366755b401337e3ad96dd96703357b20c9e0d08bf3f46a9f6"
       },
       {
-        "content_addressed_store_key": "catalog/maintained/model_asset/lite6_lite_gripper/3bc16935381668ee59e1d5edfa41576ccb5353dc77e3799050be4bbd21cd9ea1",
-        "content_digest": "sha256:4aa704acc43d8c6f8b2cb242efaa5c2c95b282e094eeb961186f3da93a886980",
+        "content_addressed_store_key": "catalog/maintained/model_asset/lite6_lite_gripper/b64c0b05bc23de6eb1fd5796baa6e32454c2f5514ab38c8f5b0b75f523272bf7",
+        "content_digest": "sha256:0bfd3048d9a76e18418f439188735a2dcce6d203fe3d6b997b940281d8832625",
         "record_id": "lite6_lite_gripper",
         "record_kind": "model_asset",
-        "record_revision": "sha256:3bc16935381668ee59e1d5edfa41576ccb5353dc77e3799050be4bbd21cd9ea1",
+        "record_revision": "sha256:b64c0b05bc23de6eb1fd5796baa6e32454c2f5514ab38c8f5b0b75f523272bf7",
         "schema_id": "manyforge.model_asset.v1",
         "schema_revision": "sha256:0820a2fbe627f2ccc5b76ff8d5348137d796893d3bd67707f7171fb420ec671c"
       },
@@ -1071,7 +1071,7 @@
     ]
   },
   "deployment_artifact_id": "lite6_lite_gripper_pick_and_place",
-  "deployment_revision": "sha256:8342d1b16c5766ec5448909674fa0933c67262604081ddcae1087559d53da09a",
+  "deployment_revision": "sha256:e8acd445b8f4dd15d70dbd5c9bc1b738a1a7ad6bb6a4b8fbb44b87eaabc5ee52",
   "description": "Native ManyForge pick-and-place deployment for UFACTORY Lite6 with the lite pneumatic gripper. The model bundle is self-contained; xarm_ros2 is a generation-time and real-robot runtime dependency only.",
   "desired_control_configurations": [
     {
@@ -1765,7 +1765,7 @@
     "controllable_components": [
       {
         "component_type_id": "lite6_lite_gripper.fixed_scale.component",
-        "component_type_revision": "sha256:9d81923f574576ac97b402b525bfc916f8c41711bec6899b55b2309acd140dca",
+        "component_type_revision": "sha256:e5a765898651b9fd2599e9ac47c9cf71b6feda9e916e965d4b0ea3ab0a200351",
         "controllable_component_id": "lite6_robot",
         "model_role_bindings": [
           {
@@ -1795,7 +1795,7 @@
       {
         "model_asset_id": "lite6_lite_gripper",
         "model_instance_id": "lite6_robot.model",
-        "model_revision": "sha256:3bc16935381668ee59e1d5edfa41576ccb5353dc77e3799050be4bbd21cd9ea1"
+        "model_revision": "sha256:b64c0b05bc23de6eb1fd5796baa6e32454c2f5514ab38c8f5b0b75f523272bf7"
       }
     ],
     "runtime_units": [

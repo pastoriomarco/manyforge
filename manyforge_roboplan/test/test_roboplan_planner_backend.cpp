@@ -1,6 +1,7 @@
 #include <gtest/gtest.h>
 
 #include <manyforge_core/testing/addressed_request_fixtures.hpp>
+#include <manyforge_core/collision/collision_world_snapshot_builder.hpp>
 #include <manyforge_roboplan/roboplan_planner_backend.hpp>
 
 #include <memory>
@@ -81,6 +82,19 @@ class RecordingCandidateClient final : public IRoboPlanCandidateClient {
   }
 
   void request_cancel() noexcept override { ++cancel_calls; }
+
+  [[nodiscard]] bool requires_retained_projection() const noexcept override {
+    return require_projection;
+  }
+
+  [[nodiscard]] Result<void> select_retained_projection(
+      const RoboPlanCandidateProjectionDTO &selected) override {
+    projection_history.push_back(selected);
+    return Result<void>::Ok();
+  }
+
+  bool require_projection{false};
+  std::vector<RoboPlanCandidateProjectionDTO> projection_history;
 
   RoboPlanCandidateBindingDTO binding_;
   TrajectoryDTO next_trajectory_;
@@ -400,6 +414,65 @@ TEST(RoboPlanPlannerBackendTest,
       (void)RoboPlanPlannerBackend(testing::make_test_projection_binding(),
                                    binding, std::move(client)),
       std::invalid_argument);
+}
+
+TEST(RoboPlanPlannerBackendTest,
+     ContactSelectionIsOperationScopedAndOrdinaryPlanAndIkClearIt) {
+  BackendFixture fixture;
+  fixture.client->require_projection = true;
+  auto policy = std::make_shared<CollisionPolicySnapshot>();
+  policy->policy_id = "contact-policy-snapshot";
+  policy->revision = CollisionPolicyRevision{
+      1U, "sha256:"
+          "0000000000000000000000000000000000000000000000000000000000000000"};
+  const auto world =
+      CollisionWorldSnapshotBuilder()
+          .set_publisher_id("backend-contact-test")
+          .set_revision_id(1U)
+          .set_policy_overlay_content_hash(policy->revision.content_hash)
+          .build_shared();
+  ASSERT_TRUE(world.ok()) << world.error().message;
+  auto input = testing::make_test_plan_request(
+      "move:contact", ResolvedMotionSpecDTO{joint_goal(fixture.binding)});
+  input.retained_collision_world = world.value();
+  input.retained_collision_policy = policy;
+  for (const auto &selected : {std::optional<std::string>("contact-a"),
+                               std::optional<std::string>("contact-b"),
+                               std::optional<std::string>{}}) {
+    input.contact_policy_id = selected;
+    const auto result = fixture.backend->plan(input);
+    ASSERT_TRUE(result.trajectory)
+        << (result.error ? result.error->message : "missing trajectory");
+    ASSERT_FALSE(fixture.client->projection_history.empty());
+    const auto &actual = fixture.client->projection_history.back();
+    EXPECT_EQ(actual.contact_policy_id, selected);
+    EXPECT_EQ(actual.world, input.retained_collision_world);
+    EXPECT_EQ(actual.policy, input.retained_collision_policy);
+    EXPECT_EQ(actual.projection_binding, input.projection_binding);
+  }
+  // IK has no operation contact selector: never inherit the previous plan's
+  // allowance, even when all retained projection identities are unchanged.
+  input.contact_policy_id = "contact-a";
+  ASSERT_TRUE(fixture.backend->plan(input).trajectory);
+  const auto resolved = testing::make_test_execution_binding();
+  IkRequestDTO ik{resolved.controllable_component_id,
+                  resolved.command_target_id,
+                  resolved.model_bindings,
+                  resolved.resources,
+                  Pose3DTO{{0.1, 0.2, 0.3}, {0.0, 0.0, 0.0, 1.0}},
+                  resolved.base_frame,
+                  resolved.tcp_frame,
+                  testing::make_test_controlled_state(resolved, {0.0, 0.0}),
+                  input.projection_binding,
+                  0.1};
+  ik.retained_collision_world = input.retained_collision_world;
+  ik.retained_collision_policy = input.retained_collision_policy;
+  const auto solved = fixture.backend->solve_ik(ik);
+  ASSERT_TRUE(solved.ok);
+  ASSERT_EQ(fixture.client->projection_history.size(), 5U);
+  EXPECT_FALSE(fixture.client->projection_history.back().contact_policy_id);
+  EXPECT_EQ(fixture.client->compute_calls, 4);
+  EXPECT_EQ(fixture.client->ik_calls, 1);
 }
 
 }  // namespace

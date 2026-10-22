@@ -94,17 +94,15 @@ def test_partial_spawn_failure_cleans_up_first_child(monkeypatch, tmp_path):
     assert child.actions == ["terminate", ("wait", 5), "kill", ("wait", None)]
 
 
-@pytest.mark.parametrize(
-    "publisher,service_type",
-    [(True, None), (False, "std_srvs/srv/SetBool"), (False, "std_srvs/srv/Trigger")],
-)
-def test_duplicate_endpoint_refusal_releases_only_preflight_node(monkeypatch, publisher, service_type):
-    actions = []
+def _preflight_ros(monkeypatch, actions, *, publishers, servers, clients):
     node = SimpleNamespace(
+        # The graph lists the service name whenever any client or server exists.
         get_service_names_and_types=lambda: (
-            [("/plc_io/start", [service_type])] if service_type else []
+            [("/plc_io/start", ["std_srvs/srv/SetBool"])] if servers or clients else []
         ),
-        count_publishers=lambda topic: int(publisher),
+        count_services=lambda name: servers if name == "/plc_io/start" else 0,
+        count_clients=lambda name: clients if name == "/plc_io/start" else 0,
+        count_publishers=lambda topic: publishers if topic == "/plc_io/ready" else 0,
         destroy_node=lambda: actions.append("destroy"),
     )
     ros = SimpleNamespace(
@@ -114,6 +112,20 @@ def test_duplicate_endpoint_refusal_releases_only_preflight_node(monkeypatch, pu
         shutdown=lambda: actions.append("shutdown"),
     )
     monkeypatch.setitem(sys.modules, "rclpy", ros)
+
+
+@pytest.mark.parametrize("publishers,servers", [(1, 0), (0, 1)])
+def test_duplicate_endpoint_refusal_releases_only_preflight_node(monkeypatch, publishers, servers):
+    actions = []
+    _preflight_ros(monkeypatch, actions, publishers=publishers, servers=servers, clients=1)
     with pytest.raises(RuntimeError, match="already have"):
         plc.check_endpoints_unused()
+    assert actions == ["init", "destroy", "shutdown"]
+
+
+def test_consumer_client_and_subscription_do_not_occupy_the_endpoints(monkeypatch):
+    # A loaded Scenario's plc_io client/subscription is the consumer, not a peer.
+    actions = []
+    _preflight_ros(monkeypatch, actions, publishers=0, servers=0, clients=1)
+    plc.check_endpoints_unused()
     assert actions == ["init", "destroy", "shutdown"]

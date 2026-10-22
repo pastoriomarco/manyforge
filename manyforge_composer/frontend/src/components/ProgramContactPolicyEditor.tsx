@@ -17,13 +17,42 @@ interface ContactTargetOption {
   modelRole?: string;
 }
 
+type ContactMode = 'contact_grasp' | 'contact_release';
+type ReleaseEvidence = 'signed_penetration' | 'binary_contact';
+
+/** Spec 250 §3.2 release envelope (signed defaults; binary keeps only the last two). */
+interface ReleaseEnvelope {
+  evidence: ReleaseEvidence;
+  enforceMaxStartPenetration: boolean;
+  maxStartPenetrationM: number;
+  minReleaseProgressM: number;
+  releaseToleranceM: number;
+  requireStrictlyDecreasingPenetration: boolean;
+  requireSeparationByEnd: boolean;
+  allowRecontact: boolean;
+}
+
+const SIGNED_RELEASE_DEFAULTS: ReleaseEnvelope = {
+  evidence: 'signed_penetration',
+  enforceMaxStartPenetration: true,
+  maxStartPenetrationM: 0,
+  minReleaseProgressM: 0,
+  releaseToleranceM: 0.00001,
+  requireStrictlyDecreasingPenetration: true,
+  requireSeparationByEnd: true,
+  allowRecontact: false,
+};
+
 interface ContactPolicyDraft {
   policyId: string;
   zoneId: string;
+  mode: ContactMode;
+  bodySource: 'component_model_body' | 'motion_endpoint';
   targetOptionId: string;
   runtimeObjectKey: string;
   maxPenetrationM: number;
   terminalWindowStartFraction: number;
+  release: ReleaseEnvelope;
 }
 
 function objectValue(value: JsonValue | undefined): Record<string, JsonValue> | null {
@@ -97,6 +126,34 @@ function policyId(value: JsonValue): string | null {
   return typeof row?.policy_id === 'string' ? row.policy_id : null;
 }
 
+function numberOr(value: JsonValue | undefined, fallback: number): number | null {
+  if (value === undefined) return fallback;
+  return typeof value === 'number' ? value : null;
+}
+
+function booleanOr(value: JsonValue | undefined, fallback: boolean): boolean | null {
+  if (value === undefined) return fallback;
+  return typeof value === 'boolean' ? value : null;
+}
+
+/** The authored release envelope with spec defaults for omitted fields. */
+function releaseFromZone(zone: Record<string, JsonValue>): ReleaseEnvelope | null {
+  const evidence = zone.release_evidence_mode;
+  if (evidence !== 'signed_penetration' && evidence !== 'binary_contact') return null;
+  const signed = evidence === 'signed_penetration';
+  const envelope = {
+    evidence,
+    enforceMaxStartPenetration: booleanOr(zone.enforce_max_start_penetration, signed),
+    maxStartPenetrationM: numberOr(zone.max_start_penetration_m, 0),
+    minReleaseProgressM: numberOr(zone.min_release_progress_m, 0),
+    releaseToleranceM: numberOr(zone.release_tolerance_m, signed ? SIGNED_RELEASE_DEFAULTS.releaseToleranceM : 0),
+    requireStrictlyDecreasingPenetration: booleanOr(zone.require_strictly_decreasing_penetration, signed),
+    requireSeparationByEnd: booleanOr(zone.require_separation_by_end, true),
+    allowRecontact: booleanOr(zone.allow_recontact, false),
+  };
+  return Object.values(envelope).some((value) => value === null) ? null : envelope as ReleaseEnvelope;
+}
+
 function fromPolicy(
   value: JsonValue,
   options: ContactTargetOption[],
@@ -108,6 +165,9 @@ function fromPolicy(
   const pairs = zone?.body_pairs;
   const pair = Array.isArray(pairs) ? objectValue(pairs[0]) : null;
   const selectors = [objectValue(pair?.body_a), objectValue(pair?.body_b)];
+  const endpoint = selectors.find(
+    (row): row is Record<string, JsonValue> => row?.kind === 'motion_endpoint',
+  );
   const component = selectors.find((row) => row?.kind === 'component_model_body');
   const runtime = selectors.find((row) => row?.kind === 'runtime_object');
   const option = options.find((row) => (
@@ -115,30 +175,95 @@ function fromPolicy(
     && row.collisionBodyRole === component?.collision_body_role_id
     && row.modelRole === component?.model_role_id
   ));
+  const mode = policy?.mode;
   if (
     typeof policy?.policy_id !== 'string'
     || typeof zone?.zone_id !== 'string'
-    || option === undefined
+    || (mode !== 'contact_grasp' && mode !== 'contact_release')
+    || (endpoint === undefined && option === undefined)
+    || (endpoint !== undefined && Object.keys(endpoint).length !== 1)
+    || (endpoint !== undefined && component !== undefined)
     || typeof runtime?.runtime_object_id !== 'string'
     || !keys.includes(runtime.runtime_object_id)
-    || typeof zone.max_penetration_m !== 'number'
-    || typeof zone.terminal_window_start_fraction !== 'number'
+  ) return null;
+  const release = mode === 'contact_release' ? releaseFromZone(zone) : SIGNED_RELEASE_DEFAULTS;
+  if (
+    release === null
+    || (mode === 'contact_grasp' && (
+      typeof zone.max_penetration_m !== 'number'
+      || typeof zone.terminal_window_start_fraction !== 'number'))
   ) return null;
   return {
     policyId: policy.policy_id,
     zoneId: zone.zone_id,
-    targetOptionId: option.id,
+    mode,
+    bodySource: endpoint === undefined ? 'component_model_body' : 'motion_endpoint',
+    targetOptionId: option?.id ?? '',
     runtimeObjectKey: runtime.runtime_object_id,
-    maxPenetrationM: zone.max_penetration_m,
-    terminalWindowStartFraction: zone.terminal_window_start_fraction,
+    // A release policy keeps the grasp defaults for a later mode switch only.
+    maxPenetrationM: typeof zone.max_penetration_m === 'number' ? zone.max_penetration_m : 0.002,
+    terminalWindowStartFraction: typeof zone.terminal_window_start_fraction === 'number'
+      ? zone.terminal_window_start_fraction : 0.8,
+    release,
   };
 }
 
 function nextPolicyId(existing: Set<string>): string {
-  let candidate = 'contact_grasp';
+  let candidate = 'contact_policy';
   let suffix = 2;
-  while (existing.has(candidate)) candidate = `contact_grasp_${suffix++}`;
+  while (existing.has(candidate)) candidate = `contact_policy_${suffix++}`;
   return candidate;
+}
+
+const RELEASE_METRIC_FIELDS = [
+  ['maxStartPenetrationM', 'Maximum starting penetration (m)'],
+  ['minReleaseProgressM', 'Minimum release progress (m)'],
+  ['releaseToleranceM', 'Release tolerance (m)'],
+] as const;
+
+function metricValid(value: number): boolean {
+  return Number.isFinite(value) && value >= 0 && value <= 1000;
+}
+
+function envelopeValid(draft: ContactPolicyDraft): boolean {
+  if (draft.mode === 'contact_grasp') {
+    return Number.isFinite(draft.maxPenetrationM)
+      && draft.maxPenetrationM > 0
+      && Number.isFinite(draft.terminalWindowStartFraction)
+      && draft.terminalWindowStartFraction >= 0
+      && draft.terminalWindowStartFraction <= 1;
+  }
+  const release = draft.release;
+  return release.evidence === 'binary_contact' || (
+    metricValid(release.maxStartPenetrationM)
+    && metricValid(release.minReleaseProgressM)
+    && metricValid(release.releaseToleranceM)
+  );
+}
+
+/** The closed zone envelope of the selected mode; binary release writes no metrics. */
+function zoneEnvelope(draft: ContactPolicyDraft): Record<string, JsonValue> {
+  if (draft.mode === 'contact_grasp') {
+    return {
+      max_penetration_m: draft.maxPenetrationM,
+      terminal_window_start_fraction: draft.terminalWindowStartFraction,
+    };
+  }
+  const release = draft.release;
+  return release.evidence === 'binary_contact' ? {
+    release_evidence_mode: 'binary_contact',
+    require_separation_by_end: release.requireSeparationByEnd,
+    allow_recontact: release.allowRecontact,
+  } : {
+    release_evidence_mode: 'signed_penetration',
+    enforce_max_start_penetration: release.enforceMaxStartPenetration,
+    max_start_penetration_m: release.maxStartPenetrationM,
+    min_release_progress_m: release.minReleaseProgressM,
+    release_tolerance_m: release.releaseToleranceM,
+    require_strictly_decreasing_penetration: release.requireStrictlyDecreasingPenetration,
+    require_separation_by_end: release.requireSeparationByEnd,
+    allow_recontact: release.allowRecontact,
+  };
 }
 
 function validDraft(
@@ -148,13 +273,10 @@ function validDraft(
 ): boolean {
   return PORTABLE_ID.test(draft.policyId)
     && PORTABLE_ID.test(draft.zoneId)
-    && options.some((option) => option.id === draft.targetOptionId)
+    && (draft.bodySource === 'motion_endpoint'
+      || options.some((option) => option.id === draft.targetOptionId))
     && keys.includes(draft.runtimeObjectKey)
-    && Number.isFinite(draft.maxPenetrationM)
-    && draft.maxPenetrationM > 0
-    && Number.isFinite(draft.terminalWindowStartFraction)
-    && draft.terminalWindowStartFraction >= 0
-    && draft.terminalWindowStartFraction <= 1;
+    && envelopeValid(draft);
 }
 
 export function ProgramContactPolicyEditor({
@@ -180,10 +302,13 @@ export function ProgramContactPolicyEditor({
   const empty = useMemo<ContactPolicyDraft>(() => ({
     policyId: nextPolicyId(new Set(policies.map(policyId).filter((id): id is string => id !== null))),
     zoneId: 'tool_contact',
+    mode: 'contact_grasp',
+    bodySource: 'component_model_body',
     targetOptionId: options[0]?.id ?? '',
     runtimeObjectKey: keys[0] ?? '',
     maxPenetrationM: 0.002,
     terminalWindowStartFraction: 0.8,
+    release: SIGNED_RELEASE_DEFAULTS,
   }), [keys, options, policies]);
   const [draft, setDraft] = useState<ContactPolicyDraft>(() => (
     selected === null ? empty : fromPolicy(selected, options, keys) ?? empty
@@ -198,33 +323,37 @@ export function ProgramContactPolicyEditor({
 
   const materialize = (next: ContactPolicyDraft) => {
     const target = options.find((option) => option.id === next.targetOptionId);
-    if (busy || target === undefined || !validDraft(next, options, keys)) return;
+    if (
+      busy
+      || !validDraft(next, options, keys)
+      || (next.bodySource === 'component_model_body' && target === undefined)
+    ) return;
+    const contactBody = next.bodySource === 'motion_endpoint'
+      ? { kind: 'motion_endpoint' }
+      : {
+        kind: 'component_model_body',
+        component_role_id: target!.componentRole,
+        collision_body_role_id: target!.collisionBodyRole,
+        ...(target!.modelRole === undefined ? {} : { model_role_id: target!.modelRole }),
+      };
     void mutate('program_draft_upsert_contact_policies', {
       contact_policies: [{
         api_version: 'manyforge.contact_policy.v1',
         policy_id: next.policyId,
-        mode: 'contact_grasp',
+        mode: next.mode,
         sensing_mode: 'geometry_only',
         default_unmatched_response: 'hard_stop',
         zones: [{
           zone_id: next.zoneId,
           body_pairs: [{
-            body_a: {
-              kind: 'component_model_body',
-              component_role_id: target.componentRole,
-              collision_body_role_id: target.collisionBodyRole,
-              ...(target.modelRole === undefined
-                ? {}
-                : { model_role_id: target.modelRole }),
-            },
+            body_a: contactBody,
             body_b: {
               kind: 'runtime_object',
               runtime_object_id: next.runtimeObjectKey,
             },
           }],
           violation_response: 'hard_stop',
-          max_penetration_m: next.maxPenetrationM,
-          terminal_window_start_fraction: next.terminalWindowStartFraction,
+          ...zoneEnvelope(next),
         }],
       } as unknown as JsonValue],
     }).then((result) => {
@@ -247,21 +376,22 @@ export function ProgramContactPolicyEditor({
       />
       <section className="dcard">
       <header>
-        <span>Robot/object grasp policy</span>
+        <span>Robot/object contact policy</span>
         <button
           type="button"
-          disabled={busy || options.length === 0 || keys.length === 0}
+          disabled={busy || keys.length === 0}
           title={blockedTitle}
           onClick={() => {
             setSelectedId('');
             setDraft(empty);
           }}
-        >New grasp policy</button>
+        >New contact policy</button>
       </header>
       <p>
-        Allowed component-body contact with one runtime object. Policies are
-        authored in this Program Draft; live contact evidence remains read-only
-        logical-scene and Kernel truth.
+        Allowed contact with one runtime object. Choose explicit component bodies
+        or the selected motion endpoint’s associated bodies. Grasp allows contact
+        that starts during the move; Release lets a move start in contact and
+        must separate from the object.
       </p>
       <label>
         <span>Policy</span>
@@ -276,10 +406,9 @@ export function ProgramContactPolicyEditor({
           })}
         </select>
       </label>
-      {options.length === 0 || keys.length === 0 ? (
+      {keys.length === 0 ? (
         <p className="scene-commit-error inline-message severity-error" role="status">
-          A contact policy needs one declared collision-body target and one
-          scene_resource blackboard key.
+          A contact policy needs one scene_resource blackboard key.
         </p>
       ) : (
         <div
@@ -313,20 +442,62 @@ export function ProgramContactPolicyEditor({
             />
           </label>
           <label>
-            <span>Component target and collision body</span>
+            <span>Contact kind</span>
             <select
-              value={draft.targetOptionId}
+              value={draft.mode}
               disabled={busy}
               title={blockedTitle}
-              onChange={(event) => update(
-                { ...draft, targetOptionId: event.target.value }, existing,
-              )}
+              onChange={(event) => update({
+                ...draft,
+                mode: event.target.value as ContactMode,
+              }, existing)}
             >
-              {options.map((option) => (
-                <option key={option.id} value={option.id}>{option.label}</option>
-              ))}
+              <option value="contact_grasp">Grasp (contact starts during the move)</option>
+              <option value="contact_release">Release (the move starts in contact)</option>
             </select>
           </label>
+          <label>
+            <span>Contact body source</span>
+            <select
+              value={draft.bodySource}
+              disabled={busy}
+              title={blockedTitle}
+              onChange={(event) => update({
+                ...draft,
+                bodySource: event.target.value as ContactPolicyDraft['bodySource'],
+              }, existing)}
+            >
+              <option value="component_model_body">Explicit component body</option>
+              <option value="motion_endpoint">Selected motion endpoint</option>
+            </select>
+          </label>
+          {draft.bodySource === 'component_model_body' ? (
+            options.length === 0 ? (
+              <p className="scene-commit-error inline-message severity-error" role="status">
+                This Program has no declared component collision bodies. Choose the selected motion endpoint if its modeled frame exposes contact bodies.
+              </p>
+            ) : (
+              <label>
+                <span>Component target and collision body</span>
+                <select
+                  value={draft.targetOptionId}
+                  disabled={busy}
+                  title={blockedTitle}
+                  onChange={(event) => update(
+                    { ...draft, targetOptionId: event.target.value }, existing,
+                  )}
+                >
+                  {options.map((option) => (
+                    <option key={option.id} value={option.id}>{option.label}</option>
+                  ))}
+                </select>
+              </label>
+            )
+          ) : (
+            <p className="program-form-hint">
+              The operation uses only contact bodies associated with its selected endpoint. Selecting an endpoint alone grants no contact permission.
+            </p>
+          )}
           <label>
             <span>Runtime object key</span>
             <select
@@ -347,6 +518,8 @@ export function ProgramContactPolicyEditor({
               />
             </select>
           </label>
+          {draft.mode === 'contact_grasp' && (
+            <>
           <label>
             <span>Maximum penetration (m)</span>
             <input
@@ -384,6 +557,101 @@ export function ProgramContactPolicyEditor({
               onBlur={() => existing && materialize(draft)}
             />
           </label>
+            </>
+          )}
+          {draft.mode === 'contact_release' && (
+            <>
+              <label>
+                <span>Release evidence</span>
+                <select
+                  value={draft.release.evidence}
+                  disabled={busy}
+                  title={blockedTitle}
+                  onChange={(event) => update({
+                    ...draft,
+                    release: event.target.value === 'binary_contact'
+                      ? { ...draft.release, evidence: 'binary_contact' }
+                      : { ...SIGNED_RELEASE_DEFAULTS,
+                        requireSeparationByEnd: draft.release.requireSeparationByEnd,
+                        allowRecontact: draft.release.allowRecontact },
+                  }, existing)}
+                >
+                  <option value="signed_penetration">Signed penetration</option>
+                  <option value="binary_contact">Binary contact</option>
+                </select>
+              </label>
+              {draft.release.evidence === 'signed_penetration' && (
+                <>
+                  <label>
+                    <input
+                      type="checkbox"
+                      checked={draft.release.enforceMaxStartPenetration}
+                      disabled={busy}
+                      title={blockedTitle}
+                      onChange={(event) => update({ ...draft, release: {
+                        ...draft.release, enforceMaxStartPenetration: event.target.checked,
+                      } }, existing)}
+                    />
+                    <span>Limit the starting penetration</span>
+                  </label>
+                  {RELEASE_METRIC_FIELDS.map(([field, label]) => (
+                    <label key={field}>
+                      <span>{label}</span>
+                      <input
+                        type="number"
+                        min={0}
+                        max={1000}
+                        step={0.0001}
+                        value={Number.isFinite(draft.release[field]) ? draft.release[field] : ''}
+                        disabled={busy}
+                        title={blockedTitle}
+                        onChange={(event) => update({ ...draft, release: {
+                          ...draft.release, [field]: event.currentTarget.valueAsNumber,
+                        } })}
+                        onBlur={() => existing && materialize(draft)}
+                      />
+                    </label>
+                  ))}
+                  <label>
+                    <input
+                      type="checkbox"
+                      checked={draft.release.requireStrictlyDecreasingPenetration}
+                      disabled={busy}
+                      title={blockedTitle}
+                      onChange={(event) => update({ ...draft, release: {
+                        ...draft.release, requireStrictlyDecreasingPenetration: event.target.checked,
+                      } }, existing)}
+                    />
+                    <span>Penetration must strictly decrease</span>
+                  </label>
+                </>
+              )}
+              <label>
+                <input
+                  type="checkbox"
+                  checked={draft.release.requireSeparationByEnd}
+                  disabled={busy}
+                  title={blockedTitle}
+                  onChange={(event) => update({ ...draft, release: {
+                    ...draft.release, requireSeparationByEnd: event.target.checked,
+                  } }, existing)}
+                />
+                <span>Must be separated by the end of the move</span>
+              </label>
+              <label>
+                <input
+                  type="checkbox"
+                  checked={draft.release.allowRecontact}
+                  disabled={busy}
+                  title={blockedTitle}
+                  onChange={(event) => update({ ...draft, release: {
+                    ...draft.release, allowRecontact: event.target.checked,
+                  } }, existing)}
+                />
+                <span>Allow contact again after separating</span>
+              </label>
+            </>
+          )}
           <div className="dactions">
             {!existing && (
               <button

@@ -142,7 +142,7 @@ function controller(document: Record<string, JsonValue>): DeploymentWorkspaceCon
         deploymentArtifactId: 'cell-a', deploymentRevision: digest, graphRevision: digest,
         differsFromSaved: false,
       },
-      saved: { path: '/workspace/cell-a.deployment.yaml', deploymentRevision: digest },
+      saved: { path: '/workspace/cell-a.deployment.yaml', deploymentRevision: digest, differsFromApplied: null },
       managerApplied: { activationOrder: null, deploymentRevision: digest, scenarioId: 'cell-a' },
       runAdmission: { ready: true, reason: null },
       binding: null,

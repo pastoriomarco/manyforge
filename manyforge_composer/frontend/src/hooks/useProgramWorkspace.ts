@@ -30,6 +30,7 @@ import {
 import type {
   DraftMutationResponse,
   NewScenarioDocumentInput,
+  SaveScenarioDocumentInput,
   JsonValue,
   LocalWorkspaceFenceRequest,
   ProgramNodeRecoveryPolicy,
@@ -227,12 +228,16 @@ export function programWorkspaceTransitionResult(
 export function useProgramWorkspace(
   snapshot: ComposerHeadlessState | null,
   authoring: AuthoringWorkspaceController,
+  /** Called after a successful Scenario Load or New reply. */
+  onScenarioOpened?: () => void,
 ) {
   const [state, dispatch] = useReducer(
     programWorkspaceReducer,
     INITIAL_PROGRAM_WORKSPACE_STATE,
   );
   const [acceptedApply, setAcceptedApply] = useState<ManagerApplyIdentity | null>(null);
+  const scenarioOpened = useRef(onScenarioOpened);
+  useEffect(() => { scenarioOpened.current = onScenarioOpened; }, [onScenarioOpened]);
   const generation = useRef(0);
   const mounted = useRef(true);
   const workspaceRead = useRef<Promise<ProgramWorkspaceResponse> | null>(null);
@@ -421,7 +426,10 @@ export function useProgramWorkspace(
     action: ProgramWorkspaceActionName,
     request: () => Promise<ProgramWorkspaceRunResult>,
   ): Promise<ProgramWorkspaceRunResult | null> => {
-    const edit = action === 'mutate' || action === 'discard';
+    // A Scenario Discard is a Draft edit; whether any Scenario document has
+    // unapplied changes is decided by its route and by the backend, never by
+    // the Program-only Discard gate below.
+    const edit = action === 'mutate' || action === 'discard' || action === 'discard_scenario';
     if ((action === 'apply' || action === 'revert' || action === 'discard')
       && programActionUnavailableReason(
         state.workspace, action, edit ? mutationUnavailableReason : documentUnavailableReason,
@@ -718,6 +726,25 @@ export function useProgramWorkspace(
     );
   }, [localFence, run]);
 
+  /** Discard unapplied Draft changes of the whole Scenario (Program and Deployment). */
+  const discardScenario = useCallback(() => {
+    if (mutationUnavailableReason !== null || published === null || snapshot === null) return;
+    const requestFence = scenarioLocalFence(
+      published,
+      snapshot,
+      requestOwnerEpoch.current,
+      identity('composer-authoring'),
+    );
+    void run(
+      'discard_scenario',
+      () => api.scenarioDocuments.discard(requestFence).then((next) =>
+        workspaceResult(
+          next,
+          'Unapplied Draft changes discarded to Applied; Saved was unchanged.',
+        )),
+    );
+  }, [mutationUnavailableReason, published, run, snapshot]);
+
   const revert = useCallback(() => {
     const requestFence = localFence('document');
     if (!requestFence) return;
@@ -728,13 +755,7 @@ export function useProgramWorkspace(
     );
   }, [localFence, run]);
 
-  const saveScenarioDocument = useCallback((input: {
-    path: string;
-    scenarioId: string;
-    name: string;
-    description: string;
-    confirmOverwrite: boolean;
-  }) => {
+  const saveScenarioDocument = useCallback((input: SaveScenarioDocumentInput) => {
     void run('save_scenario_document', async () => {
       const requestFence = scenarioFence();
       if (requestFence === null) throw new Error('Scenario Save is not admitted.');
@@ -830,6 +851,7 @@ export function useProgramWorkspace(
       const requestFence = scenarioFence();
       if (requestFence === null) throw new Error('New Scenario is not admitted.');
       const response = await api.scenarioDocuments.new(requestFence, input);
+      scenarioOpened.current?.();
       return {
         workspace: response.workspace,
         message: response.status === 'accepted'
@@ -855,6 +877,7 @@ export function useProgramWorkspace(
         path,
         confirmDiscard,
       );
+      scenarioOpened.current?.();
       if (response.status === 'applied') {
         return {
           workspace: response.workspace,
@@ -929,6 +952,7 @@ export function useProgramWorkspace(
     saveAs,
     apply,
     discard,
+    discardScenario,
     revert,
     saveScenarioDocument,
     loadScenarioDocument,
@@ -953,6 +977,7 @@ export function useProgramWorkspace(
     clearFeedback,
     reportCloseCancellation,
     discard,
+    discardScenario,
     documentUnavailableReason,
     scenarioReplacementIdentity,
     scenarioCloseHandoff,

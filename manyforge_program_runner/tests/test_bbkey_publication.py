@@ -751,6 +751,7 @@ class _Applied:
             "program": deepcopy(self.document),
             "program_binding_id": self.binding,
             "scenario_id": "scenario-1",
+            "project_path": "/projects/scenario-1.scenario",
             "retained_bundle_id": "bundle-1",
             "graph_revision": "graph-1",
         }
@@ -767,7 +768,7 @@ class _Applied:
 
 
 class _Register:
-    def restore(self, _scenario_id: str, _persistent: Any) -> dict[str, Any]:
+    def restore(self, _project_path: str, _persistent: Any) -> dict[str, Any]:
         return {"total": 4}
 
 

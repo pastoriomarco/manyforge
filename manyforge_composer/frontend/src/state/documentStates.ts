@@ -99,13 +99,29 @@ export function deploymentActionUnavailableReason(
     ? null : 'Nothing to apply: the Deployment Draft matches Manager Applied.';
   // Revert reloads Saved and applies it, so it exists only while Saved
   // differs from Applied; Draft-only edits over that baseline are Discard.
-  if (action === 'revert') return workspace.savedScenarioCandidates.length === 0
+  if (action === 'revert') return workspace.saved.path === null
     ? 'No saved Deployment is available.'
-    : workspace.saved.deploymentRevision !== null
-      && workspace.saved.deploymentRevision === workspace.managerApplied.deploymentRevision
+    : !deploymentSavedDiffersFromApplied(workspace)
       ? 'Nothing to revert: the Saved Deployment matches Manager Applied.' : null;
   return !workspace.draft.document ? 'No Deployment Draft is loaded.'
     : deploymentMatchesApplied(workspace) ? 'Nothing to apply: the Deployment Draft matches Manager Applied.' : null;
+}
+
+/**
+ * The Saved Deployment is not the one Manager applied. The server decides
+ * when it knows both; otherwise revisions decide when both carry one; a Draft
+ * that is Applied differs from Saved exactly when it differs from the file;
+ * otherwise the answer is unknown and Revert stays available (the owner
+ * refuses a real no-op).
+ */
+export function deploymentSavedDiffersFromApplied(workspace: DeploymentWorkspaceResponse | null): boolean {
+  if (workspace === null || workspace.saved.path === null) return false;
+  if (workspace.saved.differsFromApplied !== null) return workspace.saved.differsFromApplied;
+  const saved = workspace.saved.deploymentRevision;
+  const applied = workspace.managerApplied.deploymentRevision;
+  if (saved !== null && applied !== null) return saved !== applied;
+  if (deploymentMatchesApplied(workspace)) return workspace.draft.differsFromSaved;
+  return true;
 }
 
 /** Something is applied and the Deployment Draft is not it. */
@@ -145,4 +161,42 @@ export function deploymentDocumentStates(
         : 'Deployment Applied: the running Deployment is not your Draft. Apply it in the Deployment workspace, or Discard. Execute is blocked until then.',
     },
   ]);
+}
+
+export type ScenarioAction = 'apply' | 'revert' | 'discard';
+
+/**
+ * Which document carries one Scenario-wide action, or why none can.
+ *
+ * The Discard, Revert and Apply buttons act on the whole Scenario. A
+ * Deployment Apply already carries the Program Draft and a Deployment Revert
+ * the Saved Program, so whenever the Deployment differs it carries the action
+ * (one activation); otherwise the Program-only path does, which never changes
+ * components or the Scene. Discard is one Draft-only Scenario request.
+ */
+export function scenarioActionRoute(
+  action: ScenarioAction,
+  program: { reason: string | null; pending: boolean },
+  deployment: { reason: string | null; pending: boolean },
+  /** Set while the Deployment owner comparisons are unknown: nothing routes. */
+  comparisonReason: string | null = null,
+): { target: 'deployment' | 'program' | 'scenario' | null; reason: string | null } {
+  if (comparisonReason !== null) return { target: null, reason: comparisonReason };
+  if (action === 'discard') {
+    if (program.reason === null || deployment.reason === null) return { target: 'scenario', reason: null };
+  } else if (deployment.reason === null) {
+    return { target: 'deployment', reason: null };
+  } else if (program.reason === null && !deployment.pending) {
+    return { target: 'program', reason: null };
+  }
+  // A document with changes explains first why it cannot act.
+  const blocked = deployment.pending ? deployment.reason : program.pending ? program.reason : null;
+  return {
+    target: null,
+    reason: blocked ?? (action === 'apply'
+      ? 'Nothing to apply: the Scenario Drafts match Applied.'
+      : action === 'revert'
+        ? 'Nothing to revert: the Saved Scenario matches Applied.'
+        : 'Nothing to discard: the Scenario Drafts match Applied.'),
+  };
 }

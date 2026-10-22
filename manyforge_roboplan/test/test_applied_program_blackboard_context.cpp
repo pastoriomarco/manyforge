@@ -88,8 +88,9 @@ protected:
                            R"({"component_roles":[],"target_roles":[]})")
                            .root();
     auto prepared = d::assemble_prepared_activation(
-        {d::PreparedScenarioOrigin{"context.scenario", kDigestA}, kDigestB,
-         "optional"},
+        {d::PreparedScenarioOrigin{"context.scenario", kDigestA,
+                                   "/fixtures/context.scenario"},
+         kDigestB, "optional"},
         *bundle, *map, *program, roles, catalog, raw);
     d::FilesystemPreparedActivationRepository repository(package);
     static_cast<void>(repository.put_if_absent(prepared));

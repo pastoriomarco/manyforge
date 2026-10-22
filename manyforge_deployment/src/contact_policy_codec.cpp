@@ -113,6 +113,9 @@ decode_selector(const CanonicalValue &value, std::string_view path) {
         core::RuntimeObjectId(text(member(value, "runtime_object_id"),
                                    std::string(path) + ".runtime_object_id"))};
   }
+  if (kind == "motion_endpoint") {
+    return core::ContactMotionEndpointSelectorDTO{};
+  }
   fail("contact policy has an unknown body selector kind");
 }
 
@@ -254,6 +257,27 @@ decode_normalized(const CanonicalValue &normalized) {
   std::string previous_zone_id;
   for (std::size_t index = 0U; index < zone_values.size(); ++index) {
     auto decoded = decode_zone(zone_values[index], mode, index);
+    for (const auto &pair : decoded.value.body_pairs) {
+      const bool endpoint_a =
+          std::holds_alternative<core::ContactMotionEndpointSelectorDTO>(
+              pair.body_a);
+      const bool endpoint_b =
+          std::holds_alternative<core::ContactMotionEndpointSelectorDTO>(
+              pair.body_b);
+      if ((endpoint_a || endpoint_b) &&
+          ((mode != core::ContactPolicyModeDTO::kContactGrasp &&
+            mode != core::ContactPolicyModeDTO::kContactRelease) ||
+           zone_values.size() != 1U || decoded.value.body_pairs.size() != 1U ||
+           !((endpoint_a &&
+              std::holds_alternative<core::ContactRuntimeObjectSelectorDTO>(
+                  pair.body_b)) ||
+             (endpoint_b &&
+              std::holds_alternative<core::ContactRuntimeObjectSelectorDTO>(
+                  pair.body_a))))) {
+        fail("motion_endpoint requires one exclusive grasp or release pair with a "
+             "runtime object");
+      }
+    }
     if (index != 0U && previous_zone_id >= decoded.zone_id) {
       fail("contact policy zones must be unique and canonical-sorted by "
            "zone_id");

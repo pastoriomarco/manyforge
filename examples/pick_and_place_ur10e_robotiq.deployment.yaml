@@ -965,7 +965,7 @@
         "record_kind": "component_type",
         "record_revision": "sha256:9498876c8f0e774e91e0c9863e17c215c116303f8355df6bf4558eea0a35c3ac",
         "schema_id": "manyforge.component_type.v1",
-        "schema_revision": "sha256:8e728ad4442d46b98f0d0534f8189df9b7982f982ab99cb656e6fdbeef231009"
+        "schema_revision": "sha256:2f26f97a7454e620bfb39e16eeccc0b23ae2de61c32e3e8210eff46945d01fc4"
       },
       {
         "content_addressed_store_key": "catalog/maintained/control_interface_contract/manyforge.ros2_control_arm_position/d951ffd368654ba9998355a4b12844014469753c3c21e05df3b61f6f669cbb4b",
@@ -1072,7 +1072,7 @@
     ]
   },
   "deployment_artifact_id": "ur10e_robotiq_pick_place_preview",
-  "deployment_revision": "sha256:5493411e3aa0b80385ed93d34c5d1aa4866b3337d8d8c5c99348724982a99deb",
+  "deployment_revision": "sha256:0dda0cc14b1d6c9ac988188822c5056660d3393f4792a3370bda5bd8cec6eb4d",
   "description": "Preview deployment for UR10e + Robotiq 2F-140 native RoboPlan pick-and-place demo.",
   "desired_control_configurations": [
     {

@@ -851,7 +851,7 @@ def _direct_motion_request() -> OperationIntentRequest:
                         "kind": "motion",
                         "move_id": "robot-control-preview-request-1",
                         "base_frame_role_id": "base",
-                        "tcp_frame_role_id": "tcp",
+                        "tcp_endpoint": {"target_role_id": "command_target", "frame_role_id": "tcp"},
                         "tolerances": {
                             "joint_position_tol_rad": 0.05,
                             "translation_tol_m": 0.005,

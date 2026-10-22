@@ -5,7 +5,7 @@ import type { CSSProperties } from 'react';
 import { ApiError, api } from './api/client';
 import { AssistantOverlay } from './components/AssistantOverlay';
 import { DeploymentCompositionPanel } from './components/DeploymentCompositionPanel';
-import { DeploymentDocumentControls } from './components/DeploymentDocumentControls';
+import { deploymentDocumentHeader } from './components/DeploymentDocumentControls';
 import {
   HeadlessRuntimeSurfaces,
   attentionAlarmsNewestFirst,
@@ -15,7 +15,8 @@ import {
   RuntimeAttentionAutoOpen,
   shouldCloseAutomaticRuntimeAttention,
 } from './components/RuntimeAttentionAutoOpen';
-import { ProgramDocumentControls } from './components/ProgramDocumentControls';
+import { DocumentControls } from './components/DocumentControls';
+import { programDocumentHeader } from './components/ProgramDocumentControls';
 import { ScenarioDocumentCommands } from './components/ScenarioDocumentCommands';
 import { OverlayPanel } from './components/OverlayPanel';
 import { PaneDivider } from './components/PaneDivider';
@@ -73,6 +74,7 @@ import {
   programDocumentStates,
 } from './state/documentStates';
 import { DocumentStateLetters } from './components/DocumentStateLetters';
+import { ScenarioActionControls } from './components/ScenarioActionControls';
 import { useComposerSettingsNotices } from './components/ComposerSettingsPanel';
 import {
   previousSessionAlarmHandoff,
@@ -86,6 +88,7 @@ import {
   type ViewerIncidentKind,
   type WorkbenchNotice,
 } from './state/workbenchNotices';
+import { startupScenarioNotices } from './state/startupScenarioNotice';
 import type { ProgramWorkspaceActionName } from './state/programWorkspace';
 import {
   INSPECTOR_WIDTH_MIN,
@@ -106,6 +109,7 @@ const PROGRAM_ACTION_LABELS: Partial<Record<ProgramWorkspaceActionName, string>>
   open_draft: 'Opening Program as Draft',
   apply: 'Submitting Program Apply',
   discard: 'Discarding Program changes',
+  discard_scenario: 'Discarding Scenario changes',
   revert: 'Submitting Program Revert',
   load: 'Loading Program',
   load_scenario_document: 'Submitting Scenario Load',
@@ -322,9 +326,12 @@ export default function App() {
   ]);
   // Composer settings problems appear as workbench notices.
   useComposerSettingsNotices();
+  // A successful Load/New clears a refused-startup notice in the backend;
+  // health is read once per page, so read it again then.
   const programController = useProgramWorkspace(
     headlessSnapshot,
     authoringWorkspace,
+    retryHealth,
   );
   // Draft / Saved / Applied of both documents, shown in every workspace.
   const programStates = programDocumentStates(programController.state.workspace);
@@ -800,12 +807,51 @@ export default function App() {
     message: 'The cell started empty; nothing from the previous session was resumed. Its records are kept; details in History.',
     details: `Failure time unavailable. Session: ${sessionNotice.sessionId}. Archive: ${sessionNotice.archiveRelativePath}. Journal families: ${sessionNotice.journalFamilies.join(', ')}. History coverage: ${sessionNotice.historyCoverage}. ${sessionNotice.message}`,
   }], [sessionNotice, sessionNoticeOwnedByAlarms]);
+  // A refused startup project (health is read once per page).
+  const startupNotice = health.status === 'ready'
+    ? health.data.startupScenarioNotice ?? null
+    : null;
+  const startupNotices = useMemo(() => startupScenarioNotices(startupNotice), [startupNotice]);
+  // A lost reply's outcome and its recheck belong in the notice rail: the
+  // header keeps its fixed slots so the document actions stay visible.
+  const {
+    submissionUnconfirmed, recheckMessage, rechecking, recheckSubmission,
+  } = authoringWorkspace;
+  // Unconfirmed stays until rechecked; a verified result is brief Activity.
+  const submissionVerified = useBriefNotice(
+    !submissionUnconfirmed && recheckMessage !== null
+      ? {
+          id: 'authoring.submission.verified',
+          severity: 'info',
+          domain: 'activation',
+          title: 'Submission verified',
+          message: recheckMessage,
+        }
+      : null,
+  );
+  const submissionNotices = useMemo<WorkbenchNotice[]>(() => submissionUnconfirmed ? [{
+    id: 'authoring.submission',
+    severity: 'warning',
+    domain: 'activation',
+    title: 'Submission unconfirmed',
+    message: recheckMessage ?? 'The reply to the last request was lost; its outcome is not known yet. Nothing was retried.',
+    busy: rechecking,
+    actions: [{
+      id: 'recheck',
+      label: rechecking ? 'Checking…' : 'Recheck status',
+      disabled: rechecking,
+      run: () => { void recheckSubmission(); },
+    }],
+  }] : submissionVerified === null ? [] : [submissionVerified],
+  [recheckMessage, recheckSubmission, rechecking, submissionUnconfirmed, submissionVerified]);
   const workbenchNotices = useMemo(() => [
     ...controlNotices,
     ...activationNotices,
     ...publishedNotices,
     ...operationNotices,
     ...sessionNotices,
+    ...startupNotices,
+    ...submissionNotices,
     ...(activationCompleted === null ? [] : [activationCompleted]),
     ...(programMessage === null ? [] : [programMessage]),
     ...(deploymentMessage === null ? [] : [deploymentMessage]),
@@ -818,6 +864,8 @@ export default function App() {
     programMessage,
     publishedNotices,
     sessionNotices,
+    startupNotices,
+    submissionNotices,
   ]);
   const transitionScope = useTransitionScope(transitionKey, workbenchNotices);
   const transitionClassified = useMemo(
@@ -1041,19 +1089,22 @@ export default function App() {
       motionActive={documentMotionActive}
     />
   );
+  // Discard/Revert/Apply act on the whole Scenario in every workspace too.
+  const scenarioActions = (
+    <ScenarioActionControls
+      program={programController}
+      deployment={deploymentController}
+      runtime={programRuntime}
+      resetApply={resetApply}
+      localInvalidEdit={programInvalidEdit}
+      cclc={cclc}
+      authoringAdmissionGeneration={headlessSnapshot?.authoringAdmission.admissionGeneration ?? null}
+    />
+  );
 
   return (
     <main className="app-shell">
       <header className="app-header">
-        {(authoringWorkspace.submissionUnconfirmed || authoringWorkspace.recheckMessage !== null) && (
-          <div role="status" title={authoringWorkspace.recheckMessage ?? undefined}>
-            <span>{authoringWorkspace.submissionUnconfirmed ? 'Submission unconfirmed' : 'Submission verified'}</span>
-            {authoringWorkspace.submissionUnconfirmed && <button type="button" disabled={authoringWorkspace.rechecking}
-              onClick={() => { void authoringWorkspace.recheckSubmission(); }}>
-              {authoringWorkspace.rechecking ? 'Checking…' : 'Recheck status'}
-            </button>}
-          </div>
-        )}
         <div className="app-identity" aria-label="ManyForge Composer">
           <span className="brand-mark" aria-hidden="true">MF</span>
           <strong>ManyForge</strong>
@@ -1123,23 +1174,13 @@ export default function App() {
           </button>
           <DocumentStateLetters states={deploymentStates} owner="Deployment" side="right" />
         </nav>
-        {activeWorkspace === 'deployment' ? (
-          <DeploymentDocumentControls
-            controller={deploymentController}
-            resetApply={resetApply}
-            scenarioCommands={scenarioCommands}
-            cclc={cclc}
-            authoringAdmissionGeneration={headlessSnapshot?.authoringAdmission.admissionGeneration ?? null}
-          />
-        ) : (
-          <ProgramDocumentControls
-            controller={programController}
-            resetApply={resetApply}
-            scenarioCommands={scenarioCommands}
-            runtime={programRuntime}
-            localInvalidEdit={programInvalidEdit}
-          />
-        )}
+        <DocumentControls
+          {...(activeWorkspace === 'deployment'
+            ? deploymentDocumentHeader(deploymentController)
+            : programDocumentHeader(programController))}
+          scenarioCommands={scenarioCommands}
+          actions={scenarioActions}
+        />
         <div className="global-surface-launchers" aria-label="Application tools">
           <button
             ref={runtimeButton}

@@ -63,6 +63,11 @@ import {
 } from '../utils/programSourceJoints';
 import { valueSourceMenuModel } from '../utils/valueSourceMenu';
 import {
+  buildMotionEndpointMutation,
+  motionEndpointKeyOfNode,
+  programMotionEndpointChoices,
+} from '../utils/motionEndpointAuthoring';
+import {
   hasSourcesWithin,
   setValueAtPath,
   sourcesAfterLiteral,
@@ -339,22 +344,22 @@ export function ProgramPropertyEditor({
   ), [diagnostics, roots, selectedId]);
   // Warnings only: never part of the node's validity or Apply gating.
   const workspaceBinding = deploymentWorkspace?.binding;
+  // The binding's target rows, or without one the Draft-resolved rows (targetRoleResolution).
+  const targetRoleRows = useMemo(() => (workspaceBinding == null
+    ? resolvedTargetRoles(program, programRoleAssignment)
+    : workspaceBinding.target_role_bindings), [workspaceBinding, program, programRoleAssignment]);
   const stopWarnings = useMemo(() => (selected === null ? [] : precisionContactStopWarnings(
-    selected, deploymentDocument as Record<string, JsonValue> | null,
-    workspaceBinding == null
-      ? resolvedTargetRoles(program, programRoleAssignment)
-      : workspaceBinding.target_role_bindings,
-  )), [deploymentDocument, workspaceBinding, program, programRoleAssignment, selected]);
+    selected, deploymentDocument as Record<string, JsonValue> | null, targetRoleRows,
+  )), [deploymentDocument, targetRoleRows, selected]);
   // The bound robot's qualified Stop chain; null keeps "available after Apply".
   const qualifiedStopStages = useMemo(() => (selected === null ? null : stopStagesForTargetRole(
-    stopChains, deploymentWorkspace?.binding?.target_role_bindings, selected.parameters.target_role,
-  )), [deploymentWorkspace?.binding?.target_role_bindings, selected, stopChains]);
+    stopChains, targetRoleRows, selected.parameters.target_role,
+  )), [targetRoleRows, selected, stopChains]);
   const selectedDeploymentSpeed = useMemo(() => {
-    if (selected === null || deploymentWorkspace?.binding == null) return null;
-    const binding = deploymentWorkspace.binding;
+    if (selected === null) return null;
     const targetRole = selected.parameters.target_role;
     if (typeof targetRole !== 'string') return null;
-    const target = binding.target_role_bindings.find(
+    const target = targetRoleRows.find(
       (row) => row.target_role_id === targetRole,
     );
     if (target === undefined) return null;
@@ -369,7 +374,7 @@ export function ProgramPropertyEditor({
       target: `${target.controllable_component_id}/${target.command_target_id}`,
       maximum: descriptor.operationalLimit.maximumTcpLinearSpeedMps,
     };
-  }, [deploymentWorkspace, motionDescriptors, selected]);
+  }, [targetRoleRows, motionDescriptors, selected]);
   const sourceJointInventory = useMemo(() => selected === null
     ? null
     : programSourceJointInventory(
@@ -386,6 +391,10 @@ export function ProgramPropertyEditor({
       sourceModel,
       sourceModelUnavailableReason,
     ]);
+  const motionEndpointChoices = useMemo(
+    () => programMotionEndpointChoices(program),
+    [program],
+  );
   useEffect(() => {
     setErrors({});
     setDiscardEpoch((current) => current + 1);
@@ -703,6 +712,7 @@ export function ProgramPropertyEditor({
           <p className="muted">This node has no authored parameters.</p>
         )}
         {entry.parameters.map((parameter) => {
+          const hasMotionTcpEndpoint = entry.parameters.some((field) => field.id === 'tcp_endpoint');
           const source = selected.value_sources?.[parameter.id];
           const rule = keyValueParameterRule(entry, selected, blackboardKeys, parameter.id);
           const hasLiteral = Object.prototype.hasOwnProperty.call(
@@ -731,6 +741,8 @@ export function ProgramPropertyEditor({
               selected.node_id,
               selected.parameters.target_role,
               deploymentWorkspace?.binding,
+              { program, roleAssignment: programRoleAssignment,
+                deploymentDocument: deploymentDocument as Record<string, JsonValue> | null },
             )
             : null;
           const unsupportedChoices = ioUnsupportedChoices(
@@ -757,7 +769,9 @@ export function ProgramPropertyEditor({
             >
               <div className="program-property-heading">
                 <label htmlFor={`property-${selected.instance_id}-${parameter.id}`}>
-                  {parameter.id === 'max_tcp_linear_speed_mps'
+                  {hasMotionTcpEndpoint && parameter.id === 'tcp_endpoint'
+                    ? 'Motion TCP endpoint'
+                    : parameter.id === 'max_tcp_linear_speed_mps'
                     ? 'TCP speed ceiling (m/s)'
                     : parameter.id}
                 </label>
@@ -810,7 +824,8 @@ export function ProgramPropertyEditor({
                           value={hasLiteral ? literal : undefined}
                           signals={signals}
                           profiles={mockSignalProfiles(signals, deploymentWorkspace?.binding,
-                            deploymentDocument as Record<string, JsonValue> | null)}
+                            deploymentDocument as Record<string, JsonValue> | null,
+                            program, programRoleAssignment)}
                           disabled={busy || rule.locked !== undefined}
                           onCommit={(value) => commitLiteral(parameter, value)}
                           onClear={() => removeLiteral(parameter)}
@@ -893,6 +908,64 @@ export function ProgramPropertyEditor({
                     }}
                   />
                 </>
+              ) : hasMotionTcpEndpoint && parameter.id === 'tcp_endpoint' ? (
+                <div id={`property-${selected.instance_id}-tcp_endpoint`}>
+                  {source !== undefined ? (
+                    <>
+                      <p className="program-form-error inline-message severity-error" role="alert">
+                        The motion TCP endpoint must be a literal selection.
+                      </p>
+                      <button
+                        type="button"
+                        className="text-button"
+                        disabled={busy || rule.locked !== undefined}
+                        onClick={() => {
+                          const request = buildMotionEndpointMutation(selected, null);
+                          void onMutate(request.mutation, request.args);
+                        }}
+                      >Remove dynamic endpoint value</button>
+                    </>
+                  ) : (() => {
+                    const currentKey = motionEndpointKeyOfNode(selected) ?? '';
+                    const currentIsDeclared = motionEndpointChoices.some(
+                      (choice) => choice.key === currentKey,
+                    );
+                    const currentLabel = 'Current endpoint is not declared';
+                    return (
+                      <>
+                        <select
+                          value={currentKey}
+                          disabled={busy || rule.locked !== undefined}
+                          aria-label="Motion TCP endpoint"
+                          onChange={(event) => {
+                            const choice = motionEndpointChoices.find(
+                              (candidate) => candidate.key === event.currentTarget.value,
+                            );
+                            const request = buildMotionEndpointMutation(
+                              selected,
+                              choice === undefined ? null : {
+                                target_role: choice.targetRole,
+                                frame_role: choice.frameRole,
+                              },
+                            );
+                            void onMutate(request.mutation, request.args);
+                          }}
+                        >
+                          <option value="">Select a declared endpoint</option>
+                          {currentKey !== '' && !currentIsDeclared && (
+                            <option value={currentKey}>{currentLabel}</option>
+                          )}
+                          {motionEndpointChoices.map((choice) => (
+                            <option key={choice.key} value={choice.key}>{choice.label}</option>
+                          ))}
+                        </select>
+                        <p className="program-form-hint">
+                          Choose a frame declared on a target role. The selected endpoint must be on the same physical component as the motion target; this is checked when the motion starts. Current-pose capture is available when the selected endpoint matches the robot’s current TCP.
+                        </p>
+                      </>
+                    );
+                  })()}
+                </div>
               ) : (
                 <div id={`property-${selected.instance_id}-${parameter.id}`}>
                   <ProgramSchemaValueEditor
@@ -939,6 +1012,9 @@ export function ProgramPropertyEditor({
                       `Write the ${pose ? 'current TCP pose' : 'current joint positions'} of `
                       + `${String(targetRole)} into this goal`
                       + (pose ? '. Replaces the goal frame with this robot’s base frame' : '')
+                      + (pose && selected.parameters.tcp_endpoint !== undefined
+                        ? '. Capture requires the selected target and frame roles to match the robot’s current TCP'
+                        : '')
                       + (relative ? '. This switches the move to absolute.' : '.')
                     )}
                     onClick={() => {

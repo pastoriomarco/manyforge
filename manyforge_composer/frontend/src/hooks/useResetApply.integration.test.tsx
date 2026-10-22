@@ -39,7 +39,9 @@ const apiMock = vi.hoisted(() => ({
     get: vi.fn(),
     mutate: vi.fn(),
     applyDraft: vi.fn(),
+    revert: vi.fn(),
   },
+  scenarioDocuments: { discard: vi.fn() },
   authoringWorkspace: { recordResetApplyContext: vi.fn() },
   execution: { runtimeScaleControl: vi.fn() },
 }));
@@ -58,7 +60,13 @@ import {
   publicationIsCurrent,
   type PublishedAuthoringWorkspace,
 } from '../state/authoringWorkspace';
-import { deploymentUnapplied } from '../state/documentStates';
+import {
+  deploymentActionUnavailableReason,
+  deploymentSavedDiffersFromApplied,
+  deploymentUnapplied,
+  scenarioActionRoute,
+  type ScenarioAction,
+} from '../state/documentStates';
 import { managerApplySettlementKey } from '../state/managerApply';
 import { resetApplyPhaseText } from '../state/resetApply';
 import { programActionUnavailableReason } from '../state/authoringWorkspace';
@@ -93,6 +101,8 @@ interface Environment {
   appliedRevision?: string;
   /** Overrides the observed authoring admission (Idle opens it by default). */
   admissionOpen?: boolean;
+  /** The Saved Deployment revision; the Applied one by default. */
+  savedDeployment?: string;
   /** The native execution owner (Robot Control) epoch. */
   executionOwnerEpoch?: string;
 }
@@ -238,7 +248,11 @@ function deploymentWorkspace(environment: Environment): DeploymentWorkspaceRespo
       graphRevision: digest('9'),
       differsFromSaved: environment.deploymentContent !== APPLIED_DEPLOYMENT,
     },
-    saved: { path: '/cell/cell.deployment.yaml', deploymentRevision: APPLIED_DEPLOYMENT },
+    saved: {
+      path: '/cell/cell.deployment.yaml',
+      deploymentRevision: environment.savedDeployment ?? APPLIED_DEPLOYMENT,
+      differsFromApplied: (environment.savedDeployment ?? APPLIED_DEPLOYMENT) !== APPLIED_DEPLOYMENT,
+    },
     managerApplied: { activationOrder: null, deploymentRevision: APPLIED_DEPLOYMENT, scenarioId: 'cell' },
     runAdmission: { ready: environment.deploymentContent === APPLIED_DEPLOYMENT, reason: null },
     binding: null,
@@ -269,8 +283,11 @@ function publication(environment: Environment): PublishedAuthoringWorkspace {
     deployment: {
       draftId: 'deployment-draft-1', draftRevision: environment.deploymentRevision,
       document: { api_version: 'manyforge.deployment_intent.v2' },
-      savedPath: null, savedDocument: null,
-      differsFromSaved: environment.deploymentContent !== APPLIED_DEPLOYMENT,
+      savedPath: environment.savedDeployment === undefined ? null : '/cell/cell.deployment.yaml',
+      savedDocument: environment.savedDeployment === undefined ? null
+        : { api_version: 'manyforge.deployment_intent.v2', deployment_revision: environment.savedDeployment },
+      differsFromSaved: environment.deploymentContent !== APPLIED_DEPLOYMENT
+        || environment.savedDeployment !== undefined,
     },
     project: {
       documentPath: '/cell', documentId: null, documentName: null, documentDescription: null,
@@ -689,6 +706,173 @@ describe('Apply while a run exists', () => {
       kind: 'applied', apply: { applyId: 'apply-1', applyGeneration: 2 },
     });
     expect(transport.sendExecutionCommand).toHaveBeenCalledOnce();
+  });
+
+  it('sends a Scenario Discard whose only unapplied change is the Deployment', async () => {
+    // The Program Draft matches Applied; only the Deployment Draft differs.
+    const edited = {
+      ...HELD, hold: 'idle' as const, cycle: idleCycle(null), programRevision: digest('a'),
+      deploymentRevision: 2, deploymentContent: digest('e'),
+    };
+    await mount(edited);
+    expect(programActionUnavailableReason(hooks!.program.state.workspace, 'discard', null))
+      .toMatch(/^Nothing to apply/);
+    apiMock.scenarioDocuments.discard.mockResolvedValue(programWorkspace(HELD));
+
+    await act(async () => { hooks!.program.discardScenario(); });
+    await flush();
+
+    expect(apiMock.scenarioDocuments.discard).toHaveBeenCalledOnce();
+    expect(apiMock.scenarioDocuments.discard.mock.calls[0][0]).toEqual(expect.objectContaining({
+      deploymentDraftId: identity(edited).deploymentDraftId,
+      expectedDeploymentDraftRevision: 2,
+    }));
+    expect(apiMock.programWorkspace.discard).not.toHaveBeenCalled();
+  });
+
+  it('re-reads the Deployment owner after a Scenario Discard, so nothing is left to apply, revert or discard', async () => {
+    // The Scenario routes as ScenarioActionControls computes them (no run).
+    const route = (action: ScenarioAction) => {
+      const program = hooks!.program;
+      const deployment = hooks!.deployment;
+      const programWorkspace = program.state.workspace;
+      const workspace = deployment.workspace;
+      return scenarioActionRoute(action, {
+        reason: programActionUnavailableReason(programWorkspace, action, action === 'discard'
+          ? program.mutationUnavailableReason : program.documentUnavailableReason),
+        pending: action === 'revert'
+          ? programWorkspace?.saved.programRevision !== programWorkspace?.applied.programRevision
+          : action === 'apply' ? programWorkspace?.applied.matchesDraft === false
+            : programWorkspace?.hasUnappliedChanges === true,
+      }, {
+        reason: deploymentActionUnavailableReason(workspace, action, action === 'discard'
+          ? deployment.mutationUnavailableReason : deployment.documentUnavailableReason),
+        pending: action === 'revert'
+          ? deploymentSavedDiffersFromApplied(workspace) : deploymentUnapplied(workspace),
+      }, deployment.comparisonUnavailableReason);
+    };
+    const edited = {
+      ...HELD, hold: 'idle' as const, cycle: idleCycle(null), programRevision: digest('a'),
+      deploymentRevision: 2, deploymentContent: digest('e'),
+    };
+    const render = await mount(edited);
+    expect(route('discard').target).toBe('scenario');
+    expect(route('apply').target).toBe('deployment');
+    const discarded = { ...edited, deploymentRevision: 3, deploymentContent: APPLIED_DEPLOYMENT };
+    apiMock.scenarioDocuments.discard.mockResolvedValue(programWorkspace(discarded));
+    await act(async () => { hooks!.program.discardScenario(); });
+    await flush();
+    const reads = apiMock.deploymentWorkspace.get.mock.calls.length;
+    // The owner re-read is held so the interim view can be observed.
+    let land: () => void = () => undefined;
+    apiMock.deploymentWorkspace.get.mockImplementationOnce(() => new Promise((resolve) => {
+      land = () => resolve(deploymentWorkspace(discarded));
+    }));
+    // The shared publication of the discarded Draft arrives before the owner.
+    await render(discarded);
+    expect(apiMock.deploymentWorkspace.get).toHaveBeenCalledTimes(reads + 1);
+    // Until it lands, the old owner comparisons are unknown, not certain.
+    expect(hooks!.deployment.workspace?.draft.revision).toBe(3);
+    expect(hooks!.deployment.workspace?.runAdmission.ready).toBe(false);
+    expect(hooks!.deployment.workspace?.saved.differsFromApplied).toBeNull();
+    // No Scenario action is offered on unknown comparisons; Draft edits stay available.
+    const rechecking = { target: null, reason: 'Rechecking the Deployment Draft against Manager Applied…' };
+    expect(route('discard')).toEqual(rechecking);
+    expect(route('apply')).toEqual(rechecking);
+    expect(route('revert')).toEqual(rechecking);
+    expect(hooks!.deployment.mutationUnavailableReason).toBeNull();
+    await act(async () => { land(); });
+    await flush();
+    expect(hooks!.deployment.workspace?.runAdmission.ready).toBe(true);
+    expect(route('discard')).toEqual({ target: null, reason: 'Nothing to discard: the Scenario Drafts match Applied.' });
+    expect(route('apply')).toEqual({ target: null, reason: 'Nothing to apply: the Scenario Drafts match Applied.' });
+    expect(route('revert')).toEqual({ target: null, reason: 'Nothing to revert: the Saved Scenario matches Applied.' });
+    expect(apiMock.deploymentWorkspace.get).toHaveBeenCalledTimes(reads + 1);
+  });
+
+  it('offers no Scenario action while a failed Deployment recheck leaves the comparisons unknown', async () => {
+    const edited = {
+      ...HELD, hold: 'idle' as const, cycle: idleCycle(null), programRevision: digest('a'),
+      deploymentRevision: 2, deploymentContent: digest('e'),
+    };
+    const render = await mount(edited);
+    const discarded = { ...edited, deploymentRevision: 3, deploymentContent: APPLIED_DEPLOYMENT };
+    apiMock.deploymentWorkspace.get.mockRejectedValueOnce(new Error('owner unreachable'));
+    await render(discarded);
+    await flush();
+    const reason = hooks!.deployment.comparisonUnavailableReason;
+    expect(reason).toMatch(/^The Deployment could not be rechecked against Manager Applied: owner unreachable/);
+    expect(scenarioActionRoute('discard', { reason: null, pending: false }, { reason: null, pending: true }, reason))
+      .toEqual({ target: null, reason });
+    expect(hooks!.deployment.mutationUnavailableReason).toBeNull();
+    // A later successful read makes the comparisons current again.
+    await act(async () => { await hooks!.deployment.refresh(); });
+    await flush();
+    expect(hooks!.deployment.comparisonUnavailableReason).toBeNull();
+  });
+
+  it('keeps a confirmed Revert a Revert of the Saved input, never an Apply of the Draft', async () => {
+    // Saved differs from Applied while the Draft is the Applied one.
+    const idle = {
+      ...HELD, hold: 'idle' as const, cycle: idleCycle(null), admissionGeneration: 12,
+      savedDeployment: digest('5'),
+    };
+    await mount(idle);
+    apiMock.deploymentWorkspace.revert.mockResolvedValue({
+      schemaVersion: 'manyforge.composer_deployment_candidate_operation.v1',
+      workspace: deploymentWorkspace(idle),
+      result: {
+        status: 'confirmation_required', confirmationToken: digest('7'),
+        preparation: { requestOwnerEpoch: 'owner', requestId: 'prep' },
+        preparedActivation: {}, candidatePreview: null, managerApply: null,
+      },
+    });
+    await act(async () => { await hooks!.deployment.revert(); });
+    expect(hooks!.deployment.pendingApplyConfirmation).not.toBeNull();
+
+    await act(async () => { await hooks!.deployment.confirmApply(); });
+    expect(apiMock.deploymentWorkspace.revert).toHaveBeenLastCalledWith(
+      expect.objectContaining({ expectedAdmissionGeneration: 12 }),
+      { token: digest('7'), preparation: { requestOwnerEpoch: 'owner', requestId: 'prep' } },
+    );
+    expect(apiMock.deploymentWorkspace.applyDraft).not.toHaveBeenCalled();
+  });
+
+  it('keeps a confirmed Revert a Revert with a distinct Program Draft, fenced on the Deployment Draft', async () => {
+    // Saved Deployment differs from Applied, the Deployment Draft is the
+    // Applied one, and the Program Draft is edited (neither Saved nor Applied).
+    const idle = {
+      ...HELD, hold: 'idle' as const, cycle: idleCycle(null), admissionGeneration: 12,
+      programRevision: digest('f'), savedDeployment: digest('5'),
+    };
+    await mount(idle);
+    const response = (status: 'confirmation_required' | 'applied') => ({
+      schemaVersion: 'manyforge.composer_deployment_candidate_operation.v1',
+      workspace: deploymentWorkspace(idle),
+      result: {
+        status, confirmationToken: status === 'applied' ? null : digest('7'),
+        preparation: status === 'applied' ? null : { requestOwnerEpoch: 'owner', requestId: 'prep' },
+        preparedActivation: {}, candidatePreview: null, managerApply: null,
+      },
+    });
+    apiMock.deploymentWorkspace.revert.mockResolvedValueOnce(response('confirmation_required'));
+    await act(async () => { await hooks!.deployment.revert(); });
+    expect(hooks!.deployment.pendingApplyConfirmation).not.toBeNull();
+    expect(hooks!.deployment.pendingConfirmationAction).toBe('revert');
+
+    apiMock.deploymentWorkspace.revert.mockResolvedValueOnce(response('applied'));
+    await act(async () => { await hooks!.deployment.confirmApply(); });
+    expect(apiMock.deploymentWorkspace.revert).toHaveBeenLastCalledWith(
+      expect.objectContaining({
+        draftId: 'deployment-draft-1', expectedDraftRevision: 1, expectedAdmissionGeneration: 12,
+      }),
+      { token: digest('7'), preparation: { requestOwnerEpoch: 'owner', requestId: 'prep' } },
+    );
+    expect(apiMock.deploymentWorkspace.applyDraft).not.toHaveBeenCalled();
+    expect(apiMock.programWorkspace.apply).not.toHaveBeenCalled();
+    expect(hooks!.deployment.pendingApplyConfirmation).toBeNull();
+    expect(hooks!.deployment.pendingConfirmationAction).toBeNull();
+    expect(hooks!.deployment.feedback).toBe('Saved Scenario restored through the authoritative Apply.');
   });
 
   it('Applies the Deployment Draft after Reset, handing a disruptive impact to its ordinary confirmation', async () => {

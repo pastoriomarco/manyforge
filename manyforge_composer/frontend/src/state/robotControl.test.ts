@@ -309,7 +309,11 @@ describe('addressed Robot Control state', () => {
     expect(participant.component_role_id).toBe('controlled_component');
     expect(participant.target_role_id).toBe('command_target');
     expect(participant.payload.base_frame_role_id).toBe('base');
-    expect(participant.payload.tcp_frame_role_id).toBe('tcp');
+    expect(participant.payload.tcp_endpoint).toEqual({
+      target_role_id: status.directControl!.targetRoleId,
+      frame_role_id: status.directControl!.tcpFrameRoleId,
+    });
+    expect(participant.payload).not.toHaveProperty('tcp_frame_role_id');
     expect(participant.payload.motion).toEqual({
       kind: 'joint_goal',
       joint_names: ['joint1', 'joint2'],
@@ -334,6 +338,7 @@ describe('addressed Robot Control state', () => {
     expect(state.phase).toBe('planning');
     expect(state.preview).toBeNull();
     expect(state.generation).toBe(ready.generation + 2);
+    const motionKinds: string[] = [];
     for (const mode of ['joint', 'pose_goal', 'move_to', 'cartesian_path'] as const) {
       const payload = buildPreviewIntent({ ...state, mode }, `settings-${mode}`).participants[0].payload;
       expect(payload).toMatchObject({ kind: 'motion',
@@ -341,12 +346,22 @@ describe('addressed Robot Control state', () => {
         per_joint_dynamics_limits: { joint1: { max_velocity_rad_s: 0.5, max_acceleration_rad_s2: 0.8 },
           joint2: { max_velocity_rad_s: 0.7 } },
       });
+      if (payload.kind !== 'motion') throw new Error('expected motion payload');
+      motionKinds.push(payload.motion.kind);
+      expect(payload.tcp_endpoint).toEqual({
+        target_role_id: state.status!.directControl!.targetRoleId,
+        frame_role_id: state.status!.directControl!.tcpFrameRoleId,
+      });
+      expect(payload).not.toHaveProperty('tcp_frame_role_id');
       if (mode === 'cartesian_path') expect(payload).toMatchObject({ motion: {
         max_angular_speed_rad_s: 0.2,
         max_linear_acceleration_mps2: 0.15, max_angular_acceleration_rad_s2: 0.6,
         max_blend_deviation_rad: 0.02,
       }, tolerances: { translation_tol_m: 0.003, rotation_tol_rad: 0.04 } });
     }
+    expect(motionKinds).toEqual(expect.arrayContaining([
+      'joint_goal', 'pose_goal', 'cartesian_path',
+    ]));
     expect(robotControlReducer(state, { type: 'revert' }).motionSettings).toBe(state.motionSettings);
     const cleared = robotControlReducer(state, { type: 'edit_motion_settings', update: {
       jointLimits: { joint1: { max_velocity_rad_s: null, max_acceleration_rad_s2: null }, joint2: { max_velocity_rad_s: null } },

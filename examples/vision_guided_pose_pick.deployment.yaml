@@ -1066,7 +1066,7 @@
         "record_kind": "component_type",
         "record_revision": "sha256:2c6a3ed8a3792542d9169e26bd116c01a8852ec7967a774b4a79d3509cc7ff94",
         "schema_id": "manyforge.component_type.v1",
-        "schema_revision": "sha256:8e728ad4442d46b98f0d0534f8189df9b7982f982ab99cb656e6fdbeef231009"
+        "schema_revision": "sha256:2f26f97a7454e620bfb39e16eeccc0b23ae2de61c32e3e8210eff46945d01fc4"
       },
       {
         "content_addressed_store_key": "catalog/maintained/control_interface_contract/manyforge.ros2_control_arm_position/d951ffd368654ba9998355a4b12844014469753c3c21e05df3b61f6f669cbb4b",
@@ -1163,7 +1163,7 @@
     ]
   },
   "deployment_artifact_id": "ur5_roboplan_local_vision_guided_pose_pick",
-  "deployment_revision": "sha256:a452567e11d291aa7a5bf603ad478046bf7f73c93edabd9b515e2fba5981c1b8",
+  "deployment_revision": "sha256:dda83d7a80094bfe16fe9c580d217f125e7818f810a9e5d3aba0511a06aef0f9",
   "description": "Local deployment for the vision-guided pose-pick example. It requires one connected native viewer snapshot source so assistant.query_model can attach a live scene snapshot.",
   "desired_control_configurations": [
     {

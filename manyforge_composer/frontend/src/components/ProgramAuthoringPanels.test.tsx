@@ -20,7 +20,10 @@ import type {
 } from '../types/api';
 import { ProgramDeclarationsEditor } from './ProgramDeclarationsEditor';
 import { ProgramContactPolicyEditor } from './ProgramContactPolicyEditor';
-import { ProgramDocumentControls } from './ProgramDocumentControls';
+import { DocumentControls } from './DocumentControls';
+import { programDocumentHeader } from './ProgramDocumentControls';
+import { ScenarioActionControls } from './ScenarioActionControls';
+import type { DeploymentWorkspaceController } from '../hooks/useDeploymentWorkspace';
 import { ScenarioDocumentCommands } from './ScenarioDocumentCommands';
 import { NodePaletteItem } from './NodePaletteItem';
 import {
@@ -418,6 +421,67 @@ describe('Program authoring panels', () => {
     expect(markup).toContain('Contact policies');
     expect(markup).toContain('Object support contacts');
     expect(markup).toContain('Runtime object key');
+    expect(markup).toContain('Contact body source');
+    expect(markup).toContain('Selected motion endpoint');
+  });
+
+  it('renders one declared qualified TCP endpoint selector', () => {
+    const entry: CatalogEntry = {
+      ...timer,
+      id: 'motion.move_to_pose',
+      parameters: [
+        { id: 'target_role', required: true, hasDefault: false,
+          schema: { type: 'string' }, schemaHash: 'sha256:target-role' },
+        { id: 'base_frame_role', required: true, hasDefault: false,
+          schema: { type: 'string' }, schemaHash: 'sha256:base-role' },
+        { id: 'tcp_endpoint', required: true, hasDefault: false,
+          schema: {
+            type: 'object', additionalProperties: false,
+            required: ['target_role', 'frame_role'],
+            properties: { target_role: { type: 'string' }, frame_role: { type: 'string' } },
+          }, schemaHash: 'sha256:tcp-endpoint' },
+      ],
+    };
+    const node: ProgramTreeNode = {
+      node_id: entry.id,
+      instance_id: 'move',
+      parameters: {
+        target_role: 'arm', base_frame_role: 'base',
+        tcp_endpoint: { target_role: 'arm', frame_role: 'tcp' },
+      },
+      children: [],
+    };
+    const program: ProgramAuthoringDocument = {
+      ...authoringProgram([node]),
+      target_roles: {
+        arm: { component_role: 'robot', required_frame_roles: ['base', 'tcp'] },
+        tool: { component_role: 'robot', required_frame_roles: ['tcp', 'jaw_contact'] },
+      },
+    };
+    const markup = renderToStaticMarkup(<ProgramPropertyEditor
+      roots={[node]}
+      selectedId="move"
+      catalogEntries={[entry]}
+      program={program}
+      busy={false}
+      onMutate={vi.fn()}
+      onUpdateNodePolicies={vi.fn()}
+    />);
+
+    expect(markup).toContain('aria-label="Motion TCP endpoint"');
+    expect(markup).toContain(
+      'same physical component as the motion target; this is checked when the motion starts',
+    );
+    expect(markup).not.toContain('Apply checks that the endpoint shares');
+    expect(markup).toContain(
+      'Current-pose capture is available when the selected endpoint matches the robot’s current TCP.',
+    );
+    expect(markup).toContain('arm · tcp');
+    expect(markup).toContain('tool · jaw_contact');
+    expect(node.parameters).toEqual({
+      target_role: 'arm', base_frame_role: 'base',
+      tcp_endpoint: { target_role: 'arm', frame_role: 'tcp' },
+    });
   });
 
   it('renders one deterministic selected tree and exact v1 value source', () => {
@@ -690,7 +754,7 @@ describe('Program authoring panels', () => {
       draft: { id: 'deployment', revision: 1, document: null,
         deploymentArtifactId: null, deploymentRevision: null, graphRevision: null,
         differsFromSaved: false },
-      saved: { path: null, deploymentRevision: null },
+      saved: { path: null, deploymentRevision: null, differsFromApplied: null },
       managerApplied: { activationOrder: null, deploymentRevision: null, scenarioId: null },
       runAdmission: { ready: false, reason: 'not_applied' },
       binding, scenarioCandidates: [], savedScenarioCandidates: [], unavailableReasons: [],
@@ -1268,6 +1332,7 @@ describe('Program authoring panels', () => {
       saveAs: vi.fn(),
       apply: vi.fn(),
       discard: vi.fn(),
+      discardScenario: vi.fn(),
       revert: vi.fn(),
       saveScenarioDocument: vi.fn(),
       exportScenarioDocument: vi.fn(),
@@ -1465,6 +1530,7 @@ describe('Program authoring panels', () => {
       saveAs: vi.fn(),
       apply: vi.fn(),
       discard: vi.fn(),
+      discardScenario: vi.fn(),
       revert: vi.fn(),
       saveScenarioDocument: vi.fn(),
       exportScenarioDocument: vi.fn(),
@@ -1525,10 +1591,17 @@ describe('Program authoring panels', () => {
     } satisfies ProgramRuntimeController;
     const markup = renderToStaticMarkup(
       <div>
-        <ProgramDocumentControls
-          controller={controller}
-          runtime={runtime}
+        <DocumentControls
+          {...programDocumentHeader(controller)}
           scenarioCommands={<ScenarioDocumentCommands controller={controller} />}
+          actions={(
+            <ScenarioActionControls
+              program={controller}
+              deployment={{ workspace: null, busy: false, applying: false, pendingApplyConfirmation: null,
+                documentUnavailableReason: null, mutationUnavailableReason: null } as unknown as DeploymentWorkspaceController}
+              runtime={runtime}
+            />
+          )}
         />
         <ProgramWorkspace
           controller={controller}
@@ -1552,7 +1625,7 @@ describe('Program authoring panels', () => {
       </div>,
     );
     const controlsSource = readFileSync(
-      new URL('./ProgramDocumentControls.tsx', import.meta.url),
+      new URL('./ScenarioActionControls.tsx', import.meta.url),
       'utf8',
     );
 
@@ -1560,17 +1633,14 @@ describe('Program authoring panels', () => {
     expect(markup).toContain('aria-label="Save Scenario (choose a project folder)"');
     expect(markup).toContain('aria-label="Load Scenario"');
     expect(markup).not.toContain('>Open</button>');
-    expect(controlsSource).toContain('!workspace?.applicability.applyReady');
+    expect(controlsSource).toContain('!programWorkspace?.applicability.applyReady');
     expect(controlsSource).not.toContain('Affected nodes:');
-    expect(controlsSource).toContain('workspace?.applicability.unavailableReason?.message');
-    expect(controlsSource).toContain(
-      "compact={action === 'apply' || action === 'discard' || action === 'revert'}",
-    );
+    expect(controlsSource).toContain('programWorkspace?.applicability.unavailableReason?.message');
     expect(controlsSource).toContain('Apply this Program Draft to');
     expect(controlsSource).toContain('Its Deployment will not change.');
-    expect(controlsSource).toContain('Replace the Applied Program and Draft with the Saved Program?');
+    expect(controlsSource).toContain('Replace the Draft and Applied with the Saved Scenario');
     expect(controlsSource).not.toContain('className="program-current-scenario"');
-    expect(controlsSource).toContain('Your Saved Program will not change.');
+    expect(controlsSource).toContain('Saved and the running cell do not change.');
     const settingsSource = readFileSync(
       new URL('./ProgramSettingsEditor.tsx', import.meta.url),
       'utf8',

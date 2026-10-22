@@ -7,6 +7,7 @@
 #include <algorithm>
 #include <cmath>
 #include <cstdint>
+#include <filesystem>
 #include <set>
 #include <string>
 #include <utility>
@@ -302,12 +303,24 @@ parse_prepared_activation_origin(const CanonicalValue &value) {
   const auto &kind = text(member(value, "kind"), "origin.kind");
   if (kind == "scenario") {
     require_exact_fields(
-        value, {"kind", "scenario_id", "source_document_digest"}, "origin");
+        value,
+        {"kind", "scenario_id", "source_document_digest", "project_path"},
+        "origin");
     const auto &scenario = text(member(value, "scenario_id"), "origin.scenario_id");
     if (scenario.size() > 256U) fail("prepared activation origin scenario_id exceeds its bound");
     const auto &source = text(member(value, "source_document_digest"), "origin.source_document_digest");
     require_digest(source, "origin.source_document_digest");
-    return PreparedScenarioOrigin{scenario, core::ContentDigest(source)};
+    const auto &project =
+        text(member(value, "project_path"), "origin.project_path");
+    const std::filesystem::path path(project);
+    if (project.size() > 4096U || project.find('\0') != std::string::npos ||
+        !path.is_absolute() ||
+        path.lexically_normal().generic_string() != project ||
+        (project.size() > 1U && project.back() == '/'))
+      fail("prepared activation origin project_path must be a bounded "
+           "normalized absolute folder");
+    return PreparedScenarioOrigin{scenario, core::ContentDigest(source),
+                                  project};
   }
   if (kind != "sealed_canonical_empty") fail("prepared activation origin kind is unsupported");
   require_exact_fields(value, {"kind", "cell_id", "deployment_artifact_id", "deployment_revision",
@@ -335,8 +348,11 @@ parse_prepared_activation_origin(const CanonicalValue &value) {
 CanonicalValue prepared_activation_origin_value(const PreparedActivationOrigin &origin) {
   if (const auto *scenario = std::get_if<PreparedScenarioOrigin>(&origin))
     return CanonicalValue(CanonicalValue::Object{
-        {"kind", CanonicalValue("scenario")}, {"scenario_id", CanonicalValue(scenario->scenario_id)},
-        {"source_document_digest", CanonicalValue(scenario->source_document_digest.value())}});
+        {"kind", CanonicalValue("scenario")},
+        {"scenario_id", CanonicalValue(scenario->scenario_id)},
+        {"source_document_digest",
+         CanonicalValue(scenario->source_document_digest.value())},
+        {"project_path", CanonicalValue(scenario->project_path)}});
   const auto &sealed = std::get<PreparedSealedCanonicalEmptyOrigin>(origin);
   return CanonicalValue(CanonicalValue::Object{
       {"kind", CanonicalValue("sealed_canonical_empty")}, {"cell_id", CanonicalValue(sealed.cell_id.value())},

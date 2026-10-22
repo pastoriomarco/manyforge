@@ -1,0 +1,319 @@
+{
+  "authority_label": "owner-issued scoped facts",
+  "basis": {
+    "admission_generation": 7,
+    "alarm_generation": 3,
+    "alarm_owner_epoch": "alarms.epoch.1",
+    "alarm_state_revision": 5,
+    "applied_program_generation": 6,
+    "applied_program_owner_epoch": "program-owner.epoch.1",
+    "execution_owner_epoch": "execution.epoch.1",
+    "execution_publication_generation": 8,
+    "logical_scene_source_generation": 1,
+    "logical_scene_source_owner_epoch": "logical-scene.epoch.1",
+    "manager_source_owner_epoch": "manager.epoch.1",
+    "program_cycle_generation": 11,
+    "program_runner_owner_epoch": "runner.epoch.1",
+    "runtime_projection_generation": 9,
+    "runtime_projection_owner_epoch": "headless.epoch.1",
+    "scene_runtime_source_generation": 1,
+    "scene_runtime_source_owner_epoch": "scene-runtime.epoch.1"
+  },
+  "capabilities": [
+    "Observe / Render",
+    "Plan / Preview",
+    "Execute / Control"
+  ],
+  "components": [
+    {
+      "contributor_ids": [
+        "manager",
+        "logical_scene",
+        "scene_runtime",
+        "viewer_model"
+      ],
+      "detail": "Observe / Render prerequisites are current",
+      "generation": null,
+      "id": "observe_render",
+      "label": "Observe / Render",
+      "owner_epoch": null,
+      "owner_id": null,
+      "reason_code": null,
+      "required": true,
+      "required_for": [
+        "Observe / Render"
+      ],
+      "scope": "functional_scope",
+      "status": "healthy"
+    },
+    {
+      "contributor_ids": [
+        "manager",
+        "logical_scene",
+        "viewer_model",
+        "execution_owner",
+        "execution_target",
+        "planner_collision"
+      ],
+      "detail": "Plan / Preview prerequisites are current",
+      "generation": null,
+      "id": "plan_preview",
+      "label": "Plan / Preview",
+      "owner_epoch": null,
+      "owner_id": null,
+      "reason_code": null,
+      "required": true,
+      "required_for": [
+        "Plan / Preview"
+      ],
+      "scope": "functional_scope",
+      "status": "healthy"
+    },
+    {
+      "contributor_ids": [
+        "manager",
+        "applied_program",
+        "program_runner",
+        "execution_owner",
+        "execution_target",
+        "stop_capability"
+      ],
+      "detail": "Execute / Control prerequisites are current",
+      "generation": null,
+      "id": "execute_control",
+      "label": "Execute / Control",
+      "owner_epoch": null,
+      "owner_id": null,
+      "reason_code": null,
+      "required": true,
+      "required_for": [
+        "Execute / Control"
+      ],
+      "scope": "functional_scope",
+      "status": "healthy"
+    },
+    {
+      "contributor_ids": [],
+      "detail": "active graph and required runtime units are converged",
+      "generation": 4,
+      "id": "manager",
+      "label": "Manager",
+      "owner_epoch": "manager.epoch.1",
+      "owner_id": "manager",
+      "reason_code": null,
+      "required": true,
+      "required_for": [
+        "Observe / Render",
+        "Plan / Preview",
+        "Execute / Control"
+      ],
+      "scope": "composition",
+      "status": "healthy"
+    },
+    {
+      "contributor_ids": [],
+      "detail": "required runtime contract is present and converged",
+      "generation": 7,
+      "id": "runtime_unit:robot.native",
+      "label": "robot.native",
+      "owner_epoch": "native.epoch.1",
+      "owner_id": "robot.native",
+      "reason_code": "runtime_unit_converging",
+      "required": true,
+      "required_for": [
+        "Plan / Preview",
+        "Execute / Control"
+      ],
+      "scope": "component",
+      "status": "healthy"
+    },
+    {
+      "contributor_ids": [],
+      "detail": "pick · cell-pick",
+      "generation": 6,
+      "id": "applied_program",
+      "label": "Applied Program and admission",
+      "owner_epoch": "program-owner.epoch.1",
+      "owner_id": "program-owner",
+      "reason_code": null,
+      "required": true,
+      "required_for": [
+        "Execute / Control"
+      ],
+      "scope": "program",
+      "status": "healthy"
+    },
+    {
+      "contributor_ids": [],
+      "detail": "authoring is currently available",
+      "generation": 7,
+      "id": "authoring_admission",
+      "label": "Authoring admission",
+      "owner_epoch": null,
+      "owner_id": null,
+      "reason_code": null,
+      "required": false,
+      "required_for": [
+        "Program and Deployment editing"
+      ],
+      "scope": "authoring",
+      "status": "healthy"
+    },
+    {
+      "contributor_ids": [],
+      "detail": "owner projection is current",
+      "generation": 1,
+      "id": "logical_scene",
+      "label": "Logical scene",
+      "owner_epoch": "logical-scene.epoch.1",
+      "owner_id": "logical-scene",
+      "reason_code": null,
+      "required": true,
+      "required_for": [
+        "Observe / Render",
+        "Plan / Preview"
+      ],
+      "scope": "scene",
+      "status": "healthy"
+    },
+    {
+      "contributor_ids": [],
+      "detail": "owner projection is current",
+      "generation": null,
+      "id": "scene_runtime",
+      "label": "Scene runtime",
+      "owner_epoch": "scene-runtime.epoch.1",
+      "owner_id": "scene-runtime",
+      "reason_code": null,
+      "required": true,
+      "required_for": [
+        "Observe / Render",
+        "Plan / Preview"
+      ],
+      "scope": "scene",
+      "status": "healthy"
+    },
+    {
+      "contributor_ids": [],
+      "detail": "current retained source model is available",
+      "generation": 1,
+      "id": "viewer_model",
+      "label": "Viewer and model",
+      "owner_epoch": "source-model.epoch.1",
+      "owner_id": "source-model",
+      "reason_code": null,
+      "required": true,
+      "required_for": [
+        "Observe / Render",
+        "Plan / Preview"
+      ],
+      "scope": "model",
+      "status": "healthy"
+    },
+    {
+      "contributor_ids": [],
+      "detail": "addressed owner for cell-a is current",
+      "generation": 8,
+      "id": "execution_owner",
+      "label": "Execution owner",
+      "owner_epoch": "execution.epoch.1",
+      "owner_id": null,
+      "reason_code": null,
+      "required": true,
+      "required_for": [
+        "Plan / Preview",
+        "Execute / Control"
+      ],
+      "scope": "execution",
+      "status": "healthy"
+    },
+    {
+      "contributor_ids": [],
+      "detail": "robot-a / arm",
+      "generation": 8,
+      "id": "execution_target",
+      "label": "Execution target",
+      "owner_epoch": "execution.epoch.1",
+      "owner_id": null,
+      "reason_code": null,
+      "required": true,
+      "required_for": [
+        "Plan / Preview",
+        "Execute / Control"
+      ],
+      "scope": "execution",
+      "status": "healthy"
+    },
+    {
+      "contributor_ids": [],
+      "detail": "addressed planning and collision contracts are available",
+      "generation": 8,
+      "id": "planner_collision",
+      "label": "Planner and collision",
+      "owner_epoch": "execution.epoch.1",
+      "owner_id": null,
+      "reason_code": null,
+      "required": true,
+      "required_for": [
+        "Plan / Preview"
+      ],
+      "scope": "planning",
+      "status": "healthy"
+    },
+    {
+      "contributor_ids": [],
+      "detail": "controlled-Stop contract is present",
+      "generation": 2,
+      "id": "stop_capability",
+      "label": "Controlled Stop",
+      "owner_epoch": "execution.epoch.1",
+      "owner_id": null,
+      "reason_code": null,
+      "required": true,
+      "required_for": [
+        "Execute / Control"
+      ],
+      "scope": "stop",
+      "status": "healthy"
+    },
+    {
+      "contributor_ids": [],
+      "detail": "cycle state terminal awaiting reset",
+      "generation": 11,
+      "id": "program_runner",
+      "label": "Program Runner",
+      "owner_epoch": "runner.epoch.1",
+      "owner_id": null,
+      "reason_code": null,
+      "required": true,
+      "required_for": [
+        "Execute / Control"
+      ],
+      "scope": "program",
+      "status": "healthy"
+    },
+    {
+      "contributor_ids": [],
+      "detail": "no active functional alarm",
+      "generation": 3,
+      "id": "operator_alarms",
+      "label": "Current functional alarms",
+      "owner_epoch": "alarms.epoch.1",
+      "owner_id": "alarms",
+      "reason_code": null,
+      "required": true,
+      "required_for": [
+        "scope named by each alarm"
+      ],
+      "scope": "alarms",
+      "status": "healthy"
+    }
+  ],
+  "maintenance_operation": null,
+  "overview_revision": "sha256:0000000000000000000000000000000000000000000000000000000000000001",
+  "profile_label": "manyforge.native_execution_runtime",
+  "readiness": "ready",
+  "schema_version": "manyforge.component_overview.v2",
+  "summary_label": "Application surfaces ready",
+  "user_message": "Observe, plan, and execute scopes are current for the active composition."
+}

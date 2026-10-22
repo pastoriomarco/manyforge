@@ -7,6 +7,7 @@ import { PersistentKeyValuesView } from './PersistentKeyValues';
 function values(programRunId: string | null = null): PersistentKeyValues {
   return {
     scenarioId: 'cell-pick',
+    projectPath: '/projects/cell-pick.scenario',
     programRevision: `sha256:${'a'.repeat(64)}`,
     programRunId,
     sequence: 5,

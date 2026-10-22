@@ -9,6 +9,8 @@ import type {
 export type { ProgramBindingDocument } from './programBindingTransport.generated';
 
 export type ArtifactKind = 'program' | 'deployment' | 'mesh';
+/** What a folder browse lists: one artifact kind, or folders only (`scenario`). */
+export type FileBrowseKind = ArtifactKind | 'scenario';
 
 export interface RuntimeAvailability {
   code: string;
@@ -24,6 +26,14 @@ export interface HealthResponse {
   headless: Record<string, unknown> | null;
   timestamp: number;
   workbenchSessionNotice?: WorkbenchSessionNotice | null;
+  /** The startup project was not opened; cleared by the next Load or New. */
+  startupScenarioNotice?: StartupScenarioNotice | null;
+}
+
+export interface StartupScenarioNotice {
+  path: string;
+  code: string;
+  message: string;
 }
 
 export interface WorkbenchSessionNotice {
@@ -136,6 +146,8 @@ export interface FileBrowserEntry {
   path: string;
   entryType: 'directory' | 'file';
   selectable: boolean;
+  /** A folder that is itself a Scenario project (`*.scenario`). */
+  scenarioProject: boolean;
 }
 
 export interface FileBrowserResponse {
@@ -410,6 +422,10 @@ export interface ScenarioDocumentEntry {
   path: string;
   scenarioId: string | null;
   name: string;
+  /** The project folder name without `.scenario`: the name the GUI shows. */
+  folderName: string;
+  /** Its parent folder relative to the allowed root, to tell same names apart. */
+  location: string;
   description: string;
   savedManyforgeVersion: string | null;
   displayStatus: ScenarioDocumentDisplayStatus;
@@ -431,12 +447,21 @@ export interface ScenarioDocumentSaveResponse {
 }
 
 export interface NewScenarioDocumentInput {
-  path: string;
+  /** The parent folder; the project is created as `<directory>/<name>.scenario`. */
+  directory: string;
   name: string;
   deploymentChoice: 'empty';
   expectedRetainedBundleId: string;
   expectedGraphRevision: string;
   confirmDiscard: boolean;
+}
+
+/** Save the Scenario as `<directory>/<name>.scenario`; the name is also its ID. */
+export interface SaveScenarioDocumentInput {
+  directory: string;
+  name: string;
+  description: string;
+  confirmOverwrite: boolean;
 }
 
 export type ScenarioDocumentActivation =
@@ -567,6 +592,8 @@ export interface DeploymentWorkspaceResponse {
   saved: {
     path: string | null;
     deploymentRevision: string | null;
+    /** The server's Saved-vs-Applied comparison; null while either is unknown. */
+    differsFromApplied: boolean | null;
   };
   managerApplied: {
     activationOrder: {
@@ -589,6 +616,8 @@ export interface DeploymentWorkspaceResponse {
 
 export type PreparedActivationOrigin = {
   kind: 'scenario'; scenarioId: string; sourceDocumentDigest: string;
+  /** The Scenario project folder; it scopes persistent values. */
+  projectPath: string;
 } | {
   kind: 'sealed_canonical_empty'; cellId: string; deploymentArtifactId: string;
   deploymentRevision: string; retainedBundleId: string; graphRevision: string;
@@ -692,6 +721,8 @@ export interface CurrentScenarioResponse {
 export interface AppliedProgramSelection {
   schemaVersion: 'manyforge.applied_program_selection.v3';
   scenarioId: string;
+  /** The Applied Scenario project folder; it scopes persistent values. */
+  projectPath: string;
   sourceDocumentDigest: string;
   programId: string;
   programRevision: string;
@@ -905,6 +936,8 @@ export interface PersistentKeyValueEdit {
 /** Stored persistent values of one Scenario, owned by the Program runner. */
 export interface PersistentKeyValues {
   scenarioId: string;
+  /** The Applied Scenario project folder the values belong to. */
+  projectPath: string;
   programRevision: string;
   /** The live run that currently holds the values, if any. */
   programRunId: string | null;
@@ -927,7 +960,7 @@ export interface PersistentKeyValues {
 
 export interface PersistentKeyValuesCleared {
   requestId: string;
-  scenarioId: string;
+  projectPath: string;
   removed: number;
 }
 

@@ -1,6 +1,7 @@
 #include <algorithm>
 #include <manyforge_core/component_lifecycle_plan_catalog_codec.hpp>
 #include <manyforge_core/component_lifecycle_plan_evaluator.hpp>
+#include <manyforge_core/types/lifecycle_cause.hpp>
 #include <string>
 #include <string_view>
 #include <utility>
@@ -38,19 +39,46 @@ template <typename Health>
 }
 
 template <typename Health>
+[[nodiscard]] std::string observed_token_fact(const Health& observation, std::string_view id) {
+  const auto found = std::find_if(
+      observation.facts.begin(), observation.facts.end(),
+      [id](const LifecycleFactDTO& fact) { return fact.lifecycle_fact_id.value() == id; });
+  if (found == observation.facts.end()) return "missing";
+  if (found->value.kind != LifecycleFactValueKindDTO::kToken || !found->value.token_value)
+    return "nontoken";
+  return found->value.token_value->substr(0, kMaxLifecycleErrorDetailValueBytes);
+}
+
+template <typename Health>
 [[nodiscard]] Result<LifecycleDomainPlanDecision> reject_evaluation(
     std::string code, std::string message, std::string reason,
     const Health& observation) {
-  return Result<LifecycleDomainPlanDecision>::Err(ErrorDTO{
+  // Robot providers publish external.* facts; the generic I/O driver publishes
+  // io.driver.* facts under the same detail keys (plus resources_ready).
+  const bool io_driver = std::any_of(
+      observation.facts.begin(), observation.facts.end(), [](const LifecycleFactDTO& fact) {
+        return fact.lifecycle_fact_id.value().starts_with("io.driver.");
+      });
+  const std::string prefix = io_driver ? "io.driver." : "external.";
+  ErrorDTO error{
       std::move(code),
       std::move(message),
       {{"reason", std::move(reason)},
        {"observed_state", std::string(to_string(observation.observed_state))},
        {"observed_controller_loaded",
         observed_boolean_fact(observation, "external.controller_loaded")},
-       {"observed_fault_present", observed_boolean_fact(observation, "external.fault_present")},
+       {"observed_fault_present", observed_boolean_fact(observation, prefix + "fault_present")},
        {"observed_transport_ready",
-        observed_boolean_fact(observation, "external.transport_ready")}}});
+        observed_boolean_fact(observation, prefix + "transport_ready")},
+       {"observed_blocking_cause",
+        observed_token_fact(observation, kLifecycleBlockingCauseFactId)}}};
+  if (io_driver)
+    error.details.emplace("observed_resources_ready",
+                          observed_boolean_fact(observation, "io.driver.resources_ready"));
+  if (observation.diagnostic && !observation.diagnostic->code.empty())
+    error.details.emplace("observed_diagnostic_code",
+                          observation.diagnostic->code.substr(0, kMaxLifecycleErrorDetailValueBytes));
+  return Result<LifecycleDomainPlanDecision>::Err(std::move(error));
 }
 
 [[nodiscard]] bool occurrence_matches_observation(

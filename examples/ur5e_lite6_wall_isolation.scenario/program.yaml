@@ -84,7 +84,10 @@
             ],
             "planning_timeout_s": 10.0,
             "target_role": "lite6_arm",
-            "tcp_frame_role": "tcp"
+            "tcp_endpoint": {
+              "frame_role": "tcp",
+              "target_role": "lite6_arm"
+            }
           },
           "value_sources": {
             "acceleration_scale": {
@@ -143,7 +146,10 @@
             ],
             "planning_timeout_s": 10.0,
             "target_role": "ur5e_arm",
-            "tcp_frame_role": "tcp"
+            "tcp_endpoint": {
+              "frame_role": "tcp",
+              "target_role": "ur5e_arm"
+            }
           },
           "value_sources": {
             "acceleration_scale": {

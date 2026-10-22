@@ -24,6 +24,8 @@ from .security import normalize_allowed_roots
 _PROGRAM_SUFFIXES = (".program.yaml", ".program.yml")
 _DEPLOYMENT_SUFFIXES = (".deployment.yaml", ".deployment.yml")
 _MESH_SUFFIXES = (".obj", ".stl", ".ply", ".glb", ".gltf")
+# A folder with this suffix is a Scenario project (the project marker).
+_SCENARIO_PROJECT_SUFFIX = ".scenario"
 
 # Browsing is an authoring convenience, not a bulk filesystem-indexing API.
 # These limits bound every caller-controlled dimension before sorting or JSON
@@ -61,12 +63,16 @@ class FileBrowserEntryResponse(BaseModel):
     path: str = Field(min_length=1, max_length=_MAX_BROWSE_PATH_BYTES)
     entry_type: Literal["directory", "file"] = Field(alias="entryType")
     selectable: bool
+    # A directory that is itself a Scenario project folder (``*.scenario``).
+    scenario_project: bool = Field(default=False, alias="scenarioProject")
 
     @model_validator(mode="after")
     def _validate_selectability(self) -> "FileBrowserEntryResponse":
         expected = self.entry_type == "file"
         if self.selectable is not expected:
             raise ValueError("only file entries may be selectable")
+        if self.scenario_project and self.entry_type != "directory":
+            raise ValueError("only directory entries may be Scenario projects")
         return self
 
 
@@ -346,6 +352,7 @@ def _entry_payload(current_dir: Path, name: str, *, is_dir: bool) -> dict[str, A
         "path": path,
         "entryType": "directory" if is_dir else "file",
         "selectable": not is_dir,
+        "scenarioProject": is_dir and name.endswith(_SCENARIO_PROJECT_SUFFIX),
     }
 
 
@@ -476,7 +483,10 @@ def create_filesystem_router(allowed_roots: list[str] | None = None) -> APIRoute
         # The byte-exact check stays inside the handler so an oversized value
         # gets one bounded error instead of a validation body echoing the path.
         path: str | None = Query(default=None),
-        kind: str = Query(default="program", pattern="^(program|deployment|mesh)$"),
+        # ``scenario`` lists folders only, marking Scenario project folders.
+        kind: str = Query(
+            default="program", pattern="^(program|deployment|mesh|scenario)$"
+        ),
     ) -> dict:
         if path is None:
             current_dir, descriptor, initial_metadata = _open_default_browse_root(

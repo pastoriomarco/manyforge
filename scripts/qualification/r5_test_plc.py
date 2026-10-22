@@ -29,10 +29,10 @@ def check_endpoints_unused() -> None:
         until = time.monotonic() + 1.0
         while time.monotonic() < until:
             rclpy.spin_once(node, timeout_sec=0.1)
-            service_present = any(
-                name == "/plc_io/start" for name, _types in node.get_service_names_and_types()
-            )
-            if service_present or node.count_publishers("/plc_io/ready"):
+            # Only an actual server or publisher occupies an endpoint; the
+            # graph also lists a service name that has only clients, such as
+            # ManyForge's own plc_io client once a Scenario is loaded.
+            if node.count_services("/plc_io/start") or node.count_publishers("/plc_io/ready"):
                 raise RuntimeError("PLC test endpoints already have a server or publisher")
     finally:
         node.destroy_node()

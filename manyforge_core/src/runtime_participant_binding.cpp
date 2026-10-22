@@ -200,11 +200,13 @@ Result<RuntimeParticipantBinding> verify_runtime_participant_binding(
     if (value.control_path || !value.resources.empty() || !value.model_bindings.empty() ||
         !value.model_groups.empty() || !value.frame_bindings.empty() ||
         !value.collision_body_bindings.empty() || !value.contact_grasp_bindings.empty() ||
-        !value.supporting_capability_provider_paths.empty() || !value.command_schema ||
-        value.command_schema->command_schema_id.empty() || value.command_schema->command_schema_revision.empty() ||
-        !value.capability_provider_path || !valid_provider_path(*value.capability_provider_path) ||
+        value.motion_endpoint || !value.supporting_capability_provider_paths.empty() ||
+        !value.command_schema || value.command_schema->command_schema_id.empty() ||
+        value.command_schema->command_schema_revision.empty() || !value.capability_provider_path ||
+        !valid_provider_path(*value.capability_provider_path) ||
         value.capability_provider_path->capability_id != value.capability_id ||
-        value.capability_provider_path->capability_definition_revision != value.capability_definition_revision ||
+        value.capability_provider_path->capability_definition_revision !=
+            value.capability_definition_revision ||
         output.resource_role_id.empty() || !output.component_lifecycle_generation.nonzero() ||
         !output.provider.locally_valid() || !output.completion_policy.locally_valid() ||
         !IsExactLowercaseSha256Digest(output.signal_configuration_digest.value()) ||
@@ -265,6 +267,50 @@ Result<RuntimeParticipantBinding> verify_runtime_participant_binding(
       })) {
     return invalid("runtime participant frame bindings are incomplete or duplicate",
                    "runtime_frame_binding_invalid");
+  }
+  if (value.motion_endpoint) {
+    const auto& endpoint = *value.motion_endpoint;
+    const auto& frame = endpoint.frame;
+    const auto& roles = frame.contact_body_role_ids;
+    if (!value.control_path || value.model_groups.size() != 1U || endpoint.target_role_id.empty() ||
+        endpoint.command_target_id.empty() || frame.frame_role_id.empty() ||
+        frame.model_instance_id.empty() || frame.model_revision.empty() ||
+        frame.compiled_frame_name.empty() ||
+        frame.model_instance_id != value.model_groups.front().model_instance_id ||
+        std::count_if(value.model_bindings.begin(), value.model_bindings.end(),
+                      [&](const auto& model) {
+                        return model.model_instance_id == frame.model_instance_id &&
+                               model.model_revision == frame.model_revision;
+                      }) != 1 ||
+        roles.size() > kMaxProgramNestedRoleBindings ||
+        !sorted_unique(roles, [](const auto& role) { return role; }) ||
+        std::any_of(roles.begin(), roles.end(), [](const auto& role) { return role.empty(); }) ||
+        endpoint.contact_body_bindings.size() != roles.size()) {
+      return invalid("motion endpoint is outside the exact motion component/model",
+                     "runtime_motion_endpoint_invalid");
+    }
+    for (std::size_t index = 0; index < roles.size(); ++index) {
+      const auto& body = endpoint.contact_body_bindings[index];
+      if (body.component_role_id.empty() || body.target_role_id != endpoint.target_role_id ||
+          body.controllable_component_id != value.controllable_component_id ||
+          body.command_target_id != endpoint.command_target_id ||
+          (body.model_role_id && body.model_role_id->empty()) ||
+          body.collision_body_role_id != roles[index] ||
+          body.model_instance_id != frame.model_instance_id ||
+          body.model_revision != frame.model_revision || body.collision_body_ids.empty() ||
+          body.collision_body_ids.size() > kMaxProgramNestedRoleBindings) {
+        return invalid("motion endpoint body is outside its exact frame owner/model",
+                       "runtime_motion_endpoint_body_invalid");
+      }
+      for (std::size_t body_index = 0; body_index < body.collision_body_ids.size(); ++body_index) {
+        if (body.collision_body_ids[body_index] !=
+            make_component_collision_body_id(value.controllable_component_id,
+                                             frame.model_instance_id, roles[index], body_index)) {
+          return invalid("motion endpoint body does not retain its exact semantic identity",
+                         "runtime_motion_endpoint_body_invalid");
+        }
+      }
+    }
   }
   std::set<std::string, std::less<>> source_joint_names;
   if (!unique_nonempty(value.resources, [](const auto& item) { return item.resource_id; }) ||
@@ -356,11 +402,9 @@ Result<RuntimeParticipantBinding> verify_runtime_participant_binding(
           value.contact_grasp_bindings.begin(), value.contact_grasp_bindings.end(),
           [&](const auto& policy) {
             if (policy.contact_policy_id.empty() || policy.contact_policy_revision.empty() ||
-                policy.runtime_object_id.empty() || policy.allowed_body_bindings.empty() ||
-                !std::isfinite(policy.max_penetration_m) || policy.max_penetration_m <= 0.0 ||
-                !std::isfinite(policy.terminal_window_start_fraction) ||
-                policy.terminal_window_start_fraction < 0.0 ||
-                policy.terminal_window_start_fraction > 1.0 ||
+                policy.runtime_object_id.empty() ||
+                policy.bodies_from_motion_endpoint != policy.allowed_body_bindings.empty() ||
+                !valid_program_contact_envelope(policy.envelope) ||
                 !sorted_unique(policy.allowed_body_bindings, [](const auto& body) {
                   return std::tie(body.component_role_id, body.target_role_id, body.model_role_id,
                                   body.collision_body_role_id);
@@ -425,20 +469,28 @@ Result<RuntimeParticipantBinding> bind_runtime_participant_collision_body_aliase
   }
 
   auto value = binding.value();
-  for (auto& policy : value.contact_grasp_bindings) {
-    for (auto& body : policy.allowed_body_bindings) {
+  const auto project_bodies = [&](auto& bodies) {
+    for (auto& body : bodies) {
       std::set<std::string, std::less<>> projected_ids;
       for (auto& body_id : body.collision_body_ids) {
         const auto alias = by_semantic.find(CollisionBodyId(body_id));
         if (alias == by_semantic.end() || !projected_ids.insert(alias->second).second) {
-          return invalid(
-              "runtime contact-grasp body has no unique exact "
-              "physical projection",
-              "runtime_collision_body_alias_unresolved");
+          return false;
         }
         body_id = alias->second;
       }
     }
+    return true;
+  };
+  for (auto& policy : value.contact_grasp_bindings) {
+    if (!project_bodies(policy.allowed_body_bindings)) {
+      return invalid("runtime contact-grasp body has no unique exact physical projection",
+                     "runtime_collision_body_alias_unresolved");
+    }
+  }
+  if (value.motion_endpoint && !project_bodies(value.motion_endpoint->contact_body_bindings)) {
+    return invalid("runtime motion-endpoint body has no unique exact physical projection",
+                   "runtime_collision_body_alias_unresolved");
   }
   return Result<RuntimeParticipantBinding>::Ok(RuntimeParticipantBinding(std::move(value)));
 }

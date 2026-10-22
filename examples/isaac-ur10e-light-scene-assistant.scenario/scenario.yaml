@@ -5,15 +5,15 @@
     "deployment_present": true,
     "program_present": true
   },
-  "description": "Retained Isaac UR10e light-scene deployment with the ROS 2 control execution product and the finite assistant scene-authoring overlay; simulator mutation remains operator-approved.",
+  "description": "isaac_manipulator_scene_light_assistant\n\nRetained Isaac UR10e light-scene deployment with the ROS 2 control execution product and the finite assistant scene-authoring overlay; simulator mutation remains operator-approved.",
   "members": {
     "assignment.yaml": "sha256:0609b83a2c63f70215b846bae55b156fc1e15046d49c48f2c7b579f7b4be09a0",
     "deployment.yaml": "sha256:22bc0ed103f4a51a6c9f60794ede4294952e2a2f8a824afd6b2cb35976dae132",
-    "program.yaml": "sha256:51db879465f2372ce1eed550b0a3675b8399098dc813e5f6f670db08b37efcd6"
+    "program.yaml": "sha256:004ad2b411a9d15d6e3abeae7ded97de54082e9fc534a81f6267967a15b7b8e6"
   },
-  "name": "isaac_manipulator_scene_light_assistant",
+  "name": "isaac-ur10e-light-scene-assistant",
   "saved_status": {
-    "checked_content_digest": "sha256:df712937ff13a8c7e826c88da04f6735bf468118dd19812dab4a85c316949ffe",
+    "checked_content_digest": "sha256:ca067560014797dd9f7a2ba378662b096b27853bc6c1d64ca60f942dd79a42d7",
     "last_known_status": "ready",
     "manyforge_version": "0.1.0"
   },

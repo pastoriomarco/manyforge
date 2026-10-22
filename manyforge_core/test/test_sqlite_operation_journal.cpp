@@ -1183,14 +1183,22 @@ TEST(SqliteOperationJournalTest, AcceptedMotionRecordsAbsoluteGoalFrameAndRobotQ
   Pose3DTO goal;
   goal.position_m = {0.1, 0.2, 0.3};
   goal.orientation.w = 1.0;
-  MotionParticipantIntentDTO motion{MoveId("move.framed"), FrameRoleId("base"),
-                                    FrameRoleId("tcp"),    TolerancesDTO{0.01, 0.001, 0.01},
-                                    SpeedProfileDTO{},     TimeoutsDTO{},
-                                    CacheMode::kDefault,   PlanningProfileDTO::kBalanced,
-                                    MotionTargetModeDTO::kAbsolute,
-                                    std::nullopt,          std::nullopt,
-                                    PoseGoalDTO{goal},     std::nullopt,
-                                    {},                    {}};
+  MotionParticipantIntentDTO motion{
+      MoveId("move.framed"),
+      FrameRoleId("base"),
+      MotionEndpointReferenceDTO{TargetRoleId("arm"), FrameRoleId("tcp")},
+      TolerancesDTO{0.01, 0.001, 0.01},
+      SpeedProfileDTO{},
+      TimeoutsDTO{},
+      CacheMode::kDefault,
+      PlanningProfileDTO::kBalanced,
+      MotionTargetModeDTO::kAbsolute,
+      std::nullopt,
+      std::nullopt,
+      PoseGoalDTO{goal},
+      std::nullopt,
+      {},
+      {}};
   motion.goal_frame_reference =
       ReferenceDTO(FrameRoleId("tcp"),
                    ReferenceTargetDTO{TargetRoleId("peer_arm"),
@@ -2646,21 +2654,22 @@ TEST(SqliteOperationJournalTest, CapturedScopeAndFailureAreImmutableAcrossOwnerR
   const std::vector<ResourceId> inventory{ResourceId("robot.joint1")};
   auto intent = CommandIntent("retry.context", epoch.value());
   intent.participants.front().required_capability_id = CapabilityId("execution.trajectory.execute");
-  intent.participants.front().payload = MotionParticipantIntentDTO{MoveId("move"),
-                                                                   FrameRoleId("base"),
-                                                                   FrameRoleId("tcp"),
-                                                                   TolerancesDTO{},
-                                                                   SpeedProfileDTO{},
-                                                                   TimeoutsDTO{},
-                                                                   CacheMode::kDefault,
-                                                                   PlanningProfileDTO::kBalanced,
-                                                                   MotionTargetModeDTO::kAbsolute,
-                                                                   std::nullopt,
-                                                                   std::nullopt,
-                                                                   JointGoalDTO{{"joint1"}, {0.25}},
-                                                                   std::nullopt,
-                                                                   {},
-                                                                   {}};
+  intent.participants.front().payload = MotionParticipantIntentDTO{
+      MoveId("move"),
+      FrameRoleId("base"),
+      MotionEndpointReferenceDTO{TargetRoleId("arm"), FrameRoleId("tcp")},
+      TolerancesDTO{},
+      SpeedProfileDTO{},
+      TimeoutsDTO{},
+      CacheMode::kDefault,
+      PlanningProfileDTO::kBalanced,
+      MotionTargetModeDTO::kAbsolute,
+      std::nullopt,
+      std::nullopt,
+      JointGoalDTO{{"joint1"}, {0.25}},
+      std::nullopt,
+      {},
+      {}};
   auto state = PreparedMotionState("operation.retry", 10);
   state.journal_capture_order = 1U;
   state.participants.front().execution_scope =
@@ -3958,4 +3967,56 @@ TEST(SqliteOperationJournalTest, InvalidTakeoverMetadataDoesNotAppendARecord) {
     EXPECT_EQ(events.value().events.size(), 1U);
   }
 }
+
+TEST(SqliteOperationJournalTest, AcceptedMotionRecordsItsRequiredOwnerQualifiedTcp) {
+  ScopedTemporaryDirectory temporary;
+  const RequestOwnerEpoch epoch("execution-host.endpoint");
+  SqliteOperationJournal journal(temporary.path() / "endpoint.sqlite3", CellId("cell.1"), 8U);
+  ASSERT_TRUE(journal.BeginOwnerEpoch(epoch, 1, 8U, {ResourceId("robot.gripper")}).ok());
+  for (int selected = 0; selected < 3; ++selected) {
+    auto intent = CommandIntent("endpoint-" + std::to_string(selected), epoch.value());
+    MotionParticipantIntentDTO motion{
+        MoveId("move.endpoint"),
+        FrameRoleId("base"),
+        MotionEndpointReferenceDTO{TargetRoleId("arm"), FrameRoleId("tcp")},
+        TolerancesDTO{0.01, 0.001, 0.01},
+        SpeedProfileDTO{},
+        TimeoutsDTO{},
+        CacheMode::kDefault,
+        PlanningProfileDTO::kBalanced,
+        MotionTargetModeDTO::kAbsolute,
+        std::nullopt,
+        std::nullopt,
+        JointGoalDTO{{"joint"}, {0.2}},
+        std::nullopt,
+        {},
+        {}};
+    if (selected) {
+      motion.tcp_endpoint = MotionEndpointReferenceDTO{
+          TargetRoleId("tool"), FrameRoleId(selected == 1 ? "left_tip" : "right_tip")};
+    }
+    intent.participants.front().payload = motion;
+    const auto state = OperationState("operation.endpoint-" + std::to_string(selected),
+                                      OperationStateKind::kExecuting, 10 + selected);
+    ASSERT_TRUE(
+        journal.RecordOperationAccepted(epoch, intent, Acceptance(intent, state), state).ok());
+  }
+  const auto events = journal.ReadEvents(epoch, 0U, 8U);
+  ASSERT_TRUE(events.ok()) << events.error().message;
+  ASSERT_EQ(events.value().events.size(), 3U);
+  const auto& own = events.value().events[0].payload_json;
+  EXPECT_NE(own.find("\"tcp_endpoint\":{\"frame_role_id\":\"tcp\",\"target_role_id\":\"arm\"}"),
+            std::string::npos);
+  EXPECT_EQ(own.find("tcp_frame_role_id"), std::string::npos);
+  for (std::size_t index = 1; index < 3; ++index) {
+    const auto& bytes = events.value().events[index].payload_json;
+    const std::string expected = std::string("\"tcp_endpoint\":{\"frame_role_id\":\"") +
+                                 (index == 1 ? "left_tip" : "right_tip") +
+                                 "\",\"target_role_id\":\"tool\"}";
+    EXPECT_NE(bytes.find(expected), std::string::npos);
+    EXPECT_EQ(bytes.find("tcp_frame_role_id"), std::string::npos);
+  }
+  EXPECT_NE(events.value().events[1].payload_digest, events.value().events[2].payload_digest);
+}
+
 }  // namespace

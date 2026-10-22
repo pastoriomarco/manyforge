@@ -1188,7 +1188,8 @@ def test_deployment_open_edit_save_discard_share_one_revision_fenced_workspace(
     workspace = response.json()
     assert applied is not None
     publication = {
-        "origin": {"kind": "scenario", "scenario_id": "cell_a", "source_document_digest": _DIGEST},
+        "origin": {"kind": "scenario", "scenario_id": "cell_a", "source_document_digest": _DIGEST,
+                   "project_path": "/projects/cell_a.scenario"},
         "deployment_revision": applied_revision,
         "retained_bundle_id": _DIGEST,
         "graph_revision": _DIGEST,
@@ -1205,6 +1206,7 @@ def test_deployment_open_edit_save_discard_share_one_revision_fenced_workspace(
             "program_role_assignment": {},
             "source_document_digest": _DIGEST,
             "scenario_id": "cell_a",
+            "project_path": "/projects/cell_a.scenario",
         },
         publication,
     )
@@ -1666,7 +1668,8 @@ def test_authored_deployment_apply_carries_one_prepared_identity_through_confirm
             "schema_version": "manyforge.prepared_activation_input.v6",
             "prepared_activation_id": "sha256:" + "9" * 64,
             "origin": {"kind": "scenario", "scenario_id": intent["scenario_id"],
-                       "source_document_digest": intent["source_document_digest"]},
+                       "source_document_digest": intent["source_document_digest"],
+                       "project_path": intent["project_path"]},
             "captured_input_digest": intent["captured_input_digest"],
             "deployment_artifact_id": edited["draft"]["deploymentArtifactId"],
             "deployment_revision": candidate_revision,
@@ -1830,6 +1833,61 @@ def test_authored_deployment_apply_carries_one_prepared_identity_through_confirm
         confirmation.json()["result"]["prepared_activation"]
     )
 
+    # Manager's definite refusal of the candidate (Apply or preview) is a
+    # typed 409 carrying Manager's own code and message, not an anonymous 500.
+    manager_cause = "stale_admission_generation: admission generation 7 is not current (8)"
+
+    def manager_refuses(intent, claim, *, apply, prepared=None, prepare_only=False):
+        if prepare_only:
+            return execute_candidate(
+                intent, claim, apply=apply, prepared=prepared, prepare_only=True,
+            )
+        raise AuthoringOperationError(
+            "manager_apply_rejected",
+            f"Manager rejected the exact Deployment candidate: {manager_cause}",
+        )
+
+    state.execute_authored_deployment_candidate = manager_refuses  # type: ignore[method-assign]
+    rejected = client.post(
+        "/api/deployment/draft/apply",
+        json=_request(
+            edited,
+            kind="apply-manager-rejected",
+            expectedActivationScope=scope,
+            confirmationToken=confirmation_token,
+            preparationRequestOwnerEpoch=confirmation.json()["result"][
+                "preparation"
+            ]["request_owner_epoch"],
+            preparationRequestId=confirmation.json()["result"]["preparation"][
+                "request_id"
+            ],
+            local=False,
+        ),
+    )
+    assert rejected.status_code == 409, rejected.text
+    assert rejected.json()["detail"] == {
+        "code": "manager_apply_rejected",
+        "message": f"Manager rejected the exact Deployment candidate: {manager_cause}",
+    }
+
+    def preview_refused(*_args, **_kwargs):
+        raise AuthoringOperationError(
+            "deployment_candidate_rejected",
+            f"Manager rejected the prepared Deployment candidate: {manager_cause}",
+        )
+
+    state.execute_authored_deployment_candidate = preview_refused  # type: ignore[method-assign]
+    refused_preview = client.post(
+        "/api/deployment/draft/preview",
+        json=_request(edited, kind="preview-manager-rejected", local=False),
+    )
+    assert refused_preview.status_code == 409, refused_preview.text
+    assert refused_preview.json()["detail"] == {
+        "code": "deployment_candidate_rejected",
+        "message": f"Manager rejected the prepared Deployment candidate: {manager_cause}",
+    }
+    state.execute_authored_deployment_candidate = execute_candidate  # type: ignore[method-assign]
+
     # Nothing to apply: the Manager's Applied activation already is every
     # input (Deployment, sources, assignment, Scenario) and the Applied
     # Program is the Program Draft. Refused before admission or preparation.
@@ -1841,6 +1899,7 @@ def test_authored_deployment_apply_carries_one_prepared_identity_through_confirm
         "program_role_assignment": deepcopy(state.scenario_program_role_assignment),
         "source_document_digest": "sha256:" + "6" * 64,
         "scenario_id": "lite6_pick_and_place",
+        "scenario_project_path": state.scenario_project_path,
     }
     monkeypatch.setattr(
         state, "published_scenario", lambda: {"published_scenario": {
@@ -1878,6 +1937,163 @@ def test_authored_deployment_apply_carries_one_prepared_identity_through_confirm
     assert changed.status_code == 202, changed.text
 
 
+def _scenario_revert_setup(tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
+    """Unapplied edits in both Drafts of a Scenario whose Saved Deployment
+    differs from Applied; the Manager is recorded."""
+
+    from manyforge_composer.backend import routes_deployment_draft
+    from manyforge_composer.backend.authoring_forest import derive_candidate
+
+    client, state = _client(tmp_path)
+    monkeypatch.setattr(
+        routes_deployment_draft, "_active_catalog", lambda s: s.node_environment.catalog
+    )
+    project = Path(__file__).resolve().parents[2] / "examples/lite6_pick_and_place.scenario"
+    source = project / "deployment.yaml"
+    state.allowed_fs_roots.append(str(project.parents[1]))
+    _replace_deployment_session(state, DeploymentDraftSession())
+    compiled = state.deployment_draft_session.preview_source(source.read_text(encoding="utf-8"))
+    retained = state.deployment_draft_session.retained_state()
+    retained.update({
+        "draft_revision": 1,
+        "document": compiled.document,
+        "saved_path": str(source),
+        "saved_document": compiled.document,
+    })
+    state.deployment_draft_session.restore_retained_state(retained)
+    program_model = Program(
+        str(Path(__file__).resolve().parents[2]
+            / "examples/lite6_lite_gripper_pick_and_place.program.yaml"),
+        state.node_environment.catalog,
+    )
+    saved_program = program_model.to_dict()
+    state.draft_session = ComposerDraftSession(program_model)
+    state.authoring_workspace = AuthoringWorkspace(
+        program_session=state.draft_session,
+        deployment_session=state.deployment_draft_session,
+    )
+    state.authoring_workspace.remember_project(
+        document={
+            "scenario_id": "lite6_pick_and_place",
+            "program_role_assignment": json.loads(
+                (project / "assignment.yaml").read_text(encoding="utf-8")),
+        },
+        document_path=str(project),
+        source_document_digest="sha256:" + "6" * 64,
+    )
+    # Unapplied edits in both Drafts.
+    opened = client.get("/api/deployment/workspace").json()
+    client.post(
+        "/api/deployment/draft/mutations",
+        json=_request(opened, path=["name"], value="Edited", kind="edit"),
+    )
+    program_state = state.draft_session.retained_state()
+    program_state["saved_document"] = deepcopy(saved_program)
+    program_state["saved_path"] = str(project / "program.yaml")
+    program_state["saved_program_revision"] = saved_program["program_revision"]
+    program_state["authoring"]["description"] = "Edited only in the Draft."
+    program_state["draft_revision"] += 1
+    candidate, program_state["diagnostics"] = derive_candidate(
+        program_state["authoring"], state.node_environment.catalog)
+    program_state["program"] = (
+        candidate.to_dict() if hasattr(candidate, "to_dict") else candidate
+    )
+    state.authoring_workspace.commit_program(
+        draft_id=program_state["draft_id"],
+        install=lambda: state.draft_session.install_prepared_replacement(
+            state.draft_session.prepare_load_replacement(
+                program_state, state.node_environment.catalog),
+            expected_draft_id=program_state["draft_id"],
+            expected_revision=program_state["draft_revision"] - 1,
+        ),
+    )
+    assert state.draft_session.retained_state()["authoring"]["description"] == (
+        "Edited only in the Draft."
+    )
+
+    class CandidateHeadless(_Headless):
+        def manager_status(self):
+            return {
+                "source": {"available": True, "freshness": "fresh", "known_gaps": [],
+                           "source_owner_epoch": "manager.epoch.1"},
+                "status": {"manager_ready": True, "active": {
+                    "retained_bundle_id": "sha256:" + "2" * 64,
+                    "graph_revision": "sha256:" + "3" * 64,
+                }},
+            }
+
+    state.headless_client = CandidateHeadless()  # type: ignore[assignment]
+    effects: list[dict[str, Any]] = []
+
+    def execute_candidate(intent, _claim, *, apply, prepared=None, prepare_only=False):
+        assert apply
+        if prepare_only:
+            return {"result": {"status": "applied"}, "confirmation_required": False}
+        effects.append(deepcopy(intent))
+        return {"status": "applied"}
+
+    state.execute_authored_deployment_candidate = execute_candidate  # type: ignore[method-assign]
+    return client, state, compiled, saved_program, program_model, effects
+
+
+def test_scenario_revert_activates_saved_program_and_deployment_and_restores_both_drafts(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Revert acts on the whole Scenario: one activation of the Saved
+    Deployment with the Saved Program (never the Program Draft), and both
+    Drafts return to Saved in the same commit."""
+
+    client, state, compiled, saved_program, program_model, effects = (
+        _scenario_revert_setup(tmp_path, monkeypatch)
+    )
+    workspace = client.get("/api/deployment/workspace").json()
+    response = client.post("/api/deployment/revert", json=_request(workspace, kind="revert", local=False))
+
+    assert response.status_code == 202, response.text
+    assert len(effects) == 1
+    assert effects[0]["deployment"] == compiled.document
+    assert effects[0]["program"] == saved_program
+    assert effects[0]["scene_initialization"] == "initialize"
+    assert state.deployment_draft_session.retained_state()["document"] == compiled.document
+    assert state.draft_session.retained_state()["authoring"]["description"] == (
+        program_model.to_dict()["description"]
+    )
+
+
+def test_scenario_revert_partial_contained_install_keeps_the_claim(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from manyforge_composer.tests.test_authoring_local_mutation import _Headless
+
+    client, state, _compiled, _saved_program, _program_model, effects = (
+        _scenario_revert_setup(tmp_path, monkeypatch)
+    )
+    headless = _Headless(generation=1)
+    coordinator = AuthoringAdmissionCoordinator(headless)  # type: ignore[arg-type]
+    coordinator.recover()
+    state.authoring_admission = coordinator
+
+    def fail_program_restore(*_args, **_kwargs):
+        raise RuntimeError("Program restore failed")
+
+    # The Deployment restore installs first; the Program restore then fails.
+    monkeypatch.setattr(
+        state.draft_session, "install_prepared_replacement", fail_program_restore
+    )
+    workspace = client.get("/api/deployment/workspace").json()
+    response = client.post("/api/deployment/revert", json=_request(workspace, kind="revert", local=False))
+
+    assert response.status_code == 503, response.text
+    assert response.json()["detail"]["code"] == "composer_workspace_install_failed"
+    assert "effect" not in response.json()["detail"]
+    assert state.authoring_workspace.failed_closed is not None
+    assert effects == []
+    # Never settled as proven no effect: the claim is retained, admission blocked.
+    assert headless.settlements == []
+    assert coordinator.local_claim_pending is True
+    assert coordinator.mutation_ready is False
+
+
 def test_activation_submits_exact_preparation_to_manager_without_post_rebind() -> None:
     state = ComposerState()
     receipt = {
@@ -1891,7 +2107,8 @@ def test_activation_submits_exact_preparation_to_manager_without_post_rebind() -
     prepared_activation = {
         "schema_version": "manyforge.prepared_activation_input.v6",
         "origin": {"kind": "scenario", "scenario_id": "scenario-a",
-                   "source_document_digest": "sha256:" + "7" * 64},
+                   "source_document_digest": "sha256:" + "7" * 64,
+                   "project_path": "/projects/scenario-a.scenario"},
         "prepared_activation_id": "sha256:" + "6" * 64,
         "captured_input_digest": "sha256:" + "8" * 64,
         "deployment_artifact_id": "cell-a",
@@ -1929,6 +2146,7 @@ def test_activation_submits_exact_preparation_to_manager_without_post_rebind() -
             "program_role_assignment": {},
             "source_document_digest": prepared_activation["origin"]["source_document_digest"],
             "scenario_id": prepared_activation["origin"]["scenario_id"],
+            "project_path": prepared_activation["origin"]["project_path"],
         },
         parent_claim,
         apply=True,
@@ -1964,6 +2182,40 @@ def test_activation_submits_exact_preparation_to_manager_without_post_rebind() -
     )
     assert "expected_admission_generation" not in manager_requests[0]
     assert manager_requests[0]["parent_authoring_claim"] == parent_claim
+
+
+def test_manager_apply_rejection_keeps_manager_code_and_message() -> None:
+    state = ComposerState()
+
+    class Headless:
+        def manager_apply(self, _body):
+            return {
+                "ok": False,
+                "error": {
+                    "code": "stale_admission_generation",
+                    "message": "admission generation 7 is not current (8)",
+                },
+            }
+
+    state.headless_client = Headless()  # type: ignore[assignment]
+    with pytest.raises(AuthoringOperationError) as caught:
+        state.apply_manager_deployment_candidate({"manager_apply": {"request_id": "r.1"}})
+    # The Composer code that drives settlement stays the same; only the text
+    # names Manager's precise cause.
+    assert caught.value.code == "manager_apply_rejected"
+    assert str(caught.value) == (
+        "Manager rejected the exact Deployment candidate: "
+        "stale_admission_generation: admission generation 7 is not current (8)"
+    )
+
+    class Bare:
+        def manager_apply(self, _body):
+            return {"ok": False}
+
+    state.headless_client = Bare()  # type: ignore[assignment]
+    with pytest.raises(AuthoringOperationError) as bare:
+        state.apply_manager_deployment_candidate({"manager_apply": {"request_id": "r.2"}})
+    assert str(bare.value) == "Manager rejected the exact Deployment candidate"
 
 
 def test_focused_motion_target_limit_updates_one_exact_target_atomically(
@@ -2491,7 +2743,8 @@ def test_only_program_start_rejects_unapplied_deployment_before_transport(comman
                               "required_capability_id": "execution.trajectory.execute", "action_span": None,
                               "payload": {
                                   "kind": "motion", "move_id": "manual-move",
-                                  "base_frame_role_id": "base", "tcp_frame_role_id": "tcp",
+                                  "base_frame_role_id": "base",
+                                  "tcp_endpoint": {"target_role_id": "arm", "frame_role_id": "tcp"},
                                   "tolerances": {"joint_position_tol_rad": 0.05, "translation_tol_m": 0.005,
                                                  "rotation_tol_rad": 0.05},
                                   "speed_profile": {"velocity_scale": 1.0, "acceleration_scale": 1.0,
@@ -2627,7 +2880,8 @@ def _configuration_preparation(tmp_path: Path):
     prepared_activation = {
         "schema_version": "manyforge.prepared_activation_input.v6",
         "prepared_activation_id": digest, "origin": {"kind": "scenario", "scenario_id": "cell",
-        "source_document_digest": digest}, "captured_input_digest": digest,
+        "source_document_digest": digest, "project_path": "/projects/cell.scenario"},
+        "captured_input_digest": digest,
         "deployment_artifact_id": "deployment.fixture", "deployment_revision": digest,
         "retained_bundle_id": "bundle.next", "graph_revision": "graph.next",
         "program_id": None, "program_revision": None,
@@ -2679,7 +2933,8 @@ def _configuration_preparation(tmp_path: Path):
     state = ComposerState(allowed_fs_roots=[str(tmp_path)])
     state.headless_client = Headless()  # type: ignore[assignment]
     intent = {
-        "scenario_id": "cell", "source_document_digest": digest, "captured_input_digest": digest,
+        "scenario_id": "cell", "project_path": "/projects/cell.scenario",
+        "source_document_digest": digest, "captured_input_digest": digest,
         "deployment": {}, "model_source_closure": {}, "program": None, "program_role_assignment": {},
         "expected_manager_current": current, "expected_admission_generation": 1,
         "manager_request_id": "request", "correlation_id": "correlation",
@@ -2721,17 +2976,71 @@ def test_activation_order_comes_from_exact_applied_capture_not_draft(monkeypatch
     assert _workspace(state)["managerApplied"]["activationOrder"] is None
 
 
+def test_workspace_publishes_whether_saved_differs_from_the_exact_applied_deployment(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from manyforge_composer.backend.routes_deployment_draft import _workspace
+    state = ComposerState()
+    state.headless_client = object()  # type: ignore[assignment]
+    session = DeploymentDraftSession(compiler=_compile)
+    _replace_deployment_session(state, session)
+    publication = {"scenario_id": "cell_a", "deployment_revision": _DIGEST,
+                   "retained_bundle_id": "bundle", "graph_revision": _DIGEST}
+    monkeypatch.setattr(state, "published_scenario", lambda: {"ready": True, "published_scenario": publication})
+    saved = _compile(json.dumps({**_document(), "components": []}))
+    other = _compile(json.dumps({**_document(), "components": [], "name": "Cell B"}))
+    applied: dict[str, Any] = {"document": saved.document}
+    monkeypatch.setattr(state, "applied_deployment_for_publication",
+                        lambda _current: applied["document"])
+    # No Saved Deployment: unknown.
+    assert _workspace(state)["saved"]["differsFromApplied"] is None
+    session.commit_open(saved, "/workspace/cell_a.deployment.yaml",
+                        draft_id=session.retained_state()["draft_id"],
+                        expected_revision=0, confirm_discard=False)
+    # After a Revert (Saved == Applied) only the Draft is edited: Discard's job.
+    session.commit_compiled(other, draft_id=session.retained_state()["draft_id"],
+                            expected_revision=session.snapshot()["draft"]["revision"])
+    view = _workspace(state)
+    assert view["draft"]["differsFromSaved"] is True
+    assert view["runAdmission"]["ready"] is False
+    assert view["saved"]["differsFromApplied"] is False
+    applied["document"] = other.document
+    assert _workspace(state)["saved"]["differsFromApplied"] is True
+    # No exact Applied Deployment: unknown.
+    applied["document"] = None
+    assert _workspace(state)["saved"]["differsFromApplied"] is None
+    # A Save landing after the view captured its snapshot never pairs the
+    # captured Saved with a comparison of the newer one.
+    applied["document"] = saved.document
+    retained = session.retained_state
+
+    def saved_after_capture(current):
+        monkeypatch.setattr(session, "retained_state",
+                            lambda: {**retained(), "saved_document": other.document})
+        return applied["document"]
+
+    monkeypatch.setattr(state, "applied_deployment_for_publication", saved_after_capture)
+    view = _workspace(state)
+    assert view["saved"]["differsFromApplied"] is False
+
+
 @pytest.mark.parametrize("origin", [
     {"kind": "sealed_canonical_empty", "cell_id": "cell_a"},
-    {"kind": "scenario", "scenario_id": "foreign", "source_document_digest": _DIGEST},
-    {"kind": "scenario", "scenario_id": "cell_a", "source_document_digest": "sha256:" + "f" * 64},
+    {"kind": "scenario", "scenario_id": "foreign", "source_document_digest": _DIGEST,
+     "project_path": "/projects/foreign.scenario"},
+    {"kind": "scenario", "scenario_id": "cell_a", "source_document_digest": "sha256:" + "f" * 64,
+     "project_path": "/projects/cell_a.scenario"},
+    # The same Scenario prepared from another project folder is another capture.
+    {"kind": "scenario", "scenario_id": "cell_a", "source_document_digest": _DIGEST,
+     "project_path": "/elsewhere/cell_a.scenario"},
     None,
 ])
 def test_captured_authoring_context_requires_checked_scenario_origin(origin) -> None:
     state = ComposerState()
     with pytest.raises(AuthoringOperationError) as error:
         state._captured_deployment_context({"deployment": {"name": "current"},
-            "scenario_id": "cell_a", "source_document_digest": _DIGEST}, {"origin": origin})
+            "scenario_id": "cell_a", "source_document_digest": _DIGEST,
+            "project_path": "/projects/cell_a.scenario"}, {"origin": origin})
     assert error.value.code == "activation_authoring_capture_mismatch"
 
 

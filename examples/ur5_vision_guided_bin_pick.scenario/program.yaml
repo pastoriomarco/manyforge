@@ -362,7 +362,10 @@
                           "search_strategy": "first_feasible"
                         },
                         "target_role": "arm",
-                        "tcp_frame_role": "tcp",
+                        "tcp_endpoint": {
+                          "frame_role": "tcp",
+                          "target_role": "arm"
+                        },
                         "tool_position": {
                           "kind": "named_preset",
                           "name": "closed"
@@ -378,7 +381,10 @@
                         "base_frame_role": "base",
                         "planning_profile": "first_feasible",
                         "target_role": "arm",
-                        "tcp_frame_role": "tcp",
+                        "tcp_endpoint": {
+                          "frame_role": "tcp",
+                          "target_role": "arm"
+                        },
                         "velocity_scale": 0.4
                       },
                       "value_sources": {
@@ -398,7 +404,10 @@
                         "contact_policy_id": "selected_object_grasp",
                         "planning_profile": "first_feasible",
                         "target_role": "arm",
-                        "tcp_frame_role": "tcp",
+                        "tcp_endpoint": {
+                          "frame_role": "tcp",
+                          "target_role": "arm"
+                        },
                         "velocity_scale": 0.4
                       },
                       "value_sources": {
@@ -456,7 +465,10 @@
                         "base_frame_role": "base",
                         "planning_profile": "first_feasible",
                         "target_role": "arm",
-                        "tcp_frame_role": "tcp",
+                        "tcp_endpoint": {
+                          "frame_role": "tcp",
+                          "target_role": "arm"
+                        },
                         "velocity_scale": 0.4
                       },
                       "value_sources": {
@@ -514,7 +526,10 @@
                         "planning_profile": "first_feasible",
                         "selected_object_id": "left_part",
                         "target_role": "arm",
-                        "tcp_frame_role": "tcp",
+                        "tcp_endpoint": {
+                          "frame_role": "tcp",
+                          "target_role": "arm"
+                        },
                         "tool_position": {
                           "kind": "named_preset",
                           "name": "open"
@@ -530,7 +545,10 @@
                         "base_frame_role": "base",
                         "planning_profile": "first_feasible",
                         "target_role": "arm",
-                        "tcp_frame_role": "tcp",
+                        "tcp_endpoint": {
+                          "frame_role": "tcp",
+                          "target_role": "arm"
+                        },
                         "velocity_scale": 0.4
                       },
                       "value_sources": {
@@ -549,7 +567,10 @@
                         "base_frame_role": "base",
                         "planning_profile": "first_feasible",
                         "target_role": "arm",
-                        "tcp_frame_role": "tcp",
+                        "tcp_endpoint": {
+                          "frame_role": "tcp",
+                          "target_role": "arm"
+                        },
                         "velocity_scale": 0.4
                       },
                       "value_sources": {
@@ -598,7 +619,10 @@
                         "base_frame_role": "base",
                         "planning_profile": "first_feasible",
                         "target_role": "arm",
-                        "tcp_frame_role": "tcp",
+                        "tcp_endpoint": {
+                          "frame_role": "tcp",
+                          "target_role": "arm"
+                        },
                         "velocity_scale": 0.4
                       },
                       "value_sources": {
@@ -705,7 +729,10 @@
                           "search_strategy": "first_feasible"
                         },
                         "target_role": "arm",
-                        "tcp_frame_role": "tcp",
+                        "tcp_endpoint": {
+                          "frame_role": "tcp",
+                          "target_role": "arm"
+                        },
                         "tool_position": {
                           "kind": "named_preset",
                           "name": "closed"
@@ -721,7 +748,10 @@
                         "base_frame_role": "base",
                         "planning_profile": "first_feasible",
                         "target_role": "arm",
-                        "tcp_frame_role": "tcp",
+                        "tcp_endpoint": {
+                          "frame_role": "tcp",
+                          "target_role": "arm"
+                        },
                         "velocity_scale": 0.4
                       },
                       "value_sources": {
@@ -741,7 +771,10 @@
                         "contact_policy_id": "selected_object_grasp",
                         "planning_profile": "first_feasible",
                         "target_role": "arm",
-                        "tcp_frame_role": "tcp",
+                        "tcp_endpoint": {
+                          "frame_role": "tcp",
+                          "target_role": "arm"
+                        },
                         "velocity_scale": 0.4
                       },
                       "value_sources": {
@@ -799,7 +832,10 @@
                         "base_frame_role": "base",
                         "planning_profile": "first_feasible",
                         "target_role": "arm",
-                        "tcp_frame_role": "tcp",
+                        "tcp_endpoint": {
+                          "frame_role": "tcp",
+                          "target_role": "arm"
+                        },
                         "velocity_scale": 0.4
                       },
                       "value_sources": {
@@ -857,7 +893,10 @@
                         "planning_profile": "first_feasible",
                         "selected_object_id": "right_part",
                         "target_role": "arm",
-                        "tcp_frame_role": "tcp",
+                        "tcp_endpoint": {
+                          "frame_role": "tcp",
+                          "target_role": "arm"
+                        },
                         "tool_position": {
                           "kind": "named_preset",
                           "name": "open"
@@ -873,7 +912,10 @@
                         "base_frame_role": "base",
                         "planning_profile": "first_feasible",
                         "target_role": "arm",
-                        "tcp_frame_role": "tcp",
+                        "tcp_endpoint": {
+                          "frame_role": "tcp",
+                          "target_role": "arm"
+                        },
                         "velocity_scale": 0.4
                       },
                       "value_sources": {
@@ -892,7 +934,10 @@
                         "base_frame_role": "base",
                         "planning_profile": "first_feasible",
                         "target_role": "arm",
-                        "tcp_frame_role": "tcp",
+                        "tcp_endpoint": {
+                          "frame_role": "tcp",
+                          "target_role": "arm"
+                        },
                         "velocity_scale": 0.4
                       },
                       "value_sources": {
@@ -941,7 +986,10 @@
                         "base_frame_role": "base",
                         "planning_profile": "first_feasible",
                         "target_role": "arm",
-                        "tcp_frame_role": "tcp",
+                        "tcp_endpoint": {
+                          "frame_role": "tcp",
+                          "target_role": "arm"
+                        },
                         "velocity_scale": 0.4
                       },
                       "value_sources": {

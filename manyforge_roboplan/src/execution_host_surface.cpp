@@ -1814,14 +1814,25 @@ CanonicalValue ExecutionCommandSurface::IoWatchResponse(
             {"tcp_frame_role_id", field("tcp_frame_role_id")},
         };
         const auto *owner = runtime_owner->second;
+        // Route rebinds change the control path (route, activation set,
+        // active configuration generation) after composition, so the Stop
+        // source is the runtime's current binding, never the composition's
+        // construction-time copy. Motion targets require owner->runtime.
+        const auto current_physical =
+            owner->runtime != nullptr
+                ? owner->runtime->CurrentPhysicalBindings()
+                : std::vector<core::RuntimeParticipantBinding>{};
+        const auto *const current_motion =
+            current_physical.empty() ? nullptr : &current_physical.front();
         const auto stop =
             owner->target_resolver && owner->direct_control_motion_binding &&
-                    owner->direct_control_motion_binding->value()
-                            .command_target_id.value() == command_target_id &&
-                    owner->direct_control_motion_binding->value()
-                            .capability_id.value() == operation_capability_id
+                    current_motion != nullptr &&
+                    current_motion->value().command_target_id.value() ==
+                        command_target_id &&
+                    current_motion->value().capability_id.value() ==
+                        operation_capability_id
                 ? owner->target_resolver->ReadQualifiedStopResponse(
-                      *owner->direct_control_motion_binding)
+                      *current_motion, current_physical)
                 : core::Result<CanonicalValue>::Err(
                       {"stop_metadata_unavailable",
                        "The target has no exact product-backed Stop metadata "

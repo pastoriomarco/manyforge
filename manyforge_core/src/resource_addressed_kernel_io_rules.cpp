@@ -908,9 +908,16 @@ void ResourceAddressedExecutionKernel::finalize_io_rule_stop_locked(
     }
     if (operation->state.state != OperationStateKind::kInterventionRequired)
       operation->state.state =
-          (operation->has_pending_io_rule_response() ||
-           std::any_of(operation->state.participants.begin(), operation->state.participants.end(),
-                       [](const auto& row) { return !terminal(row.state); }))
+          std::any_of(operation->participants.begin(), operation->participants.end(),
+                      [&](const auto& participant) {
+                        if (!participant.stop_owns_reconciliation()) return false;
+                        const auto row = std::find_if(
+                            operation->state.participants.begin(), operation->state.participants.end(),
+                            [&](const auto& state) {
+                              return state.participant_id == participant.slot_owner.participant_id;
+                            });
+                        return row == operation->state.participants.end() || !terminal(row->state);
+                      })
               ? OperationStateKind::kStopping
               : aggregate_participant_state(operation->state.participants);
   }

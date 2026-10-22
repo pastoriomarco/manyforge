@@ -817,7 +817,7 @@ TEST(ClosedSchema, BuildRegistryQualifiesOnlyTheCompleteAdmittedFamilies) {
       EXPECT_EQ(
           entry.compiled_schema()->schema_revision().value(),
           "sha256:"
-          "8e728ad4442d46b98f0d0534f8189df9b7982f982ab99cb656e6fdbeef231009");
+          "2f26f97a7454e620bfb39e16eeccc0b23ae2de61c32e3e8210eff46945d01fc4");
       EXPECT_EQ(registry.find_qualified_catalog_schema(
                     entry.record_kind(), entry.schema_id(),
                     entry.compiled_schema()->schema_revision()),
@@ -893,7 +893,7 @@ TEST(ClosedSchema, BuildRegistryQualifiesOnlyTheCompleteAdmittedFamilies) {
       EXPECT_EQ(
           entry.compiled_schema()->schema_revision().value(),
           "sha256:"
-          "79f101a9c8cc2acf8db6ecaffd3476b03723afd5a31cce2a503f7b8764b47912");
+          "c7ad633867abbe4583dee2eda51dca5b33bd8e8827777a8ac9ab86b2aba20490");
       EXPECT_EQ(registry.find_qualified_catalog_schema(
                     entry.record_kind(), entry.schema_id(),
                     entry.compiled_schema()->schema_revision()),
@@ -1579,13 +1579,13 @@ TEST(ClosedSchema,
                  core::CatalogRecordKind::kComponentType) {
         expected_revision =
             "sha256:"
-            "8e728ad4442d46b98f0d0534f8189df9b7982f982ab99cb656e6fdbeef231009";
+            "2f26f97a7454e620bfb39e16eeccc0b23ae2de61c32e3e8210eff46945d01fc4";
         expected_path = "catalog/manyforge.component_type.v1.yaml";
       } else if (built.record_kind() ==
                  core::CatalogRecordKind::kContactPolicy) {
         expected_revision =
             "sha256:"
-            "79f101a9c8cc2acf8db6ecaffd3476b03723afd5a31cce2a503f7b8764b47912";
+            "c7ad633867abbe4583dee2eda51dca5b33bd8e8827777a8ac9ab86b2aba20490";
         expected_path = "catalog/manyforge.contact_policy.v1.yaml";
       } else if (built.record_kind() ==
                  core::CatalogRecordKind::kControlInterfaceContract) {

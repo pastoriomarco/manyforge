@@ -7,12 +7,20 @@
     {
       "component_role_id": "station",
       "controllable_component_id": "station_io"
+    },
+    {
+      "component_role_id": "tool",
+      "controllable_component_id": "lite6_robot"
     }
   ],
   "target_roles": [
     {
       "command_target_id": "arm",
       "target_role_id": "arm"
+    },
+    {
+      "command_target_id": "gripper",
+      "target_role_id": "gripper"
     },
     {
       "command_target_id": "io",

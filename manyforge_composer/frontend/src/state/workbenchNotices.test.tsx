@@ -95,7 +95,11 @@ describe('workbench notification model', () => {
     expect(noticeRowSummary([
       notice({ id: 'first', severity: 'info' }),
       notice({ id: 'second', severity: 'info' }),
-    ], { one: 'activity', many: 'activities' })).toBe('2 activities · first');
+    ], { one: 'activity', many: 'activities' })).toBe('2 activities · none in progress · first');
+    expect(noticeRowSummary([
+      notice({ id: 'done', severity: 'info' }),
+      notice({ id: 'running', severity: 'info', busy: true }),
+    ], { one: 'activity', many: 'activities' })).toBe('2 activities · 1 in progress · running');
   });
 
   it('renders warning and activity rows without acknowledgement but with source actions', () => {

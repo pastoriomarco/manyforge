@@ -708,17 +708,41 @@ def test_ros_build_stages_current_products_and_imports_overlay_before_spawn(
 
 
 def test_project_status_reads_only_the_bounded_manifest_identity(tmp_path: Path) -> None:
-    project = tmp_path / "cell.scenario"
+    project = tmp_path / "My_Cell-2.scenario"
     project.mkdir()
     (project / "scenario.yaml").write_text(
         '{"api_version":"manyforge.scenario.project.v2",'
-        '"scenario_id":"cell"}',
+        '"scenario_id":"My_Cell-2","name":"My_Cell-2"}',
         encoding="utf-8",
     )
 
     assert dev_workbench._project_scenario_id(
         str(project), allowed_root=tmp_path
-    ) == "cell"
+    ) == "My_Cell-2"
+
+
+@pytest.mark.parametrize(
+    ("folder", "scenario_id", "name"),
+    [
+        ("legacy.cell.scenario", "legacy.cell", "legacy.cell"),
+        ("cell", "cell", "cell"),
+        ("cell.scenario", "other", "other"),
+        ("cell.scenario", "cell", "Cell title"),
+    ],
+)
+def test_project_status_refuses_names_outside_the_one_name_rule(
+    tmp_path: Path, folder: str, scenario_id: str, name: str
+) -> None:
+    project = tmp_path / folder
+    project.mkdir()
+    (project / "scenario.yaml").write_text(
+        '{"api_version":"manyforge.scenario.project.v2",'
+        f'"scenario_id":"{scenario_id}","name":"{name}"}}',
+        encoding="utf-8",
+    )
+
+    with pytest.raises(dev_workbench.WorkbenchError, match="<name>.scenario"):
+        dev_workbench._project_scenario_id(str(project), allowed_root=tmp_path)
 
 
 def test_workbench_selects_a_project_only_through_the_composer_loader() -> None:

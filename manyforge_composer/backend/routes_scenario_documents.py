@@ -42,13 +42,19 @@ from .authoring_workspace import (
     scenario_project_facts,
 )
 from .authoring_workspace_fence import (
+    commit_draft_edit,
     commit_local_authoring,
     require_captured_workspace_identity,
 )
 from .deployment_draft import DeploymentDraftError
 from .draft_session import DraftSessionError
-from .routes_draft import _workspace as program_workspace
+from .routes_deployment_draft import (
+    _workspace as deployment_workspace,
+    prepare_deployment_discard,
+)
+from .routes_draft import _workspace as program_workspace, prepare_program_discard
 from .scenario_artifacts import (
+    SCENARIO_NAME_PATTERN,
     SCENARIO_PROJECT_MEMBERS,
     ScenarioArtifactError,
     build_scenario_document,
@@ -56,12 +62,13 @@ from .scenario_artifacts import (
     capture_scenario_artifact_with_diagnostics,
     discover_scenario_artifacts,
     export_scenario_artifact,
-    normalize_scenario_save_path,
     prepare_scenario_artifact,
     prepared_scenario_source_digest,
     save_scenario_artifact,
+    scenario_project_path,
+    scenario_project_stem,
 )
-from .state import ComposerState
+from .state import ComposerState, canonical_project_path
 
 
 _DTO = ConfigDict(populate_by_name=True, extra="forbid", allow_inf_nan=False)
@@ -112,9 +119,14 @@ class _ScenarioFence(BaseModel):
 
 
 class SaveScenarioDocumentRequest(_ScenarioFence):
-    path: str = Field(min_length=1, max_length=4096)
-    scenario_id: str = Field(alias="scenarioId", pattern=r"^[a-z][a-z0-9._-]{0,127}$")
-    name: str = Field(min_length=1, max_length=256)
+    """Save the Scenario as ``<directory>/<name>.scenario``.
+
+    The one Scenario name is also written as its scenario_id and manifest name;
+    the description stays free text.
+    """
+
+    directory: str = Field(min_length=1, max_length=4096)
+    name: str = Field(pattern=SCENARIO_NAME_PATTERN)
     description: str = Field(default="", max_length=4096)
     confirm_overwrite: bool = Field(default=False, alias="confirmOverwrite")
 
@@ -124,16 +136,19 @@ class LoadScenarioDocumentRequest(_ScenarioFence):
     confirm_discard: bool = Field(default=False, alias="confirmDiscard")
 
 
-# A new Scenario's name is one word, also used as its project folder name:
-# letters, digits, "_" and "-", starting with a letter or digit.
-NEW_SCENARIO_NAME_PATTERN = r"^[A-Za-z0-9][A-Za-z0-9_-]*$"
+class NewScenarioDocumentRequest(_ScenarioFence):
+    """Create ``<directory>/<name>.scenario``; the name is also its scenario_id."""
 
-
-class NewScenarioDocumentRequest(LoadScenarioDocumentRequest):
-    name: str = Field(min_length=1, max_length=256, pattern=NEW_SCENARIO_NAME_PATTERN)
+    directory: str = Field(min_length=1, max_length=4096)
+    name: str = Field(pattern=SCENARIO_NAME_PATTERN)
+    confirm_discard: bool = Field(default=False, alias="confirmDiscard")
     deployment_choice: Literal["empty"] = Field(alias="deploymentChoice")
     expected_retained_bundle_id: str = Field(alias="expectedRetainedBundleId", min_length=1)
     expected_graph_revision: str = Field(alias="expectedGraphRevision", min_length=1)
+
+
+class DiscardScenarioRequest(_ScenarioFence):
+    """Return every Draft with unapplied changes to its Applied state."""
 
 
 class ExportScenarioDocumentRequest(_ScenarioFence):
@@ -174,6 +189,23 @@ def _raise(error: Exception) -> NoReturn:
             detail["workspace"] = error.detail["workspace"]
         raise HTTPException(status_code=error.status_code, detail=detail) from error
     raise error
+
+
+def _deployment_unapplied(view: dict[str, Any]) -> bool:
+    """Something is applied and the Deployment Draft is not it.
+
+    The publication identity (revision) decides when both sides carry one;
+    otherwise the backend's document comparison (run admission) decides.
+    """
+
+    draft = view.get("draft") or {}
+    applied = (view.get("managerApplied") or {}).get("deploymentRevision")
+    if draft.get("document") is None or applied is None:
+        return False
+    revision = draft.get("deploymentRevision")
+    if revision is not None:
+        return revision != applied
+    return (view.get("runAdmission") or {}).get("ready") is not True
 
 
 def _version() -> str:
@@ -361,9 +393,10 @@ def create_scenario_document_router(state: ComposerState) -> APIRouter:
                 and isinstance(deployment, dict)
                 and isinstance(assignment, dict)
             )
+            target = scenario_project_path(body.directory, body.name)
             document = build_scenario_document(
-                scenario_id=body.scenario_id,
-                name=body.name.strip(),
+                scenario_id=body.name,
+                name=body.name,
                 description=body.description.strip(),
                 program_draft=authoring,
                 deployment_draft=deployment,
@@ -371,7 +404,6 @@ def create_scenario_document_router(state: ComposerState) -> APIRouter:
                 manyforge_version=_version(),
                 last_known_status="unknown" if complete else "incomplete",
             )
-            target = normalize_scenario_save_path(body.path)
             current_target = project["document_path"]
             source_project_root = (
                 state.deployment_draft_session.source_project_root
@@ -495,7 +527,7 @@ def create_scenario_document_router(state: ComposerState) -> APIRouter:
         return {
             "status": "saved",
             "path": saved_path,
-            "scenario_id": body.scenario_id,
+            "scenario_id": body.name,
             "last_known_status": document["saved_status"]["last_known_status"],
             "workspace": workspace,
         }
@@ -508,7 +540,9 @@ def create_scenario_document_router(state: ComposerState) -> APIRouter:
     def new_document(body: NewScenarioDocumentRequest) -> dict[str, Any]:
         return activate_document(body)
 
-    def activate_document(body: LoadScenarioDocumentRequest) -> dict[str, Any]:
+    def activate_document(
+        body: LoadScenarioDocumentRequest | NewScenarioDocumentRequest,
+    ) -> dict[str, Any]:
         committed_path: str | None = None
         created_path: str | None = None
         committed_snapshot = None
@@ -524,15 +558,14 @@ def create_scenario_document_router(state: ComposerState) -> APIRouter:
                 if not body.confirm_discard:
                     raise ScenarioArtifactError("scenario_discard_confirmation_required",
                         "New closes the current Scenario and clears its Scene; confirmation is required", status_code=409)
-                if not body.name.strip():
-                    raise ScenarioArtifactError("scenario_name_invalid", "Scenario name must not be blank")
+                new_path = scenario_project_path(body.directory, body.name)
                 if state.headless_client is None:
                     raise ScenarioArtifactError(
                         "scenario_activation_unavailable",
                         "New Scenario requires the configured Manager",
                         status_code=503,
                     )
-                _require_scenario_new_empty(state, state.headless_client.manager_status())
+                _require_scenario_closed(state, state.headless_client.manager_status(), creating=True)
                 deployment = {
                     "api_version": "manyforge.deployment_intent.v2",
                     "deployment_artifact_id": "empty_scenario",
@@ -540,17 +573,18 @@ def create_scenario_document_router(state: ComposerState) -> APIRouter:
                     "components": [], "attachments": [], "policies": {},
                 }
                 authoring = empty_authoring(authoring_catalog)
-                authoring["name"] = body.name.strip()
+                authoring["name"] = body.name
+                # One identifier: the new project's folder stem is its id.
                 scenario_document = build_scenario_document(
-                    scenario_id="scenario-" + uuid.uuid4().hex,
-                    name=body.name.strip(), description="", program_draft=authoring,
+                    scenario_id=body.name,
+                    name=body.name, description="", program_draft=authoring,
                     deployment_draft=deployment,
                     program_role_assignment={"component_roles": [], "target_roles": []},
                     manyforge_version=_version(),
                     last_known_status="incomplete",
                 )
                 scenario_document, target, members, manifest = prepare_scenario_artifact(
-                    scenario_document, body.path, allowed_roots=state.allowed_fs_roots,
+                    scenario_document, new_path, allowed_roots=state.allowed_fs_roots,
                 )
                 if target.exists() or target.is_symlink():
                     raise ScenarioArtifactError("scenario_destination_exists", "New requires a new project folder", status_code=409)
@@ -612,10 +646,13 @@ def create_scenario_document_router(state: ComposerState) -> APIRouter:
                 deployment, project_root=Path(source_path)
             )
             assignment = deepcopy(scenario_document["program_role_assignment"])
+            # The project folder scopes the Scenario's persistent values.
+            project_path = canonical_project_path(source_path)
             captured_digest = raw_sha256_digest(
                 canonical_json_bytes(
                     {
                         "scenario_id": scenario_document["scenario_id"],
+                        "project_path": project_path,
                         "source_document_digest": source_digest,
                         "deployment": deployment,
                         "model_source_closure": source_closure,
@@ -625,10 +662,7 @@ def create_scenario_document_router(state: ComposerState) -> APIRouter:
                 )
             )
             manager_status = state.headless_client.manager_status()
-            if creating:
-                _require_scenario_new_empty(state, manager_status)
-            else:
-                _require_scenario_load_identity(state, scenario_document_id, manager_status)
+            _require_scenario_closed(state, manager_status, creating=creating)
             bundle, graph, _epoch = state._manager_current(manager_status)
             if creating and (body.expected_retained_bundle_id != bundle or body.expected_graph_revision != graph):
                 raise ScenarioArtifactError("scenario_activation_preview_changed",
@@ -636,6 +670,7 @@ def create_scenario_document_router(state: ComposerState) -> APIRouter:
             activation_intent: dict[str, Any] = {
                 "scene_initialization": "initialize",
                 "scenario_id": scenario_document["scenario_id"],
+                "project_path": project_path,
                 "source_document_digest": source_digest,
                 "captured_input_digest": captured_digest,
                 "deployment": deepcopy(deployment),
@@ -787,6 +822,8 @@ def create_scenario_document_router(state: ComposerState) -> APIRouter:
                     notify=False,
                 )
                 committed_path = source_path
+                # An opened or created Scenario supersedes a refused startup project.
+                state.startup_scenario_notice = None
 
             def submit_load(claim: dict[str, Any]) -> dict[str, Any]:
                 nonlocal activation
@@ -820,6 +857,7 @@ def create_scenario_document_router(state: ComposerState) -> APIRouter:
                 validate_under_claim=validate_load,
                 submit=submit_load,
                 commit_before_submit=commit_load,
+                workspace=state.authoring_workspace,
                 after_release=state.authoring_workspace.publish_commit_wake,
                 effects=effects,
             )
@@ -898,12 +936,12 @@ def create_scenario_document_router(state: ComposerState) -> APIRouter:
                 scenario_id=(
                     project["document_id"]
                     if isinstance(project["document_id"], str)
-                    else Path(source_path).name
+                    else scenario_project_stem(source_path)
                 ),
                 name=(
                     project["document_name"]
                     if isinstance(project["document_name"], str)
-                    else Path(source_path).name
+                    else scenario_project_stem(source_path)
                 ),
                 description=(
                     project["document_description"]
@@ -936,57 +974,86 @@ def create_scenario_document_router(state: ComposerState) -> APIRouter:
         except Exception as error:
             raise_operation_failure(error, effects, _raise)
 
+    @router.post("/api/scenario-documents/discard")
+    def discard_scenario(body: DiscardScenarioRequest) -> dict[str, Any]:
+        """Discard the unapplied Draft changes of the whole Scenario.
+
+        Each document with unapplied changes is returned to its Applied state,
+        in one Draft-only whole-workspace commit fenced on the client's
+        workspace identity: one publication, or a failed install contains the
+        workspace. Nothing reaches the Manager.
+        """
+
+        try:
+            # Every Draft fence too: a stale one inside the install would
+            # contain the workspace instead of refusing.
+            _require_captured_workspace_fence(body, state.authoring_workspace.identity())
+            steps = []
+            if _deployment_unapplied(deployment_workspace(state)):
+                steps.append(prepare_deployment_discard(
+                    state, body.deployment_draft_id, body.expected_deployment_draft_revision
+                ))
+            if program_workspace(state).get("hasUnappliedChanges") is True:
+                steps.append(prepare_program_discard(
+                    state, body.draft_id, body.expected_draft_revision
+                ))
+            if not steps:
+                raise DraftSessionError(
+                    "scenario_discard_nothing_to_discard",
+                    "Nothing to discard: every Draft matches Applied",
+                    status_code=409,
+                )
+
+            def validate() -> None:
+                for step_validate, _install in steps:
+                    step_validate()
+
+            def install() -> bool:
+                changed = False
+                for _validate, step_install in steps:
+                    changed = step_install() or changed
+                return changed
+
+            commit_draft_edit(
+                state,
+                body,
+                operation_kind="discard_scenario",
+                session="scenario",
+                validate=validate,
+                install=install,
+            )
+            # The Deployment workspace follows the shared publication; the
+            # Program workspace carries its own Draft-matched identity.
+            return program_workspace(state)
+        except Exception as error:
+            _raise(error)
+
     return router
 
 
-def _require_scenario_new_empty(
-    state: ComposerState, manager_status: dict[str, Any]
+def _require_scenario_closed(
+    state: ComposerState, manager_status: dict[str, Any], *, creating: bool
 ) -> None:
-    """New never creates a project before the current owner proves Close."""
-    state._manager_current(manager_status)
+    """New and every Load start only after the current owner proves Close.
+
+    The proof comes from the same current Manager head used for preview. A
+    Load of the Scenario that is currently applied is no exception: Load
+    never reapplies over a current Scenario.
+    """
+    state._manager_current(manager_status)  # Existing freshness/identity checks.
     canonical_empty = manager_status["status"]["active"].get("canonical_empty")
     if type(canonical_empty) is not bool:
         raise ScenarioArtifactError(
             "scenario_load_current_configuration_unavailable",
-            "New Scenario requires the Manager's current canonical-empty proof",
+            ("New Scenario" if creating else "Scenario Load")
+            + " requires the Manager's current canonical-empty proof",
             status_code=409,
         )
     if not canonical_empty:
         raise ScenarioArtifactError(
             "scenario_close_required",
-            "Close first before creating a new scenario",
-            status_code=409,
-        )
-
-
-def _require_scenario_load_identity(
-    state: ComposerState, scenario_id: str, manager_status: dict[str, Any]
-) -> None:
-    """Close-first proof from the same current Manager head used for preview."""
-    state._manager_current(manager_status)  # Existing freshness/identity checks.
-    active = manager_status["status"]["active"]
-    canonical_empty = active.get("canonical_empty")
-    if type(canonical_empty) is not bool:
-        raise ScenarioArtifactError(
-            "scenario_load_current_configuration_unavailable",
-            "Scenario Load requires the Manager's current canonical-empty proof",
-            status_code=409,
-        )
-    if canonical_empty:
-        return
-    publication = state.published_scenario().get("published_scenario")
-    if not isinstance(publication, dict) or not state._manager_published_matches_scenario(
-        manager_status, publication
-    ):
-        raise ScenarioArtifactError(
-            "scenario_load_current_configuration_unavailable",
-            "Scenario Load requires the exact current published scenario identity",
-            status_code=409,
-        )
-    if publication.get("scenario_id") != scenario_id:
-        raise ScenarioArtifactError(
-            "scenario_close_required",
-            "Close first before loading a different scenario",
+            "Close first before creating a new scenario" if creating
+            else "Close first before loading a scenario",
             status_code=409,
         )
 

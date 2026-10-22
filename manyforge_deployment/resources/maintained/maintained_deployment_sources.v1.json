@@ -737,6 +737,10 @@
           {
             "collision_body_role_id": "gripper_collision",
             "source_link_names": ["lite_gripper_base_link", "lite_gripper_left_finger", "lite_gripper_right_finger"]
+          },
+          {
+            "collision_body_role_id": "gripper_fingers",
+            "source_link_names": ["lite_gripper_left_finger", "lite_gripper_right_finger"]
           }
         ],
         "frame_role_bindings": [

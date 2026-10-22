@@ -1,20 +1,28 @@
-import { act } from 'react';
+import { act, useEffect } from 'react';
 import { afterEach, describe, expect, it, vi } from 'vitest';
 
 import type { CCLCController } from '../hooks/useCCLC';
 import type { DeploymentWorkspaceController } from '../hooks/useDeploymentWorkspace';
+import type { ProgramRuntimeController } from '../hooks/useProgramRuntime';
+import type { ProgramWorkspaceController } from '../hooks/useProgramWorkspace';
 import { reactPropsHost } from '../test/reactPropsHost';
-import { DeploymentDocumentControls } from './DeploymentDocumentControls';
+import { deploymentDocumentHeader } from './DeploymentDocumentControls';
+import { DocumentControls } from './DocumentControls';
+import { programDocumentHeader } from './ProgramDocumentControls';
+import { ScenarioActionControls } from './ScenarioActionControls';
 
 afterEach(() => vi.unstubAllGlobals());
 
 const digest = (value: string) => `sha256:${value.repeat(64)}`;
 
-function controller(components: Array<{ id: string; disposition: string; reasons: string[] }>) {
+function controller(
+  components: Array<{ id: string; disposition: string; reasons: string[] }>,
+  pendingConfirmationAction: 'apply' | 'revert' = 'apply',
+) {
   return {
     workspace: {
       draft: { document: { api_version: 'manyforge.deployment_intent.v2' }, deploymentRevision: null },
-      saved: { path: null, deploymentRevision: null },
+      saved: { path: null, deploymentRevision: null, differsFromApplied: null },
       managerApplied: { activationOrder: null, deploymentRevision: digest('1'), scenarioId: 'cell' },
       runAdmission: { ready: false, reason: 'Deployment Draft differs from Manager Applied' },
       savedScenarioCandidates: [],
@@ -38,10 +46,19 @@ function controller(components: Array<{ id: string; disposition: string; reasons
         } },
       },
     },
+    pendingConfirmationAction,
     confirmApply: vi.fn().mockResolvedValue(null),
     cancelApplyConfirmation: vi.fn(),
   } as unknown as DeploymentWorkspaceController;
 }
+
+// The Program side has nothing pending: the Deployment confirmation is shown.
+const program = {
+  state: { status: 'ready', pendingAction: null, workspace: null },
+  documentUnavailableReason: null,
+  mutationUnavailableReason: null,
+} as unknown as ProgramWorkspaceController;
+const runtime = { state: { currentScenario: null } } as unknown as ProgramRuntimeController;
 
 function lifecycle(states: Record<string, string>, deactivated = true) {
   return {
@@ -66,8 +83,8 @@ async function mount(deployment: DeploymentWorkspaceController, cclc: CCLCContro
   const flush = () => act(async () => { for (let i = 0; i < 5; ++i) await Promise.resolve(); });
   const render = async (admission: number) => {
     await act(async () => {
-      root.render(<DeploymentDocumentControls controller={deployment} cclc={cclc}
-        authoringAdmissionGeneration={admission} />);
+      root.render(<ScenarioActionControls program={program} deployment={deployment} runtime={runtime}
+        cclc={cclc} authoringAdmissionGeneration={admission} />);
     });
     await flush();
   };
@@ -154,5 +171,95 @@ describe('Deployment Apply that changes active components', () => {
       expect(cclc.deactivateComponents).not.toHaveBeenCalled();
       expect(deployment.confirmApply).toHaveBeenCalledOnce();
     } finally { await mounted.unmount(); }
+  });
+
+  it('words a confirmed Revert as restoring the Saved documents, never as applying the Draft', async () => {
+    const ordinary = await mount(
+      controller([{ id: 'arm', disposition: 'replace', reasons: ['domains'] }], 'revert'),
+      lifecycle({ arm: 'disabled' }),
+    );
+    try {
+      expect(ordinary.find((props) => props.id === 'deployment-apply-confirmation-title').children)
+        .toBe('Revert Deployment configuration?');
+      expect(() => ordinary.button('Confirm apply')).toThrow('Mounted control not found');
+      expect(ordinary.button('Confirm revert')).toBeDefined();
+    } finally { await ordinary.unmount(); }
+    const deactivating = await mount(
+      controller([{ id: 'arm', disposition: 'replace', reasons: ['domains'] }], 'revert'),
+      lifecycle({ arm: 'active' }),
+    );
+    try {
+      expect(deactivating.find((props) => props.id === 'deployment-apply-confirmation-title').children)
+        .toBe('Deactivate components and revert?');
+      expect(deactivating.button('Deactivate and revert')).toBeDefined();
+    } finally { await deactivating.unmount(); }
+  });
+
+  it('enables a confirmed Revert whose Draft already matches Applied', async () => {
+    // Saved differs from Applied while the Draft is the Applied one: nothing to
+    // apply, but the Revert of the Saved input is exactly what was confirmed.
+    const reverting = (action: 'apply' | 'revert') => {
+      const deployment = controller([{ id: 'arm', disposition: 'replace', reasons: ['domains'] }], action);
+      Object.assign(deployment.workspace!, {
+        draft: { document: { api_version: 'manyforge.deployment_intent.v2' }, deploymentRevision: digest('1') },
+        saved: { path: '/cell/cell.deployment.yaml', deploymentRevision: digest('5'), differsFromApplied: null },
+      });
+      return deployment;
+    };
+    const revert = await mount(reverting('revert'), lifecycle({ arm: 'active' }));
+    try {
+      expect(revert.button('Deactivate and revert').disabled).toBe(false);
+      expect(() => revert.find((props) => props.children === 'Nothing to apply: the Deployment Draft matches Manager Applied.'))
+        .toThrow('Mounted control not found');
+    } finally { await revert.unmount(); }
+    // The same workspace confirmed as an Apply still has nothing to apply.
+    const apply = await mount(reverting('apply'), lifecycle({ arm: 'active' }));
+    try {
+      expect(apply.button('Deactivate and apply').disabled).toBe(true);
+    } finally { await apply.unmount(); }
+  });
+
+  it('keeps a deactivation awaiting admission across a Program/Deployment tab switch', async () => {
+    const deployment = controller([{ id: 'arm', disposition: 'replace', reasons: ['domains'] }]);
+    const cclc = lifecycle({ arm: 'active' });
+    const programHeader = {
+      ...program, scenarioSourceDiagnostics: [],
+    } as unknown as ProgramWorkspaceController;
+    let actionMounts = 0;
+    function MountProbe() {
+      useEffect(() => { actionMounts += 1; }, []);
+      return null;
+    }
+    const { host, find, all } = reactPropsHost();
+    (window as unknown as { requestAnimationFrame: () => number }).requestAnimationFrame = () => 0;
+    const { createRoot } = await import('react-dom/client');
+    const root = createRoot(host as unknown as Element);
+    const flush = () => act(async () => { for (let i = 0; i < 5; ++i) await Promise.resolve(); });
+    // As in App: one DocumentControls whose header props follow the tab.
+    const render = async (tab: 'program' | 'deployment', admission: number) => {
+      await act(async () => {
+        root.render(<DocumentControls
+          {...(tab === 'deployment' ? deploymentDocumentHeader(deployment) : programDocumentHeader(programHeader))}
+          actions={<><MountProbe /><ScenarioActionControls program={program} deployment={deployment}
+            runtime={runtime} cclc={cclc} authoringAdmissionGeneration={admission} /></>}
+        />);
+      });
+      await flush();
+    };
+    const waiting = 'Components deactivated; waiting for updated backend authoring permissions…';
+    try {
+      await render('program', 36);
+      await act(async () => {
+        find((props) => props.type === 'button' && props.children === 'Deactivate and apply').onClick?.();
+      });
+      await flush();
+      expect(all((props) => props.role === 'status').map((props) => props.children)).toContain(waiting);
+      await render('deployment', 36);
+      expect(find((props) => props.role === 'status' && props.children === waiting)).toBeDefined();
+      expect(deployment.confirmApply).not.toHaveBeenCalled();
+      await render('deployment', 37);
+      expect(deployment.confirmApply).toHaveBeenCalledOnce();
+      expect(actionMounts).toBe(1);
+    } finally { await act(async () => { root.unmount(); }); }
   });
 });

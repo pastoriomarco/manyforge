@@ -1131,8 +1131,7 @@ resolve_contact_grasp_bindings(
     }
     resolved.push_back(core::ProgramContactGraspBindingDTO{
         policy.contact_policy_id, policy.contact_policy_revision,
-        policy.runtime_object_id, std::move(bodies), policy.max_penetration_m,
-        policy.terminal_window_start_fraction});
+        policy.runtime_object_id, std::move(bodies), policy.envelope, policy.bodies_from_motion_endpoint});
   }
   return resolved;
 }
@@ -1402,10 +1401,10 @@ compile_program_binding_contract(
 
         std::vector<core::ProgramFrameRoleBindingDTO> frames;
         for (const auto& role : requirement.required_frame_roles) {
-          if (std::none_of(target_type.frame_roles.begin(),
-                           target_type.frame_roles.end(), [&](const auto& value) {
-                             return value.frame_role_id == role;
-                           })) {
+          const auto declared_frame = std::find_if(
+              target_type.frame_roles.begin(), target_type.frame_roles.end(),
+              [&](const auto& value) { return value.frame_role_id == role; });
+          if (declared_frame == target_type.frame_roles.end()) {
             unavailable(ProgramBindingUnresolvedReason::kTargetIncompatible,
                         "target role requires a frame absent from its component "
                         "type");
@@ -1420,18 +1419,26 @@ compile_program_binding_contract(
           }
           frames.push_back(core::ProgramFrameRoleBindingDTO{
               role, resolved->model_instance_id, resolved->model_revision,
-              resolved->compiled_frame_name});
+              resolved->compiled_frame_name,
+              declared_frame->contact_body_role_ids});
         }
 
         // Scene frame resolution is independent of command capability
         // availability. Preserve only these verified placement facts in the
         // explicitly non-executable projection before resolving commands.
         if (collector != nullptr) {
+          auto scene_frames = frames;
+          for (auto& frame : scene_frames) {
+            // This scene-only projection has no collision-role bindings, so
+            // endpoint contact-body associations stay on executable rows.
+            frame.contact_body_role_ids.clear();
+          }
           collector->resolved.target_roles.push_back(
               core::ProgramTargetRoleBindingDTO{
                   requirement.target_role_id, requirement.component_role_id,
                   component.controllable_component_id,
-                  target_assignment.command_target_id, frames, {}, {}, {}});
+                  target_assignment.command_target_id, std::move(scene_frames),
+                  {}, {}, {}});
         }
 
         std::vector<core::ProgramResourceRoleBindingDTO> resources;
@@ -1500,7 +1507,17 @@ compile_program_binding_contract(
         }
 
         std::vector<core::ProgramCollisionBodyRoleBindingDTO> collision_bodies;
+        std::set<std::string> retained_collision_role_ids;
         for (const auto& role : requirement.required_collision_body_roles) {
+          retained_collision_role_ids.insert(role.value());
+        }
+        for (const auto& frame : frames) {
+          for (const auto& role : frame.contact_body_role_ids) {
+            retained_collision_role_ids.insert(role.value());
+          }
+        }
+        for (const auto& role_text : retained_collision_role_ids) {
+          const core::CollisionBodyRoleId role(role_text);
           if (std::none_of(target_type.collision_body_roles.begin(),
                            target_type.collision_body_roles.end(),
                            [&](const auto& value) {
@@ -1511,8 +1528,25 @@ compile_program_binding_contract(
                         "component type");
           }
           const auto& collision = require_collision(*target, role);
+          const auto frame_owner = std::find_if(
+              frames.begin(), frames.end(), [&](const auto& frame) {
+                return std::find(frame.contact_body_role_ids.begin(),
+                                 frame.contact_body_role_ids.end(), role) !=
+                       frame.contact_body_role_ids.end();
+              });
+          if (frame_owner != frames.end() &&
+              frame_owner->model_instance_id !=
+                  collision.model_instance_id) {
+            fail("endpoint contact-body role does not resolve through its "
+                 "frame model role");
+          }
           const auto& model =
               require_model(bundle.cell_graph, collision.model_instance_id);
+          if (frame_owner != frames.end() &&
+              frame_owner->model_revision != model.model_revision) {
+            fail("endpoint contact-body role uses a different model revision "
+                 "from its frame");
+          }
           collision_bodies.push_back(
               core::ProgramCollisionBodyRoleBindingDTO{
                   role, collision.model_instance_id, model.model_revision,

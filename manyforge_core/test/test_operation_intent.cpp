@@ -9,21 +9,22 @@ namespace {
 using namespace manyforge::core;
 
 [[nodiscard]] OperationIntentDTO valid_motion_operation() {
-  MotionParticipantIntentDTO motion{MoveId("move.pick"),
-                                    FrameRoleId("base"),
-                                    FrameRoleId("tcp"),
-                                    TolerancesDTO{0.01, 0.001, 0.01},
-                                    SpeedProfileDTO{},
-                                    TimeoutsDTO{},
-                                    CacheMode::kDefault,
-                                    PlanningProfileDTO::kBalanced,
-                                    MotionTargetModeDTO::kAbsolute,
-                                    std::nullopt,
-                                    std::nullopt,
-                                    JointGoalDTO{{"joint_1"}, {0.25}},
-                                    std::nullopt,
-                                    {},
-                                    {}};
+  MotionParticipantIntentDTO motion{
+      MoveId("move.pick"),
+      FrameRoleId("base"),
+      MotionEndpointReferenceDTO{TargetRoleId("arm"), FrameRoleId("tcp")},
+      TolerancesDTO{0.01, 0.001, 0.01},
+      SpeedProfileDTO{},
+      TimeoutsDTO{},
+      CacheMode::kDefault,
+      PlanningProfileDTO::kBalanced,
+      MotionTargetModeDTO::kAbsolute,
+      std::nullopt,
+      std::nullopt,
+      JointGoalDTO{{"joint_1"}, {0.25}},
+      std::nullopt,
+      {},
+      {}};
   return OperationIntentDTO{
       PublicRequestContextDTO{RequestId("request.motion.1"), RequestOwnerEpoch("owner.epoch.1"),
                               "test", std::nullopt},
@@ -174,6 +175,19 @@ TEST(OperationIntentTest, RejectsGripperEffortWithDifferentCoordinateKind) {
   const auto result = validate_operation_intent(operation);
   ASSERT_FALSE(result.ok());
   EXPECT_EQ(result.error().details.at("reason"), "gripper_command_effort_unit_mismatch");
+}
+
+TEST(OperationIntentTest, TcpEndpointRequiresOnePortableOwnerAndFrame) {
+  auto operation = valid_motion_operation();
+  auto& motion = std::get<MotionParticipantIntentDTO>(operation.participants.front().payload);
+  EXPECT_TRUE(validate_operation_intent(operation).ok());
+  motion.tcp_endpoint = MotionEndpointReferenceDTO{TargetRoleId("tool"), FrameRoleId("finger_tip")};
+  EXPECT_TRUE(validate_operation_intent(operation).ok());
+  motion.tcp_endpoint.target_role_id = TargetRoleId("");
+  EXPECT_FALSE(validate_operation_intent(operation).ok());
+  motion.tcp_endpoint.target_role_id = TargetRoleId("tool");
+  motion.tcp_endpoint.frame_role_id = FrameRoleId("");
+  EXPECT_FALSE(validate_operation_intent(operation).ok());
 }
 
 }  // namespace

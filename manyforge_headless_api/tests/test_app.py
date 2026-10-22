@@ -187,6 +187,7 @@ def _applied_projection(
         "retained_bundle_id": binding["retained_bundle_id"],
         "source_document_digest": source_document_digest,
         "scenario_id": scenario_id,
+        "project_path": f"/projects/{scenario_id}.scenario",
         "schema_version": "manyforge.applied_program_selection.v3",
         "source": {
             "record_digest": record_digest,
@@ -306,7 +307,8 @@ def _applied_program_status_projection() -> dict[str, Any]:
         "record_digest": "sha256:" + "5" * 64,
         "retained_bundle_id": "sha256:" + "8" * 64,
         "origin": {"kind": "scenario", "scenario_id": "cell-pick",
-                   "source_document_digest": "sha256:" + "6" * 64},
+                   "source_document_digest": "sha256:" + "6" * 64,
+                   "project_path": "/projects/cell-pick.scenario"},
         "schema_version": "manyforge.applied_program_status.v2",
     }
 
@@ -822,7 +824,8 @@ class FakeManager:
             "prepared_activation": {
                 "schema_version": "manyforge.prepared_activation_input.v6",
                 "origin": {"kind": "scenario", "scenario_id": "scenario.1",
-                           "source_document_digest": "sha256:" + "1" * 64},
+                           "source_document_digest": "sha256:" + "1" * 64,
+                           "project_path": "/projects/scenario.1.scenario"},
                 "captured_input_digest": "sha256:" + "d" * 64,
                 "deployment_artifact_id": "deployment.1",
                 "deployment_revision": "sha256:" + "b" * 64,
@@ -1583,7 +1586,8 @@ class FakeActivationPreparer:
         return {
             "schema_version": "manyforge.prepared_activation_input.v6",
             "origin": {"kind": "scenario", "scenario_id": kwargs["scenario_id"],
-                       "source_document_digest": kwargs["source_document_digest"]},
+                       "source_document_digest": kwargs["source_document_digest"],
+                       "project_path": kwargs["project_path"]},
             "captured_input_digest": kwargs["captured_input_digest"],
             "prepared_activation_id": "sha256:" + "6" * 64,
             "deployment_artifact_id": "cell_a",
@@ -1607,6 +1611,7 @@ def test_activation_preparation_requires_current_idle_generation() -> None:
     )
     body = {
         "scenario_id": "scenario_a",
+        "project_path": "/projects/scenario_a.scenario",
         "source_document_digest": "sha256:" + "6" * 64,
         "captured_input_digest": "sha256:" + "8" * 64,
         "deployment": {"api_version": "manyforge.deployment.v1"},
@@ -1626,6 +1631,7 @@ def test_activation_preparation_requires_current_idle_generation() -> None:
     assert preparer.calls == [
         {
             "scenario_id": "scenario_a",
+            "project_path": "/projects/scenario_a.scenario",
             "source_document_digest": "sha256:" + "6" * 64,
             "captured_input_digest": "sha256:" + "8" * 64,
             "deployment": {"api_version": "manyforge.deployment.v1"},
@@ -1653,6 +1659,7 @@ def test_activation_preparation_refuses_removed_parameter_overrides() -> None:
     )
     body = {
         "scenario_id": "scenario_a",
+        "project_path": "/projects/scenario_a.scenario",
         "source_document_digest": "sha256:" + "6" * 64,
         "captured_input_digest": "sha256:" + "8" * 64,
         "deployment": {"api_version": "manyforge.deployment.v1"},
@@ -2651,7 +2658,8 @@ def test_apply_is_forwarded_and_remains_typed_unavailable_before_i6() -> None:
                 "prepared_activation": {
                     "schema_version": "manyforge.prepared_activation_input.v6",
                     "origin": {"kind": "scenario", "scenario_id": "scenario.1",
-                               "source_document_digest": "sha256:" + "1" * 64},
+                               "source_document_digest": "sha256:" + "1" * 64,
+                               "project_path": "/projects/scenario.1.scenario"},
                     "captured_input_digest": "sha256:" + "d" * 64,
                     "deployment_artifact_id": "deployment.1",
                     "deployment_revision": "sha256:" + "b" * 64,
@@ -2986,7 +2994,8 @@ def _committed_activation(apply_id: str = "apply.2") -> dict[str, Any]:
         "apply_generation": 1,
         "publication_generation": 3,
         "record_digest": "sha256:" + "d" * 64,
-        "origin": {"kind": "scenario", "scenario_id": "scenario.1", "source_document_digest": "sha256:" + "e" * 64},
+        "origin": {"kind": "scenario", "scenario_id": "scenario.1", "source_document_digest": "sha256:" + "e" * 64,
+                   "project_path": "/projects/scenario.1.scenario"},
         "program": None,
         "committed_applies": [
             {
@@ -2994,14 +3003,16 @@ def _committed_activation(apply_id: str = "apply.2") -> dict[str, Any]:
                 "apply_id": "apply.1",
                 "apply_generation": 1,
                 "record_digest": "sha256:" + "c" * 64,
-                "origin": {"kind": "scenario", "scenario_id": "scenario.2", "source_document_digest": "sha256:" + "e" * 64},
+                "origin": {"kind": "scenario", "scenario_id": "scenario.2", "source_document_digest": "sha256:" + "e" * 64,
+                           "project_path": "/projects/scenario.2.scenario"},
             },
             {
                 "scene_initialization": "initialize",
                 "apply_id": apply_id,
                 "apply_generation": 1,
                 "record_digest": "sha256:" + "d" * 64,
-                "origin": {"kind": "scenario", "scenario_id": "scenario.1", "source_document_digest": "sha256:" + "e" * 64},
+                "origin": {"kind": "scenario", "scenario_id": "scenario.1", "source_document_digest": "sha256:" + "e" * 64,
+                           "project_path": "/projects/scenario.1.scenario"},
             },
         ],
     }
@@ -3806,7 +3817,7 @@ def test_motion_preview_is_a_thin_non_effectful_execution_route(
                     "kind": "motion",
                     "move_id": "robot-control-joint-preview",
                     "base_frame_role_id": "base",
-                    "tcp_frame_role_id": "tcp",
+                    "tcp_endpoint": {"target_role_id": "command_target", "frame_role_id": "tcp"},
                     "tolerances": {
                         "joint_position_tol_rad": 0.001,
                         "translation_tol_m": 0.001,
@@ -4435,12 +4446,12 @@ class _PersistentValuesRunner:
     def __init__(self) -> None:
         self.calls: list[tuple[str, Any]] = []
 
-    def persistent_values(self, scenario_id: str) -> dict[str, Any]:
-        self.calls.append(("read", scenario_id))
-        return {"scenario_id": scenario_id, "keys": []}
+    def persistent_values(self) -> dict[str, Any]:
+        self.calls.append(("read", None))
+        return {"project_path": "/projects/cell-pick.scenario", "keys": []}
 
     def persistent_value_action(
-        self, scenario_id: str, action: str, body: dict[str, Any]
+        self, action: str, body: dict[str, Any]
     ) -> dict[str, Any]:
         self.calls.append((action, copy.deepcopy(body)))
         if body.get("key") == "halted":
@@ -4457,12 +4468,12 @@ def test_persistent_values_proxy_the_program_runner_with_its_refusals() -> None:
     client = TestClient(
         create_app(service=_service(FakeCore(), FakeManager(), program_runner=runner))
     )
-    base = "/api/program/scenarios/cell-pick/persistent-values"
+    base = "/api/program/persistent-values"
     caller = {
         "request_id": "request.1",
         "request_owner_epoch": "composer.epoch.1",
         "source_label": "operator_ui",
-        "scenario_id": "cell-pick",
+        "project_path": "/projects/cell-pick.scenario",
     }
     edit = {
         **caller,
@@ -4470,7 +4481,9 @@ def test_persistent_values_proxy_the_program_runner_with_its_refusals() -> None:
         "expected_program_revision": "sha256:" + "a" * 64,
     }
 
-    assert client.get(base).json() == {"scenario_id": "cell-pick", "keys": []}
+    assert client.get(base).json() == {
+        "project_path": "/projects/cell-pick.scenario", "keys": []
+    }
     assert client.post(base, json={**edit, "value": 2}).json() == {"action": "set"}
     assert client.post(f"{base}/reset", json=edit).json() == {"action": "reset"}
     assert client.post(f"{base}/clear", json=caller).json() == {"action": "clear"}
@@ -4486,11 +4499,15 @@ def test_persistent_values_proxy_the_program_runner_with_its_refusals() -> None:
     )
     assert refused.status_code == 409
     assert refused.json()["detail"]["code"] == "persistent_key_run_conflict"
-    mismatch = client.post(
-        "/api/program/scenarios/other/persistent-values/clear", json=caller
-    )
-    assert mismatch.status_code == 400
-    assert mismatch.json()["detail"]["code"] == "persistent_key_path_invalid"
+    # A relative or non-normalized project folder is refused before the runner.
+    for path in ("projects/cell-pick.scenario", "/projects/./cell-pick.scenario"):
+        assert client.post(
+            f"{base}/clear", json={**caller, "project_path": path}
+        ).status_code == 422
+    # The former Scenario-id addressed routes are gone.
+    assert client.get(
+        "/api/program/scenarios/cell-pick/persistent-values"
+    ).status_code == 404
 
     assert [name for name, _body in runner.calls] == [
         "read",

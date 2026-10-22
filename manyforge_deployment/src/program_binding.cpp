@@ -1,3 +1,4 @@
+#include "program_contact_envelope_codec.hpp"
 #include "manyforge_deployment/program_binding.hpp"
 
 #include <algorithm>
@@ -412,7 +413,7 @@ void normalize_and_validate(core::ProgramBindingDTO& value) {
       fail("target nested binding table exceeds fixed bound");
     }
 
-    for (const auto& frame : target.frame_role_bindings) {
+    for (auto& frame : target.frame_role_bindings) {
       require_identity(frame.frame_role_id.value(),
                        "frame_role_bindings.frame_role_id");
       require_identity(frame.model_instance_id.value(),
@@ -421,6 +422,17 @@ void normalize_and_validate(core::ProgramBindingDTO& value) {
                      "frame_role_bindings.model_revision");
       require_text(frame.compiled_frame_name,
                    "frame_role_bindings.compiled_frame_name");
+      if (frame.contact_body_role_ids.size() >
+          core::kMaxProgramNestedRoleBindings) {
+        fail("frame contact-body role binding exceeds fixed bound");
+      }
+      for (const auto& body_role : frame.contact_body_role_ids) {
+        require_identity(body_role.value(),
+                         "frame_role_bindings.contact_body_role_ids");
+      }
+      sort_unique(frame.contact_body_role_ids,
+                  [](const auto& item) { return item; },
+                  "frame_role_bindings.contact_body_role_ids");
     }
     sort_unique(target.frame_role_bindings,
                 [](const auto& item) { return item.frame_role_id; },
@@ -507,6 +519,24 @@ void normalize_and_validate(core::ProgramBindingDTO& value) {
                 [](const auto& item) { return item.collision_body_role_id; },
                 "collision_body_role_bindings");
 
+    for (const auto& frame : target.frame_role_bindings) {
+      for (const auto& body_role : frame.contact_body_role_ids) {
+        const auto body = std::lower_bound(
+            target.collision_body_role_bindings.begin(),
+            target.collision_body_role_bindings.end(), body_role,
+            [](const auto& candidate, const core::CollisionBodyRoleId& role) {
+              return candidate.collision_body_role_id < role;
+            });
+        if (body == target.collision_body_role_bindings.end() ||
+            body->collision_body_role_id != body_role ||
+            body->model_instance_id != frame.model_instance_id ||
+            body->model_revision != frame.model_revision) {
+          fail("frame contact-body role does not resolve to the same retained "
+               "model instance and revision");
+        }
+      }
+    }
+
     for (const auto& capability : target.capability_bindings) {
       require_identity(capability.capability_id.value(),
                        "capability_bindings.capability_id");
@@ -586,14 +616,10 @@ void normalize_and_validate(core::ProgramBindingDTO& value) {
                    "contact_grasp_bindings.contact_policy_revision");
     require_identity(policy.runtime_object_id.value(),
                      "contact_grasp_bindings.runtime_object_id");
-    if (policy.allowed_body_bindings.empty() ||
+    if ((policy.bodies_from_motion_endpoint != policy.allowed_body_bindings.empty()) ||
         policy.allowed_body_bindings.size() >
             core::kMaxProgramNestedRoleBindings ||
-        !std::isfinite(policy.max_penetration_m) ||
-        policy.max_penetration_m <= 0.0 ||
-        !std::isfinite(policy.terminal_window_start_fraction) ||
-        policy.terminal_window_start_fraction < 0.0 ||
-        policy.terminal_window_start_fraction > 1.0) {
+        !core::valid_program_contact_envelope(policy.envelope)) {
       fail("contact-grasp binding envelope is empty, oversized, or invalid");
     }
     for (const auto& body : policy.allowed_body_bindings) {
@@ -1034,11 +1060,18 @@ template <typename StrongType>
          ++frame_index) {
       const std::string frame_path = index_path(frames_path, frame_index);
       const auto& frame = require_object(frame_values[frame_index], frame_path);
-      require_exact_fields(
+      require_fields(
           frame,
           {"frame_role_id", "model_instance_id", "model_revision",
            "compiled_frame_name"},
+          {"contact_body_role_ids"},
           frame_path);
+      std::vector<core::CollisionBodyRoleId> contact_body_role_ids;
+      if (const auto* body_roles = find_member(frame, "contact_body_role_ids")) {
+        contact_body_role_ids = parse_identity_array<core::CollisionBodyRoleId>(
+            *body_roles,
+            child_path(frame_path, "contact_body_role_ids"), false);
+      }
       frames.push_back(core::ProgramFrameRoleBindingDTO{
           parse_identity<core::FrameRoleId>(
               require_member(frame, "frame_role_id", frame_path),
@@ -1051,6 +1084,7 @@ template <typename StrongType>
               child_path(frame_path, "model_revision")),
           require_string(require_member(frame, "compiled_frame_name", frame_path),
                          child_path(frame_path, "compiled_frame_name")),
+          std::move(contact_body_role_ids),
       });
     }
 
@@ -1316,20 +1350,37 @@ template <typename StrongType>
         index_path("program_binding.contact_grasp_bindings", policy_index);
     const auto& policy = require_object(contact_values[policy_index],
                                         policy_path);
-    require_exact_fields(
-        policy,
-        {"contact_policy_id", "contact_policy_revision",
-         "runtime_object_id", "allowed_body_bindings",
-         "max_penetration_m", "terminal_window_start_fraction"},
-        policy_path);
+    const auto* mode = find_member(policy, "mode");
+    const bool release = mode != nullptr;
+    if (release) {
+      if (require_string(*mode, child_path(policy_path, "mode")) != "contact_release")
+        fail(policy_path + ": unsupported contact mode");
+      require_fields(policy,
+          {"contact_policy_id", "contact_policy_revision", "runtime_object_id", "allowed_body_bindings",
+           "mode", "release_evidence_mode", "enforce_max_start_penetration", "max_start_penetration_m",
+           "min_release_progress_m", "release_tolerance_m", "require_strictly_decreasing_penetration",
+           "require_separation_by_end", "allow_recontact"}, {"bodies_from_motion_endpoint"}, policy_path);
+    } else {
+      require_fields(policy, {"contact_policy_id", "contact_policy_revision", "runtime_object_id",
+          "allowed_body_bindings", "max_penetration_m", "terminal_window_start_fraction"},
+          {"bodies_from_motion_endpoint"}, policy_path);
+    }
+    bool bodies_from_motion_endpoint = false;
+    if (const auto* supplied = find_member(policy, "bodies_from_motion_endpoint")) {
+      const auto* selected = std::get_if<bool>(&supplied->storage());
+      if (selected == nullptr || !*selected) {
+        fail(policy_path + ": bodies_from_motion_endpoint must be true or omitted");
+      }
+      bodies_from_motion_endpoint = true;
+    }
     const std::string bodies_path =
         child_path(policy_path, "allowed_body_bindings");
     const auto& body_values = require_array(
         require_member(policy, "allowed_body_bindings", policy_path),
         bodies_path);
-    if (body_values.empty() ||
+    if ((bodies_from_motion_endpoint != body_values.empty()) ||
         body_values.size() > core::kMaxProgramNestedRoleBindings) {
-      fail(bodies_path + ": violates fixed non-empty bound");
+      fail(bodies_path + ": endpoint/explicit body-selector shape or fixed bound is invalid");
     }
     std::vector<core::ProgramContactGraspBodyBindingDTO> bodies;
     bodies.reserve(body_values.size());
@@ -1396,12 +1447,16 @@ template <typename StrongType>
             require_member(policy, "runtime_object_id", policy_path),
             child_path(policy_path, "runtime_object_id")),
         std::move(bodies),
-        require_number(require_member(policy, "max_penetration_m", policy_path),
-                       child_path(policy_path, "max_penetration_m")),
-        require_number(
-            require_member(policy, "terminal_window_start_fraction",
-                           policy_path),
-            child_path(policy_path, "terminal_window_start_fraction"))});
+        [&]() -> core::ContactZoneEnvelopeDTO {
+          if (release) return detail::parse_program_contact_envelope(policy, true, true);
+          return core::ContactGraspEnvelopeDTO{
+              require_number(require_member(policy, "max_penetration_m", policy_path),
+                             child_path(policy_path, "max_penetration_m")),
+              require_number(
+                  require_member(policy, "terminal_window_start_fraction", policy_path),
+                  child_path(policy_path, "terminal_window_start_fraction"))};
+        }(),
+        bodies_from_motion_endpoint});
   }
 
   const auto& provenance = require_object(
@@ -1918,13 +1973,20 @@ CanonicalValue program_binding_projection(
     CanonicalValue::Array frames;
     frames.reserve(target.frame_role_bindings.size());
     for (const auto& frame : target.frame_role_bindings) {
-      frames.emplace_back(CanonicalValue::Object{
+      CanonicalValue::Object frame_projection{
           {"frame_role_id", CanonicalValue(frame.frame_role_id.value())},
           {"model_instance_id",
            CanonicalValue(frame.model_instance_id.value())},
           {"model_revision", CanonicalValue(frame.model_revision.value())},
           {"compiled_frame_name", CanonicalValue(frame.compiled_frame_name)},
-      });
+      };
+      if (!frame.contact_body_role_ids.empty()) {
+        frame_projection.emplace_back(
+            "contact_body_role_ids",
+            strong_array<core::CollisionBodyRoleId>(
+                frame.contact_body_role_ids));
+      }
+      frames.emplace_back(std::move(frame_projection));
     }
     CanonicalValue::Array resources;
     resources.reserve(target.resource_role_bindings.size());
@@ -2039,7 +2101,7 @@ CanonicalValue program_binding_projection(
            string_array(body.collision_body_ids)},
       });
     }
-    contact_grasps.emplace_back(CanonicalValue::Object{
+    CanonicalValue::Object contact{
         {"contact_policy_id",
          CanonicalValue(policy.contact_policy_id.value())},
         {"contact_policy_revision",
@@ -2047,10 +2109,13 @@ CanonicalValue program_binding_projection(
         {"runtime_object_id",
          CanonicalValue(policy.runtime_object_id.value())},
         {"allowed_body_bindings", CanonicalValue(std::move(bodies))},
-        {"max_penetration_m", CanonicalValue(policy.max_penetration_m)},
-        {"terminal_window_start_fraction",
-         CanonicalValue(policy.terminal_window_start_fraction)},
-    });
+
+    };
+    detail::append_program_contact_envelope(contact, policy.envelope);
+    if (policy.bodies_from_motion_endpoint) {
+      contact.emplace_back("bodies_from_motion_endpoint", CanonicalValue(true));
+    }
+    contact_grasps.emplace_back(std::move(contact));
   }
 
   return CanonicalValue(CanonicalValue::Object{

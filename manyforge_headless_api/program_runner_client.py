@@ -35,24 +35,17 @@ class ProgramRunnerClientError(RuntimeError):
 _PERSISTENT_VALUE_ACTION_SUFFIXES = {"set": "", "reset": "/reset", "clear": "/clear"}
 
 
-def persistent_values_path(scenario_id: str, action: str | None = None) -> str:
-    """Path of one Scenario's persistent blackboard values, or of one edit."""
+def persistent_values_path(action: str | None = None) -> str:
+    """Path of the Applied Scenario's persistent blackboard values, or of one edit.
 
-    if (
-        not isinstance(scenario_id, str)
-        or not scenario_id
-        or len(scenario_id.encode("utf-8")) > 128
-        or "/" in scenario_id
-        or ".." in scenario_id
-    ):
-        raise ValueError("scenario_id is invalid")
+    Values belong to the Applied Scenario project; the Program runner resolves
+    it, and an edit names the project folder the operator saw in its body.
+    """
+
     if action is not None and action not in _PERSISTENT_VALUE_ACTION_SUFFIXES:
         raise ValueError("persistent-value action is unsupported")
     suffix = "" if action is None else _PERSISTENT_VALUE_ACTION_SUFFIXES[action]
-    return (
-        f"/api/program/scenarios/{quote(scenario_id, safe='')}"
-        f"/persistent-values{suffix}"
-    )
+    return f"/api/program/persistent-values{suffix}"
 
 
 class ProgramRunnerPort(Protocol):
@@ -131,10 +124,10 @@ class ProgramRunnerPort(Protocol):
 
     def apply_recovery_action(self, body: Mapping[str, Any]) -> dict[str, Any]: ...
 
-    def persistent_values(self, scenario_id: str) -> dict[str, Any]: ...
+    def persistent_values(self) -> dict[str, Any]: ...
 
     def persistent_value_action(
-        self, scenario_id: str, action: str, body: Mapping[str, Any]
+        self, action: str, body: Mapping[str, Any]
     ) -> dict[str, Any]: ...
 
     def reconcile_persistent_values(self) -> dict[str, Any]: ...
@@ -439,15 +432,13 @@ class ProgramRunnerHttpClient:
     def apply_recovery_action(self, body: Mapping[str, Any]) -> dict[str, Any]:
         return self._request("POST", "/api/cycle/recovery-actions", body=body)
 
-    def persistent_values(self, scenario_id: str) -> dict[str, Any]:
-        return self._request("GET", persistent_values_path(scenario_id))
+    def persistent_values(self) -> dict[str, Any]:
+        return self._request("GET", persistent_values_path())
 
     def persistent_value_action(
-        self, scenario_id: str, action: str, body: Mapping[str, Any]
+        self, action: str, body: Mapping[str, Any]
     ) -> dict[str, Any]:
-        return self._request(
-            "POST", persistent_values_path(scenario_id, action), body=body
-        )
+        return self._request("POST", persistent_values_path(action), body=body)
 
     def reconcile_persistent_values(self) -> dict[str, Any]:
         return self._request("POST", "/api/program/persistent-values/reconcile")

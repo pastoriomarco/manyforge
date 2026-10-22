@@ -2171,7 +2171,8 @@ motion_operation(const core::RuntimeParticipantBinding &binding) {
   const core::MotionParticipantIntentDTO motion{
       core::MoveId("move.native.readiness.1"),
       core::FrameRoleId("base"),
-      core::FrameRoleId("tcp"),
+      core::MotionEndpointReferenceDTO{value.target_role_id,
+                                       core::FrameRoleId("tcp")},
       core::TolerancesDTO{0.01, 0.001, 0.01},
       core::SpeedProfileDTO{},
       core::TimeoutsDTO{},

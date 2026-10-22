@@ -350,10 +350,7 @@ std::unordered_map<CollisionBodyId, std::string> body_hashes_by_id(
       std::adjacent_find(binding.allowed_robot_body_ids.begin(),
                          binding.allowed_robot_body_ids.end()) !=
           binding.allowed_robot_body_ids.end() ||
-      !std::isfinite(binding.max_penetration_m) || binding.max_penetration_m <= 0.0 ||
-      !std::isfinite(binding.terminal_window_start_fraction) ||
-      binding.terminal_window_start_fraction < 0.0 ||
-      binding.terminal_window_start_fraction > 1.0 || !inventory.logical_scene ||
+      !valid_program_contact_envelope(binding.envelope) || !inventory.logical_scene ||
       !inventory.bundle.world || !inventory.bundle.policy.has_value()) {
     return Result<void>::Err(ErrorDTO{kErrorInvalidContactPolicy,
                                       "Resolved contact-grasp binding is incomplete",
@@ -417,9 +414,50 @@ std::unordered_map<CollisionBodyId, std::string> body_hashes_by_id(
       request, inventory.projection_binding.projection_revision, binding);
   CollisionPolicySnapshot effective = *inventory.bundle.policy;
   effective.contact_grasps.clear();
-  effective.contact_grasps.push_back(ContactGraspPolicyEntry{
-      effective_id, binding.selected_object_id.value(), std::move(allowed_body_ids),
-      binding.max_penetration_m, binding.terminal_window_start_fraction});
+  const auto* grasp = std::get_if<ContactGraspEnvelopeDTO>(&binding.envelope);
+  if (grasp != nullptr) {
+    effective.contact_grasps.push_back(ContactGraspPolicyEntry{
+        effective_id, binding.selected_object_id.value(), std::move(allowed_body_ids),
+        grasp->max_penetration_m, grasp->terminal_window_start_fraction});
+  } else {
+    const auto& release = std::get<ContactReleaseEnvelopeDTO>(binding.envelope);
+    for (const auto& body_id : allowed_body_ids) {
+      for (std::size_t index = 0; index < object->collision_shapes.size(); ++index) {
+        SupportContactPolicyEntry entry;
+        entry.pair = {body_id, make_scene_collision_body_id(binding.selected_object_id, index)};
+        if (entry.pair.body_b < entry.pair.body_a)
+          std::swap(entry.pair.body_a, entry.pair.body_b);
+        entry.release_evidence_mode =
+            release.release_evidence_mode == ContactReleaseEvidenceModeDTO::kSignedPenetration
+                ? ContactReleaseEvidenceMode::kSignedPenetration
+                : ContactReleaseEvidenceMode::kBinaryContact;
+        entry.enforce_max_start_penetration = release.enforce_max_start_penetration;
+        entry.max_start_penetration_m = release.max_start_penetration_m;
+        entry.release_tolerance_m = release.release_tolerance_m;
+        entry.min_release_progress_m = release.min_release_progress_m;
+        entry.require_separation_by_end = release.require_separation_by_end;
+        entry.require_strictly_decreasing_penetration =
+            release.require_strictly_decreasing_penetration;
+        entry.allow_recontact = release.allow_recontact;
+        const auto existing = std::find_if(
+            effective.support_contacts.begin(), effective.support_contacts.end(),
+            [&](const auto& candidate) { return candidate.pair == entry.pair; });
+        if (existing != effective.support_contacts.end()) {
+          if (*existing == entry) continue;
+          return Result<void>::Err(ErrorDTO{kErrorInvalidContactPolicy,
+              "Resolved release conflicts with an existing contact pair",
+              {{"reason", "resolved_contact_release_pair_conflict"}}});
+        }
+        if (effective.support_contacts.size() >= RuntimeCollisionQuerySession::kMaxSupportContacts)
+          return Result<void>::Err(ErrorDTO{kErrorInvalidContactPolicy,
+              "Resolved release exceeds the runtime contact bound",
+              {{"reason", "resolved_contact_release_capacity_exceeded"}}});
+        effective.support_contacts.push_back(std::move(entry));
+      }
+    }
+    std::sort(effective.support_contacts.begin(), effective.support_contacts.end(),
+              [](const auto& left, const auto& right) { return left.pair < right.pair; });
+  }
   effective.require_full_diagnostics = true;
   try {
     effective.revision.content_hash =
@@ -431,7 +469,10 @@ std::unordered_map<CollisionBodyId, std::string> body_hashes_by_id(
         {{"reason", "resolved_contact_grasp_identity_failed"}, {"exception", error.what()}}});
   }
   inventory.bundle.policy = std::move(effective);
-  request.contact_policy_id = effective_id;
+  // This copied request field selects only a grasp overlay. Release uses the
+  // exact support-contact pairs above; authored identity remains in the resolved
+  // binding and original operation intent / prepared contact-policy reference.
+  request.contact_policy_id = grasp != nullptr ? effective_id : std::string{};
   return Result<void>::Ok();
 }
 

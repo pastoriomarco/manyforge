@@ -690,14 +690,21 @@ def component_type_document(
                         "frame_role_id": "tcp",
                         "model_role_id": "arm_model",
                         "asset_frame_role_id": "gripper_tcp",
+                        **(
+                            {"contact_body_role_ids": ["gripper_fingers"]}
+                            if "gripper_fingers" in collision_roles
+                            else {}
+                        ),
                     }
                 ],
                 "collision_body_roles": [
                     {
-                        "collision_body_role_id": "gripper_collision",
+                        "collision_body_role_id": role,
                         "model_role_id": "arm_model",
-                        "asset_collision_body_role_id": "gripper_collision",
+                        "asset_collision_body_role_id": role,
                     }
+                    for role in ("gripper_collision", "gripper_fingers")
+                    if role == "gripper_collision" or role in collision_roles
                 ],
                 "capabilities": [
                     capability_selector(capability_id)
@@ -3406,6 +3413,12 @@ def _scenario_project_outputs(
     assignment: dict[str, Any],
     manyforge_version: str,
 ) -> list[tuple[Path, bytes, str]]:
+    if project_root.suffix != ".scenario" or project_root.stem != scenario_id:
+        raise GenerationError("maintained Scenario ID must match its project folder stem")
+    scenario_name = project_root.stem
+    scenario_description = description
+    if name != scenario_name and name not in description:
+        scenario_description = f"{name}\n\n{description}" if description else name
     for component in deployment_intent["components"]:
         configuration = component["configuration"]["runtime_configuration"]
         for row in configuration.get("gripper_target_configurations", []):
@@ -3457,8 +3470,8 @@ def _scenario_project_outputs(
     manifest = {
         "api_version": SCENARIO_PROJECT_API,
         "scenario_id": scenario_id,
-        "name": name,
-        "description": description,
+        "name": scenario_name,
+        "description": scenario_description,
         "content": {
             "deployment_present": True,
             "program_present": True,

@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import posixpath
 from typing import Any
 import unicodedata
 
@@ -27,6 +28,7 @@ _APPLIED_SELECTION_FIELDS = frozenset(
         "program_binding_id",
         "program_id",
         "program_revision",
+        "project_path",
         "retained_bundle_id",
         "source_document_digest",
         "scenario_id",
@@ -45,6 +47,7 @@ _APPLIED_SOURCE_FIELDS = frozenset(
 )
 _OWNER_IDENTITY_FIELDS = frozenset({"owner_epoch", "owner_id", "owner_role"})
 _SHA256_PREFIX = "sha256:"
+PROJECT_PATH_MAX_BYTES = 4096
 
 
 def _fail(path: str, expected: str) -> None:
@@ -71,6 +74,23 @@ def _text(value: object, path: str, maximum: int = 4096) -> str:
     except UnicodeEncodeError:
         _fail(path, "valid UTF-8 text")
     return value
+
+
+def validate_project_path(value: object, path: str = "project_path") -> str:
+    """The Scenario project folder: absolute and lexically normalized.
+
+    The sender resolves it; nothing here touches the filesystem.
+    """
+
+    text = _text(value, path, PROJECT_PATH_MAX_BYTES)
+    if (
+        "\x00" in text
+        or not text.startswith("/")
+        or text.startswith("//")
+        or posixpath.normpath(text) != text
+    ):
+        _fail(path, "a normalized absolute project folder path")
+    return text
 
 
 def _binding_correspondence(
@@ -157,6 +177,7 @@ def validate_applied_program_selection(
     _text(value.get("deployment_artifact_id"), f"{label}.deployment_artifact_id", 256)
     _text(value.get("program_id"), f"{label}.program_id", 256)
     _text(value.get("scenario_id"), f"{label}.scenario_id", 256)
+    validate_project_path(value.get("project_path"), f"{label}.project_path")
     program = value["program"]
     if (
         program.get("program_id") != value["program_id"]
@@ -189,10 +210,11 @@ def validate_prepared_activation_origin(
     if not isinstance(value, dict):
         _fail(label, "a closed prepared origin")
     if value.get("kind") == "scenario":
-        if set(value) != {"kind", "scenario_id", "source_document_digest"}:
+        if set(value) != {"kind", "scenario_id", "source_document_digest", "project_path"}:
             _fail(label, "the closed Scenario origin")
         _text(value["scenario_id"], f"{label}.scenario_id", 256)
         _sha256(value["source_document_digest"], f"{label}.source_document_digest")
+        validate_project_path(value["project_path"], f"{label}.project_path")
     elif value.get("kind") == "sealed_canonical_empty":
         if set(value) != {"kind", "cell_id", "deployment_artifact_id", "deployment_revision",
                           "retained_bundle_id", "graph_revision", "admission_digest"}:

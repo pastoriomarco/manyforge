@@ -210,6 +210,7 @@ def test_mock_robot_plus_io_device_load_prepares_only_the_robot_model(
         preparer.prepare(
             source_document_digest=_DIGEST,
             scenario_id="scenario_a",
+            project_path="/projects/scenario_a.scenario",
             captured_input_digest=_DIGEST,
             deployment={"components": [_mock_robot(), _io_device()]},
             model_source_closure=_closure("robot"),

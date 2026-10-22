@@ -797,3 +797,74 @@ def test_explicit_static_dir_requires_an_index(tmp_path: Path) -> None:
     built.mkdir()
     (built / "index.html").write_text("<!doctype html>\n", encoding="utf-8")
     assert _find_static_dir(str(built)) == built
+
+
+def test_scenario_folder_browser_lists_folders_and_marks_projects(
+    tmp_path: Path,
+) -> None:
+    allowed = tmp_path / "allowed"
+    (allowed / "cells").mkdir(parents=True)
+    (allowed / "pick.scenario").mkdir()
+    (allowed / "cell.program.yaml").write_text("x: 1\n", encoding="utf-8")
+    (allowed / "pick.scenario.yaml").write_text("x: 1\n", encoding="utf-8")
+    client = _client(allowed_fs_roots=[str(allowed)])
+
+    response = client.get(
+        "/api/files/browse", params={"path": str(allowed), "kind": "scenario"},
+    )
+
+    assert response.status_code == 200, response.text
+    assert [
+        (entry["name"], entry["entryType"], entry["selectable"], entry["scenarioProject"])
+        for entry in response.json()["entries"]
+    ] == [
+        ("cells", "directory", False, False),
+        ("pick.scenario", "directory", False, True),
+    ]
+    assert response.json()["parentPath"] is None
+    assert response.json()["roots"] == [str(allowed.resolve())]
+
+
+def test_scenario_folder_browser_stays_inside_the_roots(tmp_path: Path) -> None:
+    allowed = tmp_path / "allowed"
+    outside = tmp_path / "outside"
+    (allowed / "child").mkdir(parents=True)
+    outside.mkdir()
+    (outside / "secret.scenario").mkdir()
+    (allowed / "escape").symlink_to(outside, target_is_directory=True)
+    client = _client(allowed_fs_roots=[str(allowed)])
+
+    def browse(path: str):
+        return client.get(
+            "/api/files/browse", params={"path": path, "kind": "scenario"},
+        )
+
+    listing = browse(str(allowed))
+    assert "escape" not in {entry["name"] for entry in listing.json()["entries"]}
+    for path in (
+        str(allowed / ".."),
+        str(allowed / "child" / ".." / ".."),
+        str(outside),
+        "/",
+        str(allowed / "escape"),
+    ):
+        rejected = browse(path)
+        assert rejected.status_code == 403, (path, rejected.text)
+        assert "secret" not in rejected.text
+
+
+def test_scenario_folder_browser_is_bounded(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    allowed = tmp_path / "allowed"
+    allowed.mkdir()
+    for index in range(4):
+        (allowed / f"cell_{index}.scenario").mkdir()
+    monkeypatch.setattr(routes_filesystem, "_MAX_RETURNED_DIRECTORY_ENTRIES", 3)
+    client = _client(allowed_fs_roots=[str(allowed)])
+
+    response = client.get(
+        "/api/files/browse", params={"path": str(allowed), "kind": "scenario"},
+    )
+
+    assert response.status_code == 413

@@ -987,6 +987,124 @@ describe('HeadlessStateSource delivery scheduling', () => {
     source.dispose();
   });
 
+  it('shows the owner refusal details on the HTTP, REST receipt and WS receipt paths', async () => {
+    vi.useFakeTimers();
+    class FakeWebSocket {
+      static readonly OPEN = 1;
+      static shell: FakeWebSocket;
+      readonly sent: string[] = [];
+      readyState = FakeWebSocket.OPEN;
+      onopen: (() => void) | null = null;
+      onmessage: ((message: MessageEvent) => void) | null = null;
+      onerror: (() => void) | null = null;
+      onclose: (() => void) | null = null;
+
+      constructor(url: string) {
+        if (new URL(url).pathname === '/ws/control') FakeWebSocket.shell = this;
+      }
+      close(): void { this.readyState = 3; }
+      send(value: string): void { this.sent.push(value); }
+    }
+    vi.stubGlobal('window', {
+      location: { href: 'http://composer.test/' },
+      requestAnimationFrame: vi.fn(),
+      cancelAnimationFrame: vi.fn(),
+    });
+    vi.stubGlobal('WebSocket', FakeWebSocket);
+    const source = new HeadlessStateSource();
+    source.setEnabled(true);
+    synchronizeControl(FakeWebSocket.shell);
+    receiveControlSnapshot(FakeWebSocket.shell, wireState(1));
+    try {
+      // The captured Trial-E Execute refusal (HTTP 409 from Kernel admission).
+      vi.stubGlobal('fetch', vi.fn(async () => ({
+        ok: false,
+        status: 409,
+        json: async () => ({
+          detail: {
+            code: 'stale_generation',
+            details: { reason: 'expected_generation_stale' },
+            message: 'cell-admission request rejected',
+          },
+        }),
+      })));
+      await expect(source.sendExecutionCommand(
+        'program_run', { scenario_id: 'lite6' }, 'run.http.refused',
+      )).rejects.toThrow(
+        /^cell-admission request rejected \(Reason: expected_generation_stale\)$/,
+      );
+
+      vi.stubGlobal('fetch', vi.fn(async () => ({
+        ok: true,
+        status: 200,
+        json: async () => ({
+          receipt: {
+            schema_version: 'manyforge.execution_command_receipt.v1',
+            correlation_id: 'run.http.rejected',
+            control_session_id: null,
+            client_sequence: null,
+            receiver_incarnation: 'headless.receiver.1',
+            received_server_sequence: '11',
+            received_monotonic_ns: '101',
+            disposition: 'rejected',
+            code: 'invalid_request',
+            semantic_owner_epoch: 'runner.epoch.1',
+            execution_control_revision: 1,
+          },
+          result: {
+            ok: false,
+            error: {
+              code: 'invalid_request',
+              message: 'cell-admission request rejected',
+              details: { reason: 'claim_capacity_exhausted' },
+            },
+          },
+        }),
+      })));
+      await expect(source.sendExecutionCommand(
+        'program_run', { scenario_id: 'lite6' }, 'run.http.rejected',
+      )).rejects.toThrow(
+        /^invalid_request: cell-admission request rejected \(Reason: claim_capacity_exhausted\)$/,
+      );
+
+      const pending = source.sendExecutionCommand('program_reset', {}, 'reset.ws.rejected');
+      const command = JSON.parse(FakeWebSocket.shell.sent.at(-1)!) as { client_sequence: string };
+      receiveControl(FakeWebSocket.shell, {
+        schema_version: 'manyforge.execution_control.v2',
+        message_kind: 'command_receipt',
+        control_session_id: CONTROL_SESSION_ID,
+        server_sequence: nextControlServerSequence(FakeWebSocket.shell),
+        received_client_sequence: command.client_sequence,
+        emitted_monotonic_ns: '200',
+        receipt: {
+          schema_version: 'manyforge.execution_command_receipt.v1',
+          correlation_id: 'reset.ws.rejected',
+          control_session_id: CONTROL_SESSION_ID,
+          client_sequence: command.client_sequence,
+          receiver_incarnation: 'headless.receiver.1',
+          received_server_sequence: '12',
+          received_monotonic_ns: '102',
+          disposition: 'rejected',
+          code: 'stale_generation',
+          semantic_owner_epoch: 'runner.epoch.1',
+          execution_control_revision: 1,
+          current_identity: null,
+        },
+        result: {
+          code: 'stale_generation',
+          correlation_id: 'reset.ws.rejected',
+          message: 'cell-admission request rejected',
+          details: { reason: 'expected_generation_stale' },
+        },
+      });
+      await expect(pending).rejects.toThrow(
+        /^stale_generation: cell-admission request rejected \(Reason: expected_generation_stale\)$/,
+      );
+    } finally {
+      source.dispose();
+    }
+  });
+
   it('strictly parses compact execution observations', () => {
     expect(parseExecutionObservationFrame(wireObservation(2))).toMatchObject({
       sourceSequence: 2,

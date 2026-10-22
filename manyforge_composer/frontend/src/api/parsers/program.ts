@@ -5,6 +5,7 @@ import type {
   CatalogParameter,
   CatalogResponse,
   HealthResponse,
+  StartupScenarioNotice,
   WorkbenchSessionNotice,
   JsonValue,
   ProgramDocument,
@@ -290,6 +291,20 @@ export function parseHealthResponse(value: unknown): HealthResponse {
     workbenchSessionNotice: record.workbench_session_notice == null
       ? null
       : parseWorkbenchSessionNotice(record.workbench_session_notice),
+    startupScenarioNotice: record.startup_scenario_notice == null
+      ? null
+      : parseStartupScenarioNotice(record.startup_scenario_notice),
+  };
+}
+
+function parseStartupScenarioNotice(value: unknown): StartupScenarioNotice {
+  const path = 'health.startup_scenario_notice';
+  const record = objectAt(value, path);
+  exactKeysAt(record, ['code', 'message', 'path'], path);
+  return {
+    path: stringAt(record.path, `${path}.path`),
+    code: stringAt(record.code, `${path}.code`),
+    message: stringAt(record.message, `${path}.message`),
   };
 }
 

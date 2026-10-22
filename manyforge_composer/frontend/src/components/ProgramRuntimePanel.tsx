@@ -907,7 +907,7 @@ export function ProgramRuntimePanel({
 
       {enabled && hasPersistentKeys && state.applied !== null && (
         <PersistentKeyValuesSection
-          scenarioId={state.applied.scenarioId}
+          projectPath={state.applied.projectPath}
           appliedRevision={state.applied.programRevision}
           runId={state.run?.capture.programRunId ?? null}
           sceneResourceIds={sceneResourceIds}

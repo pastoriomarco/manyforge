@@ -109,3 +109,33 @@ def _walk(root: dict):
         node = pending.pop()
         yield node
         pending.extend(reversed(node.get("children", [])))
+
+
+def test_pick_place_template_preserves_one_qualified_tcp_and_separate_carrier() -> None:
+    from manyforge_behavior.pick_place_templates import (
+        PickPlaceTemplateError, build_pick_place_subtree,
+    )
+    parameters = {
+        'target_role': 'arm', 'tool_target_role': 'gripper',
+        'base_frame_role': 'base',
+        'tcp_endpoint': {'target_role': 'gripper', 'frame_role': 'tcp'},
+        'carrier_frame_role': 'carrier', 'selected_object_id': 'part',
+        'tool_position': {'kind': 'named_preset', 'name': 'closed'},
+        'contact_policy_id': 'pick.contact',
+    }
+    subtree = build_pick_place_subtree(
+        'pick', instance_id='pick', parameters=parameters, value_sources={},
+        result_key='trial.pick', touch_body_roles=['fingers'],
+    )
+    for child in subtree['children']:
+        if child['node_id'].startswith(('planning.', 'motion.')):
+            assert child['parameters']['tcp_endpoint'] == parameters['tcp_endpoint']
+            assert 'tcp_frame_role' not in child['parameters']
+    attach = next(child for child in subtree['children'] if child['node_id'] == 'scene.attach_carried_object')
+    assert attach['parameters']['target_role'] == 'gripper'
+    assert attach['parameters']['carrier_frame_role'] == 'carrier'
+    assert attach['parameters']['touch_body_roles'] == ['fingers']
+    parameters['tcp_frame_role'] = 'tcp'
+    with pytest.raises(PickPlaceTemplateError, match='tcp_frame_role'):
+        build_pick_place_subtree('pick', instance_id='pick', parameters=parameters,
+            value_sources={}, result_key='trial.pick', touch_body_roles=['fingers'])

@@ -107,9 +107,15 @@ public:
 
   /// Declarative qualified retained stages for the exact Applied bound route.
   /// No current readiness, preparation or execution authority is asserted.
+  /// `binding` must exactly equal (full control path included) one row of
+  /// `current_physical`: the owning runtime's current physical bindings, read
+  /// under its route exclusion. Route publication rebinds route, activation
+  /// set and active configuration generation without recomposing this
+  /// resolver, so its composed rows are never the authority for them.
   [[nodiscard]] core::Result<deployment::CanonicalValue>
   ReadQualifiedStopResponse(
-      const core::RuntimeParticipantBinding &binding) const;
+      const core::RuntimeParticipantBinding &binding,
+      std::span<const core::RuntimeParticipantBinding> current_physical) const;
 
   ProductBackedRuntimeParticipantResolver(
       const ProductBackedRuntimeParticipantResolver &) = delete;

@@ -9,6 +9,7 @@ export type ProgramWorkspaceActionName =
   | 'open_draft'
   | 'apply'
   | 'discard'
+  | 'discard_scenario'
   | 'revert'
   | 'load'
   | 'load_scenario_document'

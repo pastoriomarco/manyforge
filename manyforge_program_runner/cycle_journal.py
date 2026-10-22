@@ -2627,8 +2627,14 @@ class ProgramCycleJournal:
         request_id: str,
         result: Mapping[str, Any],
         run_snapshot: Mapping[str, Any],
+        advance_execution_control: bool = False,
     ) -> None:
-        """Atomically retain one C2 result and its exact updated run view."""
+        """Atomically retain one C2 result and its exact updated run view.
+
+        ``advance_execution_control`` advances the execution-control revision
+        once in the same transaction; an accepted release of a failure hold
+        uses it so the release is a later accepted control revision.
+        """
 
         projection = result.get("runtime_controls")
         if isinstance(projection, Mapping) and isinstance(
@@ -2641,7 +2647,13 @@ class ProgramCycleJournal:
         with self._transaction():
             self._retain_run_snapshot_locked(run_snapshot)
             self._database.execute(
-                "UPDATE program_cycle SET runtime_controls_json=? WHERE singleton=1",
+                "UPDATE program_cycle SET runtime_controls_json=?"
+                + (
+                    ",execution_control_revision=execution_control_revision+1"
+                    if advance_execution_control
+                    else ""
+                )
+                + " WHERE singleton=1",
                 (encoded_controls,),
             )
             changed = self._database.execute(

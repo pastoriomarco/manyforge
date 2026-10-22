@@ -153,11 +153,14 @@ template <class Id>
     const std::vector<ProgramFrameRoleBindingDTO>& values) {
   CanonicalValue::Array rows;
   for (const auto& value : values) {
-    rows.emplace_back(CanonicalValue::Object{
+    CanonicalValue::Object fields{
         {"frame_role_id", CanonicalValue(value.frame_role_id.value())},
         {"model_instance_id", CanonicalValue(value.model_instance_id.value())},
         {"model_revision", CanonicalValue(value.model_revision.value())},
-        {"compiled_frame_name", CanonicalValue(value.compiled_frame_name)}});
+        {"compiled_frame_name", CanonicalValue(value.compiled_frame_name)}};
+    if (!value.contact_body_role_ids.empty())
+      fields.emplace_back("contact_body_role_ids", id_array(value.contact_body_role_ids));
+    rows.emplace_back(std::move(fields));
   }
   return CanonicalValue(std::move(rows));
 }
@@ -169,13 +172,77 @@ template <class Id>
   }
   std::vector<ProgramFrameRoleBindingDTO> rows;
   for (const auto& row : value.as_array()) {
-    exact(row, {"frame_role_id", "model_instance_id", "model_revision", "compiled_frame_name"});
-    rows.push_back({FrameRoleId(text(member(row, "frame_role_id"))),
-                    ModelInstanceId(text(member(row, "model_instance_id"))),
-                    ModelRevision(text(member(row, "model_revision"))),
-                    text(member(row, "compiled_frame_name"))});
+    const auto* roles = row.find_object_member("contact_body_role_ids");
+    if (roles)
+      exact(row, {"frame_role_id", "model_instance_id", "model_revision", "compiled_frame_name",
+                  "contact_body_role_ids"});
+    else
+      exact(row, {"frame_role_id", "model_instance_id", "model_revision", "compiled_frame_name"});
+    rows.push_back(
+        {FrameRoleId(text(member(row, "frame_role_id"))),
+         ModelInstanceId(text(member(row, "model_instance_id"))),
+         ModelRevision(text(member(row, "model_revision"))),
+         text(member(row, "compiled_frame_name")),
+         roles ? parse_id_array<CollisionBodyRoleId>(*roles) : std::vector<CollisionBodyRoleId>{}});
   }
   return rows;
+}
+
+[[nodiscard]] CanonicalValue motion_endpoint_value(const RuntimeMotionEndpointBindingDTO& value) {
+  CanonicalValue::Array bodies;
+  for (const auto& body : value.contact_body_bindings) {
+    CanonicalValue::Array ids;
+    for (const auto& id : body.collision_body_ids) ids.emplace_back(id);
+    bodies.emplace_back(CanonicalValue::Object{
+        {"component_role_id", CanonicalValue(body.component_role_id.value())},
+        {"target_role_id", CanonicalValue(body.target_role_id.value())},
+        {"controllable_component_id", CanonicalValue(body.controllable_component_id.value())},
+        {"command_target_id", CanonicalValue(body.command_target_id.value())},
+        {"model_role_id", body.model_role_id ? CanonicalValue(body.model_role_id->value())
+                                             : CanonicalValue(nullptr)},
+        {"collision_body_role_id", CanonicalValue(body.collision_body_role_id.value())},
+        {"model_instance_id", CanonicalValue(body.model_instance_id.value())},
+        {"model_revision", CanonicalValue(body.model_revision.value())},
+        {"collision_body_ids", CanonicalValue(std::move(ids))}});
+  }
+  return CanonicalValue(
+      CanonicalValue::Object{{"target_role_id", CanonicalValue(value.target_role_id.value())},
+                             {"command_target_id", CanonicalValue(value.command_target_id.value())},
+                             {"frame", frame_bindings_value({value.frame}).as_array().front()},
+                             {"contact_body_bindings", CanonicalValue(std::move(bodies))}});
+}
+
+[[nodiscard]] RuntimeMotionEndpointBindingDTO parse_motion_endpoint(const CanonicalValue& value) {
+  exact(value, {"target_role_id", "command_target_id", "frame", "contact_body_bindings"});
+  RuntimeMotionEndpointBindingDTO result{
+      TargetRoleId(text(member(value, "target_role_id"))),
+      CommandTargetId(text(member(value, "command_target_id"))),
+      parse_frame_bindings(CanonicalValue(CanonicalValue::Array{member(value, "frame")})).front(),
+      {}};
+  const auto& bodies = member(value, "contact_body_bindings");
+  if (!bodies.is_array() || bodies.as_array().size() > kMaximumRows)
+    fail("endpoint_bodies_invalid");
+  for (const auto& body : bodies.as_array()) {
+    exact(body, {"component_role_id", "target_role_id", "controllable_component_id",
+                 "command_target_id", "model_role_id", "collision_body_role_id",
+                 "model_instance_id", "model_revision", "collision_body_ids"});
+    const auto& model_role = member(body, "model_role_id");
+    const auto& ids = member(body, "collision_body_ids");
+    if (!ids.is_array() || ids.as_array().size() > kMaximumRows) fail("endpoint_body_ids_invalid");
+    std::vector<std::string> decoded_ids;
+    for (const auto& id : ids.as_array()) decoded_ids.push_back(text(id));
+    result.contact_body_bindings.push_back(
+        {ComponentRoleId(text(member(body, "component_role_id"))),
+         TargetRoleId(text(member(body, "target_role_id"))),
+         ControllableComponentId(text(member(body, "controllable_component_id"))),
+         CommandTargetId(text(member(body, "command_target_id"))),
+         model_role.is_null() ? std::nullopt
+                              : std::optional<ModelRoleId>(ModelRoleId(text(model_role))),
+         CollisionBodyRoleId(text(member(body, "collision_body_role_id"))),
+         ModelInstanceId(text(member(body, "model_instance_id"))),
+         ModelRevision(text(member(body, "model_revision"))), std::move(decoded_ids)});
+  }
+  return result;
 }
 
 [[nodiscard]] CanonicalValue provider_value(const PreparedProviderRuntimeOccurrenceDTO& value) {
@@ -966,6 +1033,8 @@ template <class Id>
        embedded(EncodePreparedParticipantStopPlan(base, value.controller().ordinary_stop_plan, resources,
                                                   defaults, node_category),
                 "prepared_ordinary_stop_plan_encoding_invalid")}};
+  if (value.motion_endpoint)
+    fields.emplace_back("motion_endpoint", motion_endpoint_value(*value.motion_endpoint));
   if (value.controller().fault_stop_plan.has_value()) {
     fields.emplace_back("fault_stop_plan", embedded(EncodePreparedParticipantStopPlan(
                                                         base, *value.controller().fault_stop_plan, resources,
@@ -1207,6 +1276,13 @@ void validate_motion_payload(const PreparedMotionExecutionDTO& motion,
                              const PreparedOperationParticipantDTO& enclosing,
                              const RuntimeParticipantBindingDTO& binding) {
   validate_moving_validation_join(motion);
+  if (binding.motion_endpoint) {
+    const auto& frame = binding.motion_endpoint->frame;
+    const ResolvedFrameDTO selected = ResolvedComponentModelFrameDTO{
+        binding.controllable_component_id, frame.model_instance_id, frame.frame_role_id,
+        frame.compiled_frame_name, frame.model_revision};
+    if (motion.plan_request.tcp_frame != selected) fail("prepared_motion_endpoint_frame_mismatch");
+  }
   const auto* cartesian_path = std::get_if<CartesianPathDTO>(&motion.plan_request.motion);
   if (!motion.trajectory.cartesian_waypoint_times_s.empty()) {
     if (cartesian_path == nullptr ||
@@ -1387,8 +1463,10 @@ void validate_motion_payload(const PreparedMotionExecutionDTO& motion,
     std::span<const HardStopResourceLimitDTO> defaults, MotionInterruptNodeCategory node_category) {
   const bool capability_provider = value.find_object_member("capability_provider") != nullptr;
   const bool fault_stop_plan = value.find_object_member("fault_stop_plan") != nullptr;
+  const auto* motion_endpoint = value.find_object_member("motion_endpoint");
   const std::size_t expected_fields = 42U + static_cast<std::size_t>(capability_provider) +
-                                      static_cast<std::size_t>(fault_stop_plan);
+                                      static_cast<std::size_t>(fault_stop_plan) +
+                                      static_cast<std::size_t>(motion_endpoint != nullptr);
   if (!value.is_object() || value.as_object().size() != expected_fields)
     fail("participant_fields_invalid");
   for (const auto name : {"api_version",
@@ -1460,51 +1538,54 @@ void validate_motion_payload(const PreparedMotionExecutionDTO& motion,
   std::optional<PreparedCapabilityProviderRuntimeOccurrenceDTO> parsed_capability_provider;
   if (capability_provider)
     parsed_capability_provider = parse_capability_provider(member(value, "capability_provider"));
-  return {ContentDigest(text(member(value, "prepared_contract_digest"))),
-          OperationId(text(member(value, "operation_id"))),
-          OperationRevision(unsigned_integer(member(value, "operation_revision"), true)),
-          OperationParticipantId(text(member(value, "participant_id"))),
-          ProgramId(text(member(value, "program_id"))),
-          ProgramRevision(text(member(value, "program_revision"))),
-          ProgramBindingId(text(member(value, "program_binding_id"))),
-          ProgramRunId(text(member(value, "program_run_id"))),
-          RetainedBundleId(text(member(value, "retained_bundle_id"))),
-          GraphRevision(text(member(value, "graph_revision"))),
-          ControllableComponentId(text(member(value, "controllable_component_id"))),
-          ComponentLifecycleGeneration(
-              unsigned_integer(member(value, "component_lifecycle_generation"), true)),
-          ComponentTypeId(text(member(value, "component_type_id"))),
-          ComponentTypeRevision(text(member(value, "component_type_revision"))),
-          CommandTargetId(text(member(value, "command_target_id"))),
-          CapabilityId(text(member(value, "capability_id"))),
-          CapabilityDefinitionRevision(text(member(value, "capability_definition_revision"))),
-          parse_model_bindings(member(value, "model_bindings")),
-          parse_frame_bindings(member(value, "frame_bindings")),
-          ControlDomainId(text(member(value, "control_domain_id"))),
-          ControlDomainRevision(text(member(value, "control_domain_revision"))),
-          ControlBindingId(text(member(value, "control_binding_id"))),
-          ControlBindingRevision(text(member(value, "control_binding_revision"))),
-          ControlInterfaceContractId(text(member(value, "control_interface_contract_id"))),
-          ControlInterfaceRevision(text(member(value, "control_interface_revision"))),
-          ControllerTopologyId(text(member(value, "controller_topology_id"))),
-          TopologyRevision(text(member(value, "topology_revision"))),
-          ControlRouteId(text(member(value, "control_route_id"))),
-          ActivationSetId(text(member(value, "activation_set_id"))),
-          parse_provider(member(value, "control_provider")),
-          std::move(parsed_capability_provider),
-          parse_id_array<ResourceId>(member(value, "resources")),
-          parse_endpoint_contract(member(value, "endpoint_contract")),
-          parse_interfaces(member(value, "claimed_command_interfaces")),
-          parse_interfaces(member(value, "claimed_state_interfaces")),
-          ActiveControlConfigurationId(text(member(value, "active_control_configuration_id"))),
-          ActiveControlConfigurationGeneration(
-              unsigned_integer(member(value, "active_control_configuration_generation"), true)),
-          parse_epochs(member(value, "runtime_unit_epochs")),
-          StopEvidencePolicyId(text(member(value, "stop_evidence_policy_id"))),
-          StopEvidencePolicyRevision(text(member(value, "stop_evidence_policy_revision"))),
-          std::move(ordinary.value()),
-          std::move(parsed_payload),
-          std::move(fault)};
+  auto result = PreparedOperationParticipantDTO{
+      ContentDigest(text(member(value, "prepared_contract_digest"))),
+      OperationId(text(member(value, "operation_id"))),
+      OperationRevision(unsigned_integer(member(value, "operation_revision"), true)),
+      OperationParticipantId(text(member(value, "participant_id"))),
+      ProgramId(text(member(value, "program_id"))),
+      ProgramRevision(text(member(value, "program_revision"))),
+      ProgramBindingId(text(member(value, "program_binding_id"))),
+      ProgramRunId(text(member(value, "program_run_id"))),
+      RetainedBundleId(text(member(value, "retained_bundle_id"))),
+      GraphRevision(text(member(value, "graph_revision"))),
+      ControllableComponentId(text(member(value, "controllable_component_id"))),
+      ComponentLifecycleGeneration(
+          unsigned_integer(member(value, "component_lifecycle_generation"), true)),
+      ComponentTypeId(text(member(value, "component_type_id"))),
+      ComponentTypeRevision(text(member(value, "component_type_revision"))),
+      CommandTargetId(text(member(value, "command_target_id"))),
+      CapabilityId(text(member(value, "capability_id"))),
+      CapabilityDefinitionRevision(text(member(value, "capability_definition_revision"))),
+      parse_model_bindings(member(value, "model_bindings")),
+      parse_frame_bindings(member(value, "frame_bindings")),
+      ControlDomainId(text(member(value, "control_domain_id"))),
+      ControlDomainRevision(text(member(value, "control_domain_revision"))),
+      ControlBindingId(text(member(value, "control_binding_id"))),
+      ControlBindingRevision(text(member(value, "control_binding_revision"))),
+      ControlInterfaceContractId(text(member(value, "control_interface_contract_id"))),
+      ControlInterfaceRevision(text(member(value, "control_interface_revision"))),
+      ControllerTopologyId(text(member(value, "controller_topology_id"))),
+      TopologyRevision(text(member(value, "topology_revision"))),
+      ControlRouteId(text(member(value, "control_route_id"))),
+      ActivationSetId(text(member(value, "activation_set_id"))),
+      parse_provider(member(value, "control_provider")),
+      std::move(parsed_capability_provider),
+      parse_id_array<ResourceId>(member(value, "resources")),
+      parse_endpoint_contract(member(value, "endpoint_contract")),
+      parse_interfaces(member(value, "claimed_command_interfaces")),
+      parse_interfaces(member(value, "claimed_state_interfaces")),
+      ActiveControlConfigurationId(text(member(value, "active_control_configuration_id"))),
+      ActiveControlConfigurationGeneration(
+          unsigned_integer(member(value, "active_control_configuration_generation"), true)),
+      parse_epochs(member(value, "runtime_unit_epochs")),
+      StopEvidencePolicyId(text(member(value, "stop_evidence_policy_id"))),
+      StopEvidencePolicyRevision(text(member(value, "stop_evidence_policy_revision"))),
+      std::move(ordinary.value()),
+      std::move(parsed_payload),
+      std::move(fault)};
+  if (motion_endpoint) result.motion_endpoint = parse_motion_endpoint(*motion_endpoint);
+  return result;
 }
 
 }  // namespace
@@ -1588,6 +1669,7 @@ Result<PreparedOperationParticipantDTO> MakePreparedIoOutputParticipant(
     candidate.command_target_id = binding.command_target_id;
     candidate.capability_id = binding.capability_id;
     candidate.capability_definition_revision = binding.capability_definition_revision;
+    candidate.motion_endpoint.reset();
     candidate.model_bindings.clear();
     candidate.frame_bindings.clear();
     candidate.binding_identity = identity.value();
@@ -1616,7 +1698,7 @@ Result<void> VerifyPreparedIoOutputParticipant(const PreparedOperationParticipan
   const auto rebuilt = MakePreparedIoOutputParticipant(value, binding);
   if (!rebuilt.ok()) return Result<void>::Err(rebuilt.error());
   try {
-    if (!value.model_bindings.empty() || !value.frame_bindings.empty() ||
+    if (value.motion_endpoint || !value.model_bindings.empty() || !value.frame_bindings.empty() ||
         value.binding_identity != rebuilt.value().binding_identity ||
         content_identity::canonical_json(output_participant_value(value, true)) !=
             content_identity::canonical_json(output_participant_value(rebuilt.value(), true)))
@@ -1671,6 +1753,7 @@ Result<PreparedOperationParticipantDTO> MakePreparedOperationParticipant(
     candidate.capability_definition_revision = binding.capability_definition_revision;
     candidate.model_bindings = binding.model_bindings;
     candidate.frame_bindings = binding.frame_bindings;
+    candidate.motion_endpoint = binding.motion_endpoint;
     auto binding_identity = runtime_participant_binding_identity(binding);
     if (!binding_identity.ok()) return Result<PreparedOperationParticipantDTO>::Err(binding_identity.error());
     candidate.binding_identity = std::move(binding_identity.value());

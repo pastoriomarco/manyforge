@@ -1931,7 +1931,7 @@ class _ProgramValidationContext:
     parameters: dict[str, ProgramParameterDeclaration]
     blackboard_namespaces: set[str]
     blackboard_keys: dict[str, BlackboardKeyDeclaration]
-    contact_policy_ids: set[str]
+    contact_policy_modes: dict[str, str]
     expressions: ExpressionEnvironment
     execution_groups_supported: bool = True
     target_effect_count: int = 0
@@ -1996,6 +1996,7 @@ _DYNAMIC_SOURCE_FORBIDDEN_SEMANTICS: Final = frozenset(
 _DYNAMIC_SOURCE_FORBIDDEN_PARAMETERS: Final = frozenset(
     {
         "contact_policy_id",
+        "tcp_endpoint",
         "model_endpoint_alias",
         "prompt_template_id",
         # Automatic retry settings are literal values (spec 400 §7).
@@ -3063,6 +3064,29 @@ def _validate_blackboard(
     return namespaces, keys
 
 
+def motion_tcp_selection(
+    parameters: Mapping[str, Any], *, path: str = "parameters"
+) -> dict[str, Any]:
+    """Validate the portable TCP selector without resolving deployment frames.
+
+    Program validation additionally checks the selected target/frame requirements;
+    lowering uses this same shape check on immutable captured inputs.
+    """
+    if "tcp_frame_role" in parameters:
+        _program_error(path, "tcp_frame_role is unsupported; select tcp_endpoint")
+    if "tcp_endpoint" not in parameters:
+        _program_error(path, "requires tcp_endpoint")
+    value = parameters["tcp_endpoint"]
+    if not isinstance(value, Mapping) or set(value) != {"target_role", "frame_role"}:
+        _program_error(f"{path}.tcp_endpoint", "requires exactly target_role and frame_role")
+    return {
+        "tcp_endpoint": {
+            name: _program_identifier(value[name], path=f"{path}.tcp_endpoint.{name}")
+            for name in ("target_role", "frame_role")
+        }
+    }
+
+
 def _validate_contact_selector(
     value: Any,
     *,
@@ -3073,6 +3097,9 @@ def _validate_contact_selector(
 ) -> tuple[str, str]:
     row = _program_mapping(value, path=path)
     kind = row.get("kind")
+    if kind == "motion_endpoint":
+        _program_closed(row, required=frozenset({"kind"}), path=path)
+        return kind, ""
     if kind == "component_model_body":
         _program_closed(
             row,
@@ -3147,9 +3174,10 @@ def _validate_contact_policies(
     component_roles: Mapping[str, dict[str, Any]],
     target_roles: Mapping[str, dict[str, Any]],
     blackboard_keys: Mapping[str, BlackboardKeyDeclaration],
-) -> set[str]:
+) -> dict[str, str]:
     rows = _program_list(value, path=path)
     policy_ids: list[str] = []
+    policy_modes: dict[str, str] = {}
     for index, raw in enumerate(rows):
         policy_path = f"{path}[{index}]"
         policy = _program_mapping(raw, path=policy_path)
@@ -3187,13 +3215,13 @@ def _validate_contact_policies(
         except StrictArtifactError as exc:
             _program_error(f"{policy_path}.version", str(exc))
         if (
-            policy["mode"] != "contact_grasp"
+            policy["mode"] not in ("contact_grasp", "contact_release")
             or policy["sensing_mode"] != "geometry_only"
             or policy["default_unmatched_response"] != "hard_stop"
         ):
             _program_error(
                 policy_path,
-                "is outside the qualified geometry-only contact_grasp shape",
+                "is outside the qualified geometry-only contact policy shape",
             )
         zones = _program_list(policy["zones"], path=f"{policy_path}.zones")
         if len(zones) != 1:
@@ -3206,39 +3234,65 @@ def _validate_contact_policies(
         for zone_index, raw_zone in enumerate(zones):
             zone_path = f"{policy_path}.zones[{zone_index}]"
             zone = _program_mapping(raw_zone, path=zone_path)
+            release = policy["mode"] == "contact_release"
             _program_closed(
                 zone,
-                required=frozenset(
-                    {
-                        "zone_id",
-                        "body_pairs",
-                        "violation_response",
-                        "max_penetration_m",
-                        "terminal_window_start_fraction",
-                    }
-                ),
+                required=frozenset({"zone_id", "body_pairs", "violation_response"})
+                | (frozenset({"release_evidence_mode"}) if release else
+                   frozenset({"max_penetration_m", "terminal_window_start_fraction"})),
+                optional=(frozenset({
+                    "enforce_max_start_penetration", "max_start_penetration_m",
+                    "min_release_progress_m", "release_tolerance_m",
+                    "require_strictly_decreasing_penetration",
+                    "require_separation_by_end", "allow_recontact",
+                }) if release else frozenset()),
                 path=zone_path,
             )
             zone_id = _program_identifier(zone["zone_id"], path=f"{zone_path}.zone_id")
             zone_ids.append(zone_id)
             if zone["violation_response"] != "hard_stop":
                 _program_error(f"{zone_path}.violation_response", "must be hard_stop")
-            if (
-                _program_number(
-                    zone["max_penetration_m"], path=f"{zone_path}.max_penetration_m"
+            if release:
+                evidence = zone["release_evidence_mode"]
+                if evidence not in ("signed_penetration", "binary_contact"):
+                    _program_error(f"{zone_path}.release_evidence_mode",
+                                   "must be signed_penetration or binary_contact")
+                for field in ("enforce_max_start_penetration",
+                              "require_strictly_decreasing_penetration",
+                              "require_separation_by_end", "allow_recontact"):
+                    if field in zone and type(zone[field]) is not bool:
+                        _program_error(f"{zone_path}.{field}", "must be a boolean")
+                for field in ("max_start_penetration_m", "min_release_progress_m",
+                              "release_tolerance_m"):
+                    if field in zone and not 0 <= _program_number(
+                        zone[field], path=f"{zone_path}.{field}"
+                    ) <= 1000:
+                        _program_error(f"{zone_path}.{field}", "must be in [0, 1000]")
+                if evidence == "binary_contact" and (
+                    zone.get("enforce_max_start_penetration", False)
+                    or zone.get("require_strictly_decreasing_penetration", False)
+                    or any(zone.get(field, 0.0) != 0.0 for field in (
+                        "max_start_penetration_m", "min_release_progress_m",
+                        "release_tolerance_m"))
+                ):
+                    _program_error(zone_path, "binary_contact forbids signed-distance fields")
+            else:
+                if (
+                    _program_number(
+                        zone["max_penetration_m"], path=f"{zone_path}.max_penetration_m"
+                    )
+                    <= 0.0
+                ):
+                    _program_error(f"{zone_path}.max_penetration_m", "must be positive")
+                terminal_fraction = _program_number(
+                    zone["terminal_window_start_fraction"],
+                    path=f"{zone_path}.terminal_window_start_fraction",
                 )
-                <= 0.0
-            ):
-                _program_error(f"{zone_path}.max_penetration_m", "must be positive")
-            terminal_fraction = _program_number(
-                zone["terminal_window_start_fraction"],
-                path=f"{zone_path}.terminal_window_start_fraction",
-            )
-            if terminal_fraction < 0.0 or terminal_fraction > 1.0:
-                _program_error(
-                    f"{zone_path}.terminal_window_start_fraction",
-                    "must be in [0, 1]",
-                )
+                if terminal_fraction < 0.0 or terminal_fraction > 1.0:
+                    _program_error(
+                        f"{zone_path}.terminal_window_start_fraction",
+                        "must be in [0, 1]",
+                    )
             pairs = _program_list(zone["body_pairs"], path=f"{zone_path}.body_pairs")
             if not pairs:
                 _program_error(f"{zone_path}.body_pairs", "must not be empty")
@@ -3266,10 +3320,18 @@ def _validate_contact_policies(
                     blackboard_keys=blackboard_keys,
                 )
                 kinds = {left[0], right[0]}
-                if kinds != {"component_model_body", "runtime_object"}:
+                if kinds not in (
+                    {"component_model_body", "runtime_object"},
+                    {"motion_endpoint", "runtime_object"},
+                ):
                     _program_error(
                         pair_path,
-                        "must join one component body to one runtime object",
+                        "must join one component body or motion endpoint to one runtime object",
+                    )
+                if "motion_endpoint" in kinds and len(pairs) != 1:
+                    _program_error(
+                        f"{zone_path}.body_pairs",
+                        "motion_endpoint requires exactly one body pair",
                     )
                 runtime_object = left[1] if left[0] == "runtime_object" else right[1]
                 runtime_objects.add(runtime_object)
@@ -3299,9 +3361,10 @@ def _validate_contact_policies(
                 "must use one shared declared runtime-object key",
             )
         policy_ids.append(policy_id)
+        policy_modes[policy_id] = policy["mode"]
     if policy_ids != sorted(policy_ids) or len(policy_ids) != len(set(policy_ids)):
         _program_error(path, "must be unique and canonical-sorted by policy_id")
-    return set(policy_ids)
+    return policy_modes
 
 
 def _validate_semantic_value(
@@ -4017,11 +4080,15 @@ def _validate_node_cross_fields(
             parameters["contact_policy_id"],
             path=f"{path}.parameters.contact_policy_id",
         )
-        if policy_id not in context.contact_policy_ids:
+        if policy_id not in context.contact_policy_modes:
             _program_error(
                 f"{path}.parameters.contact_policy_id",
                 "does not name a declared contact policy",
             )
+        if (node_id == "planning.plan_pick_sequence"
+                and context.contact_policy_modes[policy_id] != "contact_grasp"):
+            _program_error(f"{path}.parameters.contact_policy_id",
+                           "pick requires a contact_grasp policy")
     if node_id in {"logic.check_value", "logic.wait_for_value"}:
         key_type = context.blackboard_keys[parameters["key"]].type
         reason = comparison_supported(
@@ -4246,6 +4313,9 @@ def _validate_program_tree(
         if catalog_parameter.has_default
     }
     effective_parameters.update(parameters)
+
+    if "tcp_endpoint" in catalog_parameters:
+        motion_tcp_selection(parameters, path=f"{path}.parameters")
 
     for parameter_id, catalog_parameter in catalog_parameters.items():
         supplied_literal = parameter_id in parameters
@@ -4669,14 +4739,14 @@ def _validate_program_document(
     computed_keys = _check_computed_keys(
         blackboard_keys, expressions, path=f"{source}.blackboard.keys"
     )
-    contact_policy_ids = _validate_contact_policies(
+    contact_policy_modes = _validate_contact_policies(
         root.get("contact_policies", []),
         path=f"{source}.contact_policies",
         component_roles=component_roles,
         target_roles=target_roles,
         blackboard_keys=blackboard_keys,
     )
-    unknown_scene_policies = scene_collision_policy_refs - contact_policy_ids
+    unknown_scene_policies = scene_collision_policy_refs - contact_policy_modes.keys()
     if unknown_scene_policies:
         _program_error(
             f"{source}.scene",
@@ -4691,7 +4761,7 @@ def _validate_program_document(
         parameters=parameters,
         blackboard_namespaces=namespaces,
         blackboard_keys=blackboard_keys,
-        contact_policy_ids=contact_policy_ids,
+        contact_policy_modes=contact_policy_modes,
         expressions=expressions,
         execution_groups_supported=api_version == _PROGRAM_API_VERSION,
     )

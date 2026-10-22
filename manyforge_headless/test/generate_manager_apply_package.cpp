@@ -609,12 +609,13 @@ void WriteMetadata(
         deployment::PreparedActivationAssemblyInput{
             deployment::PreparedScenarioOrigin{
                 std::string(scenario_id),
-                core::ContentDigest("sha256:" + std::string(64U, 'e'))},
+                core::ContentDigest("sha256:" + std::string(64U, 'e')),
+                "/fixtures/" + std::string(scenario_id) + ".scenario"},
             core::ContentDigest("sha256:" + std::string(64U, '2')),
             "optional",
         },
-        bundle, *model_map, *program.program, program.role_assignment,
-        catalogs, raw_artifacts);
+        bundle, *model_map, *program.program, program.role_assignment, catalogs,
+        raw_artifacts);
     static_cast<void>(repository.put_if_absent(prepared));
     deployment::CanonicalValue::Object summary;
     for (const auto &[name, value] : prepared.normalized_root().as_object()) {

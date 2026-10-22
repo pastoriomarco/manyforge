@@ -72,7 +72,10 @@
             ],
             "planning_timeout_s": 5.0,
             "target_role": "arm",
-            "tcp_frame_role": "tcp",
+            "tcp_endpoint": {
+              "frame_role": "tcp",
+              "target_role": "arm"
+            },
             "velocity_scale": 0.4
           }
         },
@@ -111,7 +114,10 @@
                 },
                 "planning_timeout_s": 1.0,
                 "target_role": "arm",
-                "tcp_frame_role": "tcp",
+                "tcp_endpoint": {
+                  "frame_role": "tcp",
+                  "target_role": "arm"
+                },
                 "velocity_scale": 0.4
               },
               "recovery_policy": {
@@ -151,7 +157,10 @@
                 },
                 "planning_timeout_s": 1.0,
                 "target_role": "arm",
-                "tcp_frame_role": "tcp",
+                "tcp_endpoint": {
+                  "frame_role": "tcp",
+                  "target_role": "arm"
+                },
                 "velocity_scale": 0.4
               }
             }
@@ -207,7 +216,10 @@
             ],
             "planning_timeout_s": 5.0,
             "target_role": "arm",
-            "tcp_frame_role": "tcp",
+            "tcp_endpoint": {
+              "frame_role": "tcp",
+              "target_role": "arm"
+            },
             "velocity_scale": 0.4
           }
         }

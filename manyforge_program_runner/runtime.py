@@ -179,6 +179,15 @@ _MOTION_PRODUCING_RECOVERY_ACTIONS: Final = frozenset(
 )
 
 
+def _released_failure_hold(
+    held: Sequence[Mapping[str, Any]], projected: Mapping[str, Any]
+) -> bool:
+    """Whether an accepted effect resolved a failure row held before it."""
+
+    remaining = projected.get("operation_failures") or ()
+    return any(dict(row) not in remaining for row in held)
+
+
 class ProgramRunnerError(RuntimeError):
     """Stable failure from the isolated Program-runner owner."""
 
@@ -192,14 +201,6 @@ class ProgramRunnerError(RuntimeError):
         super().__init__(message)
         self.code = code
         self.details = deepcopy(dict(details or {}))
-
-
-def _require_scenario_path(scenario_id: str, request: Any) -> None:
-    if request.scenario_id != scenario_id:
-        raise ProgramRunnerError(
-            "persistent_key_path_invalid",
-            "Scenario identity in path and body must match",
-        )
 
 
 def _persistent_storage_error(error: PersistentKeyRegisterError) -> ProgramRunnerError:
@@ -3177,7 +3178,7 @@ class ProgramRuntime:
         # Values already live in the register: this store only mirrors them.
         store = ProgramValueStore(
             program,
-            restored=self._persistent_keys.restore(applied["scenario_id"], persistent),
+            restored=self._persistent_keys.restore(applied["project_path"], persistent),
             persistent_commit=lambda _declaration, _value, _metadata: None,
             persistent_forget=lambda _declaration, _metadata: None,
         )
@@ -3884,19 +3885,19 @@ class ProgramRuntime:
                     for notice in (*dropped, *self._persistent_keys.take_notices()):
                         controls.audit_value(
                             "persistent_key_value_dropped",
-                            scenario_id=notice.scenario_id,
+                            project_path=notice.project_path,
                             key=notice.key,
                             reason=notice.reason,
                             detail=notice.detail,
                         )
-                    # A committed Apply of this Scenario that was never
-                    # observed: the values were kept, the defect is shown.
+                    # A committed Apply of this Scenario project that was
+                    # never observed: the values were kept, the defect is shown.
                     for record_digest in self._persistent_keys.unobserved_applies(
-                        request.scenario_id
+                        run_admission.project_path
                     ):
                         controls.audit_value(
                             "persistent_key_apply_not_observed",
-                            scenario_id=request.scenario_id,
+                            project_path=run_admission.project_path,
                             code="applied_program_not_observed",
                             record_digest=record_digest,
                         )
@@ -4451,11 +4452,12 @@ class ProgramRuntime:
                         request.program_run_id
                     ),
                 }
-                journal.complete_control_request(
-                    owner_epoch=request.request_owner_epoch,
-                    request_id=request.request_id,
+                self._complete_control(
+                    journal,
+                    request,
                     result=result,
-                    run_snapshot=projected,
+                    projected=projected,
+                    held_failures=live.operation_failures,
                 )
                 return result
             except ProgramRunOwnerOutcomeUnknownError as error:
@@ -4481,6 +4483,32 @@ class ProgramRuntime:
                 # Unexpected exceptions are not a trustworthy no-effect
                 # result: a local transition may already have happened.
                 unresolved(error)
+
+    @staticmethod
+    def _complete_control(
+        journal: ProgramCycleJournal,
+        request: Any,
+        *,
+        result: Mapping[str, Any],
+        projected: Mapping[str, Any],
+        held_failures: Sequence[Mapping[str, Any]],
+    ) -> None:
+        """Retain one accepted control effect; the one place for every kind.
+
+        An effect that resolved a failure row held before it released that
+        failure hold: it is a later accepted control revision, so the hold's
+        operation-failure condition clears.
+        """
+
+        journal.complete_control_request(
+            owner_epoch=request.request_owner_epoch,
+            request_id=request.request_id,
+            result=result,
+            run_snapshot=projected,
+            advance_execution_control=_released_failure_hold(
+                held_failures, projected
+            ),
+        )
 
     @staticmethod
     def _unknown_control_failure(
@@ -4602,11 +4630,11 @@ class ProgramRuntime:
         try:
             activation = CommittedActivation(
                 record_digest=projection["record_digest"],
-                scenario_id=projection["origin"]["scenario_id"],
+                project_path=projection["origin"]["project_path"],
                 declarations={} if program is None else dict(program.blackboard_keys),
                 # Sealed rows were validated above and carry no Scenario.
                 committed_applies={
-                    row["record_digest"]: row["origin"]["scenario_id"]
+                    row["record_digest"]: row["origin"]["project_path"]
                     for row in projection["committed_applies"]
                     if row["origin"]["kind"] == "scenario"
                 },
@@ -4648,14 +4676,14 @@ class ProgramRuntime:
             reconciliation = register.reconcile(activation)
         except PersistentKeyRegisterError as error:
             raise _persistent_storage_error(error) from error
-        for record_digest, scenario_id in reconciliation.unobserved:
+        for record_digest, project_path in reconciliation.unobserved:
             # Kept values, but a notification path failed: find and fix it.
             _LOGGER.warning(
                 "applied_program_not_observed: committed Apply %s of Scenario "
-                "%r reached the Program runner only through a later "
+                "project %r reached the Program runner only through a later "
                 "reconciliation; stored values were kept",
                 record_digest,
-                scenario_id,
+                project_path,
             )
         return activation, program, reconciliation
 
@@ -4693,18 +4721,18 @@ class ProgramRuntime:
             "schema_version": PERSISTENT_KEY_RECONCILIATION_VERSION,
             "outcome": reconciliation.outcome,
             "record_digest": activation.record_digest,
-            "scenario_id": activation.scenario_id,
+            "project_path": activation.project_path,
             "dropped": [
                 {
-                    "scenario_id": notice.scenario_id,
+                    "project_path": notice.project_path,
                     "key": notice.key,
                     "reason": notice.reason,
                 }
                 for notice in reconciliation.dropped
             ],
             "unobserved_applies": [
-                {"record_digest": digest, "scenario_id": scenario}
-                for digest, scenario in reconciliation.unobserved
+                {"record_digest": digest, "project_path": project}
+                for digest, project in reconciliation.unobserved
             ],
             "history_changed": reconciliation.history_changed,
         }
@@ -4712,7 +4740,7 @@ class ProgramRuntime:
     def _applied_persistent_keys(
         self,
         register: PersistentKeyRegister,
-        scenario_id: str,
+        project_path: str | None = None,
         *,
         tolerate_storage_fault: bool = False,
     ) -> tuple[
@@ -4720,17 +4748,22 @@ class ProgramRuntime:
         dict[str, BlackboardKeyDeclaration],
         CommittedActivation,
         dict[str, str] | None,
+        str,
     ]:
-        """The Scenario's committed Program, after reconciling stored values.
+        """The Applied Scenario's committed Program, after reconciling values.
 
+        Values belong to the Applied Scenario project folder. An edit names
+        the folder the operator saw (``project_path``); another one is
+        refused. Also returns the Applied Scenario id, for display only.
         With ``tolerate_storage_fault`` a reconciliation that could not be
         stored is returned as a fault instead of raised.
         """
 
         fault: dict[str, str] | None = None
+        projection = self._committed_projection()
         try:
             activation, program, _reconciliation = self._reconcile_persistent_keys(
-                register
+                register, projection=projection
             )
         except ProgramRunnerError as error:
             if error.code not in {
@@ -4746,11 +4779,13 @@ class ProgramRuntime:
                     f"stored values could not follow the committed Apply: {error}",
                 ) from error
             fault = {"code": error.code, "message": str(error)}
-            activation, program = self._committed_activation()
-        if activation.scenario_id != scenario_id:
+            activation, program = self._committed_activation(projection)
+        scenario_id = projection["origin"]["scenario_id"]
+        if project_path is not None and activation.project_path != project_path:
             raise ProgramRunnerError(
                 "persistent_key_scenario_conflict",
-                f"Scenario {scenario_id!r} is not the Applied Scenario",
+                f"Scenario project {project_path!r} is not the Applied Scenario "
+                "project",
             )
         if program is None:
             raise ProgramRunnerError(
@@ -4766,17 +4801,25 @@ class ProgramRuntime:
             },
             activation,
             fault,
+            scenario_id,
         )
 
-    def _live_run_id(self, scenario_id: str) -> str | None:
-        """The run whose value store currently holds this Scenario's values."""
+    def _live_run_id(self, activation: CommittedActivation) -> str | None:
+        """The run whose value store currently holds this project's values.
+
+        A run's capture names its committed Apply; the activation's history
+        maps that Apply to its Scenario project folder.
+        """
 
         snapshots, _truncated = self._owner.list_snapshots(
             active_only=True, limit=self.config.maximum_retained_runs
         )
         for snapshot in snapshots:
             capture = snapshot.to_dict()["capture"]
-            if capture["scenario_id"] == scenario_id:
+            if (
+                activation.committed_applies.get(capture["applied_record_digest"])
+                == activation.project_path
+            ):
                 return capture["program_run_id"]
         return None
 
@@ -4794,12 +4837,13 @@ class ProgramRuntime:
         # Only values the register durably reconciled with this committed
         # activation are shown, exactly those a run would restore; while a
         # storage fault is unresolved, none are.
+        project_path = activation.project_path
         reconciled = storage_fault is None and register.activation == {
             "record_digest": activation.record_digest,
-            "scenario_id": activation.scenario_id,
+            "project_path": project_path,
         }
-        rows = register.values(scenario_id) if reconciled else {}
-        restorable = register.restore(scenario_id, declarations) if reconciled else {}
+        rows = register.values(project_path) if reconciled else {}
+        restorable = register.restore(project_path, declarations) if reconciled else {}
         keys = []
         for key, declaration in declarations.items():
             row = rows.get(key) if key in restorable else None
@@ -4818,26 +4862,29 @@ class ProgramRuntime:
         return {
             "schema_version": PERSISTENT_KEY_VALUES_VERSION,
             "scenario_id": scenario_id,
+            "project_path": project_path,
             "program_revision": program_revision,
-            "program_run_id": self._live_run_id(scenario_id),
+            "program_run_id": self._live_run_id(activation),
             "sequence": sequence,
             "keys": keys,
-            "edits": register.edits(scenario_id),
+            "edits": register.edits(project_path),
             "storage_fault": None if storage_fault is None else dict(storage_fault),
             "apply_observation_fault": (
                 {
                     "code": "applied_program_not_observed",
                     "record_digests": list(unobserved),
                 }
-                if (unobserved := register.unobserved_applies(scenario_id))
+                if (unobserved := register.unobserved_applies(project_path))
                 else None
             ),
         }
 
-    def read_persistent_values(self, scenario_id: str) -> dict[str, Any]:
+    def read_persistent_values(self) -> dict[str, Any]:
+        """The Applied Scenario project's persistent values."""
+
         register = self._persistent_key_register()
-        program, declarations, activation, fault = self._applied_persistent_keys(
-            register, scenario_id, tolerate_storage_fault=True
+        program, declarations, activation, fault, scenario_id = (
+            self._applied_persistent_keys(register, tolerate_storage_fault=True)
         )
         return self._persistent_values(
             register,
@@ -4849,14 +4896,14 @@ class ProgramRuntime:
         )
 
     def set_persistent_value(
-        self, scenario_id: str, request: PersistentKeyValueSetRequest
+        self, request: PersistentKeyValueSetRequest
     ) -> dict[str, Any]:
-        return self._edit_persistent_value(scenario_id, request, action="set")
+        return self._edit_persistent_value(request, action="set")
 
     def reset_persistent_value(
-        self, scenario_id: str, request: PersistentKeyValueResetRequest
+        self, request: PersistentKeyValueResetRequest
     ) -> dict[str, Any]:
-        return self._edit_persistent_value(scenario_id, request, action="reset")
+        return self._edit_persistent_value(request, action="reset")
 
     def _persistent_edit(
         self,
@@ -4923,14 +4970,16 @@ class ProgramRuntime:
             )
             return result
 
-    def _require_persistent_fence(self, scenario_id: str, request: Any) -> str | None:
+    def _require_persistent_fence(
+        self, activation: CommittedActivation, request: Any
+    ) -> str | None:
         """Return the live run the edit names, refusing one made on a stale view.
 
         A live run fences the edit by its revision; without one the last
         admitted edit wins.
         """
 
-        program_run_id = self._live_run_id(scenario_id)
+        program_run_id = self._live_run_id(activation)
         if request.program_run_id != program_run_id:
             raise ProgramRunnerError(
                 "persistent_key_values_stale",
@@ -4959,17 +5008,15 @@ class ProgramRuntime:
 
     def _edit_persistent_value(
         self,
-        scenario_id: str,
         request: PersistentKeyValueResetRequest,
         *,
         action: str,
     ) -> dict[str, Any]:
-        _require_scenario_path(scenario_id, request)
-
         def effect(register: PersistentKeyRegister) -> dict[str, Any]:
-            program, declarations, activation, _fault = (
-                self._applied_persistent_keys(register, scenario_id)
+            program, declarations, activation, _fault, scenario_id = (
+                self._applied_persistent_keys(register, request.project_path)
             )
+            project_path = activation.project_path
             program_revision = program.program_revision
             if request.expected_program_revision != program_revision:
                 raise ProgramRunnerError(
@@ -4991,16 +5038,16 @@ class ProgramRuntime:
                 )
             if action == "set":
                 _validate_persistent_value(program, declaration, request.value)
-            program_run_id = self._require_persistent_fence(scenario_id, request)
+            program_run_id = self._require_persistent_fence(activation, request)
             if program_run_id is None:
                 edit = PersistentKeyEdit(request.request_id, request.source_label)
                 try:
                     if action == "set":
                         register.commit(
-                            scenario_id, declaration, request.value, edit=edit
+                            project_path, declaration, request.value, edit=edit
                         )
                     else:
-                        register.remove(scenario_id, request.key, edit=edit)
+                        register.remove(project_path, request.key, edit=edit)
                 except PersistentKeyRegisterError as error:
                     raise _persistent_storage_error(error) from error
                 self._follow_idle_persistent_edit(
@@ -5057,21 +5104,20 @@ class ProgramRuntime:
         )
 
     def clear_persistent_values(
-        self, scenario_id: str, request: PersistentKeyValuesClearRequest
+        self, request: PersistentKeyValuesClearRequest
     ) -> dict[str, Any]:
-        """Reset every writable key of the Applied Scenario at once.
+        """Reset every writable key of the Applied Scenario project at once.
 
         Exactly a Reset of each key the Applied Program declares writable:
         read keys keep their stored values.
         """
 
-        _require_scenario_path(scenario_id, request)
-
         def effect(register: PersistentKeyRegister) -> dict[str, Any]:
-            _program, declarations, _activation, _fault = (
-                self._applied_persistent_keys(register, scenario_id)
+            _program, declarations, activation, _fault, _scenario_id = (
+                self._applied_persistent_keys(register, request.project_path)
             )
-            program_run_id = self._live_run_id(scenario_id)
+            project_path = activation.project_path
+            program_run_id = self._live_run_id(activation)
             if program_run_id is not None:
                 raise ProgramRunnerError(
                     "persistent_key_run_conflict",
@@ -5080,7 +5126,7 @@ class ProgramRuntime:
                 )
             try:
                 removed = register.clear(
-                    scenario_id,
+                    project_path,
                     declarations,
                     edit=PersistentKeyEdit(request.request_id, request.source_label),
                 )
@@ -5093,7 +5139,7 @@ class ProgramRuntime:
                 "schema_version": PERSISTENT_KEY_EDIT_VERSION,
                 "request_id": request.request_id,
                 "action": "clear",
-                "scenario_id": scenario_id,
+                "project_path": project_path,
                 "removed": removed,
             }
 
@@ -5320,6 +5366,8 @@ class ProgramRuntime:
                         )
                     )
             controls = self._controls(program_run_id)
+            # The run's failure rows before any effect (see _complete_control).
+            held_failures = self._owner.read(program_run_id).operation_failures
             effect_started = False
             owner_effect_accepted = False
 
@@ -5562,11 +5610,12 @@ class ProgramRuntime:
                         cycle_generation=cycle.cycle_generation,
                     ),
                 }
-                journal.complete_control_request(
-                    owner_epoch=request.request_owner_epoch,
-                    request_id=request.request_id,
+                self._complete_control(
+                    journal,
+                    request,
                     result=result,
-                    run_snapshot=projected,
+                    projected=projected,
+                    held_failures=held_failures,
                 )
                 return result
             except ProgramRunnerError as error:

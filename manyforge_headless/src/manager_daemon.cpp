@@ -1207,29 +1207,40 @@ RequiredParentAuthoringClaim(const CanonicalValue &value) {
       RequiredString(intent_value, "request_payload_digest");
   Require(core::IsExactLowercaseSha256Digest(request_payload_digest),
           "parent authoring claim payload digest is invalid");
+  // Decode in the original order before constructing the nested claim, so
+  // malformed later fields unwind only independent owning locals.
+  auto owner =
+      core::RequestOwnerEpoch(RequiredString(intent_value, "owner_epoch"));
+  auto transaction = RequiredString(intent_value, "owner_transaction_id");
+  auto request = core::RequestId(RequiredString(intent_value, "request_id"));
+  auto payload_digest = core::ContentDigest(request_payload_digest);
+  const auto expected_generation = core::AdmissionGeneration(RequiredUnsigned(
+      RequiredMember(intent_value, "expected_admission_generation"),
+      "parent expected_admission_generation"));
+  const auto claim_generation = core::CellAdmissionClaimGeneration(
+      RequiredUnsigned(RequiredMember(value, "claim_generation"),
+                       "parent claim_generation"));
+  const auto acquired_generation = core::AdmissionGeneration(
+      RequiredUnsigned(RequiredMember(value, "acquired_admission_generation"),
+                       "parent acquired_admission_generation"));
+  const auto accepted_at = manyforge::content_identity::parse_nonnegative_int64(
+      RequiredMember(value, "accepted_at_ns"));
   core::CellAdmissionClaimDTO claim{
       {
           core::CellAdmissionClaimKindDTO::kAuthoringMutation,
           core::CellAdmissionOwnerRoleDTO::kAuthoringOwner,
-          core::RequestOwnerEpoch(RequiredString(intent_value, "owner_epoch")),
-          RequiredString(intent_value, "owner_transaction_id"),
-          core::RequestId(RequiredString(intent_value, "request_id")),
-          core::ContentDigest(request_payload_digest),
-          core::AdmissionGeneration(RequiredUnsigned(
-              RequiredMember(intent_value, "expected_admission_generation"),
-              "parent expected_admission_generation")),
+          std::move(owner),
+          std::move(transaction),
+          std::move(request),
+          std::move(payload_digest),
+          expected_generation,
           {},
           std::nullopt,
           std::nullopt,
       },
-      core::CellAdmissionClaimGeneration(
-          RequiredUnsigned(RequiredMember(value, "claim_generation"),
-                           "parent claim_generation")),
-      core::AdmissionGeneration(RequiredUnsigned(
-          RequiredMember(value, "acquired_admission_generation"),
-          "parent acquired_admission_generation")),
-      manyforge::content_identity::parse_nonnegative_int64(
-          RequiredMember(value, "accepted_at_ns")),
+      claim_generation,
+      acquired_generation,
+      accepted_at,
   };
   Require(core::ValidateCellAdmissionClaimIntent(claim.intent).ok(),
           "parent authoring claim is invalid");
@@ -4054,36 +4065,38 @@ private:
       const component_manager::ManagerActiveRuntimeConvergenceResult &runtime,
       const core::ProgramCycleStatusDTO &program_cycle_status,
       const std::uint32_t unsettled_effect_count, const bool forced_closed) {
-    const auto component_total = runtime.plan.runtime_units.size();
-    Require(component_total <= std::numeric_limits<std::uint32_t>::max(),
+    // These counts describe runtime-service convergence, not CCLC component
+    // activation or provider command readiness. Keep the public DTO unchanged.
+    const auto runtime_unit_total = runtime.plan.runtime_units.size();
+    Require(runtime_unit_total <= std::numeric_limits<std::uint32_t>::max(),
             "required runtime-unit count exceeds readiness capacity");
-    std::uint32_t ready = 0U;
-    std::uint32_t faults = 0U;
+    std::uint32_t converged_runtime_units = 0U;
+    std::uint32_t faulted_runtime_units = 0U;
     for (const auto &row : runtime.plan.runtime_units) {
       const auto *observation =
           runtime.observations.observation(row.runtime_unit_id.value());
       Require(observation != nullptr,
               "required runtime-unit observation is absent");
       if (observation->converged()) {
-        ++ready;
+        ++converged_runtime_units;
       }
       if (observation->source_phase() ==
               component_manager::RuntimeSourcePhase::kFaulted ||
           observation->source_health() ==
               component_manager::RuntimeSourceHealth::kFaulted) {
-        ++faults;
+        ++faulted_runtime_units;
       }
     }
     return ReduceManagerCellAdmissionReadiness({
         !forced_closed,
         program_cycle_status,
         !forced_closed,
-        static_cast<std::uint32_t>(component_total),
-        ready,
+        static_cast<std::uint32_t>(runtime_unit_total),
+        converged_runtime_units,
         !forced_closed,
         runtime.state ==
             component_manager::ManagerActiveRuntimeConvergenceState::kConverged,
-        faults,
+        faulted_runtime_units,
         scene_admission_reconciled_.load(std::memory_order_acquire) ? 0U : 1U,
         unsettled_effect_count,
     });

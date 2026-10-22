@@ -4,8 +4,10 @@ import { api, authoringRefusalMessage, isStaleWorkspaceError } from '../api/clie
 import { errorMessage } from '../state/structuralResource';
 import type { ManagerApplyIdentity } from '../state/managerApply';
 import {
+  deploymentComparisonsStale,
   deploymentLocalFence,
   publicationSupersedesDeployment,
+  DEPLOYMENT_RECHECKING_REASON,
   withSharedDeploymentAuthoring,
 } from '../state/authoringWorkspace';
 import type {
@@ -69,11 +71,15 @@ export function useDeploymentWorkspace(
   const [pendingApplyConfirmation, setPendingApplyConfirmation] = useState<
     DeploymentCandidateOperationResponse | null
   >(null);
+  /** Whether the pending confirmation is for an Apply or a Revert. */
+  const [pendingConfirmationAction, setPendingConfirmationAction] = useState<'apply' | 'revert'>('apply');
   // What the disruptive-impact confirmation must carry to its Apply: the
   // shared correlation and the exact activation scope the first Apply sent.
   const pendingConfirmationContext = useRef<{
     correlationId: string | undefined;
     scope: DeploymentActivationScope | null;
+    /** A confirmed Revert stays a Revert of the Saved input, never an Apply. */
+    action: 'apply' | 'revert';
   } | null>(null);
   const mounted = useRef(true);
   const inFlight = useRef(false);
@@ -139,6 +145,14 @@ export function useDeploymentWorkspace(
       ? 'Waiting for updated backend authoring permissions.'
       : authoring.unavailableReason
         ?? (workspace === null ? 'Deployment workspace is not loaded.' : null));
+  // While the owner is read again after a publication, its comparisons are
+  // unknown, so no Scenario action is offered; a failed read says so until a
+  // later read succeeds. Draft edits stay available.
+  const comparisonUnavailableReason = workspace?.runAdmission.reason !== DEPLOYMENT_RECHECKING_REASON
+    ? null
+    : !loading && error !== null
+      ? `The Deployment could not be rechecked against Manager Applied: ${error} Refresh to retry.`
+      : `${DEPLOYMENT_RECHECKING_REASON}…`;
   const published = authoring.published;
   /** The complete activation input of the installed publication. */
   const activationScope = useMemo(() => deploymentActivationScope(published), [published]);
@@ -149,10 +163,12 @@ export function useDeploymentWorkspace(
     if (!publicationSupersedesDeployment(published, workspace)) return;
     // Deployment Draft and Saved are authoring truth and come from the one
     // shared publication; the Manager/Applied projection stays with this owner
-    // read.
+    // read; when the publication outdates it, the owner is read again.
+    const stale = deploymentComparisonsStale(workspace, published.snapshot);
     const merged = withSharedDeploymentAuthoring(workspace, published.snapshot);
     if (
-      merged.draft.id === workspace.draft.id
+      !stale
+      && merged.draft.id === workspace.draft.id
       && merged.draft.revision === workspace.draft.revision
       && merged.draft.document === workspace.draft.document
       && merged.saved.path === workspace.saved.path
@@ -161,7 +177,8 @@ export function useDeploymentWorkspace(
       return;
     }
     setWorkspace(merged);
-  }, [published, workspace]);
+    if (stale) void refresh();
+  }, [published, refresh, workspace]);
 
   const fence = useCallback((
     kind: 'edit' | 'document',
@@ -289,7 +306,8 @@ export function useDeploymentWorkspace(
         refreshSequence.current += 1;
         setWorkspace(response.workspace);
         if (response.result.status === 'confirmation_required') {
-          pendingConfirmationContext.current = { correlationId, scope };
+          pendingConfirmationContext.current = { correlationId, scope, action };
+          setPendingConfirmationAction(action);
           setPendingApplyConfirmation(response);
           setFeedback(null);
         } else {
@@ -448,6 +466,13 @@ export function useDeploymentWorkspace(
       const context = pendingConfirmationContext.current;
       pendingConfirmationContext.current = null;
       setPendingApplyConfirmation(null);
+      if (context?.action === 'revert') {
+        return runApply(
+          (requestFence) => api.deploymentWorkspace.revert(requestFence, { token, preparation }),
+          'Saved Scenario restored through the authoritative Apply.',
+          'revert',
+        );
+      }
       return runApply(
         (requestFence, scope) => api.deploymentWorkspace.applyDraft(
           requestFence, { token, preparation }, undefined, context?.correlationId, scope,
@@ -476,9 +501,11 @@ export function useDeploymentWorkspace(
     acceptedApplyCorrelationId,
     activationScope,
     pendingApplyConfirmation,
+    pendingConfirmationAction: pendingApplyConfirmation === null ? null : pendingConfirmationAction,
     mutationAvailable,
     mutationUnavailableReason,
     documentUnavailableReason,
+    comparisonUnavailableReason,
     refresh,
     clearFeedback: () => setFeedback(null),
     dismissError: () => setError(null),

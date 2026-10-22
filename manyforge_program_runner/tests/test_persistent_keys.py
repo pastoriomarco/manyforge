@@ -54,10 +54,10 @@ class _Manager:
         self.applies: dict[str, str] = {}
 
     def apply(
-        self, scenario_id: str, *declarations: BlackboardKeyDeclaration
+        self, project_path: str, *declarations: BlackboardKeyDeclaration
     ) -> CommittedActivation:
         digest = f"{self.history}.apply.{len(self.applies) + 1}"
-        self.applies[digest] = scenario_id
+        self.applies[digest] = project_path
         return self.current(digest, declarations)
 
     def current(
@@ -65,7 +65,7 @@ class _Manager:
     ) -> CommittedActivation:
         return CommittedActivation(
             record_digest=digest,
-            scenario_id=self.applies[digest],
+            project_path=self.applies[digest],
             declarations={row.key: row for row in declarations},
             committed_applies=dict(self.applies),
         )
@@ -74,10 +74,10 @@ class _Manager:
 def _reconciled(
     register: PersistentKeyRegister,
     manager: _Manager,
-    scenario_id: str,
+    project_path: str,
     *declarations: BlackboardKeyDeclaration,
 ) -> CommittedActivation:
-    activation = manager.apply(scenario_id, *declarations)
+    activation = manager.apply(project_path, *declarations)
     assert register.reconcile(activation).outcome == "reconciled"
     return activation
 
@@ -88,23 +88,23 @@ def test_values_survive_a_new_register_and_stay_scoped_to_their_scenario(
     path = tmp_path / "state" / "persistent-keys.json"
     register = PersistentKeyRegister(path)
     manager = _Manager()
-    _reconciled(register, manager, "scenario.b", _declaration("index"))
-    register.commit("scenario.b", _declaration("index"), 9)
-    _reconciled(register, manager, "scenario.a", _declaration("index"))
-    register.commit("scenario.a", _declaration("index"), 3)
+    _reconciled(register, manager, "/cells/b/cell.scenario", _declaration("index"))
+    register.commit("/cells/b/cell.scenario", _declaration("index"), 9)
+    _reconciled(register, manager, "/cells/a/cell.scenario", _declaration("index"))
+    register.commit("/cells/a/cell.scenario", _declaration("index"), 3)
 
     reopened = PersistentKeyRegister(path)
-    assert reopened.restore("scenario.a", {"index": _declaration("index")}) == {
+    assert reopened.restore("/cells/a/cell.scenario", {"index": _declaration("index")}) == {
         "index": 3
     }
     # Only the Scenario of the reconciled activation restores anything.
-    assert reopened.restore("scenario.b", {"index": _declaration("index")}) == {}
-    assert reopened.values("scenario.b")["index"]["value"] == 9
+    assert reopened.restore("/cells/b/cell.scenario", {"index": _declaration("index")}) == {}
+    assert reopened.values("/cells/b/cell.scenario")["index"]["value"] == 9
     document = json.loads(path.read_text())
-    assert document["schema_version"] == "manyforge.persistent_key_register.v2"
+    assert document["schema_version"] == "manyforge.persistent_key_register.v3"
     assert document["activation"] == {
         "record_digest": "h.apply.2",
-        "scenario_id": "scenario.a",
+        "project_path": "/cells/a/cell.scenario",
     }
     assert document["reconciled_applies"] == ["h.apply.1", "h.apply.2"]
 
@@ -114,19 +114,19 @@ def test_a_committed_apply_drops_removed_and_restructured_keys_with_notices(
 ) -> None:
     register = PersistentKeyRegister(tmp_path / "keys.json")
     manager = _Manager()
-    _reconciled(register, manager, "scenario.other", _declaration("gone"))
-    register.commit("scenario.other", _declaration("gone"), 5)
+    _reconciled(register, manager, "/cells/other/cell.scenario", _declaration("gone"))
+    register.commit("/cells/other/cell.scenario", _declaration("gone"), 5)
     _reconciled(
         register,
         manager,
-        "scenario.a",
+        "/cells/a/cell.scenario",
         *(_declaration(key) for key in ("gone", "retyped", "now_run", "kept")),
     )
     for value, key in enumerate(("gone", "retyped", "now_run", "kept"), start=1):
-        register.commit("scenario.a", _declaration(key), value)
+        register.commit("/cells/a/cell.scenario", _declaration(key), value)
 
     activation = manager.apply(
-        "scenario.a",
+        "/cells/a/cell.scenario",
         _declaration("retyped", "float64"),
         _declaration("now_run", persistence="run"),
         # `initial:` and description are not part of the stored structure:
@@ -146,18 +146,18 @@ def test_a_committed_apply_drops_removed_and_restructured_keys_with_notices(
 
     assert result.outcome == "reconciled"
     assert set(result.dropped) == {
-        PersistentKeyNotice("scenario.a", "gone", "key_not_declared_persistent"),
-        PersistentKeyNotice("scenario.a", "now_run", "key_not_declared_persistent"),
-        PersistentKeyNotice("scenario.a", "retyped", "key_declaration_changed"),
+        PersistentKeyNotice("/cells/a/cell.scenario", "gone", "key_not_declared_persistent"),
+        PersistentKeyNotice("/cells/a/cell.scenario", "now_run", "key_not_declared_persistent"),
+        PersistentKeyNotice("/cells/a/cell.scenario", "retyped", "key_declaration_changed"),
     }
-    assert register.restore("scenario.a", activation.declarations) == {"kept": 4}
+    assert register.restore("/cells/a/cell.scenario", activation.declarations) == {"kept": 4}
     # Another Scenario's rows are untouched while all its Applies were seen.
-    assert set(register.values("scenario.other")) == {"gone"}
+    assert set(register.values("/cells/other/cell.scenario")) == {"gone"}
     reopened = PersistentKeyRegister(register.path)
-    assert set(reopened.values("scenario.a")) == {"kept"}
+    assert set(reopened.values("/cells/a/cell.scenario")) == {"kept"}
     assert [
         (edit["action"], edit["key"], edit["reason"], edit["source_label"])
-        for edit in reopened.edits("scenario.a")
+        for edit in reopened.edits("/cells/a/cell.scenario")
         if edit["action"] == "dropped"
     ] == [
         ("dropped", "gone", "key_not_declared_persistent", "committed_apply"),
@@ -171,12 +171,12 @@ def test_structure_compatibility_includes_fields(tmp_path: Path) -> None:
     manager = _Manager()
     before = _declaration("bundle", "model_response", fields={"reason": "string"})
     after = _declaration("bundle", "model_response", fields={"reason": "bool"})
-    _reconciled(register, manager, "scenario.a", before)
-    register.commit("scenario.a", before, {"reason": "ok"})
+    _reconciled(register, manager, "/cells/a/cell.scenario", before)
+    register.commit("/cells/a/cell.scenario", before, {"reason": "ok"})
 
-    assert register.restore("scenario.a", {"bundle": after}) == {}
-    _reconciled(register, manager, "scenario.a", after)
-    assert register.values("scenario.a") == {}
+    assert register.restore("/cells/a/cell.scenario", {"bundle": after}) == {}
+    _reconciled(register, manager, "/cells/a/cell.scenario", after)
+    assert register.values("/cells/a/cell.scenario") == {}
 
 
 def test_an_observed_delete_apply_drops_the_value_for_good(tmp_path: Path) -> None:
@@ -186,59 +186,59 @@ def test_an_observed_delete_apply_drops_the_value_for_good(tmp_path: Path) -> No
     register = PersistentKeyRegister(tmp_path / "keys.json")
     manager = _Manager()
     pallet = _declaration("pallet_index")
-    _reconciled(register, manager, "scenario.a", pallet, _declaration("layer"))
-    register.commit("scenario.a", pallet, 9)
-    register.commit("scenario.a", _declaration("layer"), 2)
+    _reconciled(register, manager, "/cells/a/cell.scenario", pallet, _declaration("layer"))
+    register.commit("/cells/a/cell.scenario", pallet, 9)
+    register.commit("/cells/a/cell.scenario", _declaration("layer"), 2)
 
-    deleted = _reconciled(register, manager, "scenario.a", _declaration("layer"))
-    readded = _reconciled(register, manager, "scenario.a", pallet, _declaration("layer"))
+    deleted = _reconciled(register, manager, "/cells/a/cell.scenario", _declaration("layer"))
+    readded = _reconciled(register, manager, "/cells/a/cell.scenario", pallet, _declaration("layer"))
 
-    assert register.restore("scenario.a", deleted.declarations) == {"layer": 2}
-    assert register.restore("scenario.a", readded.declarations) == {"layer": 2}
-    assert register.unobserved_applies("scenario.a") == ()
+    assert register.restore("/cells/a/cell.scenario", deleted.declarations) == {"layer": 2}
+    assert register.restore("/cells/a/cell.scenario", readded.declarations) == {"layer": 2}
+    assert register.unobserved_applies("/cells/a/cell.scenario") == ()
 
 
 def test_a_missed_apply_keeps_values_and_reports_the_fault(tmp_path: Path) -> None:
     register = PersistentKeyRegister(tmp_path / "keys.json")
     manager = _Manager()
     pallet = _declaration("pallet_index")
-    _reconciled(register, manager, "scenario.a", pallet, _declaration("layer"))
-    register.commit("scenario.a", pallet, 9)
-    register.commit("scenario.a", _declaration("layer"), 2)
+    _reconciled(register, manager, "/cells/a/cell.scenario", pallet, _declaration("layer"))
+    register.commit("/cells/a/cell.scenario", pallet, 9)
+    register.commit("/cells/a/cell.scenario", _declaration("layer"), 2)
 
-    missed = manager.apply("scenario.a", _declaration("layer"))  # never observed
-    readded = manager.apply("scenario.a", pallet, _declaration("layer"))
+    missed = manager.apply("/cells/a/cell.scenario", _declaration("layer"))  # never observed
+    readded = manager.apply("/cells/a/cell.scenario", pallet, _declaration("layer"))
     result = register.reconcile(readded)  # e.g. at Run start
 
     # Nothing is dropped for what cannot be proven; the missed Apply is a
     # named, persistent fault instead.
     assert result.dropped == ()
-    assert result.unobserved == ((missed.record_digest, "scenario.a"),)
-    assert register.restore("scenario.a", readded.declarations) == {
+    assert result.unobserved == ((missed.record_digest, "/cells/a/cell.scenario"),)
+    assert register.restore("/cells/a/cell.scenario", readded.declarations) == {
         "pallet_index": 9,
         "layer": 2,
     }
     reopened = PersistentKeyRegister(register.path)
-    assert reopened.unobserved_applies("scenario.a") == (missed.record_digest,)
-    (fault,) = [e for e in reopened.edits("scenario.a") if e["action"] == "fault"]
+    assert reopened.unobserved_applies("/cells/a/cell.scenario") == (missed.record_digest,)
+    (fault,) = [e for e in reopened.edits("/cells/a/cell.scenario") if e["action"] == "fault"]
     assert fault["reason"] == "applied_program_not_observed"
     assert missed.record_digest in fault["detail"]
     # The current declarations still decide: a key it does not declare goes.
-    narrowed = manager.apply("scenario.a", _declaration("layer"))
+    narrowed = manager.apply("/cells/a/cell.scenario", _declaration("layer"))
     assert register.reconcile(narrowed).dropped == (
-        PersistentKeyNotice("scenario.a", "pallet_index", "key_not_declared_persistent"),
+        PersistentKeyNotice("/cells/a/cell.scenario", "pallet_index", "key_not_declared_persistent"),
     )
 
 
 def test_duplicate_and_stale_activations_change_nothing(tmp_path: Path) -> None:
     register = PersistentKeyRegister(tmp_path / "keys.json")
     manager = _Manager()
-    narrow = _reconciled(register, manager, "scenario.a", _declaration("x"))
+    narrow = _reconciled(register, manager, "/cells/a/cell.scenario", _declaration("x"))
     assert register.reconcile(narrow).outcome == "duplicate"
     wide = _reconciled(
-        register, manager, "scenario.a", _declaration("x"), _declaration("y")
+        register, manager, "/cells/a/cell.scenario", _declaration("x"), _declaration("y")
     )
-    register.commit("scenario.a", _declaration("y"), 7)
+    register.commit("/cells/a/cell.scenario", _declaration("y"), 7)
     sequence = register.sequence
 
     # A repeated notification is a no-op ...
@@ -247,48 +247,48 @@ def test_duplicate_and_stale_activations_change_nothing(tmp_path: Path) -> None:
     late = manager.current(narrow.record_digest, (_declaration("x"),))
     assert register.reconcile(late).outcome == "stale"
     assert register.sequence == sequence
-    assert register.restore("scenario.a", wide.declarations) == {"y": 7}
+    assert register.restore("/cells/a/cell.scenario", wide.declarations) == {"y": 7}
 
 
 def test_a_new_publication_history_keeps_rows_that_still_fit(tmp_path: Path) -> None:
     register = PersistentKeyRegister(tmp_path / "keys.json")
     first = _Manager("first")
-    _reconciled(register, first, "scenario.b", _declaration("count"))
-    register.commit("scenario.b", _declaration("count"), 1)
-    _reconciled(register, first, "scenario.a", _declaration("index"), _declaration("gone"))
-    register.commit("scenario.a", _declaration("index"), 2)
-    register.commit("scenario.a", _declaration("gone"), 3)
-    first.apply("scenario.a", _declaration("index"))  # missed before the restart
-    register.reconcile(first.apply("scenario.a", _declaration("index"), _declaration("gone")))
-    assert register.unobserved_applies("scenario.a") == ("first.apply.3",)
+    _reconciled(register, first, "/cells/b/cell.scenario", _declaration("count"))
+    register.commit("/cells/b/cell.scenario", _declaration("count"), 1)
+    _reconciled(register, first, "/cells/a/cell.scenario", _declaration("index"), _declaration("gone"))
+    register.commit("/cells/a/cell.scenario", _declaration("index"), 2)
+    register.commit("/cells/a/cell.scenario", _declaration("gone"), 3)
+    first.apply("/cells/a/cell.scenario", _declaration("index"))  # missed before the restart
+    register.reconcile(first.apply("/cells/a/cell.scenario", _declaration("index"), _declaration("gone")))
+    assert register.unobserved_applies("/cells/a/cell.scenario") == ("first.apply.3",)
 
     # Manager restarted with new state (a workbench stop/start).
-    again = _Manager("second").apply("scenario.a", _declaration("index"))
+    again = _Manager("second").apply("/cells/a/cell.scenario", _declaration("index"))
     result = register.reconcile(again)
 
     assert result.history_changed is True
     assert result.dropped == (
-        PersistentKeyNotice("scenario.a", "gone", "key_not_declared_persistent"),
+        PersistentKeyNotice("/cells/a/cell.scenario", "gone", "key_not_declared_persistent"),
     )
-    assert register.restore("scenario.a", again.declarations) == {"index": 2}
-    assert register.values("scenario.b")["count"]["value"] == 1
+    assert register.restore("/cells/a/cell.scenario", again.declarations) == {"index": 2}
+    assert register.values("/cells/b/cell.scenario")["count"]["value"] == 1
     # Faults named Applies of the previous history; its audit stays.
-    assert register.unobserved_applies("scenario.a") == ()
-    assert [e["action"] for e in register.edits("scenario.a")].count("fault") == 1
+    assert register.unobserved_applies("/cells/a/cell.scenario") == ()
+    assert [e["action"] for e in register.edits("/cells/a/cell.scenario")].count("fault") == 1
 
 
 def test_nothing_is_restored_before_the_scenario_is_reconciled(tmp_path: Path) -> None:
     register = PersistentKeyRegister(tmp_path / "keys.json")
-    assert register.restore("scenario.a", {"index": _declaration("index")}) == {}
-    register.commit("scenario.a", _declaration("index"), 3)
-    assert register.restore("scenario.a", {"index": _declaration("index")}) == {}
+    assert register.restore("/cells/a/cell.scenario", {"index": _declaration("index")}) == {}
+    register.commit("/cells/a/cell.scenario", _declaration("index"), 3)
+    assert register.restore("/cells/a/cell.scenario", {"index": _declaration("index")}) == {}
     # The first reconciliation keeps what fits and reports nothing missed.
     manager = _Manager()
-    manager.apply("scenario.a", _declaration("index"))
-    activation = manager.apply("scenario.a", _declaration("index"))
+    manager.apply("/cells/a/cell.scenario", _declaration("index"))
+    activation = manager.apply("/cells/a/cell.scenario", _declaration("index"))
     result = register.reconcile(activation)
     assert (result.dropped, result.unobserved) == ((), ())
-    assert register.restore("scenario.a", activation.declarations) == {"index": 3}
+    assert register.restore("/cells/a/cell.scenario", activation.declarations) == {"index": 3}
 
 
 def test_a_failed_cleanup_keeps_the_register_and_retries(
@@ -296,9 +296,9 @@ def test_a_failed_cleanup_keeps_the_register_and_retries(
 ) -> None:
     register = PersistentKeyRegister(tmp_path / "keys.json")
     manager = _Manager()
-    _reconciled(register, manager, "scenario.a", _declaration("index"))
-    register.commit("scenario.a", _declaration("index"), 5)
-    removed = manager.apply("scenario.a")
+    _reconciled(register, manager, "/cells/a/cell.scenario", _declaration("index"))
+    register.commit("/cells/a/cell.scenario", _declaration("index"), 5)
+    removed = manager.apply("/cells/a/cell.scenario")
 
     def refuse(*_args, **_kwargs):
         raise OSError("read-only file system")
@@ -308,33 +308,33 @@ def test_a_failed_cleanup_keeps_the_register_and_retries(
     with pytest.raises(PersistentKeyRegisterError, match="could not be written"):
         register.reconcile(removed)
     # Unchanged, and the stale row is still not restorable for the new Apply.
-    assert register.values("scenario.a")["index"]["value"] == 5
+    assert register.values("/cells/a/cell.scenario")["index"]["value"] == 5
     assert register.activation["record_digest"] == "h.apply.1"
     monkeypatch.setattr(persistent_keys.os, "replace", replace)
     assert register.reconcile(removed).outcome == "reconciled"
-    assert register.values("scenario.a") == {}
+    assert register.values("/cells/a/cell.scenario") == {}
 
 
 def test_drop_forgets_a_refused_restored_value_with_a_notice(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     register = PersistentKeyRegister(tmp_path / "keys.json")
-    _reconciled(register, _Manager(), "scenario.a", _declaration("pose"))
-    register.commit("scenario.a", _declaration("pose"), 1)
+    _reconciled(register, _Manager(), "/cells/a/cell.scenario", _declaration("pose"))
+    register.commit("/cells/a/cell.scenario", _declaration("pose"), 1)
 
     register.drop(
-        "scenario.a",
+        "/cells/a/cell.scenario",
         "pose",
         reason="value_invalid",
         detail="frame not allowed",
         edit={"program_run_id": "run.1"},
     )
 
-    assert register.values("scenario.a") == {}
+    assert register.values("/cells/a/cell.scenario") == {}
     assert register.take_notices() == (
-        PersistentKeyNotice("scenario.a", "pose", "value_invalid", "frame not allowed"),
+        PersistentKeyNotice("/cells/a/cell.scenario", "pose", "value_invalid", "frame not allowed"),
     )
-    (dropped,) = [e for e in register.edits("scenario.a") if e["action"] == "dropped"]
+    (dropped,) = [e for e in register.edits("/cells/a/cell.scenario") if e["action"] == "dropped"]
     assert (dropped["reason"], dropped["detail"], dropped["program_run_id"]) == (
         "value_invalid",
         "frame not allowed",
@@ -343,14 +343,14 @@ def test_drop_forgets_a_refused_restored_value_with_a_notice(
     assert dropped["source_label"] == "run_start"
 
     # A removal that fails still leaves the notice for the run's audit.
-    register.commit("scenario.a", _declaration("pose"), 2)
+    register.commit("/cells/a/cell.scenario", _declaration("pose"), 2)
     monkeypatch.setattr(
         persistent_keys.os,
         "replace",
         lambda *_args: (_ for _ in ()).throw(OSError("read-only")),
     )
     with pytest.raises(PersistentKeyRegisterError):
-        register.drop("scenario.a", "pose", reason="value_invalid")
+        register.drop("/cells/a/cell.scenario", "pose", reason="value_invalid")
     assert [notice.key for notice in register.take_notices()] == ["pose"]
 
 
@@ -358,15 +358,15 @@ def test_failed_write_keeps_the_previous_visible_value(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     register = PersistentKeyRegister(tmp_path / "keys.json")
-    register.commit("scenario.a", _declaration("index"), 1)
+    register.commit("/cells/a/cell.scenario", _declaration("index"), 1)
 
     def refuse(*_args, **_kwargs):
         raise OSError("read-only file system")
 
     monkeypatch.setattr(persistent_keys.os, "replace", refuse)
     with pytest.raises(PersistentKeyRegisterError, match="could not be written"):
-        register.commit("scenario.a", _declaration("index"), 2)
-    assert register.values("scenario.a")["index"]["value"] == 1
+        register.commit("/cells/a/cell.scenario", _declaration("index"), 2)
+    assert register.values("/cells/a/cell.scenario")["index"]["value"] == 1
 
 
 def test_an_unchanged_value_is_not_written_again(
@@ -377,7 +377,7 @@ def test_an_unchanged_value_is_not_written_again(
     after = _declaration("bundle", "model_response", fields={"reason": "bool"})
     value = {"reason": "ok", "score": 1}
     register.commit(
-        "scenario.a", before, value, edit=PersistentKeyEdit("request.1", "ui")
+        "/cells/a/cell.scenario", before, value, edit=PersistentKeyEdit("request.1", "ui")
     )
 
     def refuse(*_args, **_kwargs):
@@ -386,18 +386,18 @@ def test_an_unchanged_value_is_not_written_again(
     monkeypatch.setattr(persistent_keys.os, "replace", refuse)
     # The same canonical value under the same structure changes nothing.
     register.commit(
-        "scenario.a",
+        "/cells/a/cell.scenario",
         before,
         {"score": 1, "reason": "ok"},
         edit=PersistentKeyEdit("request.2", "ui"),
     )
     assert register.sequence == 1
-    assert [row["request_id"] for row in register.edits("scenario.a")] == [
+    assert [row["request_id"] for row in register.edits("/cells/a/cell.scenario")] == [
         "request.1"
     ]
     monkeypatch.undo()
     # A new structure is a change even when the value is the same.
-    register.commit("scenario.a", after, value)
+    register.commit("/cells/a/cell.scenario", after, value)
     assert register.sequence == 2
 
 
@@ -406,17 +406,17 @@ def test_bounds_and_non_persistent_writes_are_refused(
 ) -> None:
     register = PersistentKeyRegister(tmp_path / "keys.json")
     with pytest.raises(PersistentKeyRegisterError, match="not persistent"):
-        register.commit("scenario.a", _declaration("index", persistence="run"), 1)
+        register.commit("/cells/a/cell.scenario", _declaration("index", persistence="run"), 1)
     with pytest.raises(PersistentKeyRegisterError, match="exceeds"):
         register.commit(
-            "scenario.a",
+            "/cells/a/cell.scenario",
             _declaration("text", "string"),
             "x" * persistent_keys.MAX_VALUE_BYTES,
         )
     monkeypatch.setattr(persistent_keys, "MAX_ROWS", 1)
-    register.commit("scenario.a", _declaration("index"), 1)
+    register.commit("/cells/a/cell.scenario", _declaration("index"), 1)
     with pytest.raises(PersistentKeyRegisterError, match="full"):
-        register.commit("scenario.a", _declaration("other"), 1)
+        register.commit("/cells/a/cell.scenario", _declaration("other"), 1)
 
 
 def test_remove_and_clear_forget_only_the_named_scenario(tmp_path: Path) -> None:
@@ -426,26 +426,26 @@ def test_remove_and_clear_forget_only_the_named_scenario(tmp_path: Path) -> None
         "layer": _declaration("layer", access="write"),
         "limit": _declaration("limit", access="read"),
     }
-    register.commit("scenario.a", declarations["index"], 1)
-    register.commit("scenario.a", declarations["layer"], 2)
-    register.commit("scenario.a", declarations["limit"], 4)
-    register.commit("scenario.b", declarations["index"], 3)
+    register.commit("/cells/a/cell.scenario", declarations["index"], 1)
+    register.commit("/cells/a/cell.scenario", declarations["layer"], 2)
+    register.commit("/cells/a/cell.scenario", declarations["limit"], 4)
+    register.commit("/cells/b/cell.scenario", declarations["index"], 3)
 
-    assert register.remove("scenario.a", "index") is True
-    assert register.remove("scenario.a", "index") is False
+    assert register.remove("/cells/a/cell.scenario", "index") is True
+    assert register.remove("/cells/a/cell.scenario", "index") is False
     # Clear is one Reset per writable key: a read key keeps its stored row.
-    assert register.clear("scenario.a", declarations) == 1
-    assert set(register.values("scenario.a")) == {"limit"}
-    assert register.clear("scenario.a", declarations) == 0
-    assert set(PersistentKeyRegister(register.path).values("scenario.b")) == {"index"}
+    assert register.clear("/cells/a/cell.scenario", declarations) == 1
+    assert set(register.values("/cells/a/cell.scenario")) == {"limit"}
+    assert register.clear("/cells/a/cell.scenario", declarations) == 0
+    assert set(PersistentKeyRegister(register.path).values("/cells/b/cell.scenario")) == {"index"}
 
 
 def test_malformed_register_is_refused_not_replaced(tmp_path: Path) -> None:
     path = tmp_path / "keys.json"
-    path.write_text('{"schema_version": "manyforge.persistent_key_register.v2"}')
+    path.write_text('{"schema_version": "manyforge.persistent_key_register.v3"}')
     with pytest.raises(PersistentKeyRegisterError, match="unsupported layout"):
         PersistentKeyRegister(path)
-    assert path.read_text() == '{"schema_version": "manyforge.persistent_key_register.v2"}'
+    assert path.read_text() == '{"schema_version": "manyforge.persistent_key_register.v3"}'
 
 
 def test_another_register_version_is_refused_by_name_and_left_untouched(
@@ -468,26 +468,79 @@ def test_another_register_version_is_refused_by_name_and_left_untouched(
     assert path.read_text() == earlier
 
 
+def test_the_superseded_scenario_keyed_register_is_moved_aside_not_migrated(
+    tmp_path: Path,
+) -> None:
+    path = tmp_path / "keys.json"
+    earlier = json.dumps(
+        {
+            "schema_version": "manyforge.persistent_key_register.v2",
+            "sequence": 1,
+            "rows": [
+                {"scenario_id": "cell", "key": "index", "fingerprint": "x",
+                 "value": 3, "sequence": 1}
+            ],
+        }
+    )
+    path.write_text(earlier)
+    register = PersistentKeyRegister(path)
+    assert not path.exists()
+    assert (tmp_path / "keys.json.v2.superseded").read_text() == earlier
+    assert register.sequence == 0
+    assert register.activation is None
+    assert register.values("/cells/a/cell.scenario") == {}
+
+
+def test_same_named_projects_in_different_folders_keep_separate_values(
+    tmp_path: Path,
+) -> None:
+    register = PersistentKeyRegister(tmp_path / "keys.json")
+    manager = _Manager()
+    first, second = "/site/line1/pick.scenario", "/site/line2/pick.scenario"
+    _reconciled(register, manager, first, _declaration("index"))
+    register.commit(first, _declaration("index"), 4)
+    activation = _reconciled(register, manager, second, _declaration("index"))
+    assert register.restore(second, activation.declarations) == {}
+    register.commit(second, _declaration("index"), 7)
+    # The renamed or moved folder is another project: it starts empty.
+    moved = _reconciled(
+        register, manager, "/site/line1/renamed.scenario", _declaration("index")
+    )
+    assert register.restore("/site/line1/renamed.scenario", moved.declarations) == {}
+    reopened = PersistentKeyRegister(register.path)
+    assert reopened.values(first)["index"]["value"] == 4
+    assert reopened.values(second)["index"]["value"] == 7
+
+
+def test_a_project_path_is_bounded_to_4096_bytes(tmp_path: Path) -> None:
+    register = PersistentKeyRegister(tmp_path / "keys.json")
+    longest = "/" + "p" * 4095
+    _reconciled(register, _Manager(), longest, _declaration("index"))
+    register.commit(longest, _declaration("index"), 1)
+    with pytest.raises(PersistentKeyRegisterError, match="project_path"):
+        register.commit(longest + "p", _declaration("index"), 1)
+
+
 def test_operator_edits_are_audited_with_the_change_and_bounded(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     register = PersistentKeyRegister(tmp_path / "keys.json")
     edit = PersistentKeyEdit("request.1", "operator_ui")
-    register.commit("scenario.a", _declaration("index"), 1, edit=edit)
+    register.commit("/cells/a/cell.scenario", _declaration("index"), 1, edit=edit)
     # Unattributed writes are ordered by row sequence only.
-    register.commit("scenario.a", _declaration("index"), 2)
-    register.remove("scenario.a", "index", edit=PersistentKeyEdit("request.2", "ui"))
-    register.commit("scenario.b", _declaration("index"), 3, edit=edit)
+    register.commit("/cells/a/cell.scenario", _declaration("index"), 2)
+    register.remove("/cells/a/cell.scenario", "index", edit=PersistentKeyEdit("request.2", "ui"))
+    register.commit("/cells/b/cell.scenario", _declaration("index"), 3, edit=edit)
     register.clear(
-        "scenario.b",
+        "/cells/b/cell.scenario",
         {"index": _declaration("index")},
         edit=PersistentKeyEdit("request.3", "ui"),
     )
 
-    assert PersistentKeyRegister(register.path).edits("scenario.a") == [
+    assert PersistentKeyRegister(register.path).edits("/cells/a/cell.scenario") == [
         {
             "sequence": 1,
-            "scenario_id": "scenario.a",
+            "project_path": "/cells/a/cell.scenario",
             "key": "index",
             "action": "set",
             "request_id": "request.1",
@@ -500,7 +553,7 @@ def test_operator_edits_are_audited_with_the_change_and_bounded(
         },
         {
             "sequence": 3,
-            "scenario_id": "scenario.a",
+            "project_path": "/cells/a/cell.scenario",
             "key": "index",
             "action": "reset",
             "request_id": "request.2",
@@ -512,21 +565,21 @@ def test_operator_edits_are_audited_with_the_change_and_bounded(
             "detail": None,
         },
     ]
-    assert [row["action"] for row in register.edits("scenario.b")] == [
+    assert [row["action"] for row in register.edits("/cells/b/cell.scenario")] == [
         "set",
         "clear",
     ]
 
     monkeypatch.setattr(persistent_keys, "MAX_EDITS", 2)
-    register.commit("scenario.a", _declaration("index"), 5, edit=edit)
-    assert [row["sequence"] for row in register.edits("scenario.a")] == [6]
+    register.commit("/cells/a/cell.scenario", _declaration("index"), 5, edit=edit)
+    assert [row["sequence"] for row in register.edits("/cells/a/cell.scenario")] == [6]
     assert len(json.loads(register.path.read_text())["edits"]) == 2
 
 
 def test_a_run_write_is_audited_with_its_run_node_and_attempt(tmp_path: Path) -> None:
     register = PersistentKeyRegister(tmp_path / "keys.json")
     register.commit(
-        "scenario.a",
+        "/cells/a/cell.scenario",
         _declaration("index"),
         1,
         edit={
@@ -536,10 +589,10 @@ def test_a_run_write_is_audited_with_its_run_node_and_attempt(tmp_path: Path) ->
             "node_attempt_id": "attempt.1",
         },
     )
-    assert PersistentKeyRegister(register.path).edits("scenario.a") == [
+    assert PersistentKeyRegister(register.path).edits("/cells/a/cell.scenario") == [
         {
             "sequence": 1,
-            "scenario_id": "scenario.a",
+            "project_path": "/cells/a/cell.scenario",
             "key": "index",
             "action": "set",
             "request_id": None,
@@ -553,19 +606,19 @@ def test_a_run_write_is_audited_with_its_run_node_and_attempt(tmp_path: Path) ->
     ]
     with pytest.raises(PersistentKeyRegisterError, match="node_attempt_id"):
         register.commit(
-            "scenario.a",
+            "/cells/a/cell.scenario",
             _declaration("index"),
             2,
             edit={"program_run_id": "run.1", "node_attempt_id": "x" * 300},
         )
-    assert register.values("scenario.a")["index"]["value"] == 1
+    assert register.values("/cells/a/cell.scenario")["index"]["value"] == 1
 
 
 def test_a_write_that_may_not_be_durable_is_distinct_and_reconciled(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     register = PersistentKeyRegister(tmp_path / "keys.json")
-    register.commit("scenario.a", _declaration("index"), 1)
+    register.commit("/cells/a/cell.scenario", _declaration("index"), 1)
     failing = [True]
     sync = persistent_keys.os.fsync
 
@@ -576,17 +629,17 @@ def test_a_write_that_may_not_be_durable_is_distinct_and_reconciled(
 
     monkeypatch.setattr(persistent_keys.os, "fsync", fsync)
     with pytest.raises(PersistentKeyStorageUncertainError, match="may not be durable"):
-        register.commit("scenario.a", _declaration("index"), 2)
+        register.commit("/cells/a/cell.scenario", _declaration("index"), 2)
     # The file was replaced: memory follows it, it does not claim "unchanged".
-    assert register.values("scenario.a")["index"]["value"] == 2
-    assert PersistentKeyRegister(register.path).values("scenario.a")["index"]["value"] == 2
+    assert register.values("/cells/a/cell.scenario")["index"]["value"] == 2
+    assert PersistentKeyRegister(register.path).values("/cells/a/cell.scenario")["index"]["value"] == 2
 
     # Every change is refused, as an ordinary refusal, until reconciled.
     with pytest.raises(PersistentKeyRegisterError, match="not reconciled") as refused:
-        register.remove("scenario.a", "index")
+        register.remove("/cells/a/cell.scenario", "index")
     assert not isinstance(refused.value, PersistentKeyStorageUncertainError)
-    assert register.values("scenario.a")["index"]["value"] == 2
+    assert register.values("/cells/a/cell.scenario")["index"]["value"] == 2
 
     failing[0] = False
-    register.commit("scenario.a", _declaration("index"), 3)
-    assert PersistentKeyRegister(register.path).values("scenario.a")["index"]["value"] == 3
+    register.commit("/cells/a/cell.scenario", _declaration("index"), 3)
+    assert PersistentKeyRegister(register.path).values("/cells/a/cell.scenario")["index"]["value"] == 3

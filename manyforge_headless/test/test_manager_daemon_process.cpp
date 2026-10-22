@@ -1331,13 +1331,16 @@ content_identity::CanonicalValue PublishTestPreparedActivation(
   const auto prepared = deployment::assemble_prepared_activation(
       {deployment::PreparedScenarioOrigin{
            "scenario.test",
-           core::ContentDigest("sha256:1414141414141414141414141414141414141414141414"
-                               "141414141414141414")},
-       core::ContentDigest("sha256:2020202020202020202020202020202020202020202020"
-                           "202020202020202020"),
+           core::ContentDigest(
+               "sha256:1414141414141414141414141414141414141414141414"
+               "141414141414141414"),
+           "/fixtures/scenario.test.scenario"},
+       core::ContentDigest(
+           "sha256:2020202020202020202020202020202020202020202020"
+           "202020202020202020"),
        "optional"},
-      candidate, model_map, *program, fixture.program_role_assignment,
-      catalogs, raw_artifacts);
+      candidate, model_map, *program, fixture.program_role_assignment, catalogs,
+      raw_artifacts);
   static_cast<void>(
       deployment::FilesystemPreparedActivationRepository(directory.activation_root())
           .put_if_absent(prepared));
@@ -3887,6 +3890,87 @@ TEST(ManagerDaemonProcess,
                    RequiredText(metadata, "predecessor_graph_revision"),
                    predecessor_id, "empty-ros-one-mock.1", {}, false, "receipt",
                    RequiredText(metadata, "prepared_activation_id"));
+  // Decode genuine Apply envelopes with an intentionally unowned parent claim.
+  // The stale outer owner prevents every valid-shape control from applying.
+  {
+    const auto replace = [](CanonicalValue value, const std::string &name,
+                            CanonicalValue member) {
+      auto fields = value.as_object();
+      for (auto &[key, field] : fields) {
+        if (key == name) {
+          field = std::move(member);
+          return CanonicalValue(std::move(fields));
+        }
+      }
+      throw std::logic_error("parent claim fixture field is absent");
+    };
+    const CanonicalValue intent(CanonicalValue::Object{
+        {"claim_kind", CanonicalValue("authoring_mutation")},
+        {"owner_role", CanonicalValue("authoring_owner")},
+        {"owner_epoch", CanonicalValue(std::string(60U, 'o'))},
+        {"owner_transaction_id", CanonicalValue("parent.decoder.transaction")},
+        {"request_id", CanonicalValue("parent.decoder.request")},
+        {"request_payload_digest",
+         CanonicalValue("sha256:" + std::string(64U, 'a'))},
+        {"expected_admission_generation", CanonicalValue(1.0)},
+        {"scope",
+         CanonicalValue(CanonicalValue::Object{
+             {"resources", CanonicalValue(CanonicalValue::Array{})},
+             {"configurations", CanonicalValue(CanonicalValue::Array{})}})},
+        {"program_cycle_evidence", CanonicalValue(nullptr)},
+        {"intervention_evidence", CanonicalValue(nullptr)}});
+    const CanonicalValue claim(CanonicalValue::Object{
+        {"intent", intent},
+        {"claim_generation", CanonicalValue(2.0)},
+        {"acquired_admission_generation", CanonicalValue(3.0)},
+        {"accepted_at_ns", CanonicalValue(7.0)}});
+    const auto submit_parent = [&](CanonicalValue parent) {
+      auto command = deployment::parse_strict_json_model_yaml(request).root();
+      command = replace(std::move(command), "request_owner_epoch",
+                        CanonicalValue("manager.parent-decoder.stale"));
+      command = replace(std::move(command), "admission_context",
+                        CanonicalValue(CanonicalValue::Object{
+                            {"kind", CanonicalValue("parent_authoring_claim")},
+                            {"claim", std::move(parent)}}));
+      return deployment::parse_strict_json_model_yaml(
+                 SendCommand(directory.socket_path(),
+                             content_identity::canonical_json(command)))
+          .root();
+    };
+    for (const auto &field :
+         {"claim_generation", "acquired_admission_generation"}) {
+      const auto rejected =
+          submit_parent(replace(claim, field, CanonicalValue(0.0)));
+      EXPECT_EQ(RequiredText(RequiredMember(rejected, "error"), "code"),
+                "manager_command_rejected");
+      EXPECT_EQ(RequiredText(RequiredMember(rejected, "error"), "message"),
+                "Manager daemon: parent " + std::string(field) +
+                    " must be one positive safe integer");
+    }
+    const auto bad_timestamp = submit_parent(
+        replace(claim, "accepted_at_ns", CanonicalValue("not-a-timestamp")));
+    EXPECT_EQ(RequiredText(RequiredMember(bad_timestamp, "error"), "code"),
+              "manager_command_rejected");
+    EXPECT_EQ(RequiredText(RequiredMember(bad_timestamp, "error"), "message"),
+              "exact nonnegative int64 scalar required");
+    // An earlier claim generation still wins over a malformed final timestamp.
+    const auto precedence = submit_parent(replace(
+        replace(claim, "accepted_at_ns", CanonicalValue("not-a-timestamp")),
+        "claim_generation", CanonicalValue(0.0)));
+    EXPECT_EQ(RequiredText(RequiredMember(precedence, "error"), "message"),
+              "Manager daemon: parent claim_generation must be one positive "
+              "safe integer");
+    for (const auto &timestamp :
+         {CanonicalValue(7.0), CanonicalValue("9007199254740992")}) {
+      const auto valid =
+          submit_parent(replace(claim, "accepted_at_ns", timestamp));
+      EXPECT_EQ(RequiredText(RequiredMember(valid, "error"), "code"),
+                "stale_request_owner_epoch")
+          << content_identity::canonical_json(valid);
+      EXPECT_EQ(RequiredText(valid, "request_owner_epoch"),
+                "manager.parent-decoder.stale");
+    }
+  }
   const auto submitted = SendCommand(directory.socket_path(), request);
   const auto submission =
       deployment::parse_strict_json_model_yaml(submitted).root();
@@ -4059,7 +4143,9 @@ TEST(ManagerDaemonProcess,
     CanonicalValue payload(CanonicalValue::Object{
         {"kind", CanonicalValue("motion")}, {"move_id", CanonicalValue(request_id + ".hold")},
         {"base_frame_role_id", RequiredMember(command, "base_frame_role_id")},
-        {"tcp_frame_role_id", RequiredMember(command, "tcp_frame_role_id")},
+        {"tcp_endpoint", CanonicalValue(CanonicalValue::Object{
+            {"target_role_id", RequiredMember(command, "target_role_id")},
+            {"frame_role_id", RequiredMember(command, "tcp_frame_role_id")}})},
         {"tolerances", CanonicalValue(CanonicalValue::Object{
             {"joint_position_tol_rad", CanonicalValue(0.01)}, {"translation_tol_m", CanonicalValue(0.001)},
             {"rotation_tol_rad", CanonicalValue(0.01)}})},
@@ -4627,8 +4713,9 @@ TEST(ManagerDaemonProcess,
   EXPECT_EQ(RequiredText(RequiredMember(malformed_scope, "error"), "code"),
             "execution_command_invalid");
 
-  // Output value decoding conveys only a typed logical write. A stale owner
-  // proves this reaches Kernel validation without permitting a provider effect.
+  // Valid output values pass the decoder but this invented Program binding has
+  // no captured node origin. The existing origin gate refuses before Kernel
+  // owner validation or any provider effect.
   const auto submit_output_value = [&](CanonicalValue command_value,
                                        std::optional<CanonicalValue>
                                            caller_timeout = std::nullopt) {
@@ -4676,8 +4763,12 @@ TEST(ManagerDaemonProcess,
             {"value", CanonicalValue(value)}}));
     ASSERT_EQ(RequiredMember(stale_output, "ok"), CanonicalValue(false));
     EXPECT_EQ(RequiredText(RequiredMember(stale_output, "error"), "code"),
-              "stale_request_owner_epoch")
+              "invalid_request")
         << content_identity::canonical_json(stale_output);
+    EXPECT_EQ(RequiredText(RequiredMember(RequiredMember(stale_output, "error"),
+                                         "details"),
+                           "reason"),
+              "program_execution_scope_missing");
   }
   for (const auto &value : {CanonicalValue(nullptr), CanonicalValue(0.0),
                             CanonicalValue("false")}) {
@@ -4713,7 +4804,11 @@ TEST(ManagerDaemonProcess,
   const auto gripper_with_timeout =
       submit_output_value(gripper, CanonicalValue(1.0));
   EXPECT_EQ(RequiredText(RequiredMember(gripper_with_timeout, "error"), "code"),
-            "stale_request_owner_epoch");
+            "invalid_request");
+  EXPECT_EQ(RequiredText(RequiredMember(RequiredMember(gripper_with_timeout, "error"),
+                                       "details"),
+                         "reason"),
+            "program_execution_scope_missing");
 
   for (auto &[key, value] : io_request)
     if (key == "condition")
@@ -4775,8 +4870,25 @@ TEST(ManagerDaemonProcess,
   const auto mixed_coordinate = query_io(CanonicalValue(std::move(io_query)));
   EXPECT_EQ(RequiredText(RequiredMember(mixed_coordinate, "error"), "code"),
             "execution_command_invalid");
-  // Exercise the recovery codec through the Manager-owned production host.
-  // The completed hold is resident, but cannot authorize a motion retry.
+  // The owner automatically acknowledges clean completed manual work.
+  // Wait for its actual retirement, rather than racing that owner for a
+  // recovery assessment; a completed manual move needs no Program Reset.
+  const auto retired_deadline =
+      std::chrono::steady_clock::now() + std::chrono::seconds(20);
+  CanonicalValue retired_motion(nullptr);
+  do {
+    retired_motion = execution_command(CanonicalValue::Object{
+        {"api_version", CanonicalValue("manyforge.execution_command.v1")},
+        {"command", CanonicalValue("read")},
+        {"operation_id", CanonicalValue(operation_id)}});
+    ASSERT_EQ(RequiredMember(retired_motion, "ok"), CanonicalValue(true));
+    if (RequiredMember(retired_motion, "resident") == CanonicalValue(false))
+      break;
+    std::this_thread::sleep_for(std::chrono::milliseconds(10));
+  } while (std::chrono::steady_clock::now() < retired_deadline);
+  ASSERT_EQ(RequiredMember(retired_motion, "resident"), CanonicalValue(false));
+  EXPECT_EQ(RequiredText(RequiredMember(retired_motion, "operation"), "state"),
+            "completed");
   const auto read_recovery = [&] {
     return deployment::parse_strict_json_model_yaml(
                SendCommand(
@@ -4791,32 +4903,25 @@ TEST(ManagerDaemonProcess,
         .root();
   };
   const auto recovery = read_recovery();
-  ASSERT_EQ(RequiredMember(recovery, "ok"), CanonicalValue(true))
+  ASSERT_EQ(RequiredMember(recovery, "ok"), CanonicalValue(false))
       << content_identity::canonical_json(recovery);
-  const auto &assessment = RequiredMember(recovery, "recovery_assessment");
-  EXPECT_EQ(RequiredText(assessment, "schema_version"),
-            "manyforge.kernel_recovery_assessment.v1");
-  const auto &eligibility = RequiredMember(assessment, "retry_eligibility");
-  ASSERT_TRUE(eligibility.is_object());
-  EXPECT_EQ(eligibility.as_object().size(), 4U);
-  EXPECT_EQ(RequiredMember(eligibility, "eligible"), CanonicalValue(false));
-  EXPECT_EQ(RequiredText(eligibility, "cause"), "not_eligible");
-  EXPECT_FALSE(RequiredText(eligibility, "effect").empty());
-  EXPECT_FALSE(RequiredText(eligibility, "reason").empty());
+  EXPECT_EQ(
+      RequiredText(RequiredMember(RequiredMember(recovery, "error"), "details"),
+                   "reason"),
+      "operation_recovery_unavailable");
+  // These inert fences exercise wire validation only. No resident owner can
+  // authorize an effect. Live-owner replay/fence behavior has focused Core
+  // tests.
   CanonicalValue::Object recovery_request{
       {"request_id", CanonicalValue("managed-recovery-wire")},
       {"action", CanonicalValue("reset_cycle")},
       {"principal_id", CanonicalValue("operator.recovery-wire-test")},
-      {"expected_assessment_revision",
-       RequiredMember(assessment, "assessment_revision")},
-      {"expected_control_command_epoch",
-       RequiredMember(assessment, "control_command_epoch")},
-      {"expected_execution_id", RequiredMember(assessment, "execution_id")},
-      {"expected_latch_id", RequiredMember(assessment, "latch_id")},
-      {"expected_stop_certificate_id",
-       RequiredMember(assessment, "stop_certificate_id")},
-      {"expected_stop_owner_generation",
-       RequiredMember(assessment, "stop_owner_generation")},
+      {"expected_assessment_revision", CanonicalValue(1.0)},
+      {"expected_control_command_epoch", CanonicalValue(0.0)},
+      {"expected_execution_id", CanonicalValue(1.0)},
+      {"expected_latch_id", CanonicalValue("")},
+      {"expected_stop_certificate_id", CanonicalValue("")},
+      {"expected_stop_owner_generation", CanonicalValue(0.0)},
       {"reason", CanonicalValue("wire validation only")}};
   const auto apply_recovery = [&](CanonicalValue request_value,
                                   const CanonicalValue &operation_revision) {
@@ -4835,47 +4940,8 @@ TEST(ManagerDaemonProcess,
         .root();
   };
 
-  // Reset belongs to Program control and is always rejected by participant
-  // recovery. This checks the action-result encoder without changing state.
-  const auto refused_recovery_reset =
-      apply_recovery(CanonicalValue(recovery_request),
-                     RequiredMember(recovery, "operation_revision"));
-  ASSERT_EQ(RequiredMember(refused_recovery_reset, "ok"), CanonicalValue(true))
-      << content_identity::canonical_json(refused_recovery_reset);
-  const auto &refused_result = RequiredMember(refused_recovery_reset, "result");
-  EXPECT_EQ(RequiredMember(refused_result, "accepted"), CanonicalValue(false));
-  EXPECT_EQ(RequiredText(RequiredMember(RequiredMember(refused_result, "error"),
-                                        "details"),
-                         "reason"),
-            "action_not_allowed");
-  const auto &resulting_assessment =
-      RequiredMember(refused_result, "resulting_assessment");
-  EXPECT_EQ(RequiredText(resulting_assessment, "schema_version"),
-            "manyforge.kernel_recovery_assessment.v1");
-  EXPECT_EQ(RequiredMember(resulting_assessment, "retry_eligibility"),
-            eligibility);
-  auto explicit_default = recovery_request;
-  explicit_default.emplace_back("fresh_motion_attempt", CanonicalValue(false));
-  EXPECT_EQ(apply_recovery(CanonicalValue(std::move(explicit_default)),
-                           RequiredMember(recovery, "operation_revision")),
-            refused_recovery_reset);
-  auto changed_attempt = recovery_request;
-  changed_attempt.emplace_back("fresh_motion_attempt", CanonicalValue(true));
-  const auto conflicting_attempt =
-      apply_recovery(CanonicalValue(std::move(changed_attempt)),
-                     RequiredMember(recovery, "operation_revision"));
-  ASSERT_EQ(RequiredMember(conflicting_attempt, "ok"), CanonicalValue(false));
-  EXPECT_EQ(RequiredText(RequiredMember(conflicting_attempt, "error"), "code"),
-            "request_id_conflict");
-
-  // A stale operation fence proves valid shapes reached Core; it cannot
-  // execute recovery even if a future participant policy changes.
   const CanonicalValue stale_revision(
-      RequiredMember(recovery, "operation_revision").as_number() + 1.0);
-  std::erase_if(recovery_request,
-                [](const auto &field) { return field.first == "request_id"; });
-  recovery_request.emplace_back("request_id",
-                                CanonicalValue("managed-recovery-stale-wire"));
+      RequiredMember(actual_motion, "operation_revision").as_number() + 1.0);
   for (const auto flag : {std::optional<bool>{}, std::optional<bool>{false},
                           std::optional<bool>{true}}) {
     auto request_value = recovery_request;
@@ -4884,8 +4950,11 @@ TEST(ManagerDaemonProcess,
     const auto refused = apply_recovery(
         CanonicalValue(std::move(request_value)), stale_revision);
     ASSERT_EQ(RequiredMember(refused, "ok"), CanonicalValue(false));
-    EXPECT_EQ(RequiredText(RequiredMember(refused, "error"), "code"),
-              "operation_recovery_stale")
+    EXPECT_EQ(RequiredText(
+                  RequiredMember(RequiredMember(refused, "error"), "details"),
+                  "reason"),
+              flag.value_or(false) ? "operation_recovery_unavailable"
+                                   : "operation_recovery_stale")
         << content_identity::canonical_json(refused);
   }
   auto final_failure_request = recovery_request;
@@ -4932,14 +5001,7 @@ TEST(ManagerDaemonProcess,
               "execution_command_invalid")
         << content_identity::canonical_json(refused);
   }
-  const auto unchanged_recovery = read_recovery();
-  ASSERT_EQ(RequiredMember(unchanged_recovery, "ok"), CanonicalValue(true));
-  EXPECT_EQ(RequiredMember(unchanged_recovery, "operation_revision"),
-            RequiredMember(recovery, "operation_revision"));
-  EXPECT_EQ(
-      RequiredMember(RequiredMember(unchanged_recovery, "recovery_assessment"),
-                     "retry_eligibility"),
-      eligibility);
+  EXPECT_EQ(read_recovery(), recovery);
   const auto execution = WaitForExecutionReady(directory, candidate_id);
   EXPECT_FALSE(execution.owner_epoch.empty());
   const auto scene_after = scene_source.Read();

@@ -267,20 +267,20 @@ class FakeRuntime:
         self.calls.append(("apply_recovery_action", request))
         return {"accepted": True}
 
-    def read_persistent_values(self, scenario_id: str) -> dict[str, Any]:
-        self.calls.append(("read_persistent_values", scenario_id))
-        return {"scenario_id": scenario_id}
+    def read_persistent_values(self) -> dict[str, Any]:
+        self.calls.append(("read_persistent_values", None))
+        return {"project_path": "/projects/cell-pick.scenario"}
 
-    def set_persistent_value(self, scenario_id: str, request) -> dict[str, Any]:
-        self.calls.append(("set_persistent_value", (scenario_id, request)))
+    def set_persistent_value(self, request) -> dict[str, Any]:
+        self.calls.append(("set_persistent_value", request))
         return {"action": "set"}
 
-    def reset_persistent_value(self, scenario_id: str, request) -> dict[str, Any]:
-        self.calls.append(("reset_persistent_value", (scenario_id, request)))
+    def reset_persistent_value(self, request) -> dict[str, Any]:
+        self.calls.append(("reset_persistent_value", request))
         return {"action": "reset"}
 
-    def clear_persistent_values(self, scenario_id: str, request) -> dict[str, Any]:
-        self.calls.append(("clear_persistent_values", (scenario_id, request)))
+    def clear_persistent_values(self, request) -> dict[str, Any]:
+        self.calls.append(("clear_persistent_values", request))
         return {"action": "clear"}
 
     def reconcile_persistent_values(self) -> dict[str, Any]:
@@ -752,26 +752,44 @@ def test_program_start_preconditions_map_to_client_conflict(code: str) -> None:
     assert response.json()["detail"]["code"] == code
 
 
-def test_persistent_value_routes_are_scenario_scoped_strict_requests() -> None:
+def test_persistent_value_routes_are_applied_project_strict_requests() -> None:
     runtime = FakeRuntime()
-    base = "/api/program/scenarios/cell-pick/persistent-values"
+    base = "/api/program/persistent-values"
+    project = "/projects/cell-pick.scenario"
     edit = {
         **_caller(),
-        "scenario_id": "cell-pick",
+        "project_path": project,
         "key": "layer",
         "expected_program_revision": _DIGEST_A,
     }
     with TestClient(create_app(runtime)) as client:
-        assert client.get(base).json() == {"scenario_id": "cell-pick"}
+        assert client.get(base).json() == {"project_path": project}
         assert client.post(base, json={**edit, "value": 3}).json() == {
             "action": "set"
         }
         assert client.post(f"{base}/reset", json=edit).json() == {"action": "reset"}
         cleared = client.post(
             f"{base}/clear",
-            json={**_caller(), "scenario_id": "cell-pick"},
+            json={**_caller(), "project_path": project},
         )
         assert cleared.json() == {"action": "clear"}
+        # The project folder is absolute and lexically normalized.
+        for path in (
+            "projects/cell-pick.scenario",
+            "/projects/../cell-pick.scenario",
+            "/projects/cell-pick.scenario/",
+            "//projects/cell-pick.scenario",
+            "/projects/\x00cell-pick",
+            "/" + "p" * 4096,
+        ):
+            assert client.post(
+                f"{base}/clear", json={**_caller(), "project_path": path}
+            ).status_code == 422
+        assert client.post(f"{base}/clear", json=_caller()).status_code == 422
+        # The former Scenario-id addressed routes are gone.
+        assert client.get(
+            "/api/program/scenarios/cell-pick/persistent-values"
+        ).status_code == 404
         # A value is required to set, and nothing else is accepted.
         assert client.post(base, json=edit).status_code == 422
         assert client.post(f"{base}/reset", json={**edit, "value": 3}).status_code == 422
@@ -789,9 +807,8 @@ def test_persistent_value_routes_are_scenario_scoped_strict_requests() -> None:
         ).json() == {"action": "reset"}
         assert client.post(
             f"{base}/clear",
-            json={**_caller(), "scenario_id": "cell-pick", "expected_sequence": 4},
+            json={**_caller(), "project_path": project, "expected_sequence": 4},
         ).status_code == 422
-        assert client.get("/api/program/scenarios/Bad!/persistent-values").status_code == 422
         # Headless's wake after a committed Apply carries nothing to trust.
         assert client.post("/api/program/persistent-values/reconcile").json() == {
             "outcome": "duplicate"
@@ -805,7 +822,7 @@ def test_persistent_value_routes_are_scenario_scoped_strict_requests() -> None:
         "reset_persistent_value",
         "reconcile_persistent_values",
     ]
-    assert runtime.calls[1][1][1].value == 3
+    assert runtime.calls[1][1].value == 3
 
 
 def test_runtime_override_routes_are_removed_and_key_writes_remain() -> None:

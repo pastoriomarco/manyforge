@@ -345,15 +345,9 @@ class ExecutionControlIngress:
                 current_owner_epoch=owner_epoch,
                 current_control_revision=control_revision,
             )
+            # The envelope DTO already pins expected_* to the token fields, and
+            # validate() rejected any token not matching this same projection.
             stamp = replace(stamp, valid_until_monotonic_ns=valid_until_ns)
-            if (
-                envelope.expected_semantic_owner_epoch != owner_epoch
-                or envelope.expected_execution_control_revision != control_revision
-            ):
-                raise ControlProtocolError(
-                    "control_projection_stale",
-                    "command does not identify the current semantic owner state",
-                )
         disposition, result = self._dispatch(request, stamp)
         receipt = ExecutionCommandReceiptDTO(
             schema_version="manyforge.execution_command_receipt.v1",

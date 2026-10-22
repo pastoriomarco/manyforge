@@ -50,6 +50,7 @@ import {
   numberAt,
   objectAt,
   positiveIntegerAt,
+  projectPathAt,
   stringArrayAt,
   stringAt,
 } from './shared';
@@ -1320,7 +1321,7 @@ function persistentKeyValueEditAt(value: unknown, path: string): PersistentKeyVa
   const record = objectAt(value, path);
   exactKeysAt(record, [
     'action', 'detail', 'key', 'node_attempt_id', 'node_instance_id', 'program_run_id',
-    'reason', 'request_id', 'scenario_id', 'sequence', 'source_label',
+    'project_path', 'reason', 'request_id', 'sequence', 'source_label',
   ], path);
   const action = stringAt(record.action, `${path}.action`);
   if (
@@ -1382,13 +1383,14 @@ export function parsePersistentKeyValues(
   const record = objectAt(value, path);
   exactKeysAt(record, [
     'apply_observation_fault', 'edits', 'keys', 'program_revision', 'program_run_id',
-    'scenario_id', 'schema_version', 'sequence', 'storage_fault',
+    'project_path', 'scenario_id', 'schema_version', 'sequence', 'storage_fault',
   ], path);
   if (record.schema_version !== 'manyforge.persistent_key_values.v1') {
     return fail(`${path}.schema_version`, 'manyforge.persistent_key_values.v1');
   }
   return {
     scenarioId: stringAt(record.scenario_id, `${path}.scenario_id`),
+    projectPath: projectPathAt(record.project_path, `${path}.project_path`),
     programRevision: digestAt(record.program_revision, `${path}.program_revision`),
     programRunId: nullableStringAt(record.program_run_id, `${path}.program_run_id`),
     sequence: integerAt(record.sequence, `${path}.sequence`),
@@ -1421,13 +1423,13 @@ export function parsePersistentKeyEdit(value: unknown): PersistentKeyValues {
 export function parsePersistentKeyValuesCleared(value: unknown): PersistentKeyValuesCleared {
   const path = 'persistentKeyValuesCleared';
   const record = objectAt(value, path);
-  exactKeysAt(record, ['action', 'removed', 'request_id', 'scenario_id', 'schema_version'], path);
+  exactKeysAt(record, ['action', 'project_path', 'removed', 'request_id', 'schema_version'], path);
   if (record.schema_version !== 'manyforge.persistent_key_edit.v1' || record.action !== 'clear') {
     return fail(path, 'a manyforge.persistent_key_edit.v1 clear result');
   }
   return {
     requestId: stringAt(record.request_id, `${path}.request_id`),
-    scenarioId: stringAt(record.scenario_id, `${path}.scenario_id`),
+    projectPath: projectPathAt(record.project_path, `${path}.project_path`),
     removed: integerAt(record.removed, `${path}.removed`),
   };
 }

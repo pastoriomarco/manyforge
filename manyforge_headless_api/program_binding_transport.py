@@ -35,7 +35,7 @@ _FIELDS = {
     "component": ("component_role_id", "controllable_component_id", "component_type_id", "component_type_revision", "model_role_bindings"),
     "model": ("model_role_id", "model_instance_id", "model_revision"),
     "target": ("target_role_id", "component_role_id", "controllable_component_id", "command_target_id", "frame_role_bindings", "resource_role_bindings", "collision_body_role_bindings", "capability_bindings", "signal_role_bindings"),
-    "frame": ("frame_role_id", "model_instance_id", "model_revision", "compiled_frame_name"),
+    "frame": ("frame_role_id", "model_instance_id", "model_revision", "compiled_frame_name", "contact_body_role_ids"),
     "resource": ("resource_role_id", "resource_ids", "compiled_resource_names"),
     "collision": ("collision_body_role_id", "model_instance_id", "model_revision", "compiled_collision_body_names"),
     "capability": ("capability_id", "capability_definition_revision", "control_binding", "capability_provider_binding", "command_schema"),
@@ -44,13 +44,14 @@ _FIELDS = {
     "control": ("control_binding_id", "control_binding_revision"),
     "provider": ("capability_provider_binding_id", "capability_provider_binding_revision"),
     "command_schema": ("command_schema_id", "command_schema_revision"),
-    "contact": ("contact_policy_id", "contact_policy_revision", "runtime_object_id", "allowed_body_bindings", "max_penetration_m", "terminal_window_start_fraction"),
+    "contact": ("contact_policy_id", "contact_policy_revision", "runtime_object_id", "allowed_body_bindings", "max_penetration_m", "terminal_window_start_fraction", "bodies_from_motion_endpoint"),
     "contact_body": ("component_role_id", "target_role_id", "controllable_component_id", "command_target_id", "model_role_id", "collision_body_role_id", "model_instance_id", "model_revision", "collision_body_ids"),
     "provenance": ("binding_compiler_contract_digest", "role_assignment_digest", "source_records", "resolved_output_records"),
     "provenance_record": ("record_kind", "record_id", "revision"),
     "signal": ("resource_role_id", "signal_name", "value_type", "direction", "transition_capability", "signal_descriptor_digest"),
+    "contact_release": ("contact_policy_id", "contact_policy_revision", "runtime_object_id", "allowed_body_bindings", "mode", "release_evidence_mode", "enforce_max_start_penetration", "max_start_penetration_m", "min_release_progress_m", "release_tolerance_m", "require_strictly_decreasing_penetration", "require_separation_by_end", "allow_recontact", "bodies_from_motion_endpoint"),
 }
-_OPTIONAL_FIELDS = {'recovery_policy': ('intervention_stop_scope',), 'target': ('signal_role_bindings',)}
+_OPTIONAL_FIELDS = {'recovery_policy': ('intervention_stop_scope',), 'target': ('signal_role_bindings',), 'frame': ('contact_body_role_ids',), 'contact': ('bodies_from_motion_endpoint',), 'contact_release': ('bodies_from_motion_endpoint',)}
 _STOP_POLICIES = frozenset(('inherit', 'hold', 'continue'))
 _INTERVENTION_STOP_SCOPES = frozenset(('all', 'own_groups'))
 _PROGRAM_ID = re.compile(r"^[a-z][a-z0-9_.-]*\Z")
@@ -216,11 +217,16 @@ def validate_program_binding(value: object, *, label: str = "program_binding") -
         frames = _array(target["frame_role_bindings"], f"{path}.frame_role_bindings")
         for fi, item2 in enumerate(frames):
             fp = f"{path}.frame_role_bindings[{fi}]"
-            frame = _record(item2, _FIELDS["frame"], fp)
+            frame = _record(item2, _FIELDS["frame"], fp, optional=_OPTIONAL_FIELDS["frame"])
             _identity(frame["frame_role_id"], f"{fp}.frame_role_id")
             _identity(frame["model_instance_id"], f"{fp}.model_instance_id")
             _digest(frame["model_revision"], f"{fp}.model_revision")
             _string(frame["compiled_frame_name"], f"{fp}.compiled_frame_name")
+            if "contact_body_role_ids" in frame:
+                roles = _array(frame["contact_body_role_ids"], f"{fp}.contact_body_role_ids")
+                for role in roles:
+                    _identity(role, f"{fp}.contact_body_role_ids")
+                _sorted_unique(roles, lambda x: x, f"{fp}.contact_body_role_ids")
         _sorted_unique(frames, lambda x: x["frame_role_id"], f"{path}.frame_role_bindings")
         resources = _array(target["resource_role_bindings"], f"{path}.resource_role_bindings")
         for ri, item2 in enumerate(resources):
@@ -255,6 +261,12 @@ def validate_program_binding(value: object, *, label: str = "program_binding") -
             _digest(collision["model_revision"], f"{cp}.model_revision")
             _id_array(collision["compiled_collision_body_names"], f"{cp}.compiled_collision_body_names", text=True)
         _sorted_unique(collisions, lambda x: x["collision_body_role_id"], f"{path}.collision_body_role_bindings")
+        collision_by_role = {row["collision_body_role_id"]: row for row in collisions}
+        for frame in frames:
+            for role in frame.get("contact_body_role_ids", []):
+                body = collision_by_role.get(role)
+                if body is None or body["model_instance_id"] != frame["model_instance_id"] or body["model_revision"] != frame["model_revision"]:
+                    _fail(path, "endpoint body must resolve through the same target and model")
         capabilities = _array(target["capability_bindings"], f"{path}.capability_bindings")
         for ci, item2 in enumerate(capabilities):
             cp = f"{path}.capability_bindings[{ci}]"
@@ -294,15 +306,41 @@ def validate_program_binding(value: object, *, label: str = "program_binding") -
     contacts = _array(root["contact_grasp_bindings"], f"{label}.contact_grasp_bindings", maximum=_ROLE_MAX)
     for pi, item in enumerate(contacts):
         pp = f"{label}.contact_grasp_bindings[{pi}]"
-        policy = _record(item, _FIELDS["contact"], pp)
+        branch = "contact_release" if isinstance(item, dict) and "mode" in item else "contact"
+        policy = _record(item, _FIELDS[branch], pp, optional=_OPTIONAL_FIELDS[branch])
         _identity(policy["contact_policy_id"], f"{pp}.contact_policy_id")
         _digest(policy["contact_policy_revision"], f"{pp}.contact_policy_revision")
         _identity(policy["runtime_object_id"], f"{pp}.runtime_object_id")
-        penetration = _number(policy["max_penetration_m"], f"{pp}.max_penetration_m")
-        fraction = _number(policy["terminal_window_start_fraction"], f"{pp}.terminal_window_start_fraction")
-        if penetration <= 0 or not 0 <= fraction <= 1:
-            _fail(pp, "contact numeric ranges are invalid")
-        bodies = _array(policy["allowed_body_bindings"], f"{pp}.allowed_body_bindings", minimum=1)
+        if branch == "contact_release":
+            if policy["mode"] != "contact_release":
+                _fail(pp, "unsupported contact mode")
+            if policy["release_evidence_mode"] not in ("signed_penetration", "binary_contact"):
+                _fail(pp, "unsupported release evidence")
+            for field in ("enforce_max_start_penetration", "require_strictly_decreasing_penetration",
+                          "require_separation_by_end", "allow_recontact"):
+                if type(policy[field]) is not bool:
+                    _fail(pp, "release flags must be boolean")
+            for field in ("max_start_penetration_m", "min_release_progress_m", "release_tolerance_m"):
+                if not 0 <= _number(policy[field], f"{pp}.{field}") <= 1000:
+                    _fail(pp, "release metric ranges are invalid")
+            if policy["release_evidence_mode"] == "binary_contact" and (
+                policy["enforce_max_start_penetration"]
+                or policy["require_strictly_decreasing_penetration"]
+                or any(policy[field] != 0 for field in (
+                    "max_start_penetration_m", "min_release_progress_m", "release_tolerance_m"))
+            ):
+                _fail(pp, "binary contact requires neutral metric fields")
+        else:
+            penetration = _number(policy["max_penetration_m"], f"{pp}.max_penetration_m")
+            fraction = _number(policy["terminal_window_start_fraction"], f"{pp}.terminal_window_start_fraction")
+            if penetration <= 0 or not 0 <= fraction <= 1:
+                _fail(pp, "contact numeric ranges are invalid")
+        endpoint = "bodies_from_motion_endpoint" in policy
+        if endpoint and policy["bodies_from_motion_endpoint"] is not True:
+            _fail(pp, "bodies_from_motion_endpoint must be true or omitted")
+        bodies = _array(policy["allowed_body_bindings"], f"{pp}.allowed_body_bindings", minimum=0 if endpoint else 1)
+        if endpoint != (len(bodies) == 0):
+            _fail(pp, "endpoint and explicit contact bodies are mutually exclusive")
         for bi, item2 in enumerate(bodies):
             bp = f"{pp}.allowed_body_bindings[{bi}]"
             body = _record(item2, _FIELDS["contact_body"], bp)

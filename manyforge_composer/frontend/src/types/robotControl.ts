@@ -416,7 +416,10 @@ export interface MotionParticipantPayload {
   kind: 'motion';
   move_id: string;
   base_frame_role_id: string;
-  tcp_frame_role_id: string;
+  tcp_endpoint: {
+    target_role_id: string;
+    frame_role_id: string;
+  };
   tolerances: {
     joint_position_tol_rad: number;
     translation_tol_m: number;

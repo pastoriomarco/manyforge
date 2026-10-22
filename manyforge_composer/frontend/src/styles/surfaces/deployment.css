@@ -681,6 +681,9 @@
 .component-overview .runtime-components {
   max-height: 24rem;
   overflow-y: auto;
+  /* Keep the status column clear of the scrollbar. */
+  scrollbar-gutter: stable;
+  padding-right: 0.75rem;
 }
 
 .cclc-panel {

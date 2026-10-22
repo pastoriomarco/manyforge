@@ -46,7 +46,6 @@ if TYPE_CHECKING:
 
 
 SCENARIO_API_VERSION = "manyforge.scenario.authoring.v3"
-SCENARIO_SUFFIXES = (".scenario.yaml", ".scenario.yml")
 SCENARIO_PROJECT_API_VERSION = "manyforge.scenario.project.v2"
 SCENARIO_MANIFEST = "scenario.yaml"
 SCENARIO_PROJECT_MEMBERS = {
@@ -80,7 +79,15 @@ SCENARIO_SAVE_MARKER = ".manyforge-save-pending.json"
 # Save failed after it created the project or published a file in it.
 SCENARIO_SAVE_INCOMPLETE = "scenario_artifact_save_incomplete"
 SCENARIO_SOURCE_SNAPSHOT_VERSION = "manyforge.scenario.source_snapshot.v1"
-_SCENARIO_ID = re.compile(r"^[a-z][a-z0-9._-]{0,127}$")
+# One Scenario name: the project folder name without its ``.scenario``
+# suffix, which Save and New also write as the scenario_id and manifest name.
+# Letters, digits, "_" and "-", starting with a letter or digit; no dots or
+# spaces. The frontend twin is ``SCENARIO_NAME_PATTERN`` in
+# ``frontend/src/state/newScenario.ts``.
+SCENARIO_NAME_MAX = 128
+SCENARIO_NAME_PATTERN = r"^[A-Za-z0-9][A-Za-z0-9_-]{0,127}$"
+SCENARIO_PROJECT_SUFFIX = ".scenario"
+_SCENARIO_NAME = re.compile(SCENARIO_NAME_PATTERN)
 _STATUS_VALUES = frozenset({"ready", "incomplete", "unknown"})
 
 
@@ -106,18 +113,57 @@ def _roots(values: list[str]) -> list[str]:
     return roots
 
 
-def normalize_scenario_save_path(raw_path: str) -> str:
-    try:
-        path = Path(raw_path).expanduser()
-        if not path.name:
-            raise ValueError
-        lowered = path.name.lower()
-        for suffix in SCENARIO_SUFFIXES:
-            if lowered.endswith(suffix):
-                return str(path.with_name(path.name[: -len(suffix)]))
-        return str(path)
-    except (RuntimeError, TypeError, ValueError):
-        _fail("scenario_artifact_path_invalid", "invalid Scenario path")
+def scenario_name_valid(name: Any) -> bool:
+    """Whether *name* follows the one Scenario naming rule."""
+
+    return type(name) is str and _SCENARIO_NAME.fullmatch(name) is not None
+
+
+def require_scenario_project_identity(
+    folder: str | Path, scenario_id: Any, name: Any, *, source: str
+) -> None:
+    """One name: folder ``<name>.scenario``, and scenario_id == name == <name>."""
+
+    folder_name = Path(folder).name
+    stem = (
+        folder_name[: -len(SCENARIO_PROJECT_SUFFIX)]
+        if folder_name.endswith(SCENARIO_PROJECT_SUFFIX)
+        else None
+    )
+    if stem is None or not scenario_name_valid(stem) or scenario_id != stem or name != stem:
+        _fail(
+            "scenario_project_name_invalid",
+            f"{source}: a Scenario project must be a folder '<name>.scenario' whose "
+            "scenario_id and name both equal <name> (letters, digits, '_' or '-', "
+            f"starting with a letter or digit, at most {SCENARIO_NAME_MAX} "
+            f"characters); found folder {folder_name!r}, scenario_id "
+            f"{scenario_id!r}, name {name!r}",
+        )
+
+
+def scenario_project_stem(path: str | Path) -> str:
+    """The Scenario name a project folder shows: its name without ``.scenario``."""
+
+    folder = Path(path).name
+    if folder.endswith(SCENARIO_PROJECT_SUFFIX) and len(folder) > len(
+        SCENARIO_PROJECT_SUFFIX
+    ):
+        return folder[: -len(SCENARIO_PROJECT_SUFFIX)]
+    return folder
+
+
+def scenario_project_path(directory: str, name: str) -> str:
+    """Return ``<directory>/<name>.scenario`` for one valid Scenario name."""
+
+    if not scenario_name_valid(name):
+        _fail(
+            "scenario_name_invalid",
+            "Scenario name must use letters, digits, '_' or '-', start with a "
+            f"letter or digit, and have at most {SCENARIO_NAME_MAX} characters",
+        )
+    if type(directory) is not str or not directory.strip() or "\x00" in directory:
+        _fail("scenario_artifact_path_invalid", "invalid Scenario directory")
+    return str(Path(directory).expanduser() / f"{name}{SCENARIO_PROJECT_SUFFIX}")
 
 
 def scenario_content_digest(
@@ -285,10 +331,10 @@ def validate_scenario_document(
             "scenario_artifact_version_unsupported",
             f"{source}: unsupported Scenario version {value['api_version']!r}",
         )
-    if type(scenario_id) is not str or _SCENARIO_ID.fullmatch(scenario_id) is None:
+    if not scenario_name_valid(scenario_id):
         _fail(
             "scenario_artifact_invalid",
-            f"{source}: scenario_id must be a portable identifier",
+            f"{source}: scenario_id must be a valid Scenario name",
         )
     if type(name) is not str or not name.strip() or len(name) > 256:
         _fail("scenario_artifact_invalid", f"{source}: name is invalid")
@@ -396,7 +442,7 @@ def _validate_project_manifest(value: Any, *, source: str) -> dict[str, Any]:
             f"{source}: unsupported Scenario project version {value['api_version']!r}",
         )
     scenario_id = value["scenario_id"]
-    if type(scenario_id) is not str or _SCENARIO_ID.fullmatch(scenario_id) is None:
+    if not scenario_name_valid(scenario_id):
         _fail("scenario_artifact_invalid", f"{source}: scenario_id is invalid")
     if type(value["name"]) is not str or not value["name"].strip() or len(value["name"]) > 256:
         _fail("scenario_artifact_invalid", f"{source}: name is invalid")
@@ -645,6 +691,9 @@ def _capture_project(
         manifest = _validate_project_manifest(
             manifest_value, source=str(project / SCENARIO_MANIFEST)
         )
+        require_scenario_project_identity(
+            project, manifest["scenario_id"], manifest["name"], source=str(project)
+        )
         _refuse_removed_overrides_member(directory_fd, source=str(project))
         member_values: dict[str, Any] = {}
         member_digests: dict[str, str] = {}
@@ -796,7 +845,10 @@ def _replace_regular_at(directory_fd: int, name: str, raw: bytes) -> None:
 
 
 def _writable_project(raw_path: str, roots: list[str]) -> tuple[Path, Path]:
-    target = Path(normalize_scenario_save_path(raw_path)).expanduser()
+    try:
+        target = Path(raw_path).expanduser()
+    except (RuntimeError, TypeError, ValueError):
+        _fail("scenario_artifact_path_invalid", "invalid Scenario path")
     try:
         parent = target.parent.resolve(strict=True)
     except FileNotFoundError:
@@ -828,6 +880,9 @@ def prepare_scenario_artifact(
     """Resolve and encode one project without writing it (Save and New)."""
     roots = _roots(allowed_roots)
     target, _parent = _writable_project(raw_path, roots)
+    require_scenario_project_identity(
+        target, document.get("scenario_id"), document.get("name"), source=str(target)
+    )
     prepared_document = deepcopy(document)
     if source_project_path is not None:
         source_project = _existing_project(source_project_path, roots)
@@ -1164,6 +1219,9 @@ def export_scenario_artifact(
     roots = _roots(allowed_roots)
     source_project = _existing_project(source_project_path, roots)
     target, parent = _writable_project(raw_destination_path, roots)
+    require_scenario_project_identity(
+        target, document.get("scenario_id"), document.get("name"), source=str(target)
+    )
     if target.exists() or target.is_symlink():
         _fail(
             "scenario_artifact_overwrite_confirmation_required",
@@ -1178,9 +1236,13 @@ def export_scenario_artifact(
         if closure is None:
             raise AssertionError("Deployment source capture returned no closure")
 
-    temporary = parent / f".{target.name}.export-{uuid.uuid4().hex}"
-    temporary.mkdir(mode=0o755)
+    # The staged copy already carries its final folder name, so it reopens
+    # under the one-name rule before it is published.
+    staging = parent / f".{target.name}.export-{uuid.uuid4().hex}"
+    staging.mkdir(mode=0o755)
+    temporary = staging / target.name
     try:
+        temporary.mkdir(mode=0o755)
         if deployment is not None and closure is not None:
             components = {
                 row["component_id"]: row for row in closure["components"]
@@ -1278,6 +1340,7 @@ def export_scenario_artifact(
         os.replace(temporary, target)
         if effects is not None:
             effects.destination_published(str(target))
+        shutil.rmtree(staging, ignore_errors=True)  # Now empty.
         parent_fd = os.open(parent, os.O_RDONLY | os.O_DIRECTORY | os.O_CLOEXEC)
         try:
             os.fsync(parent_fd)
@@ -1285,7 +1348,7 @@ def export_scenario_artifact(
             os.close(parent_fd)
         return str(target)
     except Exception as error:
-        shutil.rmtree(temporary, ignore_errors=True)
+        shutil.rmtree(staging, ignore_errors=True)
         if (
             isinstance(error, ScenarioArtifactError)
             and error.code == SCENARIO_SAVE_INCOMPLETE
@@ -1323,6 +1386,18 @@ def scenario_directory(
     return resolved
 
 
+def _root_relative_location(directory: Path, roots: list[str]) -> str:
+    """The folder *directory* as shown to tell same-named Scenarios apart."""
+
+    for root in roots:
+        try:
+            relative = directory.relative_to(Path(root))
+        except ValueError:
+            continue
+        return relative.as_posix() if relative.parts else "."
+    return str(directory)
+
+
 def discover_scenario_artifacts(
     raw_directory: str | None,
     *,
@@ -1330,6 +1405,9 @@ def discover_scenario_artifacts(
     manyforge_version: str,
 ) -> tuple[str, list[dict[str, Any]]]:
     directory = scenario_directory(raw_directory, allowed_roots=allowed_roots)
+    # Every entry shows its folder name; the location names its parent folder
+    # relative to the allowed root, for same-named entries.
+    location = _root_relative_location(directory, _roots(allowed_roots))
     rows: list[dict[str, Any]] = []
     for path in sorted(directory.iterdir(), key=lambda item: item.name.casefold()):
         if path.is_symlink() or not path.is_dir() or not (path / SCENARIO_MANIFEST).is_file():
@@ -1356,6 +1434,9 @@ def discover_scenario_artifacts(
                 )
             except StrictArtifactError as error:
                 _fail("scenario_artifact_invalid", str(error))
+            require_scenario_project_identity(
+                project, document["scenario_id"], document["name"], source=str(project)
+            )
             saved = document["saved_status"]
             version_changed = saved["manyforge_version"] != manyforge_version
             display_status = (
@@ -1369,6 +1450,8 @@ def discover_scenario_artifacts(
                     "path": str(project),
                     "scenario_id": document["scenario_id"],
                     "name": document["name"],
+                    "folder_name": scenario_project_stem(project),
+                    "location": location,
                     "description": document["description"],
                     "saved_manyforge_version": saved["manyforge_version"],
                     "display_status": display_status,
@@ -1395,6 +1478,8 @@ def discover_scenario_artifacts(
                     "path": str(path.resolve()),
                     "scenario_id": None,
                     "name": path.name,
+                    "folder_name": scenario_project_stem(path),
+                    "location": location,
                     "description": "",
                     "saved_manyforge_version": None,
                     "display_status": "unsupported",

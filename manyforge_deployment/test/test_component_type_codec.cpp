@@ -23,7 +23,7 @@ namespace {
 constexpr std::string_view kCapabilitySchemaRevision =
     "sha256:2de23ede0e941349e90f0a3a344b7d240426703d250234f86e788343213727e0";
 constexpr std::string_view kComponentTypeSchemaRevision =
-    "sha256:8e728ad4442d46b98f0d0534f8189df9b7982f982ab99cb656e6fdbeef231009";
+    "sha256:2f26f97a7454e620bfb39e16eeccc0b23ae2de61c32e3e8210eff46945d01fc4";
 constexpr std::string_view kZeroDigest =
     "sha256:0000000000000000000000000000000000000000000000000000000000000000";
 
@@ -38,6 +38,9 @@ struct CapabilitySelection final {
 struct TargetSpec final {
   std::string target_id{"arm"};
   std::string source_model_role{"base"};
+  std::string collision_body_model_role;
+  std::vector<std::string> contact_body_role_ids;
+  std::vector<std::string> sibling_contact_body_role_ids;
   bool include_model_aliases = true;
   bool include_model_resource = true;
   bool include_local_resource = true;
@@ -154,17 +157,42 @@ struct TypeSpec final {
         {"model_role_id", CanonicalValue(spec.source_model_role)},
         {"asset_model_group_role_id", CanonicalValue("arm")},
     });
-    frames.emplace_back(CanonicalValue::Object{
+    CanonicalValue::Object frame{
         {"frame_role_id", CanonicalValue("tcp")},
         {"model_role_id", CanonicalValue(spec.source_model_role)},
         {"asset_frame_role_id", CanonicalValue("tcp")},
-    });
+    };
+    if (!spec.contact_body_role_ids.empty()) {
+      frame.emplace_back("contact_body_role_ids",
+                         string_array(spec.contact_body_role_ids));
+    }
+    if (!spec.sibling_contact_body_role_ids.empty()) {
+      frames.emplace_back(CanonicalValue::Object{
+          {"frame_role_id", CanonicalValue("sibling_tcp")},
+          {"model_role_id", CanonicalValue(spec.source_model_role)},
+          {"asset_frame_role_id", CanonicalValue("sibling_tcp")},
+          {"contact_body_role_ids",
+           string_array(spec.sibling_contact_body_role_ids)},
+      });
+    }
+    frames.emplace_back(std::move(frame));
     bodies.emplace_back(CanonicalValue::Object{
         {"collision_body_role_id", CanonicalValue("arm_collision")},
-        {"model_role_id", CanonicalValue(spec.source_model_role)},
+        {"model_role_id",
+         CanonicalValue(spec.collision_body_model_role.empty()
+                            ? spec.source_model_role
+                            : spec.collision_body_model_role)},
         {"asset_collision_body_role_id",
          CanonicalValue("arm_collision")},
     });
+    if (!spec.sibling_contact_body_role_ids.empty()) {
+      bodies.emplace_back(CanonicalValue::Object{
+          {"collision_body_role_id", CanonicalValue("sibling_collision")},
+          {"model_role_id", CanonicalValue(spec.source_model_role)},
+          {"asset_collision_body_role_id",
+           CanonicalValue("sibling_collision")},
+      });
+    }
     if (spec.duplicate_group_source) {
       groups.emplace_back(CanonicalValue::Object{
           {"model_group_role_id", CanonicalValue("arm_group_alias")},
@@ -463,6 +491,56 @@ TEST(ComponentTypeCodecTest,
             std::string::npos);
 }
 
+TEST(ComponentTypeCodecTest,
+     EndpointContactRolesAreOptionalAndBoundToTheirTargetModel) {
+  TypeSpec legacy_spec;
+  const auto legacy = qualify(legacy_spec, rich_dependencies());
+  ASSERT_EQ(legacy.value().command_targets.size(), 1U);
+  ASSERT_EQ(legacy.value().command_targets.front().frame_roles.size(), 1U);
+  EXPECT_TRUE(legacy.value().command_targets.front()
+                  .frame_roles.front()
+                  .contact_body_role_ids.empty());
+
+  TypeSpec endpoint_spec;
+  endpoint_spec.targets.front().contact_body_role_ids = {"arm_collision"};
+  endpoint_spec.targets.front().sibling_contact_body_role_ids = {
+      "sibling_collision"};
+  const auto endpoint = qualify(endpoint_spec, rich_dependencies());
+  const auto& endpoint_frames =
+      endpoint.value().command_targets.front().frame_roles;
+  ASSERT_EQ(endpoint_frames.size(), 2U);
+  const auto frame = std::find_if(
+      endpoint_frames.begin(), endpoint_frames.end(), [](const auto& value) {
+        return value.frame_role_id == core::FrameRoleId("tcp");
+      });
+  ASSERT_NE(frame, endpoint_frames.end());
+  ASSERT_EQ(frame->contact_body_role_ids.size(), 1U);
+  EXPECT_EQ(frame->contact_body_role_ids.front().value(), "arm_collision");
+  const auto sibling_frame = std::find_if(
+      endpoint_frames.begin(), endpoint_frames.end(), [](const auto& value) {
+        return value.frame_role_id == core::FrameRoleId("sibling_tcp");
+      });
+  ASSERT_NE(sibling_frame, endpoint_frames.end());
+  ASSERT_EQ(sibling_frame->contact_body_role_ids.size(), 1U);
+  EXPECT_EQ(sibling_frame->contact_body_role_ids.front().value(),
+            "sibling_collision");
+
+  auto wrong_model = endpoint_spec;
+  wrong_model.targets.front().collision_body_model_role = "tool";
+  EXPECT_THROW(qualify(wrong_model, rich_dependencies()),
+               ComponentTypeCodecError);
+
+  auto missing_body = endpoint_spec;
+  missing_body.targets.front().contact_body_role_ids = {"missing_body"};
+  EXPECT_THROW(qualify(missing_body, rich_dependencies()),
+               ComponentTypeCodecError);
+
+  auto duplicate_body = endpoint_spec;
+  duplicate_body.targets.front().contact_body_role_ids = {
+      "arm_collision", "arm_collision"};
+  EXPECT_ANY_THROW(qualify(duplicate_body, rich_dependencies()));
+}
+
 TEST(ComponentTypeCodecTest, QualifiesZeroModelIoOnlyType) {
   TypeSpec spec;
   spec.type_id = "vacuum_io";
@@ -472,6 +550,9 @@ TEST(ComponentTypeCodecTest, QualifiesZeroModelIoOnlyType) {
   spec.tags.clear();
   spec.targets = {TargetSpec{
       .target_id = "vacuum",
+      .collision_body_model_role = {},
+      .contact_body_role_ids = {},
+      .sibling_contact_body_role_ids = {},
       .include_model_aliases = false,
       .include_model_resource = false,
       .include_local_resource = true,
@@ -542,6 +623,9 @@ TEST(ComponentTypeCodecTest, RejectsEmptyAndBrokenStructuralTypes) {
   zero_models_with_root.targets = {TargetSpec{
       .target_id = "vacuum",
       .source_model_role = "base",
+      .collision_body_model_role = {},
+      .contact_body_role_ids = {},
+      .sibling_contact_body_role_ids = {},
       .include_model_aliases = false,
       .include_model_resource = false,
       .include_local_resource = true,

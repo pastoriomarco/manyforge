@@ -156,9 +156,13 @@ export function parseProgramBindingTransport(value: unknown, path: string): Prog
       if (!component || component.controllable_component_id !== target.controllable_component_id) bad(tp, 'target/component correspondence');
       const frames = array(target.frame_role_bindings, `${tp}.frame_role_bindings`).map((item2, j) => {
         const fp = `${tp}.frame_role_bindings[${j}]`;
-        const frame = record(item2, FIELDS.frame, fp);
+        const frame = record(item2, FIELDS.frame, fp, OPTIONAL_FIELDS.frame);
         identity(frame.frame_role_id, `${fp}.frame_role_id`); identity(frame.model_instance_id, `${fp}.model_instance_id`);
         digest(frame.model_revision, `${fp}.model_revision`); text(frame.compiled_frame_name, `${fp}.compiled_frame_name`);
+        if ('contact_body_role_ids' in frame) {
+          const roles = array(frame.contact_body_role_ids, `${fp}.contact_body_role_ids`).map((role) => identity(role, `${fp}.contact_body_role_ids`));
+          sorted(roles, (role) => role, `${fp}.contact_body_role_ids`);
+        }
         return frame;
       });
       sorted(frames, (row) => row.frame_role_id as string, `${tp}.frame_role_bindings`);
@@ -197,6 +201,13 @@ export function parseProgramBindingTransport(value: unknown, path: string): Prog
         return collision;
       });
       sorted(collisions, (row) => row.collision_body_role_id as string, `${tp}.collision_body_role_bindings`);
+      const collisionByRole = new Map(collisions.map((row) => [row.collision_body_role_id, row]));
+      for (const frame of frames) {
+        for (const role of (frame.contact_body_role_ids ?? []) as string[]) {
+          const body = collisionByRole.get(role);
+          if (!body || body.model_instance_id !== frame.model_instance_id || body.model_revision !== frame.model_revision) bad(tp, 'endpoint body must resolve through the same target and model');
+        }
+      }
       const capabilities = array(target.capability_bindings, `${tp}.capability_bindings`).map((item2, j) => {
         const cp = `${tp}.capability_bindings[${j}]`;
         const capability = record(item2, FIELDS.capability, cp);
@@ -231,14 +242,37 @@ export function parseProgramBindingTransport(value: unknown, path: string): Prog
 
   const contacts = array(root.contact_grasp_bindings, `${path}.contact_grasp_bindings`, 0, ROLE_MAX_ROWS).map((item, i) => {
     const pp = `${path}.contact_grasp_bindings[${i}]`;
-    const policy = record(item, FIELDS.contact, pp);
+    const release = item !== null && typeof item === 'object' && 'mode' in item;
+    const policy = release
+      ? record(item, FIELDS.contact_release, pp, OPTIONAL_FIELDS.contact_release)
+      : record(item, FIELDS.contact, pp, OPTIONAL_FIELDS.contact);
     identity(policy.contact_policy_id, `${pp}.contact_policy_id`);
     digest(policy.contact_policy_revision, `${pp}.contact_policy_revision`);
     identity(policy.runtime_object_id, `${pp}.runtime_object_id`);
-    const penetration = number(policy.max_penetration_m, `${pp}.max_penetration_m`);
-    const fraction = number(policy.terminal_window_start_fraction, `${pp}.terminal_window_start_fraction`);
-    if (penetration <= 0 || fraction < 0 || fraction > 1) bad(pp, 'contact numeric ranges');
-    const bodies = array(policy.allowed_body_bindings, `${pp}.allowed_body_bindings`, 1).map((item2, j) => {
+    if (release) {
+      if (policy.mode !== 'contact_release') bad(pp, 'unsupported contact mode');
+      if (policy.release_evidence_mode !== 'signed_penetration' && policy.release_evidence_mode !== 'binary_contact') bad(pp, 'unsupported release evidence');
+      for (const field of ['enforce_max_start_penetration', 'require_strictly_decreasing_penetration', 'require_separation_by_end', 'allow_recontact']) {
+        if (typeof policy[field] !== 'boolean') bad(pp, 'release flags must be boolean');
+      }
+      for (const field of ['max_start_penetration_m', 'min_release_progress_m', 'release_tolerance_m']) {
+        const metric = number(policy[field], `${pp}.${field}`);
+        if (metric < 0 || metric > 1000) bad(pp, 'release metric ranges');
+      }
+      if (policy.release_evidence_mode === 'binary_contact' && (
+        policy.enforce_max_start_penetration || policy.require_strictly_decreasing_penetration
+        || ['max_start_penetration_m', 'min_release_progress_m', 'release_tolerance_m'].some((field) => policy[field] !== 0)
+      )) bad(pp, 'binary contact requires neutral metric fields');
+    } else {
+      const penetration = number(policy.max_penetration_m, `${pp}.max_penetration_m`);
+      const fraction = number(policy.terminal_window_start_fraction, `${pp}.terminal_window_start_fraction`);
+      if (penetration <= 0 || fraction < 0 || fraction > 1) bad(pp, 'contact numeric ranges');
+    }
+    const endpoint = 'bodies_from_motion_endpoint' in policy;
+    if (endpoint && policy.bodies_from_motion_endpoint !== true) bad(pp, 'bodies_from_motion_endpoint must be true or omitted');
+    const bodyValues = array(policy.allowed_body_bindings, `${pp}.allowed_body_bindings`, endpoint ? 0 : 1);
+    if (endpoint !== (bodyValues.length === 0)) bad(pp, 'endpoint and explicit contact bodies are mutually exclusive');
+    const bodies = bodyValues.map((item2, j) => {
       const bp = `${pp}.allowed_body_bindings[${j}]`;
       const body = record(item2, FIELDS.contact_body, bp);
       ['component_role_id', 'target_role_id', 'controllable_component_id', 'command_target_id',

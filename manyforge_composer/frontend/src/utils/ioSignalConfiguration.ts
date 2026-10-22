@@ -646,8 +646,8 @@ export interface DeclaredIoSource {
   liveness: IoLivenessMode;
 }
 
-/** Every declared input row of a Deployment document (intent components and compiled runtime units). */
-export function declaredIoInputs(document: Record<string, JsonValue> | null): IoSignalInputDraft[] {
+/** Every declared row of a Deployment document (intent components and compiled runtime units). */
+function declaredIoRows(document: Record<string, JsonValue> | null): IoSignalRow[] {
   const configurations: Record<string, JsonValue>[] = [];
   const components = document?.components;
   if (Array.isArray(components)) {
@@ -665,7 +665,17 @@ export function declaredIoInputs(document: Record<string, JsonValue> | null): Io
   }
   return configurations.flatMap((configuration) => ioSignalRows(
     ioSignalsConfiguration(configuration, []).configuration,
-  ).flatMap((row) => (row.kind === 'input' ? [row.draft] : [])));
+  ));
+}
+
+/** Every declared input row of a Deployment document (intent components and compiled runtime units). */
+export function declaredIoInputs(document: Record<string, JsonValue> | null): IoSignalInputDraft[] {
+  return declaredIoRows(document).flatMap((row) => (row.kind === 'input' ? [row.draft] : []));
+}
+
+/** Every declared output row of a Deployment document (intent components and compiled runtime units). */
+export function declaredIoOutputs(document: Record<string, JsonValue> | null): IoSignalOutputDraft[] {
+  return declaredIoRows(document).flatMap((row) => (row.kind === 'output' ? [row.draft] : []));
 }
 
 /** Every declared input of a Deployment document, by component/target/resource role. */

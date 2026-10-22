@@ -60,6 +60,7 @@ const applied: AppliedProgramSelection = {
   schemaVersion: 'manyforge.applied_program_selection.v3',
   scenarioId: 'lite6',
   sourceDocumentDigest: 'sha256:catalog',
+  projectPath: '/projects/lite6.scenario',
   programId: 'pick',
   programRevision: 'sha256:program',
   programBindingId: 'sha256:binding',

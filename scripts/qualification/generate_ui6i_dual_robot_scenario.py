@@ -381,7 +381,7 @@ def motion_node(
         "parameters": {
             "target_role": target_role,
             "base_frame_role": "base",
-            "tcp_frame_role": "tcp",
+            "tcp_endpoint": {"target_role": target_role, "frame_role": "tcp"},
             "goal": [
                 {"joint_name": joint_name, "position_rad": position}
                 for joint_name, position in goal

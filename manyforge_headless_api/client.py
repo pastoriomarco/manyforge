@@ -880,15 +880,13 @@ class HeadlessHttpClient:
             body=body,
         )
 
-    def program_persistent_values(self, scenario_id: str) -> dict[str, Any]:
-        return self.request("GET", persistent_values_path(scenario_id))
+    def program_persistent_values(self) -> dict[str, Any]:
+        return self.request("GET", persistent_values_path())
 
     def program_persistent_value_action(
-        self, scenario_id: str, action: str, body: Mapping[str, Any]
+        self, action: str, body: Mapping[str, Any]
     ) -> dict[str, Any]:
-        return self.request(
-            "POST", persistent_values_path(scenario_id, action), body=body
-        )
+        return self.request("POST", persistent_values_path(action), body=body)
 
     def viewer_model_urdf(self) -> ViewerModelAsset:
         asset = self._request_viewer_asset(

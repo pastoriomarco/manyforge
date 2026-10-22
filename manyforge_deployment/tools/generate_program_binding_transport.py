@@ -58,7 +58,7 @@ EXPECTED_RECORDS = {
     "component": ["component_role_id", "controllable_component_id", "component_type_id", "component_type_revision", "model_role_bindings"],
     "model": ["model_role_id", "model_instance_id", "model_revision"],
     "target": ["target_role_id", "component_role_id", "controllable_component_id", "command_target_id", "frame_role_bindings", "resource_role_bindings", "collision_body_role_bindings", "capability_bindings", "signal_role_bindings"],
-    "frame": ["frame_role_id", "model_instance_id", "model_revision", "compiled_frame_name"],
+    "frame": ["frame_role_id", "model_instance_id", "model_revision", "compiled_frame_name", "contact_body_role_ids"],
     "resource": ["resource_role_id", "resource_ids", "compiled_resource_names"],
     "signal": ["resource_role_id", "signal_name", "value_type", "direction", "transition_capability", "signal_descriptor_digest"],
     "collision": ["collision_body_role_id", "model_instance_id", "model_revision", "compiled_collision_body_names"],
@@ -68,12 +68,16 @@ EXPECTED_RECORDS = {
     "control": ["control_binding_id", "control_binding_revision"],
     "provider": ["capability_provider_binding_id", "capability_provider_binding_revision"],
     "command_schema": ["command_schema_id", "command_schema_revision"],
-    "contact": ["contact_policy_id", "contact_policy_revision", "runtime_object_id", "allowed_body_bindings", "max_penetration_m", "terminal_window_start_fraction"],
+    "contact": ["contact_policy_id", "contact_policy_revision", "runtime_object_id", "allowed_body_bindings", "max_penetration_m", "terminal_window_start_fraction", "bodies_from_motion_endpoint"],
+    "contact_release": ['contact_policy_id', 'contact_policy_revision', 'runtime_object_id', 'allowed_body_bindings', 'mode', 'release_evidence_mode', 'enforce_max_start_penetration', 'max_start_penetration_m', 'min_release_progress_m', 'release_tolerance_m', 'require_strictly_decreasing_penetration', 'require_separation_by_end', 'allow_recontact', 'bodies_from_motion_endpoint'],
     "contact_body": ["component_role_id", "target_role_id", "controllable_component_id", "command_target_id", "model_role_id", "collision_body_role_id", "model_instance_id", "model_revision", "collision_body_ids"],
     "provenance": ["binding_compiler_contract_digest", "role_assignment_digest", "source_records", "resolved_output_records"],
     "provenance_record": ["record_kind", "record_id", "revision"],
 }
 EXPECTED_OPTIONAL_RECORD_FIELDS = {
+    "frame": ["contact_body_role_ids"],
+    "contact": ["bodies_from_motion_endpoint"],
+    "contact_release": ["bodies_from_motion_endpoint"],
     "target": ["signal_role_bindings"],
     "recovery_policy": ["intervention_stop_scope"],
 }
@@ -113,7 +117,8 @@ TYPE_NAMES = {
     "control": "ProgramControlBindingRef",
     "provider": "ProgramCapabilityProviderBindingRef",
     "command_schema": "ProgramCommandSchemaRef",
-    "contact": "ProgramContactGraspBinding",
+    "contact": "ProgramContactGraspEnvelopeBinding",
+    "contact_release": "ProgramContactReleaseBinding",
     "contact_body": "ProgramContactGraspBodyBinding",
     "provenance": "ProgramBindingProvenance",
     "provenance_record": "ProgramBindingProvenanceRecord",
@@ -135,6 +140,8 @@ FIELD_TYPES = {
     ("target", "resource_role_bindings"): "ProgramResourceRoleBinding[]",
     ("target", "collision_body_role_bindings"): "ProgramCollisionBodyRoleBinding[]",
     ("target", "capability_bindings"): "ProgramCapabilityBinding[]",
+    ("frame", "contact_body_role_ids"): "string[]",
+    ("contact", "bodies_from_motion_endpoint"): "true",
     ("resource", "resource_ids"): "string[]",
     ("resource", "compiled_resource_names"): "string[]",
     ("collision", "compiled_collision_body_names"): "string[]",
@@ -149,6 +156,17 @@ FIELD_TYPES = {
     ("contact", "allowed_body_bindings"): "ProgramContactGraspBodyBinding[]",
     ("contact", "max_penetration_m"): "number",
     ("contact", "terminal_window_start_fraction"): "number",
+    ("contact_release", "mode"): "'contact_release'",
+    ("contact_release", "release_evidence_mode"): "'signed_penetration' | 'binary_contact'",
+    ("contact_release", "enforce_max_start_penetration"): "boolean",
+    ("contact_release", "max_start_penetration_m"): "number",
+    ("contact_release", "min_release_progress_m"): "number",
+    ("contact_release", "release_tolerance_m"): "number",
+    ("contact_release", "require_strictly_decreasing_penetration"): "boolean",
+    ("contact_release", "require_separation_by_end"): "boolean",
+    ("contact_release", "allow_recontact"): "boolean",
+    ("contact_release", "allowed_body_bindings"): "ProgramContactGraspBodyBinding[]",
+    ("contact_release", "bodies_from_motion_endpoint"): "true",
     ("contact_body", "model_role_id"): "string | null",
     ("contact_body", "collision_body_ids"): "string[]",
     ("provenance", "source_records"): "ProgramBindingProvenanceRecord[]",
@@ -290,6 +308,7 @@ def _type_interfaces(descriptor: dict[str, Any]) -> str:
             optional = "?" if field in descriptor["optional_record_fields"].get(record_name, ()) else ""
             sections.append(f"  {field}{optional}: {field_type.format(api_version=api_version)};")
         sections.append("}")
+    sections.append("export type ProgramContactGraspBinding = ProgramContactGraspEnvelopeBinding | ProgramContactReleaseBinding;")
     return "\n".join(sections)
 
 

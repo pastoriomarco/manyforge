@@ -192,6 +192,7 @@ function controller(
       applied: {
         schemaVersion: 'manyforge.applied_program_selection.v3',
         scenarioId: 'cell-pick',
+        projectPath: '/projects/cell-pick.scenario',
         sourceDocumentDigest: `sha256:${'a'.repeat(64)}`,
         programId: 'next-pick',
         programRevision: `sha256:${'b'.repeat(64)}`,
@@ -363,6 +364,7 @@ describe('Program runtime projection', () => {
       kind: 'scenario',
       scenarioId: 'authored-cell',
       sourceDocumentDigest: `sha256:${'e'.repeat(64)}`,
+      projectPath: '/projects/authored-cell.scenario',
     };
     expect(renderToStaticMarkup(<ProgramRuntimePanel enabled controller={view} />))
       .toContain('authored-cell · no Program');

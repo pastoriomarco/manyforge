@@ -226,6 +226,7 @@ type FakeDocument = {
 
 let root: { render: (value: ReactNode) => void; unmount: () => void } | null = null;
 let latest: ReturnType<typeof useProgramWorkspace> | null = null;
+const scenarioOpened = vi.fn();
 
 async function mountHarness(
   initial: Deferred<ProgramWorkspaceResponse>,
@@ -297,7 +298,7 @@ async function mountHarness(
       () => testAuthoringController(currentPublication, currentSnapshot),
       [currentPublication, currentSnapshot],
     );
-    const controller = useProgramWorkspace(currentSnapshot, authoring);
+    const controller = useProgramWorkspace(currentSnapshot, authoring, scenarioOpened);
     useEffect(() => {
       latest = controller;
       return () => {
@@ -638,7 +639,7 @@ describe('useProgramWorkspace Draft policy interaction', () => {
       activation: { status: 'accepted', apply_id: 'apply.new', apply_generation: 9 },
     });
     const input = {
-      name: 'New cell', path: '/workspace/new', deploymentChoice: 'empty' as const,
+      name: 'new_cell', directory: '/workspace', deploymentChoice: 'empty' as const,
       expectedRetainedBundleId: 'bundle', expectedGraphRevision: 'graph', confirmDiscard: true,
     };
     await act(async () => { await latest?.newScenarioDocument(input); });
@@ -672,9 +673,8 @@ describe('useProgramWorkspace Draft policy interaction', () => {
 
     await act(async () => {
       latest?.saveScenarioDocument({
-        path: '/workspace/cell',
-        scenarioId: 'cell',
-        name: 'Cell',
+        directory: '/workspace',
+        name: 'cell',
         description: '',
         confirmOverwrite: false,
       });
@@ -721,9 +721,8 @@ describe('useProgramWorkspace Draft policy interaction', () => {
 
     await act(async () => {
       latest?.saveScenarioDocument({
-        path: '/workspace/cell',
-        scenarioId: 'cell',
-        name: 'Cell',
+        directory: '/workspace',
+        name: 'cell',
         description: '',
         confirmOverwrite: false,
       });
@@ -737,7 +736,7 @@ describe('useProgramWorkspace Draft policy interaction', () => {
         deploymentDraftId: 'deployment-draft-1',
         expectedDeploymentDraftRevision: 4,
       }),
-      expect.objectContaining({ scenarioId: 'cell' }),
+      expect.objectContaining({ directory: '/workspace', name: 'cell' }),
     );
     expect(latest?.scenarioDocumentPath).toBe('/workspace/cell');
 
@@ -762,6 +761,8 @@ describe('useProgramWorkspace Draft policy interaction', () => {
     expect(latest?.state.message).not.toContain('Check Runtime / history');
     // Activity follows the exact accepted Manager operation, not any newer one.
     expect(latest?.acceptedApply?.applyId).toBe('apply.1');
+    // A successful Load reply asks the page to read health again.
+    expect(scenarioOpened).toHaveBeenCalledTimes(1);
 
     apiMock.scenarioDocuments.load.mockResolvedValueOnce({
       status: 'applied',
@@ -782,5 +783,15 @@ describe('useProgramWorkspace Draft policy interaction', () => {
     expect(latest?.state.message).toContain('already match the Applied configuration');
     expect(latest?.state.message).toContain('No configuration change was needed');
     expect(latest?.state.transitionStatus).toBe('applied');
+    expect(scenarioOpened).toHaveBeenCalledTimes(2);
+
+    // A refused or unconfirmed Load does not.
+    apiMock.scenarioDocuments.load.mockRejectedValueOnce(new Error('activation not confirmed'));
+    await act(async () => {
+      latest?.loadScenarioDocument('/workspace/cell', false);
+      await Promise.resolve();
+      await Promise.resolve();
+    });
+    expect(scenarioOpened).toHaveBeenCalledTimes(2);
   });
 });

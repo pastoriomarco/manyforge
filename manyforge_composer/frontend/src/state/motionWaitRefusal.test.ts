@@ -27,9 +27,12 @@ describe('global interrupt source not ready (contract 75)', () => {
   });
 
   it('is presented as an amber notice on both refusal paths, never an operational error', () => {
+    // Every command refusal path renders through the one refusal text.
+    const refusal = readFileSync(new URL('./commandRefusal.ts', import.meta.url), 'utf8');
+    expect(refusal).toContain('?? motionWaitRefusalMessage(error.code, error.details);');
     const headless = readFileSync(new URL('../hooks/useHeadlessState.ts', import.meta.url), 'utf8');
-    expect(headless).toContain('|| motionWaitRefusalMessage(error?.code, error?.details)');
-    expect(headless).toContain('?? motionWaitRefusalMessage(value.code as string, ownerDetails);');
+    expect(headless).toContain(': commandRefusalText(error));');
+    expect(headless.match(/commandRefusalText\(\s*receiptRefusal\(/g)).toHaveLength(2);
     const app = readFileSync(new URL('../App.tsx', import.meta.url), 'utf8');
     expect(app).toContain('message: isMotionWaitRefusal(programRuntime.state.error) ? null : programRuntime.state.error,');
     expect(app).toContain('&& !isMotionWaitRefusal(robotControl.state.error)');

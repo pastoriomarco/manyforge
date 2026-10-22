@@ -482,7 +482,7 @@ describe('useAuthoringWorkspace', () => {
     for (const request of [
       () => realApi.scenarioDocuments.load(fence, '/workspace/cell', false),
       () => realApi.scenarioDocuments.save(fence, {
-        path: '/workspace/cell', scenarioId: 'cell.1', name: 'Cell', description: '', confirmOverwrite: true,
+        directory: '/workspace', name: 'Cell', description: '', confirmOverwrite: true,
       }),
     ]) {
       await act(async () => { expect(latest!.beginMutation()).toBe(true); });
@@ -497,6 +497,34 @@ describe('useAuthoringWorkspace', () => {
     }
     expect(fetchMock).toHaveBeenCalledTimes(2);
     // Authoring stays usable: the next change is admitted.
+    await act(async () => { expect(latest!.beginMutation()).toBe(true); });
+  });
+
+  it('releases the guard for a Manager Apply rejection and keeps its precise text', async () => {
+    // The exact backend refusal body (routes_deployment_draft._raise, HTTP 409),
+    // read through the real client: Manager's code and message stay in the text.
+    const message = 'Manager rejected the exact Deployment candidate: '
+      + 'stale_admission_generation: admission generation 7 is not current (8)';
+    vi.stubGlobal('fetch', vi.fn(async () => new Response(
+      JSON.stringify({ detail: { code: 'manager_apply_rejected', message } }),
+      { status: 409, statusText: 'Conflict', headers: { 'Content-Type': 'application/json' } },
+    )));
+    const { api: realApi } = await vi.importActual<typeof import('../api/client')>('../api/client');
+    apiMock.authoringWorkspace.get.mockResolvedValue(snapshotFixture(1, 3, 4, '/workspace/cell'));
+    await mountHarness(headlessSnapshot(1));
+    await flush();
+    const fence = {
+      draftId: 'deployment-draft.1', expectedDraftRevision: 4,
+      expectedAdmissionGeneration: 4, requestOwnerEpoch: 'browser.1', requestId: 'apply.1',
+      expectedWorkspaceEpoch: 'workspace.epoch.1', expectedWorkspaceRevision: 1,
+    } as Parameters<typeof realApi.deploymentWorkspace.applyDraft>[0];
+    await act(async () => { expect(latest!.beginMutation()).toBe(true); });
+    const failure = await realApi.deploymentWorkspace.applyDraft(fence)
+      .then(() => null, (error: unknown) => error);
+    expect(failure).toBeInstanceOf(ApiError);
+    expect((failure as ApiError).message).toBe(message);
+    await act(async () => latest!.finishMutation(null, failure));
+    expect(latest!.submissionUnconfirmed).toBe(false);
     await act(async () => { expect(latest!.beginMutation()).toBe(true); });
   });
 

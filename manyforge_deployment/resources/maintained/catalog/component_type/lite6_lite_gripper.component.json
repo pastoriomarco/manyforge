@@ -141,12 +141,20 @@
           "asset_collision_body_role_id": "gripper_collision",
           "collision_body_role_id": "gripper_collision",
           "model_role_id": "arm_model"
+        },
+        {
+          "asset_collision_body_role_id": "gripper_fingers",
+          "collision_body_role_id": "gripper_fingers",
+          "model_role_id": "arm_model"
         }
       ],
       "command_target_id": "gripper",
       "frame_roles": [
         {
           "asset_frame_role_id": "gripper_tcp",
+          "contact_body_role_ids": [
+            "gripper_fingers"
+          ],
           "frame_role_id": "tcp",
           "model_role_id": "arm_model"
         }
@@ -173,7 +181,7 @@
     "model_role_id": "arm_model"
   },
   "component_type_id": "lite6_lite_gripper.component",
-  "component_type_revision": "sha256:0140b9130f0147bb90a8724842dacc31089f9edb537bcd1ffc8801ec641b750d",
+  "component_type_revision": "sha256:4808bd5d97c2c7c6761701aa8090cadc078dc217ab7563e2b235c963a41308ca",
   "model_mounts": [],
   "model_roles": [
     {

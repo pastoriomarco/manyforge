@@ -2068,18 +2068,18 @@ class HeadlessService:
         except ProgramRunnerClientError as error:
             raise self._runner_error(error) from error
 
-    def program_persistent_values(self, scenario_id: str) -> dict[str, Any]:
+    def program_persistent_values(self) -> dict[str, Any]:
         try:
-            return self._program_runner().persistent_values(scenario_id)
+            return self._program_runner().persistent_values()
         except ProgramRunnerClientError as error:
             raise self._runner_error(error) from error
 
     def program_persistent_value_action(
-        self, scenario_id: str, action: str, request: Any
+        self, action: str, request: Any
     ) -> dict[str, Any]:
         try:
             return self._program_runner().persistent_value_action(
-                scenario_id, action, request.model_dump(mode="json")
+                action, request.model_dump(mode="json")
             )
         except ProgramRunnerClientError as error:
             raise self._runner_error(error) from error
@@ -2616,6 +2616,7 @@ class HeadlessService:
             "prepared_activation": self.activation_preparer.prepare(
                 source_document_digest=request.source_document_digest,
                 scenario_id=request.scenario_id,
+                project_path=request.project_path,
                 captured_input_digest=request.captured_input_digest,
                 deployment=request.deployment,
                 model_source_closure=request.model_source_closure,

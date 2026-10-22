@@ -2,8 +2,11 @@
 
 Only values are stored here. Declarations, initial values and formulas stay
 in the Program, and running never changes the Program. Rows belong to one
-Scenario and key name; the file lives with the installation, so copying or
-exporting a Scenario never carries machine state.
+Scenario project folder (its canonical absolute path, as Manager's committed
+Apply records it) and key name: two same-named projects in different folders
+never share values, and a moved or renamed folder starts with none. The file
+lives with the installation, so copying or exporting a Scenario never carries
+machine state.
 
 Stored values follow Manager's committed Scenario activations. Every
 publication after the canonical-empty bootstrap is one committed named Apply,
@@ -21,6 +24,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import logging
 import os
 from collections.abc import Mapping
 from dataclasses import dataclass, field
@@ -31,7 +35,12 @@ from typing import Any, Final
 from manyforge_behavior.orchestration_ports import PersistentValueUncertainError
 from manyforge_behavior.program import BlackboardKeyDeclaration
 
-SCHEMA_VERSION: Final = "manyforge.persistent_key_register.v2"
+_LOGGER = logging.getLogger(__name__)
+
+SCHEMA_VERSION: Final = "manyforge.persistent_key_register.v3"
+# The previous layout keyed rows by Scenario id; such a file is moved aside
+# (one bounded slot, never migrated) and the register starts empty.
+_SUPERSEDED_SCHEMA_VERSION: Final = "manyforge.persistent_key_register.v2"
 MAX_ROWS: Final = 4_096
 MAX_VALUE_BYTES: Final = 65_536
 MAX_EDITS: Final = 256
@@ -40,13 +49,14 @@ MAX_RECONCILED_APPLIES: Final = 1_024
 # Declared access that lets the operator change a key's value (Set, Reset, Clear).
 OPERATOR_WRITABLE_ACCESS: Final = frozenset({"write", "read_write"})
 _MAX_ID_BYTES: Final = 256
+_MAX_PROJECT_PATH_BYTES: Final = 4_096
 _MAX_DETAIL_BYTES: Final = 512
 
 
 _EDIT_FIELDS: Final = frozenset(
     {
         "sequence",
-        "scenario_id",
+        "project_path",
         "key",
         "action",
         "request_id",
@@ -100,9 +110,9 @@ class PersistentKeyStorageUncertainError(
 
 @dataclass(frozen=True, slots=True)
 class PersistentKeyNotice:
-    """One dropped stored value; ``key`` is None when a Scenario's rows went."""
+    """One dropped stored value; ``key`` is None when a project's rows went."""
 
-    scenario_id: str
+    project_path: str
     key: str | None
     reason: str
     detail: str | None = None
@@ -113,20 +123,20 @@ class CommittedActivation:
     """Manager's current committed Scenario activation.
 
     ``committed_applies`` maps every committed Apply record of the current
-    publication history, this one included, to its Scenario.
+    publication history, this one included, to its Scenario project folder.
     """
 
     record_digest: str
-    scenario_id: str
+    project_path: str
     declarations: Mapping[str, BlackboardKeyDeclaration]
     committed_applies: Mapping[str, str]
 
     def __post_init__(self) -> None:
         _require_id(self.record_digest, field="record_digest")
-        _require_id(self.scenario_id, field="scenario_id")
+        _require_project(self.project_path)
         if (
             len(self.committed_applies) > MAX_RECONCILED_APPLIES
-            or self.committed_applies.get(self.record_digest) != self.scenario_id
+            or self.committed_applies.get(self.record_digest) != self.project_path
         ):
             raise PersistentKeyRegisterError(
                 "committed activation must be one of its history's committed Applies"
@@ -139,7 +149,7 @@ class PersistentKeyReconciliation:
     activation already reconciled. ``stale``: a newer one was reconciled
     already. Only ``reconciled`` changes anything.
 
-    ``unobserved`` names committed Applies (record digest, Scenario) this
+    ``unobserved`` names committed Applies (record digest, project folder) this
     reconciliation found that the register never observed;
     ``history_changed`` says the activation starts a new publication history.
     """
@@ -218,6 +228,20 @@ def _require_id(value: str, *, field: str) -> str:
     return value
 
 
+def _require_project(value: str) -> str:
+    """A Scenario project folder path: the register's Scenario identity."""
+
+    if (
+        not isinstance(value, str)
+        or not value
+        or len(value.encode("utf-8")) > _MAX_PROJECT_PATH_BYTES
+    ):
+        raise PersistentKeyRegisterError(
+            "project_path must be bounded non-empty text"
+        )
+    return value
+
+
 def _bounded_detail(detail: str | None) -> str | None:
     if detail is None:
         return None
@@ -228,7 +252,7 @@ def _bounded_detail(detail: str | None) -> str | None:
 def _audit(
     edit: PersistentKeyEdit | Mapping[str, Any] | None,
     action: str,
-    scenario_id: str,
+    project_path: str,
     key: str | None,
     *,
     reason: str | None = None,
@@ -239,7 +263,7 @@ def _audit(
     if isinstance(edit, Mapping):
         edit = PersistentKeyEdit.from_write_metadata(edit)
     record: dict[str, Any] = {
-        "scenario_id": scenario_id,
+        "project_path": project_path,
         "key": key,
         "action": action,
         "source_label": _require_id(edit.source_label, field="source_label"),
@@ -259,11 +283,11 @@ def _audit(
     return record
 
 
-def _fault_audit(record_digest: str, scenario_id: str) -> dict[str, Any]:
+def _fault_audit(record_digest: str, project_path: str) -> dict[str, Any]:
     record = _audit(
         _RECONCILIATION_EDIT,
         "fault",
-        scenario_id,
+        project_path,
         None,
         reason=FAULT_APPLY_NOT_OBSERVED,
         detail=f"committed Apply {record_digest} was not observed",
@@ -276,7 +300,7 @@ def _drop_audit(notice: PersistentKeyNotice, edit: PersistentKeyEdit) -> dict[st
     record = _audit(
         edit,
         "dropped",
-        notice.scenario_id,
+        notice.project_path,
         notice.key,
         reason=notice.reason,
         detail=notice.detail,
@@ -294,7 +318,7 @@ class PersistentKeyRegister:
         self._path = path
         self._lock = RLock()
         self._sequence = 0
-        # (scenario_id, key) -> {"fingerprint", "value", "sequence"}
+        # (project_path, key) -> {"fingerprint", "value", "sequence"}
         self._rows: dict[tuple[str, str], dict[str, Any]] = {}
         # Recent attributed changes, oldest first, written with the change.
         # Only an audit list: the cycle journal refuses a resent request.
@@ -332,6 +356,23 @@ class PersistentKeyRegister:
                 "persistent-key register is not valid JSON"
             ) from error
         found = document.get("schema_version") if type(document) is dict else None
+        if found == _SUPERSEDED_SCHEMA_VERSION:
+            superseded = self._path.with_name(f"{self._path.name}.v2.superseded")
+            try:
+                os.replace(self._path, superseded)
+            except OSError as error:
+                raise PersistentKeyRegisterError(
+                    f"persistent-key register {self._path} has the superseded "
+                    f"layout and could not be moved aside: {error}"
+                ) from error
+            _LOGGER.warning(
+                "persistent-key register %s had the superseded layout %s; it "
+                "was moved aside to %s and the register starts empty",
+                self._path,
+                found,
+                superseded,
+            )
+            return
         if found != SCHEMA_VERSION:
             raise PersistentKeyRegisterVersionError(
                 f"persistent-key register {self._path} has schema_version "
@@ -353,7 +394,7 @@ class PersistentKeyRegister:
                 activation is None
                 or (
                     type(activation) is dict
-                    and set(activation) == {"record_digest", "scenario_id"}
+                    and set(activation) == {"record_digest", "project_path"}
                 )
             )
             or type(reconciled) is not list
@@ -362,7 +403,7 @@ class PersistentKeyRegister:
             or type(unobserved) is not list
             or len(unobserved) > MAX_RECONCILED_APPLIES
             or any(
-                type(row) is not dict or set(row) != {"record_digest", "scenario_id"}
+                type(row) is not dict or set(row) != {"record_digest", "project_path"}
                 for row in unobserved
             )
         ):
@@ -372,7 +413,7 @@ class PersistentKeyRegister:
         rows: dict[tuple[str, str], dict[str, Any]] = {}
         for row in document["rows"]:
             if type(row) is not dict or set(row) != {
-                "scenario_id",
+                "project_path",
                 "key",
                 "fingerprint",
                 "value",
@@ -382,7 +423,7 @@ class PersistentKeyRegister:
                     "persistent-key register has a malformed row"
                 )
             identity = (
-                _require_id(row["scenario_id"], field="scenario_id"),
+                _require_project(row["project_path"]),
                 _require_id(row["key"], field="key"),
             )
             if identity in rows:
@@ -401,7 +442,7 @@ class PersistentKeyRegister:
                 )
         if activation is not None:
             _require_id(activation["record_digest"], field="record_digest")
-            _require_id(activation["scenario_id"], field="scenario_id")
+            _require_project(activation["project_path"])
             if activation["record_digest"] not in reconciled:
                 raise PersistentKeyRegisterError(
                     "persistent-key register activation is not reconciled"
@@ -409,9 +450,7 @@ class PersistentKeyRegister:
         for digest in reconciled:
             _require_id(digest, field="record_digest")
         unobserved_applies = {
-            _require_id(row["record_digest"], field="record_digest"): _require_id(
-                row["scenario_id"], field="scenario_id"
-            )
+            _require_id(row["record_digest"], field="record_digest"): _require_project(row["project_path"])
             for row in unobserved
         }
         if not set(unobserved_applies) <= set(reconciled):
@@ -449,15 +488,15 @@ class PersistentKeyRegister:
             "schema_version": SCHEMA_VERSION,
             "sequence": sequence,
             "rows": [
-                {"scenario_id": row_scenario, "key": row_key, **row}
-                for (row_scenario, row_key), row in sorted(rows.items())
+                {"project_path": row_project, "key": row_key, **row}
+                for (row_project, row_key), row in sorted(rows.items())
             ],
             "edits": edits,
             "activation": activation,
             "reconciled_applies": sorted(reconciled),
             "unobserved_applies": [
-                {"record_digest": digest, "scenario_id": scenario}
-                for digest, scenario in sorted(unobserved.items())
+                {"record_digest": digest, "project_path": project}
+                for digest, project in sorted(unobserved.items())
             ],
         }
         encoded = json.dumps(document, sort_keys=True, indent=1, allow_nan=False)
@@ -566,8 +605,8 @@ class PersistentKeyRegister:
             unobserved.update(missed)
             rows = dict(self._rows)
             notices: list[PersistentKeyNotice] = []
-            for (row_scenario, key), row in sorted(rows.items()):
-                if row_scenario != activation.scenario_id:
+            for (row_project, key), row in sorted(rows.items()):
+                if row_project != activation.project_path:
                     continue
                 declaration = activation.declarations.get(key)
                 if declaration is None or declaration.persistence != "persistent":
@@ -576,8 +615,8 @@ class PersistentKeyRegister:
                     reason = REASON_DECLARATION_CHANGED
                 else:
                     continue
-                del rows[(row_scenario, key)]
-                notices.append(PersistentKeyNotice(row_scenario, key, reason))
+                del rows[(row_project, key)]
+                notices.append(PersistentKeyNotice(row_project, key, reason))
             self._write(
                 rows,
                 self._sequence + 1,
@@ -587,7 +626,7 @@ class PersistentKeyRegister:
                 ],
                 activation={
                     "record_digest": activation.record_digest,
-                    "scenario_id": activation.scenario_id,
+                    "project_path": activation.project_path,
                 },
                 reconciled=frozenset(committed),
                 unobserved=unobserved,
@@ -596,21 +635,21 @@ class PersistentKeyRegister:
                 "reconciled", tuple(notices), missed, history_changed
             )
 
-    def unobserved_applies(self, scenario_id: str) -> tuple[str, ...]:
-        """Record digests of this history's committed Applies of the Scenario
+    def unobserved_applies(self, project_path: str) -> tuple[str, ...]:
+        """Record digests of this history's committed Applies of the project
         that were never observed (the `applied_program_not_observed` fault)."""
 
-        _require_id(scenario_id, field="scenario_id")
+        _require_project(project_path)
         with self._lock:
             return tuple(
                 digest
-                for digest, scenario in sorted(self._unobserved.items())
-                if scenario == scenario_id
+                for digest, project in sorted(self._unobserved.items())
+                if project == project_path
             )
 
     def restore(
         self,
-        scenario_id: str,
+        project_path: str,
         declarations: Mapping[str, BlackboardKeyDeclaration],
     ) -> Mapping[str, Any]:
         """Return the Scenario's stored values that fit the committed Program.
@@ -620,20 +659,20 @@ class PersistentKeyRegister:
         against. Restoring never writes.
         """
 
-        _require_id(scenario_id, field="scenario_id")
+        _require_project(project_path)
         with self._lock:
             if (
                 self._uncertain
                 or self._activation is None
-                or self._activation["scenario_id"] != scenario_id
+                or self._activation["project_path"] != project_path
             ):
                 # Nothing is restored while a write may not be durable.
                 return {}
             restored: dict[str, Any] = {}
-            for (row_scenario, key), row in self._rows.items():
+            for (row_project, key), row in self._rows.items():
                 declaration = declarations.get(key)
                 if (
-                    row_scenario == scenario_id
+                    row_project == project_path
                     and declaration is not None
                     and declaration.persistence == "persistent"
                     and row["fingerprint"] == declaration_fingerprint(declaration)
@@ -643,7 +682,7 @@ class PersistentKeyRegister:
 
     def drop(
         self,
-        scenario_id: str,
+        project_path: str,
         key: str,
         *,
         reason: str,
@@ -657,11 +696,11 @@ class PersistentKeyRegister:
         """
 
         identity = (
-            _require_id(scenario_id, field="scenario_id"),
+            _require_project(project_path),
             _require_id(key, field="key"),
         )
         notice = PersistentKeyNotice(
-            scenario_id, key, _require_id(reason, field="reason"), _bounded_detail(detail)
+            project_path, key, _require_id(reason, field="reason"), _bounded_detail(detail)
         )
         if edit is None:
             edit = PersistentKeyEdit(None, "run_start")
@@ -680,7 +719,7 @@ class PersistentKeyRegister:
 
     def commit(
         self,
-        scenario_id: str,
+        project_path: str,
         declaration: BlackboardKeyDeclaration,
         value: Any,
         *,
@@ -694,7 +733,7 @@ class PersistentKeyRegister:
         """
 
         identity = (
-            _require_id(scenario_id, field="scenario_id"),
+            _require_project(project_path),
             _require_id(declaration.key, field="key"),
         )
         if declaration.persistence != "persistent":
@@ -732,7 +771,7 @@ class PersistentKeyRegister:
 
     def remove(
         self,
-        scenario_id: str,
+        project_path: str,
         key: str,
         *,
         edit: PersistentKeyEdit | Mapping[str, Any] | None = None,
@@ -740,7 +779,7 @@ class PersistentKeyRegister:
         """Forget one stored value so the key starts again from `initial:`."""
 
         identity = (
-            _require_id(scenario_id, field="scenario_id"),
+            _require_project(project_path),
             _require_id(key, field="key"),
         )
         with self._lock:
@@ -756,7 +795,7 @@ class PersistentKeyRegister:
 
     def clear(
         self,
-        scenario_id: str,
+        project_path: str,
         declarations: Mapping[str, BlackboardKeyDeclaration],
         *,
         edit: PersistentKeyEdit | None = None,
@@ -768,7 +807,7 @@ class PersistentKeyRegister:
         from `initial:` (or empty). A read key keeps its stored value.
         """
 
-        _require_id(scenario_id, field="scenario_id")
+        _require_project(project_path)
         writable = {
             key
             for key, declaration in declarations.items()
@@ -779,14 +818,14 @@ class PersistentKeyRegister:
             rows = {
                 identity: row
                 for identity, row in self._rows.items()
-                if identity[0] != scenario_id or identity[1] not in writable
+                if identity[0] != project_path or identity[1] not in writable
             }
             removed = len(self._rows) - len(rows)
             if removed:
                 self._write(
                     rows,
                     self._sequence + 1,
-                    _audit(edit, "clear", scenario_id, None),
+                    _audit(edit, "clear", project_path, None),
                 )
             return removed
 
@@ -804,8 +843,8 @@ class PersistentKeyRegister:
         with self._lock:
             return None if self._activation is None else dict(self._activation)
 
-    def values(self, scenario_id: str) -> dict[str, dict[str, Any]]:
-        _require_id(scenario_id, field="scenario_id")
+    def values(self, project_path: str) -> dict[str, dict[str, Any]]:
+        _require_project(project_path)
         with self._lock:
             return {
                 key: {
@@ -813,17 +852,17 @@ class PersistentKeyRegister:
                     "sequence": row["sequence"],
                     "fingerprint": row["fingerprint"],
                 }
-                for (row_scenario, key), row in sorted(self._rows.items())
-                if row_scenario == scenario_id
+                for (row_project, key), row in sorted(self._rows.items())
+                if row_project == project_path
             }
 
-    def edits(self, scenario_id: str) -> list[dict[str, Any]]:
+    def edits(self, project_path: str) -> list[dict[str, Any]]:
         """Recent attributed changes of one Scenario, oldest first."""
 
-        _require_id(scenario_id, field="scenario_id")
+        _require_project(project_path)
         with self._lock:
             return [
-                dict(edit) for edit in self._edits if edit["scenario_id"] == scenario_id
+                dict(edit) for edit in self._edits if edit["project_path"] == project_path
             ]
 
     def take_notices(self) -> tuple[PersistentKeyNotice, ...]:

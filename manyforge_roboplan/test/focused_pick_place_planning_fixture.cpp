@@ -91,8 +91,7 @@ BoxObject(std::string id, SceneObjectPlacementDTO placement) {
            ModelInstanceId("model:test"),
            ModelRevision("model-revision:test"),
            {CollisionBodyId("body:tool")}}},
-       0.001,
-       0.8}};
+       ContactGraspEnvelopeDTO{0.001, 0.8}}};
   return {ProgramId("program:test"),
           ProgramRevision("program-revision:test"),
           ProgramBindingId("program-binding:test"),
@@ -187,8 +186,7 @@ public:
           motion->runtime_object_bindings.front().runtime_object_id,
           motion->runtime_object_bindings.front().scene_resource_id,
           {CollisionBodyId("body:tool")},
-          0.001,
-          0.8};
+          ContactGraspEnvelopeDTO{0.001, 0.8}};
     }
     return Result<ExecuteRequestDTO>::Ok(std::move(request));
   }

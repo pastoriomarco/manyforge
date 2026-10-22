@@ -74,6 +74,7 @@ def _client_applied() -> dict[str, object]:
         "retained_bundle_id": binding["retained_bundle_id"],
         "source_document_digest": "sha256:" + "1" * 64,
         "scenario_id": "cell-pick",
+        "project_path": "/projects/cell-pick.scenario",
         "schema_version": "manyforge.applied_program_selection.v3",
         "source": {
             "record_digest": "sha256:" + "2" * 64,

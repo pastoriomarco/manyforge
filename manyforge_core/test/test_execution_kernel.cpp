@@ -2074,8 +2074,7 @@ void bind_resolved_contact_grasp(ExecuteRequestDTO& request, MockCollisionWorldP
                                      RuntimeObjectId("selected_object"),
                                      SceneResourceId(object_id),
                                      std::move(allowed_bodies),
-                                     max_penetration_m,
-                                     0.75};
+                                     ContactGraspEnvelopeDTO{max_penetration_m, 0.75}};
 }
 
 [[nodiscard]] bool is_bound_contact_grasp_policy(const std::string& policy_id) {
@@ -4470,6 +4469,18 @@ TEST_F(ExecutionKernelTest,
   ASSERT_EQ(ended_as(kernel), "failed");
   const auto resets = execution.reset_count;
   const auto dispatches = execution.execute_count;
+  const auto before_reset = kernel.get_status();
+  const auto reset = apply_recovery_action_after_projection(kernel, RecoveryAction::kResetCycle);
+  EXPECT_FALSE(reset.accepted);
+  ASSERT_TRUE(reset.error);
+  EXPECT_EQ(reset.error->details.at("reason"), reason_codes::kRecoveryActionNotAllowed);
+  const auto after_reset = kernel.get_status();
+  EXPECT_EQ(after_reset.state, before_reset.state);
+  EXPECT_EQ(after_reset.execution_id, before_reset.execution_id);
+  EXPECT_EQ(after_reset.active_move_id, before_reset.active_move_id);
+  EXPECT_EQ(after_reset.fact, before_reset.fact);
+  EXPECT_EQ(execution.reset_count, resets);
+  EXPECT_EQ(execution.execute_count, dispatches);
   const auto result = apply_recovery_action_after_projection(
       kernel, RecoveryAction::kCloseOperation, "program_runner", "failure propagated");
   ASSERT_TRUE(result.accepted) << (result.error ? result.error->message : "");
@@ -6711,8 +6722,7 @@ TEST_F(ExecutionKernelTest, Execute_ResolvedContactGraspInstallsExactEphemeralPo
                                      RuntimeObjectId("selected_object"),
                                      SceneResourceId("graspable"),
                                      {allowed_body},
-                                     0.002,
-                                     0.75};
+                                     ContactGraspEnvelopeDTO{0.002, 0.75}};
 
   const auto result = execute_sync(request);
   ASSERT_TRUE(result.ok()) << result.error().code << ": " << result.error().message;
@@ -6731,6 +6741,51 @@ TEST_F(ExecutionKernelTest, Execute_ResolvedContactGraspInstallsExactEphemeralPo
 
   ASSERT_TRUE(collision_world_publisher.current_policy.has_value());
   EXPECT_TRUE(collision_world_publisher.current_policy->contact_grasps.empty())
+      << "operation-local binding must not mutate configured policy";
+  ASSERT_TRUE(collision_world_publisher.current_logical_scene);
+  ASSERT_EQ(collision_world_publisher.current_logical_scene->objects.size(), 1U);
+  EXPECT_TRUE(std::holds_alternative<CellFixedSceneObjectPlacementDTO>(
+      collision_world_publisher.current_logical_scene->objects.front().placement));
+}
+
+TEST_F(ExecutionKernelTest, Execute_ResolvedContactReleaseInstallsOnlyExactDeparturePairs) {
+  // SetUp installs the authoritative collision resources for the fixture's
+  // Kernel. A second install is prohibited without an Apply fence.
+  install_mock_contact_grasp_world(collision_world_publisher, "graspable",
+                                   {"right_finger", "left_finger"});
+  install_mock_detached_logical_object(collision_world_publisher, "graspable");
+
+  const CollisionBodyId allowed_body("component/arm/model/arm_model/body/right_finger/collision/0");
+  auto request = make_test_request("resolved_contact_grasp");
+  request.contact_policy_id = "pick_grasp";
+  request.runtime_object_bindings = {RuntimeObjectReferenceBindingDTO{
+      RuntimeObjectId("selected_object"), SceneResourceId("graspable")}};
+  request.resolved_contact_grasp =
+      ResolvedContactGraspBindingDTO{ContactPolicyId("pick_grasp"),
+                                     ContactPolicyRevision(kTestDigestA),
+                                     RuntimeObjectId("selected_object"),
+                                     SceneResourceId("graspable"),
+                                     {allowed_body},
+                                     ContactReleaseEnvelopeDTO{ContactReleaseEvidenceModeDTO::kSignedPenetration, true, 0.002}};
+
+  const auto result = execute_sync(request);
+  ASSERT_TRUE(result.ok()) << result.error().code << ": " << result.error().message;
+  EXPECT_EQ(ended_as(kernel), "completed");
+  EXPECT_FALSE(planner.last_request.contact_policy_id.has_value());
+  ASSERT_TRUE(planner.last_request.retained_collision_policy);
+  const auto& effective_policy = *planner.last_request.retained_collision_policy;
+  EXPECT_TRUE(effective_policy.contact_grasps.empty());
+  ASSERT_EQ(effective_policy.support_contacts.size(), 1U);
+  const auto& release = effective_policy.support_contacts.front();
+  EXPECT_EQ(release.mode, CollisionContactPolicyMode::kContactRelease);
+  EXPECT_EQ(release.pair, (CollisionPairId{allowed_body, "scene/graspable/shape/0"}));
+  EXPECT_DOUBLE_EQ(release.max_start_penetration_m, 0.002);
+  EXPECT_TRUE(release.require_strictly_decreasing_penetration);
+  EXPECT_TRUE(release.require_separation_by_end);
+  EXPECT_FALSE(release.allow_recontact);
+
+  ASSERT_TRUE(collision_world_publisher.current_policy.has_value());
+  EXPECT_TRUE(collision_world_publisher.current_policy->support_contacts.empty())
       << "operation-local binding must not mutate configured policy";
   ASSERT_TRUE(collision_world_publisher.current_logical_scene);
   ASSERT_EQ(collision_world_publisher.current_logical_scene->objects.size(), 1U);

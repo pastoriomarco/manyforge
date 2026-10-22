@@ -23,7 +23,7 @@ from manyforge_behavior.node_registry import build_node_registry
 
 
 CATALOG_PATH = Path(__file__).parent.parent / "resources" / "node_catalog.yaml"
-EXPECTED_CATALOG_DIGEST = "sha256:4dfd2fcb507323ca8355cee098fd76187f26ca704edcf7b3a1ed65c3fc03b336"
+EXPECTED_CATALOG_DIGEST = "sha256:376863946817c83ee0e92f3a72257bc2ac25e3f9cdbdca0029aab5af42c3d6e2"
 
 
 def _catalog_data() -> dict[str, object]:
@@ -190,7 +190,7 @@ def test_catalog_exposes_structured_v2_semantics() -> None:
         "target_reference",
         "target_mode",
         "target_role",
-        "tcp_frame_role",
+        "tcp_endpoint",
         "translation_tol_m",
         "velocity_scale",
     }
@@ -307,8 +307,12 @@ def test_reference_frames_name_any_declared_robot_while_effect_frames_stay_scope
     for offset in ("pick_offset_reference", "approach_offset_reference"):
         assert synthesis.properties[offset].ref == "#/schema_types/motion_reference"
     move = {parameter.id: parameter for parameter in catalog.get("motion.move_to_pose").parameters}
-    for effect in ("base_frame_role", "tcp_frame_role"):
-        assert registry.resolve(move[effect].schema).semantic_scope_parameter == "target_role"
+    assert registry.resolve(move["base_frame_role"].schema).semantic_scope_parameter == "target_role"
+    assert move["tcp_endpoint"].required and not move["tcp_endpoint"].has_default
+    endpoint = registry.resolve(move["tcp_endpoint"].schema)
+    assert endpoint.required == ("target_role", "frame_role")
+    assert registry.resolve(endpoint.properties["target_role"]).semantic_type == "target_role"
+    assert registry.resolve(endpoint.properties["frame_role"]).semantic_type == "frame_role"
     # Geometry and Scene nodes choose any declared frame.
     offset = {parameter.id: parameter for parameter in catalog.get("geometry.offset_pose").parameters}
     assert offset["offset_frame"].required is False and not offset["offset_frame"].has_default
@@ -885,3 +889,13 @@ def test_nested_parameter_defaults_are_transitively_read_only(
         default["type"] = "sphere"
     with pytest.raises(TypeError):
         default["box_dimensions_m"][0] = 99.0
+
+
+def test_joint_goal_exposes_the_same_explicit_contact_inputs_as_pose_goal() -> None:
+    catalog = NodeCatalog(CATALOG_PATH)
+    joint = {row.id: row for row in catalog.get('motion.move_to_joint_target').parameters}
+    pose = {row.id: row for row in catalog.get('motion.move_to_pose').parameters}
+    for name in ('contact_policy_id', 'contact_scene_resource_id'):
+        assert joint[name].required is False
+        assert joint[name].has_default is False
+        assert joint[name].schema == pose[name].schema

@@ -82,19 +82,19 @@ beforeEach(() => {
       graphRevision: active.graphRevision } } });
   apiMock.files.browse.mockResolvedValue({ entries: [] });
   apiMock.scenarioDocuments.list.mockResolvedValue({ directory: '/projects', entries: [
-    { sourceKind: 'saved', path: '/projects/other', scenarioId: 'other', name: 'Other',
-      description: '', displayStatus: 'ready', statusDetail: '', savedManyforgeVersion: null },
-    { sourceKind: 'saved', path: '/projects/current', scenarioId: 'current', name: 'Current',
-      description: '', displayStatus: 'ready', statusDetail: '', savedManyforgeVersion: null },
+    { sourceKind: 'saved', path: '/projects/other', scenarioId: 'other', name: 'Other', folderName: 'other',
+      location: 'projects', description: '', displayStatus: 'ready', statusDetail: '', savedManyforgeVersion: null },
+    { sourceKind: 'saved', path: '/projects/current', scenarioId: 'current', name: 'Current', folderName: 'current',
+      location: 'projects', description: '', displayStatus: 'ready', statusDetail: '', savedManyforgeVersion: null },
   ] });
 });
 async function mount(closeScenario = vi.fn(async () => empty as ManagerActiveProjection | null),
-  documentUnavailableReason: string | null = null, motionActive = false) {
+  documentUnavailableReason: string | null = null, motionActive = false, documentPath = '/projects/current.scenario') {
   const dom = mountedHost();
   const controller = {
     documentUnavailableReason, state: { status: 'ready', pendingAction: null, workspace: {
       authoringWorkspace: { revision: 1 }, draft: { authoring: null }, hasUnsavedChanges: true,
-      hasUnappliedChanges: true } }, scenarioDocumentPath: '/projects/current',
+      hasUnappliedChanges: true } }, scenarioDocumentPath: documentPath,
     scenarioDocument: { id: 'current', name: 'Current', description: '' },
     saveScenarioDocument: vi.fn(), exportScenarioDocument: vi.fn(),
     scenarioReplacementIdentity: { authoring: { workspaceEpoch: 'workspace', workspaceRevision: 1,
@@ -173,10 +173,18 @@ it.each(['unknown', 'failure', 'not_empty'])('does not load a replacement after 
   expect(test.find((p) => p.role === 'dialog')).toBeDefined();
 });
 
-it('same-scenario reload applies differences without Close', async () => {
-  const test = await mount(); await test.open('Load Scenario'); await test.choose('current');
-  await test.confirm(); await test.click(test.primary('Load Scenario'));
+it('Load of the applied Scenario requires the same confirmation and waits for Close', async () => {
+  const close = deferred<ManagerActiveProjection | null>();
+  const test = await mount(vi.fn(() => close.promise));
+  await test.open('Load Scenario'); await test.choose('current');
+  expect(() => test.find((p) => p.type === 'checkbox')).toThrow();
+  await test.click(test.primary('Load Scenario'));
   expect(test.closeScenario).not.toHaveBeenCalled();
+  expect(test.controller.loadScenarioDocument).not.toHaveBeenCalled();
+  await test.ack();
+  expect(test.closeScenario).toHaveBeenCalledExactlyOnceWith(active, test.controller.scenarioReplacementIdentity, expect.any(AbortSignal));
+  expect(test.controller.loadScenarioDocument).not.toHaveBeenCalled();
+  await act(() => close.resolve(empty));
   expect(test.controller.loadScenarioDocument).toHaveBeenCalledExactlyOnceWith('/projects/current', true);
 });
 
@@ -189,7 +197,7 @@ it('New creates only after Close and names its resulting empty publication', asy
   expect(test.controller.newScenarioDocument).not.toHaveBeenCalled();
   await act(() => close.resolve(empty));
   expect(test.controller.newScenarioDocument).toHaveBeenCalledExactlyOnceWith({
-    path: '/projects/next_cell.scenario', name: 'next_cell', deploymentChoice: 'empty',
+    directory: '/projects', name: 'next_cell', deploymentChoice: 'empty',
     expectedRetainedBundleId: empty.retainedBundleId, expectedGraphRevision: empty.graphRevision,
     confirmDiscard: true,
   });
@@ -210,13 +218,13 @@ it('restores the temporary standalone Close command and keeps empty Load Close-f
   expect(test.controller.loadScenarioDocument).toHaveBeenCalledExactlyOnceWith('/projects/other', true);
 });
 
-it('blocks same-scenario reload on ordinary document admission without using Close', async () => {
+it.each(['current', 'other'])('Load of %s is admitted by the Close path, not by ordinary document admission', async (id) => {
   const test = await mount(undefined, 'Reset stopped operations first');
-  await test.open('Load Scenario'); await test.choose('current'); await test.confirm();
-  expect(test.primary('Load Scenario').disabled).toBe(true);
-  await test.click(test.primary('Load Scenario'));
-  expect(test.closeScenario).not.toHaveBeenCalled();
-  expect(test.controller.loadScenarioDocument).not.toHaveBeenCalled();
+  await test.open('Load Scenario'); await test.choose(id);
+  expect(test.primary('Load Scenario').disabled).toBe(false);
+  await test.click(test.primary('Load Scenario')); await test.ack();
+  expect(test.closeScenario).toHaveBeenCalledOnce();
+  expect(test.controller.loadScenarioDocument).toHaveBeenCalledExactlyOnceWith(`/projects/${id}`, true);
 });
 
 it('keeps the dialog after an unresolved replacement without sending it again', async () => {
@@ -296,4 +304,111 @@ it.each(['unknown', 'failure', 'not_empty'])('temporary Close keeps %s visible w
   expect(test.controller.newScenarioDocument).not.toHaveBeenCalled();
   expect(test.controller.loadScenarioDocument).not.toHaveBeenCalled();
   expect(test.find((p) => p.className === 'inline-message severity-error')).toBeDefined();
+});
+
+it('New refuses an invalid or already used name before any effect', async () => {
+  apiMock.files.browse.mockResolvedValue({ entries: [{ name: 'taken.scenario', entryType: 'directory',
+    path: '/projects/taken.scenario', selectable: false, scenarioProject: true }] });
+  const test = await mount(); await test.open('New');
+  const name = () => test.find((p) => p.placeholder === 'e.g. lite6_pick_and_place');
+  for (const value of ['my cell', 'cell.v2', '_cell', 'taken']) {
+    await act(() => name().onChange?.({ target: { value } }));
+    expect(test.primary('Create Scenario').disabled).toBe(true);
+  }
+  await act(() => name().onChange?.({ target: { value: 'Fresh_Cell' } }));
+  expect(test.primary('Create Scenario').disabled).toBe(false);
+  expect(test.closeScenario).not.toHaveBeenCalled();
+});
+
+it('Save As saves <directory>/<name>.scenario with one name and asks before replacing', async () => {
+  apiMock.files.browse.mockResolvedValue({ entries: [{ name: 'Renamed.scenario', entryType: 'directory',
+    path: '/projects/Renamed.scenario', selectable: false, scenarioProject: true }] });
+  const test = await mount(undefined, null, false, '/projects/Lab_Cell.scenario');
+  await test.open('Save Scenario as');
+  const name = () => test.find((p) => p['aria-describedby'] === 'save-scenario-name-help');
+  expect(name().value).toBe('Lab_Cell');
+  await act(() => name().onChange?.({ target: { value: 'my cell' } }));
+  expect(test.primary('Save Scenario').disabled).toBe(true);
+  await act(() => name().onChange?.({ target: { value: 'Renamed' } }));
+  // Another project already has this name: replacing it needs the explicit choice.
+  expect(test.primary('Save Scenario').disabled).toBe(true);
+  await test.confirm();
+  expect(test.primary('Save Scenario').disabled).toBe(false);
+  await test.click(test.primary('Save Scenario'));
+  expect(test.controller.saveScenarioDocument).toHaveBeenCalledExactlyOnceWith({
+    directory: '/projects', name: 'Renamed', description: '', confirmOverwrite: true,
+  });
+});
+
+it('plain Save writes the open project under its folder name', async () => {
+  const test = await mount(undefined, null, false, '/projects/Lab_Cell.scenario');
+  await test.open('Save Scenario');
+  expect(test.controller.saveScenarioDocument).toHaveBeenCalledExactlyOnceWith({
+    directory: '/projects', name: 'Lab_Cell', description: '', confirmOverwrite: false,
+  });
+});
+
+it('Available Scenario shows Scenario names and a refused folder by its folder name', async () => {
+  apiMock.scenarioDocuments.list.mockResolvedValue({ directory: '/projects', entries: [
+    { sourceKind: 'saved', path: '/projects/pick', scenarioId: null, name: 'pick',
+      folderName: 'pick', location: 'projects', description: '', displayStatus: 'unsupported',
+      statusDetail: 'a Scenario project must be a folder', savedManyforgeVersion: null },
+    { sourceKind: 'saved', path: '/projects/pick.scenario', scenarioId: 'pick', name: 'pick',
+      folderName: 'pick', location: 'projects', description: '', displayStatus: 'ready', statusDetail: '',
+      savedManyforgeVersion: null },
+  ] });
+  const test = await mount(); await test.open('Load Scenario');
+  const option = (path: string) => test.find((p) => p.value === `saved:${path}`);
+  expect(option('/projects/pick.scenario').children).toBe('pick');
+  expect(option('/projects/pick').children).toBe('pick');
+  expect(option('/projects/pick').disabled).toBe(true);
+});
+
+const label = (p: Props) => [p.children].flat(3).filter((part) => typeof part === 'string').join('').trim();
+function browseTree(tree: Record<string, Array<[string, boolean]>>) {
+  apiMock.files.browse.mockImplementation(async (_kind: string, path?: string) => {
+    const currentPath = path ?? '/projects';
+    return { currentPath, parentPath: currentPath === '/projects' ? null : currentPath.slice(0, currentPath.lastIndexOf('/')),
+      roots: ['/projects'], entries: (tree[currentPath] ?? []).map(([name, scenarioProject]) => ({
+        name, path: `${currentPath}/${name}`, entryType: 'directory', selectable: false, scenarioProject })) };
+  });
+}
+
+it('Load Browse… selects a Scenario project and loads it through Close', async () => {
+  browseTree({ '/projects': [['cells', false]], '/projects/cells': [['lab', false], ['pick.scenario', true]] });
+  apiMock.scenarioDocuments.list.mockImplementation(async (directory?: string) => directory === '/projects/cells'
+    ? { directory: '/projects/cells', entries: [
+      { sourceKind: 'saved', path: '/projects/cells/pick.scenario', scenarioId: 'pick', name: 'pick', folderName: 'pick',
+        location: 'cells', description: '', displayStatus: 'ready', statusDetail: '', savedManyforgeVersion: null }] }
+    : { directory: '/projects', entries: [] });
+  const test = await mount(); await test.open('Load Scenario');
+  await test.click(test.find((p) => p.children === 'Browse…'));
+  expect(test.find((p) => p['aria-label'] === 'Choose a Scenario project')).toBeDefined();
+  expect(() => test.find((p) => p.children === 'Use this folder')).toThrow();
+  await test.click(test.find((p) => p.role === 'listitem' && label(p) === 'cells'));
+  await test.click(test.find((p) => p.role === 'listitem' && label(p) === 'pick.scenario'));
+  expect(apiMock.scenarioDocuments.list).toHaveBeenLastCalledWith('/projects/cells');
+  expect(test.find((p) => p.value === 'saved:/projects/cells/pick.scenario')).toBeDefined();
+  await test.click(test.primary('Load Scenario')); await test.ack();
+  expect(test.closeScenario).toHaveBeenCalledOnce();
+  expect(test.controller.loadScenarioDocument).toHaveBeenCalledExactlyOnceWith('/projects/cells/pick.scenario', true);
+});
+
+it('Export Browse… picks a parent folder and exports the project there under its name', async () => {
+  browseTree({ '/projects': [['out', false], ['Lab_Cell.scenario', true]] });
+  const test = await mount(undefined, null, false, '/projects/Lab_Cell.scenario');
+  await test.open('Save Scenario as');
+  await test.click(test.find((p) => p.children === 'Portable copy'));
+  expect(test.primary('Export copy').disabled).toBe(true);
+  await test.click(test.find((p) => p.children === 'Browse…'));
+  // The open project's own folder already holds it: that destination is refused.
+  await test.click(test.find((p) => p.children === 'Use this folder'));
+  expect(test.primary('Export copy').disabled).toBe(true);
+  await test.click(test.find((p) => p.children === 'Browse…'));
+  expect(test.find((p) => p.role === 'listitem' && label(p) === 'Lab_Cell.scenario').disabled).toBe(true);
+  await test.click(test.find((p) => p.role === 'listitem' && label(p) === 'out'));
+  await test.click(test.find((p) => p.children === 'Use this folder'));
+  expect(test.primary('Export copy').disabled).toBe(false);
+  await test.click(test.primary('Export copy'));
+  expect(test.controller.exportScenarioDocument).toHaveBeenCalledExactlyOnceWith('/projects/out/Lab_Cell.scenario');
 });

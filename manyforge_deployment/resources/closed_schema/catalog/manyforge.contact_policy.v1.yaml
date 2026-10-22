@@ -1,6 +1,6 @@
 api_version: manyforge.closed_schema.v1
 schema_id: manyforge.contact_policy.v1
-schema_revision: sha256:79f101a9c8cc2acf8db6ecaffd3476b03723afd5a31cce2a503f7b8764b47912
+schema_revision: sha256:c7ad633867abbe4583dee2eda51dca5b33bd8e8827777a8ac9ab86b2aba20490
 schema_purpose: artifact_document
 root_definition_id: contact_policy
 definitions:
@@ -611,6 +611,10 @@ definitions:
           value_schema:
             kind: local_ref
             definition_id: component_model_body_selector
+        - tag_value: motion_endpoint
+          value_schema:
+            kind: local_ref
+            definition_id: motion_endpoint_selector
         - tag_value: runtime_object
           value_schema:
             kind: local_ref
@@ -619,6 +623,19 @@ definitions:
           value_schema:
             kind: local_ref
             definition_id: scene_resource_selector
+  - definition_id: motion_endpoint_selector
+    value_schema:
+      kind: object
+      fields:
+        - field_id: kind
+          presence: required
+          default: {kind: absent}
+          value_schema:
+            kind: scalar
+            scalar_type: string
+            constraints:
+              - kind: enum
+                values: [motion_endpoint]
   - definition_id: component_model_body_selector
     value_schema:
       kind: object

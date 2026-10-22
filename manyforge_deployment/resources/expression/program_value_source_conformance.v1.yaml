@@ -63,7 +63,7 @@ nodes:
     parameters:
       target_role: arm
       base_frame_role: base
-      tcp_frame_role: tcp
+      tcp_endpoint: {target_role: arm, frame_role: tcp}
       goal: [{joint_name: joint1, position_rad: 0.0}]
   probe:
     node_id: motion.probe_search

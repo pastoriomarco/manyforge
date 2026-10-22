@@ -162,6 +162,25 @@ namespace {
 
 namespace scene = manyforge::scene;
 
+template <typename Resolver>
+[[nodiscard]] RetainedRuntimeParticipantResolver
+MakeRetainedRuntimeParticipantResolver(const Resolver &resolver) {
+  return [resolver](const core::OperationIntentDTO &operation,
+                    const std::size_t participant_index) {
+    return resolver->ResolveExecutionParticipant(operation, participant_index);
+  };
+}
+
+template <typename MakeResolver>
+[[nodiscard]] RetainedRuntimeParticipantResolverFactory
+MakeCandidateParticipantResolverFactory(MakeResolver make_resolver) {
+  return [make_resolver = std::move(make_resolver)](
+             std::vector<core::RuntimeParticipantBinding> bindings) {
+    auto resolver = make_resolver(std::move(bindings));
+    return MakeRetainedRuntimeParticipantResolver(resolver);
+  };
+}
+
 [[nodiscard]] std::vector<RoboPlanJointLimitInput>
 RoboPlanJointLimitsFromRetainedModel(
     const deployment::UrdfDocumentIr &urdf) {
@@ -406,7 +425,8 @@ SelectManagedComponentProjections(const ManagedRuntimeChildConfig &config,
 [[nodiscard]] int
 RunManagedRuntimeChild(const ManagedRuntimeChildConfig &config);
 [[nodiscard]] RoboPlanCandidateBindingDTO
-CandidateBinding(const core::RuntimeParticipantBinding &runtime) {
+CandidateBinding(const core::RuntimeParticipantBinding &runtime,
+                 const deployment::VerifiedRetainedModelMap &model_map) {
   const auto &value = runtime.value();
   Require(value.model_groups.size() == 1U,
           "motion binding has no sole retained model group");
@@ -426,13 +446,7 @@ CandidateBinding(const core::RuntimeParticipantBinding &runtime) {
     resources.push_back(resource.resource_id);
     compiled_joint_names.push_back(resource.compiled_resource_name);
   }
-  std::vector<core::ResolvedFrameDTO> frames;
-  frames.reserve(value.frame_bindings.size());
-  for (const auto &frame : value.frame_bindings) {
-    frames.emplace_back(core::ResolvedComponentModelFrameDTO{
-        value.controllable_component_id, frame.model_instance_id,
-        frame.frame_role_id, frame.compiled_frame_name, frame.model_revision});
-  }
+  auto frames = retained_motion_planner_frames(runtime, &model_map);
   return RoboPlanCandidateBindingDTO{
       value.controllable_component_id, value.command_target_id,
       group.model_instance_id,         model->model_revision,
@@ -2629,22 +2643,16 @@ BuildRetainedProductComposition(CompositionBuildInput input) {
             std::vector<core::RuntimeParticipantBinding>{*physical.gripper},
             direct_binding_ids, input.program_artifact_root);
     RetainedRuntimeParticipantResolverFactory resolver_factory =
-        [package_root = input.package_root, bundle = input.bundle,
-         model_map = input.model_map,
-         program_artifact_root = input.program_artifact_root,
-         direct_binding_ids](
-            std::vector<core::RuntimeParticipantBinding> bindings) {
-          auto resolver =
-              std::make_shared<ProductBackedRuntimeParticipantResolver>(
+        MakeCandidateParticipantResolverFactory(
+            [package_root = input.package_root, bundle = input.bundle,
+             model_map = input.model_map,
+             program_artifact_root = input.program_artifact_root,
+             direct_binding_ids](
+                std::vector<core::RuntimeParticipantBinding> bindings) {
+              return std::make_shared<ProductBackedRuntimeParticipantResolver>(
                   package_root, bundle, model_map, std::move(bindings),
                   direct_binding_ids, program_artifact_root);
-          return RetainedRuntimeParticipantResolver{
-              [resolver](const core::OperationIntentDTO &operation,
-                         const std::size_t participant_index) {
-                return resolver->ResolveExecutionParticipant(
-                    operation, participant_index);
-              }};
-        };
+            });
     auto composition = std::make_unique<Composition>(
         *input.selected_component_id, std::move(input.bundle), nullptr, nullptr,
         nullptr, std::move(physical.gripper_program), std::nullopt,
@@ -2795,21 +2803,16 @@ BuildRetainedProductComposition(CompositionBuildInput input) {
           std::move(physical_bindings), direct_binding_ids,
           input.program_artifact_root);
   RetainedRuntimeParticipantResolverFactory resolver_factory =
-      [package_root = input.package_root, bundle = input.bundle,
-       model_map = input.model_map,
-       program_artifact_root = input.program_artifact_root,
-       direct_binding_ids = std::move(direct_binding_ids)](
-          std::vector<core::RuntimeParticipantBinding> bindings) {
-        auto resolver =
-            std::make_shared<ProductBackedRuntimeParticipantResolver>(
+      MakeCandidateParticipantResolverFactory(
+          [package_root = input.package_root, bundle = input.bundle,
+           model_map = input.model_map,
+           program_artifact_root = input.program_artifact_root,
+           direct_binding_ids = std::move(direct_binding_ids)](
+              std::vector<core::RuntimeParticipantBinding> bindings) {
+            return std::make_shared<ProductBackedRuntimeParticipantResolver>(
                 package_root, bundle, model_map, std::move(bindings),
                 direct_binding_ids, program_artifact_root);
-        return RetainedRuntimeParticipantResolver{
-            [resolver](const core::OperationIntentDTO &operation,
-                       const std::size_t index) {
-              return resolver->ResolveExecutionParticipant(operation, index);
-            }};
-      };
+          });
   auto composition = std::make_unique<Composition>(
       *input.selected_component_id, std::move(input.bundle), nullptr, nullptr,
       std::move(physical.motion_program),
@@ -3061,12 +3064,8 @@ BuildGripperOnlyProductComposition(CompositionBuildInput input, NativePhysicalBi
   composition->prepared_controller_launch = launch;
   owned_launch.receipt = nullptr;
   composition->target_resolver = std::move(resolver);
-  composition->candidate_participant_resolver_factory = [make_resolver](auto bindings) {
-    auto owner = make_resolver(std::move(bindings));
-    return RetainedRuntimeParticipantResolver{[owner](const auto& operation, const std::size_t index) {
-      return owner->ResolveExecutionParticipant(operation, index);
-    }};
-  };
+  composition->candidate_participant_resolver_factory =
+      MakeCandidateParticipantResolverFactory(make_resolver);
   composition->scene_frame_resolver = std::move(frames);
   composition->candidate_control_representatives = std::move(physical.representatives);
   composition->required_projection_pins = std::move(input.required_projection_pins);
@@ -3346,7 +3345,7 @@ BuildSingleProductComposition(CompositionBuildInput input) {
           "projection");
 
   auto candidate_binding =
-      CandidateBinding(direct_control_motion_binding.value());
+      CandidateBinding(direct_control_motion_binding.value(), input.model_map);
   auto candidate_client =
       std::make_unique<ProcessContainedRoboPlanCandidateClient>(
           NativeWorkerBaseModel(stage, roboplan_joint_limits),
@@ -3388,16 +3387,7 @@ BuildSingleProductComposition(CompositionBuildInput input) {
             intrinsic_direct_bindings, program_artifact_root);
       };
   const RetainedRuntimeParticipantResolverFactory participant_resolver_factory =
-      [make_participant_resolver](
-          std::vector<core::RuntimeParticipantBinding> physical_bindings) {
-        auto resolver = make_participant_resolver(std::move(physical_bindings));
-        return RetainedRuntimeParticipantResolver{
-            [resolver](const core::OperationIntentDTO &operation,
-                       const std::size_t participant_index) {
-              return resolver->ResolveExecutionParticipant(operation,
-                                                           participant_index);
-            }};
-      };
+      MakeCandidateParticipantResolverFactory(make_participant_resolver);
   std::vector<core::RuntimeParticipantBinding> target_physical_bindings{
       direct_control_motion_binding.value()};
   if (direct_control_gripper_binding.has_value())
@@ -3405,11 +3395,7 @@ BuildSingleProductComposition(CompositionBuildInput input) {
   auto target_resolver =
       make_participant_resolver(std::move(target_physical_bindings));
   RetainedRuntimeParticipantResolver participant_resolver =
-      [resolver = target_resolver](const core::OperationIntentDTO &operation,
-                                   const std::size_t participant_index) {
-        return resolver->ResolveExecutionParticipant(operation,
-                                                     participant_index);
-      };
+      MakeRetainedRuntimeParticipantResolver(target_resolver);
   const auto reference_collision_model = collision_model;
   const auto reference_runtime_unit_id = *local_runtime_unit_id;
   const auto reference_runtime_epoch = input.runtime_epoch;
@@ -3465,6 +3451,7 @@ BuildSingleProductComposition(CompositionBuildInput input) {
       {},
       {},
       {}};
+  runtime_input.planner_model_map = input.model_map;
   runtime_input.control_binding_representatives =
       std::move(control_binding_representatives);
   runtime_input.observation_wake = std::move(input.observation_wake);
@@ -4306,15 +4293,7 @@ BuildProductComposition(CompositionBuildInput input) {
             intrinsic_direct_bindings, program_artifact_root);
       };
   RetainedRuntimeParticipantResolverFactory resolver_factory =
-      [make_resolver](std::vector<core::RuntimeParticipantBinding> bindings) {
-        auto resolver = make_resolver(std::move(bindings));
-        return RetainedRuntimeParticipantResolver{
-            [resolver](const core::OperationIntentDTO &operation,
-                       const std::size_t participant_index) {
-              return resolver->ResolveExecutionParticipant(operation,
-                                                           participant_index);
-            }};
-      };
+      MakeCandidateParticipantResolverFactory(make_resolver);
 
   auto primary = std::move(compositions.front());
   compositions.erase(compositions.begin());
@@ -11448,6 +11427,21 @@ RunManagedRuntimeChild(const ManagedRuntimeChildConfig &config) {
                 request.candidate_projection_revision, generation,
                 config.manager_run_root);
             candidate.bundle = std::move(retained_view_input->bundle);
+            // Adopt this Apply's selected Program products and NamedApply
+            // provenance exactly as BuildProductComposition does for a full
+            // candidate. The global catalog staged below is then activated at
+            // the parent claim release from this Apply's own terminal record;
+            // a stale origin made that release skip activation and left the
+            // predecessor catalog/service current (design rule B).
+            candidate.origin_named_apply =
+                retained_view_input->origin_named_apply;
+            if (retained_view_input->selected_program_products) {
+              const auto &selected =
+                  *retained_view_input->selected_program_products;
+              candidate.program = selected.program;
+              candidate.program_binding = selected.binding;
+              candidate.selected_program_outcome = selected.outcome;
+            }
             PrepareCompositionIoResources(candidate, *stable_cell_runtime_owner,
                                           generic_io_transport, host_ros_context_provider, io_resources);
             const auto bound_outputs = BindCompositionIoOutputParticipants(candidate, output_construction_generations);

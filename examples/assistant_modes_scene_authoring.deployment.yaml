@@ -1097,7 +1097,7 @@
         "record_kind": "component_type",
         "record_revision": "sha256:9498876c8f0e774e91e0c9863e17c215c116303f8355df6bf4558eea0a35c3ac",
         "schema_id": "manyforge.component_type.v1",
-        "schema_revision": "sha256:8e728ad4442d46b98f0d0534f8189df9b7982f982ab99cb656e6fdbeef231009"
+        "schema_revision": "sha256:2f26f97a7454e620bfb39e16eeccc0b23ae2de61c32e3e8210eff46945d01fc4"
       },
       {
         "content_addressed_store_key": "catalog/maintained/control_interface_contract/manyforge.ros2_control_arm_position/d951ffd368654ba9998355a4b12844014469753c3c21e05df3b61f6f669cbb4b",
@@ -1223,7 +1223,7 @@
     ]
   },
   "deployment_artifact_id": "ur10e_robotiq_assistant_modes_scene_authoring",
-  "deployment_revision": "sha256:cc9bc8c63fa20da727e84a69d1a02c2d77ffea1d9719a78e55025a23285c95d7",
+  "deployment_revision": "sha256:ba1922c35ba2eb17832a7499dbb1c7d26ebd35cc666295e30aa0f258ba43f760",
   "description": "Local deployment fixture for assistant-mode catalog plumbing on the UR10e + Robotiq 2F-140 preview stack. It keeps the deterministic scene-authoring provider enabled while declaring the finite tools visible to query and composer-assistant requests.",
   "desired_control_configurations": [
     {

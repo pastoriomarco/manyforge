@@ -965,7 +965,7 @@
         "record_kind": "component_type",
         "record_revision": "sha256:0140b9130f0147bb90a8724842dacc31089f9edb537bcd1ffc8801ec641b750d",
         "schema_id": "manyforge.component_type.v1",
-        "schema_revision": "sha256:8e728ad4442d46b98f0d0534f8189df9b7982f982ab99cb656e6fdbeef231009"
+        "schema_revision": "sha256:2f26f97a7454e620bfb39e16eeccc0b23ae2de61c32e3e8210eff46945d01fc4"
       },
       {
         "content_addressed_store_key": "catalog/maintained/control_interface_contract/manyforge.native_arm_position/97090c00547d4d84fabf4912bcc9c3ae310faf9b4c425322fa988848b9a0edc3",

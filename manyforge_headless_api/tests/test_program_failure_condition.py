@@ -358,6 +358,8 @@ def test_accepted_retry_leaving_the_hold_clears_with_original_provenance(
     # Running again without a later accepted control revision is no release.
     _accept(source, _cycle(control=5, run_state="running", run_revision=3))
     assert observer.states() == [("active", "operation.1", 5)]
+    # The Runner's accepted Retry advances the control revision exactly once
+    # (ProgramRuntime.apply_recovery_action); the cycle stays running.
     _accept(source, _cycle(control=6, run_state="running", run_revision=4))
     assert observer.states() == [
         ("active", "operation.1", 5),
@@ -450,10 +452,12 @@ def test_multiple_origins_are_observed_once_each_with_own_resources(
         ("operation.1", ["robot.arm"]),
         ("operation.2", ["gripper.a", "gripper.b"]),
     ]
-    _accept(source, _cycle(control=6, run_state="running", run_revision=3))
+    # Both holds were released before this projection was read: the Runner
+    # advanced the control revision once per accepted release.
+    _accept(source, _cycle(control=7, run_state="running", run_revision=3))
     assert sorted(observer.states()[2:]) == [
-        ("clear", "operation.1", 6),
-        ("clear", "operation.2", 6),
+        ("clear", "operation.1", 7),
+        ("clear", "operation.2", 7),
     ]
 
 
@@ -473,14 +477,17 @@ def test_retry_of_one_hold_clears_only_its_alarm(source_and_observer) -> None:
         source, _cycle(control=5, run_state="intervention_required", rows=[first, second])
     )
     # Retry released the first hold; the tree ticks with the second still held.
+    # The Runner advanced the control revision once for that release.
     _accept(source, _cycle(control=6, run_state="running", run_revision=3, rows=[second]))
     assert observer.states() == [
         ("active", "operation.1", 5),
         ("active", "operation.2", 5),
         ("clear", "operation.1", 6),
     ]
+    # A later revision that releases nothing (e.g. another control) keeps it.
     _accept(source, _cycle(control=7, run_state="running", run_revision=4, rows=[second]))
     assert len(observer.calls) == 3
+    # The second hold's release is its own single Runner advance.
     _accept(source, _cycle(control=8, run_state="running", run_revision=5))
     assert observer.states()[-1] == ("clear", "operation.2", 8)
 
@@ -492,6 +499,7 @@ def test_continue_of_one_hold_clears_its_alarm(source_and_observer) -> None:
         source, _cycle(control=5, run_state="intervention_required", rows=[first, second])
     )
     # Continue closed the second hold's operation; the first remains held.
+    # The Runner advanced the control revision once for that release.
     _accept(
         source,
         _cycle(control=6, run_state="intervention_required", run_revision=3, rows=[first]),

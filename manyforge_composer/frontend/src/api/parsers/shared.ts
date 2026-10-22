@@ -114,6 +114,26 @@ export function digestAt(value: unknown, path: string): string {
   return digest;
 }
 
+/**
+ * A Scenario project folder as Apply records it: absolute, lexically
+ * normalized (no empty, `.` or `..` segment, no trailing slash), no NUL, and
+ * at most 4096 UTF-8 bytes. Persistent values are scoped by it.
+ */
+export function projectPathAt(value: unknown, path: string): string {
+  const text = stringAt(value, path);
+  const segments = text.split('/').slice(1);
+  if (
+    !text.startsWith('/') || text.includes('\0')
+    || new TextEncoder().encode(text).length > 4096
+    || (text !== '/' && segments.some((segment) => (
+      segment === '' || segment === '.' || segment === '..'
+    )))
+  ) {
+    return fail(path, 'a normalized absolute project folder path');
+  }
+  return text;
+}
+
 export function nullableStringAt(value: unknown, path: string): string | null {
   if (value === null) {
     return null;

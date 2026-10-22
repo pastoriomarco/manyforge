@@ -18,6 +18,7 @@ import {
 } from '../state/resetApply';
 import { errorMessage } from '../state/structuralResource';
 import {
+  useBriefNotice,
   usePublishWorkbenchNotices,
   type WorkbenchNotice,
 } from '../state/workbenchNotices';
@@ -330,28 +331,18 @@ export function useResetApply({
     setSequence(null);
   }, []);
 
-  // One Activity notice follows the chain with its correlation.
-  const notices = useMemo((): WorkbenchNotice[] => {
-    if (sequence === null) return [];
-    const { phase, plan } = sequence;
-    const failedPhase = phase.kind === 'failed';
-    const name = plan.document === 'program' ? 'Program' : 'Deployment';
-    return [{
-      id: `reset-apply.${plan.correlationId}`,
-      severity: failedPhase ? 'error' : 'info',
-      domain: 'activation',
-      title: failedPhase
-        ? `${name} Apply stopped`
-        : phase.kind === 'applied'
-          ? `${name} Applied after Reset`
-          : `Resetting the run to Apply the ${name}`,
-      message: `${resetApplyPhaseText(phase)} Correlation ${plan.correlationId}.`,
-      busy: !resetApplyTerminal(phase),
-      actions: resetApplyDismissible(phase)
-        ? [{ id: 'dismiss', label: 'Dismiss', title: 'Stop showing this Apply. Nothing is undone, resent or resumed.', run: dismiss }]
-        : undefined,
-    }];
-  }, [dismiss, sequence]);
+  // One Activity notice follows the chain with its correlation. A completed
+  // Apply is a result, not progress: it clears by itself without Dismiss.
+  const current = useMemo(
+    () => (sequence === null ? null : resetApplyNotice(sequence, dismiss)),
+    [dismiss, sequence],
+  );
+  const applied = useBriefNotice(sequence?.phase.kind === 'applied' ? current : null);
+  const notices = useMemo((): WorkbenchNotice[] => (
+    sequence?.phase.kind === 'applied'
+      ? (applied === null ? [] : [applied])
+      : current === null ? [] : [current]
+  ), [applied, current, sequence]);
   usePublishWorkbenchNotices('reset-apply', notices);
 
   return {
@@ -366,3 +357,28 @@ export function useResetApply({
 }
 
 export type ResetApplyController = ReturnType<typeof useResetApply>;
+
+/** The Activity notice of one Reset-then-Apply chain. */
+export function resetApplyNotice(
+  sequence: ResetApplySequence,
+  dismiss: () => void,
+): WorkbenchNotice {
+  const { phase, plan } = sequence;
+  const failedPhase = phase.kind === 'failed';
+  const name = plan.document === 'program' ? 'Program' : 'Deployment';
+  return {
+    id: `reset-apply.${plan.correlationId}`,
+    severity: failedPhase ? 'error' : 'info',
+    domain: 'activation',
+    title: failedPhase
+      ? `${name} Apply stopped`
+      : phase.kind === 'applied'
+        ? `${name} Applied after Reset`
+        : `Resetting the run to Apply the ${name}`,
+    message: `${resetApplyPhaseText(phase)} Correlation ${plan.correlationId}.`,
+    busy: !resetApplyTerminal(phase),
+    actions: resetApplyDismissible(phase) && phase.kind !== 'applied'
+      ? [{ id: 'dismiss', label: 'Dismiss', title: 'Stop showing this Apply. Nothing is undone, resent or resumed.', run: dismiss }]
+      : undefined,
+  };
+}

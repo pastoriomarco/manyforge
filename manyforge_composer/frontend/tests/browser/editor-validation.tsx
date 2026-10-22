@@ -224,7 +224,8 @@ async function suite() {
         count('renders');
         const [draft, setDraft] = useState<ProgramAuthoringDocument>({ ...program, forest: [{
           ...node, node_id: pose.id, parameters: {
-            ...(complete ? { target_role: 'arm', base_frame_role: 'base', tcp_frame_role: 'tcp',
+            ...(complete ? { target_role: 'arm', base_frame_role: 'base',
+              tcp_endpoint: { target_role: 'arm', frame_role: 'tcp' },
               goal: { frame_ref: { kind: 'cell_frame' }, position_m: [0, 0, 0], orientation: { rpy_deg: [0, 0, 0] } } } : {}),
             per_joint_dynamics_limits: {},
           },

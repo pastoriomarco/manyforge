@@ -238,6 +238,14 @@ export function noticeRowSummary(
     const [notice] = notices;
     return notice.message ? `${notice.title} · ${notice.message}` : notice.title;
   }
+  // Activity says how much is still running, so finished results are not
+  // mistaken for progress.
+  if (noun.many === 'activities') {
+    const running = notices.filter((notice) => notice.busy);
+    return running.length === 0
+      ? `${notices.length} ${noun.many} · none in progress · ${notices[0].title}`
+      : `${notices.length} ${noun.many} · ${running.length} in progress · ${running[0].title}`;
+  }
   return `${notices.length} ${noun.many} · ${notices[0].title}`;
 }
 

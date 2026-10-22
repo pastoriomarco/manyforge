@@ -1,8 +1,7 @@
 import { useEffect, useRef, useState, useSyncExternalStore } from 'react';
 import { resolveStructuralAssetUrl } from '../api/client';
 import { viewerModelRefreshKey } from '../state/nodeEnvironmentRefresh';
-import { motionWaitRefusalMessage } from '../state/motionWaitRefusal';
-import { operatorAlarmRefusalMessage } from '../state/operatorAlarmRefusal';
+import { commandRefusalText, receiptRefusal } from '../state/commandRefusal';
 import { structuredErrorText } from '../state/structuredError';
 import { verifiedNoPhysicalComponents } from '../state/viewerModelReadiness';
 import { EMPTY_OPERATION_PROGRESS, parseOperationProgress, type OperationProgressSample } from '../utils/operationProgress';
@@ -892,12 +891,9 @@ export class HeadlessStateSource implements ExecutionObservationReader {
                 ? 'Run stopped before start' : 'Run stopped';
               throw new Error(`${stopped}. Reset required. ${structuredErrorText(outcome)}`);
             }
-            throw new Error(
-              operatorAlarmRefusalMessage(error?.code, error?.details)
-                || motionWaitRefusalMessage(error?.code, error?.details)
-                || error?.message || error?.code
-                || `Execution command rejected (HTTP ${response.status}).`,
-            );
+            throw new Error(error === null
+              ? `Execution command rejected (HTTP ${response.status}).`
+              : commandRefusalText(error));
           }
           if (body === null || typeof body !== 'object' || Array.isArray(body)) {
             throw new Error('Execution command response is invalid.');
@@ -926,18 +922,9 @@ export class HeadlessStateSource implements ExecutionObservationReader {
           }
           acknowledged = true;
           if (value.disposition === 'rejected') {
-            const cause = record.result;
-            const detail = cause !== null && typeof cause === 'object'
-              && !Array.isArray(cause) ? cause as Record<string, unknown> : null;
-            const ownerError = detail?.error !== null && typeof detail?.error === 'object'
-              && !Array.isArray(detail.error) ? detail.error as Record<string, unknown> : detail;
-            const ownerDetails = ownerError?.details !== null
-              && typeof ownerError?.details === 'object' && !Array.isArray(ownerError.details)
-              ? ownerError.details as Record<string, unknown> : null;
-            const alarmRefusal = operatorAlarmRefusalMessage(value.code as string, ownerDetails)
-              ?? motionWaitRefusalMessage(value.code as string, ownerDetails);
-            throw new Error(alarmRefusal ?? `${value.code}: ${typeof detail?.message === 'string'
-              ? detail.message : value.code}`);
+            throw new Error(commandRefusalText(
+              receiptRefusal(value.code as string, record.result), { withCode: true },
+            ));
           }
           return {
             correlationId,
@@ -1492,14 +1479,15 @@ export class HeadlessStateSource implements ExecutionObservationReader {
             };
             if (parsed.disposition === 'rejected') {
               const cause = record.result;
-              const detail = cause !== null && typeof cause === 'object'
+              // Only a result addressed to this exact receipt is its cause.
+              const addressed = cause !== null && typeof cause === 'object'
                 && !Array.isArray(cause)
                 && (cause as Record<string, unknown>).code === code
                 && (cause as Record<string, unknown>).correlation_id === correlationId
-                && typeof (cause as Record<string, unknown>).message === 'string'
-                ? (cause as Record<string, string>).message
-                : code;
-              pending.reject(new Error(`${code}: ${detail}`));
+                && typeof (cause as Record<string, unknown>).message === 'string';
+              pending.reject(new Error(commandRefusalText(
+                receiptRefusal(code, addressed ? cause : null), { withCode: true },
+              )));
             } else {
               pending.resolve(parsed);
             }

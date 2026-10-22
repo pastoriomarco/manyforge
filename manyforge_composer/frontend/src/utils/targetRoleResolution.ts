@@ -1,5 +1,5 @@
 import type { JsonValue, ProgramAuthoringDocument } from '../types/api';
-import { declaredIoInputs } from './ioSignalConfiguration';
+import { declaredIoInputs, declaredIoOutputs } from './ioSignalConfiguration';
 
 /**
  * Target-role resolution from the authored Draft facts, for when the
@@ -7,7 +7,7 @@ import { declaredIoInputs } from './ioSignalConfiguration';
  * the Program's `target_roles.<role>.component_role`, the scenario's Program
  * role assignment (`component_roles[]`: component role → controllable
  * component, `target_roles[]`: target role → command target) and the
- * Deployment Draft's declared I/O inputs. The backend stays the authority.
+ * Deployment Draft's declared I/O inputs and outputs. The backend stays the authority.
  */
 
 /** A target role resolved to its component and command target (binding-row field names). */
@@ -22,6 +22,14 @@ export interface ResolvedInputSignal {
   resource_role_id: string;
   signal_name: string;
   value_type: 'bool';
+}
+
+/** One declared output signal of a resolved target role (same shape as an input). */
+export type ResolvedOutputSignal = ResolvedInputSignal;
+
+/** A resolved target role with its declared signals (binding-row field names). */
+export interface ResolvedTargetRoleBinding extends ResolvedTargetRole {
+  signal_role_bindings: Array<ResolvedInputSignal & { direction: 'input' | 'output' }>;
 }
 
 type ProgramRoles = Pick<ProgramAuthoringDocument, 'target_roles'>;
@@ -63,6 +71,20 @@ export function resolvedTargetRoles(
   });
 }
 
+/** The declared rows of `drafts` that belong to `target` and one of its `required_resource_roles`. */
+function requiredSignals(
+  program: ProgramRoles,
+  target: ResolvedTargetRole,
+  drafts: ReadonlyArray<{ componentId: string; targetId: string; resourceRoleId: string; signalName: string }>,
+): ResolvedInputSignal[] {
+  const required = object(program.target_roles?.[target.target_role_id])?.required_resource_roles;
+  const roles = new Set(Array.isArray(required) ? required.filter((role) => typeof role === 'string') : []);
+  return drafts
+    .filter((draft) => draft.componentId === target.controllable_component_id
+      && draft.targetId === target.command_target_id && roles.has(draft.resourceRoleId))
+    .map((draft) => ({ resource_role_id: draft.resourceRoleId, signal_name: draft.signalName, value_type: 'bool' }));
+}
+
 /**
  * The Deployment Draft's declared inputs of one resolved target role, limited
  * to the role's `required_resource_roles`: the backend binds signal roles only
@@ -73,10 +95,36 @@ export function resolvedInputSignals(
   target: ResolvedTargetRole,
   deploymentDocument: Record<string, JsonValue> | null | undefined,
 ): ResolvedInputSignal[] {
-  const required = object(program.target_roles?.[target.target_role_id])?.required_resource_roles;
-  const roles = new Set(Array.isArray(required) ? required.filter((role) => typeof role === 'string') : []);
-  return declaredIoInputs(deploymentDocument ?? null)
-    .filter((draft) => draft.componentId === target.controllable_component_id
-      && draft.targetId === target.command_target_id && roles.has(draft.resourceRoleId))
-    .map((draft) => ({ resource_role_id: draft.resourceRoleId, signal_name: draft.signalName, value_type: 'bool' }));
+  return requiredSignals(program, target, declaredIoInputs(deploymentDocument ?? null));
+}
+
+/** The Deployment Draft's declared outputs of one resolved target role, limited as the inputs are. */
+export function resolvedOutputSignals(
+  program: ProgramRoles,
+  target: ResolvedTargetRole,
+  deploymentDocument: Record<string, JsonValue> | null | undefined,
+): ResolvedOutputSignal[] {
+  return requiredSignals(program, target, declaredIoOutputs(deploymentDocument ?? null));
+}
+
+/**
+ * Binding-shaped target rows (inputs, then outputs) from the Draft facts;
+ * empty when the role assignment or the Deployment Draft is unavailable.
+ */
+export function resolvedTargetRoleBindings(
+  program: ProgramRoles,
+  roleAssignment: Record<string, JsonValue> | null | undefined,
+  deploymentDocument: Record<string, JsonValue> | null | undefined,
+): ResolvedTargetRoleBinding[] {
+  if (!deploymentDocument) return [];
+  // Parse the Deployment once, then filter per target.
+  const inputs = declaredIoInputs(deploymentDocument);
+  const outputs = declaredIoOutputs(deploymentDocument);
+  return resolvedTargetRoles(program, roleAssignment).map((target) => ({
+    ...target,
+    signal_role_bindings: [
+      ...requiredSignals(program, target, inputs).map((row) => ({ ...row, direction: 'input' as const })),
+      ...requiredSignals(program, target, outputs).map((row) => ({ ...row, direction: 'output' as const })),
+    ],
+  }));
 }

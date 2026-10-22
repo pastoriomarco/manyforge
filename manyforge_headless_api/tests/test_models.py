@@ -142,6 +142,17 @@ def test_native_failure_detail_keys_match_the_runtime_constant() -> None:
     ).read_text(encoding="utf-8")
     block = source.split("kFailureDetailKeys{", maxsplit=1)[1].split("};", maxsplit=1)[0]
     assert frozenset(re.findall(r'"([a-z_]+)"', block)) == frozenset(FAILURE_DETAIL_KEYS)
+    # The Composer parser rejects any other key, which closes the control
+    # socket, so its copy must not drift either.
+    frontend = (
+        Path(__file__).resolve().parents[2]
+        / "manyforge_composer/frontend/src/api/parsers/programRuntime.ts"
+    ).read_text(encoding="utf-8")
+    block = frontend.split("FAILURE_DETAIL_KEYS: ReadonlySet<string> = new Set([", maxsplit=1)[
+        1
+    ].split("]);", maxsplit=1)[0]
+    block = re.sub(r"//[^\n]*", "", block)
+    assert frozenset(re.findall(r"'([a-z_]+)'", block)) == frozenset(FAILURE_DETAIL_KEYS)
 
 
 def _caller() -> dict[str, object]:
@@ -158,7 +169,8 @@ def _prepared_activation() -> dict[str, object]:
         {
             "schema_version": "manyforge.prepared_activation_input.v6",
             "origin": {"kind": "scenario", "scenario_id": "scenario.1",
-                       "source_document_digest": "sha256:" + "1" * 64},
+                       "source_document_digest": "sha256:" + "1" * 64,
+                       "project_path": "/projects/scenario.1.scenario"},
             "captured_input_digest": "sha256:" + "d" * 64,
             "deployment_artifact_id": "deployment.1",
             "deployment_revision": "sha256:" + "a" * 64,
@@ -214,7 +226,9 @@ def _planning_motion(
         "kind": "motion",
         "move_id": move_id,
         "base_frame_role_id": "frame-role:base",
-        "tcp_frame_role_id": "frame-role:tcp",
+        "tcp_endpoint": {
+            "target_role_id": "arm", "frame_role_id": "frame-role:tcp"
+        },
         "tolerances": {
             "joint_position_tol_rad": 0.01,
             "translation_tol_m": 0.001,
@@ -573,7 +587,82 @@ def test_pick_place_requests_preserve_defaults_and_phase_boundaries() -> None:
         PlaceSequencePlanningRequest.model_validate(place)
 
 
-def test_motion_payload_accepts_pose_and_cartesian_but_not_joint_contact() -> None:
+@pytest.mark.parametrize("owner", ["arm", "tool"])
+def test_motion_tcp_endpoint_is_the_only_wire_form_and_round_trips(owner: str) -> None:
+    payload = _planning_motion("tcp", {"kind": "pose_goal", "goal": _planning_pose()})
+    payload["tcp_endpoint"] = {
+        "target_role_id": owner,
+        "frame_role_id": "fingertip",
+    }
+    operation = _planning_operation("endpoint", payload)
+    parsed = OperationIntentRequest.model_validate(operation)
+    wire = parsed.model_dump(mode="json")
+    motion = wire["participants"][0]["payload"]
+    assert "tcp_frame_role_id" not in motion
+    assert motion["tcp_endpoint"] == payload["tcp_endpoint"]
+    assert OperationIntentRequest.model_validate_json(
+        parsed.model_dump_json()
+    ).model_dump(mode="json") == wire
+
+
+@pytest.mark.parametrize(
+    "selectors",
+    [
+        {},
+        {"tcp_frame_role_id": None},
+        {"tcp_frame_role_id": ""},
+        {"tcp_endpoint": None},
+        {"tcp_endpoint": {}},
+        {"tcp_endpoint": {"target_role_id": "tool"}},
+        {"tcp_endpoint": {"target_role_id": "", "frame_role_id": "tcp"}},
+        {"tcp_endpoint": {"target_role_id": "tool", "frame_role_id": ""}},
+        {"tcp_endpoint": {"target_role_id": 1, "frame_role_id": "tcp"}},
+        {"tcp_endpoint": {
+            "target_role_id": "tool", "frame_role_id": "tcp", "offset": {},
+        }},
+        {
+            "tcp_frame_role_id": "tcp",
+            "tcp_endpoint": {"target_role_id": "tool", "frame_role_id": "tcp"},
+        },
+        {
+            "tcp_frame_role_id": None,
+            "tcp_endpoint": {"target_role_id": "tool", "frame_role_id": "tcp"},
+        },
+        {"tcp_frame_role_id": "tcp", "tcp_endpoint": None},
+    ],
+)
+def test_motion_tcp_endpoint_rejects_missing_null_legacy_and_open_shapes(
+    selectors: dict[str, object],
+) -> None:
+    payload = _planning_motion("tcp", {"kind": "pose_goal", "goal": _planning_pose()})
+    payload.pop("tcp_endpoint")
+    with pytest.raises(ValidationError):
+        MotionParticipantRequest.model_validate({**payload, **selectors})
+
+
+@pytest.mark.parametrize("crossed_field", ["target_role_id", "frame_role_id"])
+def test_pick_motion_phases_compare_the_exact_qualified_tcp(crossed_field: str) -> None:
+    request = _pick_request()
+    for phase in ("approach_operation", "descend_operation", "retreat_operation"):
+        payload = request[phase]["participants"][0]["payload"]
+        payload["tcp_endpoint"] = {
+            "target_role_id": "tool",
+            "frame_role_id": "fingertip",
+        }
+    parsed = PickSequencePlanningRequest.model_validate(request)
+    assert parsed.carrier_frame_role_id == "frame-role:tcp"
+    wire = parsed.model_dump(mode="json")
+    assert PickSequencePlanningRequest.model_validate_json(
+        parsed.model_dump_json()
+    ).model_dump(mode="json") == wire
+    request["retreat_operation"]["participants"][0]["payload"]["tcp_endpoint"][
+        crossed_field
+    ] = "other"
+    with pytest.raises(ValidationError, match="share one target and frame set"):
+        PickSequencePlanningRequest.model_validate(request)
+
+
+def test_motion_payload_accepts_explicit_joint_contact_but_not_spatial_references() -> None:
     pose = MotionParticipantRequest.model_validate(
         _planning_motion("pose", {"kind": "pose_goal", "goal": _planning_pose()})
     )
@@ -582,18 +671,26 @@ def test_motion_payload_accepts_pose_and_cartesian_but_not_joint_contact() -> No
         _planning_motion("path", _cartesian_path())
     )
     assert path.motion.kind == "cartesian_path"
-    with pytest.raises(ValidationError, match="joint_goal cannot carry"):
-        MotionParticipantRequest.model_validate(
-            _planning_motion(
-                "joint",
-                {
-                    "kind": "joint_goal",
-                    "joint_names": ["joint1"],
-                    "positions_rad": [0.0],
-                },
-                contact_policy_id="pick.contact",
-            )
-        )
+    joint = _planning_motion(
+        "joint", {"kind": "joint_goal", "joint_names": ["joint1"], "positions_rad": [0.0]},
+        contact_policy_id="withdrawal.contact", selected_object_id="probe_block",
+    )
+    parsed = MotionParticipantRequest.model_validate(joint)
+    assert parsed.motion.kind == "joint_goal"
+    assert parsed.contact_policy_id == "withdrawal.contact"
+    assert parsed.runtime_object_bindings[0].runtime_object_id == "selected_object"
+    assert parsed.runtime_object_bindings[0].scene_resource_id == "probe_block"
+    for mode in ("absolute", "relative"):
+        for field in ("target_reference", "offset_reference"):
+            spatial = {**joint, "target_mode": mode, field: {"type": "cell_frame"}}
+            with pytest.raises(ValidationError, match="joint_goal cannot carry spatial references"):
+                MotionParticipantRequest.model_validate(spatial)
+    with pytest.raises(ValidationError, match="exactly cover motion references"):
+        MotionParticipantRequest.model_validate({**joint, "contact_policy_id": None})
+    with pytest.raises(ValidationError, match="unique runtime_object_id"):
+        MotionParticipantRequest.model_validate({
+            **joint, "runtime_object_bindings": joint["runtime_object_bindings"] * 2,
+        })
 
 
 @pytest.mark.parametrize(

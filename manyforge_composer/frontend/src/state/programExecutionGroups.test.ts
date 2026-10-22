@@ -29,6 +29,7 @@ function appliedProgram(): AppliedProgramSelection {
     schemaVersion: 'manyforge.applied_program_selection.v3',
     scenarioId: 'two-robots',
     sourceDocumentDigest: digest('a'),
+    projectPath: '/projects/two-robots.scenario',
     programId: 'two-robots',
     programRevision: digest('b'),
     programBindingId: digest('c'),

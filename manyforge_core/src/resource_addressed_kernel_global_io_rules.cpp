@@ -884,6 +884,15 @@ Result<void> ResourceAddressedExecutionKernel::process_global_io_rule_evidence_l
     } else if (left.source.has_value() != right.source.has_value()) return left.source.has_value();
     return a.policy_id < b.policy_id;
   });
+  // Design rule B: only this Apply's staged successor (Stage needs the held
+  // fence + exact parent) on a different service makes the current service's
+  // loss its planned handover; no live operation may need this Stop.
+  const bool planned_service_handover =
+      staged_global_io_rule_catalog_ && staged_global_io_rule_catalog_->fence &&
+      staged_global_io_rule_catalog_->parent &&
+      staged_global_io_rule_catalog_->service != global_io_rule_service_ &&
+      std::none_of(active_operations_.begin(), active_operations_.end(),
+                   [](const auto& entry) { return !terminal(entry.second->state.state); });
   for (const auto& candidate_order : order) {
     const auto index = candidate_order.index;
     auto& row = global_io_rules_[index];
@@ -903,6 +912,12 @@ Result<void> ResourceAddressedExecutionKernel::process_global_io_rule_evidence_l
     if (row.evidence->evaluation_error && !loss && !row.evidence->trip)
       return Result<void>::Err(*row.evidence->evaluation_error);
     const bool matched = row.evidence->trip.has_value();
+    // Design rule B: the outgoing ingress loss of the staged handover is not
+    // latched. Activation retires this row and the successor arms (or
+    // waits for its first sample) on the new service. The loss stays in this
+    // registration's evidence, so motion stays refused, and a discarded
+    // handover latches it on the next pass.
+    if (loss && !matched && !recovering_index && planned_service_handover) continue;
     // Defer all row/event publication until the response decision has either
     // succeeded or proved no effect is needed. Recovery keeps its old scoped
     // latch in place even while the successor's Stop is being accepted.

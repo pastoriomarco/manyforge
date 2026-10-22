@@ -4,6 +4,8 @@ from __future__ import annotations
 
 from pathlib import Path
 from copy import deepcopy
+import importlib.util
+import sys
 from typing import Any
 
 import pytest
@@ -31,6 +33,63 @@ def _stop_body() -> dict[str, Any]:
         "program_run_id": "program-run.1",
         "reason": "operator Stop",
     }
+
+
+@pytest.mark.parametrize("endpoint_owner", ["arm", "gripper"])
+def test_behavior_motion_endpoint_crosses_the_runner_strict_transport(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path, endpoint_owner: str
+) -> None:
+    # Reuse the owner tests' captured context/transport; the operation itself
+    # is emitted by the real production port, not assembled for this parser.
+    source = (
+        Path(__file__).resolve().parents[2]
+        / "manyforge_behavior/tests/test_production_ports.py"
+    )
+    name = "_runner_endpoint_production_port_fixture"
+    spec = importlib.util.spec_from_file_location(name, source)
+    assert spec is not None and spec.loader is not None
+    fixture = importlib.util.module_from_spec(spec)
+    monkeypatch.setitem(sys.modules, name, fixture)
+    spec.loader.exec_module(fixture)
+    recorder = fixture._Transport()
+    port = fixture.NativeKernelProgramPort(fixture.KernelClient(recorder))
+    port.bind(fixture._context())
+    parameters = dict(fixture._motion_inputs().parameters)
+    parameters["tcp_endpoint"] = {"target_role": endpoint_owner, "frame_role": "tcp"}
+    port.operations.start(
+        "motion.move_to_pose",
+        fixture._identity("runner-endpoint"),
+        fixture.OwnerNodeInputs(parameters),
+    )
+    operation = recorder.submissions[0]
+    commands: list[dict[str, Any]] = []
+
+    def exchange(_client, command, _socket_path):
+        commands.append(command)
+        return {
+            "ok": True,
+            "command": "submit",
+            "accepted": {
+                "request_id": command["operation"]["request_context"]["request_id"]
+            },
+        }
+
+    monkeypatch.setattr(ExecutionCommandClient, "_exchange_on", exchange)
+    transport = ProgramRunnerExecutionTransport(tmp_path, timeout_seconds=1)
+    assert transport.submit(operation)["ok"] is True
+    sent = commands[0]["operation"]["participants"][0]
+    assert sent["payload"]["tcp_endpoint"] == {
+        "target_role_id": endpoint_owner, "frame_role_id": "tcp",
+    }
+    assert "tcp_frame_role_id" not in sent["payload"]
+    assert sent["execution_scope"] == operation["participants"][0]["execution_scope"]
+    legacy = deepcopy(operation)
+    payload = legacy["participants"][0]["payload"]
+    payload["tcp_frame_role_id"] = payload.pop("tcp_endpoint")["frame_role_id"]
+    with pytest.raises(HeadlessApiError) as refused:
+        transport.submit(legacy)
+    assert refused.value.code == "execution_command_invalid"
+    assert len(commands) == 1  # refusal occurs before the socket exchange
 
 
 @pytest.mark.parametrize(

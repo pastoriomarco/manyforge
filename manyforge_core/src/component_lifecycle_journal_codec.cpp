@@ -2371,7 +2371,28 @@ std::string SelectedComponentBringUpSemanticOfferDigest(
     writer.Vector(binding.frame_bindings, [&](const auto& frame) {
       identities(frame.frame_role_id, frame.model_instance_id, frame.model_revision);
       writer.String(frame.compiled_frame_name);
+      if (!frame.contact_body_role_ids.empty()) {
+        writer.String("frame-contact-bodies.v1");
+        writer.Vector(frame.contact_body_role_ids,
+                      [&](const auto& role) { writer.Identity(role); });
+      }
     });
+    if (binding.motion_endpoint) {
+      writer.String("motion-endpoint-binding.v1");
+      const auto& endpoint = *binding.motion_endpoint;
+      identities(endpoint.target_role_id, endpoint.command_target_id, endpoint.frame.frame_role_id,
+                 endpoint.frame.model_instance_id, endpoint.frame.model_revision);
+      writer.String(endpoint.frame.compiled_frame_name);
+      writer.Vector(endpoint.frame.contact_body_role_ids,
+                    [&](const auto& role) { writer.Identity(role); });
+      writer.Vector(endpoint.contact_body_bindings, [&](const auto& body) {
+        identities(body.component_role_id, body.target_role_id, body.controllable_component_id,
+                   body.command_target_id);
+        optional_identity(body.model_role_id);
+        identities(body.collision_body_role_id, body.model_instance_id, body.model_revision);
+        writer.Vector(body.collision_body_ids, [&](const auto& id) { writer.String(id); });
+      });
+    }
     writer.Vector(binding.resources, [&](const auto& resource) {
       identities(resource.resource_role_id, resource.resource_id);
       writer.Optional(resource.source_joint_name, [&](const auto& name) { writer.String(name); });
@@ -2420,8 +2441,24 @@ std::string SelectedComponentBringUpSemanticOfferDigest(
         identities(body.collision_body_role_id, body.model_instance_id, body.model_revision);
         writer.Vector(body.collision_body_ids, [&](const auto& id) { writer.String(id); });
       });
-      writer.U64(std::bit_cast<std::uint64_t>(contact.max_penetration_m));
-      writer.U64(std::bit_cast<std::uint64_t>(contact.terminal_window_start_fraction));
+      if (const auto* grasp = std::get_if<ContactGraspEnvelopeDTO>(&contact.envelope)) {
+        writer.U64(std::bit_cast<std::uint64_t>(grasp->max_penetration_m));
+        writer.U64(std::bit_cast<std::uint64_t>(grasp->terminal_window_start_fraction));
+      } else {
+        const auto& release = std::get<ContactReleaseEnvelopeDTO>(contact.envelope);
+        writer.String("contact-release.v1");
+        writer.Bool(release.release_evidence_mode == ContactReleaseEvidenceModeDTO::kBinaryContact);
+        writer.Bool(release.enforce_max_start_penetration);
+        writer.U64(std::bit_cast<std::uint64_t>(release.max_start_penetration_m));
+        writer.U64(std::bit_cast<std::uint64_t>(release.min_release_progress_m));
+        writer.U64(std::bit_cast<std::uint64_t>(release.release_tolerance_m));
+        writer.Bool(release.require_strictly_decreasing_penetration);
+        writer.Bool(release.require_separation_by_end);
+        writer.Bool(release.allow_recontact);
+      }
+      if (contact.bodies_from_motion_endpoint) {
+        writer.String("motion-endpoint-contact.v1");
+      }
     });
   });
   if (!offer.candidate_provider_domains.empty()) {

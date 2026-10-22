@@ -1,6 +1,6 @@
 api_version: manyforge.program.v2
 program_id: lite6_lite_gripper_pick_and_place
-program_revision: sha256:838a2b90dd69e39bdfd98c0f608bfa9e10379c6a214ef4386de656f54941f8da
+program_revision: sha256:2fe743c33b3ff5746b75d3662ea4582df65c522f0f9c170dcc3b4a0ade926285
 program_profile: composable-cell-v1
 name: lite6_lite_gripper_pick_and_place
 description: >-
@@ -139,7 +139,7 @@ tree:
       parameters:
         target_role: arm
         base_frame_role: base
-        tcp_frame_role: tcp
+        tcp_endpoint: {target_role: arm, frame_role: tcp}
         goal:
           - {joint_name: joint1, position_rad: 0.0}
           - {joint_name: joint2, position_rad: -0.785}
@@ -168,7 +168,7 @@ tree:
       parameters:
         target_role: arm
         base_frame_role: base
-        tcp_frame_role: tcp
+        tcp_endpoint: {target_role: arm, frame_role: tcp}
         target_mode: relative
         target_reference: {type: scene_resource, scene_resource_id: graspable}
         offset_reference: {type: frame_role, frame_role_id: base}
@@ -196,7 +196,7 @@ tree:
       parameters:
         target_role: arm
         base_frame_role: base
-        tcp_frame_role: tcp
+        tcp_endpoint: {target_role: arm, frame_role: tcp}
         target_mode: relative
         target_reference: {type: scene_resource, scene_resource_id: graspable}
         offset_reference: {type: frame_role, frame_role_id: base}
@@ -240,7 +240,7 @@ tree:
       parameters:
         target_role: arm
         base_frame_role: base
-        tcp_frame_role: tcp
+        tcp_endpoint: {target_role: arm, frame_role: tcp}
         target_mode: relative
         target_reference: {type: frame_role, frame_role_id: tcp}
         goal:
@@ -267,7 +267,7 @@ tree:
       parameters:
         target_role: arm
         base_frame_role: base
-        tcp_frame_role: tcp
+        tcp_endpoint: {target_role: arm, frame_role: tcp}
         goal:
           frame_ref: {kind: target_frame, target_role: arm, frame_role: base}
           position_m: [0.16, 0.08, 0.2]
@@ -293,7 +293,7 @@ tree:
       parameters:
         target_role: arm
         base_frame_role: base
-        tcp_frame_role: tcp
+        tcp_endpoint: {target_role: arm, frame_role: tcp}
         goal:
           frame_ref: {kind: target_frame, target_role: arm, frame_role: base}
           position_m: [0.16, 0.08, 0.17]
@@ -333,7 +333,7 @@ tree:
       parameters:
         target_role: arm
         base_frame_role: base
-        tcp_frame_role: tcp
+        tcp_endpoint: {target_role: arm, frame_role: tcp}
         goal:
           frame_ref: {kind: target_frame, target_role: arm, frame_role: base}
           position_m: [0.16, 0.08, 0.22]
@@ -359,7 +359,7 @@ tree:
       parameters:
         target_role: arm
         base_frame_role: base
-        tcp_frame_role: tcp
+        tcp_endpoint: {target_role: arm, frame_role: tcp}
         goal:
           - {joint_name: joint1, position_rad: 0.0}
           - {joint_name: joint2, position_rad: -0.785}

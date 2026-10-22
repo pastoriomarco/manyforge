@@ -1044,22 +1044,25 @@ TEST(HeadlessApiCore, NoProgramIsPublishedNormallyButHasNoExecutableSelection) {
       })},
   }));
   const CanonicalValue prepared(CanonicalValue::Object{
-      {"schema_version", CanonicalValue("manyforge.prepared_activation_input.v6")},
+      {"schema_version",
+       CanonicalValue("manyforge.prepared_activation_input.v6")},
       {"prepared_activation_id", CanonicalValue(Digest('a'))},
       {"retained_bundle_id", Member(active, "retained_bundle_id")},
       {"graph_revision", Member(active, "graph_revision")},
-      {"origin", CanonicalValue(CanonicalValue::Object{
-          {"kind", CanonicalValue("scenario")},
-          {"scenario_id", CanonicalValue("new_scenario")},
-          {"source_document_digest", CanonicalValue(Digest('b'))},
-      })},
+      {"origin",
+       CanonicalValue(CanonicalValue::Object{
+           {"kind", CanonicalValue("scenario")},
+           {"scenario_id", CanonicalValue("new_scenario")},
+           {"project_path", CanonicalValue("/fixtures/new_scenario.scenario")},
+           {"source_document_digest", CanonicalValue(Digest('b'))},
+       })},
       {"deployment_artifact_id", CanonicalValue("new_deployment")},
       {"deployment_revision", CanonicalValue(Digest('c'))},
       {"program_id", CanonicalValue(nullptr)},
       {"program_revision", CanonicalValue(nullptr)},
       {"program_outcome", CanonicalValue(CanonicalValue::Object{
-          {"kind", CanonicalValue("no_program")},
-      })},
+                              {"kind", CanonicalValue("no_program")},
+                          })},
   });
   payload = JournalField(payload, "active", active);
   payload = JournalField(payload, "apply", CanonicalValue(CanonicalValue::Object{
@@ -1161,6 +1164,8 @@ CanonicalValue CommittedApplyRecord(const std::string &apply_id,
             CanonicalValue(CanonicalValue::Object{
                 {"kind", CanonicalValue("scenario")},
                 {"scenario_id", CanonicalValue(scenario_id)},
+                {"project_path",
+                 CanonicalValue("/fixtures/" + scenario_id + ".scenario")},
                 {"source_document_digest", CanonicalValue(Digest('b'))},
             })},
            {"program_id", CanonicalValue(nullptr)},

@@ -91,9 +91,11 @@ namespace {
 }
 
 [[nodiscard]] Result<void> validate_motion_intent(const MotionParticipantIntentDTO& motion) {
-  if (motion.move_id.empty() || motion.base_frame_role_id.empty() ||
-      motion.tcp_frame_role_id.empty()) {
+  if (motion.move_id.empty() || motion.base_frame_role_id.empty()) {
     return invalid("motion intent has an empty portable identity", "motion_identity_empty");
+  }
+  if (motion.tcp_endpoint.target_role_id.empty() || motion.tcp_endpoint.frame_role_id.empty()) {
+    return invalid("motion TCP endpoint is incomplete", "motion_tcp_endpoint_invalid");
   }
   if (!std::isfinite(motion.tolerances.joint_position_tol_rad) ||
       motion.tolerances.joint_position_tol_rad < 0.0 ||

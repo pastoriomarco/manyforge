@@ -41,7 +41,12 @@
         "arm_model"
       ]
     },
-    "station": {}
+    "station": {},
+    "tool": {
+      "required_component_type_tags": [
+        "gripper"
+      ]
+    }
   },
   "contact_policies": [
     {
@@ -50,15 +55,13 @@
       "mode": "contact_grasp",
       "policy_id": "probe_contact_policy",
       "sensing_mode": "geometry_only",
-      "version": "sha256:40ce215bc1bfd867468188da25db0caa5759637cddf945639d7c6f2e9d473efb",
+      "version": "sha256:11a706e763213d82e6a078b979413bb398d85f5d735c407da152ad02c1a455d4",
       "zones": [
         {
           "body_pairs": [
             {
               "body_a": {
-                "collision_body_role_id": "arm_collision",
-                "component_role_id": "robot",
-                "kind": "component_model_body"
+                "kind": "motion_endpoint"
               },
               "body_b": {
                 "kind": "runtime_object",
@@ -72,9 +75,42 @@
           "zone_id": "probe_tip"
         }
       ]
+    },
+    {
+      "api_version": "manyforge.contact_policy.v1",
+      "default_unmatched_response": "hard_stop",
+      "mode": "contact_release",
+      "policy_id": "withdrawal_contact_policy",
+      "sensing_mode": "geometry_only",
+      "version": "sha256:ad2cbd0f863a88c2705756ffaa835fefbd5eda9921f35ae686587c8ee0bdc28f",
+      "zones": [
+        {
+          "allow_recontact": false,
+          "body_pairs": [
+            {
+              "body_a": {
+                "kind": "motion_endpoint"
+              },
+              "body_b": {
+                "kind": "runtime_object",
+                "runtime_object_id": "trial.probe_object"
+              }
+            }
+          ],
+          "enforce_max_start_penetration": true,
+          "max_start_penetration_m": 0.002,
+          "min_release_progress_m": 0.0,
+          "release_evidence_mode": "signed_penetration",
+          "release_tolerance_m": 1e-05,
+          "require_separation_by_end": true,
+          "require_strictly_decreasing_penetration": true,
+          "violation_response": "hard_stop",
+          "zone_id": "probe_tip"
+        }
+      ]
     }
   ],
-  "description": "R5 trial (e): signal moves. search_trip scripts probe_contact false then true after 1000 ms -> signal_trip/success; search_no_trip scripts edge_sensor false with no change and completes without trip -> no_signal_trip (default success); probe_no_trip approaches probe_block slowly (TCP speed limit 10 mm/s), scripts edge_sensor false with no change and completes without trip with on_no_signal success -> no_signal_trip. The node_outcome keys are checked.",
+  "description": "R5 trial (e) signal moves: search_trip scripts probe_contact false then true after 1000 ms -> signal_trip/success; search_no_trip scripts edge_sensor false with no change and completes without trip -> no_signal_trip (default success); probe_no_trip descends slowly (TCP ≤ 10 mm/s, endpoint gripper/tcp) to a requested goal 1 mm past the probe_block top, so the fingertips touch the block; probe_contact_policy allows contact only for the endpoint bodies against probe_block in the last 20% of the motion (≤ 2 mm); it scripts edge_sensor false with no change and completes without a trip (on_no_signal success) -> no_signal_trip. end_rest withdraws from the probe_block contact under withdrawal_contact_policy (same endpoint/block pair, 2 mm initial cap, decreasing penetration, separation required, no recontact). The node_outcome keys are checked.",
   "forest": [
     {
       "children": [
@@ -113,7 +149,10 @@
             ],
             "planning_timeout_s": 5.0,
             "target_role": "arm",
-            "tcp_frame_role": "tcp",
+            "tcp_endpoint": {
+              "frame_role": "tcp",
+              "target_role": "arm"
+            },
             "velocity_scale": 0.4
           }
         },
@@ -180,7 +219,10 @@
             "on_signal": "success",
             "stop_mode": "soft_on_path",
             "target_role": "arm",
-            "tcp_frame_role": "tcp"
+            "tcp_endpoint": {
+              "frame_role": "tcp",
+              "target_role": "arm"
+            }
           }
         },
         {
@@ -240,7 +282,10 @@
             ],
             "stop_mode": "soft_on_path",
             "target_role": "arm",
-            "tcp_frame_role": "tcp"
+            "tcp_endpoint": {
+              "frame_role": "tcp",
+              "target_role": "arm"
+            }
           }
         },
         {
@@ -276,7 +321,7 @@
               "position_m": [
                 0.16,
                 0.08,
-                0.12
+                0.0667
               ]
             },
             "interrupt_condition": {
@@ -304,7 +349,10 @@
             "on_no_signal": "success",
             "stop_mode": "soft_on_path",
             "target_role": "arm",
-            "tcp_frame_role": "tcp"
+            "tcp_endpoint": {
+              "frame_role": "tcp",
+              "target_role": "gripper"
+            }
           },
           "value_sources": {
             "contact_scene_resource_id": {
@@ -328,6 +376,7 @@
           "node_id": "motion.move_to_joint_target",
           "parameters": {
             "base_frame_role": "base",
+            "contact_policy_id": "withdrawal_contact_policy",
             "execution_timeout_s": 30.0,
             "goal": [
               {
@@ -357,8 +406,17 @@
             ],
             "planning_timeout_s": 5.0,
             "target_role": "arm",
-            "tcp_frame_role": "tcp",
+            "tcp_endpoint": {
+              "frame_role": "tcp",
+              "target_role": "gripper"
+            },
             "velocity_scale": 0.4
+          },
+          "value_sources": {
+            "contact_scene_resource_id": {
+              "kind": "blackboard_key",
+              "reference": "trial.probe_object"
+            }
           }
         }
       ],
@@ -489,6 +547,32 @@
       "required_resource_roles": [
         "arm_joints"
       ]
+    },
+    "gripper": {
+      "component_role": "tool",
+      "required_capabilities": [
+        {
+          "capability_id": "model.kinematics.fk",
+          "disposition": "required",
+          "parameters": {}
+        },
+        {
+          "capability_id": "tool.gripper.command",
+          "disposition": "required",
+          "parameters": {}
+        },
+        {
+          "capability_id": "tool.gripper.feedback",
+          "disposition": "required",
+          "parameters": {}
+        }
+      ],
+      "required_collision_body_roles": [],
+      "required_frame_roles": [
+        "tcp"
+      ],
+      "required_model_roles": [],
+      "required_resource_roles": []
     },
     "station": {
       "component_role": "station",

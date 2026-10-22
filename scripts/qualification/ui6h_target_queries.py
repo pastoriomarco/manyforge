@@ -80,6 +80,7 @@ def activation_preparation_inputs(scenario_project, program, *, allowed_root):
     from manyforge_composer.backend.scenario_artifacts import (
         capture_scenario_artifact,
     )
+    from manyforge_composer.backend.state import canonical_project_path
 
     document, source, source_document_digest = capture_scenario_artifact(
         str(scenario_project), allowed_roots=[str(allowed_root)]
@@ -90,6 +91,7 @@ def activation_preparation_inputs(scenario_project, program, *, allowed_root):
     )
     captured = {
         "scenario_id": document["scenario_id"],
+        "project_path": canonical_project_path(source),
         "source_document_digest": source_document_digest,
         "deployment": deployment,
         "model_source_closure": model_source_closure,
@@ -97,7 +99,7 @@ def activation_preparation_inputs(scenario_project, program, *, allowed_root):
         "program_role_assignment": document["program_role_assignment"],
     }
     # The identity Composer captures for Load and the native preparer
-    # recomputes; it covers exactly these six inputs.
+    # recomputes; it covers exactly these seven inputs.
     return {
         **captured,
         "captured_input_digest": raw_sha256_digest(canonical_json_bytes(captured)),
@@ -1110,7 +1112,7 @@ def main() -> None:
             motion["parameters"] = {
                 "target_role": "arm",
                 "base_frame_role": "base",
-                "tcp_frame_role": "tcp",
+                "tcp_endpoint": {"target_role": "arm", "frame_role": "tcp"},
                 "target_mode": "relative",
                 "target_reference": {"type": "frame_role", "frame_role_id": "tcp"},
                 "path": [

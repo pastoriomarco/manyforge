@@ -126,7 +126,7 @@ V program_root(const d::RetainedBundle &bundle, bool motion, bool key = true) {
     root = replace(
         root, "tree",
         parse(
-            R"({"node_id":"motion.move_to_pose","instance_id":"move","execution_groups":["arm_group"],"parameters":{"target_role":"arm","base_frame_role":"base","tcp_frame_role":"tcp","goal":{"position_m":[0,0,0],"orientation":{"xyzw":[0,0,0,1]}}},"children":[]})"));
+            R"({"node_id":"motion.move_to_pose","instance_id":"move","execution_groups":["arm_group"],"parameters":{"target_role":"arm","base_frame_role":"base","tcp_endpoint":{"target_role":"arm","frame_role":"tcp"},"goal":{"position_m":[0,0,0],"orientation":{"xyzw":[0,0,0,1]}}},"children":[]})"));
   }
   root = d::normalize_program_authoring(root);
   const auto revision = d::detail::compute_content_identity(
@@ -417,7 +417,8 @@ TEST(RetainedIoPolicyCompilerTest,
   const auto prepared = d::assemble_prepared_activation(
       {d::PreparedScenarioOrigin{
            "global.apply.fixture",
-           c::ContentDigest("sha256:" + std::string(64U, 'a'))},
+           c::ContentDigest("sha256:" + std::string(64U, 'a')),
+           "/fixtures/global-apply.scenario"},
        c::ContentDigest("sha256:" + std::string(64U, 'b')), "optional"},
       *fixture.bundle, selected.map, *selected.program, assignment, catalog,
       raw_store);
@@ -436,7 +437,8 @@ TEST(RetainedIoPolicyCompilerTest,
       d::assemble_prepared_activation(
           {d::PreparedScenarioOrigin{
                "global.apply.fixture",
-               c::ContentDigest("sha256:" + std::string(64U, 'a'))},
+               c::ContentDigest("sha256:" + std::string(64U, 'a')),
+               "/fixtures/global-apply.scenario"},
            c::ContentDigest("sha256:" + std::string(64U, 'b')), "optional"},
           *wrong.bundle, wrong_selected.map, *wrong_selected.program,
           assignment, wrong_catalog, wrong_raw),
@@ -468,7 +470,8 @@ TEST(RetainedIoPolicyCompilerTest,
       static_cast<void>(d::assemble_prepared_activation(
           {d::PreparedScenarioOrigin{
                "global.qualification.fixture",
-               c::ContentDigest("sha256:" + std::string(64U, 'a'))},
+               c::ContentDigest("sha256:" + std::string(64U, 'a')),
+               "/fixtures/global-apply.scenario"},
            c::ContentDigest("sha256:" + std::string(64U, 'b')), "optional"},
           *fixture.bundle, selected.map, *selected.program,
           parse(R"({"component_roles":[],"target_roles":[]})"), catalog, raw));
@@ -634,7 +637,7 @@ TEST(RetainedIoPolicyCompilerTest,
     auto tree =
         parse(R"({"node_id":"motion.move_until_signal","instance_id":"move",
       "execution_groups":["arm_group"],"children":[],
-      "parameters":{"target_role":"arm","stop_mode":"soft_on_path","priority":0,
+      "parameters":{"target_role":"arm","tcp_endpoint":{"target_role":"arm","frame_role":"tcp"},"stop_mode":"soft_on_path","priority":0,
         "activation_mode":"require_inactive_at_arm","on_signal":"success","on_no_signal":"failure",
         "goal":{"frame_ref":{"kind":"target_frame","target_role":"arm","frame_role":"base"},
           "position_m":[0.1,0.1,0.1],"orientation":{"xyzw":[0,0,0,1]}},

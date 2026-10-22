@@ -76,6 +76,7 @@ def _applied(selection: dict[str, Any]) -> dict[str, Any]:
     return {
         **deepcopy(selection),
         "baseline_program_binding_id": selection["program_binding_id"],
+        "project_path": "/projects/" + selection["scenario_id"] + ".scenario",
         "program_binding_id": compiled_binding_id,
         "program_binding": {"program_binding_id": compiled_binding_id},
         "source": {"record_digest": "sha256:" + "7" * 64},
@@ -126,7 +127,8 @@ def _non_executable_status(
         "record_digest": "sha256:" + "b" * 64,
         "retained_bundle_id": selection["retained_bundle_id"],
         "origin": {"kind": "scenario", "scenario_id": selection["scenario_id"],
-                   "source_document_digest": selection["source_document_digest"]},
+                   "source_document_digest": selection["source_document_digest"],
+                   "project_path": "/projects/" + selection["scenario_id"] + ".scenario"},
         "schema_version": "manyforge.applied_program_status.v2",
     }
 
@@ -142,6 +144,7 @@ def _captured_activation(
         "program_role_assignment": {},
         "source_document_digest": selection["source_document_digest"],
         "scenario_id": selection["scenario_id"],
+        "project_path": "/projects/" + selection["scenario_id"] + ".scenario",
     }
     prepared = {
         "deployment_revision": selection["deployment_revision"],
@@ -151,7 +154,8 @@ def _captured_activation(
         "program_outcome": deepcopy(program_outcome),
         "retained_bundle_id": selection["retained_bundle_id"],
         "origin": {"kind": "scenario", "scenario_id": selection["scenario_id"],
-                   "source_document_digest": selection["source_document_digest"]},
+                   "source_document_digest": selection["source_document_digest"],
+                   "project_path": "/projects/" + selection["scenario_id"] + ".scenario"},
     }
     return state._captured_deployment_context(intent, prepared)
 
@@ -198,7 +202,8 @@ class _Headless:
             "record_digest": applied["source"]["record_digest"],
             "retained_bundle_id": applied["retained_bundle_id"],
             "origin": {"kind": "scenario", "scenario_id": applied["scenario_id"],
-                       "source_document_digest": applied["source_document_digest"]},
+                       "source_document_digest": applied["source_document_digest"],
+                       "project_path": "/projects/" + applied["scenario_id"] + ".scenario"},
             "schema_version": "manyforge.applied_program_status.v2",
         }
 

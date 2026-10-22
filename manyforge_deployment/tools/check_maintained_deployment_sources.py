@@ -622,6 +622,10 @@ _EXPECTED_MODEL_FAMILIES: Final = {
                 "lite_gripper_left_finger",
                 "lite_gripper_right_finger",
             ),
+            "gripper_fingers": (
+                "lite_gripper_left_finger",
+                "lite_gripper_right_finger",
+            ),
         },
         "root": "root",
         "source": {

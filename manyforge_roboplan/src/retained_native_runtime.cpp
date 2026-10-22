@@ -25,6 +25,56 @@
 
 namespace manyforge::roboplan_backend {
 
+std::vector<core::ResolvedFrameDTO> retained_motion_planner_frames(
+    const core::RuntimeParticipantBinding &runtime,
+    const deployment::VerifiedRetainedModelMap *model_map) {
+  const auto &value = runtime.value();
+  std::vector<core::ResolvedFrameDTO> frames;
+  for (const auto &frame : value.frame_bindings)
+    frames.emplace_back(core::ResolvedComponentModelFrameDTO{
+        value.controllable_component_id, frame.model_instance_id,
+        frame.frame_role_id, frame.compiled_frame_name, frame.model_revision});
+  if (!model_map)
+    return frames;
+  if (model_map->query().retained_bundle_id != value.retained_bundle_id ||
+      value.model_groups.size() != 1U)
+    throw std::invalid_argument(
+        "planner frame inventory crosses its retained motion product");
+  const auto &group = value.model_groups.front();
+  const auto model =
+      std::find_if(value.model_bindings.begin(), value.model_bindings.end(),
+                   [&](const auto &row) {
+                     return row.model_instance_id == group.model_instance_id;
+                   });
+  if (model == value.model_bindings.end())
+    throw std::invalid_argument(
+        "planner frame inventory has no exact motion model");
+  for (const auto &target : model_map->targets()) {
+    if (target.controllable_component_id != value.controllable_component_id)
+      continue;
+    for (const auto &exposed : target.frames) {
+      const auto *frame =
+          std::get_if<deployment::CompositionComponentModelFrame>(
+              &exposed.frame);
+      if (!frame ||
+          frame->controllable_component_id != value.controllable_component_id ||
+          frame->model_instance_id != group.model_instance_id ||
+          frame->model_revision != model->model_revision)
+        continue;
+      core::ResolvedFrameDTO resolved = core::ResolvedComponentModelFrameDTO{
+          frame->controllable_component_id, frame->model_instance_id,
+          exposed.frame_role_id, frame->compiled_frame_name,
+          frame->model_revision};
+      if (std::find(frames.begin(), frames.end(), resolved) == frames.end())
+        frames.push_back(std::move(resolved));
+    }
+  }
+  if (frames.size() > core::kMaxProgramNestedRoleBindings)
+    throw std::invalid_argument(
+        "planner frame inventory exceeds its fixed bound");
+  return frames;
+}
+
 RetainedPlanningSceneSynchronizer::RetainedPlanningSceneSynchronizer(
     std::shared_ptr<core::IPlanningSceneSynchronizer> target)
     : target_(std::move(target)) {
@@ -189,7 +239,8 @@ inline constexpr std::string_view kNoActiveGoalEvidenceApiVersion =
 void require_planner_binding(
     const core::RuntimeParticipantBinding &runtime,
     const RoboPlanPlannerBackend &planner,
-    const core::ProjectionRevisionDTO &projection_revision) {
+    const core::ProjectionRevisionDTO &projection_revision,
+    const deployment::VerifiedRetainedModelMap *model_map) {
   const auto &value = runtime.value();
   const auto &candidate = planner.candidate_binding();
   if (value.model_groups.size() != 1U) {
@@ -211,13 +262,8 @@ void require_planner_binding(
     throw std::invalid_argument(
         "native planner model group has no exact retained model binding");
   }
-  std::vector<core::ResolvedFrameDTO> permitted_frames;
-  permitted_frames.reserve(value.frame_bindings.size());
-  for (const auto &frame : value.frame_bindings) {
-    permitted_frames.emplace_back(core::ResolvedComponentModelFrameDTO{
-        value.controllable_component_id, frame.model_instance_id,
-        frame.frame_role_id, frame.compiled_frame_name, frame.model_revision});
-  }
+  const auto permitted_frames =
+      retained_motion_planner_frames(runtime, model_map);
   std::vector<std::string> resource_joint_names;
   resource_joint_names.reserve(value.resources.size());
   for (const auto &resource : value.resources) {
@@ -1388,8 +1434,9 @@ create_retained_native_runtime_participants(
     throw std::invalid_argument(
         "native runtime motion binding crosses its collision projection");
   }
-  require_planner_binding(input.motion_binding, *input.planner,
-                          projection_revision);
+  require_planner_binding(
+      input.motion_binding, *input.planner, projection_revision,
+      input.planner_model_map ? &*input.planner_model_map : nullptr);
 
   std::optional<core::RuntimeParticipantPolicySelection>
       motion_participant_policy =
@@ -2628,6 +2675,60 @@ void for_each_cell_runtime(RetainedNativeRuntime &runtime, Visitor visitor) {
   return result;
 }
 
+enum class ParticipantResolverRebuildPurpose {
+  kRoutePublication,
+  kComponentReadiness,
+  kPredecessorAdoption,
+};
+
+// Pure preparation only. Callers retain their own authority, commit, rollback
+// and success-only adoption sequence around this shared resolver construction.
+[[nodiscard]] core::Result<core::RuntimeParticipantAdmissionResolver>
+rebuild_participant_resolver(
+    const RetainedRuntimeParticipantResolverFactory &factory,
+    bool had_participant_resolver,
+    const std::vector<core::RuntimeParticipantExecutionRegistration>
+        &registrations,
+    std::vector<core::RuntimeParticipantExecutionRegistration>
+        &&physical_registrations,
+    ParticipantResolverRebuildPurpose purpose) {
+  struct Diagnostic final {
+    const char *failed_reason;
+    const char *failed_message;
+    const char *missing_reason;
+    const char *missing_message;
+  };
+  static constexpr Diagnostic diagnostics[]{
+      {"route_publication_resolver_factory_failed",
+       "native participant resolver factory returned no resolver",
+       "route_publication_resolver_factory_missing",
+       "dynamic native participant resolution cannot retain stale physical "
+       "facts"},
+      {"component_readiness_resolver_factory_failed",
+       "native participant resolver factory returned no resolver",
+       "component_readiness_resolver_factory_missing",
+       "dynamic native participant resolution cannot retain stale readiness"},
+      {"route_predecessor_resolver_factory_failed",
+       "native predecessor resolver factory returned no resolver",
+       "route_predecessor_resolver_factory_missing",
+       "native predecessor adoption cannot retain a stale resolver"}};
+  const auto &diagnostic = diagnostics[static_cast<std::size_t>(purpose)];
+  RetainedRuntimeParticipantResolver binding_resolver;
+  if (factory) {
+    binding_resolver = factory(composed_bindings(registrations));
+    if (!binding_resolver) {
+      return route_publication_error<core::RuntimeParticipantAdmissionResolver>(
+          diagnostic.failed_reason, diagnostic.failed_message);
+    }
+  } else if (had_participant_resolver) {
+    return route_publication_error<core::RuntimeParticipantAdmissionResolver>(
+        diagnostic.missing_reason, diagnostic.missing_message);
+  }
+  return core::Result<core::RuntimeParticipantAdmissionResolver>::Ok(
+      make_kernel_participant_resolver(std::move(binding_resolver),
+                                       std::move(physical_registrations)));
+}
+
 [[nodiscard]] std::vector<core::RuntimeParticipantExecutionRegistration>
 physical_registration_cache(
     std::vector<core::RuntimeParticipantExecutionRegistration> rows) {
@@ -3473,6 +3574,17 @@ bool RetainedNativeRuntime::GripperSourceIsCurrent(
   return true;
 }
 
+std::vector<core::RuntimeParticipantBinding>
+RetainedNativeRuntime::CurrentPhysicalBindings() const {
+  const auto *const cell_root =
+      cell_runtime_root != nullptr ? cell_runtime_root : this;
+  std::lock_guard lock(cell_root->route_publication_mutex_);
+  std::vector<core::RuntimeParticipantBinding> result{motion_binding};
+  if (gripper_binding.has_value())
+    result.push_back(*gripper_binding);
+  return result;
+}
+
 core::Result<core::GripperCommandStatusDTO>
 RetainedNativeRuntime::ReadGripperStatus(
     const core::RuntimeParticipantBinding &source) const {
@@ -3781,25 +3893,16 @@ RetainedNativeRuntime::PublishAndReadBackRouteConfiguration(
       cell_physical_registrations.push_back(*registration);
     }
     append_io_output_registrations(cell_physical_registrations, registrations);
-    RetainedRuntimeParticipantResolver binding_resolver;
-    if (cell_root->participant_resolver_factory) {
-      binding_resolver = cell_root->participant_resolver_factory(
-          composed_bindings(registrations));
-      if (!binding_resolver) {
-        return route_publication_error<
-            core::RuntimeRouteConfigurationReadbackDTO>(
-            "route_publication_resolver_factory_failed",
-            "native participant resolver factory returned no resolver");
-      }
-    } else if (cell_root->participant_resolver) {
-      return route_publication_error<
-          core::RuntimeRouteConfigurationReadbackDTO>(
-          "route_publication_resolver_factory_missing",
-          "dynamic native participant resolution cannot retain stale physical "
-          "facts");
+    auto rebuilt_resolver = rebuild_participant_resolver(
+        cell_root->participant_resolver_factory,
+        static_cast<bool>(cell_root->participant_resolver), registrations,
+        std::move(cell_physical_registrations),
+        ParticipantResolverRebuildPurpose::kRoutePublication);
+    if (!rebuilt_resolver.ok()) {
+      return core::Result<core::RuntimeRouteConfigurationReadbackDTO>::Err(
+          std::move(rebuilt_resolver.error()));
     }
-    auto kernel_resolver = make_kernel_participant_resolver(
-        std::move(binding_resolver), std::move(cell_physical_registrations));
+    auto kernel_resolver = std::move(rebuilt_resolver.value());
     if (cell_root != this)
       staged_root_resolver = kernel_resolver;
 
@@ -4215,23 +4318,16 @@ RetainedNativeRuntime::PublishComponentCommandReadiness(
       cell_physical_registrations.push_back(*registration);
     }
     append_io_output_registrations(cell_physical_registrations, cell_registrations);
-    RetainedRuntimeParticipantResolver binding_resolver;
-    if (cell_root->participant_resolver_factory) {
-      binding_resolver =
-          cell_root->participant_resolver_factory(composed_bindings(cell_registrations));
-      if (!binding_resolver) {
-        return route_publication_error<core::ComponentCommandReadinessDTO>(
-            "component_readiness_resolver_factory_failed",
-            "native participant resolver factory returned no resolver");
-      }
-    } else if (cell_root->participant_resolver) {
-      return route_publication_error<core::ComponentCommandReadinessDTO>(
-          "component_readiness_resolver_factory_missing",
-          "dynamic native participant resolution cannot retain stale "
-          "readiness");
+    auto rebuilt_resolver = rebuild_participant_resolver(
+        cell_root->participant_resolver_factory,
+        static_cast<bool>(cell_root->participant_resolver), cell_registrations,
+        std::move(cell_physical_registrations),
+        ParticipantResolverRebuildPurpose::kComponentReadiness);
+    if (!rebuilt_resolver.ok()) {
+      return core::Result<core::ComponentCommandReadinessDTO>::Err(
+          std::move(rebuilt_resolver.error()));
     }
-    auto kernel_resolver = make_kernel_participant_resolver(
-        std::move(binding_resolver), std::move(cell_physical_registrations));
+    auto kernel_resolver = std::move(rebuilt_resolver.value());
     auto staged_root_resolver = kernel_resolver;
     std::vector<core::RuntimeParticipantExecutionRegistration> stable_registrations;
     core::RuntimeParticipantAdmissionResolver stable_resolver;
@@ -4671,24 +4767,16 @@ RetainedNativeRuntime::AdoptAndReadBackRouteConfigurationPredecessor(
       cell_physical_registrations.push_back(*registration);
     }
     append_io_output_registrations(cell_physical_registrations, registrations);
-    RetainedRuntimeParticipantResolver binding_resolver;
-    if (cell_root->participant_resolver_factory) {
-      binding_resolver = cell_root->participant_resolver_factory(
-          composed_bindings(registrations));
-      if (!binding_resolver) {
-        return route_publication_error<
-            core::RuntimeRouteConfigurationReadbackDTO>(
-            "route_predecessor_resolver_factory_failed",
-            "native predecessor resolver factory returned no resolver");
-      }
-    } else if (cell_root->participant_resolver) {
-      return route_publication_error<
-          core::RuntimeRouteConfigurationReadbackDTO>(
-          "route_predecessor_resolver_factory_missing",
-          "native predecessor adoption cannot retain a stale resolver");
+    auto rebuilt_resolver = rebuild_participant_resolver(
+        cell_root->participant_resolver_factory,
+        static_cast<bool>(cell_root->participant_resolver), registrations,
+        std::move(cell_physical_registrations),
+        ParticipantResolverRebuildPurpose::kPredecessorAdoption);
+    if (!rebuilt_resolver.ok()) {
+      return core::Result<core::RuntimeRouteConfigurationReadbackDTO>::Err(
+          std::move(rebuilt_resolver.error()));
     }
-    auto kernel_resolver = make_kernel_participant_resolver(
-        std::move(binding_resolver), std::move(cell_physical_registrations));
+    auto kernel_resolver = std::move(rebuilt_resolver.value());
 
     const auto transition_time_ns = clock->now();
     const auto old_motion = motion_binding;

@@ -371,7 +371,9 @@ RoboPlanPlannerBackend::ReplaceRetainedModel(const RoboPlanWorkerModelDTO &model
 core::PlanResultDTO
 RoboPlanPlannerBackend::plan(const core::PlanRequestDTO &request) {
   const auto setup_started = std::chrono::steady_clock::now();
-  std::shared_lock projection_lock(projection_mutex_);
+  // Select and consume one operation's worker allowances atomically. Another
+  // plan or IK request must not replace them between selection and computation.
+  std::unique_lock projection_lock(projection_mutex_);
   if (auto invalid = validate_plan_binding(request, projection_binding_,
                                            candidate_binding_);
       invalid.has_value()) {
@@ -387,7 +389,8 @@ RoboPlanPlannerBackend::plan(const core::PlanRequestDTO &request) {
     auto selected = candidate_client_->select_retained_projection(
         RoboPlanCandidateProjectionDTO{request.projection_binding,
                                        request.retained_collision_world,
-                                       request.retained_collision_policy});
+                                       request.retained_collision_policy,
+                                       request.contact_policy_id});
     if (!selected.ok()) {
       return plan_error(selected.error());
     }
@@ -457,7 +460,7 @@ void RoboPlanPlannerBackend::request_cancel() {
 
 core::IkResultDTO
 RoboPlanPlannerBackend::solve_ik(const core::IkRequestDTO &request) {
-  std::shared_lock projection_lock(projection_mutex_);
+  std::unique_lock projection_lock(projection_mutex_);
   if (auto invalid =
           validate_ik_binding(request, projection_binding_, candidate_binding_);
       invalid.has_value()) {

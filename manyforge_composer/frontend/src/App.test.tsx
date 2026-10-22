@@ -63,6 +63,29 @@ describe('Composer shell continuity', () => {
     expect(renderToStaticMarkup(<App />)).not.toContain('ManyForge did not close correctly last time.');
   });
 
+  it('shows a refused startup project in the warning rail until it is cleared', () => {
+    const health: HealthResponse = {
+      status: 'ok', mode: 'headless_client', components: {},
+      runtimeAvailability: null, headless: null, timestamp: 1,
+    };
+    const message = 'Startup project /p/cell.scenario was not opened: a Scenario is still applied. Close it, then Load.';
+    healthProjection.value = { ...health, startupScenarioNotice: {
+      path: '/p/cell.scenario', code: 'scenario_close_required', message,
+    } };
+    const markup = renderToStaticMarkup(<App />);
+    expect(markup).toContain('Startup project was not opened.');
+    expect(markup).toContain(message);
+    expect(markup).toContain('workbench-notice-row severity-warning');
+    // The refreshed health after a successful Load no longer has it.
+    healthProjection.value = { ...health, startupScenarioNotice: null };
+    expect(renderToStaticMarkup(<App />)).not.toContain('Startup project was not opened.');
+    // A restarted backend reports a new refusal: nothing earlier hides it.
+    healthProjection.value = { ...health, startupScenarioNotice: {
+      path: '/p/cell.scenario', code: 'scenario_close_required', message,
+    } };
+    expect(renderToStaticMarkup(<App />)).toContain(message);
+  });
+
   it('renders one compact application spine without duplicate authority surfaces', () => {
     const started = performance.now();
     const markup = renderToStaticMarkup(<App />);
@@ -188,14 +211,35 @@ describe('Composer shell continuity', () => {
     expect(source).not.toContain('type="range"');
   });
 
+  it('shows a submission outcome in the notice rail, never as an extra header slot', () => {
+    const appSource = readFileSync(new URL('./App.tsx', import.meta.url), 'utf8');
+    const header = appSource.slice(
+      appSource.indexOf('<header className="app-header">'),
+      appSource.indexOf('</header>'),
+    );
+    // The header grid has four fixed slots; a fifth child wraps and hides
+    // the document actions.
+    expect(header).not.toContain('Submission');
+    expect(appSource).toContain("title: 'Submission unconfirmed'");
+    expect(appSource).toContain("title: 'Submission verified'");
+    expect(appSource).toContain('...submissionNotices,');
+    // A verified outcome is brief Activity, like other results: no action.
+    expect(appSource).toContain("id: 'authoring.submission.verified'");
+    expect(appSource).not.toContain('dismissRecheckMessage');
+  });
+
   it('keeps document, deployment, status, and artifact workflows in their owned locations', () => {
     const appSource = readFileSync(new URL('./App.tsx', import.meta.url), 'utf8');
     const controlsSource = readFileSync(
-      new URL('./components/ProgramDocumentControls.tsx', import.meta.url),
+      new URL('./components/ScenarioActionControls.tsx', import.meta.url),
       'utf8',
     );
 
-    expect(appSource).toContain('<ProgramDocumentControls');
+    // One header component type for every tab: switching tabs never remounts
+    // the Scenario actions or an Apply/Revert confirmation in progress.
+    expect(appSource).toContain('<DocumentControls');
+    expect(appSource).not.toContain('<ProgramDocumentControls');
+    expect(appSource).not.toContain('<DeploymentDocumentControls');
     expect(appSource).toContain('<DeploymentCompositionPanel');
     expect(appSource).toContain('viewerModelRefreshKey(headlessSnapshot)');
     expect(appSource).toMatch(

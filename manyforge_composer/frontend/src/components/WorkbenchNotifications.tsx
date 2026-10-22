@@ -159,7 +159,10 @@ export function NoticeRow({
       />
       {expanded && (
         <div className="workbench-notice-list">
-          {notices.map((notice) => <NoticeItem key={notice.id} notice={notice} />)}
+          {/* Activity still in progress first. */}
+          {(severity === 'info'
+            ? [...notices.filter((notice) => notice.busy), ...notices.filter((notice) => !notice.busy)]
+            : notices).map((notice) => <NoticeItem key={notice.id} notice={notice} />)}
         </div>
       )}
     </section>

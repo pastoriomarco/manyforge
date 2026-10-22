@@ -573,16 +573,16 @@ assistant_source(const bool composer_draft_enabled = false) {
   });
 }
 
-[[nodiscard]] inline QualifiedControlCatalog
-qualify_control_catalog(bool chained, bool native_motion = false,
-                        bool stoppable = false,
-                        std::string_view containment_granularity = "resource",
-                        bool qualified_motion_controlled_stop = false,
-                        std::string_view lifecycle_semantic_digest = {},
-                        bool ros2_control_execution = false,
-                        std::string_view provider_id = "lite6_arm_provider",
-                        bool include_lifecycle_recover = false,
-                        bool include_observed_state = false) {
+[[nodiscard]] inline QualifiedControlCatalog qualify_control_catalog(
+    bool chained, bool native_motion = false, bool stoppable = false,
+    std::string_view containment_granularity = "resource",
+    bool qualified_motion_controlled_stop = false,
+    std::string_view lifecycle_semantic_digest = {},
+    bool ros2_control_execution = false,
+    std::string_view provider_id = "lite6_arm_provider",
+    bool include_lifecycle_recover = false, bool include_observed_state = false,
+    bool associate_arm_tcp_contact_bodies = false,
+    bool shared_arm_endpoint_bodies = false) {
   const std::string_view primary_capability_id =
       native_motion ? "execution.trajectory.execute" : "state.observed.current";
   const auto *descriptor =
@@ -819,6 +819,31 @@ qualify_control_catalog(bool chained, bool native_motion = false,
     });
   }
 
+  CanonicalValue::Object arm_tcp_frame{
+      {"frame_role_id", CanonicalValue("tcp")},
+      {"model_role_id", CanonicalValue("arm_model")},
+      {"asset_frame_role_id", CanonicalValue("tcp")},
+  };
+  if (associate_arm_tcp_contact_bodies) {
+    arm_tcp_frame.emplace_back(
+        "contact_body_role_ids",
+        CanonicalValue(CanonicalValue::Array{CanonicalValue("arm_collision")}));
+  }
+  CanonicalValue::Array arm_frame_roles{
+      CanonicalValue(CanonicalValue::Object{
+          {"frame_role_id", CanonicalValue("base")},
+          {"model_role_id", CanonicalValue("arm_model")},
+          {"asset_frame_role_id", CanonicalValue("base")},
+      }),
+      CanonicalValue(std::move(arm_tcp_frame)),
+  };
+
+  if (shared_arm_endpoint_bodies) {
+    auto base = arm_frame_roles.front().as_object();
+    base.emplace_back("contact_body_role_ids", text_array({"arm_collision"}));
+    arm_frame_roles.front() = CanonicalValue(std::move(base));
+  }
+
   const std::string component_bytes = revisioned_document(
       CanonicalValue(CanonicalValue::Object{
           {"api_version",
@@ -860,17 +885,7 @@ qualify_control_catalog(bool chained, bool native_motion = false,
                              CanonicalValue("arm_joints")},
                         })})},
                    {"frame_roles",
-                    CanonicalValue(CanonicalValue::Array{
-                        CanonicalValue(CanonicalValue::Object{
-                            {"frame_role_id", CanonicalValue("base")},
-                            {"model_role_id", CanonicalValue("arm_model")},
-                            {"asset_frame_role_id", CanonicalValue("base")},
-                        }),
-                        CanonicalValue(CanonicalValue::Object{
-                            {"frame_role_id", CanonicalValue("tcp")},
-                            {"model_role_id", CanonicalValue("arm_model")},
-                            {"asset_frame_role_id", CanonicalValue("tcp")},
-                        })})},
+                    CanonicalValue(std::move(arm_frame_roles))},
                    {"collision_body_roles",
                     CanonicalValue(CanonicalValue::Array{
                         CanonicalValue(CanonicalValue::Object{
@@ -1488,15 +1503,15 @@ qualify_control_catalog(bool chained, bool native_motion = false,
   };
 }
 
-[[nodiscard]] inline QualifiedControlCatalog
-add_aggregate_gripper_catalog(QualifiedControlCatalog catalog,
-                              bool stoppable = false,
-                              std::string_view lifecycle_semantic_digest = {},
-                              bool gripper_feedback = false,
-                              bool gripper_only = false,
-                              bool ros2_control_execution = false,
-                              std::string_view ros_gripper_actuation_kind = "pneumatic",
-                              void (*component_input_mapper)(CanonicalValue::Object &) = nullptr) {
+[[nodiscard]] inline QualifiedControlCatalog add_aggregate_gripper_catalog(
+    QualifiedControlCatalog catalog, bool stoppable = false,
+    std::string_view lifecycle_semantic_digest = {},
+    bool gripper_feedback = false, bool gripper_only = false,
+    bool ros2_control_execution = false,
+    std::string_view ros_gripper_actuation_kind = "pneumatic",
+    void (*component_input_mapper)(CanonicalValue::Object &) = nullptr,
+    bool associate_arm_tcp_contact_bodies = false,
+    bool shared_arm_endpoint_bodies = false) {
   const std::string_view gripper_provider_id =
       ros2_control_execution ? "manyforge.provider.ros2_control"
                              : "lite6_gripper_provider";
@@ -1648,6 +1663,41 @@ add_aggregate_gripper_catalog(QualifiedControlCatalog catalog,
         {"capability_definition_revision", CanonicalValue(catalog.observed_state_capability->value().capability_definition_revision.value())},
     });
   }
+  CanonicalValue::Object aggregate_arm_tcp_frame{
+      {"frame_role_id", CanonicalValue("tcp")},
+      {"model_role_id", CanonicalValue("arm_model")},
+      {"asset_frame_role_id", CanonicalValue("tcp")},
+  };
+  CanonicalValue::Object aggregate_gripper_tcp_frame{
+      {"frame_role_id", CanonicalValue("tcp")},
+      {"model_role_id", CanonicalValue("arm_model")},
+      {"asset_frame_role_id", CanonicalValue("tcp")},
+  };
+  if (associate_arm_tcp_contact_bodies) {
+    aggregate_arm_tcp_frame.emplace_back(
+        "contact_body_role_ids",
+        CanonicalValue(CanonicalValue::Array{CanonicalValue("arm_collision")}));
+    aggregate_gripper_tcp_frame.emplace_back(
+        "contact_body_role_ids",
+        CanonicalValue(
+            CanonicalValue::Array{CanonicalValue("gripper_collision")}));
+  }
+  CanonicalValue::Array aggregate_arm_frame_roles{
+      CanonicalValue(CanonicalValue::Object{
+          {"frame_role_id", CanonicalValue("base")},
+          {"model_role_id", CanonicalValue("arm_model")},
+          {"asset_frame_role_id", CanonicalValue("base")},
+      }),
+      CanonicalValue(std::move(aggregate_arm_tcp_frame)),
+  };
+  if (shared_arm_endpoint_bodies) {
+    auto base = aggregate_arm_frame_roles.front().as_object();
+    base.emplace_back("contact_body_role_ids", text_array({"arm_collision"}));
+    aggregate_arm_frame_roles.front() = CanonicalValue(std::move(base));
+  }
+  CanonicalValue::Array aggregate_gripper_frame_roles{
+      CanonicalValue(std::move(aggregate_gripper_tcp_frame)),
+  };
   CanonicalValue component_document(CanonicalValue::Object{
           {"api_version",
            CanonicalValue(std::string(core::kComponentTypeApiVersion))},
@@ -1690,17 +1740,7 @@ add_aggregate_gripper_catalog(QualifiedControlCatalog catalog,
                              CanonicalValue("arm_joints")},
                         })})},
                    {"frame_roles",
-                    CanonicalValue(CanonicalValue::Array{
-                        CanonicalValue(CanonicalValue::Object{
-                            {"frame_role_id", CanonicalValue("base")},
-                            {"model_role_id", CanonicalValue("arm_model")},
-                            {"asset_frame_role_id", CanonicalValue("base")},
-                        }),
-                        CanonicalValue(CanonicalValue::Object{
-                            {"frame_role_id", CanonicalValue("tcp")},
-                            {"model_role_id", CanonicalValue("arm_model")},
-                            {"asset_frame_role_id", CanonicalValue("tcp")},
-                        })})},
+                    CanonicalValue(std::move(aggregate_arm_frame_roles))},
                    {"collision_body_roles",
                     CanonicalValue(CanonicalValue::Array{
                         CanonicalValue(CanonicalValue::Object{
@@ -1735,12 +1775,7 @@ add_aggregate_gripper_catalog(QualifiedControlCatalog catalog,
                              CanonicalValue("gripper_joint")},
                         })})},
                    {"frame_roles",
-                    CanonicalValue(CanonicalValue::Array{
-                        CanonicalValue(CanonicalValue::Object{
-                            {"frame_role_id", CanonicalValue("tcp")},
-                            {"model_role_id", CanonicalValue("arm_model")},
-                            {"asset_frame_role_id", CanonicalValue("tcp")},
-                        })})},
+                    CanonicalValue(std::move(aggregate_gripper_frame_roles))},
                    {"collision_body_roles",
                     CanonicalValue(CanonicalValue::Array{
                         CanonicalValue(CanonicalValue::Object{
@@ -2973,21 +3008,20 @@ make_lite6_controllable_retention_fixture(
         std::nullopt,
     const std::optional<double> arm_max_stop_time_s = std::nullopt,
     std::string_view first_ros_frame_prefix = {},
-    std::string_view isaac_world = "lite6_grf_ros2",
-    bool ros_mock_peers = true,
+    std::string_view isaac_world = "lite6_grf_ros2", bool ros_mock_peers = true,
     std::string_view empty_ros_configuration_field = {},
     std::string_view direct_provider_id = "lite6_arm_provider",
-    bool include_lifecycle_recover = false,
-    bool ros_mock_first = false,
+    bool include_lifecycle_recover = false, bool ros_mock_first = false,
     const Lite6StructuralRetentionFixture *structural_override = nullptr,
     void (*graph_input_mapper)(CanonicalValue::Object &) = nullptr,
-    bool include_observed_state = false,
-    bool independent_scalar_peer = false,
+    bool include_observed_state = false, bool independent_scalar_peer = false,
     std::string_view ros_gripper_actuation_kind = "pneumatic",
     std::optional<double> ros_gripper_dwell_s = std::nullopt,
     std::string_view ros_gripper_output_mode = "commanded",
     void (*component_input_mapper)(CanonicalValue::Object &) = nullptr,
-    const CanonicalValue *interrupt_policy_configuration = nullptr) {
+    const CanonicalValue *interrupt_policy_configuration = nullptr,
+    bool associate_arm_tcp_contact_bodies = false,
+    bool shared_arm_endpoint_bodies = false) {
   namespace fixture_detail = lite6_controllable_fixture_detail;
   if (component_input_mapper != nullptr &&
       (!gripper_only || !ros2_control_execution || structural_override == nullptr ||
@@ -3044,8 +3078,10 @@ make_lite6_controllable_retention_fixture(
       chained, native_motion, stoppable, containment_granularity,
       qualified_motion_controlled_stop, arm_lifecycle_semantic_digest,
       ros2_control_execution,
-      shared_native_domain ? "manyforge.provider.native_control" : direct_provider_id,
-      include_lifecycle_recover, include_observed_state);
+      shared_native_domain ? "manyforge.provider.native_control"
+                           : direct_provider_id,
+      include_lifecycle_recover, include_observed_state,
+      associate_arm_tcp_contact_bodies, shared_arm_endpoint_bodies);
   if (aggregate_gripper && stoppable && qualified_motion_controlled_stop) {
     auto gripper_stop_catalog = fixture_detail::qualify_control_catalog(
         false, true, true, "resource", false, {}, false);
@@ -3081,7 +3117,8 @@ make_lite6_controllable_retention_fixture(
     catalog = fixture_detail::add_aggregate_gripper_catalog(
         std::move(catalog), stoppable, gripper_lifecycle_semantic_digest,
         gripper_feedback, gripper_only, ros2_control_execution,
-        ros_gripper_actuation_kind, component_input_mapper);
+        ros_gripper_actuation_kind, component_input_mapper,
+        associate_arm_tcp_contact_bodies, shared_arm_endpoint_bodies);
   }
   if (scalar_peer_type_artifact.has_value()) {
     catalog.artifacts.push_back(*scalar_peer_type_artifact);
@@ -3662,13 +3699,25 @@ make_lite6_ros2_control_shared_consumer_retention_fixture(
 /// Genuine ROS execution owner with a distinct retained read-only StateObserved binding.
 /// This qualifies compiler/binding inputs, not actual state transport.
 [[nodiscard]] inline Lite6ControllableRetentionFixture
-make_lite6_ros2_control_observed_consumer_retention_fixture(bool aggregate_gripper = false) {
+make_lite6_ros2_control_observed_consumer_retention_fixture(
+    bool aggregate_gripper = false, bool associate_tcp_contact_bodies = false,
+    bool shared_arm_endpoint_bodies = false) {
   return make_lite6_controllable_retention_fixture(
-      false, false, 1U, aggregate_gripper, true, {}, false,
-      false, "resource", false, {}, {}, true, false, false,
-      std::nullopt, false, kLite6ArmTargetId, std::nullopt, std::nullopt,
-      {}, {}, true, {}, "manyforge.provider.ros2_control", false, true,
-      nullptr, nullptr, true);
+      false, false, 1U, aggregate_gripper, true, {}, false, false, "resource",
+      false, {}, {}, true, false, false, std::nullopt, false, kLite6ArmTargetId,
+      std::nullopt, std::nullopt, {}, {}, true, {},
+      "manyforge.provider.ros2_control", false, true, nullptr, nullptr, true,
+      false, "pneumatic", std::nullopt, "commanded", nullptr, nullptr,
+      associate_tcp_contact_bodies, shared_arm_endpoint_bodies);
+}
+
+/// Same retained observed-state fixture with endpoint-associated contact body
+/// metadata on its model TCP, for compiler compatibility tests.
+[[nodiscard]] inline Lite6ControllableRetentionFixture
+make_lite6_ros2_control_observed_endpoint_consumer_retention_fixture(
+    bool aggregate_gripper = false, bool shared_arm_endpoint_bodies = false) {
+  return make_lite6_ros2_control_observed_consumer_retention_fixture(
+      aggregate_gripper, true, shared_arm_endpoint_bodies);
 }
 
 class Lite6ControllableCompilerInputArtifactSource final

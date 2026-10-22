@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from copy import deepcopy
+import json
 from pathlib import Path
 import shutil
 from types import SimpleNamespace
@@ -27,6 +28,12 @@ from manyforge_composer.backend.program_artifacts import (
 )
 from manyforge_composer.backend import routes_draft
 from manyforge_composer.backend.authoring_admission import LocalAuthoringCommit
+from manyforge_composer.backend.authoring_forest import derive_candidate
+from manyforge_composer.backend.authoring_workspace import AuthoringWorkspace
+from manyforge_composer.backend.deployment_draft import (
+    CompiledDeploymentDocument,
+    DeploymentDraftSession,
+)
 from manyforge_composer.backend.routes_draft import (
     _assistant_proposal_operations,
     _observed_scene_arguments,
@@ -210,8 +217,10 @@ def _motion_targets_projection() -> dict:
                         "base_frame_role_id": "base",
                         "tcp_frame_role_id": "tcp",
                         "target_descriptor": {"frames": [
-                            {"frame_role_id": "base", "compiled_frame_name": "robot.base"},
-                            {"frame_role_id": "tcp", "compiled_frame_name": "robot.tcp"},
+                            {"frame_role_id": "base", "compiled_frame_name": "robot.base",
+                             "model_instance_id": "robot-model", "model_revision": "model-r1"},
+                            {"frame_role_id": "tcp", "compiled_frame_name": "robot.tcp",
+                             "model_instance_id": "robot-model", "model_revision": "model-r1"},
                         ]},
                     },
                 }],
@@ -349,8 +358,10 @@ def _mock_applied_motion_binding(monkeypatch: pytest.MonkeyPatch) -> dict:
         "target_role_bindings": [{
             "target_role_id": "arm", "controllable_component_id": "robot",
             "command_target_id": "arm", "frame_role_bindings": [
-                {"frame_role_id": "base", "compiled_frame_name": "robot.base"},
-                {"frame_role_id": "tcp", "compiled_frame_name": "robot.tcp"},
+                {"frame_role_id": "base", "compiled_frame_name": "robot.base",
+                 "model_instance_id": "robot-model", "model_revision": "model-r1"},
+                {"frame_role_id": "tcp", "compiled_frame_name": "robot.tcp",
+                 "model_instance_id": "robot-model", "model_revision": "model-r1"},
             ],
         }],
     }
@@ -371,7 +382,11 @@ def test_observed_pose_joins_applied_address_and_preserves_base_frame(monkeypatc
     other_observed["controllable_component_id"] = "other-robot"
     other_observed["observed"]["current_tcp_pose"]["position_m"]["x_m"] = 99
     control["control_state"]["observed_targets"].insert(0, other_observed)
-    parameters = {"target_role": "arm", "base_frame_role": "base", "tcp_frame_role": "tcp"}
+    parameters = {
+        "target_role": "arm",
+        "base_frame_role": "base",
+        "tcp_endpoint": {"target_role": "arm", "frame_role": "tcp"},
+    }
     authoring = {"forest": [{"instance_id": "move", "node_id": "motion.move_to_pose", "parameters": parameters}]}
     state = SimpleNamespace(
         headless_client=SimpleNamespace(execution_targets=lambda: targets, execution_control_state=lambda: control),
@@ -383,6 +398,76 @@ def test_observed_pose_joins_applied_address_and_preserves_base_frame(monkeypatc
     assert resolved["observed"]["frame_ref"] == {
         "kind": "target_frame", "target_role": "arm", "frame_role": "base",
     }
+
+
+def test_observed_pose_endpoint_capture_requires_exact_current_tcp_model_frame(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    binding = _mock_applied_motion_binding(monkeypatch)
+    binding["target_role_bindings"].append({
+        "target_role_id": "tool",
+        "controllable_component_id": "robot",
+        "command_target_id": "gripper",
+        "frame_role_bindings": [{
+            "frame_role_id": "jaw_tcp",
+            "compiled_frame_name": "robot.tcp",
+            "model_instance_id": "robot-model",
+            "model_revision": "model-r1",
+        }],
+    })
+    targets = _motion_targets_projection()
+    control = _motion_control_projection()
+    authoring = {"forest": [{
+        "instance_id": "move",
+        "node_id": "motion.move_to_pose",
+        "parameters": {
+            "target_role": "arm",
+            "base_frame_role": "base",
+            "tcp_endpoint": {"target_role": "tool", "frame_role": "jaw_tcp"},
+        },
+    }]}
+    state = SimpleNamespace(
+        headless_client=SimpleNamespace(
+            execution_targets=lambda: targets,
+            execution_control_state=lambda: control,
+        ),
+        draft_session=SimpleNamespace(snapshot=lambda: {"authoring": authoring}),
+    )
+
+    resolved, _identity = routes_draft._observed_move_arguments(
+        state, {"instance_id": "move", "observed_kind": "tcp_pose"},
+    )
+    assert resolved["observed"]["frame_ref"] == {
+        "kind": "target_frame", "target_role": "arm", "frame_role": "base",
+    }
+
+    binding["target_role_bindings"][1]["frame_role_bindings"][0]["compiled_frame_name"] = (
+        "robot.jaw_tcp"
+    )
+    with pytest.raises(DraftSessionError) as frame_mismatch:
+        routes_draft._observed_move_arguments(
+            state, {"instance_id": "move", "observed_kind": "tcp_pose"},
+        )
+    assert frame_mismatch.value.code == "observed_move_frame_mismatch"
+    assert (
+        "TCP endpoint target role 'tool' frame role 'jaw_tcp' resolves to 'robot.jaw_tcp', "
+        "but the robot reports its current pose with TCP frame 'robot.tcp'; current-pose "
+        "capture requires the selected endpoint to match the robot's current TCP"
+    ) in str(frame_mismatch.value)
+
+    binding["target_role_bindings"][1]["frame_role_bindings"][0]["compiled_frame_name"] = (
+        "robot.tcp"
+    )
+    binding["target_role_bindings"][1]["frame_role_bindings"][0]["model_revision"] = "model-r2"
+    with pytest.raises(DraftSessionError) as mismatch:
+        routes_draft._observed_move_arguments(
+            state, {"instance_id": "move", "observed_kind": "tcp_pose"},
+        )
+    assert mismatch.value.code == "observed_move_frame_mismatch"
+    assert (
+        "TCP endpoint target role 'tool' frame role 'jaw_tcp' and the robot's current TCP "
+        "do not share the same retained model instance and revision"
+    ) in str(mismatch.value)
 
 
 def _set_parameter(field: str, value: object):
@@ -426,6 +511,10 @@ def _no_change(_node: dict, _binding: dict, _targets: dict) -> None:
     return None
 
 
+def _invalid_tcp_endpoint(node: dict, _binding: dict, _targets: dict) -> None:
+    node["parameters"]["tcp_endpoint"] = None
+
+
 @pytest.mark.parametrize(
     ("observed_kind", "change", "applied", "code", "message"),
     [
@@ -433,8 +522,15 @@ def _no_change(_node: dict, _binding: dict, _targets: dict) -> None:
                      "observed_move_role_missing", "has no target role", id="target-role-missing"),
         pytest.param("tcp_pose", _set_parameter("base_frame_role", None), "bound",
                      "observed_move_role_missing", "has no base frame role", id="base-role-missing"),
-        pytest.param("tcp_pose", _set_parameter("tcp_frame_role", None), "bound",
-                     "observed_move_role_missing", "has no TCP frame role", id="tcp-role-missing"),
+        pytest.param("tcp_pose", _set_parameter("tcp_endpoint", None), "bound",
+                     "observed_move_role_missing",
+                     "the selected move has no valid TCP endpoint; choose its target and frame "
+                     "roles before capturing the current robot pose",
+                     id="tcp-endpoint-missing"),
+        pytest.param("tcp_pose", _invalid_tcp_endpoint, "bound",
+                     "observed_move_role_missing",
+                     "has no valid TCP endpoint",
+                     id="endpoint-selector-invalid"),
         pytest.param("joint", _no_change, "unavailable", "observed_move_unavailable",
                      "could not be read: Applied owner disconnected", id="applied-unreadable"),
         pytest.param("joint", _no_change, "none", "observed_move_target_unbound",
@@ -456,10 +552,13 @@ def _no_change(_node: dict, _binding: dict, _targets: dict) -> None:
         pytest.param("tcp_pose", _unbind_frame_role, "bound", "observed_move_target_unbound",
                      "base frame role 'base' is not bound for target role 'arm'",
                      id="frame-role-unbound"),
-        pytest.param("tcp_pose", _set_parameter("tcp_frame_role", "base"), "bound",
+        pytest.param("tcp_pose", _set_parameter(
+                         "tcp_endpoint", {"target_role": "arm", "frame_role": "base"}
+                     ), "bound",
                      "observed_move_frame_mismatch",
-                     "TCP frame role 'base' resolves to 'robot.base', but the robot reports "
-                     "its current pose with TCP frame 'robot.tcp'",
+                     "TCP endpoint target role 'arm' frame role 'base' resolves to "
+                     "'robot.base', but the robot reports its current pose with TCP frame "
+                     "'robot.tcp'",
                      id="frame-mismatch"),
         pytest.param("tcp_pose", _drop_observed_base_frame, "bound", "observed_move_frame_mismatch",
                      "does not report a base frame", id="observed-frame-missing"),
@@ -2072,6 +2171,7 @@ def test_program_apply_preserves_a_shared_reset_apply_correlation(
         "program_role_assignment": {"component_roles": [], "target_roles": []},
         "source_document_digest": "sha256:" + "b" * 64,
         "scenario_id": "cell",
+        "scenario_project_path": "/projects/cell.scenario",
         "project_path": str(tmp_path),
         "model_source_closure": closure,
     })
@@ -2197,3 +2297,223 @@ def test_program_revert_refuses_saved_equal_to_applied_before_any_effect(
     assert response.json()["detail"]["code"] == "program_revert_nothing_to_revert"
     assert response.json()["detail"]["message"].startswith("Nothing to revert")
     assert state.draft_session.retained_state() == before
+
+
+def _deployment(name: str, revision: str | None = None) -> dict:
+    document = {"deployment_artifact_id": "cell", "name": name}
+    if revision is not None:
+        document["deployment_revision"] = revision
+    return document
+
+
+def _compile_as_is(source: str) -> CompiledDeploymentDocument:
+    document = json.loads(source)
+    return CompiledDeploymentDocument(
+        document=document,
+        canonical_json=source,
+        deployment_artifact_id=document["deployment_artifact_id"],
+        deployment_revision=document.get("deployment_revision"),
+        graph_revision=None,
+    )
+
+
+def _program_revert_scenario(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    *,
+    saved_deployment: dict,
+    draft_deployment: dict,
+    applied_deployment: dict,
+) -> tuple[TestClient, ComposerState, list[str]]:
+    """Saved Program differs from Applied, both Drafts edited, Manager recorded."""
+
+    source = _copy_program(tmp_path)
+    program = Program(source, build_node_environment().catalog)
+    state = _enable_authoring(
+        ComposerState(program=program, program_source_path=str(source))
+    )
+    deployment = DeploymentDraftSession(compiler=_compile_as_is)
+    retained = deployment.retained_state()
+    retained.update(
+        draft_revision=1, document=draft_deployment, saved_document=saved_deployment
+    )
+    deployment.restore_retained_state(retained)
+    state.deployment_draft_session = deployment
+    state.authoring_workspace = AuthoringWorkspace(
+        program_session=state.draft_session, deployment_session=deployment
+    )
+    edited = state.draft_session.retained_state()
+    edited["authoring"]["description"] = "Edited only in the Draft."
+    edited["draft_revision"] += 1
+    candidate, edited["diagnostics"] = derive_candidate(
+        edited["authoring"], state.node_catalog
+    )
+    edited["program"] = candidate.to_dict() if candidate is not None else None
+    state.authoring_workspace.commit_program(
+        draft_id=edited["draft_id"],
+        install=lambda: state.draft_session.install_prepared_replacement(
+            state.draft_session.prepare_load_replacement(edited, state.node_catalog),
+            expected_draft_id=edited["draft_id"],
+            expected_revision=edited["draft_revision"] - 1,
+        ),
+    )
+    manager_calls: list[str] = []
+
+    class Admission(_AuthoringPassThrough):
+        def execute_external_submission(
+            self, _envelope, *, validate_under_claim, submit,
+            commit_before_submit=None, **_kwargs,
+        ):
+            validate_under_claim({})
+            if commit_before_submit is not None:
+                commit_before_submit()
+            return submit({})
+
+    state.authoring_admission = Admission()  # type: ignore[assignment]
+    closure = {"closure": "fixture"}
+    monkeypatch.setattr(state, "published_scenario", lambda: {"published_scenario": {}})
+    monkeypatch.setattr(state, "applied_activation_for_publication", lambda _p: {
+        "deployment": deepcopy(applied_deployment),
+        "program_role_assignment": {"component_roles": [], "target_roles": []},
+        "source_document_digest": "sha256:" + "b" * 64,
+        "scenario_id": "cell",
+        "scenario_project_path": "/projects/cell.scenario",
+        "project_path": str(tmp_path),
+        "model_source_closure": closure,
+    })
+    monkeypatch.setattr(
+        routes_draft, "capture_deployment_model_sources", lambda *_a, **_k: closure
+    )
+    monkeypatch.setattr(routes_draft, "_active_catalog", lambda s: s.node_catalog)
+    monkeypatch.setattr(routes_draft, "_workspace", lambda _s: {})
+    # The Applied Program is another revision, so the Saved one is reverted to.
+    monkeypatch.setattr(routes_draft, "_applied_context", lambda _s: (
+        SimpleNamespace(program_revision="sha256:" + "c" * 64), None,
+    ))
+    monkeypatch.setattr(state, "_manager_current", lambda _s: ("bundle", "graph", "epoch"))
+
+    def execute(intent, claim, *, apply, prepared=None, prepare_only=False):
+        manager_calls.append("prepare_only" if prepare_only else "apply")
+        if prepare_only:
+            return {"confirmation_required": False, "prepared_activation": {}}
+        return {"status": "accepted", "apply_id": "apply-1", "apply_generation": 4}
+
+    monkeypatch.setattr(state, "execute_authored_deployment_candidate", execute)
+    client = TestClient(create_app(state, security=SecurityConfig(
+        allowed_fs_roots=[str(tmp_path)], cors_origins=["http://localhost:3000"],
+    )))
+    # Only the Manager read the activation needs; the app routes no headless.
+    state.headless_client = SimpleNamespace(  # type: ignore[assignment]
+        manager_status=lambda: manager_calls.append("manager_status") or {},
+    )
+    return client, state, manager_calls
+
+
+@pytest.mark.parametrize(
+    ("saved", "applied"),
+    [
+        # Revisions decide when both carry one.
+        (_deployment("Cell", "sha256:" + "1" * 64), _deployment("Cell", "sha256:" + "2" * 64)),
+        # Without revision fields the documents decide.
+        (_deployment("Cell"), _deployment("Other cell")),
+    ],
+)
+def test_program_revert_refuses_a_saved_deployment_other_than_applied_before_any_effect(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, saved: dict, applied: dict
+) -> None:
+    client, state, manager_calls = _program_revert_scenario(
+        tmp_path, monkeypatch,
+        saved_deployment=saved, draft_deployment=saved, applied_deployment=applied,
+    )
+    program_before = state.draft_session.retained_state()
+    deployment_before = state.deployment_draft_session.retained_state()
+    revision_before = state.authoring_workspace.identity().workspace_revision
+    body = _fence({"draft": {
+        "draftId": state.draft_session.draft_id,
+        "draftRevision": state.draft_session.revision,
+    }})
+    response = client.post("/api/program/revert", json=body)
+
+    assert response.status_code == 409, response.text
+    assert response.json()["detail"]["code"] == "scenario_revert_requires_deployment"
+    assert response.json()["detail"]["effect"] == "none"
+    # Refused before the Manager preview: no Manager call at all.
+    assert manager_calls == []
+    assert state.draft_session.retained_state() == program_before
+    assert state.deployment_draft_session.retained_state() == deployment_before
+    assert state.authoring_workspace.identity().workspace_revision == revision_before
+
+
+def test_program_revert_restores_both_drafts_to_saved_in_one_workspace_revision(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    saved = _deployment("Cell", "sha256:" + "1" * 64)
+    client, state, manager_calls = _program_revert_scenario(
+        tmp_path, monkeypatch,
+        saved_deployment=saved,
+        draft_deployment=_deployment("Edited cell", "sha256:" + "3" * 64),
+        applied_deployment=saved,
+    )
+    saved_description = state.draft_session.retained_state()["saved_document"][
+        "description"
+    ]
+    revision_before = state.authoring_workspace.identity().workspace_revision
+    body = _fence({"draft": {
+        "draftId": state.draft_session.draft_id,
+        "draftRevision": state.draft_session.revision,
+    }})
+    response = client.post("/api/program/revert", json=body)
+
+    assert response.status_code == 202, response.text
+    assert manager_calls == ["manager_status", "prepare_only", "apply"]
+    # The Deployment Draft that left Saved returns to it together with the
+    # Program restore, in one workspace revision.
+    assert state.deployment_draft_session.retained_state()["document"] == saved
+    assert state.draft_session.retained_state()["authoring"]["description"] == (
+        saved_description
+    )
+    assert state.authoring_workspace.identity().workspace_revision == revision_before + 1
+
+
+def test_program_revert_partial_contained_install_keeps_the_claim(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from manyforge_composer.backend.authoring_admission import (
+        AuthoringAdmissionCoordinator,
+    )
+    from manyforge_composer.tests.test_authoring_local_mutation import _Headless
+
+    saved = _deployment("Cell", "sha256:" + "1" * 64)
+    client, state, manager_calls = _program_revert_scenario(
+        tmp_path, monkeypatch,
+        saved_deployment=saved,
+        draft_deployment=_deployment("Edited cell", "sha256:" + "3" * 64),
+        applied_deployment=saved,
+    )
+    headless = _Headless(generation=1)
+    coordinator = AuthoringAdmissionCoordinator(headless)  # type: ignore[arg-type]
+    coordinator.recover()
+    state.authoring_admission = coordinator
+
+    def fail_after_program_restore(_identity):
+        raise RuntimeError("Deployment restore failed")
+
+    # The Program restore installs first; the Deployment restore then fails.
+    monkeypatch.setattr(
+        routes_draft, "saved_deployment_restore", lambda _s: fail_after_program_restore
+    )
+    body = _fence({"draft": {
+        "draftId": state.draft_session.draft_id,
+        "draftRevision": state.draft_session.revision,
+    }})
+    response = client.post("/api/program/revert", json=body)
+
+    assert response.status_code == 503, response.text
+    assert response.json()["detail"]["code"] == "composer_workspace_install_failed"
+    assert "effect" not in response.json()["detail"]
+    assert state.authoring_workspace.failed_closed is not None
+    assert "apply" not in manager_calls
+    # Never settled as proven no effect: the claim is retained, admission blocked.
+    assert headless.settlements == []
+    assert coordinator.local_claim_pending is True
+    assert coordinator.mutation_ready is False

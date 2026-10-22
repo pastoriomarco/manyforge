@@ -123,9 +123,8 @@ constexpr char kDigest5[] =
                                          ModelInstanceId("model:test"),
                                          ModelRevision("model-revision:test"),
                                          {CollisionBodyId("body:tool")}}},
-      0.001,
-      0.8}};
-  return RuntimeParticipantBindingDTO{ProgramId("program:test"),
+      ContactGraspEnvelopeDTO{0.001, 0.8}}};
+  auto value = RuntimeParticipantBindingDTO{ProgramId("program:test"),
                                       ProgramRevision("program-revision:test"),
                                       ProgramBindingId("program-binding:test"),
                                       RetainedBundleId("bundle:test"),
@@ -149,6 +148,9 @@ constexpr char kDigest5[] =
                                       {},
                                       {},
                                       std::move(contact_grasps)};
+  value.motion_endpoint = RuntimeMotionEndpointBindingDTO{
+      value.target_role_id, value.command_target_id, value.frame_bindings.back(), {}};
+  return value;
 }
 
 [[nodiscard]] RuntimeParticipantBindingDTO carrier_runtime_binding() {
@@ -156,15 +158,20 @@ constexpr char kDigest5[] =
   value.component_role_id = ComponentRoleId("component-role:tool");
   value.target_role_id = TargetRoleId("target-role:tool");
   value.capability_id = CapabilityId("tool.gripper.command");
+  value.motion_endpoint.reset();
   return value;
 }
 
 class FakeMotionPreview final : public IAddressedMotionPreviewSession {
  public:
   explicit FakeMotionPreview(const bool fail_first = false,
-                             std::size_t* reference_resolution_count = nullptr)
+                             std::size_t* reference_resolution_count = nullptr,
+                             const RuntimeParticipantBindingDTO* motion_binding = nullptr,
+                             const RuntimeParticipantBindingDTO* carrier_binding = nullptr)
       : fail_first_with_start_collision(fail_first),
-        reference_resolution_count_(reference_resolution_count) {}
+        reference_resolution_count_(reference_resolution_count),
+        motion_binding_(motion_binding),
+        carrier_binding_(carrier_binding) {}
 
   Result<RuntimeParticipantBindingDTO> resolve_binding(
       const OperationIntentDTO& operation) const override {
@@ -174,8 +181,8 @@ class FakeMotionPreview final : public IAddressedMotionPreviewSession {
     }
     return Result<RuntimeParticipantBindingDTO>::Ok(
         std::holds_alternative<CapabilityCommandIntentDTO>(operation.participants.front().payload)
-            ? carrier_runtime_binding()
-            : arm_runtime_binding());
+            ? (carrier_binding_ ? *carrier_binding_ : carrier_runtime_binding())
+            : (motion_binding_ ? *motion_binding_ : arm_runtime_binding()));
   }
 
   Result<ExecuteRequestDTO> prepare_motion(const OperationIntentDTO& operation) override {
@@ -191,6 +198,22 @@ class FakeMotionPreview final : public IAddressedMotionPreviewSession {
     }
     auto request =
         testing::make_test_execute_request({"joint1", "joint2"}, operation.program_run_id.value());
+    const auto binding = motion_binding_ ? *motion_binding_ : arm_runtime_binding();
+    if (!binding.motion_endpoint) {
+      return Result<ExecuteRequestDTO>::Err(
+          ErrorDTO{"invalid_request", "fixture motion endpoint capture is absent", {}});
+    }
+    {
+      const auto& endpoint = *binding.motion_endpoint;
+      if (endpoint.target_role_id != motion->tcp_endpoint.target_role_id ||
+          endpoint.frame.frame_role_id != motion->tcp_endpoint.frame_role_id)
+        return Result<ExecuteRequestDTO>::Err(
+            ErrorDTO{"invalid_request", "fixture endpoint capture differs from motion", {}});
+      request.binding.tcp_frame = ResolvedComponentModelFrameDTO{
+          binding.controllable_component_id, endpoint.frame.model_instance_id,
+          endpoint.frame.frame_role_id, endpoint.frame.compiled_frame_name,
+          endpoint.frame.model_revision};
+    }
     request.move_id = motion->move_id.value();
     request.tolerances = motion->tolerances;
     request.speed_profile = motion->speed_profile;
@@ -218,8 +241,7 @@ class FakeMotionPreview final : public IAddressedMotionPreviewSession {
                                          motion->runtime_object_bindings.front().runtime_object_id,
                                          motion->runtime_object_bindings.front().scene_resource_id,
                                          {CollisionBodyId("body:tool")},
-                                         0.001,
-                                         0.8};
+                                         ContactGraspEnvelopeDTO{0.001, 0.8}};
     }
     return Result<ExecuteRequestDTO>::Ok(std::move(request));
   }
@@ -295,6 +317,8 @@ class FakeMotionPreview final : public IAddressedMotionPreviewSession {
 
  private:
   std::size_t* reference_resolution_count_{};
+  const RuntimeParticipantBindingDTO* motion_binding_{};
+  const RuntimeParticipantBindingDTO* carrier_binding_{};
 };
 
 class FakeMotionPreviewOwner final : public IAddressedMotionPreviewOwner {
@@ -303,13 +327,16 @@ class FakeMotionPreviewOwner final : public IAddressedMotionPreviewOwner {
       const OperationIntentDTO&) override {
     ++begin_count;
     std::unique_ptr<IAddressedMotionPreviewSession> session = std::make_unique<FakeMotionPreview>(
-        fail_first_with_start_collision, &reference_resolution_count);
+        fail_first_with_start_collision, &reference_resolution_count,
+        motion_binding ? &*motion_binding : nullptr, carrier_binding ? &*carrier_binding : nullptr);
     return Result<std::unique_ptr<IAddressedMotionPreviewSession>>::Ok(std::move(session));
   }
 
   std::size_t begin_count{};
   bool fail_first_with_start_collision{};
   std::size_t reference_resolution_count{};
+  std::optional<RuntimeParticipantBindingDTO> motion_binding;
+  std::optional<RuntimeParticipantBindingDTO> carrier_binding;
 };
 
 [[nodiscard]] OperationIntentDTO motion_operation(
@@ -332,7 +359,8 @@ class FakeMotionPreviewOwner final : public IAddressedMotionPreviewOwner {
                                      CapabilityId("execution.trajectory.execute"), std::nullopt,
                                      MotionParticipantIntentDTO{MoveId(std::move(move_id)),
                                                                 FrameRoleId("frame-role:base"),
-                                                                FrameRoleId("frame-role:tcp"),
+                                                                MotionEndpointReferenceDTO{TargetRoleId("target-role:test"),
+                                                                                           FrameRoleId("frame-role:tcp")},
                                                                 TolerancesDTO{},
                                                                 SpeedProfileDTO{},
                                                                 TimeoutsDTO{1.0, 1.0},
@@ -1032,6 +1060,85 @@ TEST(AddressedPickPlacePlanningOwner,
   EXPECT_TRUE(std::holds_alternative<CartesianPathDTO>(result.value().plan->retreat_motion));
 }
 
+TEST(AddressedPickPlacePlanningOwner, QualifiedSiblingTcpKeepsTheExplicitCarrierFrameAndOwner) {
+  // The endpoint's portable alias and modeled TCP differ from the tool operation's
+  // carrier alias/frame. Only the exact physical carrier component/target/model
+  // may authorize attachment; the TCP is never substituted for that frame.
+  for (int carrier_identity = 0; carrier_identity < 3; ++carrier_identity) {
+    SCOPED_TRACE(carrier_identity);
+    auto predecessor = predecessor_projection();
+    FakeMotionPreviewOwner motion;
+    motion.motion_binding = arm_runtime_binding();
+    auto& arm = *motion.motion_binding;
+    auto endpoint_bodies = arm.contact_grasp_bindings.front().allowed_body_bindings;
+    endpoint_bodies.front().target_role_id = TargetRoleId("target-role:tool_tcp_alias");
+    arm.motion_endpoint =
+        RuntimeMotionEndpointBindingDTO{TargetRoleId("target-role:tool_tcp_alias"),
+                                        CommandTargetId("target:test"),
+                                        {FrameRoleId("frame-role:fingertip"),
+                                         ModelInstanceId("model:test"),
+                                         ModelRevision("model-revision:test"),
+                                         "fingertip",
+                                         {CollisionBodyRoleId("collision-body-role:tool")}},
+                                        std::move(endpoint_bodies)};
+    arm.contact_grasp_bindings.front().allowed_body_bindings.clear();
+    arm.contact_grasp_bindings.front().bodies_from_motion_endpoint = true;
+    motion.carrier_binding = carrier_runtime_binding();
+    if (carrier_identity == 1)
+      motion.carrier_binding->controllable_component_id =
+          ControllableComponentId("other-component");
+    if (carrier_identity == 2)
+      motion.carrier_binding->command_target_id = CommandTargetId("other-target");
+    FakeSceneCandidatePreview scene(predecessor);
+    FakeSceneCandidateProjection projection(predecessor);
+    AddressedPickPlacePlanningOwner owner(motion, scene, scene, projection);
+    const auto qualified = [&](OperationIntentDTO operation) {
+      auto& payload = std::get<MotionParticipantIntentDTO>(operation.participants.front().payload);
+      payload.tcp_endpoint = MotionEndpointReferenceDTO{arm.motion_endpoint->target_role_id,
+                                                        arm.motion_endpoint->frame.frame_role_id};
+      return operation;
+    };
+    const PickSequencePlanningIntentDTO request{
+        "qualified-endpoint-pick",
+        SceneResourceId("workpiece"),
+        RuntimeObjectId("selected_object"),
+        FrameRoleId("frame-role:tcp"),
+        PickCandidateSynthesisIntentDTO{},
+        qualified(motion_operation("qualified.approach", "approach", PoseGoalDTO{Pose3DTO{}})),
+        qualified(motion_operation(
+            "qualified.descend", "descend", CartesianPathDTO{}, ContactPolicyId("pick.contact"),
+            {{RuntimeObjectId("selected_object"), SceneResourceId("workpiece")}})),
+        tool_operation("qualified.tool", 0.0),
+        qualified(motion_operation("qualified.retreat", "retreat", CartesianPathDTO{}))};
+    const auto result = owner.PlanPick(request);
+    if (carrier_identity != 0) {
+      ASSERT_FALSE(result.ok());
+      EXPECT_EQ(result.error().details.at("reason"), "pick_carrier_touch_roles_unresolved");
+      EXPECT_EQ(projection.retain_call_count, 0U);
+      EXPECT_EQ(scene.call_count, 0U);
+    } else {
+      ASSERT_TRUE(result.ok()) << result.error().message;
+      EXPECT_EQ(result.value().status, PickPlacePlanningStatusDTO::kPlanned);
+      ASSERT_TRUE(scene.last_request);
+      const auto& attach =
+          std::get<AttachCarriedObjectRequestDTO>(scene.last_request->request.operation);
+      EXPECT_EQ(attach.controllable_component_id, ControllableComponentId("component:test"));
+      EXPECT_EQ(attach.command_target_id, CommandTargetId("target:test"));
+      EXPECT_EQ(attach.frame_role_id, request.carrier_frame_role_id);
+      EXPECT_NE(attach.frame_role_id, arm.motion_endpoint->frame.frame_role_id);
+      EXPECT_EQ(
+          attach.touch_body_roles,
+          (std::vector<CollisionBodyRoleId>{CollisionBodyRoleId("collision-body-role:tool")}));
+      ASSERT_TRUE(scene.last_request->frame_resolution);
+      const auto& frame = std::get<ResolvedComponentModelFrameDTO>(
+          scene.last_request->frame_resolution->resolved_frame);
+      EXPECT_EQ(frame.frame_role_id, request.carrier_frame_role_id);
+      EXPECT_EQ(frame.compiled_frame_name, "tcp");
+    }
+    EXPECT_EQ(scene.commit_count, 0U);
+  }
+}
+
 TEST(AddressedPickPlacePlanningOwner, RebindsValidatedPublicIntentToOwnerSynchronizedScene) {
   auto predecessor = predecessor_projection();
   auto successor = successor_projection(predecessor);
@@ -1230,9 +1337,13 @@ TEST(AddressedPickPlacePlanningOwner, NamesAnUnresolvedCarrierFrameWithTheToolTa
 
 TEST(AddressedPickPlacePlanningOwner, NamesTheRuntimeObjectAndPolicyOfAnUnresolvedContactGrasp) {
   const auto plan = [](const std::string& id, const std::string& runtime_object_id,
-                       const std::string& contact_policy_id) {
+                       const std::string& contact_policy_id, bool release = false) {
     auto predecessor = predecessor_projection();
     FakeMotionPreviewOwner motion;
+    if (release) {
+      motion.motion_binding = arm_runtime_binding();
+      motion.motion_binding->contact_grasp_bindings.front().envelope = ContactReleaseEnvelopeDTO{};
+    }
     FakeSceneCandidatePreview scene(predecessor);
     FakeSceneCandidateProjection projection(predecessor);
     AddressedPickPlacePlanningOwner owner(motion, scene, scene, projection);
@@ -1270,6 +1381,10 @@ TEST(AddressedPickPlacePlanningOwner, NamesTheRuntimeObjectAndPolicyOfAnUnresolv
   expect_named(mismatch.error(), "other_object", "pick.contact");
   EXPECT_NE(mismatch.error().message.find("other than the selected"), std::string::npos)
       << mismatch.error().message;
+
+  const auto release = plan("release-policy-pick", "selected_object", "pick.contact", true);
+  ASSERT_FALSE(release.ok());
+  expect_named(release.error(), "selected_object", "pick.contact");
 }
 
 TEST(AddressedPickPlacePlanningOwner, FailedPlanningRetainsOneBoundedLinkedMotionDiagnostic) {

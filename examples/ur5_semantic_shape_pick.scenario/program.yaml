@@ -329,7 +329,10 @@
               "translation_step_m": 0.025
             },
             "target_role": "arm",
-            "tcp_frame_role": "tcp",
+            "tcp_endpoint": {
+              "frame_role": "tcp",
+              "target_role": "arm"
+            },
             "tool_position": {
               "kind": "named_preset",
               "name": "closed"
@@ -351,7 +354,10 @@
           "parameters": {
             "base_frame_role": "base",
             "target_role": "arm",
-            "tcp_frame_role": "tcp",
+            "tcp_endpoint": {
+              "frame_role": "tcp",
+              "target_role": "arm"
+            },
             "velocity_scale": 0.3
           },
           "value_sources": {
@@ -369,7 +375,10 @@
           "parameters": {
             "base_frame_role": "base",
             "target_role": "arm",
-            "tcp_frame_role": "tcp",
+            "tcp_endpoint": {
+              "frame_role": "tcp",
+              "target_role": "arm"
+            },
             "velocity_scale": 0.2
           },
           "value_sources": {
@@ -418,7 +427,10 @@
           "parameters": {
             "base_frame_role": "base",
             "target_role": "arm",
-            "tcp_frame_role": "tcp",
+            "tcp_endpoint": {
+              "frame_role": "tcp",
+              "target_role": "arm"
+            },
             "velocity_scale": 0.3
           },
           "value_sources": {
@@ -477,7 +489,10 @@
               "type": "pose"
             },
             "target_role": "arm",
-            "tcp_frame_role": "tcp",
+            "tcp_endpoint": {
+              "frame_role": "tcp",
+              "target_role": "arm"
+            },
             "velocity_scale": 0.3
           }
         },
@@ -507,7 +522,10 @@
               ]
             },
             "target_role": "arm",
-            "tcp_frame_role": "tcp",
+            "tcp_endpoint": {
+              "frame_role": "tcp",
+              "target_role": "arm"
+            },
             "velocity_scale": 0.2
           }
         },
@@ -586,7 +604,10 @@
               "type": "pose"
             },
             "target_role": "arm",
-            "tcp_frame_role": "tcp",
+            "tcp_endpoint": {
+              "frame_role": "tcp",
+              "target_role": "arm"
+            },
             "velocity_scale": 0.3
           }
         }

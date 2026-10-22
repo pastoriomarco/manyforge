@@ -86,7 +86,8 @@ def test_probe_request_is_the_complete_native_v3_request(probe, tmp_path: Path) 
     )
     assert request["model_source_closure"]["components"]
     assert request["prepared_model_closure"]["components"]
-    # The same six-input identity the native preparer recomputes.
+    assert request["project_path"] == str(SCENARIO.resolve())
+    # The same seven-input identity the native preparer recomputes.
     assert request["captured_input_digest"] == raw_sha256_digest(
         canonical_json_bytes(
             {
@@ -96,6 +97,7 @@ def test_probe_request_is_the_complete_native_v3_request(probe, tmp_path: Path) 
                     "model_source_closure",
                     "program",
                     "program_role_assignment",
+                    "project_path",
                     "scenario_id",
                     "source_document_digest",
                 )
@@ -119,6 +121,13 @@ def test_probe_request_is_accepted_by_the_native_preparer(probe, tmp_path: Path)
         runtime_cell_id=CELL_ID,
         timeout_seconds=600.0,
     ).prepare(**inputs)
-    assert prepared["schema_version"] == "manyforge.prepared_activation_input.v5"
-    assert prepared["scenario_id"] == inputs["scenario_id"]
+    assert prepared["schema_version"] == "manyforge.prepared_activation_input.v6"
+    # The Scenario identity is the closed four-key origin, never a top-level field.
+    assert "scenario_id" not in prepared
+    assert prepared["origin"] == {
+        "kind": "scenario",
+        "scenario_id": inputs["scenario_id"],
+        "source_document_digest": inputs["source_document_digest"],
+        "project_path": inputs["project_path"],
+    }
     assert prepared["captured_input_digest"] == inputs["captured_input_digest"]

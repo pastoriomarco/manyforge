@@ -1011,7 +1011,7 @@
         "record_kind": "component_type",
         "record_revision": "sha256:dce266914adb570342ad6a7f567ebae00f09de6c64b70e180af14ec9840c8dda",
         "schema_id": "manyforge.component_type.v1",
-        "schema_revision": "sha256:8e728ad4442d46b98f0d0534f8189df9b7982f982ab99cb656e6fdbeef231009"
+        "schema_revision": "sha256:2f26f97a7454e620bfb39e16eeccc0b23ae2de61c32e3e8210eff46945d01fc4"
       },
       {
         "content_addressed_store_key": "catalog/maintained/control_interface_contract/manyforge.ros2_control_arm_position/d951ffd368654ba9998355a4b12844014469753c3c21e05df3b61f6f669cbb4b",
@@ -1127,7 +1127,7 @@
     ]
   },
   "deployment_artifact_id": "ur5_roboplan_local_vision_guided_pick",
-  "deployment_revision": "sha256:4d95c87cf5abc76e82610aed95f6125ea28ef6857cb1837c83c36abb94f4d2d0",
+  "deployment_revision": "sha256:990f3f5d3627ffbd787a5708341295a47943d4b5faa54c3c95fda7e05efad2d3",
   "description": "Local deployment for the vision-guided bin-pick example. It requires one connected native viewer snapshot source so assistant.query_model can attach a live scene snapshot.",
   "desired_control_configurations": [
     {

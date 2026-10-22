@@ -1,5 +1,15 @@
-import type { CatalogJsonSchema, JsonValue, ProgramBindingDocument } from '../types/api';
+import type {
+  CatalogJsonSchema, JsonValue, ProgramAuthoringDocument, ProgramBindingDocument,
+} from '../types/api';
 import type { ProgramSemanticChoice } from './programAuthoring';
+import { resolvedTargetRoleBindings } from './targetRoleResolution';
+
+/** The authored Draft facts that resolve target roles while the binding is null. */
+export interface TargetRoleDraftFacts {
+  program: Pick<ProgramAuthoringDocument, 'target_roles'>;
+  roleAssignment: Record<string, JsonValue> | null | undefined;
+  deploymentDocument: Record<string, JsonValue> | null | undefined;
+}
 
 /** The executable io nodes that read one input signal. */
 export const IO_INPUT_NODE_IDS: ReadonlySet<string> = new Set([
@@ -17,19 +27,23 @@ export const IO_EDGE_UNSUPPORTED_HINT = 'Edge waits are not supported yet; only 
  * never offered an output: reading one needs a declared readback input. Null
  * when the binding does not know the node's target (no binding, no target
  * chosen, or the target is not bound), so the ordinary resource-role picker
- * applies.
+ * applies. Without a binding, `draftFacts` resolve the target and its declared
+ * signals (targetRoleResolution).
  */
 export function ioSignalRoleChoices(
   nodeId: string,
   targetRole: JsonValue | undefined,
   binding: ProgramBindingDocument | null | undefined,
+  draftFacts?: TargetRoleDraftFacts,
 ): ProgramSemanticChoice[] | null {
   const direction = IO_INPUT_NODE_IDS.has(nodeId) ? 'input'
     : nodeId === 'io.set_output' ? 'output' : null;
-  if (direction === null || binding == null || typeof targetRole !== 'string') {
-    return null;
-  }
-  const target = binding.target_role_bindings.find((row) => row.target_role_id === targetRole);
+  if (direction === null || typeof targetRole !== 'string') return null;
+  const targets = binding != null ? binding.target_role_bindings
+    : draftFacts === undefined ? null
+      : resolvedTargetRoleBindings(draftFacts.program, draftFacts.roleAssignment, draftFacts.deploymentDocument);
+  if (targets === null) return null;
+  const target = targets.find((row) => row.target_role_id === targetRole);
   if (target === undefined) return null;
   return (target.signal_role_bindings ?? [])
     .filter((row) => row.direction === direction)

@@ -83,8 +83,9 @@ import {
   parseCCLCStatusEnvelope,
 } from './cclcParsers';
 import type {
-  ArtifactKind,
+  FileBrowseKind,
   NewScenarioDocumentInput,
+  SaveScenarioDocumentInput,
   AppliedProgramSelection,
   AppliedProgramStatus,
   PersistentKeyValues,
@@ -489,14 +490,16 @@ export type PersistentKeyValuesFence =
   | { program_run_id?: never; expected_run_revision?: never };
 
 export type PersistentKeyValueEditBody = PersistentKeyRequestIdentity & PersistentKeyValuesFence & {
-  scenario_id: string;
+  /** The Applied Scenario project folder the operator saw. */
+  project_path: string;
   key: string;
   expected_program_revision: string;
   value?: JsonValue;
 };
 
-function persistentValuesPath(scenarioId: string, suffix = ''): string {
-  return `/api/program/scenarios/${encodeURIComponent(scenarioId)}/persistent-values${suffix}`;
+/** The Applied Scenario project's values; an edit names the folder it saw. */
+function persistentValuesPath(suffix = ''): string {
+  return `/api/program/persistent-values${suffix}`;
 }
 
 async function requestJson<T>(
@@ -1019,13 +1022,7 @@ export const api = {
     ),
     save: (
       fence: ScenarioDocumentFenceRequest,
-      input: {
-        path: string;
-        scenarioId: string;
-        name: string;
-        description: string;
-        confirmOverwrite: boolean;
-      },
+      input: SaveScenarioDocumentInput,
       signal?: AbortSignal,
     ): Promise<ScenarioDocumentSaveResponse> => requestJson(
       '/api/scenario-documents/save',
@@ -1053,6 +1050,16 @@ export const api = {
           confirmDiscard,
         }),
       },
+    ),
+    /** Return every Draft with unapplied changes to Applied (Draft-only). */
+    discard: (
+      fence: ScenarioDocumentFenceRequest,
+      signal?: AbortSignal,
+    ): Promise<ProgramWorkspaceResponse> => requestJson(
+      '/api/scenario-documents/discard',
+      parseProgramWorkspaceResponse,
+      signal,
+      { method: 'POST', body: JSON.stringify(fence) },
     ),
     export: (
       fence: ScenarioDocumentFenceRequest,
@@ -1171,12 +1178,25 @@ export const api = {
     ),
     revert: (
       fence: DraftFenceRequest,
+      /** Manager's disruptive-impact confirmation of this exact Revert. */
+      confirmation: {
+        token: string;
+        preparation: DeploymentCandidatePreparation;
+      } | null = null,
       signal?: AbortSignal,
     ): Promise<DeploymentCandidateOperationResponse> => requestJson(
       '/api/deployment/revert',
       parseDeploymentCandidateOperationResponse,
       signal,
-      { method: 'POST', body: JSON.stringify(fence) },
+      {
+        method: 'POST',
+        body: JSON.stringify({
+          ...fence,
+          confirmationToken: confirmation?.token ?? null,
+          preparationRequestOwnerEpoch: confirmation?.preparation.requestOwnerEpoch ?? null,
+          preparationRequestId: confirmation?.preparation.requestId ?? null,
+        }),
+      },
     ),
     applyDraft: (
       fence: DraftFenceRequest,
@@ -1227,28 +1247,25 @@ export const api = {
       { method: 'POST', body: JSON.stringify(request) },
     ),
     persistentValues: (
-      scenarioId: string,
       signal?: AbortSignal,
     ): Promise<PersistentKeyValues> => requestJson(
-      persistentValuesPath(scenarioId),
+      persistentValuesPath(),
       parsePersistentKeyValues,
       signal,
     ),
     /** Set one stored value, or Reset it to `initial:` (value omitted). */
     editPersistentValue: (
-      scenarioId: string,
       body: PersistentKeyValueEditBody,
     ): Promise<PersistentKeyValues> => requestJson(
-      persistentValuesPath(scenarioId, 'value' in body ? '' : '/reset'),
+      persistentValuesPath('value' in body ? '' : '/reset'),
       parsePersistentKeyEdit,
       undefined,
       { method: 'POST', body: JSON.stringify(body) },
     ),
     clearPersistentValues: (
-      scenarioId: string,
-      body: PersistentKeyRequestIdentity & { scenario_id: string },
+      body: PersistentKeyRequestIdentity & { project_path: string },
     ): Promise<PersistentKeyValuesCleared> => requestJson(
-      persistentValuesPath(scenarioId, '/clear'),
+      persistentValuesPath('/clear'),
       parsePersistentKeyValuesCleared,
       undefined,
       { method: 'POST', body: JSON.stringify(body) },
@@ -1321,7 +1338,7 @@ export const api = {
   },
   files: {
     browse: (
-      kind: ArtifactKind,
+      kind: FileBrowseKind,
       path?: string,
       signal?: AbortSignal,
     ): Promise<FileBrowserResponse> => {

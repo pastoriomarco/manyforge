@@ -2,8 +2,21 @@
 api_version: manyforge.node_catalog.v2
 content_version: 2.7.0
 catalog_id: manyforge_builtin
-catalog_digest: sha256:4dfd2fcb507323ca8355cee098fd76187f26ca704edcf7b3a1ed65c3fc03b336
+catalog_digest: sha256:376863946817c83ee0e92f3a72257bc2ac25e3f9cdbdca0029aab5af42c3d6e2
 schema_types:
+  motion_endpoint_ref:
+    type: object
+    additional_properties: false
+    required:
+    - target_role
+    - frame_role
+    properties:
+      target_role:
+        type: string
+        semantic_type: target_role
+      frame_role:
+        type: string
+        semantic_type: frame_role
   coordinate_position:
     type: object
     additional_properties: false
@@ -848,12 +861,9 @@ entries:
       type: string
       semantic_type: frame_role
       semantic_scope_parameter: target_role
-  - id: tcp_frame_role
+  - id: tcp_endpoint
     required: true
-    schema:
-      type: string
-      semantic_type: frame_role
-      semantic_scope_parameter: target_role
+    schema_ref: '#/schema_types/motion_endpoint_ref'
   - id: goal
     required: true
     schema_ref: '#/schema_types/joint_target_list'
@@ -943,6 +953,15 @@ entries:
       values:
       - default
       - disable
+  - id: contact_policy_id
+    required: false
+    schema:
+      type: string
+  - id: contact_scene_resource_id
+    required: false
+    schema:
+      type: string
+      semantic_type: scene_resource
   - id: automatic_retries
     required: false
     default: 3
@@ -1055,12 +1074,9 @@ entries:
       type: string
       semantic_type: frame_role
       semantic_scope_parameter: target_role
-  - id: tcp_frame_role
+  - id: tcp_endpoint
     required: true
-    schema:
-      type: string
-      semantic_type: frame_role
-      semantic_scope_parameter: target_role
+    schema_ref: '#/schema_types/motion_endpoint_ref'
   - id: goal
     required: true
     schema_ref: '#/schema_types/motion_pose'
@@ -1277,12 +1293,9 @@ entries:
       type: string
       semantic_type: frame_role
       semantic_scope_parameter: target_role
-  - id: tcp_frame_role
+  - id: tcp_endpoint
     required: true
-    schema:
-      type: string
-      semantic_type: frame_role
-      semantic_scope_parameter: target_role
+    schema_ref: '#/schema_types/motion_endpoint_ref'
   - id: path
     required: true
     schema_ref: '#/schema_types/cartesian_path'
@@ -1548,12 +1561,9 @@ entries:
       type: string
       semantic_type: frame_role
       semantic_scope_parameter: target_role
-  - id: tcp_frame_role
+  - id: tcp_endpoint
     required: true
-    schema:
-      type: string
-      semantic_type: frame_role
-      semantic_scope_parameter: target_role
+    schema_ref: '#/schema_types/motion_endpoint_ref'
   - id: goal
     required: true
     schema_ref: '#/schema_types/stored_pose'
@@ -1771,12 +1781,9 @@ entries:
       type: string
       semantic_type: frame_role
       semantic_scope_parameter: target_role
-  - id: tcp_frame_role
+  - id: tcp_endpoint
     required: true
-    schema:
-      type: string
-      semantic_type: frame_role
-      semantic_scope_parameter: target_role
+    schema_ref: '#/schema_types/motion_endpoint_ref'
   - id: goal
     required: true
     schema_ref: '#/schema_types/stored_pose'
@@ -3852,12 +3859,9 @@ entries:
       type: string
       semantic_type: frame_role
       semantic_scope_parameter: target_role
-  - id: tcp_frame_role
+  - id: tcp_endpoint
     required: true
-    schema:
-      type: string
-      semantic_type: frame_role
-      semantic_scope_parameter: target_role
+    schema_ref: '#/schema_types/motion_endpoint_ref'
   - id: carrier_frame_role
     required: true
     schema:
@@ -4053,12 +4057,9 @@ entries:
       type: string
       semantic_type: frame_role
       semantic_scope_parameter: target_role
-  - id: tcp_frame_role
+  - id: tcp_endpoint
     required: true
-    schema:
-      type: string
-      semantic_type: frame_role
-      semantic_scope_parameter: target_role
+    schema_ref: '#/schema_types/motion_endpoint_ref'
   - id: carrier_frame_role
     required: true
     schema:

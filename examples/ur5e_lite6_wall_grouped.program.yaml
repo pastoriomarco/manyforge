@@ -1,6 +1,6 @@
 api_version: manyforge.program.v2
 program_id: ur5e_lite6_wall_grouped
-program_revision: sha256:45d06d0d38eb0c41d689b3d0292829f4bd874fc0f8c04af2b875b5e04f1b9881
+program_revision: sha256:1613592318c594caa80fd8e405681c3dac781cea25a7a415eddda5113317195f
 program_profile: composable-cell-v1
 name: ur5e_lite6_wall_grouped
 description: Two independent joint trajectories in the UR5e + Lite6 wall cell, in one shared control group
@@ -187,7 +187,9 @@ tree:
     parameters:
       target_role: lite6_arm
       base_frame_role: base
-      tcp_frame_role: tcp
+      tcp_endpoint:
+        target_role: lite6_arm
+        frame_role: tcp
       goal:
       - joint_name: joint1
         position_rad: 0.3
@@ -224,7 +226,9 @@ tree:
     parameters:
       target_role: ur5e_arm
       base_frame_role: base
-      tcp_frame_role: tcp
+      tcp_endpoint:
+        target_role: ur5e_arm
+        frame_role: tcp
       goal:
       - joint_name: shoulder_pan_joint
         position_rad: -0.45

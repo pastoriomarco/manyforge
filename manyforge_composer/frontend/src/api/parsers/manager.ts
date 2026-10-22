@@ -38,6 +38,7 @@ import {
   objectAt,
   parseProjectionRevision,
   positiveIntegerAt,
+  projectPathAt,
   sourceFreshnessAt,
   stringArrayAt,
   stringAt,
@@ -1130,9 +1131,10 @@ export function parseManagerApplyStatus(value: unknown): ManagerApplyStatus {
 export function parsePreparedActivationOrigin(value: unknown, path: string): PreparedActivationOrigin {
   const row = objectAt(value, path);
   if (row.kind === 'scenario') {
-    exactKeysAt(row, ['kind', 'scenario_id', 'source_document_digest'], path);
+    exactKeysAt(row, ['kind', 'scenario_id', 'source_document_digest', 'project_path'], path);
     return { kind: 'scenario', scenarioId: stringAt(row.scenario_id, `${path}.scenario_id`),
-      sourceDocumentDigest: digestAt(row.source_document_digest, `${path}.source_document_digest`) };
+      sourceDocumentDigest: digestAt(row.source_document_digest, `${path}.source_document_digest`),
+      projectPath: projectPathAt(row.project_path, `${path}.project_path`) };
   }
   if (row.kind !== 'sealed_canonical_empty') return fail(`${path}.kind`, 'scenario or sealed_canonical_empty');
   exactKeysAt(row, ['kind', 'cell_id', 'deployment_artifact_id', 'deployment_revision',

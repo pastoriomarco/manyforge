@@ -709,7 +709,7 @@ def headless_client() -> (
                 "schema_version": "manyforge.historian_reconciliation.v1",
                 "reconciled": True,
             }
-        elif path.startswith("/api/program/scenarios/cell-pick/persistent-values"):
+        elif path.startswith("/api/program/persistent-values"):
             payload = {"forwarded": path}
         elif path == "/api/program/runs/program-run.7/node-correction-previews":
             payload = {"forwarded": path}
@@ -2094,13 +2094,13 @@ def test_composer_forwards_persistent_value_edits_as_strict_requests(
     headless_client,
 ) -> None:
     client, requests, _node_environment = headless_client
-    base = "/api/program/scenarios/cell-pick/persistent-values"
+    base = "/api/program/persistent-values"
     caller = {
         "request_id": "request.1",
         "request_owner_epoch": "composer.epoch.1",
         "source_label": "operator_ui",
         "correlation_id": None,
-        "scenario_id": "cell-pick",
+        "project_path": "/projects/cell-pick.scenario",
     }
     edit = {
         **caller,
@@ -2116,16 +2116,16 @@ def test_composer_forwards_persistent_value_edits_as_strict_requests(
         assert composer.post(f"{base}/reset", json=edit).status_code == 200
         assert composer.post(f"{base}/clear", json=caller).status_code == 200
         assert composer.post(base, json=edit).status_code == 422
-        mismatch = composer.post(
-            "/api/program/scenarios/other/persistent-values/clear", json=caller
+        # The project folder must be absolute and normalized; never forwarded.
+        relative = composer.post(
+            f"{base}/clear", json={**caller, "project_path": "projects/cell-pick"}
         )
 
-    assert mismatch.status_code == 400
-    assert mismatch.json()["detail"]["code"] == "persistent_key_path_invalid"
+    assert relative.status_code == 422
     forwarded = [
         (item["method"], item["path"], item["body"])
         for item in requests
-        if item["path"].startswith("/api/program/scenarios/")
+        if item["path"].startswith("/api/program/persistent-values")
     ]
     assert forwarded == [
         ("GET", base, None),

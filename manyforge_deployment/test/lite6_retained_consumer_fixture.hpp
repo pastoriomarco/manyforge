@@ -249,4 +249,14 @@ materialize_lite6_ros2_control_observed_retained_consumer_fixture(
       package_root, make_lite6_ros2_control_observed_consumer_retention_fixture(aggregate_gripper));
 }
 
+[[nodiscard]] inline DurableLite6RetainedConsumerFixture
+materialize_lite6_ros2_control_observed_endpoint_retained_consumer_fixture(
+    const std::filesystem::path &package_root, bool aggregate_gripper = false,
+    bool shared_arm_endpoint_bodies = false) {
+  return materialize_lite6_retained_consumer_fixture_from(
+      package_root,
+      make_lite6_ros2_control_observed_endpoint_consumer_retention_fixture(
+          aggregate_gripper, shared_arm_endpoint_bodies));
+}
+
 }  // namespace manyforge::deployment::test

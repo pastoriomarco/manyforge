@@ -1,5 +1,7 @@
 #pragma once
 
+#include <manyforge_core/types/program_contact_envelope.hpp>
+
 #include <cstddef>
 #include <cstdint>
 #include <manyforge_core/types/action_span.hpp>
@@ -94,8 +96,7 @@ struct ResolvedContactGraspBindingDTO final {
   RuntimeObjectId runtime_object_id;
   SceneResourceId selected_object_id;
   std::vector<CollisionBodyId> allowed_robot_body_ids;
-  double max_penetration_m{};
-  double terminal_window_start_fraction{};
+  ContactZoneEnvelopeDTO envelope{ContactGraspEnvelopeDTO{}};
 
   friend bool operator==(const ResolvedContactGraspBindingDTO&,
                          const ResolvedContactGraspBindingDTO&) = default;

@@ -5,15 +5,15 @@
     "deployment_present": true,
     "program_present": true
   },
-  "description": "Local deployment with native in-process RoboPlan planning and simulated execution for the backend-authoritative pick-and-place demo.",
+  "description": "ur5_roboplan_local_pick_place\n\nLocal deployment with native in-process RoboPlan planning and simulated execution for the backend-authoritative pick-and-place demo.",
   "members": {
     "assignment.yaml": "sha256:10e42acc3e46a6f842fc6fd5e2bb3eef41f005fb4ea03423f340ac4c2b34eee6",
     "deployment.yaml": "sha256:888891b7e8fbcd237ad1db5f222b8e4cded02251951d4ef4494b3fc7ef570015",
-    "program.yaml": "sha256:bc056ea1cfbead496e0e8b47f2a71b505dd1d4473288f0ac772708779df4edda"
+    "program.yaml": "sha256:d2dd052e6ac73532455e06b91226326f46ccb6ec3869b6a0311065aa44b91322"
   },
-  "name": "ur5_roboplan_local_pick_place",
+  "name": "ur5_pick_and_place_minimal",
   "saved_status": {
-    "checked_content_digest": "sha256:6f86eed9aeac12fcba51885dea4ec64e77041e8dc04e50d664ec896b767db320",
+    "checked_content_digest": "sha256:8ca08b91312b1ab2a9dbcb64d333d61367ff1ff0d1bc0b4384520682ed6ad24c",
     "last_known_status": "ready",
     "manyforge_version": "0.1.0"
   },

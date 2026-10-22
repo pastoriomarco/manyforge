@@ -940,9 +940,8 @@ def _save_and_reopen_current_scenario(
                         "expectedDeploymentDraftRevision": deployment["draft"][
                             "revision"
                         ],
-                        "path": str(target),
-                        "scenarioId": scenario_id,
-                        "name": "UI6-I grouped Scenario copy",
+                        "directory": str(directory),
+                        "name": scenario_id,
                         "description": "Native Save/Load qualification copy",
                         "confirmOverwrite": False,
                     },
@@ -1397,7 +1396,8 @@ def _write_mixed_variants(
                     for key in ("max_blend_deviation_rad", "translation_tol_m")
                 }
                 motion["parameters"] = {
-                    "target_role": "lite6_arm", "base_frame_role": "base", "tcp_frame_role": "tcp",
+                    "target_role": "lite6_arm", "base_frame_role": "base",
+                    "tcp_endpoint": {"target_role": "lite6_arm", "frame_role": "tcp"},
                     "target_mode": "relative",
                     "target_reference": {"type": "frame_role", "frame_role_id": "tcp"},
                     "path": [{"position_m": xyz, "orientation": {"rpy_deg": [0, 0, 0]}}

@@ -9,11 +9,11 @@
   "members": {
     "assignment.yaml": "sha256:f4dd3bfffcc14e0cb446f820e79e2405f4477ecbc470ca9fdc127dce17086e06",
     "deployment.yaml": "sha256:baf1dff901ef66bdcb99dd774713e4eeafcb3e35e58bbdda3fc16f999d4c9f98",
-    "program.yaml": "sha256:a7fbac2f2efb48bc25467a74b5ce97a0af5cd6cf9d86d8c7ad7a7b03130e483a"
+    "program.yaml": "sha256:9356e7306326ef8bf717019669f05201596b8bf8c980d987cdf7aabaf79ce581"
   },
-  "name": "R5 trial (b) preemption",
+  "name": "r5_trial_b_preemption",
   "saved_status": {
-    "checked_content_digest": "sha256:f3eb8b805e614f78463c652648f715359550a8cff09cfb9026a823cb9b0206be",
+    "checked_content_digest": "sha256:e4d438e742673c00cdbb3d39cf87bf3ea8a008368273e429f3b678693f460317",
     "last_known_status": "unknown",
     "manyforge_version": "0.1.0"
   },

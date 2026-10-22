@@ -41,6 +41,8 @@ from manyforge_program_runner.tests.test_runtime import _Headless as _Transport
 
 _ROOT = Path(__file__).resolve().parents[2]
 _SCENARIO = "cell-pick"
+# The Scenario project folder: the identity persistent values are kept under.
+_PROJECT = "/projects/cell-pick.scenario"
 _RUN = "program-cycle.1"
 
 
@@ -98,7 +100,12 @@ class _Headless(_Transport):
         self.current: dict[str, Any] | Exception = {}
         self.apply(_DOCUMENT)
 
-    def apply(self, document: dict[str, Any] | None, scenario_id: str = _SCENARIO) -> str:
+    def apply(
+        self,
+        document: dict[str, Any] | None,
+        scenario_id: str = _SCENARIO,
+        project_path: str | None = None,
+    ) -> str:
         """Commit one Scenario Apply; nothing tells the runner about it."""
 
         committed = {
@@ -114,6 +121,7 @@ class _Headless(_Transport):
                 "scenario_id": scenario_id,
                 "source_document_digest": "sha256:"
                 + hashlib.sha256(scenario_id.encode()).hexdigest(),
+                "project_path": project_path or f"/projects/{scenario_id}.scenario",
             },
         }
         self.applies.append(committed)
@@ -162,37 +170,49 @@ class _Headless(_Transport):
 
 
 class _Snapshot:
-    def __init__(self, state: str, run_revision: int = 1) -> None:
+    def __init__(
+        self, state: str, run_revision: int = 1, record_digest: str | None = None
+    ) -> None:
         self.state = state
         self.run_revision = run_revision
+        self.record_digest = record_digest
+        self.operation_failures: tuple[dict[str, Any], ...] = ()
 
     def to_dict(self) -> dict[str, Any]:
         return {
             "state": self.state,
-            "capture": {"program_run_id": _RUN, "scenario_id": _SCENARIO},
+            "capture": {
+                "program_run_id": _RUN,
+                "scenario_id": _SCENARIO,
+                # The committed Apply the run was admitted from.
+                "applied_record_digest": self.record_digest,
+            },
         }
 
 
 class _Owner:
     """One live run whose value store is built exactly as a run builds it."""
 
-    def __init__(self, register: PersistentKeyRegister) -> None:
+    def __init__(
+        self, register: PersistentKeyRegister, record_digest: str | None = None
+    ) -> None:
         self.store = ProgramValueStore.from_program(
             Program.from_dict(deepcopy(_DOCUMENT), build_node_environment().catalog),
-            scenario_id=_SCENARIO,
+            project_path=_PROJECT,
             register=register,
         )
+        self.record_digest = record_digest
         self.state = "running"
         self.revision = 1
         self.writes: list[dict[str, Any]] = []
 
     def list_snapshots(self, *, active_only: bool, limit: int):
         assert active_only and limit >= 1
-        return (_Snapshot(self.state, self.revision),), False
+        return (_Snapshot(self.state, self.revision, self.record_digest),), False
 
     def read(self, program_run_id: str) -> _Snapshot:
         assert program_run_id == _RUN
-        return _Snapshot(self.state, self.revision)
+        return _Snapshot(self.state, self.revision, self.record_digest)
 
     def note_runtime_control_change(self, program_run_id: str) -> None:
         assert program_run_id == _RUN
@@ -265,7 +285,7 @@ def _runtime(tmp_path: Path) -> tuple[ProgramRuntime, _Headless]:
     runtime._owner = _NoRuns()  # type: ignore[assignment]  # noqa: SLF001
     runtime._started = True  # noqa: SLF001
     # The operator page reads the values (reconciling them) before editing.
-    runtime.read_persistent_values(_SCENARIO)
+    runtime.read_persistent_values()
     return runtime, headless
 
 
@@ -283,7 +303,7 @@ def _edit(runtime: ProgramRuntime, key: str, **extra: Any) -> dict[str, Any]:
         "request_id": f"request.{key}.{len(extra)}",
         "request_owner_epoch": "composer.epoch.1",
         "source_label": "operator_ui",
-        "scenario_id": _SCENARIO,
+        "project_path": _PROJECT,
         "key": key,
         "expected_program_revision": _REVISION,
         **_fence(runtime),
@@ -309,7 +329,7 @@ def _clear(request_id: str = "request.clear") -> PersistentKeyValuesClearRequest
             "request_id": request_id,
             "request_owner_epoch": "composer.epoch.1",
             "source_label": "operator_ui",
-            "scenario_id": _SCENARIO,
+            "project_path": _PROJECT,
         }
     )
 
@@ -327,7 +347,7 @@ def _refusal(call) -> str:
 def test_values_are_listed_set_reset_and_cleared_without_a_run(tmp_path) -> None:
     runtime, _headless = _runtime(tmp_path)
 
-    listed = runtime.read_persistent_values(_SCENARIO)
+    listed = runtime.read_persistent_values()
     assert listed["program_revision"] == _REVISION
     assert listed["program_run_id"] is None
     # Only persistent keys; run keys are not stored between runs.
@@ -343,39 +363,39 @@ def test_values_are_listed_set_reset_and_cleared_without_a_run(tmp_path) -> None
         "sequence": None,
     }
 
-    written = runtime.set_persistent_value(_SCENARIO, _set(runtime, "layer", 3))
+    written = runtime.set_persistent_value(_set(runtime, "layer", 3))
     assert written["action"] == "set"
     layer = _rows(written["values"])["layer"]
     assert (layer["stored"], layer["value"]) == (True, 3)
     # Committed before success is reported: a new register sees it.
     reopened = PersistentKeyRegister(tmp_path / "persistent-keys.json")
-    assert reopened.values(_SCENARIO)["layer"]["value"] == 3
+    assert reopened.values(_PROJECT)["layer"]["value"] == 3
 
-    reset = runtime.reset_persistent_value(_SCENARIO, _reset(runtime, "layer"))
+    reset = runtime.reset_persistent_value(_reset(runtime, "layer"))
     assert _rows(reset["values"])["layer"]["stored"] is False
 
     runtime.set_persistent_value(
-        _SCENARIO, _set(runtime, "layer", 4, request_id="request.layer.again")
+        _set(runtime, "layer", 4, request_id="request.layer.again")
     )
-    runtime.set_persistent_value(_SCENARIO, _set(runtime, "counted", 7))
+    runtime.set_persistent_value(_set(runtime, "counted", 7))
     # A read key's stored value (the Program wrote it) is the Program's own.
     register = runtime._persistent_keys  # noqa: SLF001
     assert register is not None
     limit = Program.from_dict(
         deepcopy(_DOCUMENT), build_node_environment().catalog
     ).blackboard_keys["limit"]
-    register.commit(_SCENARIO, limit, 0.7)
+    register.commit(_PROJECT, limit, 0.7)
     # Clear is one Reset per writable key: read keys keep their stored value.
-    cleared = runtime.clear_persistent_values(_SCENARIO, _clear())
+    cleared = runtime.clear_persistent_values(_clear())
     assert cleared["removed"] == 2
-    rows = _rows(runtime.read_persistent_values(_SCENARIO))
+    rows = _rows(runtime.read_persistent_values())
     assert (rows["layer"]["stored"], rows["layer"]["initial"]) == (False, 0)
     assert rows["counted"]["stored"] is False
     assert (rows["limit"]["stored"], rows["limit"]["value"]) == (True, 0.7)
     # Every accepted edit is audited with its request, in commit order.
     assert [
         (edit["action"], edit["key"], edit["request_id"])
-        for edit in runtime.read_persistent_values(_SCENARIO)["edits"]
+        for edit in runtime.read_persistent_values()["edits"]
     ] == [
         ("set", "layer", "request.layer.1"),
         ("reset", "layer", "request.layer.0"),
@@ -389,46 +409,51 @@ def test_edits_are_validated_like_a_run_write_and_refused_by_name(tmp_path) -> N
     runtime, headless = _runtime(tmp_path)
 
     assert _refusal(lambda: runtime.set_persistent_value(
-        _SCENARIO, _set(runtime, "layer", 1.5)
+        _set(runtime, "layer", 1.5)
     )) == "persistent_key_value_invalid"
     # Set and Reset are both operator value changes: a read key refuses both.
     assert _refusal(lambda: runtime.set_persistent_value(
-        _SCENARIO, _set(runtime, "limit", 1.0)
+        _set(runtime, "limit", 1.0)
     )) == "persistent_key_access_conflict"
     assert _refusal(lambda: runtime.reset_persistent_value(
-        _SCENARIO, _reset(runtime, "limit")
+        _reset(runtime, "limit")
     )) == "persistent_key_access_conflict"
     assert _refusal(lambda: runtime.set_persistent_value(
-        _SCENARIO, _set(runtime, "scratch", 1)
+        _set(runtime, "scratch", 1)
     )) == "persistent_key_not_found"
     assert _refusal(lambda: runtime.set_persistent_value(
-        _SCENARIO, _set(runtime, "layer", 1, expected_program_revision="sha256:" + "0" * 64)
+        _set(runtime, "layer", 1, expected_program_revision="sha256:" + "0" * 64)
     )) == "persistent_key_program_stale"
+    # An edit names the project folder the operator saw; another is refused.
     assert _refusal(lambda: runtime.set_persistent_value(
-        "other", _set(runtime, "layer", 1)
-    )) == "persistent_key_path_invalid"
+        _set(runtime, "layer", 1, project_path="/projects/other/cell-pick.scenario")
+    )) == "persistent_key_scenario_conflict"
 
     headless.apply(_DOCUMENT, "other-scenario")
-    assert _refusal(
-        lambda: runtime.read_persistent_values(_SCENARIO)
-    ) == "persistent_key_scenario_conflict"
+    # A read follows the Applied project; an edit made on the old one is refused.
+    assert runtime.read_persistent_values()["project_path"] == (
+        "/projects/other-scenario.scenario"
+    )
+    assert _refusal(lambda: runtime.set_persistent_value(
+        _set(runtime, "layer", 1, request_id="request.layer.other")
+    )) == "persistent_key_scenario_conflict"
     # Clear resets the Applied Program's writable keys, so it needs that Program.
     assert _refusal(
-        lambda: runtime.clear_persistent_values(_SCENARIO, _clear())
+        lambda: runtime.clear_persistent_values(_clear())
     ) == "persistent_key_scenario_conflict"
     headless.current = HeadlessClientError(
         "program_applied_selection_not_active", "Apply in progress"
     )
     assert _refusal(
-        lambda: runtime.read_persistent_values(_SCENARIO)
+        lambda: runtime.read_persistent_values()
     ) == "persistent_key_activation_unavailable"
     # A Scenario applied without a Program declares no keys to edit.
     headless.apply(None)
     assert _refusal(
-        lambda: runtime.read_persistent_values(_SCENARIO)
+        lambda: runtime.read_persistent_values()
     ) == "persistent_key_program_unavailable"
     assert PersistentKeyRegister(tmp_path / "persistent-keys.json").values(
-        _SCENARIO
+        _PROJECT
     ) == {}
 
 
@@ -436,14 +461,13 @@ def test_a_live_run_owns_the_values_and_serializes_operator_edits(tmp_path) -> N
     runtime, _headless = _runtime(tmp_path)
     register = runtime._persistent_keys  # noqa: SLF001
     assert register is not None
-    register.commit(
-        _SCENARIO,
+    register.commit(_PROJECT,
         Program.from_dict(
             deepcopy(_DOCUMENT), build_node_environment().catalog
         ).blackboard_keys["layer"],
         4,
     )
-    owner = _Owner(register)
+    owner = _Owner(register, runtime._headless.current["record_digest"])  # noqa: SLF001
     runtime._owner = owner  # type: ignore[assignment]  # noqa: SLF001
     controls = ProgramRuntimeControls(
         {
@@ -459,7 +483,7 @@ def test_a_live_run_owns_the_values_and_serializes_operator_edits(tmp_path) -> N
     runtime._runtime_controls[_RUN] = controls  # noqa: SLF001
     assert owner.store.read("layer") == 4
 
-    written = runtime.set_persistent_value(_SCENARIO, _set(runtime, "layer", 5))
+    written = runtime.set_persistent_value(_set(runtime, "layer", 5))
     # The run's own store took the write: visible value and register agree.
     assert owner.store.read("layer") == 5
     assert owner.writes == [
@@ -468,12 +492,12 @@ def test_a_live_run_owns_the_values_and_serializes_operator_edits(tmp_path) -> N
     assert _rows(written["values"])["layer"]["value"] == 5
     assert written["values"]["program_run_id"] == _RUN
 
-    runtime.reset_persistent_value(_SCENARIO, _reset(runtime, "layer"))
+    runtime.reset_persistent_value(_reset(runtime, "layer"))
     assert owner.store.read("layer") == 0
     assert owner.store.read_bundle("layer")["meta"]["value_source"] == "initial"
-    assert "layer" not in register.values(_SCENARIO)
-    runtime.set_persistent_value(_SCENARIO, _set(runtime, "counted", 2))
-    runtime.reset_persistent_value(_SCENARIO, _reset(runtime, "counted"))
+    assert "layer" not in register.values(_PROJECT)
+    runtime.set_persistent_value(_set(runtime, "counted", 2))
+    runtime.reset_persistent_value(_reset(runtime, "counted"))
     # A key without `initial:` is empty again after Reset.
     assert not owner.store.contains("counted")
     assert [
@@ -486,7 +510,7 @@ def test_a_live_run_owns_the_values_and_serializes_operator_edits(tmp_path) -> N
     ]
     # Clearing would bypass the live store; the run must end first.
     assert _refusal(
-        lambda: runtime.clear_persistent_values(_SCENARIO, _clear())
+        lambda: runtime.clear_persistent_values(_clear())
     ) == "persistent_key_run_conflict"
 
     # Edits through the run are attributed to it and keep their request.
@@ -498,7 +522,7 @@ def test_a_live_run_owns_the_values_and_serializes_operator_edits(tmp_path) -> N
             edit["source_label"],
             edit["program_run_id"],
         )
-        for edit in register.edits(_SCENARIO)
+        for edit in register.edits(_PROJECT)
     ] == [
         ("set", "layer", "request.layer.1", "runtime_control", _RUN),
         ("reset", "layer", "request.layer.0", "runtime_control", _RUN),
@@ -509,19 +533,19 @@ def test_a_live_run_owns_the_values_and_serializes_operator_edits(tmp_path) -> N
     owner.state = "full_stopped"
     with pytest.raises(ProgramRunnerError) as halted:
         runtime.set_persistent_value(
-            _SCENARIO, _set(runtime, "layer", 9, request_id="request.layer.halted")
+            _set(runtime, "layer", 9, request_id="request.layer.halted")
         )
     assert halted.value.code == "persistent_key_run_conflict"
     assert "require a current Program run" in str(halted.value)
-    assert "layer" not in register.values(_SCENARIO)
-    assert len(register.edits(_SCENARIO)) == 4
+    assert "layer" not in register.values(_PROJECT)
+    assert len(register.edits(_PROJECT)) == 4
 
 
 def test_a_runner_without_a_register_refuses_by_name(tmp_path) -> None:
     runtime, _headless = _runtime(tmp_path)
     runtime._persistent_keys = None  # noqa: SLF001
     assert _refusal(
-        lambda: runtime.read_persistent_values(_SCENARIO)
+        lambda: runtime.read_persistent_values()
     ) == "persistent_key_register_unavailable"
 
 
@@ -537,7 +561,7 @@ def test_a_failed_reset_leaves_the_stored_and_visible_value(tmp_path) -> None:
     with pytest.raises(ProgramValueError, match="could not be reset"):
         store.reset_to_initial("layer")
     assert store.read("layer") == 6
-    assert register.values(_SCENARIO)["layer"]["value"] == 6
+    assert register.values(_PROJECT)["layer"]["value"] == 6
     with pytest.raises(ProgramValueError, match="not persistent"):
         store.reset_to_initial("scratch")
 
@@ -551,7 +575,7 @@ def _layer() -> Any:
 def _live(runtime: ProgramRuntime) -> _Owner:
     register = runtime._persistent_keys  # noqa: SLF001
     assert register is not None
-    owner = _Owner(register)
+    owner = _Owner(register, runtime._headless.current["record_digest"])  # noqa: SLF001
     runtime._owner = owner  # type: ignore[assignment]  # noqa: SLF001
     runtime._runtime_controls[_RUN] = ProgramRuntimeControls(  # noqa: SLF001
         {
@@ -573,20 +597,19 @@ def test_without_a_run_the_last_edit_wins_and_a_resend_never_applies(tmp_path) -
     assert register is not None
 
     first = _set(runtime, "layer", 3, request_id="request.first")
-    runtime.set_persistent_value(_SCENARIO, first)
+    runtime.set_persistent_value(first)
     # Two different requests in sequence: the later one wins.
-    runtime.set_persistent_value(
-        _SCENARIO, _set(runtime, "layer", 8, request_id="request.second")
+    runtime.set_persistent_value(_set(runtime, "layer", 8, request_id="request.second")
     )
-    assert register.values(_SCENARIO)["layer"]["value"] == 8
+    assert register.values(_PROJECT)["layer"]["value"] == 8
     # Resending the first is refused by its identity: the value stays 8.
     assert _refusal(
-        lambda: runtime.set_persistent_value(_SCENARIO, first)
+        lambda: runtime.set_persistent_value(first)
     ) == "persistent_key_request_replayed"
-    assert register.values(_SCENARIO)["layer"]["value"] == 8
+    assert register.values(_PROJECT)["layer"]["value"] == 8
     # A Reset brings no earlier state back, and is never applied twice.
     reset = _reset(runtime, "layer")
-    runtime.reset_persistent_value(_SCENARIO, reset)
+    runtime.reset_persistent_value(reset)
     for request in (first, reset):
         call = (
             runtime.set_persistent_value
@@ -594,21 +617,21 @@ def test_without_a_run_the_last_edit_wins_and_a_resend_never_applies(tmp_path) -
             else runtime.reset_persistent_value
         )
         assert _refusal(
-            lambda: call(_SCENARIO, request)
+            lambda: call(request)
         ) == "persistent_key_request_replayed"
-    assert "layer" not in register.values(_SCENARIO)
+    assert "layer" not in register.values(_PROJECT)
 
     # A Clear after another edit is admitted; resending it is refused.
-    runtime.set_persistent_value(_SCENARIO, _set(runtime, "counted", 1))
+    runtime.set_persistent_value(_set(runtime, "counted", 1))
     clear = _clear()
-    assert runtime.clear_persistent_values(_SCENARIO, clear)["removed"] == 1
+    assert runtime.clear_persistent_values(clear)["removed"] == 1
     runtime.set_persistent_value(
-        _SCENARIO, _set(runtime, "counted", 2, request_id="request.counted.again")
+        _set(runtime, "counted", 2, request_id="request.counted.again")
     )
     assert _refusal(
-        lambda: runtime.clear_persistent_values(_SCENARIO, clear)
+        lambda: runtime.clear_persistent_values(clear)
     ) == "persistent_key_request_replayed"
-    assert register.values(_SCENARIO)["counted"]["value"] == 2
+    assert register.values(_PROJECT)["counted"]["value"] == 2
 
     # The same request identity while it is still in flight is not admitted.
     journal = runtime._journal  # noqa: SLF001
@@ -622,9 +645,9 @@ def test_without_a_run_the_last_edit_wins_and_a_resend_never_applies(tmp_path) -
         cycle_generation=journal.read().cycle_generation,
     )
     assert _refusal(
-        lambda: runtime.set_persistent_value(_SCENARIO, pending)
+        lambda: runtime.set_persistent_value(pending)
     ) == "execution_control_command_in_progress"
-    assert "layer" not in register.values(_SCENARIO)
+    assert "layer" not in register.values(_PROJECT)
     # Refused and accepted edits leave nothing in flight behind them.
     assert [row["request_id"] for row in journal.pending_commands()] == [
         "request.pending"
@@ -634,17 +657,15 @@ def test_without_a_run_the_last_edit_wins_and_a_resend_never_applies(tmp_path) -
     # identity there too.
     owner = _live(runtime)
     through_run = _set(runtime, "layer", 5, request_id="request.run")
-    runtime.set_persistent_value(_SCENARIO, through_run)
+    runtime.set_persistent_value(through_run)
     owner.store.write("layer", 6)
     assert _refusal(
-        lambda: runtime.set_persistent_value(_SCENARIO, through_run)
+        lambda: runtime.set_persistent_value(through_run)
     ) == "persistent_key_request_replayed"
     assert owner.store.read("layer") == 6
     # A new edit made on an older view of the run is stale.
     assert _refusal(
-        lambda: runtime.set_persistent_value(
-            _SCENARIO,
-            _set(
+        lambda: runtime.set_persistent_value(_set(
                 runtime,
                 "layer",
                 7,
@@ -656,7 +677,6 @@ def test_without_a_run_the_last_edit_wins_and_a_resend_never_applies(tmp_path) -
     # An edit must name the live run that holds the values.
     assert _refusal(
         lambda: runtime.set_persistent_value(
-            _SCENARIO,
             _set(runtime, "layer", 7, program_run_id=None, expected_run_revision=None),
         )
     ) == "persistent_key_values_stale"
@@ -669,37 +689,35 @@ def test_without_a_run_a_value_is_written_only_when_it_changes(tmp_path) -> None
     path = tmp_path / "persistent-keys.json"
 
     # No stored row is never equal to `initial:`: setting it stores a row.
-    runtime.set_persistent_value(
-        _SCENARIO, _set(runtime, "layer", 0, request_id="request.initial")
+    runtime.set_persistent_value(_set(runtime, "layer", 0, request_id="request.initial")
     )
-    assert register.values(_SCENARIO)["layer"]["value"] == 0
+    assert register.values(_PROJECT)["layer"]["value"] == 0
     stored = path.read_bytes()
     sequence = register.sequence
 
     # The same value again completes without rewriting the register.
     same = _set(runtime, "layer", 0, request_id="request.same")
-    written = runtime.set_persistent_value(_SCENARIO, same)
+    written = runtime.set_persistent_value(same)
     assert _rows(written["values"])["layer"]["value"] == 0
     assert path.read_bytes() == stored
     assert register.sequence == sequence
     assert [
         edit["request_id"]
-        for edit in runtime.read_persistent_values(_SCENARIO)["edits"]
+        for edit in runtime.read_persistent_values()["edits"]
     ] == ["request.initial"]
     # It was still applied: a resend is refused by its identity.
     assert _refusal(
-        lambda: runtime.set_persistent_value(_SCENARIO, same)
+        lambda: runtime.set_persistent_value(same)
     ) == "persistent_key_request_replayed"
 
     # A changed value is written.
-    runtime.set_persistent_value(
-        _SCENARIO, _set(runtime, "layer", 1, request_id="request.changed")
+    runtime.set_persistent_value(_set(runtime, "layer", 1, request_id="request.changed")
     )
-    assert register.values(_SCENARIO)["layer"]["value"] == 1
+    assert register.values(_PROJECT)["layer"]["value"] == 1
     assert register.sequence == sequence + 1
     assert [
         edit["request_id"]
-        for edit in runtime.read_persistent_values(_SCENARIO)["edits"]
+        for edit in runtime.read_persistent_values()["edits"]
     ] == ["request.initial", "request.changed"]
 
 
@@ -710,9 +728,8 @@ def test_a_resend_stays_refused_after_many_node_writes_and_a_journal_reopen(
     register = runtime._persistent_keys  # noqa: SLF001
     assert register is not None
     first = _set(runtime, "layer", 3, request_id="request.first")
-    runtime.set_persistent_value(_SCENARIO, first)
-    runtime.set_persistent_value(
-        _SCENARIO, _set(runtime, "layer", 8, request_id="request.second")
+    runtime.set_persistent_value(first)
+    runtime.set_persistent_value(_set(runtime, "layer", 8, request_id="request.second")
     )
 
     # A run's node writes carry no request: more of them than the register's
@@ -720,14 +737,14 @@ def test_a_resend_stays_refused_after_many_node_writes_and_a_journal_reopen(
     store = _Owner(register).store
     for value in range(100, 400):
         store.write("layer", value)
-    assert len(register.edits(_SCENARIO)) == persistent_keys.MAX_EDITS
+    assert len(register.edits(_PROJECT)) == persistent_keys.MAX_EDITS
     assert not any(
-        edit["request_id"] == "request.first" for edit in register.edits(_SCENARIO)
+        edit["request_id"] == "request.first" for edit in register.edits(_PROJECT)
     )
     assert _refusal(
-        lambda: runtime.set_persistent_value(_SCENARIO, first)
+        lambda: runtime.set_persistent_value(first)
     ) == "persistent_key_request_replayed"
-    assert register.values(_SCENARIO)["layer"]["value"] == 399
+    assert register.values(_PROJECT)["layer"]["value"] == 399
 
     # The completed identities survive a journal reopen (runner restart).
     journal = runtime._journal  # noqa: SLF001
@@ -735,10 +752,10 @@ def test_a_resend_stays_refused_after_many_node_writes_and_a_journal_reopen(
     journal.close()
     restarted, _headless = _runtime(tmp_path)
     assert _refusal(
-        lambda: restarted.set_persistent_value(_SCENARIO, first)
+        lambda: restarted.set_persistent_value(first)
     ) == "persistent_key_request_replayed"
     assert register.path == restarted._persistent_keys.path  # noqa: SLF001
-    assert PersistentKeyRegister(register.path).values(_SCENARIO)["layer"][
+    assert PersistentKeyRegister(register.path).values(_PROJECT)["layer"][
         "value"
     ] == 399
 
@@ -748,7 +765,7 @@ def test_an_edit_names_the_live_run_with_its_revision_or_nothing() -> None:
         "request_id": "request.1",
         "request_owner_epoch": "composer.epoch.1",
         "source_label": "operator_ui",
-        "scenario_id": _SCENARIO,
+        "project_path": _PROJECT,
         "key": "layer",
         "expected_program_revision": _REVISION,
     }
@@ -772,7 +789,7 @@ def test_a_program_without_persistent_keys_still_drops_the_scenarios_rows(
     runtime, headless = _runtime(tmp_path)
     register = runtime._persistent_keys  # noqa: SLF001
     assert register is not None
-    runtime.set_persistent_value(_SCENARIO, _set(runtime, "layer", 9))
+    runtime.set_persistent_value(_set(runtime, "layer", 9))
     headless.apply(_program(_key("scratch", persistence="run")))
 
     reconciled = runtime.reconcile_persistent_values()
@@ -780,15 +797,15 @@ def test_a_program_without_persistent_keys_still_drops_the_scenarios_rows(
     assert reconciled["outcome"] == "reconciled"
     assert reconciled["dropped"] == [
         {
-            "scenario_id": _SCENARIO,
+            "project_path": _PROJECT,
             "key": "layer",
             "reason": "key_not_declared_persistent",
         }
     ]
-    assert register.values(_SCENARIO) == {}
+    assert register.values(_PROJECT) == {}
     # Re-declaring the key later never brings the dropped value back.
     headless.apply(_DOCUMENT)
-    assert _rows(runtime.read_persistent_values(_SCENARIO))["layer"]["stored"] is False
+    assert _rows(runtime.read_persistent_values())["layer"]["stored"] is False
 
 
 def _fail_directory_sync(monkeypatch: pytest.MonkeyPatch) -> list[bool]:
@@ -814,53 +831,53 @@ def test_an_edit_that_may_not_be_durable_is_reported_as_such(
 
     written = _set(runtime, "layer", 3)
     assert _refusal(
-        lambda: runtime.set_persistent_value(_SCENARIO, written)
+        lambda: runtime.set_persistent_value(written)
     ) == "persistent_key_storage_uncertain"
     # The file has the value, so the register holds it, and the request is
     # completed: a resend is refused at once, never applied twice ...
-    assert register.values(_SCENARIO)["layer"]["value"] == 3
+    assert register.values(_PROJECT)["layer"]["value"] == 3
     assert _refusal(
-        lambda: runtime.set_persistent_value(_SCENARIO, written)
+        lambda: runtime.set_persistent_value(written)
     ) == "persistent_key_request_replayed"
     # ... and until it is reconciled with disk nothing is shown or changed.
     assert _refusal(
         lambda: runtime.set_persistent_value(
-            _SCENARIO, _set(runtime, "layer", 4, request_id="request.layer.blocked")
+            _set(runtime, "layer", 4, request_id="request.layer.blocked")
         )
     ) == "persistent_key_storage_unavailable"
-    listed = runtime.read_persistent_values(_SCENARIO)
+    listed = runtime.read_persistent_values()
     assert listed["storage_fault"]["code"] == "persistent_key_storage_unavailable"
     assert not any(row["stored"] for row in listed["keys"])
     failing[0] = False
     assert _refusal(
-        lambda: runtime.set_persistent_value(_SCENARIO, written)
+        lambda: runtime.set_persistent_value(written)
     ) == "persistent_key_request_replayed"
     runtime.set_persistent_value(
-        _SCENARIO, _set(runtime, "layer", 4, request_id="request.layer.after")
+        _set(runtime, "layer", 4, request_id="request.layer.after")
     )
-    assert PersistentKeyRegister(register.path).values(_SCENARIO)["layer"]["value"] == 4
+    assert PersistentKeyRegister(register.path).values(_PROJECT)["layer"]["value"] == 4
 
     # Through a live run the run shows the change and advances its revision.
     owner = _live(runtime)
     failing[0] = True
     through_run = _set(runtime, "layer", 5, request_id="request.layer.run")
     assert _refusal(
-        lambda: runtime.set_persistent_value(_SCENARIO, through_run)
+        lambda: runtime.set_persistent_value(through_run)
     ) == "persistent_key_storage_uncertain"
     assert owner.store.read("layer") == 5
-    assert register.values(_SCENARIO)["layer"]["value"] == 5
+    assert register.values(_PROJECT)["layer"]["value"] == 5
     assert _refusal(
-        lambda: runtime.set_persistent_value(_SCENARIO, through_run)
+        lambda: runtime.set_persistent_value(through_run)
     ) == "persistent_key_request_replayed"
     failing[0] = False
     assert _refusal(
-        lambda: runtime.set_persistent_value(_SCENARIO, through_run)
+        lambda: runtime.set_persistent_value(through_run)
     ) == "persistent_key_request_replayed"
 
 
 def test_sealed_current_reconciliation_is_read_only_and_repeated(tmp_path, monkeypatch):
     runtime, headless = _runtime(tmp_path)
-    runtime.set_persistent_value(_SCENARIO, _set(runtime, "layer", 9))
+    runtime.set_persistent_value(_set(runtime, "layer", 9))
     register = runtime._persistent_keys  # noqa: SLF001
     assert register is not None
     original_bytes = register.path.read_bytes()
@@ -884,7 +901,7 @@ def test_sealed_current_reconciliation_is_read_only_and_repeated(tmp_path, monke
     assert register.path.read_bytes() == original_bytes
     assert register.sequence == original_sequence
     assert register.activation == original_activation
-    assert register.values(_SCENARIO)["layer"]["value"] == 9
+    assert register.values(_PROJECT)["layer"]["value"] == 9
     assert _refusal(
         lambda: runtime._committed_activation()  # noqa: SLF001
     ) == "persistent_key_activation_unavailable"
@@ -997,7 +1014,7 @@ def test_originless_projection_is_a_named_refusal_with_a_stale_parser(
 @pytest.mark.parametrize("extra", [0, 1])
 def test_complete_history_bound_counts_sealed_rows(tmp_path, current_kind, extra):
     runtime, headless = _runtime(tmp_path)
-    runtime.set_persistent_value(_SCENARIO, _set(runtime, "layer", 9))
+    runtime.set_persistent_value(_set(runtime, "layer", 9))
     register = runtime._persistent_keys  # noqa: SLF001
     assert register is not None
     original = register.path.read_bytes()
@@ -1018,12 +1035,12 @@ def test_complete_history_bound_counts_sealed_rows(tmp_path, current_kind, extra
         assert result["outcome"] == (
             "reconciled" if current_kind == "scenario" else "no_scenario"
         )
-    assert register.values(_SCENARIO)["layer"]["value"] == 9
+    assert register.values(_PROJECT)["layer"]["value"] == 9
 
 
 def test_distinct_scenario_a_empty_b_keeps_a_values_without_a_fake_scenario(tmp_path):
     runtime, headless = _runtime(tmp_path)
-    runtime.set_persistent_value(_SCENARIO, _set(runtime, "layer", 9))
+    runtime.set_persistent_value(_set(runtime, "layer", 9))
     register = runtime._persistent_keys  # noqa: SLF001
     assert register is not None
     original = register.path.read_bytes()
@@ -1033,13 +1050,38 @@ def test_distinct_scenario_a_empty_b_keeps_a_values_without_a_fake_scenario(tmp_
     other_scenario = "cell-other"
     current = headless.apply(_DOCUMENT, other_scenario)
     result = runtime.reconcile_persistent_values()
-    assert result["scenario_id"] == other_scenario
+    assert result["project_path"] == "/projects/cell-other.scenario"
     assert result["record_digest"] == current
     assert result["dropped"] == []
     assert result["unobserved_applies"] == []
-    assert register.values(_SCENARIO)["layer"]["value"] == 9
-    assert register.activation["scenario_id"] == other_scenario
+    assert register.values(_PROJECT)["layer"]["value"] == 9
+    assert register.activation["project_path"] == "/projects/cell-other.scenario"
     assert empty not in json.loads(register.path.read_text())["reconciled_applies"]
     assert _refusal(
-        lambda: runtime.read_persistent_values(_SCENARIO)
+        lambda: runtime.set_persistent_value(
+            _set(runtime, "layer", 1, request_id="request.layer.other")
+        )
     ) == "persistent_key_scenario_conflict"
+
+
+def test_same_named_projects_in_different_folders_keep_separate_values(tmp_path):
+    runtime, headless = _runtime(tmp_path)
+    runtime.set_persistent_value(_set(runtime, "layer", 9))
+    # The same Scenario id applied from another folder is another project.
+    elsewhere = "/site/line2/cell-pick.scenario"
+    headless.apply(_DOCUMENT, _SCENARIO, elsewhere)
+    listed = runtime.read_persistent_values()
+    assert (listed["scenario_id"], listed["project_path"]) == (_SCENARIO, elsewhere)
+    assert _rows(listed)["layer"]["stored"] is False
+    runtime.set_persistent_value(
+        _set(runtime, "layer", 2, project_path=elsewhere, request_id="request.elsewhere")
+    )
+    # A moved or renamed folder starts with no stored values either.
+    headless.apply(_DOCUMENT, _SCENARIO, "/site/line1/renamed.scenario")
+    assert _rows(runtime.read_persistent_values())["layer"]["stored"] is False
+    # Back at the original folder, its own value is restored untouched.
+    headless.apply(_DOCUMENT)
+    assert _rows(runtime.read_persistent_values())["layer"]["value"] == 9
+    register = runtime._persistent_keys  # noqa: SLF001
+    assert register is not None
+    assert register.values(elsewhere)["layer"]["value"] == 2

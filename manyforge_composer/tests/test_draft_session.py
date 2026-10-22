@@ -163,7 +163,7 @@ def _pick_macro_arguments() -> dict:
         "target_role": "arm",
         "tool_target_role": "gripper",
         "base_frame_role": "base",
-        "tcp_frame_role": "tcp",
+        "tcp_endpoint": {"target_role": "arm", "frame_role": "tcp"},
         "carrier_frame_role": "tcp",
         "touch_body_roles": ["gripper_collision"],
         "tool_position": {"kind": "linear_m", "value_m": 0.0},
@@ -290,6 +290,107 @@ def test_contact_policy_upsert_mints_identity_and_remove_is_atomic() -> None:
     assert session.snapshot()["authoring"]["contact_policies"] == []
 
 
+def test_contact_policy_canonicalizes_motion_endpoint_pair_without_body_alias() -> None:
+    session = ComposerDraftSession(_pick_program())
+    policy = deepcopy(session.snapshot()["authoring"]["contact_policies"][0])
+    policy["zones"][0]["body_pairs"] = [{
+        "body_a": {"kind": "runtime_object", "runtime_object_id": "graspable"},
+        "body_b": {"kind": "motion_endpoint"},
+    }]
+
+    _mutate(
+        session,
+        "program_draft_upsert_contact_policies",
+        {"contact_policies": [policy]},
+    )
+
+    stored = session.snapshot()["authoring"]["contact_policies"][0]
+    assert stored["zones"][0]["body_pairs"] == policy["zones"][0]["body_pairs"]
+    assert stored["version"] != policy["version"]
+
+    invalid = deepcopy(stored)
+    invalid["zones"][0]["body_pairs"][0]["body_b"]["frame_role"] = "tcp"
+    before = session.retained_state()
+    with pytest.raises(DraftSessionError):
+        _mutate(
+            session,
+            "program_draft_upsert_contact_policies",
+            {"contact_policies": [invalid]},
+        )
+    assert session.retained_state() == before
+
+
+def _release_policy(policy: dict, **zone: object) -> dict:
+    """The selected grasp policy as a release policy with the given envelope."""
+
+    release = deepcopy(policy)
+    release.pop("version", None)
+    release["mode"] = "contact_release"
+    common = {
+        key: release["zones"][0][key]
+        for key in ("zone_id", "body_pairs", "violation_response")
+    }
+    release["zones"] = [{**common, **zone}]
+    return release
+
+
+def test_contact_policy_accepts_release_envelope_and_refuses_mixed_fields() -> None:
+    session = ComposerDraftSession(_pick_program())
+    grasp = session.snapshot()["authoring"]["contact_policies"][0]
+    signed = _release_policy(
+        grasp,
+        release_evidence_mode="signed_penetration",
+        enforce_max_start_penetration=True,
+        max_start_penetration_m=0.002,
+        min_release_progress_m=0,
+        release_tolerance_m=0.00001,
+        require_strictly_decreasing_penetration=True,
+        require_separation_by_end=True,
+        allow_recontact=False,
+    )
+
+    _mutate(session, "program_draft_upsert_contact_policies", {"contact_policies": [signed]})
+
+    stored = deepcopy(session.snapshot()["authoring"]["contact_policies"][0])
+    stored.pop("version")
+    assert stored == signed
+
+    invalid = [
+        # A release zone never carries the grasp envelope.
+        _release_policy(grasp, release_evidence_mode="signed_penetration", max_penetration_m=0.002),
+        # Binary evidence admits only neutral metric values.
+        _release_policy(grasp, release_evidence_mode="binary_contact", max_start_penetration_m=0.002),
+        _release_policy(grasp, release_evidence_mode="unknown"),
+        _release_policy(grasp, release_evidence_mode="signed_penetration", release_tolerance_m=1001),
+        _release_policy(grasp, release_evidence_mode="signed_penetration", allow_recontact=0),
+        # Malformed discriminators are refusals, never a TypeError.
+        _release_policy(grasp, release_evidence_mode=[]),
+        _release_policy(grasp, release_evidence_mode={}),
+        {**_release_policy(grasp, release_evidence_mode="signed_penetration"), "mode": []},
+        {**_release_policy(grasp, release_evidence_mode="signed_penetration"), "mode": {}},
+    ]
+    before = session.retained_state()
+    for policy in invalid:
+        with pytest.raises(DraftSessionError):
+            _mutate(session, "program_draft_upsert_contact_policies", {"contact_policies": [policy]})
+    assert session.retained_state() == before
+
+    # The grasp envelope keeps its approved bounds: no new upper penetration cap.
+    wide_grasp = deepcopy(grasp)
+    wide_grasp.pop("version", None)
+    wide_grasp["zones"][0]["max_penetration_m"] = 1500.0
+    _mutate(session, "program_draft_upsert_contact_policies", {"contact_policies": [wide_grasp]})
+
+    # Omitted binary metrics are the neutral values.
+    binary = _release_policy(
+        grasp,
+        release_evidence_mode="binary_contact",
+        require_separation_by_end=True,
+        allow_recontact=False,
+    )
+    _mutate(session, "program_draft_upsert_contact_policies", {"contact_policies": [binary]})
+
+
 def test_pick_authoring_macro_expands_visible_nodes_and_declarations_once() -> None:
     session = ComposerDraftSession(_pick_program())
     before_revision = session.revision
@@ -342,6 +443,38 @@ def test_pick_authoring_macro_expands_visible_nodes_and_declarations_once() -> N
         {"field": "selected_object_id", "type": "scene_resource"},
         {"field": "tool_position", "type": "coordinate_position"},
     ]
+
+
+def test_pick_authoring_macro_forwards_one_qualified_endpoint_to_motion_nodes() -> None:
+    session = ComposerDraftSession(_pick_program())
+    arguments = _pick_macro_arguments()
+
+    _mutate(session, "program_draft_expand_authoring_macro", arguments)
+
+    inserted = next(
+        node
+        for node in session.snapshot()["authoring"]["forest"]
+        if node["instance_id"] == "authored_pick"
+    )
+    motion_nodes = [
+        node for node in inserted["children"]
+        if node["node_id"] in {"motion.move_to_pose", "motion.follow_cartesian_path"}
+    ]
+    assert motion_nodes
+    assert all(node["parameters"]["tcp_endpoint"] == arguments["tcp_endpoint"]
+               for node in motion_nodes)
+    assert all("tcp_frame_role" not in node["parameters"] for node in motion_nodes)
+
+
+def test_pick_authoring_macro_rejects_legacy_tcp_frame_selector() -> None:
+    session = ComposerDraftSession(_pick_program())
+    arguments = _pick_macro_arguments()
+    arguments["tcp_frame_role"] = "tcp"
+
+    with pytest.raises(DraftSessionError) as refused:
+        _mutate(session, "program_draft_expand_authoring_macro", arguments)
+
+    assert refused.value.code == "draft_arguments_invalid"
 
 
 def test_pick_authoring_macro_failure_leaves_draft_unchanged() -> None:
@@ -454,7 +587,7 @@ def test_store_observed_move_updates_only_selected_node(
     node["parameters"] = {
         "target_role": "arm",
         "base_frame_role": "base",
-        "tcp_frame_role": "tcp",
+        "tcp_endpoint": {"target_role": "arm", "frame_role": "tcp"},
         "goal": (
             [{"joint_name": "joint1", "position_rad": 0.0}]
             if observed_kind == "joint"
@@ -1936,7 +2069,7 @@ def test_new_cartesian_node_inherits_scenario_fidelity_defaults() -> None:
         "parameters": {
             "target_role": "arm",
             "base_frame_role": "base",
-            "tcp_frame_role": "tcp",
+            "tcp_endpoint": {"target_role": "arm", "frame_role": "tcp"},
             "translation_tol_m": 0.002,
             "max_blend_deviation_rad": 0.03,
         },

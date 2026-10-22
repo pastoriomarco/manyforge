@@ -6,6 +6,7 @@
 #include <Eigen/Geometry>
 #include <algorithm>
 #include <chrono>
+#include <cmath>
 #include <filesystem>
 #include <fstream>
 #include <future>
@@ -1297,6 +1298,183 @@ TEST(ProcessContainedCandidateClientTest,
   EXPECT_EQ(recovered.value().waypoints.back().positions_rad,
             values(fixture.goal));
   std::filesystem::remove(marker, ignored);
+}
+
+// One modeled rotating tool: two disjoint 10mm spheres at radii 0.1/0.2m.
+// At q=0.5 the selected object is 19mm from the chosen tool sphere, so the
+// endpoint penetrates by 1mm. The planner projection alone permits this pair;
+// the final coordinator still owns terminal-window and penetration checks.
+[[nodiscard]] ProcessFixture
+make_contact_fixture(const std::filesystem::path &root) {
+  auto fixture = make_fixture();
+  const std::string urdf = R"(<robot name="contact_tool">
+<link name="base"/><link name="rotor"/>
+<joint name="spin" type="revolute"><parent link="base"/><child link="rotor"/>
+<axis xyz="0 0 1"/><limit lower="-1" upper="1" effort="1" velocity="1"/></joint>
+<link name="finger"><collision><geometry><sphere radius="0.01"/></geometry></collision></link>
+<joint name="finger_mount" type="fixed"><parent link="rotor"/><child link="finger"/><origin xyz="0.1 0 0"/></joint>
+<link name="palm"><collision><geometry><sphere radius="0.01"/></geometry></collision></link>
+<joint name="palm_mount" type="fixed"><parent link="rotor"/><child link="palm"/><origin xyz="0.2 0 0"/></joint>
+</robot>)";
+  const std::string srdf =
+      R"(<robot name="contact_tool"><group name="arm"><joint name="spin"/></group></robot>)";
+  write_file(root / "tool.urdf", urdf);
+  write_file(root / "tool.srdf", srdf);
+  fixture.model = RoboPlanWorkerModelDTO{
+      "contact-tool",
+      root / "tool.urdf",
+      root / "tool.srdf",
+      {root},
+      {RoboPlanJointLimitInput{"spin",
+                               std::vector<double>{-1.0},
+                               std::vector<double>{1.0},
+                               {1.0},
+                               std::vector<double>{2.0}}},
+      {},
+      {}};
+  fixture.binding.resources = {ResourceId("resource/spin")};
+  fixture.binding.compiled_joint_names = {"spin"};
+  std::get<ResolvedComponentModelFrameDTO>(fixture.binding.permitted_frames[1])
+      .compiled_frame_name = "finger";
+  fixture.start = Eigen::VectorXd::Constant(1, 0.0);
+  fixture.goal = Eigen::VectorXd::Constant(1, 0.5);
+  fixture.reference_scene = make_roboplan_scene(RoboPlanSceneInput{
+      "contact-reference", urdf, srdf, {root}, fixture.model.joint_limits});
+  return fixture;
+}
+
+[[nodiscard]] RoboPlanCandidateProjectionDTO
+contact_projection(const std::optional<std::string> &active_policy,
+                   const std::string &object_id = "probe-object",
+                   const bool at_palm = false,
+                   const bool include_second_object = false) {
+  const auto robot_body = [](const std::string &link) {
+    CollisionWorldBody body;
+    body.body_id = CollisionBodyId("component/component-a/model/model-a/body/" +
+                                   link + "/collision/0");
+    body.owner_kind = CollisionOwnerKind::kComponentModelBody;
+    body.frame_id = link;
+    body.pose = identity_pose();
+    auto geometry = box_geometry(body.body_id, body.owner_kind);
+    geometry.geometry_kind = CollisionGeometryKind::kSphere;
+    geometry.box_dimensions_m.reset();
+    geometry.sphere_radius_m = 0.01;
+    body.geometries.push_back(std::move(geometry));
+    return body;
+  };
+  const auto object_body = [&](const std::string &id, bool inside = false) {
+    CollisionWorldBody body;
+    body.body_id = CollisionBodyId("scene/" + id + "/shape/0");
+    body.owner_kind = CollisionOwnerKind::kSceneResource;
+    body.frame_id = "base";
+    const double radius = (at_palm ? 0.2 : 0.1) + (inside ? -0.019 : 0.019);
+    body.pose = {{radius * std::cos(0.5), radius * std::sin(0.5), 0.0},
+                 {0.0, 0.0, 0.0, 1.0}};
+    auto geometry = box_geometry(body.body_id, body.owner_kind);
+    geometry.geometry_kind = CollisionGeometryKind::kSphere;
+    geometry.box_dimensions_m.reset();
+    geometry.sphere_radius_m = 0.01;
+    body.geometries.push_back(std::move(geometry));
+    return body;
+  };
+  auto policy = std::make_shared<CollisionPolicySnapshot>();
+  policy->policy_id = "operation-contact-projection";
+  policy->revision = CollisionPolicyRevision{1U, std::string(kDigestZero)};
+  policy->contact_grasps = {{"finger-contact",
+                             "probe-object",
+                             {robot_body("finger").body_id},
+                             0.001,
+                             0.8},
+                            {"palm-contact",
+                             "probe-object",
+                             {robot_body("palm").body_id},
+                             0.001,
+                             0.8}};
+  auto builder =
+      CollisionWorldSnapshotBuilder()
+          .set_publisher_id("operation-contact-test")
+          .set_revision_id(1U)
+          .set_policy_overlay_content_hash(policy->revision.content_hash);
+  builder.add_body(robot_body("finger"));
+  builder.add_body(robot_body("palm"));
+  builder.add_body(object_body(object_id));
+  if (include_second_object)
+    builder.add_body(object_body("probe-object-extra", true));
+  auto world = builder.build_shared();
+  if (!world.ok())
+    throw std::runtime_error(world.error().message);
+  return {projection().projection_binding, std::move(world.value()),
+          std::move(policy), active_policy};
+}
+
+TEST(ProcessContainedCandidateClientTest,
+     RealWorkerContactSelectionAllowsOneMillimetreGoalAndDoesNotLeak) {
+  SeparatedSceneRoots roots("contact-selected");
+  auto fixture = make_contact_fixture(roots.package_root);
+  auto process_config = config(MANYFORGE_ROBOPLAN_CANDIDATE_WORKER_PATH);
+  process_config.require_retained_projection = true;
+  ProcessContainedRoboPlanCandidateClient client(
+      fixture.model, fixture.binding,
+      RoboPlanCandidateComputerConfig{0x1234U, 65'536U, 0.01}, process_config);
+  auto selected = contact_projection("finger-contact");
+  const auto base_from_finger = fixture.reference_scene->forwardKinematics(
+      fixture.goal, "finger", "base");
+  const Eigen::Vector3d object_center{0.119 * std::cos(0.5),
+                                      0.119 * std::sin(0.5), 0.0};
+  EXPECT_NEAR(0.02 -
+                  (base_from_finger.block<3, 1>(0, 3) - object_center).norm(),
+              0.001, 1e-12);
+  ASSERT_TRUE(client.select_retained_projection(selected).ok());
+  auto result = client.compute(request(fixture));
+  ASSERT_TRUE(result.ok()) << result.error().message;
+  EXPECT_EQ(result.value().waypoints.back().positions_rad,
+            values(fixture.goal));
+
+  // Same world/policy identity: only the operation selector changes. A cached
+  // contact allowance must not leak to another policy or an ordinary request.
+  for (const auto &id : {std::optional<std::string>("palm-contact"),
+                         std::optional<std::string>("absent-policy"),
+                         std::optional<std::string>{}}) {
+    selected.contact_policy_id = id;
+    ASSERT_TRUE(client.select_retained_projection(selected).ok());
+    const auto strict = client.compute(request(fixture));
+    ASSERT_FALSE(strict.ok()) << "selector=" << id.value_or("<none>");
+    EXPECT_EQ(strict.error().details.at("reason"),
+              "native_goal_state_collision");
+  }
+  selected.contact_policy_id = "finger-contact";
+  ASSERT_TRUE(client.select_retained_projection(selected).ok());
+  result = client.compute(request(fixture));
+  ASSERT_TRUE(result.ok()) << result.error().message;
+}
+
+TEST(ProcessContainedCandidateClientTest,
+     RealWorkerContactSelectionKeepsOtherBodiesAndObjectsStrict) {
+  SeparatedSceneRoots roots("contact-unrelated");
+  auto fixture = make_contact_fixture(roots.package_root);
+  auto process_config = config(MANYFORGE_ROBOPLAN_CANDIDATE_WORKER_PATH);
+  process_config.require_retained_projection = true;
+  ProcessContainedRoboPlanCandidateClient client(
+      fixture.model, fixture.binding,
+      RoboPlanCandidateComputerConfig{0x1234U, 65'536U, 0.01}, process_config);
+  const auto assert_goal_collision =
+      [&](const RoboPlanCandidateProjectionDTO &selected) {
+        const auto selection = client.select_retained_projection(selected);
+        ASSERT_TRUE(selection.ok()) << selection.error().message;
+        const auto strict = client.compute(request(fixture));
+        ASSERT_FALSE(strict.ok());
+        EXPECT_EQ(strict.error().details.at("reason"),
+                  "native_goal_state_collision");
+      };
+  // Same policy and object, but collision belongs to the unlisted palm.
+  assert_goal_collision(
+      contact_projection("finger-contact", "probe-object", true));
+  // Similar object ID is not the selected runtime object.
+  assert_goal_collision(
+      contact_projection("finger-contact", "probe-object-extra"));
+  // Allowing the selected object's pair does not allow another contacting one.
+  assert_goal_collision(
+      contact_projection("finger-contact", "probe-object", false, true));
 }
 
 } // namespace

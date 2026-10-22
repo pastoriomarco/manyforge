@@ -1,5 +1,7 @@
 #pragma once
 
+#include <manyforge_core/types/contact_policy.hpp>
+
 #include <manyforge_core/types/program_contract.hpp>
 #include <manyforge_core/types/io_signal.hpp>
 #include <manyforge_core/types/retained_product.hpp>
@@ -44,6 +46,9 @@ struct ProgramFrameRoleBindingDTO final {
   ModelInstanceId model_instance_id;
   ModelRevision model_revision;
   std::string compiled_frame_name;
+  // Omitted from canonical bytes when empty. These portable body roles are
+  // qualified against this exact model instance and revision.
+  std::vector<CollisionBodyRoleId> contact_body_role_ids{};
 
   friend bool operator==(const ProgramFrameRoleBindingDTO&,
                          const ProgramFrameRoleBindingDTO&) = default;
@@ -160,8 +165,11 @@ struct ProgramContactGraspBindingDTO final {
   ContactPolicyRevision contact_policy_revision;
   RuntimeObjectId runtime_object_id;
   std::vector<ProgramContactGraspBodyBindingDTO> allowed_body_bindings;
-  double max_penetration_m{};
-  double terminal_window_start_fraction{};
+  ContactZoneEnvelopeDTO envelope{ContactGraspEnvelopeDTO{}};
+
+  /// Omitted from canonical bytes when false. Endpoint bodies are selected
+  /// only at operation admission, never mixed with explicit body bindings.
+  bool bodies_from_motion_endpoint{};
 
   friend bool operator==(const ProgramContactGraspBindingDTO&,
                          const ProgramContactGraspBindingDTO&) = default;

@@ -508,3 +508,113 @@ def test_signal_binding_shape_and_coordinate_exclusivity_fail_closed(mutation: C
     _rehash(document)
     with pytest.raises(ProgramBindingTransportError):
         validate_program_binding(document)
+
+
+def _endpoint_fixture() -> dict[str, Any]:
+    value = _fixture()
+    target = value["target_role_bindings"][0]
+    body = target["collision_body_role_bindings"][0]
+    frame = next(frame for frame in target["frame_role_bindings"]
+                 if frame["model_instance_id"] == body["model_instance_id"])
+    frame["contact_body_role_ids"] = [body["collision_body_role_id"]]
+    policy = value["contact_grasp_bindings"][0]
+    policy["bodies_from_motion_endpoint"] = True
+    policy["allowed_body_bindings"] = []
+    _rehash(value)
+    return value
+
+
+def test_endpoint_binding_transport_preserves_exact_association() -> None:
+    value = _endpoint_fixture()
+    assert validate_program_binding(value) == value
+
+
+@pytest.mark.parametrize("fault", ["missing_body", "wrong_model", "duplicate_body", "false_selector", "mixed_bodies"])
+def test_endpoint_binding_transport_rejects_invalid_association(fault: str) -> None:
+    value = _endpoint_fixture()
+    target = value["target_role_bindings"][0]
+    frame = next(frame for frame in target["frame_role_bindings"] if "contact_body_role_ids" in frame)
+    if fault == "missing_body":
+        frame["contact_body_role_ids"] = ["absent"]
+    elif fault == "wrong_model":
+        frame["model_revision"] = "sha256:" + "f" * 64
+    elif fault == "duplicate_body":
+        frame["contact_body_role_ids"] *= 2
+    elif fault == "false_selector":
+        value["contact_grasp_bindings"][0]["bodies_from_motion_endpoint"] = False
+    else:
+        value["contact_grasp_bindings"][0]["allowed_body_bindings"] = _fixture()["contact_grasp_bindings"][0]["allowed_body_bindings"]
+    _rehash(value)
+    with pytest.raises(ProgramBindingTransportError):
+        validate_program_binding(value)
+
+
+def _release_fixture(*, binary=False, endpoint=False):
+    value = _fixture()
+    policy = value["contact_grasp_bindings"][0]
+    policy.pop("max_penetration_m")
+    policy.pop("terminal_window_start_fraction")
+    policy.update(
+        mode="contact_release",
+        release_evidence_mode="binary_contact" if binary else "signed_penetration",
+        enforce_max_start_penetration=not binary,
+        max_start_penetration_m=0.0 if binary else 0.002,
+        min_release_progress_m=0.0,
+        release_tolerance_m=0.0 if binary else 1e-5,
+        require_strictly_decreasing_penetration=not binary,
+        require_separation_by_end=True,
+        allow_recontact=False,
+    )
+    if endpoint:
+        policy["bodies_from_motion_endpoint"] = True
+        policy["allowed_body_bindings"] = []
+    _rehash(value)
+    return value
+
+
+@pytest.mark.parametrize("binary", [False, True])
+@pytest.mark.parametrize("endpoint", [False, True])
+def test_contact_release_binding_uses_one_closed_mode_specific_envelope(binary, endpoint):
+    value = _release_fixture(binary=binary, endpoint=endpoint)
+    assert validate_program_binding(value) == value
+
+
+@pytest.mark.parametrize("field,value", [
+    ("mode", "contact_grasp"), ("mode", None),
+    ("release_evidence_mode", "distance"), ("enforce_max_start_penetration", 1),
+    ("require_separation_by_end", None), ("max_start_penetration_m", -0.001),
+    ("min_release_progress_m", 1000.001), ("release_tolerance_m", True),
+    ("max_penetration_m", 0.002), ("terminal_window_start_fraction", 0.5),
+])
+def test_contact_release_binding_rejects_crossed_or_invalid_fields(field, value):
+    binding = _release_fixture(endpoint=True)
+    binding["contact_grasp_bindings"][0][field] = value
+    _rehash(binding)
+    with pytest.raises(ProgramBindingTransportError):
+        validate_program_binding(binding)
+
+
+@pytest.mark.parametrize("field", [
+    "mode", "release_evidence_mode", "enforce_max_start_penetration",
+    "max_start_penetration_m", "min_release_progress_m", "release_tolerance_m",
+    "require_strictly_decreasing_penetration", "require_separation_by_end", "allow_recontact",
+])
+def test_contact_release_binding_requires_every_normalized_release_field(field):
+    binding = _release_fixture()
+    binding["contact_grasp_bindings"][0].pop(field)
+    _rehash(binding)
+    with pytest.raises(ProgramBindingTransportError):
+        validate_program_binding(binding)
+
+
+@pytest.mark.parametrize("field,value", [
+    ("enforce_max_start_penetration", True), ("require_strictly_decreasing_penetration", True),
+    ("max_start_penetration_m", 0.002), ("min_release_progress_m", 0.001),
+    ("release_tolerance_m", 1e-5),
+])
+def test_binary_release_binding_requires_neutral_metric_fields(field, value):
+    binding = _release_fixture(binary=True)
+    binding["contact_grasp_bindings"][0][field] = value
+    _rehash(binding)
+    with pytest.raises(ProgramBindingTransportError):
+        validate_program_binding(binding)

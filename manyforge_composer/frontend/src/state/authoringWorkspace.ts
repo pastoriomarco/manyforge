@@ -362,10 +362,33 @@ export function withSharedProgramAuthoring(
  * publication; the compiled artifact identity and the Manager/Applied
  * projections stay with their existing owner read.
  */
+/**
+ * The owner read predates a publication that changed the Deployment Draft or
+ * its Saved baseline, so its Applied comparisons (Run admission, Saved vs
+ * Applied) describe other documents until the owner is read again.
+ */
+/** The owner comparisons of a projection the publication outdated, until read again. */
+export const DEPLOYMENT_RECHECKING_REASON = 'Rechecking the Deployment Draft against Manager Applied';
+
+export function deploymentComparisonsStale(
+  projection: DeploymentWorkspaceResponse,
+  snapshot: AuthoringWorkspaceSnapshot,
+): boolean {
+  const deployment = snapshot.deployment;
+  return (projection.authoringWorkspace.workspaceEpoch !== snapshot.workspaceEpoch
+    || projection.authoringWorkspace.workspaceRevision !== snapshot.workspaceRevision)
+    && (deployment.draftId !== projection.draft.id
+      || deployment.draftRevision !== projection.draft.revision
+      || deployment.savedPath !== projection.saved.path
+      || deployment.differsFromSaved !== projection.draft.differsFromSaved);
+}
+
 export function withSharedDeploymentAuthoring(
   projection: DeploymentWorkspaceResponse,
   snapshot: AuthoringWorkspaceSnapshot,
 ): DeploymentWorkspaceResponse {
+  // Stale comparisons are unknown, never a stale certainty.
+  const stale = deploymentComparisonsStale(projection, snapshot);
   return {
     ...projection,
     authoringWorkspace: authoringWorkspaceIdentity(snapshot),
@@ -379,7 +402,11 @@ export function withSharedDeploymentAuthoring(
     saved: {
       path: snapshot.deployment.savedPath,
       deploymentRevision: deploymentRevisionOf(snapshot.deployment.savedDocument),
+      differsFromApplied: stale ? null : projection.saved.differsFromApplied,
     },
+    runAdmission: stale
+      ? { ready: false, reason: DEPLOYMENT_RECHECKING_REASON }
+      : projection.runAdmission,
   };
 }
 

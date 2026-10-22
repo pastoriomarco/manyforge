@@ -58,6 +58,12 @@ _MAXIMUM_REQUEST_BODY_BYTES = 1024 * 1024
 # A structured error code is one short identifier; nothing else of an error
 # body (messages may carry user data) reaches the request log.
 _LOGGED_ERROR_CODE = re.compile(r"[a-z][a-z0-9_.-]{0,127}")
+# A refusal's structured details are logged only when every key and value is
+# an identifier list (blocking conditions, operation and resource ids): what a
+# refusal waits for must be recoverable from the log, never free text.
+_LOGGED_DETAIL_KEY = re.compile(r"[a-z][a-z0-9_]{0,63}")
+_LOGGED_DETAIL_VALUE = re.compile(r"[A-Za-z0-9_.:/@,-]{0,1024}")
+_MAXIMUM_LOGGED_DETAILS = 8
 
 
 def _structured_error_code(body: bytes) -> str | None:
@@ -74,6 +80,28 @@ def _structured_error_code(body: bytes) -> str | None:
         if isinstance(code, str) and _LOGGED_ERROR_CODE.fullmatch(code)
         else None
     )
+
+def _structured_error_details(body: bytes) -> dict[str, str] | None:
+    """Return the identifier-only ``detail.details`` of one JSON error body."""
+
+    try:
+        payload = json.loads(body)
+    except ValueError:
+        return None
+    detail = payload.get("detail") if isinstance(payload, dict) else None
+    details = detail.get("details") if isinstance(detail, dict) else None
+    if not isinstance(details, dict):
+        return None
+    logged = {
+        key: value
+        for key, value in sorted(details.items())
+        if isinstance(key, str)
+        and _LOGGED_DETAIL_KEY.fullmatch(key)
+        and isinstance(value, str)
+        and _LOGGED_DETAIL_VALUE.fullmatch(value)
+    }
+    return dict(list(logged.items())[:_MAXIMUM_LOGGED_DETAILS]) or None
+
 
 _UNAVAILABLE_PAYLOAD = UnavailableResponse(
     detail=UnavailableDetail(
@@ -370,6 +398,7 @@ def create_app(
             )
         duration_ms = (time.monotonic() - started_at) * 1000.0
         error_code = None
+        error_details = None
         if response.status_code >= 400 and response.headers.get(
             "content-type", ""
         ).startswith("application/json"):
@@ -387,12 +416,14 @@ def create_app(
                 )
                 response.raw_headers = list(streamed.raw_headers)
             error_code = _structured_error_code(body)
+            error_details = _structured_error_details(body)
         response.headers["X-Request-ID"] = request_id
         fields = {
             "method": request.method,
             "path": str(request.url.path),
             "status_code": response.status_code,
             "error_code": error_code,
+            **({"error_details": error_details} if error_details else {}),
             "duration_ms": round(duration_ms, 1),
             "client": request.client.host if request.client else None,
             "request_id": request_id,
@@ -431,6 +462,7 @@ def create_app(
                 return {
                     "status": headless.get("status", "degraded"),
                     "workbench_session_notice": session_notice,
+                    "startup_scenario_notice": state.startup_scenario_notice,
                     "mode": "headless_client",
                     "components": {
                         "backend": "structural_client",
@@ -458,6 +490,7 @@ def create_app(
                 return {
                     "status": "degraded",
                     "workbench_session_notice": session_notice,
+                    "startup_scenario_notice": state.startup_scenario_notice,
                     "mode": "headless_client",
                     "components": {
                         "backend": "structural_client",
@@ -489,6 +522,7 @@ def create_app(
         return {
             "status": "degraded",
             "workbench_session_notice": session_notice,
+            "startup_scenario_notice": state.startup_scenario_notice,
             "mode": "structural_only",
             "components": {
                 "backend": "structural_only",

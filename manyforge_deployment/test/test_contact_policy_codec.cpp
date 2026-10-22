@@ -23,10 +23,19 @@ namespace manyforge::deployment {
 namespace {
 
 constexpr std::string_view kSchemaRevision =
-    "sha256:79f101a9c8cc2acf8db6ecaffd3476b03723afd5a31cce2a503f7b8764b47912";
+    "sha256:c7ad633867abbe4583dee2eda51dca5b33bd8e8827777a8ac9ab86b2aba20490";
 
 static_assert(!std::is_aggregate_v<QualifiedContactPolicy>);
 static_assert(!std::is_default_constructible_v<QualifiedContactPolicy>);
+static_assert(
+    std::is_same_v<std::variant_alternative_t<0, core::ContactBodySelectorDTO>,
+                   core::ContactComponentModelBodySelectorDTO>);
+static_assert(
+    std::is_same_v<std::variant_alternative_t<1, core::ContactBodySelectorDTO>,
+                   core::ContactSceneResourceSelectorDTO>);
+static_assert(
+    std::is_same_v<std::variant_alternative_t<2, core::ContactBodySelectorDTO>,
+                   core::ContactRuntimeObjectSelectorDTO>);
 
 [[nodiscard]] CanonicalValue component_selector() {
   return CanonicalValue(CanonicalValue::Object{
@@ -173,6 +182,60 @@ TEST(ContactPolicyCodec, ProducesExactTypedGraspEnvelopeAndSelectors) {
           selected_zone.body_pairs.front().body_a));
   EXPECT_TRUE(std::holds_alternative<core::ContactRuntimeObjectSelectorDTO>(
       selected_zone.body_pairs.front().body_b));
+}
+
+TEST(ContactPolicyCodec,
+     MotionEndpointIsOneExclusiveGraspOrReleasePairWithoutAuthoredIds) {
+  for (const int scenario : {0, 1, 2, 3, 4, 5}) {
+    SCOPED_TRACE(
+        scenario); // grasp, extra ID, mixed bodies, release, wrong other side, bounded
+    auto policy = policy_without_revision(scenario == 3 ? "contact_release"
+                                        : scenario == 5 ? "bounded_penetration"
+                                                        : "contact_grasp")
+                      .as_object();
+    CanonicalValue::Object endpoint{
+        {"kind", CanonicalValue("motion_endpoint")}};
+    if (scenario == 1)
+      endpoint.emplace_back("component_role_id", CanonicalValue("robot"));
+    const CanonicalValue selected(CanonicalValue::Object{
+        {"body_a", CanonicalValue(std::move(endpoint))},
+        {"body_b", scenario == 4
+                       ? CanonicalValue(CanonicalValue::Object{
+                             {"kind", CanonicalValue("scene_resource")},
+                             {"scene_resource_id", CanonicalValue("part")}})
+                       : runtime_selector()}});
+    for (auto &[name, value] : policy) {
+      if (name != "zones")
+        continue;
+      auto zones = value.as_array();
+      auto zone = zones.front().as_object();
+      for (auto &[field, contents] : zone) {
+        if (field != "body_pairs")
+          continue;
+        contents = CanonicalValue(
+            scenario == 2 ? CanonicalValue::Array{body_pair(), selected}
+                          : CanonicalValue::Array{selected});
+      }
+      zones.front() = CanonicalValue(std::move(zone));
+      value = CanonicalValue(std::move(zones));
+    }
+    const auto bytes = document(CanonicalValue(std::move(policy)));
+    const auto reference = reference_for(bytes);
+    if (scenario == 0 || scenario == 3) {
+      const auto qualified = resolve_and_qualify_contact_policy(
+          reference, reference.content_addressed_store_key, bytes);
+      EXPECT_TRUE(
+          std::holds_alternative<core::ContactMotionEndpointSelectorDTO>(
+              qualified.value().zones.front().body_pairs.front().body_a));
+      EXPECT_TRUE(std::holds_alternative<core::ContactRuntimeObjectSelectorDTO>(
+          qualified.value().zones.front().body_pairs.front().body_b));
+    } else {
+      EXPECT_THROW(
+          static_cast<void>(resolve_and_qualify_contact_policy(
+              reference, reference.content_addressed_store_key, bytes)),
+          ContactPolicyCodecError);
+    }
+  }
 }
 
 TEST(ContactPolicyCodec, RejectsNoncanonicalAndCrossZoneDuplicatePairs) {

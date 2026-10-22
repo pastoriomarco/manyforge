@@ -1,8 +1,10 @@
 #include "execution_host_commands.hpp"
+#include "execution_host_responses.hpp"
 
 #include <gtest/gtest.h>
 #include <algorithm>
 #include <limits>
+#include <stdexcept>
 #include <manyforge_content_identity/content_identity.hpp>
 
 namespace manyforge::roboplan_backend::host_detail {
@@ -401,4 +403,277 @@ TEST(VolatileMotionTraceCommandTest, OrdinaryReadHasBoundedAllowanceAndNoControl
     EXPECT_THROW((void)DecodeCommand(request(invalid)), std::exception);
 }
 }  // namespace
+
+TEST(MotionEndpointCommandCodecTest,
+     DecodesOnlyTheRequiredPortableTcpEndpoint) {
+  const auto payload = Value(Value::Object{
+      {"kind", Value("motion")},
+      {"move_id", Value("move.endpoint")},
+      {"base_frame_role_id", Value("base")},
+      {"tcp_endpoint", Value(Value::Object{{"target_role_id", Value("arm")},
+                                           {"frame_role_id", Value("tcp")}})},
+      {"tolerances",
+       Value(Value::Object{{"joint_position_tol_rad", Value(0.01)},
+                           {"translation_tol_m", Value(0.001)},
+                           {"rotation_tol_rad", Value(0.01)}})},
+      {"speed_profile",
+       Value(Value::Object{{"velocity_scale", Value(1.0)},
+                           {"acceleration_scale", Value(1.0)},
+                           {"max_tcp_linear_speed_mps", Value(nullptr)}})},
+      {"timeouts", Value(Value::Object{{"planning_timeout_s", Value(2.0)},
+                                       {"execution_timeout_s", Value(5.0)}})},
+      {"cache_mode", Value("default")},
+      {"planning_profile", Value("first_feasible")},
+      {"target_mode", Value("absolute")},
+      {"target_reference", Value(nullptr)},
+      {"offset_reference", Value(nullptr)},
+      {"contact_policy_id", Value(nullptr)},
+      {"per_joint_dynamics_limits", Value(Value::Object{})},
+      {"motion_interrupt_scopes", Value(Value::Array{})},
+      {"motion", Value(Value::Object{
+                     {"kind", Value("joint_goal")},
+                     {"joint_names", Value(Value::Array{Value("joint")})},
+                     {"positions_rad", Value(Value::Array{Value(0.2)})}})}});
+  const auto decode = [&](Value motion) {
+    return DecodeOperation(
+        Value(Value::Object{
+            {"request_context",
+             Value(Value::Object{{"request_id", Value("request.endpoint")},
+                                 {"request_owner_epoch", Value("owner")},
+                                 {"source_label", Value("test")},
+                                 {"correlation_id", Value(nullptr)}})},
+            {"program_id", Value("program")},
+            {"program_revision", Value("revision")},
+            {"program_binding_id", Value("binding")},
+            {"program_run_id", Value("run")},
+            {"expected_graph_revision", Value("graph")},
+            {"expected_retained_bundle_id", Value("bundle")},
+            {"expected_scene_revision", Value(nullptr)},
+            {"coordination_policy", Value("independent")},
+            {"participants", Value(Value::Array{Value(Value::Object{
+                                 {"component_role_id", Value("robot")},
+                                 {"target_role_id", Value("arm")},
+                                 {"required_capability_id",
+                                  Value("planning.motion.joint_goal")},
+                                 {"action_span", Value(nullptr)},
+                                 {"payload", std::move(motion)}})})}}),
+        core::RequestAttributionDTO{});
+  };
+  const auto own = decode(payload);
+  EXPECT_EQ(std::get<core::MotionParticipantIntentDTO>(
+                own.participants.front().payload)
+                .tcp_endpoint.target_role_id,
+            core::TargetRoleId("arm"));
+  auto fields = payload.as_object();
+  const Value endpoint(Value::Object{{"target_role_id", Value("tool")},
+                                     {"frame_role_id", Value("tip")}});
+  const auto qualified =
+      decode(Replace(Value(fields), "tcp_endpoint", endpoint));
+  const auto &motion = std::get<core::MotionParticipantIntentDTO>(
+      qualified.participants.front().payload);
+  EXPECT_EQ(motion.tcp_endpoint.target_role_id, core::TargetRoleId("tool"));
+  EXPECT_EQ(motion.tcp_endpoint.frame_role_id, core::FrameRoleId("tip"));
+  // Contact is explicit even for a joint destination. Spatial references
+  // remain invalid; resolving this policy/object pair remains Core-owned.
+  const Value runtime_object(Value::Object{
+      {"runtime_object_id", Value("selected_object")},
+      {"scene_resource_id", Value("probe_block")}});
+  const auto withdrawal = Replace(
+      Replace(payload, "contact_policy_id", Value("withdrawal.contact")),
+      "runtime_object_bindings", Value(Value::Array{runtime_object}));
+  const auto decoded_withdrawal = decode(withdrawal);
+  const auto &joint_contact = std::get<core::MotionParticipantIntentDTO>(
+      decoded_withdrawal.participants.front().payload);
+  ASSERT_TRUE(joint_contact.contact_policy_id.has_value());
+  EXPECT_EQ(joint_contact.contact_policy_id->value(), "withdrawal.contact");
+  ASSERT_EQ(joint_contact.runtime_object_bindings.size(), 1U);
+  EXPECT_EQ(joint_contact.runtime_object_bindings.front().runtime_object_id.value(),
+            "selected_object");
+  EXPECT_EQ(joint_contact.runtime_object_bindings.front().scene_resource_id.value(),
+            "probe_block");
+  EXPECT_THROW(decode(Replace(withdrawal, "contact_policy_id", Value(nullptr))),
+               std::exception);
+  const Value reference(Value::Object{{"type", Value("cell_frame")}});
+  for (const auto &mode : {"absolute", "relative"}) {
+    for (const auto &field : {"target_reference", "offset_reference"}) {
+      EXPECT_THROW(decode(Replace(Replace(withdrawal, "target_mode", Value(mode)),
+                                  field, reference)),
+                   std::exception);
+    }
+  }
+  EXPECT_THROW(
+      decode(Replace(withdrawal, "runtime_object_bindings",
+                     Value(Value::Array{Replace(runtime_object, "extra", Value(true))}))),
+      std::exception);
+  EXPECT_THROW(
+      decode(Replace(Value(fields), "tcp_frame_role_id", Value("tcp"))),
+      std::exception);
+  EXPECT_THROW(decode(Replace(Value(fields), "tcp_endpoint",
+                              Replace(endpoint, "extra", Value(true)))),
+               std::exception);
+  EXPECT_THROW(decode(Replace(Value(fields), "tcp_endpoint",
+                              Replace(endpoint, "frame_role_id", Value("")))),
+               std::exception);
+  std::erase_if(fields,
+                [](const auto &row) { return row.first == "tcp_endpoint"; });
+  EXPECT_THROW(decode(Value(fields)), std::exception);
+}
+
+TEST(MockIoInputCommandCodecTest,
+     MalformedFinalBooleanPreservesOwningCleanupAndValidationOrder) {
+  const std::string owner =
+      "kernel-owner-native-runtime-096bf5ba514b8728699ff5c290ccd23f";
+  const Value request(Value::Object{
+      {"schema_version", Value("manyforge.mock_io_input_request.v1")},
+      {"owner_epoch", Value(owner)},
+      {"program_binding_id", Value("binding.io-wire")},
+      {"target_role_id", Value("io_target")},
+      {"resource_role_id", Value("ready_input")},
+      {"expected_source_epoch", Value("installation.io-wire")},
+      {"value", Value("false")}});
+  const auto decode = [](Value input) {
+    return DecodeCommand(content_identity::canonical_json(Value(Value::Object{
+        {"api_version", Value(std::string(kCommandApiVersion))},
+        {"command", Value("set_mock_io_input")},
+        {"attribution", Value(Value::Object{{"transport", Value("internal")},
+                                            {"assurance", Value("unverified")},
+                                            {"principal_id", Value(nullptr)}})},
+        {"request", std::move(input)}})));
+  };
+  // This exact malformed last field previously double-destroyed the nested
+  // query's heap-backed owner during exception cleanup on the qualified GCC.
+  try {
+    static_cast<void>(decode(request));
+    FAIL() << "a string Boolean must be refused";
+  } catch (const std::runtime_error &error) {
+    EXPECT_STREQ(error.what(),
+                 "Native execution host: command field value must be boolean");
+  }
+  for (const bool value : {false, true}) {
+    const auto decoded = decode(Replace(request, "value", Value(value)));
+    EXPECT_EQ(decoded.kind, CommandKind::kSetMockIoInput);
+    ASSERT_TRUE(decoded.mock_io_input_set);
+    const auto &input = *decoded.mock_io_input_set;
+    EXPECT_EQ(input.query.owner_epoch, core::RequestOwnerEpoch(owner));
+    EXPECT_EQ(input.query.program_binding_id,
+              core::ProgramBindingId("binding.io-wire"));
+    EXPECT_EQ(input.query.target_role_id, core::TargetRoleId("io_target"));
+    ASSERT_TRUE(input.query.io_signal_role);
+    EXPECT_EQ(*input.query.io_signal_role, core::ResourceRoleId("ready_input"));
+    EXPECT_FALSE(input.query.frame_role_id);
+    EXPECT_FALSE(input.query.relative_to_frame_role_id);
+    EXPECT_FALSE(input.query.frame_transform);
+    EXPECT_EQ(input.expected_source_epoch,
+              core::IoSourceIncarnation("installation.io-wire"));
+    EXPECT_EQ(input.value, value);
+  }
+  // The last string field still takes precedence over the malformed Boolean.
+  try {
+    static_cast<void>(
+        decode(Replace(request, "expected_source_epoch", Value(""))));
+    FAIL() << "an empty source epoch must be refused";
+  } catch (const std::runtime_error &error) {
+    EXPECT_STREQ(error.what(),
+                 "Native execution host: command field expected_source_epoch "
+                 "must be one bounded string");
+  }
+}
+
+TEST(OperationRecoveryCommandCodecTest,
+     ExactFencesAndOptionalFreshAttemptStayClosed) {
+  const Value request(Value::Object{
+      {"request_id", Value("recovery.codec.request")},
+      {"action", Value("reset_cycle")},
+      {"principal_id", Value("operator.codec")},
+      {"expected_assessment_revision", Value(7.0)},
+      {"expected_control_command_epoch", Value(3.0)},
+      {"expected_execution_id", Value(42.0)},
+      {"expected_latch_id", Value("latch.codec")},
+      {"expected_stop_certificate_id", Value("certificate.codec")},
+      {"expected_stop_owner_generation", Value(2.0)},
+      {"reason", Value("codec validation only")}});
+  const auto decode = [](Value selected) {
+    return DecodeCommand(content_identity::canonical_json(Value(
+        Value::Object{{"api_version", Value(std::string(kCommandApiVersion))},
+                      {"command", Value("apply_operation_recovery")},
+                      {"operation_id", Value("operation.codec")},
+                      {"expected_operation_revision", Value(5.0)},
+                      {"request", std::move(selected)}})));
+  };
+  const auto omitted = decode(request);
+  ASSERT_TRUE(omitted.operation_recovery);
+  EXPECT_EQ(omitted.kind, CommandKind::kApplyOperationRecovery);
+  ASSERT_TRUE(omitted.operation_id);
+  EXPECT_EQ(*omitted.operation_id, core::OperationId("operation.codec"));
+  ASSERT_TRUE(omitted.expected_operation_revision);
+  EXPECT_EQ(*omitted.expected_operation_revision, core::OperationRevision(5U));
+  const auto &captured = *omitted.operation_recovery;
+  EXPECT_EQ(captured.action, core::RecoveryAction::kResetCycle);
+  EXPECT_EQ(captured.expected_assessment_revision, 7U);
+  EXPECT_EQ(captured.expected_control_command_epoch, 3U);
+  EXPECT_EQ(captured.expected_execution_id, 42U);
+  EXPECT_EQ(captured.expected_latch_id, "latch.codec");
+  EXPECT_EQ(captured.expected_stop_certificate_id, "certificate.codec");
+  EXPECT_EQ(captured.expected_stop_owner_generation, 2U);
+  EXPECT_FALSE(captured.fresh_motion_attempt);
+  for (const bool fresh : {false, true}) {
+    const auto decoded =
+        decode(Replace(request, "fresh_motion_attempt", Value(fresh)));
+    ASSERT_TRUE(decoded.operation_recovery);
+    EXPECT_EQ(decoded.operation_recovery->fresh_motion_attempt, fresh);
+    EXPECT_EQ(decoded.operation_recovery->expected_execution_id,
+              captured.expected_execution_id);
+  }
+  for (const auto &malformed :
+       {Value(nullptr), Value(0.0), Value(1.0), Value("false"),
+        Value(Value::Array{}), Value(Value::Object{})})
+    EXPECT_THROW(decode(Replace(request, "fresh_motion_attempt", malformed)),
+                 std::exception);
+  EXPECT_THROW(decode(Replace(request, "unknown_field", Value(false))),
+               std::exception);
+  EXPECT_THROW(
+      decode(Replace(request, "action", Value("report_final_motion_failure"))),
+      std::exception);
+}
+
+TEST(OperationRecoveryCommandCodecTest,
+     AssessmentAndRejectedActionKeepTypedWireEvidence) {
+  core::KernelRecoveryAssessmentDTO assessment;
+  assessment.assessment_revision = 7U;
+  assessment.control_command_epoch = 3U;
+  assessment.execution_id = 42U;
+  assessment.execution_state = core::ExecutionState::kCompleted;
+  assessment.reason_code = "codec_validation_only";
+  const auto encoded = RecoveryAssessmentValue(assessment);
+  ASSERT_NE(encoded.find_object_member("schema_version"), nullptr);
+  EXPECT_EQ(*encoded.find_object_member("schema_version"),
+            Value("manyforge.kernel_recovery_assessment.v1"));
+  const auto *eligibility = encoded.find_object_member("retry_eligibility");
+  ASSERT_NE(eligibility, nullptr);
+  EXPECT_EQ(*eligibility,
+            Value(Value::Object{{"cause", Value("not_eligible")},
+                                {"effect", Value("effect_uncertain")},
+                                {"eligible", Value(false)},
+                                {"reason", Value("not_retryable_state")}}));
+  const core::KernelRecoveryActionResultDTO rejected{
+      "recovery.codec.request", core::RecoveryAction::kResetCycle, false,
+      assessment,
+      core::ErrorDTO{"recovery_rejected",
+                     "reset belongs to Program control",
+                     {{"reason", "action_not_allowed"}}}};
+  const auto result = RecoveryActionResultValue(rejected);
+  ASSERT_TRUE(result.is_object());
+  EXPECT_EQ(result.as_object().size(), 5U);
+  EXPECT_EQ(*result.find_object_member("accepted"), Value(false));
+  EXPECT_EQ(*result.find_object_member("action"), Value("reset_cycle"));
+  EXPECT_EQ(*result.find_object_member("resulting_assessment"), encoded);
+  const auto *error = result.find_object_member("error");
+  ASSERT_NE(error, nullptr);
+  EXPECT_EQ(*error->find_object_member("code"), Value("recovery_rejected"));
+  const auto *details = error->find_object_member("details");
+  ASSERT_NE(details, nullptr);
+  EXPECT_EQ(*details->find_object_member("reason"),
+            Value("action_not_allowed"));
+}
+
 }  // namespace manyforge::roboplan_backend::host_detail

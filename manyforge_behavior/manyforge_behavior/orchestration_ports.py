@@ -798,23 +798,23 @@ class PersistentKeyRegisterPort(Protocol):
     """Values of `persistent` blackboard keys, owned by the Program runner.
 
     Declarations stay in the Program; the register keeps only values, scoped
-    to one Scenario and key name.
+    to one Scenario project folder (its canonical absolute path) and key name.
     """
 
     def restore(
-        self, scenario_id: str, declarations: Mapping[str, Any]
+        self, project_path: str, declarations: Mapping[str, Any]
     ) -> Mapping[str, Any]:
         """Return stored values still compatible with the committed Program.
 
         The owner reconciles stored rows with Manager's committed Applies
         before a run starts; restoring only reads, and returns nothing it
-        cannot show still belongs to this Scenario's committed Program.
+        cannot show still belongs to this project's committed Program.
         """
         ...
 
     def drop(
         self,
-        scenario_id: str,
+        project_path: str,
         key: str,
         *,
         reason: str,
@@ -830,7 +830,7 @@ class PersistentKeyRegisterPort(Protocol):
 
     def commit(
         self,
-        scenario_id: str,
+        project_path: str,
         declaration: Any,
         value: Any,
         *,
@@ -844,7 +844,7 @@ class PersistentKeyRegisterPort(Protocol):
         ...
 
     def remove(
-        self, scenario_id: str, key: str, *, edit: Mapping[str, Any] | None = None
+        self, project_path: str, key: str, *, edit: Mapping[str, Any] | None = None
     ) -> bool:
         """Durably forget one stored value; raise on failure."""
         ...

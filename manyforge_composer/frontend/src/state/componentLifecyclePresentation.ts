@@ -1,6 +1,7 @@
 import type {
   CCLCBlockingCauseClass,
   CCLCComponentIncident,
+  CCLCComponentReadiness,
   CCLCComponentSnapshot,
   CCLCIncidentCauseClass,
   CCLCLifecycleTargetOrigin,
@@ -113,8 +114,24 @@ export function readinessErrorPresentation(error: CCLCTransactionStatus['error']
     .filter((part): part is string => typeof part === 'string').join(' · ');
 }
 
+/**
+ * Not-ready wording: the first provider-domain health diagnostic names the
+ * actual blocker (e.g. a missing ROS service); the owner error follows unchanged.
+ */
+export function readinessBlockerPresentation(
+  readiness: Pick<CCLCComponentReadiness, 'error' | 'providerOccurrences'>,
+): string | null {
+  const diagnostic = readiness.providerOccurrences
+    .find((domain) => domain.health?.diagnostic?.message)?.health?.diagnostic?.message;
+  const parts = [diagnostic, readinessErrorPresentation(readiness.error)]
+    .filter((part): part is string => typeof part === 'string' && part !== '');
+  return parts.length === 0 ? null : parts.join(' · ');
+}
+
 function targetWaitFact(snapshot: CCLCComponentSnapshot): string | null {
   if (snapshot.readiness.ready) return null;
+  // Nothing waits while closed admission only holds an already Active component.
+  if (snapshot.lifecycleState === 'active' && lifecycleRequestsClosed(snapshot)) return null;
   const progress = snapshot.lifecycleProgress;
   const start = progress?.waitingSinceNs;
   if (progress?.phase === 'satisfied' || progress?.phase === 'cancelled' || start === null || start === undefined) return 'Target wait duration unavailable';
@@ -126,10 +143,40 @@ function targetWaitFact(snapshot: CCLCComponentSnapshot): string | null {
   return `Target wait: ${milliseconds / 1000n}.${String(milliseconds % 1000n).padStart(3, '0')} s at last owner evaluation`;
 }
 
+/**
+ * The owner refuses lifecycle requests because cell admission is closed (for
+ * example while a Program runs). That says nothing about the component's own
+ * health, so it never makes an Active component "Not ready".
+ */
+function lifecycleRequestsClosed(snapshot: CCLCComponentSnapshot): boolean {
+  return !snapshot.readiness.ready && snapshot.readiness.error?.code === 'authoring_not_ready'
+    && readinessSubBlocker(snapshot) === null;
+}
+
+/**
+ * A real readiness failure the owner also returned. The owner's top-level
+ * error keeps only its first refusal, so closed admission can sit in front of
+ * a provider or measured-state failure; that failure still decides.
+ */
+function readinessSubBlocker(snapshot: CCLCComponentSnapshot): CCLCTransactionStatus['error'] {
+  const readiness = snapshot.readiness;
+  const provider = readiness.providerOccurrences.find((domain) => domain.error !== null)?.error;
+  if (provider) return provider;
+  if (readiness.measuredState.error !== null) return readiness.measuredState.error;
+  if (readiness.measuredState.required === true && readiness.measuredState.available !== true) {
+    return { code: 'measured_state_unavailable', message: 'Required measured state is unavailable', details: {} };
+  }
+  return null;
+}
+
 function readinessFact(snapshot: CCLCComponentSnapshot): string {
   const readiness = snapshot.readiness;
+  const subBlocker = readiness.ready || readiness.error?.code !== 'authoring_not_ready'
+    ? null : readinessSubBlocker(snapshot);
   return [
-    readiness.ready ? 'Ready' : 'Not ready',
+    readiness.ready ? 'Ready' : lifecycleRequestsClosed(snapshot) ? 'Lifecycle changes closed' : 'Not ready',
+    // The real failure first; closed admission is only the owner's first refusal.
+    readinessErrorPresentation(subBlocker),
     readinessErrorPresentation(readiness.error),
     readiness.nextIntent === null ? null : `next step: ${readiness.nextIntent}`,
     targetWaitFact(snapshot),
@@ -205,7 +252,7 @@ function verdict(
     }
     return { message, tone: 'waiting', consequence: WAITING_CONSEQUENCE };
   }
-  if (!snapshot.readiness.ready) {
+  if (!snapshot.readiness.ready && !(achieved === 'active' && lifecycleRequestsClosed(snapshot))) {
     return { message: 'Not ready', tone: 'waiting', consequence: WAITING_CONSEQUENCE };
   }
   if (achieved === 'active') {

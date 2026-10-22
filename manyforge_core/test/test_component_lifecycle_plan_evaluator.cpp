@@ -2,6 +2,7 @@
 
 #include <manyforge_core/component_lifecycle_plan_catalog_codec.hpp>
 #include <manyforge_core/component_lifecycle_plan_evaluator.hpp>
+#include <manyforge_core/types/lifecycle_cause.hpp>
 #include <map>
 #include <string_view>
 
@@ -319,7 +320,8 @@ TEST(ComponentLifecyclePlanEvaluator, FailedPrepareNamesTheSameObservationWithou
         {"observed_state", expected[index][0]},
         {"observed_controller_loaded", expected[index][1]},
         {"observed_fault_present", expected[index][2]},
-        {"observed_transport_ready", expected[index][3]}};
+        {"observed_transport_ready", expected[index][3]},
+        {"observed_blocking_cause", "missing"}};
     EXPECT_EQ(result.error().details, details);
     EXPECT_LE(result.error().details.size(), kMaxLifecycleErrorDetails);
     EXPECT_EQ(observations[index], original);
@@ -355,9 +357,66 @@ TEST(ComponentLifecyclePlanEvaluator, FailureDistinguishesMissingUnknownAndNonbo
     EXPECT_EQ(result.error().details.at("observed_controller_loaded"), marker);
     EXPECT_EQ(result.error().details.at("observed_fault_present"), "false");
     EXPECT_EQ(result.error().details.at("observed_transport_ready"), "true");
-    EXPECT_EQ(result.error().details.size(), 5U);
+    EXPECT_EQ(result.error().details.size(), 6U);
     EXPECT_EQ(observation, original);
   }
+}
+
+TEST(ComponentLifecyclePlanEvaluator, FailureNamesStandardBlockingCauseAndDiagnosticCode) {
+  // The I/O driver publishes io.driver.* (not external.*) facts; they fill the
+  // same keys, and the standard cause token and bounded diagnostic explain.
+  const auto catalog = Catalog({FixedPlan({{LifecyclePrimitiveId("io.provider.prepare"),
+      {{ComponentLifecycleStateDTO::kDeclared},
+       {{LifecycleFactId("io.driver.transport_ready"), Boolean(true)}}},
+      Predicate(ComponentLifecycleStateDTO::kPrepared)}})});
+  const LifecycleDomainHealthDTO health{
+      ComponentLifecycleStateDTO::kDeclared,
+      {{LifecycleFactId("io.driver.enabled"), Boolean(false)},
+       {LifecycleFactId("io.driver.fault_present"), Boolean(false)},
+       {LifecycleFactId("io.driver.resources_ready"), Boolean(true)},
+       {LifecycleFactId("io.driver.transport_ready"), Boolean(false)},
+       {LifecycleFactId(std::string(kLifecycleBlockingCauseFactId)), Token("availability")}},
+      ErrorDTO{"io_provider_transport_unavailable", "ROS service /plc_io/start is not available",
+               {{"ros_name", "/plc_io/start"}}}};
+  ASSERT_TRUE(health.locally_valid());
+  const auto before = health;
+  const auto result = EvaluateLifecycleDomainPlan(ComponentLifecycleIntentKindDTO::kPrepare,
+      ComponentLifecycleStateDTO::kPrepared, catalog, Occurrence(catalog), health);
+  ASSERT_FALSE(result.ok());
+  EXPECT_EQ(result.error().code, "component_lifecycle_transition_missing");
+  const std::map<std::string, std::string> details{
+      {"reason", "no_transition_satisfied"},
+      {"observed_state", "declared"},
+      {"observed_controller_loaded", "missing"},
+      {"observed_fault_present", "false"},
+      {"observed_transport_ready", "false"},
+      {"observed_resources_ready", "true"},
+      {"observed_blocking_cause", "availability"},
+      {"observed_diagnostic_code", "io_provider_transport_unavailable"}};
+  EXPECT_EQ(result.error().details, details);
+  EXPECT_LE(result.error().details.size(), kMaxLifecycleErrorDetails);
+  EXPECT_EQ(health, before);
+}
+
+TEST(ComponentLifecyclePlanEvaluator, RobotFailureKeepsExternalKeysAndAddsCauseAndDiagnostic) {
+  const auto catalog = PrepareCatalog();
+  auto facts = PrepareFacts(true, true, true);
+  facts.push_back({LifecycleFactId(std::string(kLifecycleBlockingCauseFactId)), Token("fault")});
+  const LifecycleDomainHealthDTO health{ComponentLifecycleStateDTO::kDeclared, std::move(facts),
+      ErrorDTO{"physical_fault", "drive fault", {{"reason", "guard_trip"}}}};
+  ASSERT_TRUE(health.locally_valid());
+  const auto result = EvaluateLifecycleDomainPlan(ComponentLifecycleIntentKindDTO::kPrepare,
+      ComponentLifecycleStateDTO::kPrepared, catalog, Occurrence(catalog), health);
+  ASSERT_FALSE(result.ok());
+  const std::map<std::string, std::string> details{
+      {"reason", "no_transition_satisfied"},
+      {"observed_state", "declared"},
+      {"observed_controller_loaded", "true"},
+      {"observed_fault_present", "true"},
+      {"observed_transport_ready", "true"},
+      {"observed_blocking_cause", "fault"},
+      {"observed_diagnostic_code", "physical_fault"}};
+  EXPECT_EQ(result.error().details, details);
 }
 
 TEST(ComponentLifecyclePlanEvaluator, EligiblePrepareAndInvalidObservationKeepExistingDecisions) {

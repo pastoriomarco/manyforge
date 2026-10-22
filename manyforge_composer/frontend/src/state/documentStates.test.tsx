@@ -23,7 +23,7 @@ function program(overrides: {
 function deployment(draftRevision: string, applied: string, differsFromSaved = false): DeploymentWorkspaceResponse {
   return {
     draft: { document: {}, deploymentRevision: draftRevision, differsFromSaved },
-    saved: { path: 'cell/deployment.yaml', deploymentRevision: 'x' },
+    saved: { path: 'cell/deployment.yaml', deploymentRevision: 'x', differsFromApplied: null },
     managerApplied: { activationOrder: null, deploymentRevision: applied, scenarioId: 'cell' },
     // The backend compares the documents; revisions may be absent.
     runAdmission: { ready: draftRevision === applied, reason: null },

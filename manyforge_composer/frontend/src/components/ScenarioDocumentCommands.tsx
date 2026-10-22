@@ -19,12 +19,15 @@ import type {
 import { FolderPicker } from './FolderPicker';
 import { OverlayPanel } from './OverlayPanel';
 import {
-  newScenarioFolderError,
-  newScenarioNameError,
   parentFolder,
-  scenarioFolderName,
+  scenarioEntryLabel,
+  scenarioNameError,
+  scenarioNameTaken,
+  scenarioProjectPath,
+  scenarioProjectStem,
   SCENARIO_NAME_MAX,
 } from '../state/newScenario';
+import { errorMessage } from '../state/structuralResource';
 
 type ScenarioAction = 'new' | 'save_as' | 'load' | 'close';
 type SaveAsMode = 'project' | 'portable';
@@ -56,7 +59,6 @@ interface ScenarioDocumentCommandsProps {
   motionActive?: boolean;
 }
 
-const SCENARIO_ID_PATTERN = /^[a-z][a-z0-9._-]{0,127}$/;
 function scenarioEntryKey(entry: ScenarioDocumentEntry): string {
   return `${entry.sourceKind}:${entry.path ?? entry.scenarioId ?? entry.name}`;
 }
@@ -116,20 +118,18 @@ export function ScenarioDocumentCommands({
   } = controller;
   const [action, setAction] = useState<ScenarioAction | null>(null);
   const [saveAsMode, setSaveAsMode] = useState<SaveAsMode>('project');
-  const [confirmDiscard, setConfirmDiscard] = useState(false);
   const [confirmOverwrite, setConfirmOverwrite] = useState(false);
   const [scenarioIndex, setScenarioIndex] = useState<ScenarioDocumentIndexResponse | null>(null);
   const [scenarioIndexError, setScenarioIndexError] = useState<string | null>(null);
   const [scenarioIndexLoading, setScenarioIndexLoading] = useState(false);
   const [scenarioDirectory, setScenarioDirectory] = useState('');
   const [selectedScenarioKey, setSelectedScenarioKey] = useState('');
-  const [savePath, setSavePath] = useState('');
-  const [scenarioId, setScenarioId] = useState('scenario');
-  const [scenarioName, setScenarioName] = useState('Scenario');
+  const [saveDirectory, setSaveDirectory] = useState<string | null>(null);
+  const [savePickerOpen, setSavePickerOpen] = useState(false);
+  const [scenarioName, setScenarioName] = useState('');
   const [scenarioDescription, setScenarioDescription] = useState('');
   const [currentApplied, setCurrentApplied] = useState<ManagerActiveProjection | null>(null);
   const [newError, setNewError] = useState<string | null>(null);
-  const [publishedScenarioId, setPublishedScenarioId] = useState<string | null>(null);
   const [replacementPending, setReplacementPending] = useState(false);
   const replacementInFlight = useRef<false | 'closing' | 'waiting' | 'submitting'>(false);
   const [confirmation, setConfirmation] = useState<ReplacementConfirmation | null>(null);
@@ -147,12 +147,15 @@ export function ScenarioDocumentCommands({
   useEffect(() => { latestController.current = controller; }, [controller]);
   const [newWorkspaceKey, setNewWorkspaceKey] = useState<string | null>(null);
   const [newParent, setNewParent] = useState<string | null>(null);
-  const [newFolderName, setNewFolderName] = useState('');
-  const [newFolderEdited, setNewFolderEdited] = useState(false);
   const [newNameTouched, setNewNameTouched] = useState(false);
   const [newPickerOpen, setNewPickerOpen] = useState(false);
-  const [newParentEntries, setNewParentEntries] = useState<ReadonlySet<string> | null>(null);
-  const [exportDestinationPath, setExportDestinationPath] = useState('');
+  // Entry names of the folder New or Save As writes into, so a clash shows at once.
+  const [locationEntries, setLocationEntries] = useState<ReadonlySet<string> | null>(null);
+  // Export writes `<exportParent>/<open project folder name>`, keeping the
+  // project's one name; only the parent folder is chosen.
+  const [exportParent, setExportParent] = useState<string | null>(null);
+  const [exportPickerOpen, setExportPickerOpen] = useState(false);
+  const [loadPickerOpen, setLoadPickerOpen] = useState(false);
   const scenarioDirectoryRef = useRef('');
   const returnFocus = useRef<HTMLElement | null>(null);
   const workspace = state.workspace;
@@ -185,13 +188,13 @@ export function ScenarioDocumentCommands({
   const replaceNeedsConfirmation = workspace?.hasUnsavedChanges === true
     || workspace?.hasUnappliedChanges === true
     || deploymentDirty;
-  const saveTarget = scenarioDocumentPath !== null
-    && scenarioDocument.id !== null
-    && scenarioDocument.name !== null
+  // Plain Save writes back to the open project folder under its one name.
+  const openProject = scenarioDocumentPath !== null && scenarioDocument.id !== null
+    ? scenarioDocumentPath : null;
+  const saveTarget = openProject !== null
     ? {
-        path: scenarioDocumentPath,
-        scenarioId: scenarioDocument.id,
-        name: scenarioDocument.name,
+        directory: parentFolder(openProject),
+        name: scenarioProjectStem(openProject),
         description: scenarioDocument.description ?? '',
       }
     : null;
@@ -202,13 +205,22 @@ export function ScenarioDocumentCommands({
     && selectedScenarioDocument.displayStatus !== 'unsupported'
     ? selectedScenarioDocument.path
     : null;
-  const scenarioIdValid = SCENARIO_ID_PATTERN.test(scenarioId.trim());
-  const newFolder = newFolderEdited ? newFolderName : scenarioFolderName(scenarioName);
-  const newNameError = newScenarioNameError(scenarioName);
+  // The index lists one directory, so two projects never share a name in it.
+  const selectedScenarioLabel = selectedScenarioDocument === null ? null : scenarioEntryLabel(selectedScenarioDocument);
+  const nameError = scenarioNameError(scenarioName);
+  const nameTaken = nameError === null && scenarioNameTaken(scenarioName, locationEntries);
   const newFolderError = newParent === null
     ? 'Choose where to create the project.'
-    : newScenarioFolderError(newFolder, newParentEntries);
-  const newPath = newParent === null ? null : `${newParent.replace(/\/+$/, '')}/${newFolder.trim()}`;
+    : nameTaken ? 'A Scenario with this name already exists here. Choose another name.' : null;
+  const newPath = newParent === null || nameError !== null ? null : scenarioProjectPath(newParent, scenarioName);
+  const savePath = saveDirectory === null || nameError !== null ? null : scenarioProjectPath(saveDirectory, scenarioName);
+  // Replacing another existing project needs the explicit overwrite choice;
+  // saving the open project back to its own folder does not.
+  const saveReplacesOther = nameTaken && savePath !== null
+    && (openProject === null || savePath !== openProject.replace(/\/+$/, ''));
+  const exportName = scenarioDocumentPath === null ? null : scenarioProjectStem(scenarioDocumentPath);
+  const exportPath = exportParent === null || exportName === null ? null : scenarioProjectPath(exportParent, exportName);
+  const exportTaken = exportName !== null && scenarioNameTaken(exportName, locationEntries);
 
   const refreshScenarioIndex = useCallback(async (directory?: string) => {
     setScenarioIndexLoading(true);
@@ -226,7 +238,7 @@ export function ScenarioDocumentCommands({
       return index;
     } catch (error: unknown) {
       setScenarioIndexError(
-        error instanceof Error ? error.message : 'Scenario directory could not be read.',
+        errorMessage(error, 'Scenario directory could not be read.'),
       );
       return null;
     } finally {
@@ -240,31 +252,34 @@ export function ScenarioDocumentCommands({
     }
   }, [action, refreshScenarioIndex]);
 
+  // Browse… for Load picks one project: list its folder and select it there,
+  // so Load uses the same listed entry as choosing it from the list.
+  const chooseLoadProject = async (projectPath: string) => {
+    const index = await refreshScenarioIndex(parentFolder(projectPath));
+    if (index === null) return;
+    const chosen = projectPath.replace(/\/+$/, '');
+    const entry = index.entries.find((candidate) => candidate.path?.replace(/\/+$/, '') === chosen);
+    if (entry === undefined || entry.displayStatus === 'unsupported') {
+      setSelectedScenarioKey('');
+      setScenarioIndexError(entry === undefined
+        ? 'The chosen project is not a loadable Scenario.' : entry.statusDetail);
+      return;
+    }
+    setSelectedScenarioKey(scenarioEntryKey(entry));
+  };
+
   useEffect(() => {
     if (action !== 'new' && action !== 'load' && action !== 'close') return;
     const abort = new AbortController();
     setCurrentApplied(null);
-    setPublishedScenarioId(null);
     setNewError(null);
-    void api.manager.status(abort.signal).then(async (value) => {
+    void api.manager.status(abort.signal).then((value) => {
       if (abort.signal.aborted) return;
       if (!value.source.available || value.source.freshness !== 'fresh' || !value.status.managerReady) {
         setNewError('Current Applied Deployment cannot be verified.');
-      } else {
-        setCurrentApplied(value.status.active);
-        if (action === 'load' && !value.status.active.canonicalEmpty) {
-          const current = await api.deploymentWorkspace.get(abort.signal);
-          if (abort.signal.aborted) return;
-          const published = current.managerApplied;
-          if (published.scenarioId === null || published.activationOrder === null
-            || published.activationOrder.retainedBundleId !== value.status.active.retainedBundleId
-            || published.activationOrder.graphRevision !== value.status.active.graphRevision) {
-            setNewError('Current published Scenario identity cannot be verified.');
-          } else setPublishedScenarioId(published.scenarioId);
-        }
-      }
+      } else setCurrentApplied(value.status.active);
     }).catch((error: unknown) => {
-      if (!abort.signal.aborted) setNewError(error instanceof Error ? error.message : 'Applied Deployment is unavailable.');
+      if (!abort.signal.aborted) setNewError(errorMessage(error, 'Applied Deployment is unavailable.'));
     });
     return () => abort.abort();
   }, [action]);
@@ -283,16 +298,18 @@ export function ScenarioDocumentCommands({
   }, [action, refreshScenarioIndex, scenarioDocumentPath]);
 
   // Names already present in the chosen location, so a clash shows at once.
+  const locationDirectory = action === 'new' ? newParent
+    : action === 'save_as' ? (saveAsMode === 'portable' ? exportParent : saveDirectory) : null;
   useEffect(() => {
-    if (action !== 'new' || newParent === null) return undefined;
+    if (locationDirectory === null) return undefined;
     const controller = new AbortController();
-    setNewParentEntries(null);
-    api.files.browse('program', newParent, controller.signal).then(
-      (listing) => setNewParentEntries(new Set(listing.entries.map((entry) => entry.name))),
-      () => { if (!controller.signal.aborted) setNewParentEntries(null); },
+    setLocationEntries(null);
+    api.files.browse('scenario', locationDirectory, controller.signal).then(
+      (listing) => setLocationEntries(new Set(listing.entries.map((entry) => entry.name))),
+      () => { if (!controller.signal.aborted) setLocationEntries(null); },
     );
     return () => controller.abort();
-  }, [action, newParent]);
+  }, [locationDirectory]);
 
   const closeAction = useCallback(() => {
     if (replacementInFlight.current && replacementInFlight.current !== 'waiting') return;
@@ -303,7 +320,6 @@ export function ScenarioDocumentCommands({
     setConfirmation(null);
     setReplacementPending(false);
     setAction(null);
-    setConfirmDiscard(false);
     setConfirmOverwrite(false);
   }, [afterClose]);
   const beginAction = (
@@ -312,28 +328,30 @@ export function ScenarioDocumentCommands({
   ) => {
     returnFocus.current = event.currentTarget;
     if (next === 'close') setCurrentApplied(null);
-    setConfirmDiscard(false);
     setConfirmOverwrite(false);
+    setLoadPickerOpen(false);
     if (next === 'new') {
       setNewWorkspaceKey(workspaceKey);
       setScenarioName('');
       setNewParent(null);
-      setNewFolderName('');
-      setNewFolderEdited(false);
       setNewNameTouched(false);
       setNewPickerOpen(false);
     }
     if (next === 'save_as') {
-      const id = scenarioDocument.id ?? authoring?.program_id ?? 'scenario';
+      // The open project's folder name is its one name; a legacy folder name
+      // outside the rule is shown so the operator corrects it.
       setSaveAsMode('project');
-      setScenarioId(id);
-      setScenarioName(scenarioDocument.name ?? authoring?.name ?? 'Scenario');
+      setSavePickerOpen(false);
+      setExportParent(null);
+      setExportPickerOpen(false);
+      setScenarioName(scenarioDocumentPath !== null
+        ? scenarioProjectStem(scenarioDocumentPath) : authoring?.program_id ?? '');
       setScenarioDescription(scenarioDocument.description ?? authoring?.description ?? '');
-      setSavePath(scenarioDocumentPath ?? '');
+      setSaveDirectory(scenarioDocumentPath !== null ? parentFolder(scenarioDocumentPath) : null);
       if (scenarioDocumentPath === null) {
         void refreshScenarioIndex(scenarioDirectoryRef.current || undefined)
           .then((index) => {
-            if (index) setSavePath((current) => current || `${index.directory}/${id}`);
+            if (index) setSaveDirectory((current) => current ?? index.directory);
           });
       }
     }
@@ -344,13 +362,14 @@ export function ScenarioDocumentCommands({
     closeAction();
   };
 
-  const loadClosesCurrent = currentApplied !== null
-    && (currentApplied.canonicalEmpty || selectedScenarioDocument?.scenarioId !== publishedScenarioId);
-  const closeUnavailable = (action === 'new' || action === 'close' || loadClosesCurrent)
+  // New, Close and every Load (also of the Scenario that is currently
+  // applied) go through Close first; Load never reapplies over a Scenario.
+  const replacesScenario = action === 'new' || action === 'close' || action === 'load';
+  const closeUnavailable = replacesScenario
     && (closeScenario === undefined || closeUnavailableReason !== null);
   const replacementReason = newError ?? (replacementPending ? null
-    : (action === 'new' || action === 'close' || loadClosesCurrent
-      ? closeEntryReason : blockReason) ?? (closeUnavailable ? 'Scenario Close is unavailable.' : null));
+    : (replacesScenario ? closeEntryReason : blockReason)
+      ?? (closeUnavailable ? 'Scenario Close is unavailable.' : null));
   const selectedIdentityUnknown = action === 'load' && selectedScenarioDocument !== null
     && selectedScenarioDocument.scenarioId === null;
   const completeReplacement = async (kind: 'new' | 'load' | 'close', acknowledged?: ReplacementConfirmation) => {
@@ -362,14 +381,12 @@ export function ScenarioDocumentCommands({
       }
       return;
     }
-    const mustClose = acknowledged !== undefined || kind !== 'load' || loadClosesCurrent;
-    if (!mustClose && replaceNeedsConfirmation && !confirmDiscard) return;
     const expected = acknowledged?.predecessor ?? currentApplied;
     const confirmedPath = kind === 'close' ? null
       : acknowledged?.path ?? (kind === 'new' ? newPath : selectedScenarioPath);
     const confirmedName = acknowledged?.name ?? scenarioName;
     const confirmed = acknowledged?.confirmed ?? latestController.current.scenarioReplacementIdentity;
-    if (mustClose && confirmed === null) {
+    if (confirmed === null) {
       setNewError('The shared workspace is not current. No replacement was requested.');
       return;
     }
@@ -387,9 +404,7 @@ export function ScenarioDocumentCommands({
       }
     }
     if (kind !== 'close' && confirmedPath === null) return;
-    const discard = mustClose || confirmDiscard;
-    if (mustClose && (!expected.canonicalEmpty || replaceNeedsConfirmation)
-      && acknowledged === undefined && confirmed !== null) {
+    if ((!expected.canonicalEmpty || replaceNeedsConfirmation) && acknowledged === undefined) {
       setConfirmation({ kind, path: confirmedPath, name: confirmedName, confirmDiscard: true,
         predecessor: expected, confirmed });
       return;
@@ -400,32 +415,22 @@ export function ScenarioDocumentCommands({
     setNewError(null);
     let deferredAfterClose = false;
     try {
-      let empty = expected;
-      if (mustClose) {
-        if (closeScenario === undefined) throw new Error('Scenario Close is unavailable.');
-        const result = await closeScenario(expected, confirmed ?? undefined,
-          (closeCallerAbort.current = new AbortController()).signal);
-        if (!replacementMounted.current) return;
-        if (result === null) {
-          setNewError('Scenario Close is refused or unresolved; no replacement was requested.');
-          return;
-        }
-        if (!result.canonicalEmpty) throw new Error('Scenario Close has no current canonical-empty proof.');
-        empty = result;
-      }
-      if (kind !== 'close' && confirmedPath === null) return;
-      if (mustClose && confirmed !== null) {
-        replacementInFlight.current = 'waiting';
-        deferredAfterClose = true;
-        setAfterClose({ kind, path: confirmedPath, name: confirmedName, confirmDiscard: discard,
-          predecessor: expected, closed: empty, confirmed });
+      if (closeScenario === undefined) throw new Error('Scenario Close is unavailable.');
+      const empty = await closeScenario(expected, confirmed,
+        (closeCallerAbort.current = new AbortController()).signal);
+      if (!replacementMounted.current) return;
+      if (empty === null) {
+        setNewError('Scenario Close is refused or unresolved; no replacement was requested.');
         return;
       }
-      if (confirmedPath === null) return;
-      const result = await latestController.current.loadScenarioDocument(confirmedPath, discard);
-      if (result !== null) setAction(null);
+      if (!empty.canonicalEmpty) throw new Error('Scenario Close has no current canonical-empty proof.');
+      if (kind !== 'close' && confirmedPath === null) return;
+      replacementInFlight.current = 'waiting';
+      deferredAfterClose = true;
+      setAfterClose({ kind, path: confirmedPath, name: confirmedName, confirmDiscard: true,
+        predecessor: expected, closed: empty, confirmed });
     } catch (error: unknown) {
-      const message = error instanceof Error ? error.message : 'Scenario replacement is unresolved.';
+      const message = errorMessage(error, 'Scenario replacement is unresolved.');
       if (!replacementMounted.current) latestController.current.reportCloseCancellation(0, message);
       else setNewError(message);
     } finally {
@@ -478,7 +483,7 @@ export function ScenarioDocumentCommands({
           }
           result = await controller.clearClosedScenario(afterClose.predecessor, afterClose.closed, afterClose.confirmed, step.progress);
         } else result = afterClose.kind === 'new' && afterClose.path !== null
-          ? await controller.newScenarioDocument({ path: afterClose.path, name: afterClose.name,
+          ? await controller.newScenarioDocument({ directory: parentFolder(afterClose.path), name: afterClose.name,
             deploymentChoice: 'empty', expectedRetainedBundleId: afterClose.closed.retainedBundleId,
             expectedGraphRevision: afterClose.closed.graphRevision, confirmDiscard: true })
           : afterClose.path !== null
@@ -487,7 +492,7 @@ export function ScenarioDocumentCommands({
         else setNewError('Scenario closed, but the replacement was refused or is unresolved. Review the current backend status; nothing was retried.');
       } catch (error: unknown) {
         const removed = afterClose.sceneProgress?.removed ?? 0;
-        setNewError(`${error instanceof Error ? error.message : 'Scenario replacement is unresolved.'}${afterClose.kind === 'close'
+        setNewError(`${errorMessage(error, 'Scenario replacement is unresolved.')}${afterClose.kind === 'close'
           ? ` ${removed} Scene object removal(s) confirmed; editors were kept. Nothing was retried.` : ''}`);
       } finally {
         if (!continuingScene) {
@@ -606,7 +611,7 @@ export function ScenarioDocumentCommands({
                   disabled={replacementPending}
                   required
                   aria-required="true"
-                  aria-invalid={newNameTouched && newNameError !== null}
+                  aria-invalid={newNameTouched && nameError !== null}
                   aria-describedby="new-scenario-name-help"
                   maxLength={SCENARIO_NAME_MAX}
                   placeholder="e.g. lite6_pick_and_place"
@@ -620,10 +625,10 @@ export function ScenarioDocumentCommands({
                 />
                 <small
                   id="new-scenario-name-help"
-                  className={newNameTouched && newNameError !== null ? 'field-error' : 'field-hint'}
-                  role={newNameTouched && newNameError !== null ? 'alert' : undefined}
+                  className={newNameTouched && nameError !== null ? 'field-error' : 'field-hint'}
+                  role={newNameTouched && nameError !== null ? 'alert' : undefined}
                 >
-                  {newNameTouched && newNameError !== null ? newNameError : 'Letters, digits, “_” and “-” only, no spaces. Also used as the project folder name.'}
+                  {newNameTouched && nameError !== null ? nameError : 'Letters, digits, “_” and “-” only, no spaces or dots. Also the project folder name.'}
                 </small>
               </label>
               <div className="new-scenario-location">
@@ -643,27 +648,15 @@ export function ScenarioDocumentCommands({
                   }}
                 />
               )}
-              <label className="stacked">
-                <span>Project folder</span>
-                <input
-                  value={newFolder}
-                  disabled={replacementPending}
-                  aria-invalid={newFolderError !== null}
-                  aria-describedby="new-scenario-folder-help"
-                  onChange={(event) => {
-                    setNewFolderEdited(true);
-                    setNewFolderName(event.target.value);
-                  }}
-                />
-                <small
-                  id="new-scenario-folder-help"
-                  className={newFolderError !== null && newParent !== null ? 'field-error' : 'field-hint'}
-                >
-                  {newFolderError !== null && newParent !== null
-                    ? newFolderError
-                    : newPath !== null ? <>Will be created as <code>{newPath}</code></> : 'A new folder for this project.'}
-                </small>
-              </label>
+              <small
+                id="new-scenario-folder-help"
+                className={newFolderError !== null && newParent !== null ? 'field-error' : 'field-hint'}
+                role={newFolderError !== null && newParent !== null ? 'alert' : undefined}
+              >
+                {newFolderError !== null && newParent !== null
+                  ? newFolderError
+                  : newPath !== null ? <>Will be created as <code>{newPath}</code></> : 'A new project folder named after the Scenario.'}
+              </small>
             </section>
             <p>The new Scenario starts with an empty Deployment. Components are configured
               without activation when you later Apply a Deployment.</p>
@@ -678,8 +671,8 @@ export function ScenarioDocumentCommands({
               <button type="button" onClick={closeAction} disabled={replacementPending && afterClose === null}>Cancel</button>
               <button type="button" className="primary-action"
                 disabled={busy || newConfirmationStale || currentApplied === null
-                  || replacementReason !== null || newNameError !== null || newFolderError !== null || newPath === null}
-                title={replacementReason ?? newNameError ?? newFolderError ?? undefined}
+                  || replacementReason !== null || nameError !== null || newFolderError !== null || newPath === null}
+                title={replacementReason ?? nameError ?? newFolderError ?? undefined}
                 onClick={() => { void completeReplacement('new'); }}>
                 Create Scenario
               </button>
@@ -698,40 +691,60 @@ export function ScenarioDocumentCommands({
                 <p className="new-scenario-intro">
                   Save the Program, Scene, Deployment, assignment and overrides as one project folder, and continue working on it.
                 </p>
-                <section className="dcard" aria-label="Project">
-                  <h4>Project</h4>
+                <section className="dcard" aria-label="Scenario">
+                  <h4>Scenario</h4>
                   <label className="stacked">
-                    <span>Project folder <span className="required-mark" aria-hidden="true">*</span></span>
-                    <input value={savePath} onChange={(event) => setSavePath(event.target.value)} />
-                    <small className="field-hint">Robot meshes and other referenced sources stay where they are.</small>
+                    <span>Name <span className="required-mark" aria-hidden="true">*</span></span>
+                    <input
+                      value={scenarioName}
+                      required
+                      aria-required="true"
+                      aria-invalid={nameError !== null}
+                      aria-describedby="save-scenario-name-help"
+                      maxLength={SCENARIO_NAME_MAX}
+                      spellCheck={false}
+                      autoCapitalize="off"
+                      onChange={(event) => setScenarioName(event.target.value)}
+                    />
+                    <small
+                      id="save-scenario-name-help"
+                      className={scenarioName !== '' && nameError !== null ? 'field-error' : 'field-hint'}
+                      role={scenarioName !== '' && nameError !== null ? 'alert' : undefined}
+                    >
+                      {scenarioName !== '' && nameError !== null ? nameError : 'Letters, digits, “_” and “-” only, no spaces or dots. Also the project folder name.'}
+                    </small>
                   </label>
+                  <div className="new-scenario-location">
+                    <span>Location</span>
+                    <code title={saveDirectory ?? undefined}>{saveDirectory ?? 'Reading default location…'}</code>
+                    <button type="button" onClick={() => setSavePickerOpen((open) => !open)} aria-expanded={savePickerOpen}>
+                      Browse…
+                    </button>
+                  </div>
+                  {savePickerOpen && (
+                    <FolderPicker
+                      initialPath={saveDirectory}
+                      onCancel={() => setSavePickerOpen(false)}
+                      onChoose={(path) => {
+                        setSaveDirectory(path);
+                        setSavePickerOpen(false);
+                      }}
+                    />
+                  )}
+                  <small className={saveReplacesOther && !confirmOverwrite ? 'field-error' : 'field-hint'}>
+                    {savePath === null ? 'Saved as a project folder named after the Scenario.'
+                      : saveReplacesOther
+                        ? <>A project <code>{savePath}</code> already exists. Allow replacing it to overwrite it.</>
+                        : <>Saved as <code>{savePath}</code></>}
+                  </small>
                   <label className="confirmation-check">
                     <input type="checkbox" checked={confirmOverwrite} onChange={(event) => setConfirmOverwrite(event.target.checked)} />
                     Allow replacing an existing project
                   </label>
-                </section>
-                <section className="dcard" aria-label="Scenario">
-                  <h4>Scenario</h4>
-                  <div className="scenario-metadata-grid">
-                    <label className="stacked">
-                      <span>Scenario ID <span className="required-mark" aria-hidden="true">*</span></span>
-                      <input
-                        value={scenarioId}
-                        aria-invalid={!scenarioIdValid}
-                        onChange={(event) => setScenarioId(event.target.value)}
-                      />
-                      {!scenarioIdValid && (
-                        <small className="field-error">Use lowercase letters, digits, dots, underscores, or hyphens; start with a letter.</small>
-                      )}
-                    </label>
-                    <label className="stacked">
-                      <span>Name <span className="required-mark" aria-hidden="true">*</span></span>
-                      <input value={scenarioName} onChange={(event) => setScenarioName(event.target.value)} />
-                    </label>
-                  </div>
                   <label className="stacked">
                     <span>Description</span>
                     <input value={scenarioDescription} onChange={(event) => setScenarioDescription(event.target.value)} />
+                    <small className="field-hint">Free text, e.g. a readable title. Robot meshes and other referenced sources stay where they are.</small>
                   </label>
                 </section>
                 <div className="dactions new-scenario-actions">
@@ -739,15 +752,18 @@ export function ScenarioDocumentCommands({
                   <button
                     type="button"
                     className="primary-action"
-                    disabled={blocked || !savePath.trim() || !scenarioIdValid || !scenarioName.trim()}
-                    title={blockReason ?? undefined}
-                    onClick={() => complete(() => saveScenarioDocument({
-                      path: savePath.trim(),
-                      scenarioId: scenarioId.trim(),
-                      name: scenarioName.trim(),
-                      description: scenarioDescription.trim(),
-                      confirmOverwrite,
-                    }))}
+                    disabled={blocked || saveDirectory === null || nameError !== null
+                      || (saveReplacesOther && !confirmOverwrite)}
+                    title={blockReason ?? nameError ?? undefined}
+                    onClick={() => {
+                      if (saveDirectory === null || nameError !== null) return;
+                      complete(() => saveScenarioDocument({
+                        directory: saveDirectory,
+                        name: scenarioName,
+                        description: scenarioDescription.trim(),
+                        confirmOverwrite,
+                      }));
+                    }}
                   >
                     Save Scenario
                   </button>
@@ -763,18 +779,40 @@ export function ScenarioDocumentCommands({
                 )}
                 <section className="dcard" aria-label="Destination">
                   <h4>Destination</h4>
-                  <label className="stacked">
-                    <span>New destination folder <span className="required-mark" aria-hidden="true">*</span></span>
-                    <input value={exportDestinationPath} onChange={(event) => setExportDestinationPath(event.target.value)} />
-                  </label>
+                  <div className="new-scenario-location">
+                    <span>Location</span>
+                    <code title={exportParent ?? undefined}>{exportParent ?? 'Choose where to write the copy.'}</code>
+                    <button type="button" disabled={scenarioDocumentPath === null} onClick={() => setExportPickerOpen((open) => !open)} aria-expanded={exportPickerOpen}>
+                      Browse…
+                    </button>
+                  </div>
+                  {exportPickerOpen && (
+                    <FolderPicker
+                      initialPath={exportParent ?? (scenarioDocumentPath !== null ? parentFolder(scenarioDocumentPath) : null)}
+                      onCancel={() => setExportPickerOpen(false)}
+                      onChoose={(path) => {
+                        setExportParent(path);
+                        setExportPickerOpen(false);
+                      }}
+                    />
+                  )}
+                  <small className={exportTaken ? 'field-error' : 'field-hint'} role={exportTaken ? 'alert' : undefined}>
+                    {exportPath === null ? 'The copy is a new project folder with the same name.'
+                      : exportTaken
+                        ? <>A project <code>{exportPath}</code> already exists. Choose another location.</>
+                        : <>Written as <code>{exportPath}</code></>}
+                  </small>
                 </section>
                 <div className="dactions new-scenario-actions">
                   <button type="button" onClick={closeAction}>Cancel</button>
                   <button
                     type="button"
                     className="primary-action"
-                    disabled={busy || scenarioDocumentPath === null || !exportDestinationPath.trim()}
-                    onClick={() => complete(() => exportScenarioDocument(exportDestinationPath.trim()))}
+                    disabled={busy || exportPath === null || exportTaken}
+                    onClick={() => {
+                      if (exportPath === null) return;
+                      complete(() => exportScenarioDocument(exportPath));
+                    }}
                   >
                     Export copy
                   </button>
@@ -802,7 +840,21 @@ export function ScenarioDocumentCommands({
                 <button type="button" disabled={replacementPending || scenarioIndexLoading} onClick={() => void refreshScenarioIndex(scenarioDirectory)}>
                   {scenarioIndexLoading ? 'Reading…' : 'Refresh'}
                 </button>
+                <button type="button" disabled={replacementPending} onClick={() => setLoadPickerOpen((open) => !open)} aria-expanded={loadPickerOpen}>
+                  Browse…
+                </button>
               </div>
+              {loadPickerOpen && (
+                <FolderPicker
+                  chooseProject
+                  initialPath={scenarioDirectory || null}
+                  onCancel={() => setLoadPickerOpen(false)}
+                  onChoose={(path) => {
+                    setLoadPickerOpen(false);
+                    void chooseLoadProject(path);
+                  }}
+                />
+              )}
               {scenarioIndexError && <div className="document-apply-blocked" role="alert">{scenarioIndexError}</div>}
             </section>
             <section className="dcard" aria-label="Scenario">
@@ -812,7 +864,7 @@ export function ScenarioDocumentCommands({
                 <select
                   value={selectedScenarioKey}
                   disabled={replacementPending || scenarioIndexLoading || scenarioIndex === null}
-                  onChange={(event) => { setSelectedScenarioKey(event.target.value); setConfirmDiscard(false); }}
+                  onChange={(event) => setSelectedScenarioKey(event.target.value)}
                 >
                   <option value="">Select a Scenario</option>
                   {scenarioIndex?.entries.map((entry) => (
@@ -822,7 +874,7 @@ export function ScenarioDocumentCommands({
                       disabled={entry.displayStatus === 'unsupported'}
                       title={entry.statusDetail}
                     >
-                      {entry.name}
+                      {scenarioEntryLabel(entry)}
                     </option>
                   ))}
                 </select>
@@ -830,7 +882,7 @@ export function ScenarioDocumentCommands({
               </label>
               {selectedScenarioDocument && (
                 <div className={`scenario-status scenario-status-${selectedScenarioDocument.displayStatus}`}>
-                  <strong>{selectedScenarioDocument.name}</strong>
+                  <strong>{selectedScenarioLabel}</strong>
                   <span>{selectedScenarioDocument.statusDetail}</span>
                   {selectedScenarioDocument.description && (
                     <span>{selectedScenarioDocument.description}</span>
@@ -838,10 +890,6 @@ export function ScenarioDocumentCommands({
                 </div>
               )}
             </section>
-            {!loadClosesCurrent && replaceNeedsConfirmation && <label className="confirmation-check">
-              <input type="checkbox" checked={confirmDiscard} onChange={(event) => setConfirmDiscard(event.target.checked)} />
-              Replace current unsaved or unapplied Draft changes
-            </label>}
             {replacementReason && <p className="inline-message severity-error" role="status">{replacementReason}</p>}
             {afterCloseMessage && <p role="status">{afterCloseMessage}</p>}
             {selectedIdentityUnknown && <p role="status">Selected Scenario identity cannot be verified.</p>}
@@ -850,8 +898,7 @@ export function ScenarioDocumentCommands({
               <button
                 type="button"
                 className="primary-action"
-                disabled={busy || currentApplied === null || replacementReason !== null || selectedIdentityUnknown || selectedScenarioPath === null
-                  || (!loadClosesCurrent && replaceNeedsConfirmation && !confirmDiscard)}
+                disabled={busy || currentApplied === null || replacementReason !== null || selectedIdentityUnknown || selectedScenarioPath === null}
                 title={replacementReason ?? undefined}
                 onClick={() => {
                   if (selectedScenarioPath === null) return;

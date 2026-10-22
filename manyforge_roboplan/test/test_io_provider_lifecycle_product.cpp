@@ -8,6 +8,7 @@
 #include <gtest/gtest.h>
 #include <limits>
 #include <manyforge_core/component_lifecycle_plan_catalog_codec.hpp>
+#include <manyforge_core/component_lifecycle_plan_evaluator.hpp>
 #include <manyforge_core/time/fake_clock.hpp>
 #include <manyforge_core/time/manual_scheduler.hpp>
 #include <manyforge_core/types/capability_definition.hpp>
@@ -548,6 +549,9 @@ TEST_F(IoProviderLifecycleProductTest,
     return output->ServiceReady() == expected;
   };
   ASSERT_TRUE(wait_ready(true));
+  EXPECT_FALSE(driver->ReadLifecycleHealth(kDomain, clock->now())
+                   .value()
+                   .diagnostic.has_value());
   ASSERT_EQ(Step("prepare").known,
             core::LifecyclePrimitiveKnownResultDTO::kSucceeded);
   ASSERT_EQ(Step("enable").known,
@@ -555,6 +559,23 @@ TEST_F(IoProviderLifecycleProductTest,
   service.reset(); // Actual remote service disappears; local connection owner
                    // survives.
   ASSERT_TRUE(wait_ready(false));
+  {
+    // Presentation diagnostic names the missing service; facts, cause and the
+    // snapshot (lifecycle decision input) stay exactly as before.
+    const auto health = driver->ReadLifecycleHealth(kDomain, clock->now());
+    const auto snapshot = driver->ReadLifecycleSnapshot(kDomain, clock->now());
+    ASSERT_TRUE(health.ok() && snapshot.ok());
+    EXPECT_TRUE(health.value().locally_valid());
+    EXPECT_EQ(health.value().facts, snapshot.value().facts);
+    EXPECT_FALSE(snapshot.value().diagnostic.has_value());
+    ASSERT_TRUE(health.value().diagnostic.has_value());
+    const auto &diagnostic = *health.value().diagnostic;
+    EXPECT_EQ(diagnostic.code, "io_provider_transport_unavailable");
+    EXPECT_EQ(diagnostic.message,
+              "ROS service /test/local_disable is not available");
+    EXPECT_EQ(diagnostic.details.at("ros_name"), "/test/local_disable");
+    EXPECT_EQ(diagnostic.details.at("signal_name"), kSignal.name);
+  }
   EXPECT_EQ(
       cause(driver->ReadLifecycleSnapshot(kDomain, clock->now()).value().facts),
       core::LifecycleBlockingCauseClassDTO::kProviderLost);
@@ -591,6 +612,123 @@ TEST_F(IoProviderLifecycleProductTest,
   executor.remove_node(server);
   output.reset();
   context->shutdown("local Disable fixture complete");
+}
+
+TEST_F(IoProviderLifecycleProductTest,
+       InitiallyMissingServiceIsDiagnosedAvailabilityUntilItAppears) {
+  Build(true);
+  using Service = std_srvs::srv::SetBool;
+  auto context = std::make_shared<rclcpp::Context>();
+  context->init(0, nullptr);
+  rclcpp::NodeOptions options;
+  options.context(context);
+  options.use_global_arguments(false);
+  auto node = std::make_shared<rclcpp::Node>("missing_service_client", options);
+  auto server =
+      std::make_shared<rclcpp::Node>("missing_service_server", options);
+  const core::ResourceId resource("output.channel");
+  const auto occurrence = driver->occurrence();
+  auto made = RosBooleanOutputProvider::Create(
+      node, *clock,
+      {resource,
+       RosSetBoolOutputAddress{"/test/plc_io/start"},
+       {{kSignal, occurrence, 1U, driver}},
+       core::ActiveBundlePublicationGeneration(1U)});
+  ASSERT_TRUE(made.ok());
+  std::shared_ptr<RosBooleanOutputProvider> output(std::move(made.value()));
+  deployment::IoSignalProviderConfiguration configuration{
+      "ros_set_bool", {}, {}, {}, 0, "/test/plc_io/start"};
+  deployment::RetainedIoSignalConfiguration row{
+      kUnit, core::CommandTargetId("gpio"), core::ResourceRoleId("ready"),
+      *descriptor, configuration};
+  {
+    auto delivery = driver->AcquireDelivery();
+    ASSERT_TRUE(
+        driver->InstallResourcesLocked({}, {{resource, {row}, output}}, [] {})
+            .ok());
+  }
+  const auto catalog = core::MakeIoProviderLifecycleCatalog(manifest());
+  ASSERT_TRUE(catalog.ok());
+  const auto boolean_fact = [](const auto &facts, std::string_view id) {
+    for (const auto &fact : facts)
+      if (fact.lifecycle_fact_id.value() == id)
+        return fact.value.boolean_value;
+    return std::optional<bool>{};
+  };
+  // Same driver occurrence: missing service is availability, never a fault.
+  ASSERT_FALSE(output->ServiceReady());
+  auto health = driver->ReadLifecycleHealth(kDomain, clock->now());
+  ASSERT_TRUE(health.ok());
+  EXPECT_TRUE(health.value().locally_valid());
+  EXPECT_EQ(cause(health.value().facts),
+            core::LifecycleBlockingCauseClassDTO::kAvailability);
+  EXPECT_EQ(boolean_fact(health.value().facts, "io.driver.fault_present"),
+            std::optional(false));
+  EXPECT_EQ(boolean_fact(health.value().facts, "io.driver.transport_ready"),
+            std::optional(false));
+  const auto snapshot = driver->ReadLifecycleSnapshot(kDomain, clock->now());
+  ASSERT_TRUE(snapshot.ok());
+  EXPECT_EQ(health.value().facts, snapshot.value().facts);
+  EXPECT_FALSE(snapshot.value().diagnostic.has_value());
+  ASSERT_TRUE(health.value().diagnostic.has_value());
+  EXPECT_EQ(health.value().diagnostic->code,
+            "io_provider_transport_unavailable");
+  EXPECT_EQ(health.value().diagnostic->message,
+            "ROS service /test/plc_io/start is not available");
+  EXPECT_EQ(health.value().diagnostic->details.at("ros_name"),
+            "/test/plc_io/start");
+  EXPECT_EQ(health.value().diagnostic->details.at("signal_name"),
+            kSignal.name);
+  auto decision = core::EvaluateLifecycleDomainPlan(
+      core::ComponentLifecycleIntentKindDTO::kPrepare,
+      core::ComponentLifecycleStateDTO::kPrepared, catalog.value(), occurrence,
+      health.value());
+  ASSERT_FALSE(decision.ok());
+  EXPECT_EQ(decision.error().code, "component_lifecycle_transition_missing");
+  EXPECT_EQ(decision.error().details.at("observed_transport_ready"), "false");
+  EXPECT_EQ(decision.error().details.at("observed_fault_present"), "false");
+  EXPECT_EQ(decision.error().details.at("observed_blocking_cause"),
+            "availability");
+  EXPECT_EQ(decision.error().details.at("observed_diagnostic_code"),
+            "io_provider_transport_unavailable");
+  EXPECT_EQ(Step("prepare").dispatch,
+            core::LifecyclePrimitiveDispatchStateDTO::kNotDispatched);
+
+  // The service appears: the same observation clears the diagnostic and
+  // Prepare becomes eligible and succeeds.
+  auto service = server->create_service<Service>(
+      "/test/plc_io/start",
+      [](Service::Request::SharedPtr, Service::Response::SharedPtr response) {
+        response->success = true;
+      });
+  rclcpp::ExecutorOptions executor_options;
+  executor_options.context = context;
+  rclcpp::executors::SingleThreadedExecutor executor(executor_options);
+  executor.add_node(node);
+  executor.add_node(server);
+  const auto limit = std::chrono::steady_clock::now() + std::chrono::seconds(2);
+  while (!output->ServiceReady() && std::chrono::steady_clock::now() < limit)
+    executor.spin_once(std::chrono::milliseconds(5));
+  ASSERT_TRUE(output->ServiceReady());
+  health = driver->ReadLifecycleHealth(kDomain, clock->now());
+  ASSERT_TRUE(health.ok());
+  EXPECT_FALSE(health.value().diagnostic.has_value());
+  EXPECT_EQ(cause(health.value().facts),
+            core::LifecycleBlockingCauseClassDTO::kNone);
+  decision = core::EvaluateLifecycleDomainPlan(
+      core::ComponentLifecycleIntentKindDTO::kPrepare,
+      core::ComponentLifecycleStateDTO::kPrepared, catalog.value(), occurrence,
+      health.value());
+  ASSERT_TRUE(decision.ok());
+  EXPECT_EQ(decision.value().kind,
+            core::LifecycleDomainPlanDecisionKind::kDispatchPrimitive);
+  EXPECT_EQ(Step("prepare").known,
+            core::LifecyclePrimitiveKnownResultDTO::kSucceeded);
+  driver->Shutdown();
+  executor.remove_node(node);
+  executor.remove_node(server);
+  output.reset();
+  context->shutdown("missing service fixture complete");
 }
 
 TEST_F(IoProviderLifecycleProductTest,

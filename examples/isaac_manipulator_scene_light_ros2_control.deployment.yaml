@@ -965,7 +965,7 @@
         "record_kind": "component_type",
         "record_revision": "sha256:9498876c8f0e774e91e0c9863e17c215c116303f8355df6bf4558eea0a35c3ac",
         "schema_id": "manyforge.component_type.v1",
-        "schema_revision": "sha256:8e728ad4442d46b98f0d0534f8189df9b7982f982ab99cb656e6fdbeef231009"
+        "schema_revision": "sha256:2f26f97a7454e620bfb39e16eeccc0b23ae2de61c32e3e8210eff46945d01fc4"
       },
       {
         "content_addressed_store_key": "catalog/maintained/control_interface_contract/manyforge.ros2_control_arm_position/d951ffd368654ba9998355a4b12844014469753c3c21e05df3b61f6f669cbb4b",
@@ -1074,7 +1074,7 @@
     ]
   },
   "deployment_artifact_id": "isaac_manipulator_scene_light_ros2_control",
-  "deployment_revision": "sha256:2cde734d89046ca3ae183a4d12713dbe3315fa499c91f86060994f6f7691d519",
+  "deployment_revision": "sha256:e79a6de0297a7b55accb29723e06d705fd7be0431d4c994e23a30fc1e250dd8d",
   "description": "Retained Isaac UR10e light-scene pick-and-place deployment using the separately retained ROS 2 control execution product, commanded state authority, and Robotiq bridge profile.",
   "desired_control_configurations": [
     {

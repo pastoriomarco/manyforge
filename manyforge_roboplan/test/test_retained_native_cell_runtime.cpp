@@ -2136,8 +2136,7 @@ TEST(RetainedNativeCellRuntimeTest,
             program_value.controllable_component_id,
             core::ModelInstanceId("robot.model"),
             core::CollisionBodyRoleId("tool_collision"), 0U)}}},
-      0.002,
-      0.8}};
+      core::ContactGraspEnvelopeDTO{0.002, 0.8}}};
   const auto program_binding =
       core::verify_runtime_participant_binding(std::move(program_value));
   ASSERT_TRUE(program_binding.ok()) << program_binding.error().message;

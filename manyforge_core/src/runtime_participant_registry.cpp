@@ -44,7 +44,9 @@ namespace {
           if (!runtime.control_path.has_value() || runtime.model_groups.empty() ||
               runtime.resources.empty() ||
               find_frame(runtime, payload.base_frame_role_id) == nullptr ||
-              find_frame(runtime, payload.tcp_frame_role_id) == nullptr) {
+              !runtime.motion_endpoint ||
+              runtime.motion_endpoint->target_role_id != payload.tcp_endpoint.target_role_id ||
+              runtime.motion_endpoint->frame.frame_role_id != payload.tcp_endpoint.frame_role_id) {
             return reject("motion participant lacks an exact runtime mapping",
                           "runtime_motion_mapping_incomplete");
           }

@@ -1,6 +1,6 @@
 api_version: manyforge.program.v2
 program_id: isaac_manipulator_scene_light
-program_revision: sha256:97ad9fe6477558b6115861236b8eebe5f25fea44b6302a265d92fb95f8243984
+program_revision: sha256:341dcc281d7a2a0e2ec579c4e01d401240cf816a40544430d8a0dcaf12ee489a
 program_profile: composable-cell-v1
 name: isaac_manipulator_scene_light
 description: >-
@@ -169,7 +169,7 @@ tree:
       parameters:
         target_role: arm
         base_frame_role: base
-        tcp_frame_role: tcp
+        tcp_endpoint: {target_role: arm, frame_role: tcp}
         target_mode: relative
         target_reference: {type: scene_resource, scene_resource_id: isaac_cheese_box}
         offset_reference: {type: frame_role, frame_role_id: base}
@@ -186,7 +186,7 @@ tree:
       parameters:
         target_role: arm
         base_frame_role: base
-        tcp_frame_role: tcp
+        tcp_endpoint: {target_role: arm, frame_role: tcp}
         target_mode: relative
         target_reference: {type: scene_resource, scene_resource_id: isaac_cheese_box}
         offset_reference: {type: frame_role, frame_role_id: base}
@@ -227,7 +227,7 @@ tree:
       parameters:
         target_role: arm
         base_frame_role: base
-        tcp_frame_role: tcp
+        tcp_endpoint: {target_role: arm, frame_role: tcp}
         target_mode: relative
         target_reference: {type: frame_role, frame_role_id: tcp}
         goal:
@@ -243,7 +243,7 @@ tree:
       parameters:
         target_role: arm
         base_frame_role: base
-        tcp_frame_role: tcp
+        tcp_endpoint: {target_role: arm, frame_role: tcp}
         target_mode: relative
         target_reference: {type: scene_resource, scene_resource_id: isaac_small_klt}
         offset_reference: {type: frame_role, frame_role_id: base}
@@ -260,7 +260,7 @@ tree:
       parameters:
         target_role: arm
         base_frame_role: base
-        tcp_frame_role: tcp
+        tcp_endpoint: {target_role: arm, frame_role: tcp}
         target_mode: relative
         target_reference: {type: scene_resource, scene_resource_id: isaac_small_klt}
         offset_reference: {type: frame_role, frame_role_id: base}
@@ -300,7 +300,7 @@ tree:
       parameters:
         target_role: arm
         base_frame_role: base
-        tcp_frame_role: tcp
+        tcp_endpoint: {target_role: arm, frame_role: tcp}
         target_mode: relative
         target_reference: {type: scene_resource, scene_resource_id: isaac_small_klt}
         offset_reference: {type: frame_role, frame_role_id: base}
@@ -317,7 +317,7 @@ tree:
       parameters:
         target_role: arm
         base_frame_role: base
-        tcp_frame_role: tcp
+        tcp_endpoint: {target_role: arm, frame_role: tcp}
         goal:
           - {joint_name: shoulder_pan_joint, position_rad: 2.63422544}
           - {joint_name: shoulder_lift_joint, position_rad: -0.875980752}

@@ -111,6 +111,12 @@ struct Composition final : ExecutionProduct {
   std::shared_ptr<const deployment::ProgramBinding> direct_control_binding;
   std::shared_ptr<const deployment::ProgramBinding>
       direct_control_gripper_program_binding;
+  // Construction-time physical target identity (component, target,
+  // capability, resources). Route publication later rebinds the runtime's
+  // control path (route, activation set, active configuration generation)
+  // without updating these copies: read route-specific facts from the
+  // runtime's current binding (RetainedNativeRuntime::CurrentPhysicalBindings,
+  // RetainedNativeGripperRuntime::binding), never from here.
   std::optional<core::RuntimeParticipantBinding> direct_control_motion_binding;
   std::optional<core::RuntimeParticipantBinding>
       direct_control_gripper_binding;

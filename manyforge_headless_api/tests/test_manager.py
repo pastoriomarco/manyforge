@@ -28,7 +28,8 @@ def _prepared_activation() -> dict[str, object]:
     return {
         "schema_version": "manyforge.prepared_activation_input.v6",
         "origin": {"kind": "scenario", "scenario_id": "scenario.1",
-                   "source_document_digest": "sha256:" + "1" * 64},
+                   "source_document_digest": "sha256:" + "1" * 64,
+                   "project_path": "/projects/scenario.1.scenario"},
         "captured_input_digest": "sha256:" + "d" * 64,
         "deployment_artifact_id": "deployment.1",
         "deployment_revision": "sha256:" + "a" * 64,

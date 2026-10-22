@@ -1,7 +1,10 @@
-import type { JsonValue, ProgramBindingDocument, ProgramTreeNode } from '../types/api';
+import type {
+  JsonValue, ProgramAuthoringDocument, ProgramBindingDocument, ProgramTreeNode,
+} from '../types/api';
 import { conditionKind } from './interruptAuthoring';
 import { declaredIoSources, ioSourceKey, type IoSourceProfile } from './ioSignalConfiguration';
 import { INTERRUPT_MOTION_NODE_IDS } from './programAuthoring';
+import { resolvedTargetRoles } from './targetRoleResolution';
 import { valuePathParameter } from './valuePaths';
 
 /**
@@ -185,16 +188,23 @@ export function mockSimulationProblem(
  * The declared source profile of each signal a node reads, by `mockSignalId`,
  * from the current binding and Deployment Draft. A signal is missing when its
  * source is not declared there (unknown: the simulation stays editable).
+ * Without a binding, the target resolves through `program` and the scenario
+ * `roleAssignment` (targetRoleResolution).
  */
 export function mockSignalProfiles(
   signals: readonly MockSignal[],
   binding: ProgramBindingDocument | null | undefined,
   deploymentDocument: Record<string, JsonValue> | null,
+  program?: Pick<ProgramAuthoringDocument, 'target_roles'>,
+  roleAssignment?: Record<string, JsonValue> | null,
 ): Map<string, IoSourceProfile> {
   const declared = declaredIoSources(deploymentDocument);
+  const targets = binding == null
+    ? (program === undefined ? [] : resolvedTargetRoles(program, roleAssignment))
+    : binding.target_role_bindings;
   const result = new Map<string, IoSourceProfile>();
   for (const signal of signals) {
-    const target = binding?.target_role_bindings?.find((row) => row.target_role_id === signal.targetRole);
+    const target = targets?.find((row) => row.target_role_id === signal.targetRole);
     if (target === undefined) continue;
     const profile = declared.get(ioSourceKey(
       target.controllable_component_id, target.command_target_id, signal.resourceRole,

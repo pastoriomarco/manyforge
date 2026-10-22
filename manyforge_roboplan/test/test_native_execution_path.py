@@ -866,7 +866,10 @@ def _planning_motion(
         "kind": "motion",
         "move_id": move_id,
         "base_frame_role_id": "frame-role:base",
-        "tcp_frame_role_id": "frame-role:tcp",
+        "tcp_endpoint": {
+            "target_role_id": "target-role:test",
+            "frame_role_id": "frame-role:tcp",
+        },
         "tolerances": {
             "joint_position_tol_rad": 0.01,
             "translation_tol_m": 0.001,
@@ -1015,7 +1018,10 @@ def _direct_control_joint_operation(
                 )
                 | {
                     "base_frame_role_id": command["base_frame_role_id"],
-                    "tcp_frame_role_id": command["tcp_frame_role_id"],
+                    "tcp_endpoint": {
+                        "target_role_id": command["target_role_id"],
+                        "frame_role_id": command["tcp_frame_role_id"],
+                    },
                     "planning_profile": "balanced",
                     "speed_profile": {
                         "velocity_scale": 1.0,

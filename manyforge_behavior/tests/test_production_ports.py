@@ -755,7 +755,7 @@ def _motion_inputs() -> OwnerNodeInputs:
         parameters={
             "target_role": "arm",
             "base_frame_role": "base",
-            "tcp_frame_role": "tcp",
+            "tcp_endpoint": {"target_role": "arm", "frame_role": "tcp"},
             "goal": {
                 "position_m": [0.0, 0.0, 0.1],
                 "orientation": {"rpy_deg": [180.0, 0.0, 0.0]},
@@ -2703,7 +2703,7 @@ def _pick_inputs(*, policy: str = "pause_for_operator") -> OwnerNodeInputs:
             "target_role": "arm",
             "tool_target_role": "gripper",
             "base_frame_role": "base",
-            "tcp_frame_role": "tcp",
+            "tcp_endpoint": {"target_role": "arm", "frame_role": "tcp"},
             "carrier_frame_role": "tcp",
             "selected_object_id": "graspable",
             "synthesis": {
@@ -4827,6 +4827,44 @@ def test_idle_reset_scene_preparation_forwards_exact_claim_without_authoring_adm
     assert all("expected_admission_generation" not in row for row in transport.forwarded)
 
 
+_IDLE_RESET_CLAIM = {"request_owner_epoch": "caller.1", "request_id": "reset.1",
+                     "request_payload_digest": _DIGEST_A, "reset_claim_generation": 7}
+_RUN_RESET_AUTHORIZATION = {"program_runner_owner_epoch": "runner.1", "program_run_id": "program-run.1",
+                            "cycle_claim_generation": 7, "terminal_or_settlement_reference": _DIGEST_A}
+
+
+@pytest.mark.parametrize(
+    ("authorization", "message"),
+    [
+        ({"program_runner_owner_epoch": "runner.1", "cycle_generation": 3,
+          "reset_claim": {**_IDLE_RESET_CLAIM, "reset_claim_generation": 0}},
+         "Program Reset scene claim generation is invalid"),
+        ({"program_runner_owner_epoch": "runner.1", "cycle_generation": 3,
+          "reset_claim": {**_IDLE_RESET_CLAIM, "request_payload_digest": "sha256:bad"}},
+         "Program Reset scene evidence digest is invalid"),
+        ({**_RUN_RESET_AUTHORIZATION, "cycle_claim_generation": True},
+         "Program Reset scene claim generation is invalid"),
+        ({**_RUN_RESET_AUTHORIZATION, "terminal_or_settlement_reference": "sha256:bad"},
+         "Program Reset scene settlement reference is invalid"),
+    ],
+)
+def test_reset_scene_authorization_rejects_malformed_claim_before_commit(authorization, message):
+    class Transport(_SceneTransport):
+        def __init__(self):
+            super().__init__()
+            self.forwarded = []
+        def authoring_admission(self):
+            raise AssertionError("Reset used ordinary authoring admission")
+        def commit_scene_transaction(self, request):
+            self.forwarded.append(deepcopy(request))
+            raise AssertionError("malformed Reset authorization reached the Scene owner")
+    transport = Transport()
+    port = _scene_port(transport)
+    with pytest.raises(ProductionPortError, match=message):
+        port.prepare_initial_scene(_scene_context(), _authored_scene(), program_reset_scene_authorization=authorization)
+    assert transport.forwarded == []
+
+
 def _stopped_motion_for_recovery(*, lost_replies: int = 0):
     transport = _Transport()
     port = NativeKernelProgramPort(KernelClient(transport))
@@ -5182,3 +5220,147 @@ def test_an_observed_operation_carries_its_exact_state_and_residency() -> None:
     fixture.transport.resident[observed.metadata["operation_id"]] = False
     retired = fixture.port.operations.observe(fixture.started.task_id)
     assert retired.metadata["resident"] is False
+
+
+@pytest.mark.parametrize('node_id', ['motion.move_to_pose', 'motion.probe_search'])
+def test_qualified_tcp_endpoint_is_identical_for_execution_and_preview(node_id) -> None:
+    transport = _Transport()
+    port = NativeKernelProgramPort(KernelClient(transport))
+    port.bind(_context())
+    inputs = _contact_pose_inputs() if node_id == 'motion.move_to_pose' else _interrupt_inputs(node_id)
+    parameters = dict(inputs.parameters)
+    parameters['tcp_endpoint'] = {'target_role': 'gripper', 'frame_role': 'tcp'}
+    identity = _identity('endpoint-preview')
+    port.operations.start(node_id, identity, OwnerNodeInputs(parameters))
+    payload = transport.submissions[0]['participants'][0]['payload']
+    assert payload['tcp_endpoint'] == {'target_role_id': 'gripper', 'frame_role_id': 'tcp'}
+    assert 'tcp_frame_role_id' not in payload
+    # Exercise the first real strict ingress, rather than only our recording
+    # transport: the previous legacy-only model rejected this emitted payload.
+    from manyforge_headless_api.models import MotionParticipantRequest
+
+    validated = MotionParticipantRequest.model_validate(payload)
+    wire = validated.model_dump(mode="json")
+    assert wire["tcp_endpoint"] == payload["tcp_endpoint"]
+    assert "tcp_frame_role_id" not in wire
+    assert MotionParticipantRequest.model_validate_json(
+        validated.model_dump_json()
+    ).model_dump(mode="json") == wire
+    _, preview = port.motion_preview_intent(identity, node_id, parameters, request_id='endpoint.preview')
+    preview_payload = preview['participants'][0]['payload']
+    assert {**preview_payload, 'move_id': None} == {**payload, 'move_id': None}
+    assert len(transport.submissions) == 1
+
+
+def test_pick_place_phase_motion_preserves_qualified_tcp_endpoint() -> None:
+    parameters = {'base_frame_role': 'base', 'tcp_endpoint': {'target_role': 'gripper', 'frame_role': 'tcp'}}
+    payload = NativeKernelProgramPort._phase_motion_payload(
+        identity=_identity('pick-endpoint'), parameters=parameters,
+        phase='approach', motion={
+            'kind': 'pose_goal',
+            'goal': {
+                'position_m': {'x_m': 0.0, 'y_m': 0.0, 'z_m': 0.1},
+                'orientation': {'x': 0.0, 'y': 0.0, 'z': 0.0, 'w': 1.0},
+            },
+        },
+    )
+    assert payload['tcp_endpoint'] == {'target_role_id': 'gripper', 'frame_role_id': 'tcp'}
+    assert 'tcp_frame_role_id' not in payload
+    from manyforge_headless_api.models import MotionParticipantRequest
+
+    wire = MotionParticipantRequest.model_validate(payload).model_dump(mode="json")
+    assert wire["tcp_endpoint"] == payload["tcp_endpoint"]
+    assert "tcp_frame_role_id" not in wire
+    parameters['tcp_frame_role'] = ''
+    with pytest.raises(ProductionPortError, match='tcp_frame_role is unsupported'):
+        NativeKernelProgramPort._phase_motion_payload(
+            identity=_identity('pick-endpoint'), parameters=parameters,
+            phase='approach', motion={'kind': 'pose_goal'},
+        )
+
+
+@pytest.mark.parametrize('missing', [None, 'contact_policy_id', 'contact_scene_resource_id'])
+def test_joint_goal_uses_the_common_exact_contact_binding_before_strict_ingress(missing) -> None:
+    parameters = dict(_motion_inputs().parameters)
+    parameters.update(
+        target_mode='absolute', target_reference=None, offset_reference=None,
+        tcp_endpoint={'target_role': 'gripper', 'frame_role': 'tcp'},
+        goal=[{'joint_name': 'joint1', 'position_rad': 0.0}],
+        contact_policy_id='pick.contact', contact_scene_resource_id='part.7',
+    )
+    if missing is not None:
+        parameters.pop(missing)
+    transport = _Transport()
+    port = NativeKernelProgramPort(KernelClient(transport))
+    port.bind(_context())
+    if missing is not None:
+        with pytest.raises(ProductionPortError, match='supplied together'):
+            port.operations.start('motion.move_to_joint_target', _identity('withdraw'), OwnerNodeInputs(parameters))
+        assert transport.submissions == []
+        return
+    port.operations.start('motion.move_to_joint_target', _identity('withdraw'), OwnerNodeInputs(parameters))
+    payload = transport.submissions[0]['participants'][0]['payload']
+    assert payload['motion']['kind'] == 'joint_goal'
+    assert payload['contact_policy_id'] == 'pick.contact'
+    assert payload['runtime_object_bindings'] == [
+        {'runtime_object_id': 'selected_object', 'scene_resource_id': 'part.7'},
+    ]
+    from manyforge_headless_api.models import MotionParticipantRequest
+
+    parsed = MotionParticipantRequest.model_validate(payload)
+    assert parsed.model_dump(mode='json')['tcp_endpoint'] == {
+        'target_role_id': 'gripper', 'frame_role_id': 'tcp',
+    }
+
+
+def _thawed(value: Any) -> Any:
+    """An ordinary mutable copy of a recursively frozen JSON value."""
+
+    if isinstance(value, Mapping):
+        return {key: _thawed(nested) for key, nested in value.items()}
+    if isinstance(value, (list, tuple)):
+        return [_thawed(nested) for nested in value]
+    return value
+
+
+def _release_bound_context():
+    context = _context()
+    binding = _thawed(context.program_binding)
+    binding["contact_grasp_bindings"][0]["mode"] = "contact_release"
+    return replace(context, program_binding=binding)
+
+
+def test_contact_release_motion_lowers_only_its_exact_policy_and_object():
+    transport = _Transport()
+    port = NativeKernelProgramPort(KernelClient(transport))
+    port.bind(_release_bound_context())
+    parameters = dict(_motion_inputs().parameters)
+    parameters.update(
+        target_mode="absolute", target_reference=None, offset_reference=None,
+        tcp_endpoint={"target_role": "gripper", "frame_role": "tcp"},
+        goal=[{"joint_name": "joint1", "position_rad": 0.0}],
+        contact_policy_id="pick.contact", contact_scene_resource_id="part.7",
+    )
+    port.operations.start(
+        "motion.move_to_joint_target", _identity("release"), OwnerNodeInputs(parameters)
+    )
+    payload = transport.submissions[0]["participants"][0]["payload"]
+    assert payload["motion"]["kind"] == "joint_goal"
+    assert payload["tcp_endpoint"] == {"target_role_id": "gripper", "frame_role_id": "tcp"}
+    assert payload["contact_policy_id"] == "pick.contact"
+    assert payload["runtime_object_bindings"] == [
+        {"runtime_object_id": "selected_object", "scene_resource_id": "part.7"},
+    ]
+    from manyforge_headless_api.models import MotionParticipantRequest
+
+    assert MotionParticipantRequest.model_validate(payload).contact_policy_id == "pick.contact"
+
+
+def test_contact_release_binding_cannot_be_used_for_pick_synthesis():
+    transport = _PickPlaceTransport()
+    port = NativeKernelProgramPort(KernelClient(transport))
+    port.bind(_release_bound_context())
+    with pytest.raises(ProductionPortError, match="pick requires a contact-grasp policy"):
+        port.operations.start("planning.plan_pick_sequence", _identity("pick"), _pick_inputs())
+    assert transport.submissions == []
+    assert transport.pick_requests == []

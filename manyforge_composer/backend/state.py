@@ -21,7 +21,10 @@ from manyforge_behavior.node_environment import NodeEnvironment, build_node_envi
 from manyforge_behavior.canonical_artifact import canonical_json_bytes
 from manyforge_behavior.program import Program, ProgramValidationError
 from manyforge_headless_api.client import HeadlessClientError
-from manyforge_headless_api.program_binding_projection import validate_prepared_activation_origin
+from manyforge_headless_api.program_binding_projection import (
+    validate_prepared_activation_origin,
+    validate_project_path,
+)
 
 from .draft_session import (
     ComposerDraftSession,
@@ -128,6 +131,16 @@ _ProgramOutcomeIdentity = tuple[str, str]
 _DeploymentPublicationIdentity = tuple[str, str, str, str | None, _ProgramOutcomeIdentity]
 
 
+def canonical_project_path(path: str) -> str:
+    """The Scenario project folder as Apply records it: resolved and absolute.
+
+    Composer owns the files, so it resolves the path; Manager and the Program
+    runner only compare it. Persistent values are scoped by it.
+    """
+
+    return validate_project_path(str(Path(path).expanduser().resolve()))
+
+
 def _is_sha256_identity(value: object) -> bool:
     return (
         isinstance(value, str)
@@ -135,6 +148,26 @@ def _is_sha256_identity(value: object) -> bool:
         and value.startswith("sha256:")
         and all(character in "0123456789abcdef" for character in value[7:])
     )
+
+
+def _manager_refusal_message(lead: str, response: object) -> str:
+    """Keep Manager's own refusal code and message after the generic lead.
+
+    The Composer code, HTTP status and effect handling stay those of the lead;
+    only the text names Manager's precise cause when the response carries one.
+    """
+
+    error = response.get("error") if isinstance(response, dict) else None
+    if not isinstance(error, dict):
+        return lead
+    code = error.get("code")
+    message = error.get("message")
+    cause = ": ".join(
+        value for value in (code, message) if isinstance(value, str) and value
+    )
+    return f"{lead}: {cause}" if cause else lead
+
+
 _PREPARED_ACTIVATION_FIELDS = (
     "schema_version",
     "prepared_activation_id",
@@ -471,6 +504,9 @@ class ComposerState:
             source_path=self.program_source_path,
         )
         self.deployment_draft_session = DeploymentDraftSession()
+        # Set when the startup project was not opened; cleared by the next
+        # successful Load or New. Shown to the GUI through /api/health.
+        self.startup_scenario_notice: dict[str, str] | None = None
         self.allowed_fs_roots = list(allowed_fs_roots or [])
         self.allowed_program_write_roots = (
             None
@@ -739,6 +775,7 @@ class ComposerState:
             or origin.get("scenario_id") != intent.get("scenario_id")
             or origin.get("source_document_digest")
             != intent.get("source_document_digest")
+            or origin.get("project_path") != intent.get("project_path")
         ):
             raise AuthoringOperationError(
                 "activation_authoring_capture_mismatch",
@@ -752,6 +789,7 @@ class ComposerState:
             "program_role_assignment": deepcopy(intent["program_role_assignment"]),
             "source_document_digest": intent["source_document_digest"],
             "scenario_id": intent["scenario_id"],
+            "scenario_project_path": intent["project_path"],
             "project_path": self.deployment_source_project_path,
         }
         return identity, context
@@ -806,6 +844,13 @@ class ComposerState:
     @property
     def scenario_document_path(self) -> str | None:
         return self._authoring_project_fact("document_path")
+
+    @property
+    def scenario_project_path(self) -> str | None:
+        """The loaded Scenario project folder, canonical as Apply records it."""
+
+        path = self.scenario_document_path
+        return None if path is None else canonical_project_path(path)
 
     @property
     def deployment_source_project_path(self) -> str | None:
@@ -1177,7 +1222,9 @@ class ComposerState:
         if response.get("ok") is not True:
             raise AuthoringOperationError(
                 "manager_apply_rejected",
-                "Manager rejected the exact Deployment candidate",
+                _manager_refusal_message(
+                    "Manager rejected the exact Deployment candidate", response
+                ),
             )
         acceptance = deepcopy(response)
         if (
@@ -1264,6 +1311,7 @@ class ComposerState:
                 {
                     "source_document_digest": intent["source_document_digest"],
                     "scenario_id": intent["scenario_id"],
+                    "project_path": intent["project_path"],
                     "captured_input_digest": intent["captured_input_digest"],
                     "deployment": deepcopy(intent["deployment"]),
                     "model_source_closure": deepcopy(
@@ -1341,7 +1389,9 @@ class ComposerState:
         if preview.get("ok") is not True or not isinstance(receipt, dict):
             raise AuthoringOperationError(
                 "deployment_candidate_rejected",
-                "Manager rejected the prepared Deployment candidate",
+                _manager_refusal_message(
+                    "Manager rejected the prepared Deployment candidate", preview
+                ),
             )
         if (
             receipt.get("candidate_retained_bundle_id")

@@ -114,6 +114,63 @@ _PORTABLE_ID_MAX_BYTES = 128
 _T = TypeVar("_T")
 
 
+def _finite(value: Any) -> bool:
+    return type(value) in {int, float} and math.isfinite(float(value))
+
+
+def _contact_grasp_envelope_valid(zone: dict[str, Any], common: set[str]) -> bool:
+    """The grasp envelope: a positive penetration cap and a terminal window."""
+
+    return (
+        set(zone) == common | {"max_penetration_m", "terminal_window_start_fraction"}
+        and _finite(zone["max_penetration_m"])
+        and float(zone["max_penetration_m"]) > 0.0
+        and _finite(zone["terminal_window_start_fraction"])
+        and 0.0 <= float(zone["terminal_window_start_fraction"]) <= 1.0
+    )
+
+
+# Spec 250 §3.2 release envelope fields; signed defaults and binary neutral values.
+_RELEASE_METRICS = ("max_start_penetration_m", "min_release_progress_m", "release_tolerance_m")
+_RELEASE_FLAGS = (
+    "enforce_max_start_penetration",
+    "require_strictly_decreasing_penetration",
+    "require_separation_by_end",
+    "allow_recontact",
+)
+_RELEASE_BINARY_NEUTRAL: dict[str, Any] = {
+    "enforce_max_start_penetration": False,
+    "max_start_penetration_m": 0,
+    "min_release_progress_m": 0,
+    "release_tolerance_m": 0,
+    "require_strictly_decreasing_penetration": False,
+}
+
+
+def _contact_release_envelope_valid(zone: dict[str, Any], common: set[str]) -> bool:
+    """Spec 250 §3.2 release envelope; omitted fields take their defaults.
+
+    A ``binary_contact`` zone may only carry the neutral metric values.
+    """
+
+    mode = zone.get("release_evidence_mode")
+    if type(mode) is not str or mode not in ("signed_penetration", "binary_contact"):
+        return False
+    if not set(zone) <= common | {"release_evidence_mode", *_RELEASE_METRICS, *_RELEASE_FLAGS}:
+        return False
+    if any(
+        field in zone and not (_finite(zone[field]) and 0.0 <= float(zone[field]) <= 1000.0)
+        for field in _RELEASE_METRICS
+    ):
+        return False
+    if any(field in zone and type(zone[field]) is not bool for field in _RELEASE_FLAGS):
+        return False
+    return mode == "signed_penetration" or all(
+        field not in zone or zone[field] == neutral
+        for field, neutral in _RELEASE_BINARY_NEUTRAL.items()
+    )
+
+
 def _is_portable_id(value: Any) -> bool:
     return (
         type(value) is str
@@ -1853,7 +1910,8 @@ class ComposerDraftSession:
             )
         if (
             policy["api_version"] != "manyforge.contact_policy.v1"
-            or policy["mode"] != "contact_grasp"
+            or type(policy["mode"]) is not str
+            or policy["mode"] not in ("contact_grasp", "contact_release")
             or policy["sensing_mode"] != "geometry_only"
             or policy["default_unmatched_response"] != "hard_stop"
             or not _is_portable_id(policy["policy_id"])
@@ -1862,29 +1920,22 @@ class ComposerDraftSession:
         ):
             _error(
                 "draft_arguments_invalid",
-                "contact policy is outside the qualified geometry-only contact-grasp profile",
+                "contact policy is outside the qualified geometry-only grasp/release profile",
             )
         zone = policy["zones"][0]
-        zone_fields = {
-            "zone_id",
-            "body_pairs",
-            "violation_response",
-            "max_penetration_m",
-            "terminal_window_start_fraction",
-        }
+        common = {"zone_id", "body_pairs", "violation_response"}
         if (
             type(zone) is not dict
-            or set(zone) != zone_fields
+            or not common <= set(zone)
             or not _is_portable_id(zone["zone_id"])
             or type(zone["body_pairs"]) is not list
             or not zone["body_pairs"]
             or zone["violation_response"] != "hard_stop"
-            or type(zone["max_penetration_m"]) not in {int, float}
-            or not math.isfinite(float(zone["max_penetration_m"]))
-            or float(zone["max_penetration_m"]) <= 0.0
-            or type(zone["terminal_window_start_fraction"]) not in {int, float}
-            or not math.isfinite(float(zone["terminal_window_start_fraction"]))
-            or not 0.0 <= float(zone["terminal_window_start_fraction"]) <= 1.0
+            or not (
+                _contact_grasp_envelope_valid(zone, common)
+                if policy["mode"] == "contact_grasp"
+                else _contact_release_envelope_valid(zone, common)
+            )
         ):
             _error("draft_arguments_invalid", "contact policy zone is invalid")
         pair_keys: list[tuple[str, str]] = []
@@ -1902,6 +1953,14 @@ class ComposerDraftSession:
                 ),
                 None,
             )
+            endpoint = next(
+                (
+                    selector
+                    for selector in selectors
+                    if selector.get("kind") == "motion_endpoint"
+                ),
+                None,
+            )
             runtime = next(
                 (
                     selector
@@ -1910,14 +1969,15 @@ class ComposerDraftSession:
                 ),
                 None,
             )
-            if component is None or runtime is None:
+            if (component is None) == (endpoint is None) or runtime is None:
                 _error(
                     "draft_arguments_invalid",
-                    "contact pair must join one component body to one runtime object",
+                    "contact pair must join one component body or motion endpoint "
+                    "to one runtime object",
                 )
-            if (
+            component_valid = component is not None and (
                 frozenset(component)
-                not in {
+                in {
                     frozenset(
                         {"kind", "component_role_id", "collision_body_role_id"}
                     ),
@@ -1930,20 +1990,29 @@ class ComposerDraftSession:
                         }
                     ),
                 }
-                or set(runtime) != {"kind", "runtime_object_id"}
-                or any(
-                    not _is_portable_id(component.get(field))
+                and all(
+                    _is_portable_id(component.get(field))
                     for field in set(component) - {"kind"}
                 )
+            )
+            endpoint_valid = endpoint is not None and set(endpoint) == {"kind"}
+            if (
+                not (component_valid or endpoint_valid)
+                or set(runtime) != {"kind", "runtime_object_id"}
                 or not _is_portable_id(runtime.get("runtime_object_id"))
             ):
                 _error("draft_arguments_invalid", "contact selector is invalid")
+            body_identity = (
+                "component_model_body:"
+                + canonical_json_bytes(component).decode("utf-8")
+                if component is not None
+                else "motion_endpoint"
+            )
             pair_keys.append(
                 tuple(
                     sorted(
                         (
-                            "component_model_body:"
-                            + canonical_json_bytes(component).decode("utf-8"),
+                            body_identity,
                             f"runtime_object:{runtime['runtime_object_id']}",
                         )
                     )
@@ -1953,6 +2022,14 @@ class ComposerDraftSession:
             _error(
                 "draft_arguments_invalid",
                 "contact body pairs must be unique and canonical-sorted",
+            )
+        if (
+            any("motion_endpoint" in pair for pair in pair_keys)
+            and len(pair_keys) != 1
+        ):
+            _error(
+                "draft_arguments_invalid",
+                "motion_endpoint contact requires exactly one body pair",
             )
         policy["version"] = "sha256:" + ("0" * 64)
         policy["version"] = compute_content_identity(
@@ -2013,7 +2090,6 @@ class ComposerDraftSession:
             "target_role",
             "tool_target_role",
             "base_frame_role",
-            "tcp_frame_role",
             "carrier_frame_role",
             "tool_position",
             "blackboard_namespace_id",
@@ -2043,8 +2119,11 @@ class ComposerDraftSession:
                 f"unknown authoring macro: {macro_id}",
                 status_code=404,
             )
-        required = common | specific
-        if set(arguments) - required - optional or not required <= set(arguments):
+        required = common | specific | {"tcp_endpoint"}
+        if (
+            set(arguments) - required - optional
+            or not required <= set(arguments)
+        ):
             _error(
                 "draft_arguments_invalid",
                 f"{operation} subtree macro arguments are incomplete or unsupported",
@@ -2054,7 +2133,6 @@ class ComposerDraftSession:
             "target_role",
             "tool_target_role",
             "base_frame_role",
-            "tcp_frame_role",
             "carrier_frame_role",
             "blackboard_namespace_id",
             "blackboard_key",
@@ -2077,6 +2155,34 @@ class ComposerDraftSession:
             _error(
                 "draft_arguments_invalid",
                 "touch_body_roles must be a non-empty canonical ID array",
+            )
+        endpoint = arguments["tcp_endpoint"]
+        if (
+            not isinstance(endpoint, dict)
+            or set(endpoint) != {"target_role", "frame_role"}
+            or any(
+                not _is_portable_id(endpoint.get(field))
+                for field in ("target_role", "frame_role")
+            )
+        ):
+            _error(
+                "draft_arguments_invalid",
+                "authoring tcp_endpoint must name one portable target role and frame role",
+            )
+        endpoint_target = document.get("target_roles", {}).get(endpoint["target_role"])
+        if not isinstance(endpoint_target, dict):
+            _error(
+                "draft_target_role_not_found",
+                f"{operation} authoring endpoint target role {endpoint['target_role']!r} "
+                "is not declared",
+                status_code=404,
+            )
+        endpoint_frames = endpoint_target.get("required_frame_roles", [])
+        if endpoint["frame_role"] not in endpoint_frames:
+            _error(
+                "draft_arguments_invalid",
+                f"{operation} authoring endpoint target role {endpoint['target_role']!r} "
+                f"does not declare frame role {endpoint['frame_role']!r}",
             )
         scene_ids = {row.get("scene_resource_id") for row in self._scene(document)}
         if arguments["scene_resource_id"] not in scene_ids:
@@ -2169,9 +2275,9 @@ class ComposerDraftSession:
             "target_role": arguments["target_role"],
             "tool_target_role": arguments["tool_target_role"],
             "base_frame_role": arguments["base_frame_role"],
-            "tcp_frame_role": arguments["tcp_frame_role"],
             "carrier_frame_role": arguments["carrier_frame_role"],
             "selected_object_id": arguments["scene_resource_id"],
+            "tcp_endpoint": deepcopy(endpoint),
             "tool_position": deepcopy(arguments["tool_position"]),
             "planning_profile": arguments.get("planning_profile", "first_feasible"),
             "motion_options": deepcopy(arguments.get("motion_options", {})),

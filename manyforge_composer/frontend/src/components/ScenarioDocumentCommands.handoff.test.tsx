@@ -158,8 +158,8 @@ beforeEach(() => {
         content_hash: `scene.digest.${request.expected_projection_revision.scene_revision.revision_id + 1}` } },
   }));
   apiMock.scenarioDocuments.list.mockResolvedValue({ directory: '/projects', entries: [
-    { sourceKind: 'saved', path: '/projects/other', scenarioId: 'other', name: 'Other', displayStatus: 'ready' },
-    { sourceKind: 'saved', path: '/projects/current', scenarioId: 'current', name: 'Current', displayStatus: 'ready' },
+    { sourceKind: 'saved', path: '/projects/other', scenarioId: 'other', name: 'Other', folderName: 'other', location: 'projects', displayStatus: 'ready' },
+    { sourceKind: 'saved', path: '/projects/current', scenarioId: 'current', name: 'Current', folderName: 'current', location: 'projects', displayStatus: 'ready' },
   ] });
 });
 async function mount(empty = true, dirty = false,
@@ -258,7 +258,7 @@ it.each([true, false])('New uses the exact completed empty identity, empty start
   expect(apiMock.scenarioDocuments.new).toHaveBeenCalledTimes(1);
   expect(apiMock.scenarioDocuments.new).toHaveBeenCalledWith(expect.anything(), expect.objectContaining({
     expectedRetainedBundleId: test.closed.retainedBundleId, expectedGraphRevision: test.closed.graphRevision,
-    path: '/projects/next_cell.scenario', deploymentChoice: 'empty',
+    directory: '/projects', name: 'next_cell', deploymentChoice: 'empty',
   }));
 });
 
@@ -320,11 +320,17 @@ it('does not send a follow-up mutation when the confirmed component unmounts dur
   expect(apiMock.scenarioDocuments.new).not.toHaveBeenCalled();
 });
 
-it('same-Scenario reload keeps the existing direct Load without Close', async () => {
+it('Load of the applied Scenario closes first exactly like a different Scenario', async () => {
   const test = await mount(false);
   await test.openLoad('current');
-  expect(test.closeScenario).not.toHaveBeenCalled();
+  expect(test.closeScenario).toHaveBeenCalledExactlyOnceWith(test.predecessor, expect.objectContaining({
+    authoring: authoringWorkspaceIdentity(test.published),
+  }), expect.any(AbortSignal));
+  expect(apiMock.scenarioDocuments.load).not.toHaveBeenCalled();
+  await act(async () => { test.close.resolve(test.closed); });
+  await test.observe(snapshot(test.closed, test.published));
   expect(apiMock.scenarioDocuments.load).toHaveBeenCalledTimes(1);
+  expect(apiMock.scenarioDocuments.load).toHaveBeenCalledWith(expect.anything(), '/projects/current', true);
 });
 
 it.each(['load', 'new'])('cancels waiting without a follow-up, then allows later %s', async (kind) => {

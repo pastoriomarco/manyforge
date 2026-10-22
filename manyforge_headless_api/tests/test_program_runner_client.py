@@ -130,7 +130,7 @@ def test_program_runner_client_rejects_non_object_or_duplicate_json() -> None:
         raw.close()
 
 
-def test_program_runner_client_addresses_scenario_persistent_values() -> None:
+def test_program_runner_client_addresses_applied_persistent_values() -> None:
     requests: list[httpx.Request] = []
 
     def handler(request: httpx.Request) -> httpx.Response:
@@ -143,19 +143,17 @@ def test_program_runner_client_addresses_scenario_persistent_values() -> None:
     )
     client = ProgramRunnerHttpClient("http://runner.test", client=raw)
     try:
-        assert client.persistent_values("cell-pick") == {"ok": True}
+        assert client.persistent_values() == {"ok": True}
         for action in ("set", "reset", "clear"):
             assert client.persistent_value_action(
-                "cell-pick", action, {"request_id": action}
+                action, {"request_id": action}
             ) == {"ok": True}
         with pytest.raises(ValueError, match="unsupported"):
-            client.persistent_value_action("cell-pick", "delete", {})
-        with pytest.raises(ValueError, match="scenario_id"):
-            client.persistent_values("../cell-pick")
+            client.persistent_value_action("delete", {})
     finally:
         raw.close()
 
-    base = "/api/program/scenarios/cell-pick/persistent-values"
+    base = "/api/program/persistent-values"
     assert [(request.method, request.url.path) for request in requests] == [
         ("GET", base),
         ("POST", base),

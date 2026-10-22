@@ -5,15 +5,15 @@
     "deployment_present": true,
     "program_present": true
   },
-  "description": "Retained Isaac commanded-simulation pick-and-place deployment for UFACTORY Lite6 with the articulated lite pneumatic gripper and the source-matched ROS 2 control execution product.",
+  "description": "isaac_lite6_lite_gripper_pick_and_place\n\nRetained Isaac commanded-simulation pick-and-place deployment for UFACTORY Lite6 with the articulated lite pneumatic gripper and the source-matched ROS 2 control execution product.",
   "members": {
     "assignment.yaml": "sha256:dc572e492edec9edcd61a9e8404f16c75c4ad77cb9cab55aff7d8f20eeb7a253",
     "deployment.yaml": "sha256:43622d01bd29025efeb578f53e0730d94e7851dc7bcc7d6dbfdfec7514c0d357",
-    "program.yaml": "sha256:0f0e4cdb722eb72cf905cf21e6a7be9144432d84afc5600a4ab11c7f8769f3be"
+    "program.yaml": "sha256:4e6120d8d5847d65d0009c2f0c627b613d0dae00cbb181ac36480cffdb7ea1ca"
   },
-  "name": "isaac_lite6_lite_gripper_pick_and_place",
+  "name": "isaac-lite6-pick-place",
   "saved_status": {
-    "checked_content_digest": "sha256:0ec41ede0402d338f77b1e9b5f318aabfff4774b5c31da6d30a300e89e7a3e85",
+    "checked_content_digest": "sha256:932e421730c32d61a7946cde7d4b6af61c236667c5324e2b3f379f612a6cbb63",
     "last_known_status": "ready",
     "manyforge_version": "0.1.0"
   },

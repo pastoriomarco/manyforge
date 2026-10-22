@@ -76,6 +76,8 @@ using manyforge::deployment::test::kLite6GripperTargetId;
 using manyforge::deployment::test::
     materialize_lite6_ros2_control_observed_retained_consumer_fixture;
 using manyforge::deployment::test::
+    materialize_lite6_ros2_control_observed_endpoint_retained_consumer_fixture;
+using manyforge::deployment::test::
     materialize_lite6_ros2_control_motion_retained_consumer_fixture_for_cell;
 
 constexpr std::string_view kZeroDigest =
@@ -115,10 +117,15 @@ struct BindingCompilerContext final {
 };
 
 [[nodiscard]] BindingCompilerContext
-make_context(const std::filesystem::path &root,
-             bool aggregate_gripper = false, bool gripper_only = false) {
+make_context(const std::filesystem::path &root, bool aggregate_gripper = false,
+             bool gripper_only = false, bool endpoint_contact_bodies = false,
+             bool shared_arm_endpoint_bodies = false) {
   const auto materialized = [&] {
     if (!gripper_only) {
+      if (endpoint_contact_bodies) {
+        return materialize_lite6_ros2_control_observed_endpoint_retained_consumer_fixture(
+            root, aggregate_gripper, shared_arm_endpoint_bodies);
+      }
       return materialize_lite6_ros2_control_observed_retained_consumer_fixture(
           root, aggregate_gripper);
     }
@@ -904,8 +911,9 @@ TEST(ProgramBindingCompilerTest,
 }
 
 [[nodiscard]] manyforge::deployment::PreparedActivationInput
-prepare(const std::filesystem::path &root, const BindingCompilerContext &context,
-        std::string_view command_target) {
+prepare(const std::filesystem::path &root,
+        const BindingCompilerContext &context, std::string_view command_target,
+        std::string project_path = "/fixtures/scenario.readback.scenario") {
   const auto contract = verify_program_binding_contract(
       make_program_bytes(*context.bundle), *context.bundle);
   FilesystemCatalogArtifactStore catalog_store(root);
@@ -913,7 +921,8 @@ prepare(const std::filesystem::path &root, const BindingCompilerContext &context
   return manyforge::deployment::assemble_prepared_activation(
       {manyforge::deployment::PreparedScenarioOrigin{
            "scenario.readback",
-           manyforge::core::ContentDigest("sha256:" + std::string(64U, '1'))},
+           manyforge::core::ContentDigest("sha256:" + std::string(64U, '1')),
+           std::move(project_path)},
        manyforge::core::ContentDigest("sha256:" + std::string(64U, '2')),
        "optional"},
       *context.bundle, context.model_map, *contract,
@@ -1228,9 +1237,268 @@ TEST(ProgramBindingCompilerTest,
   ASSERT_EQ(scene.size(), 2U);
   EXPECT_TRUE(std::holds_alternative<manyforge::core::ComponentSceneFrameRefDTO>(
       scene.front().frame_ref));
+  auto endpoint_annotated_scene_roles = *outcome.resolved_roles;
+  for (auto& target : endpoint_annotated_scene_roles.target_roles) {
+    for (auto& frame : target.frame_role_bindings) {
+      frame.contact_body_role_ids = {
+          manyforge::core::CollisionBodyRoleId("endpoint_contact_body")};
+    }
+  }
+  EXPECT_EQ(manyforge::deployment::project_resolved_initial_scene(
+                *contract, endpoint_annotated_scene_roles,
+                context.bundle->value().cell_graph.cell_id),
+            scene);
   for (const auto &target : outcome.resolved_roles->target_roles) {
     EXPECT_TRUE(target.capability_bindings.empty());
   }
+}
+
+TEST(ProgramBindingCompilerTest,
+     EndpointAssociatedBodiesAreRetainedAndNonExecutableSceneStillResolves) {
+  ScopedTrustedRoot root;
+  const BindingCompilerContext context = make_context(root.path(), true, false,
+                                                      true);
+  CanonicalValue program = manyforge::deployment::parse_strict_json_model_yaml(
+                               aggregate_program_with_scene(*context.bundle))
+                               .root();
+  const auto &target_table = *program.find_object_member("target_roles");
+  auto arm = *target_table.find_object_member("arm");
+  arm = with_member(arm, "required_collision_body_roles",
+                    CanonicalValue(CanonicalValue::Array{}));
+  program = with_member(program, "target_roles",
+                        with_member(target_table, "arm", arm));
+  program = with_member(
+      program, "program_revision",
+      CanonicalValue(compute_content_identity(
+          program, ContentIdentitySpec{.identity_domain = "program-revision",
+                                       .api_version = "manyforge.program.v2",
+                                       .own_field = "program_revision"})));
+  const auto contract = verify_program_binding_contract(
+      canonical_json(program), *context.bundle);
+  FilesystemCatalogArtifactStore catalog_store(root.path());
+
+  const auto binding = compile_program_binding(
+      *contract, valid_assignment(true), *context.bundle, context.model_map,
+      catalog_store);
+  ASSERT_NE(binding, nullptr);
+  const auto arm_target = std::find_if(
+      binding->value().target_role_bindings.begin(),
+      binding->value().target_role_bindings.end(), [](const auto &target) {
+        return target.target_role_id == TargetRoleId("arm");
+      });
+  ASSERT_NE(arm_target, binding->value().target_role_bindings.end());
+  const auto tcp = std::find_if(
+      arm_target->frame_role_bindings.begin(),
+      arm_target->frame_role_bindings.end(), [](const auto &frame) {
+        return frame.frame_role_id == manyforge::core::FrameRoleId("tcp");
+      });
+  ASSERT_NE(tcp, arm_target->frame_role_bindings.end());
+  EXPECT_EQ(tcp->contact_body_role_ids,
+            std::vector<manyforge::core::CollisionBodyRoleId>{
+                manyforge::core::CollisionBodyRoleId("arm_collision")});
+  EXPECT_NE(std::find_if(
+                arm_target->collision_body_role_bindings.begin(),
+                arm_target->collision_body_role_bindings.end(),
+                [](const auto &body) {
+                  return body.collision_body_role_id ==
+                         manyforge::core::CollisionBodyRoleId("arm_collision");
+                }),
+            arm_target->collision_body_role_bindings.end());
+  const auto gripper_target = std::find_if(
+      binding->value().target_role_bindings.begin(),
+      binding->value().target_role_bindings.end(), [](const auto &target) {
+        return target.target_role_id == TargetRoleId("gripper");
+      });
+  ASSERT_NE(gripper_target, binding->value().target_role_bindings.end());
+  EXPECT_EQ(gripper_target->controllable_component_id,
+            arm_target->controllable_component_id);
+  const auto gripper_tcp = std::find_if(
+      gripper_target->frame_role_bindings.begin(),
+      gripper_target->frame_role_bindings.end(), [](const auto &frame) {
+        return frame.frame_role_id == manyforge::core::FrameRoleId("tcp");
+      });
+  ASSERT_NE(gripper_tcp, gripper_target->frame_role_bindings.end());
+  EXPECT_EQ(gripper_tcp->contact_body_role_ids,
+            std::vector<manyforge::core::CollisionBodyRoleId>{
+                manyforge::core::CollisionBodyRoleId("gripper_collision")});
+  EXPECT_EQ(gripper_tcp->model_instance_id, tcp->model_instance_id);
+  EXPECT_EQ(gripper_tcp->model_revision, tcp->model_revision);
+  EXPECT_NE(std::find_if(
+                gripper_target->collision_body_role_bindings.begin(),
+                gripper_target->collision_body_role_bindings.end(),
+                [](const auto &body) {
+                  return body.collision_body_role_id ==
+                         manyforge::core::CollisionBodyRoleId(
+                             "gripper_collision");
+                }),
+            gripper_target->collision_body_role_bindings.end());
+
+  auto unavailable_program = program;
+  const auto &unavailable_target_table =
+      *unavailable_program.find_object_member("target_roles");
+  auto unavailable_arm =
+      *unavailable_target_table.find_object_member("arm");
+  unavailable_arm = with_member(
+      unavailable_arm, "required_capabilities",
+      CanonicalValue(CanonicalValue::Array{CanonicalValue(
+          CanonicalValue::Object{
+              {"capability_id", CanonicalValue("tool.gripper.command")},
+              {"parameters", CanonicalValue(CanonicalValue::Object{})},
+              {"disposition", CanonicalValue("required")},
+          })}));
+  unavailable_program = with_member(
+      unavailable_program, "target_roles",
+      with_member(unavailable_target_table, "arm", unavailable_arm));
+  unavailable_program = with_member(
+      unavailable_program, "program_revision",
+      CanonicalValue(compute_content_identity(
+          unavailable_program,
+          ContentIdentitySpec{.identity_domain = "program-revision",
+                              .api_version = "manyforge.program.v2",
+                              .own_field = "program_revision"})));
+  const auto unavailable_contract = verify_program_binding_contract(
+      canonical_json(unavailable_program), *context.bundle);
+  const auto outcome = compile_program_binding_outcome(
+      *unavailable_contract, valid_assignment(true), *context.bundle,
+      context.model_map, catalog_store);
+  EXPECT_EQ(outcome.binding, nullptr);
+  ASSERT_TRUE(outcome.non_executable.has_value());
+  ASSERT_TRUE(outcome.resolved_roles.has_value());
+  const auto scene = manyforge::deployment::project_resolved_initial_scene(
+      *unavailable_contract, *outcome.resolved_roles,
+      context.bundle->value().cell_graph.cell_id);
+  ASSERT_EQ(scene.size(), 2U);
+  EXPECT_TRUE(std::holds_alternative<manyforge::core::ComponentSceneFrameRefDTO>(
+      scene.front().frame_ref));
+  const auto resolved_arm = std::find_if(
+      outcome.resolved_roles->target_roles.begin(),
+      outcome.resolved_roles->target_roles.end(), [](const auto &target) {
+        return target.target_role_id == TargetRoleId("arm");
+      });
+  ASSERT_NE(resolved_arm, outcome.resolved_roles->target_roles.end());
+  ASSERT_FALSE(resolved_arm->frame_role_bindings.empty());
+  EXPECT_TRUE(resolved_arm->frame_role_bindings.front()
+                  .contact_body_role_ids.empty());
+}
+
+TEST(ProgramBindingCompilerTest,
+     UnchangedEndpointProgramBindsTwoConcreteComponentTypes) {
+  ScopedTrustedRoot arm_root;
+  ScopedTrustedRoot aggregate_root;
+  const auto arm_only = make_context(arm_root.path(), false, false, true);
+  const auto aggregate = make_context(aggregate_root.path(), true, false, true);
+  // Program declarations are portable. A richer component type implements the
+  // same endpoint without changing one byte of the Program or its Assignment.
+  const auto program_bytes = make_program_bytes(*arm_only.bundle);
+  EXPECT_EQ(program_bytes, make_program_bytes(*aggregate.bundle));
+  const auto first_program =
+      verify_program_binding_contract(program_bytes, *arm_only.bundle);
+  const auto second_program =
+      verify_program_binding_contract(program_bytes, *aggregate.bundle);
+  FilesystemCatalogArtifactStore first_catalog(arm_root.path());
+  FilesystemCatalogArtifactStore second_catalog(aggregate_root.path());
+  const auto first = compile_program_binding(*first_program, valid_assignment(),
+                                             *arm_only.bundle,
+                                             arm_only.model_map, first_catalog);
+  const auto second = compile_program_binding(
+      *second_program, valid_assignment(), *aggregate.bundle,
+      aggregate.model_map, second_catalog);
+  ASSERT_NE(first, nullptr);
+  ASSERT_NE(second, nullptr);
+  EXPECT_EQ(first->value().program_id, second->value().program_id);
+  EXPECT_EQ(first->value().program_revision, second->value().program_revision);
+  ASSERT_EQ(first->value().component_role_bindings.size(), 1U);
+  ASSERT_EQ(second->value().component_role_bindings.size(), 1U);
+  EXPECT_NE(first->value().component_role_bindings.front().component_type_id,
+            second->value().component_role_bindings.front().component_type_id);
+  EXPECT_EQ(
+      first->value().component_role_bindings.front().component_type_id.value(),
+      "lite6_arm_component");
+  EXPECT_EQ(
+      second->value().component_role_bindings.front().component_type_id.value(),
+      "lite6_arm_gripper_component");
+  ASSERT_EQ(first->value().target_role_bindings.size(), 1U);
+  ASSERT_EQ(second->value().target_role_bindings.size(), 1U);
+  const auto &a = first->value().target_role_bindings.front();
+  const auto &b = second->value().target_role_bindings.front();
+  EXPECT_EQ(a.target_role_id, b.target_role_id);
+  EXPECT_EQ(a.command_target_id, b.command_target_id);
+  ASSERT_EQ(a.frame_role_bindings.size(), 1U);
+  ASSERT_EQ(b.frame_role_bindings.size(), 1U);
+  EXPECT_EQ(a.frame_role_bindings.front().frame_role_id,
+            manyforge::core::FrameRoleId("tcp"));
+  EXPECT_EQ(b.frame_role_bindings.front().frame_role_id,
+            a.frame_role_bindings.front().frame_role_id);
+  EXPECT_EQ(a.frame_role_bindings.front().contact_body_role_ids,
+            b.frame_role_bindings.front().contact_body_role_ids);
+  EXPECT_EQ(a.frame_role_bindings.front().contact_body_role_ids,
+            std::vector<manyforge::core::CollisionBodyRoleId>{
+                manyforge::core::CollisionBodyRoleId("arm_collision")});
+  EXPECT_NE(first->program_binding_id(), second->program_binding_id());
+  EXPECT_EQ(manyforge::deployment::reload_verified_program_binding(
+                first->canonical_bytes(), *arm_only.bundle, arm_only.model_map)
+                ->value(),
+            first->value());
+  EXPECT_EQ(
+      manyforge::deployment::reload_verified_program_binding(
+          second->canonical_bytes(), *aggregate.bundle, aggregate.model_map)
+          ->value(),
+      second->value());
+}
+
+TEST(ProgramBindingCompilerTest,
+     DistinctModeledEndpointsMayShareOneRetainedBodyGroup) {
+  ScopedTrustedRoot root;
+  const auto context = make_context(root.path(), false, false, true, true);
+  auto program = make_program_root(*context.bundle);
+  const auto &target_table = *program.find_object_member("target_roles");
+  auto arm = *target_table.find_object_member("arm");
+  arm = with_member(arm, "required_frame_roles",
+                    CanonicalValue(CanonicalValue::Array{
+                        CanonicalValue("base"), CanonicalValue("tcp")}));
+  arm = with_member(arm, "required_collision_body_roles",
+                    CanonicalValue(CanonicalValue::Array{}));
+  program = with_member(program, "target_roles",
+                        with_member(target_table, "arm", arm));
+  program = with_member(
+      program, "program_revision",
+      CanonicalValue(compute_content_identity(
+          program, ContentIdentitySpec{.identity_domain = "program-revision",
+                                       .api_version = "manyforge.program.v2",
+                                       .own_field = "program_revision"})));
+  const auto contract =
+      verify_program_binding_contract(canonical_json(program), *context.bundle);
+  FilesystemCatalogArtifactStore catalog(root.path());
+  const auto binding =
+      compile_program_binding(*contract, valid_assignment(), *context.bundle,
+                              context.model_map, catalog);
+  ASSERT_NE(binding, nullptr);
+  ASSERT_EQ(binding->value().target_role_bindings.size(), 1U);
+  const auto &target = binding->value().target_role_bindings.front();
+  ASSERT_EQ(target.frame_role_bindings.size(), 2U);
+  const auto &first = target.frame_role_bindings.front();
+  const auto &second = target.frame_role_bindings.back();
+  EXPECT_EQ(first.frame_role_id, manyforge::core::FrameRoleId("base"));
+  EXPECT_EQ(second.frame_role_id, manyforge::core::FrameRoleId("tcp"));
+  EXPECT_NE(first.compiled_frame_name, second.compiled_frame_name);
+  EXPECT_EQ(first.model_instance_id, second.model_instance_id);
+  EXPECT_EQ(first.model_revision, second.model_revision);
+  EXPECT_EQ(first.contact_body_role_ids, second.contact_body_role_ids);
+  EXPECT_EQ(first.contact_body_role_ids,
+            std::vector<manyforge::core::CollisionBodyRoleId>{
+                manyforge::core::CollisionBodyRoleId("arm_collision")});
+  // Neither Program requested bodies explicitly; both endpoints share exactly
+  // one retained body row instead of duplicating or aliasing the frames.
+  ASSERT_EQ(target.collision_body_role_bindings.size(), 1U);
+  const auto &body = target.collision_body_role_bindings.front();
+  EXPECT_EQ(body.collision_body_role_id, first.contact_body_role_ids.front());
+  EXPECT_EQ(body.model_instance_id, first.model_instance_id);
+  EXPECT_EQ(body.model_revision, first.model_revision);
+  EXPECT_FALSE(body.compiled_collision_body_names.empty());
+  EXPECT_EQ(manyforge::deployment::reload_verified_program_binding(
+                binding->canonical_bytes(), *context.bundle, context.model_map)
+                ->value(),
+            binding->value());
 }
 
 TEST(ProgramBindingCompilerTest,
@@ -1733,6 +2001,12 @@ TEST(ProgramBindingCompilerTest, PreparedOriginIsClosedAndScenarioAccessIsChecke
   const auto prepared = prepare(root.path(), context, kLite6ArmTargetId);
   ASSERT_NE(prepared.scenario_origin(), nullptr);
   EXPECT_EQ(prepared.scenario_origin()->scenario_id, "scenario.readback");
+  EXPECT_EQ(prepared.scenario_origin()->project_path,
+            "/fixtures/scenario.readback.scenario");
+  EXPECT_EQ(
+      d::prepared_activation_origin_value(d::parse_prepared_activation_origin(
+          d::prepared_activation_origin_value(prepared.origin()))),
+      d::prepared_activation_origin_value(prepared.origin()));
   EXPECT_EQ(prepared.sealed_canonical_empty_origin(), nullptr);
   EXPECT_EQ(prepared.normalized_root().find_object_member("scenario_id"), nullptr);
   EXPECT_EQ(prepared.normalized_root().find_object_member("source_document_digest"), nullptr);
@@ -1745,6 +2019,51 @@ TEST(ProgramBindingCompilerTest, PreparedOriginIsClosedAndScenarioAccessIsChecke
       with_member(prepared.normalized_root(), "schema_version",
                   CanonicalValue("manyforge.prepared_activation_input.v5"))))),
       d::PreparedActivationInputError);
+}
+
+TEST(ProgramBindingCompilerTest,
+     ScenarioProjectPathIsRequiredNormalizedAndScopesPreparation) {
+  namespace d = manyforge::deployment;
+  ScopedTrustedRoot root;
+  const BindingCompilerContext context = make_context(root.path());
+  const auto first = prepare(root.path(), context, kLite6ArmTargetId,
+                             "/fixtures/first/same.scenario");
+  const auto second = prepare(root.path(), context, kLite6ArmTargetId,
+                              "/fixtures/second/same.scenario");
+  EXPECT_EQ(first.scenario_origin()->scenario_id,
+            second.scenario_origin()->scenario_id);
+  EXPECT_EQ(first.scenario_origin()->source_document_digest,
+            second.scenario_origin()->source_document_digest);
+  EXPECT_EQ(first.retained_bundle_id(), second.retained_bundle_id());
+  EXPECT_EQ(first.program_revision(), second.program_revision());
+  EXPECT_NE(first.prepared_activation_id(), second.prepared_activation_id());
+  const auto first_origin = d::prepared_activation_origin_value(first.origin());
+  const auto second_origin =
+      d::prepared_activation_origin_value(second.origin());
+  EXPECT_NE(d::sha256_digest(d::canonical_json(first_origin)),
+            d::sha256_digest(d::canonical_json(second_origin)));
+  const auto maximum = d::parse_prepared_activation_origin(
+      with_member(first_origin, "project_path",
+                  CanonicalValue("/" + std::string(4095U, 'x'))));
+  EXPECT_EQ(std::get<d::PreparedScenarioOrigin>(maximum).project_path.size(),
+            4096U);
+  auto missing = first_origin.as_object();
+  std::erase_if(missing,
+                [](const auto &row) { return row.first == "project_path"; });
+  EXPECT_THROW(static_cast<void>(d::parse_prepared_activation_origin(
+                   CanonicalValue(missing))),
+               d::PreparedActivationInputError);
+  for (const auto &invalid : std::vector<std::string>{
+           "", "same.scenario", "/fixtures/../same.scenario",
+           "/fixtures//same.scenario", "/fixtures/same.scenario/",
+           "/" + std::string(4096U, 'x'),
+           std::string("/fixtures/a") + '\0' + "b.scenario"}) {
+    EXPECT_THROW(
+        static_cast<void>(d::parse_prepared_activation_origin(with_member(
+            first_origin, "project_path", CanonicalValue(invalid)))),
+        d::PreparedActivationInputError)
+        << invalid;
+  }
 }
 
 TEST(ProgramBindingCompilerTest, SealedEmptyReadbackRequiresTheActualAdmission) {
@@ -1954,6 +2273,61 @@ TEST(ProgramBindingCompilerTest,
   EXPECT_THROW(static_cast<void>(compile_program_binding(
                    *edge_program, assignment, bundle, *map, catalog)),
                ProgramBindingCompilerError);
+}
+
+TEST(ProgramBindingCompilerTest, CompilesPortableReleaseWithoutChangingItsEnvelope) {
+  ScopedTrustedRoot root;
+  const auto context = make_context(root.path(), true);
+  auto program = make_aggregate_program_root(*context.bundle);
+  auto policies = program.find_object_member("contact_policies")->as_array();
+  auto policy = policies.front();
+  auto zones = policy.find_object_member("zones")->as_array();
+  auto zone = zones.front().as_object();
+  std::erase_if(zone, [](const auto& field) {
+    return field.first == "max_penetration_m" ||
+           field.first == "terminal_window_start_fraction";
+  });
+  zone.emplace_back("release_evidence_mode", CanonicalValue("signed_penetration"));
+  zone.emplace_back("max_start_penetration_m", CanonicalValue(0.002));
+  zones.front() = CanonicalValue(std::move(zone));
+  policy = with_member(policy, "mode", CanonicalValue("contact_release"));
+  policy = with_member(policy, "zones", CanonicalValue(std::move(zones)));
+  policy = with_member(policy, "version", CanonicalValue(compute_content_identity(
+      policy, ContentIdentitySpec{.identity_domain = "catalog-record-revision/contact_policy",
+                                  .api_version = "manyforge.contact_policy.v1",
+                                  .own_field = "version"})));
+  policies.front() = policy;
+  program = with_member(program, "contact_policies", CanonicalValue(std::move(policies)));
+  program = with_member(program, "program_revision", CanonicalValue(compute_content_identity(
+      program, ContentIdentitySpec{.identity_domain = "program-revision",
+                                   .api_version = "manyforge.program.v2",
+                                   .own_field = "program_revision"})));
+  const auto contract = verify_program_binding_contract(canonical_json(program), *context.bundle);
+  ASSERT_EQ(contract->value().contact_grasp_templates.size(), 1U);
+  const auto& release = std::get<manyforge::core::ContactReleaseEnvelopeDTO>(
+      contract->value().contact_grasp_templates.front().envelope);
+  EXPECT_DOUBLE_EQ(release.max_start_penetration_m, 0.002);
+  EXPECT_TRUE(release.require_separation_by_end);
+  EXPECT_TRUE(release.require_strictly_decreasing_penetration);
+  EXPECT_FALSE(release.allow_recontact);
+  FilesystemCatalogArtifactStore catalog_store(root.path());
+  const auto binding = compile_program_binding(
+      *contract, valid_assignment(true), *context.bundle, context.model_map, catalog_store);
+  ASSERT_EQ(binding->value().contact_grasp_bindings.size(), 1U);
+  const auto& bound = binding->value().contact_grasp_bindings.front();
+  EXPECT_EQ(bound.envelope, contract->value().contact_grasp_templates.front().envelope);
+  EXPECT_EQ(bound.runtime_object_id.value(), "selected_object");
+  ASSERT_EQ(bound.allowed_body_bindings.size(), 1U);
+  EXPECT_EQ(bound.allowed_body_bindings.front().target_role_id, TargetRoleId("gripper"));
+  const auto& body = bound.allowed_body_bindings.front();
+  EXPECT_EQ(body.collision_body_role_id.value(), "gripper_collision");
+  ASSERT_FALSE(body.collision_body_ids.empty());
+  for (std::size_t index = 0; index < body.collision_body_ids.size(); ++index)
+    EXPECT_EQ(body.collision_body_ids[index], manyforge::core::make_component_collision_body_id(
+        body.controllable_component_id, body.model_instance_id, body.collision_body_role_id, index));
+  EXPECT_EQ(manyforge::deployment::reload_verified_program_binding(
+                binding->canonical_bytes(), *context.bundle, context.model_map)->value(),
+            binding->value());
 }
 
 } // namespace

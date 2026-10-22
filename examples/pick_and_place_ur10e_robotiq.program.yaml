@@ -1,6 +1,6 @@
 api_version: manyforge.program.v2
 program_id: pick_and_place_ur10e_robotiq_demo
-program_revision: sha256:cbf101ad1670470212ccd38294889d16a05e70e337c0c37fff8b8084c613e6b6
+program_revision: sha256:514d30d0813df8c9bc129cb8a1419e113ebd2fbe92cef3242b155258dfc62a50
 program_profile: composable-cell-v1
 name: pick_and_place_ur10e_robotiq_demo
 description: >-
@@ -110,7 +110,7 @@ tree:
       parameters:
         target_role: arm
         base_frame_role: base
-        tcp_frame_role: tcp
+        tcp_endpoint: {target_role: arm, frame_role: tcp}
         target_mode: relative
         target_reference: {type: scene_resource, scene_resource_id: graspable}
         goal:
@@ -128,7 +128,7 @@ tree:
       parameters:
         target_role: arm
         base_frame_role: base
-        tcp_frame_role: tcp
+        tcp_endpoint: {target_role: arm, frame_role: tcp}
         target_mode: relative
         target_reference: {type: scene_resource, scene_resource_id: graspable}
         goal:
@@ -162,7 +162,7 @@ tree:
       parameters:
         target_role: arm
         base_frame_role: base
-        tcp_frame_role: tcp
+        tcp_endpoint: {target_role: arm, frame_role: tcp}
         target_mode: relative
         target_reference: {type: frame_role, frame_role_id: tcp}
         goal:
@@ -180,7 +180,7 @@ tree:
       parameters:
         target_role: arm
         base_frame_role: base
-        tcp_frame_role: tcp
+        tcp_endpoint: {target_role: arm, frame_role: tcp}
         target_mode: relative
         target_reference:
           type: pose
@@ -204,7 +204,7 @@ tree:
       parameters:
         target_role: arm
         base_frame_role: base
-        tcp_frame_role: tcp
+        tcp_endpoint: {target_role: arm, frame_role: tcp}
         goal:
           frame_ref: {kind: target_frame, target_role: arm, frame_role: base}
           position_m: [0.3, 0.3, 0.05]
@@ -236,7 +236,7 @@ tree:
       parameters:
         target_role: arm
         base_frame_role: base
-        tcp_frame_role: tcp
+        tcp_endpoint: {target_role: arm, frame_role: tcp}
         target_mode: relative
         target_reference:
           type: pose
@@ -260,7 +260,7 @@ tree:
       parameters:
         target_role: arm
         base_frame_role: base
-        tcp_frame_role: tcp
+        tcp_endpoint: {target_role: arm, frame_role: tcp}
         goal:
           - {joint_name: shoulder_pan_joint, position_rad: 0.0}
           - {joint_name: shoulder_lift_joint, position_rad: -1.57}

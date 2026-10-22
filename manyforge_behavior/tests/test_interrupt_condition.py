@@ -111,7 +111,7 @@ def _document(
     parameters: dict[str, Any] = {
         "target_role": "arm",
         "base_frame_role": "base",
-        "tcp_frame_role": "tcp",
+        "tcp_endpoint": {"target_role": "arm", "frame_role": "tcp"},
         "goal": deepcopy(_GOAL),
         "stop_mode": "soft_on_path",
         "interrupt_condition": _rich_condition() if condition is None else condition,
@@ -131,7 +131,7 @@ def _document(
         "parameters": {
             "target_role": "arm",
             "base_frame_role": "base",
-            "tcp_frame_role": "tcp",
+            "tcp_endpoint": {"target_role": "arm", "frame_role": "tcp"},
             "goal": deepcopy(_GOAL),
             "stop_mode": "soft_on_path",
             "interrupt_condition": _compare(_SIGNAL, "==", True),
@@ -161,7 +161,7 @@ def test_catalog_declares_the_per_node_interrupt_fields(node_id: str) -> None:
     assert parameters["stop_mode"].required
     assert "interrupt_policy_id" not in parameters  # contract 63
     # The ordinary motion fields of the move (same as motion.move_to_pose).
-    assert parameters["base_frame_role"].required and parameters["tcp_frame_role"].required
+    assert parameters["base_frame_role"].required and parameters["tcp_endpoint"].required
     pose = {parameter.id: parameter for parameter in _CATALOG.get("motion.move_to_pose").parameters}
     for setting in ("velocity_scale", "acceleration_scale", "joint_position_tol_rad",
                     "translation_tol_m", "rotation_tol_rad", "planning_timeout_s",

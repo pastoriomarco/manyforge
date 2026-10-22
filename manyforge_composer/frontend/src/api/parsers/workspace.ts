@@ -40,6 +40,7 @@ import {
   numberAt,
   objectAt,
   positiveIntegerAt,
+  projectPathAt,
   stringArrayAt,
   stringAt,
 } from './shared';
@@ -620,6 +621,8 @@ export function parseScenarioDocumentIndexResponse(
         exactKeysAt(row, [
           'description',
           'display_status',
+          'folder_name',
+          'location',
           'name',
           'path',
           'saved_manyforge_version',
@@ -648,6 +651,8 @@ export function parseScenarioDocumentIndexResponse(
             `${entryPath}.scenario_id`,
           ),
           name: stringAt(row.name, `${entryPath}.name`),
+          folderName: stringAt(row.folder_name, `${entryPath}.folder_name`),
+          location: stringAt(row.location, `${entryPath}.location`),
           description: stringAt(row.description, `${entryPath}.description`),
           savedManyforgeVersion: nullableStringAt(
             row.saved_manyforge_version,
@@ -887,11 +892,14 @@ export function parseDeploymentWorkspaceResponse(
     }
   }
   const savedRecord = objectAt(record.saved, `${path}.saved`);
-  exactKeysAt(savedRecord, ['path', 'deploymentRevision'], `${path}.saved`);
+  exactKeysAt(savedRecord, ['path', 'deploymentRevision', 'differsFromApplied'], `${path}.saved`);
   const savedPath = nullableStringAt(savedRecord.path, `${path}.saved.path`);
   const savedRevision = savedRecord.deploymentRevision === null
     ? null
     : digestAt(savedRecord.deploymentRevision, `${path}.saved.deploymentRevision`);
+  const savedDiffersFromApplied = savedRecord.differsFromApplied === null
+    ? null
+    : booleanAt(savedRecord.differsFromApplied, `${path}.saved.differsFromApplied`);
   // A saved source-referenced intent is a file, not a compiled Deployment.
   if (savedPath === null && savedRevision !== null) {
     return fail(`${path}.saved`, 'one complete Saved identity');
@@ -1058,7 +1066,11 @@ export function parseDeploymentWorkspaceResponse(
         `${path}.draft.differsFromSaved`,
       ),
     },
-    saved: { path: savedPath, deploymentRevision: savedRevision },
+    saved: {
+      path: savedPath,
+      deploymentRevision: savedRevision,
+      differsFromApplied: savedDiffersFromApplied,
+    },
     managerApplied: {
       activationOrder,
       deploymentRevision: managerRevision,
@@ -1093,7 +1105,7 @@ export function parseDeploymentCandidateOperationResponse(
   allowedKeysAt(resultRecord, [
     'status', 'confirmation_token', 'prepared_activation', 'candidate_preview',
     'manager_apply',
-  ], ['preparation', 'phases_ms', 'apply_id'], `${path}.result`);
+  ], ['preparation', 'phases_ms', 'apply_id', 'apply_generation'], `${path}.result`);
   const status = stringAt(resultRecord.status, `${path}.result.status`);
   if (
     status !== 'previewed'
@@ -1192,6 +1204,17 @@ export function parseDeploymentCandidateOperationResponse(
   const applyId = resultRecord.apply_id === undefined
     ? null
     : nullableStringAt(resultRecord.apply_id, `${path}.result.apply_id`);
+  // An accepted Apply names its exact Manager operation, as the Program
+  // Apply reply does; no other status carries an Apply generation.
+  if (status === 'accepted') {
+    if (managerApply === null || applyId !== managerApply.applyId
+      || positiveIntegerAt(resultRecord.apply_generation, `${path}.result.apply_generation`)
+        !== managerApply.applyGeneration) {
+      return fail(`${path}.result`, 'the exact accepted Manager operation');
+    }
+  } else if (resultRecord.apply_generation !== undefined) {
+    return fail(`${path}.result.apply_generation`, 'absent unless the Apply was accepted');
+  }
   if (
     candidatePreview !== null
     && (
@@ -1336,6 +1359,7 @@ export function parseAppliedProgramSelection(value: unknown): AppliedProgramSele
       'program_binding_id',
       'program_id',
       'program_revision',
+      'project_path',
       'retained_bundle_id',
       'source_document_digest',
       'scenario_id',
@@ -1449,6 +1473,7 @@ export function parseAppliedProgramSelection(value: unknown): AppliedProgramSele
   return {
     schemaVersion,
     scenarioId: stringAt(record.scenario_id, `${path}.scenario_id`),
+    projectPath: projectPathAt(record.project_path, `${path}.project_path`),
     sourceDocumentDigest: digestAt(
       record.source_document_digest,
       `${path}.source_document_digest`,

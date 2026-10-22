@@ -111,6 +111,17 @@ struct RuntimeIoOutputBindingDTO final {
                          const RuntimeIoOutputBindingDTO&) = default;
 };
 
+/// Exact selected endpoint. Body IDs follow the existing semantic-to-physical
+/// alias projection; this record does not grant motion ownership to the tool.
+struct RuntimeMotionEndpointBindingDTO final {
+  TargetRoleId target_role_id;
+  CommandTargetId command_target_id;
+  ProgramFrameRoleBindingDTO frame;
+  std::vector<ProgramContactGraspBodyBindingDTO> contact_body_bindings;
+  friend bool operator==(const RuntimeMotionEndpointBindingDTO&,
+                         const RuntimeMotionEndpointBindingDTO&) = default;
+};
+
 /// Complete owner-to-owner value before sealing. Public operation callers
 /// never construct or submit this record.
 struct RuntimeParticipantBindingDTO final {
@@ -147,6 +158,7 @@ struct RuntimeParticipantBindingDTO final {
   /// Mutually exclusive with coordinate resources/control_path. The ordinary
   /// capability provider path still identifies the exact installed command port.
   std::optional<RuntimeIoOutputBindingDTO> io_output_binding{};
+  std::optional<RuntimeMotionEndpointBindingDTO> motion_endpoint{};
 
   friend bool operator==(const RuntimeParticipantBindingDTO&,
                          const RuntimeParticipantBindingDTO&) = default;

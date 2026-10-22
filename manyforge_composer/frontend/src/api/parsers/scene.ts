@@ -1409,6 +1409,9 @@ function parseFileBrowserEntry(value: unknown, path: string): FileBrowserEntry {
     path: stringAt(record.path, `${path}.path`),
     entryType,
     selectable: booleanAt(record.selectable, `${path}.selectable`),
+    scenarioProject: record.scenarioProject === undefined
+      ? false
+      : booleanAt(record.scenarioProject, `${path}.scenarioProject`),
   };
 }
 

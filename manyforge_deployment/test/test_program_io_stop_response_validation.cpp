@@ -111,7 +111,7 @@ protected:
         "required_model_roles":["arm_model"],"required_collision_body_roles":["arm_collision"]}},
       "blackboard":{"namespaces":[],"keys":[{"key":"ready","type":"bool","access":"read_write","persistence":"run","initial":false}]},
       "tree":{"node_id":"motion.move_until_signal","instance_id":"move","children":[],
-        "parameters":{"target_role":"arm","stop_mode":"soft_on_path","priority":7,
+        "parameters":{"target_role":"arm","tcp_endpoint":{"target_role":"arm","frame_role":"tcp"},"stop_mode":"soft_on_path","priority":7,
           "activation_mode":"require_inactive_at_arm",
           "on_signal":"success","on_no_signal":"failure",
           "goal":{"frame_ref":{"kind":"target_frame","target_role":"arm","frame_role":"base"},
@@ -173,7 +173,9 @@ protected:
     d::FilesystemRawArtifactStore raw(package_root);
     return d::assemble_prepared_activation(
         {d::PreparedScenarioOrigin{
-             "condition.apply.fixture", c::ContentDigest("sha256:" + std::string(64U, 'a'))},
+             "condition.apply.fixture",
+             c::ContentDigest("sha256:" + std::string(64U, 'a')),
+             "/fixtures/condition-apply.scenario"},
          c::ContentDigest("sha256:" + std::string(64U, 'b')), "optional"},
         *bundle, *map, program, roles, catalog, raw);
   }

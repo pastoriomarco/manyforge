@@ -267,6 +267,7 @@ def _held_run():
     )
     admission = ProgramRunAdmission(
         scenario_id="ur5-pick-place",
+        project_path="/projects/ur5-pick-place.scenario",
         applied_record_digest="sha256:" + "9" * 64,
         source_document_digest=_DIGEST_A,
         program=program,

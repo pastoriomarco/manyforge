@@ -25,6 +25,9 @@ inline constexpr std::string_view kPreparedActivationInputSchemaVersion =
 struct PreparedScenarioOrigin final {
   std::string scenario_id;
   core::ContentDigest source_document_digest;
+  /// Resolved absolute project folder; stable persistence scope, not content
+  /// identity.
+  std::string project_path;
   friend bool operator==(const PreparedScenarioOrigin &, const PreparedScenarioOrigin &) = default;
 };
 

@@ -49,9 +49,6 @@ from .models import (
 from .runtime import ProgramRunnerError
 
 
-ScenarioPath = Annotated[
-    str, Path(min_length=1, max_length=128, pattern=r"^[a-z][a-z0-9_.-]*$")
-]
 _MAXIMUM_PROGRAM_CONTROL_CLIENTS = 4
 _MAXIMUM_PROGRAM_CONTROL_MESSAGE_BYTES = 16 * 1024 * 1024
 _NODE_PROGRESS_PERIOD_NS = 50_000_000
@@ -322,18 +319,18 @@ class ProgramRunnerApplicationPort(Protocol):
         self, program_run_id: str, request: ManualResultStageRequest
     ) -> dict[str, Any]: ...
 
-    def read_persistent_values(self, scenario_id: str) -> dict[str, Any]: ...
+    def read_persistent_values(self) -> dict[str, Any]: ...
 
     def set_persistent_value(
-        self, scenario_id: str, request: PersistentKeyValueSetRequest
+        self, request: PersistentKeyValueSetRequest
     ) -> dict[str, Any]: ...
 
     def reset_persistent_value(
-        self, scenario_id: str, request: PersistentKeyValueResetRequest
+        self, request: PersistentKeyValueResetRequest
     ) -> dict[str, Any]: ...
 
     def clear_persistent_values(
-        self, scenario_id: str, request: PersistentKeyValuesClearRequest
+        self, request: PersistentKeyValuesClearRequest
     ) -> dict[str, Any]: ...
 
     def reconcile_persistent_values(self) -> dict[str, Any]: ...
@@ -632,36 +629,29 @@ def create_app(runtime: ProgramRunnerApplicationPort) -> FastAPI:
             lambda: runtime.stage_manual_result(program_run_id, request)
         )
 
-    @app.get("/api/program/scenarios/{scenario_id}/persistent-values")
-    def read_persistent_values(scenario_id: ScenarioPath) -> dict[str, Any]:
-        return runtime.read_persistent_values(scenario_id)
+    # Values of the Applied Scenario project; an edit names the project
+    # folder the operator saw (`project_path`) and another one is refused.
+    @app.get("/api/program/persistent-values")
+    def read_persistent_values() -> dict[str, Any]:
+        return runtime.read_persistent_values()
 
-    @app.post("/api/program/scenarios/{scenario_id}/persistent-values")
+    @app.post("/api/program/persistent-values")
     async def set_persistent_value(
-        scenario_id: ScenarioPath,
         request: PersistentKeyValueSetRequest,
     ) -> dict[str, Any]:
-        return await control_call(
-            lambda: runtime.set_persistent_value(scenario_id, request)
-        )
+        return await control_call(lambda: runtime.set_persistent_value(request))
 
-    @app.post("/api/program/scenarios/{scenario_id}/persistent-values/reset")
+    @app.post("/api/program/persistent-values/reset")
     async def reset_persistent_value(
-        scenario_id: ScenarioPath,
         request: PersistentKeyValueResetRequest,
     ) -> dict[str, Any]:
-        return await control_call(
-            lambda: runtime.reset_persistent_value(scenario_id, request)
-        )
+        return await control_call(lambda: runtime.reset_persistent_value(request))
 
-    @app.post("/api/program/scenarios/{scenario_id}/persistent-values/clear")
+    @app.post("/api/program/persistent-values/clear")
     async def clear_persistent_values(
-        scenario_id: ScenarioPath,
         request: PersistentKeyValuesClearRequest,
     ) -> dict[str, Any]:
-        return await control_call(
-            lambda: runtime.clear_persistent_values(scenario_id, request)
-        )
+        return await control_call(lambda: runtime.clear_persistent_values(request))
 
     @app.post("/api/program/persistent-values/reconcile")
     async def reconcile_persistent_values() -> dict[str, Any]:

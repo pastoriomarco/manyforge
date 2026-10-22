@@ -21,6 +21,7 @@ from manyforge_program_runner.runtime import (
     ProgramRuntime,
 )
 from manyforge_program_runner.tests.test_persistent_values import (
+    _PROJECT,
     _SCENARIO,
     _Headless as _ValuesHeadless,
     _fail_directory_sync,
@@ -49,6 +50,7 @@ class _Headless(_ValuesHeadless):
         applied = super().program_applied()
         assert not isinstance(self.current, Exception)
         applied["source"] = {**applied["source"], "record_digest": self.current["record_digest"]}
+        applied["project_path"] = self.current["origin"]["project_path"]
         return applied
 
 
@@ -70,7 +72,7 @@ class _StoreHost(_Host):
                 Program.from_dict(
                     deepcopy(current["program"]), build_node_environment().catalog
                 ),
-                scenario_id=_SCENARIO,
+                project_path=_PROJECT,
                 register=self.register,
                 program_run_id=program_run_id,
             )
@@ -183,13 +185,13 @@ def test_a_missed_delete_apply_keeps_the_value_and_reports_the_fault(
     # ... and the missed Apply is a named fault in the run and on the page.
     assert {
         "kind": "persistent_key_apply_not_observed",
-        "scenario_id": _SCENARIO,
+        "project_path": _PROJECT,
         "code": "applied_program_not_observed",
         "record_digest": missed,
     } in _audit(runtime, run)
     page, _host = _runtime(tmp_path, headless, "page")
     try:
-        assert page.read_persistent_values(_SCENARIO)["apply_observation_fault"] == {
+        assert page.read_persistent_values()["apply_observation_fault"] == {
             "code": "applied_program_not_observed",
             "record_digests": [missed],
         }
@@ -212,7 +214,7 @@ def test_values_survive_a_workbench_restart_when_the_program_still_declares_them
         assert reconciled["history_changed"] is True
         assert reconciled["dropped"] == [
             {
-                "scenario_id": _SCENARIO,
+                "project_path": _PROJECT,
                 "key": "pallet_index",
                 "reason": "key_not_declared_persistent",
             }
@@ -221,7 +223,7 @@ def test_values_survive_a_workbench_restart_when_the_program_still_declares_them
             # The new history's first Apply was the startup one, never seen.
             {
                 "record_digest": restarted.applies[0]["record_digest"],
-                "scenario_id": _SCENARIO,
+                "project_path": _PROJECT,
             }
         ]
         _start(runtime, restarted)
@@ -239,7 +241,7 @@ def test_a_notified_delete_apply_drops_only_the_removed_key(tmp_path: Path) -> N
     notified, _host = _runtime(tmp_path, headless, "notified")
     assert notified.reconcile_persistent_values()["dropped"] == [
         {
-            "scenario_id": _SCENARIO,
+            "project_path": _PROJECT,
             "key": "pallet_index",
             "reason": "key_not_declared_persistent",
         }
@@ -251,7 +253,7 @@ def test_a_notified_delete_apply_drops_only_the_removed_key(tmp_path: Path) -> N
 
     pallet, runtime, run = _pallet_after_rerun(tmp_path, headless, "second")
     assert pallet == 0
-    assert runtime._persistent_keys.values(_SCENARIO)["layer"]["value"] == 4  # noqa: SLF001
+    assert runtime._persistent_keys.values(_PROJECT)["layer"]["value"] == 4  # noqa: SLF001
     assert not [
         event for event in _audit(runtime, run)
         if event["kind"] == "persistent_key_value_dropped"
@@ -285,7 +287,7 @@ def test_a_late_notification_never_cleans_against_outdated_declarations(
 
 def _stored_values(tmp_path: Path) -> dict[str, Any]:
     register = persistent_keys.PersistentKeyRegister(tmp_path / "persistent-keys.json")
-    return {key: row["value"] for key, row in register.values(_SCENARIO).items()}
+    return {key: row["value"] for key, row in register.values(_PROJECT).items()}
 
 
 @pytest.mark.usefixtures("_no_scene")
@@ -360,7 +362,7 @@ def test_a_restored_value_a_new_rule_refuses_is_dropped_without_blocking_the_run
         assert _stored_values(tmp_path) == {"layer": 4}
         (edit,) = [
             edit
-            for edit in runtime._persistent_keys.edits(_SCENARIO)  # noqa: SLF001
+            for edit in runtime._persistent_keys.edits(_PROJECT)  # noqa: SLF001
             if edit["action"] == "dropped"
         ]
         assert edit["program_run_id"] == run["capture"]["program_run_id"]
@@ -388,7 +390,7 @@ def test_a_cleanup_that_cannot_be_stored_is_a_fault_and_restores_nothing_stale(
         assert fault.value.code == "persistent_key_storage_unavailable"
         # The values page shows the fault and no value it cannot vouch for.
         headless.apply(_PALLET)
-        listed = runtime.read_persistent_values(_SCENARIO)
+        listed = runtime.read_persistent_values()
         assert listed["storage_fault"]["code"] == "persistent_key_storage_unavailable"
         assert not any(row["stored"] for row in listed["keys"])
         # A run is refused by name rather than started on unreconciled values.
@@ -398,7 +400,7 @@ def test_a_cleanup_that_cannot_be_stored_is_a_fault_and_restores_nothing_stale(
         assert host.stores == []
 
         monkeypatch.setattr(persistent_keys.os, "replace", replace)
-        listed = runtime.read_persistent_values(_SCENARIO)
+        listed = runtime.read_persistent_values()
         assert listed["storage_fault"] is None
         # The delete Apply was never reconciled: the value is kept and the
         # missed Apply is reported, not hidden.
@@ -426,7 +428,7 @@ def test_a_reconciliation_that_may_not_be_durable_suppresses_values_until_settle
         with pytest.raises(ProgramRunnerError) as again:
             runtime.reconcile_persistent_values()
         assert again.value.code == "persistent_key_storage_unavailable"
-        listed = runtime.read_persistent_values(_SCENARIO)
+        listed = runtime.read_persistent_values()
         assert listed["storage_fault"]["code"] == "persistent_key_storage_unavailable"
         assert not any(row["stored"] for row in listed["keys"])
         with pytest.raises(ProgramRunnerError) as refused:
@@ -436,7 +438,7 @@ def test_a_reconciliation_that_may_not_be_durable_suppresses_values_until_settle
 
         failing[0] = False
         assert runtime.reconcile_persistent_values()["outcome"] == "duplicate"
-        listed = runtime.read_persistent_values(_SCENARIO)
+        listed = runtime.read_persistent_values()
         assert listed["storage_fault"] is None
         assert _rows(listed)["pallet_index"]["value"] == 9
     finally:
@@ -525,7 +527,7 @@ def test_scenario_empty_scenario_preserves_values_and_only_reports_missed_scenar
     faults = [event for event in _audit(runtime, run)
               if event["kind"] == "persistent_key_apply_not_observed"]
     assert faults == [{
-        "kind": "persistent_key_apply_not_observed", "scenario_id": _SCENARIO,
+        "kind": "persistent_key_apply_not_observed", "project_path": _PROJECT,
         "code": "applied_program_not_observed", "record_digest": missed,
     }]
-    assert empty_digest not in runtime._persistent_keys.unobserved_applies(_SCENARIO)  # noqa: SLF001
+    assert empty_digest not in runtime._persistent_keys.unobserved_applies(_PROJECT)  # noqa: SLF001

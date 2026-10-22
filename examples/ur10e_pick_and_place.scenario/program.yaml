@@ -82,7 +82,10 @@
               "type": "scene_resource"
             },
             "target_role": "arm",
-            "tcp_frame_role": "tcp"
+            "tcp_endpoint": {
+              "frame_role": "tcp",
+              "target_role": "arm"
+            }
           },
           "value_sources": {
             "velocity_scale": {
@@ -119,7 +122,10 @@
               "type": "scene_resource"
             },
             "target_role": "arm",
-            "tcp_frame_role": "tcp"
+            "tcp_endpoint": {
+              "frame_role": "tcp",
+              "target_role": "arm"
+            }
           },
           "value_sources": {
             "velocity_scale": {
@@ -186,7 +192,10 @@
               "type": "frame_role"
             },
             "target_role": "arm",
-            "tcp_frame_role": "tcp"
+            "tcp_endpoint": {
+              "frame_role": "tcp",
+              "target_role": "arm"
+            }
           },
           "value_sources": {
             "velocity_scale": {
@@ -245,7 +254,10 @@
               "type": "pose"
             },
             "target_role": "arm",
-            "tcp_frame_role": "tcp"
+            "tcp_endpoint": {
+              "frame_role": "tcp",
+              "target_role": "arm"
+            }
           },
           "value_sources": {
             "velocity_scale": {
@@ -283,7 +295,10 @@
             "joint_position_tol_rad": 0.05,
             "planning_timeout_s": 10.0,
             "target_role": "arm",
-            "tcp_frame_role": "tcp"
+            "tcp_endpoint": {
+              "frame_role": "tcp",
+              "target_role": "arm"
+            }
           },
           "value_sources": {
             "velocity_scale": {
@@ -368,7 +383,10 @@
               "type": "pose"
             },
             "target_role": "arm",
-            "tcp_frame_role": "tcp"
+            "tcp_endpoint": {
+              "frame_role": "tcp",
+              "target_role": "arm"
+            }
           },
           "value_sources": {
             "velocity_scale": {
@@ -412,7 +430,10 @@
             ],
             "planning_timeout_s": 10.0,
             "target_role": "arm",
-            "tcp_frame_role": "tcp"
+            "tcp_endpoint": {
+              "frame_role": "tcp",
+              "target_role": "arm"
+            }
           },
           "value_sources": {
             "velocity_scale": {

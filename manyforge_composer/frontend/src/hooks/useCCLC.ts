@@ -14,7 +14,7 @@ import type {
   CCLCTransactionStatus,
 } from '../types/cclc';
 import type { ExecutionIdentity } from '../types/robotControl';
-import { readinessErrorPresentation } from '../state/componentLifecyclePresentation';
+import { readinessBlockerPresentation } from '../state/componentLifecyclePresentation';
 
 const POLL_INTERVAL_MS = 250;
 const OBSERVATION_INTERVAL_MS = 2000;
@@ -618,7 +618,7 @@ export function useCCLC(
         await activateThroughOrdinaryLifecycle(verify, async (intent) => {
           let current = await verify();
           while (!current.snapshot.readiness.ready) {
-            setActivationProgress(`${id}: Not ready · ${readinessErrorPresentation(current.snapshot.readiness.error) ?? 'owner prerequisites are unmet'}`);
+            setActivationProgress(`${id}: Not ready · ${readinessBlockerPresentation(current.snapshot.readiness) ?? 'owner prerequisites are unmet'}`);
             await waitForObservation(abort.signal);
             current = await verify();
           }
@@ -676,7 +676,7 @@ export function useCCLC(
         }, () => waitForObservation(abort.signal), (current) => {
           setActivationProgress(current.lifecycleState === 'active' ? `${id}: Active`
             : current.readiness.ready ? `Activating ${id}: ${current.readiness.nextIntent}`
-              : `${id}: Not ready · ${readinessErrorPresentation(current.readiness.error) ?? 'owner prerequisites are unmet'}`);
+              : `${id}: Not ready · ${readinessBlockerPresentation(current.readiness) ?? 'owner prerequisites are unmet'}`);
         });
       });
       if (expectedIdentity !== undefined) {

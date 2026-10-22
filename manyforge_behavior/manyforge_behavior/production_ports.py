@@ -39,6 +39,7 @@ from manyforge_behavior.kernel_client import (
 )
 from manyforge_behavior.program import INTERRUPT_MOTION_NODE_IDS as _INTERRUPT_MOTION_NODE_IDS
 from manyforge_behavior.program import MOTION_NODE_IDS as _MOTION_NODE_IDS
+from manyforge_behavior.program import ProgramValidationError, motion_tcp_selection
 from manyforge_behavior.orchestration_ports import (
     FAILED_EXECUTION_STATES as _FAILED_STATES,
     INTERRUPTED_EXECUTION_STATES as _INTERRUPTED_STATES,
@@ -813,6 +814,7 @@ class _IoWatch:
 class _ContactGraspBinding:
     contact_policy_id: str
     runtime_object_id: str
+    mode: str
 
 
 @dataclass(frozen=True, slots=True)
@@ -1047,6 +1049,20 @@ def _motion_spec(
     raise ProductionPortError(f"unsupported Kernel motion node {node_id!r}")
 
 
+def _motion_tcp_payload(parameters: Mapping[str, Any]) -> dict[str, Any]:
+    try:
+        selection = motion_tcp_selection(parameters)
+    except ProgramValidationError as exc:
+        raise ProductionPortError(str(exc)) from exc
+    endpoint = selection["tcp_endpoint"]
+    return {
+        "tcp_endpoint": {
+            "target_role_id": endpoint["target_role"],
+            "frame_role_id": endpoint["frame_role"],
+        }
+    }
+
+
 def program_motion_participant(
     node_id: str,
     parameters: Mapping[str, Any],
@@ -1074,7 +1090,7 @@ def program_motion_participant(
             f"target role {target_role_id!r} lacks 'execution.trajectory.execute'"
         )
     base_frame_role_id = _text(parameters.get("base_frame_role"), field="base_frame_role")
-    tcp_frame_role_id = _text(parameters.get("tcp_frame_role"), field="tcp_frame_role")
+    tcp_payload = _motion_tcp_payload(parameters)
     target_mode = parameters.get("target_mode", "absolute")
     if target_mode not in {"absolute", "relative"}:
         raise ProductionPortError("motion target_mode is unsupported")
@@ -1151,7 +1167,7 @@ def program_motion_participant(
         "kind": "motion",
         "move_id": _text(move_id, field="move_id"),
         "base_frame_role_id": base_frame_role_id,
-        "tcp_frame_role_id": tcp_frame_role_id,
+        **tcp_payload,
         "tolerances": {
             "joint_position_tol_rad": parameters["joint_position_tol_rad"],
             "translation_tol_m": parameters["translation_tol_m"],
@@ -1319,9 +1335,13 @@ class NativeKernelProgramPort:
             )
             if policy_id in contact_grasps:
                 raise ProductionPortError("Program Binding repeats a contact-grasp policy")
+            mode = contact.get("mode", "contact_grasp")
+            if mode not in ("contact_grasp", "contact_release"):
+                raise ProductionPortError("Program Binding contact mode is invalid")
             contact_grasps[policy_id] = _ContactGraspBinding(
                 policy_id,
                 runtime_object_id,
+                mode,
             )
         NativeKernelProgramPort._validate_execution_group_policies(context.program)
         _validate_io_signal_nodes(context.program, targets)
@@ -1927,7 +1947,7 @@ class NativeKernelProgramPort:
                 phase,
             ),
             "base_frame_role_id": _text(parameters.get("base_frame_role"), field="base_frame_role"),
-            "tcp_frame_role_id": _text(parameters.get("tcp_frame_role"), field="tcp_frame_role"),
+            **_motion_tcp_payload(parameters),
             "tolerances": {
                 "joint_position_tol_rad": options.get("joint_position_tol_rad", 0.05),
                 "translation_tol_m": options.get("translation_tol_m", 0.005),
@@ -2065,6 +2085,8 @@ class NativeKernelProgramPort:
                 raise ProductionPortError(
                     "Program Binding has no exact pick contact-grasp policy"
                 ) from exc
+            if contact.mode != "contact_grasp":
+                raise ProductionPortError("pick requires a contact-grasp policy")
             approach_motion: Mapping[str, Any] = {
                 "kind": "pose_goal",
                 "goal": identity_pose,
@@ -5505,6 +5527,13 @@ class HeadlessSceneProgramPort:
                         _text(idle[key], field=key)
                     generation = idle["reset_claim_generation"]
                     reference = _text(idle["request_payload_digest"], field="request_payload_digest")
+                    if type(generation) is not int or not 1 <= generation <= 9_007_199_254_740_991:
+                        raise ProductionPortError("Program Reset scene claim generation is invalid")
+                    if (
+                        len(reference) != 71 or not reference.startswith("sha256:")
+                        or any(character not in "0123456789abcdef" for character in reference[7:])
+                    ):
+                        raise ProductionPortError("Program Reset scene evidence digest is invalid")
                 else:
                     if set(authorization) != {
                         "program_runner_owner_epoch",
@@ -5534,13 +5563,6 @@ class HeadlessSceneProgramPort:
                         or any(character not in "0123456789abcdef" for character in reference[7:])
                     ):
                         raise ProductionPortError("Program Reset scene settlement reference is invalid")
-                if type(generation) is not int or not 1 <= generation <= 9_007_199_254_740_991:
-                    raise ProductionPortError("Program Reset scene claim generation is invalid")
-                if (
-                    len(reference) != 71 or not reference.startswith("sha256:")
-                    or any(character not in "0123456789abcdef" for character in reference[7:])
-                ):
-                    raise ProductionPortError("Program Reset scene evidence digest is invalid")
                 body["program_reset_scene_authorization"] = authorization
                 body["request_context"]["request_id"] = _request_identity(
                     "scene-reset", request_id, str(generation)

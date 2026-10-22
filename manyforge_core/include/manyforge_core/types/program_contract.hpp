@@ -1,5 +1,7 @@
 #pragma once
 
+#include <manyforge_core/types/program_contact_envelope.hpp>
+
 #include <cstddef>
 #include <cstdint>
 #include <manyforge_core/types/retained_product.hpp>
@@ -305,8 +307,11 @@ struct ProgramContactGraspTemplateDTO final {
   ContactPolicyRevision contact_policy_revision;
   RuntimeObjectId runtime_object_id;
   std::vector<ProgramContactGraspBodySelectorDTO> allowed_body_selectors;
-  double max_penetration_m{};
-  double terminal_window_start_fraction{};
+  ContactZoneEnvelopeDTO envelope{ContactGraspEnvelopeDTO{}};
+
+  /// Resolve bodies from the operation's selected motion endpoint; explicit
+  /// body selectors must be empty in this mode.
+  bool bodies_from_motion_endpoint{};
 
   friend bool operator==(const ProgramContactGraspTemplateDTO&,
                          const ProgramContactGraspTemplateDTO&) = default;

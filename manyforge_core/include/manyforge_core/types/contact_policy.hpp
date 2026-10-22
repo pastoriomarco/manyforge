@@ -66,9 +66,15 @@ struct ContactRuntimeObjectSelectorDTO final {
                          const ContactRuntimeObjectSelectorDTO&) = default;
 };
 
+/// Bodies are supplied only by the operation's exact selected motion endpoint.
+struct ContactMotionEndpointSelectorDTO final {
+  friend bool operator==(const ContactMotionEndpointSelectorDTO&,
+                         const ContactMotionEndpointSelectorDTO&) = default;
+};
+
 using ContactBodySelectorDTO =
     std::variant<ContactComponentModelBodySelectorDTO, ContactSceneResourceSelectorDTO,
-                 ContactRuntimeObjectSelectorDTO>;
+                 ContactRuntimeObjectSelectorDTO, ContactMotionEndpointSelectorDTO>;
 
 /// One exact unordered portable body pair. Qualified values retain the two
 /// selectors in canonical encoded order and never use declaration order to

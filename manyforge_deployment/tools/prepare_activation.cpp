@@ -358,8 +358,9 @@ assistant_mode_text(deployment::ScenarioAssistantMode value) {
         "launch-time typed_parameter_overrides were removed)");
   }
   require_exact_fields(root,
-                       {"schema_version", "runtime_cell_id", "source_document_digest",
-                        "scenario_id", "captured_input_digest", "deployment",
+                       {"schema_version", "runtime_cell_id",
+                        "source_document_digest", "scenario_id", "project_path",
+                        "captured_input_digest", "deployment",
                         "model_source_closure", "prepared_model_closure",
                         "program", "program_role_assignment"},
                        "activation preparation request");
@@ -371,6 +372,12 @@ assistant_mode_text(deployment::ScenarioAssistantMode value) {
            "captured_input_digest");
   const auto &scenario_id =
       text(member(root, "scenario_id", "request"), "scenario_id");
+  const auto &project_path =
+      text(member(root, "project_path", "request"), "project_path");
+  const auto scenario_origin = deployment::parse_prepared_activation_origin(
+      deployment::prepared_activation_origin_value(
+          deployment::PreparedScenarioOrigin{
+              scenario_id, core::ContentDigest(source_digest), project_path}));
   if (scenario_id.size() > 256U) {
     throw std::invalid_argument("scenario_id exceeds its byte bound");
   }
@@ -408,6 +415,7 @@ assistant_mode_text(deployment::ScenarioAssistantMode value) {
       {"program", program_value},
       {"program_role_assignment", assignment_value},
       {"scenario_id", deployment::CanonicalValue(scenario_id)},
+      {"project_path", deployment::CanonicalValue(project_path)},
       {"source_document_digest", deployment::CanonicalValue(source_digest)},
   });
   if (deployment::sha256_digest(deployment::canonical_json(captured)) !=
@@ -524,13 +532,13 @@ assistant_mode_text(deployment::ScenarioAssistantMode value) {
        deployment::CanonicalValue(deployment::CanonicalValue::Object{
            {"catalog_artifacts",
             artifact_payload(materialized.catalog_artifacts)},
-           {"program", program != nullptr ? program->normalized_program_root()
-                                          : deployment::CanonicalValue(nullptr)},
+           {"program", program != nullptr
+                           ? program->normalized_program_root()
+                           : deployment::CanonicalValue(nullptr)},
            {"program_binding", std::move(program_binding_payload)},
            {"program_role_assignment", assignment_value},
-           {"raw_artifacts",
-            deployment::prepared_activation_artifact_rows(
-                std::move(raw_artifact_rows))},
+           {"raw_artifacts", deployment::prepared_activation_artifact_rows(
+                                 std::move(raw_artifact_rows))},
            {"retained_bundle", materialized.bundle->normalized_root()},
        })},
       {"assistant_mode",
@@ -548,19 +556,21 @@ assistant_mode_text(deployment::ScenarioAssistantMode value) {
            materialized.bundle->value()
                .catalogs.node_environment.environment_digest.value())},
       {"program_id",
-       program != nullptr ? deployment::CanonicalValue(program->value().program_id.value())
-                          : deployment::CanonicalValue(nullptr)},
+       program != nullptr
+           ? deployment::CanonicalValue(program->value().program_id.value())
+           : deployment::CanonicalValue(nullptr)},
       {"program_outcome", std::move(program_outcome)},
-      {"program_revision",
-       program != nullptr ? deployment::CanonicalValue(program->value().program_revision.value())
-                          : deployment::CanonicalValue(nullptr)},
+      {"program_revision", program != nullptr
+                               ? deployment::CanonicalValue(
+                                     program->value().program_revision.value())
+                               : deployment::CanonicalValue(nullptr)},
       {"retained_bundle_id",
        deployment::CanonicalValue(
            materialized.bundle->retained_bundle_id().value())},
-      {"origin", deployment::prepared_activation_origin_value(
-          deployment::PreparedScenarioOrigin{scenario_id, core::ContentDigest(source_digest)})},
+      {"origin", deployment::prepared_activation_origin_value(scenario_origin)},
       {"schema_version",
-       deployment::CanonicalValue(std::string(deployment::kPreparedActivationInputSchemaVersion))},
+       deployment::CanonicalValue(
+           std::string(deployment::kPreparedActivationInputSchemaVersion))},
   };
   const auto prepared_id = deployment::sha256_digest(
       deployment::canonical_json(deployment::CanonicalValue(identity)));

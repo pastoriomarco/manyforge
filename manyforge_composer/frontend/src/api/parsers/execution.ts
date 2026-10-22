@@ -870,14 +870,25 @@ export function parseExecutionControlStatus(
             'base_frame_role_id', 'component_role_id', 'frame_role_ids', 'joints',
             'manual_control', 'planning_capability_ids', 'target_descriptor',
             'target_role_id', 'tcp_frame_role_id',
-          ], ['stop_response'], `${targetPath}.command`);
-          if (command.stop_response !== undefined) {
+          ], ['stop_response', 'stop_response_error'], `${targetPath}.command`);
+          // The execution host publishes `stop_response: null` with the
+          // owner's error when it cannot read the target's Stop metadata.
+          // That is a fact about this target, never a malformed snapshot.
+          if (command.stop_response === null) {
+            const error = objectAt(command.stop_response_error, `${targetPath}.command.stop_response_error`);
+            allowedKeysAt(error, ['code', 'message'], ['details'], `${targetPath}.command.stop_response_error`);
+            stringAt(error.code, `${targetPath}.command.stop_response_error.code`);
+            stringAt(error.message, `${targetPath}.command.stop_response_error.message`);
+          } else if (command.stop_response_error !== undefined) {
+            return fail(`${targetPath}.command.stop_response_error`, 'present only without a Stop response');
+          } else if (command.stop_response !== undefined) {
             stopResponses.set(
               JSON.stringify([componentId, commandTargetId]),
               targetStopResponseAt(command.stop_response, `${targetPath}.command.stop_response`),
             );
-            delete (addressed as JsonObject).stop_response;
           }
+          delete (addressed as JsonObject).stop_response;
+          delete (addressed as JsonObject).stop_response_error;
           motionRows.push({
             ...addressed,
             observed_state: observationFor(componentId, target, 'joint_positions', targetPath),

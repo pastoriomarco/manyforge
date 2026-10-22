@@ -328,7 +328,7 @@ template <typename T>
          lhs.target_role_id == rhs.target_role_id &&
          lhs.required_capability_id == rhs.required_capability_id &&
          lhs_motion->base_frame_role_id == rhs_motion->base_frame_role_id &&
-         lhs_motion->tcp_frame_role_id == rhs_motion->tcp_frame_role_id;
+         lhs_motion->tcp_endpoint == rhs_motion->tcp_endpoint;
 }
 
 void set_absolute_pose(OperationIntentDTO& operation, const Pose3DTO& pose) {

@@ -20,6 +20,13 @@
         "lite_gripper_left_finger",
         "lite_gripper_right_finger"
       ]
+    },
+    {
+      "collision_body_role_id": "gripper_fingers",
+      "source_link_names": [
+        "lite_gripper_left_finger",
+        "lite_gripper_right_finger"
+      ]
     }
   ],
   "expanded_source": {
@@ -182,7 +189,7 @@
       "source_group_name": "lite_gripper"
     }
   ],
-  "model_revision": "sha256:3bc16935381668ee59e1d5edfa41576ccb5353dc77e3799050be4bbd21cd9ea1",
+  "model_revision": "sha256:b64c0b05bc23de6eb1fd5796baa6e32454c2f5514ab38c8f5b0b75f523272bf7",
   "resource_role_bindings": [
     {
       "resource_role_id": "arm_joints",

@@ -390,6 +390,7 @@ derive_route_readiness_projection(
   candidate_controller_binding.component_role_id = a.component_role_id;
   candidate_controller_binding.target_role_id = a.target_role_id;
   candidate_controller_binding.contact_grasp_bindings = a.contact_grasp_bindings;
+  candidate_controller_binding.motion_endpoint = a.motion_endpoint;
   if (a != candidate_controller_binding || left.engine != right.engine ||
       left.stop_execution_port != right.stop_execution_port ||
       left.prepared_motion_engine != right.prepared_motion_engine ||
@@ -635,8 +636,9 @@ struct StopStaticFacts final {
   return left_stable_identity == right_stable_identity;
 }
 
-[[nodiscard]] inline Result<std::optional<ResolvedContactGraspBindingDTO>> resolve_contact_grasp_binding(
-    const MotionParticipantIntentDTO& motion, const RuntimeParticipantBindingDTO& binding) {
+[[nodiscard]] inline Result<std::optional<ResolvedContactGraspBindingDTO>>
+resolve_contact_grasp_binding(const MotionParticipantIntentDTO& motion,
+                              const RuntimeParticipantBindingDTO& binding) {
   if (!motion.contact_policy_id.has_value()) {
     return Result<std::optional<ResolvedContactGraspBindingDTO>>::Ok(std::nullopt);
   }
@@ -670,7 +672,15 @@ struct StopStaticFacts final {
     return Result<std::optional<ResolvedContactGraspBindingDTO>>::Err(std::move(unresolved));
   }
   std::vector<CollisionBodyId> body_ids;
-  for (const auto& body : policy->allowed_body_bindings) {
+  if (policy->bodies_from_motion_endpoint && !binding.motion_endpoint) {
+    return reject<std::optional<ResolvedContactGraspBindingDTO>>(
+        "contact-grasp policy requires a resolved motion endpoint",
+        "contact_grasp_motion_endpoint_unresolved", ErrorCode::kMissingReference);
+  }
+  const auto& bodies = policy->bodies_from_motion_endpoint
+                           ? binding.motion_endpoint->contact_body_bindings
+                           : policy->allowed_body_bindings;
+  for (const auto& body : bodies) {
     body_ids.insert(body_ids.end(), body.collision_body_ids.begin(), body.collision_body_ids.end());
   }
   std::sort(body_ids.begin(), body_ids.end());
@@ -683,8 +693,7 @@ struct StopStaticFacts final {
   return Result<std::optional<ResolvedContactGraspBindingDTO>>::Ok(
       std::optional<ResolvedContactGraspBindingDTO>{ResolvedContactGraspBindingDTO{
           policy->contact_policy_id, policy->contact_policy_revision, policy->runtime_object_id,
-          object->scene_resource_id, std::move(body_ids), policy->max_penetration_m,
-          policy->terminal_window_start_fraction}});
+          object->scene_resource_id, std::move(body_ids), policy->envelope}});
 }
 
 [[nodiscard]] inline ResolvedFrameDTO resolved_component_frame(const RuntimeParticipantBindingDTO& binding,
@@ -708,7 +717,12 @@ struct StopStaticFacts final {
                                      "i6_motion_model_group_cardinality_invalid");
   }
   const auto* base = find_frame(binding, motion.base_frame_role_id);
-  const auto* tcp = find_frame(binding, motion.tcp_frame_role_id);
+  const auto* tcp =
+      binding.motion_endpoint &&
+              motion.tcp_endpoint.target_role_id == binding.motion_endpoint->target_role_id &&
+              motion.tcp_endpoint.frame_role_id == binding.motion_endpoint->frame.frame_role_id
+          ? &binding.motion_endpoint->frame
+          : nullptr;
   if (base == nullptr || tcp == nullptr) {
     return reject<ExecuteRequestDTO>("motion frame roles do not resolve through the exact binding",
                                      "motion_frame_role_unresolved");

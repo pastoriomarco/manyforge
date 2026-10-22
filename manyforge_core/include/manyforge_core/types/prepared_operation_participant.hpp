@@ -200,6 +200,7 @@ struct PreparedOperationParticipantDTO final {
   PreparedParticipantPayloadDTO payload;
   std::variant<PreparedControllerExecutionAuthorityDTO, PreparedProviderExecutionAuthorityDTO>
       execution_authority;
+  std::optional<RuntimeMotionEndpointBindingDTO> motion_endpoint{};
 
   PreparedOperationParticipantDTO(
       ContentDigest prepared_contract_digest, OperationId operation_id,

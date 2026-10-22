@@ -88,7 +88,10 @@
             ],
             "planning_timeout_s": 10.0,
             "target_role": "arm",
-            "tcp_frame_role": "tcp"
+            "tcp_endpoint": {
+              "frame_role": "tcp",
+              "target_role": "arm"
+            }
           },
           "value_sources": {
             "acceleration_scale": {
@@ -141,7 +144,10 @@
               "type": "scene_resource"
             },
             "target_role": "arm",
-            "tcp_frame_role": "tcp"
+            "tcp_endpoint": {
+              "frame_role": "tcp",
+              "target_role": "arm"
+            }
           },
           "value_sources": {
             "acceleration_scale": {
@@ -194,7 +200,10 @@
               "type": "scene_resource"
             },
             "target_role": "arm",
-            "tcp_frame_role": "tcp"
+            "tcp_endpoint": {
+              "frame_role": "tcp",
+              "target_role": "arm"
+            }
           },
           "value_sources": {
             "acceleration_scale": {
@@ -273,7 +282,10 @@
               "type": "frame_role"
             },
             "target_role": "arm",
-            "tcp_frame_role": "tcp"
+            "tcp_endpoint": {
+              "frame_role": "tcp",
+              "target_role": "arm"
+            }
           },
           "value_sources": {
             "acceleration_scale": {
@@ -322,7 +334,10 @@
             },
             "planning_timeout_s": 10.0,
             "target_role": "arm",
-            "tcp_frame_role": "tcp"
+            "tcp_endpoint": {
+              "frame_role": "tcp",
+              "target_role": "arm"
+            }
           },
           "value_sources": {
             "acceleration_scale": {
@@ -371,7 +386,10 @@
             },
             "planning_timeout_s": 10.0,
             "target_role": "arm",
-            "tcp_frame_role": "tcp"
+            "tcp_endpoint": {
+              "frame_role": "tcp",
+              "target_role": "arm"
+            }
           },
           "value_sources": {
             "acceleration_scale": {
@@ -446,7 +464,10 @@
             },
             "planning_timeout_s": 10.0,
             "target_role": "arm",
-            "tcp_frame_role": "tcp"
+            "tcp_endpoint": {
+              "frame_role": "tcp",
+              "target_role": "arm"
+            }
           },
           "value_sources": {
             "acceleration_scale": {
@@ -502,7 +523,10 @@
             ],
             "planning_timeout_s": 10.0,
             "target_role": "arm",
-            "tcp_frame_role": "tcp"
+            "tcp_endpoint": {
+              "frame_role": "tcp",
+              "target_role": "arm"
+            }
           },
           "value_sources": {
             "acceleration_scale": {

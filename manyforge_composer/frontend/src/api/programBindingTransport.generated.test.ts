@@ -297,3 +297,93 @@ describe('generated Program Binding transport parser', () => {
     expect(() => parseProgramBindingTransport(document, 'binding')).toThrow(/closed record/);
   });
 });
+
+describe('logical endpoint transport', () => {
+  function endpointFixture(): Row {
+    const value = fixture();
+    const target = rows(value.target_role_bindings)[0];
+    const body = rows(target.collision_body_role_bindings)[0];
+    const frame = rows(target.frame_role_bindings).find((candidate) => candidate.model_instance_id === body.model_instance_id)!;
+    frame.contact_body_role_ids = [body.collision_body_role_id];
+    const policy = rows(value.contact_grasp_bindings)[0];
+    policy.bodies_from_motion_endpoint = true;
+    policy.allowed_body_bindings = [];
+    return value;
+  }
+
+  it('preserves the selected frame association and endpoint policy', () => {
+    const value = endpointFixture();
+    expect(parseProgramBindingTransport(value, 'binding')).toBe(value);
+  });
+
+  it.each(['missing_body', 'wrong_model', 'duplicate_body', 'false_selector', 'mixed_bodies'])('rejects %s', (fault) => {
+    const value = endpointFixture();
+    const target = rows(value.target_role_bindings)[0];
+    const frame = rows(target.frame_role_bindings).find((candidate) => 'contact_body_role_ids' in candidate)!;
+    const policy = rows(value.contact_grasp_bindings)[0];
+    if (fault === 'missing_body') frame.contact_body_role_ids = ['absent'];
+    else if (fault === 'wrong_model') frame.model_revision = `sha256:${'f'.repeat(64)}`;
+    else if (fault === 'duplicate_body') {
+      const roles = frame.contact_body_role_ids as string[];
+      frame.contact_body_role_ids = [...roles, ...roles];
+    } else if (fault === 'false_selector') policy.bodies_from_motion_endpoint = false;
+    else policy.allowed_body_bindings = rows(fixture().contact_grasp_bindings)[0].allowed_body_bindings;
+    expect(() => parseProgramBindingTransport(value, 'binding')).toThrow();
+  });
+});
+
+describe('contact release transport', () => {
+  function releaseFixture(binary: boolean, endpoint = true): Row {
+    const value = fixture();
+    const policy = rows(value.contact_grasp_bindings)[0];
+    delete policy.max_penetration_m;
+    delete policy.terminal_window_start_fraction;
+    Object.assign(policy, {
+      mode: 'contact_release',
+      release_evidence_mode: binary ? 'binary_contact' : 'signed_penetration',
+      enforce_max_start_penetration: !binary,
+      max_start_penetration_m: binary ? 0 : 0.002,
+      min_release_progress_m: 0,
+      release_tolerance_m: binary ? 0 : 1e-5,
+      require_strictly_decreasing_penetration: !binary,
+      require_separation_by_end: true,
+      allow_recontact: false,
+    });
+    if (endpoint) {
+      policy.bodies_from_motion_endpoint = true;
+      policy.allowed_body_bindings = [];
+    }
+    return value;
+  }
+
+  it.each([
+    [false, false], [false, true], [true, false], [true, true],
+  ])('accepts normalized binary=%s endpoint=%s release without rewriting it', (binary, endpoint) => {
+    const value = releaseFixture(binary, endpoint);
+    expect(parseProgramBindingTransport(value, 'binding')).toBe(value);
+  });
+
+  it.each([
+    'wrong_mode', 'missing_mode', 'unknown', 'grasp_field', 'missing_release_field',
+    'wrong_evidence', 'number_boolean', 'negative_metric', 'oversized_metric',
+    'nonfinite_metric', 'binary_enforce', 'binary_strict', 'binary_metric',
+  ])('rejects %s in a release binding', (fault) => {
+    const binary = fault.startsWith('binary_');
+    const value = releaseFixture(binary);
+    const policy = rows(value.contact_grasp_bindings)[0];
+    if (fault === 'wrong_mode') policy.mode = 'contact_grasp';
+    else if (fault === 'missing_mode') delete policy.mode;
+    else if (fault === 'unknown') policy.extra = true;
+    else if (fault === 'grasp_field') policy.max_penetration_m = 0.002;
+    else if (fault === 'missing_release_field') delete policy.require_separation_by_end;
+    else if (fault === 'wrong_evidence') policy.release_evidence_mode = 'distance';
+    else if (fault === 'number_boolean') policy.allow_recontact = 1;
+    else if (fault === 'negative_metric') policy.max_start_penetration_m = -0.001;
+    else if (fault === 'oversized_metric') policy.min_release_progress_m = 1000.001;
+    else if (fault === 'nonfinite_metric') policy.release_tolerance_m = Number.POSITIVE_INFINITY;
+    else if (fault === 'binary_enforce') policy.enforce_max_start_penetration = true;
+    else if (fault === 'binary_strict') policy.require_strictly_decreasing_penetration = true;
+    else policy.release_tolerance_m = 1e-5;
+    expect(() => parseProgramBindingTransport(value, 'binding')).toThrow();
+  });
+});

@@ -69,7 +69,7 @@ template <typename T>
          left.participants.front().required_capability_id ==
              right.participants.front().required_capability_id &&
          lhs->base_frame_role_id == rhs->base_frame_role_id &&
-         lhs->tcp_frame_role_id == rhs->tcp_frame_role_id;
+         lhs->tcp_endpoint == rhs->tcp_endpoint;
 }
 
 [[nodiscard]] Result<void> validate_common(
@@ -184,7 +184,8 @@ template <typename T>
         return candidate.contact_policy_id < selected;
       });
   const bool policy_bound =
-      policy != arm_binding.contact_grasp_bindings.end() && policy->contact_policy_id == policy_id;
+      policy != arm_binding.contact_grasp_bindings.end() && policy->contact_policy_id == policy_id &&
+      std::holds_alternative<ContactGraspEnvelopeDTO>(policy->envelope);
   if (!policy_bound || policy->runtime_object_id != runtime_object_id) {
     // One reason for both causes. The message says which one happened; the
     // details name the selected runtime object as the one reference and carry
@@ -203,8 +204,16 @@ template <typename T>
     unresolved.details.emplace("contact_policy_id", policy_id.value());
     return Result<std::vector<CollisionBodyRoleId>>::Err(std::move(unresolved));
   }
+  if (policy->bodies_from_motion_endpoint && !arm_binding.motion_endpoint) {
+    return planning_error<std::vector<CollisionBodyRoleId>>(
+        "pick_motion_endpoint_unresolved",
+        "pick contact policy requires a selected motion endpoint", ErrorCode::kMissingReference);
+  }
+  const auto& bodies = policy->bodies_from_motion_endpoint
+                           ? arm_binding.motion_endpoint->contact_body_bindings
+                           : policy->allowed_body_bindings;
   std::vector<CollisionBodyRoleId> roles;
-  for (const auto& body : policy->allowed_body_bindings) {
+  for (const auto& body : bodies) {
     if (body.controllable_component_id != carrier_binding.controllable_component_id ||
         body.command_target_id != carrier_binding.command_target_id) {
       continue;
@@ -252,7 +261,7 @@ struct ResolvedPickOffsetBases final {
 [[nodiscard]] Result<ResolvedPickOffsetBases> resolve_pick_offset_bases(
     IAddressedMotionPreviewSession& session, const PickSequencePlanningIntentDTO& intent,
     const CollisionWorldLeaseInventory& predecessor, const RobotStateDTO& start_state,
-    const FrameRoleId& tcp_frame_role_id) {
+    const RuntimeParticipantBindingDTO& arm_binding) {
   ResolvedPickOffsetBases bases;
   std::vector<ReferenceDTO> references;
   std::optional<std::size_t> pick_index;
@@ -270,8 +279,18 @@ struct ResolvedPickOffsetBases final {
           "pick_offset_reference_invalid",
           "pick offset reference is malformed or has mismatched typed identity");
     }
-    if (selected->type == ReferenceDTO::Type::kFrameRole && !selected->target.has_value() &&
-        std::get<FrameRoleId>(selected->id) == tcp_frame_role_id) {
+    // An unqualified frame reference still belongs to the moving target.
+    // This reference rule is independent of the required TCP selector spelling.
+    const ReferenceTargetDTO reference_owner = selected->target.value_or(
+        ReferenceTargetDTO{arm_binding.target_role_id, arm_binding.controllable_component_id,
+                           arm_binding.command_target_id});
+    const bool candidate_tcp =
+        selected->type == ReferenceDTO::Type::kFrameRole && arm_binding.motion_endpoint &&
+        reference_owner.target_role_id == arm_binding.motion_endpoint->target_role_id &&
+        reference_owner.controllable_component_id == arm_binding.controllable_component_id &&
+        reference_owner.command_target_id == arm_binding.motion_endpoint->command_target_id &&
+        std::get<FrameRoleId>(selected->id) == arm_binding.motion_endpoint->frame.frame_role_id;
+    if (candidate_tcp) {
       basis.use_candidate_tcp_orientation = true;
       return Result<void>::Ok();
     }
@@ -574,7 +593,7 @@ Result<PickPlacePlanningResultDTO> AddressedPickPlacePlanningOwner::PlanPick(
     return Result<PickPlacePlanningResultDTO>::Err(state.error());
   }
   auto offset_bases = resolve_pick_offset_bases(*session.value(), intent, predecessor.value(),
-                                                state.value(), approach_motion->tcp_frame_role_id);
+                                                state.value(), arm.value());
   if (!offset_bases.ok()) {
     return Result<PickPlacePlanningResultDTO>::Err(offset_bases.error());
   }

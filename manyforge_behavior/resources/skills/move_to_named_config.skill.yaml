@@ -50,7 +50,7 @@ body:
   parameters:
     target_role: '${target:arm}'
     base_frame_role: base
-    tcp_frame_role: tcp
+    tcp_endpoint: {target_role: "${target:arm}", frame_role: tcp}
     goal: '${param:goal}'
     velocity_scale: '${param:velocity_scale}'
     acceleration_scale: '${param:acceleration_scale}'

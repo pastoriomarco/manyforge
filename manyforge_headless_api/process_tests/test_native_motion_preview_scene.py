@@ -113,7 +113,10 @@ def test_managed_preview_computes_on_the_current_scene_after_a_scene_edit(
                     )
                     | {
                         "base_frame_role_id": command["base_frame_role_id"],
-                        "tcp_frame_role_id": command["tcp_frame_role_id"],
+                        "tcp_endpoint": {
+                            "target_role_id": command["target_role_id"],
+                            "frame_role_id": command["tcp_frame_role_id"],
+                        },
                         "planning_profile": "balanced",
                         "speed_profile": {
                             "velocity_scale": 1.0,

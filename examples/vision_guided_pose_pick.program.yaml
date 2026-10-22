@@ -1,6 +1,6 @@
 api_version: manyforge.program.v2
 program_id: vision_guided_pose_pick
-program_revision: sha256:1cd8fff5dc4ac1be38b84ff6ef719d6e16bb49ab5491160ef868783e394f6092
+program_revision: sha256:83058dd90181e965d7e08ee54760c391d8a5bc10b02fcc33d633406a0f24fa8b
 program_profile: composable-cell-v1
 name: vision_guided_pose_pick
 description: >-
@@ -132,7 +132,7 @@ tree:
       parameters:
         target_role: arm
         base_frame_role: base
-        tcp_frame_role: tcp
+        tcp_endpoint: {target_role: arm, frame_role: tcp}
         velocity_scale: 0.35
       value_sources:
         goal:
@@ -145,7 +145,7 @@ tree:
       parameters:
         target_role: arm
         base_frame_role: base
-        tcp_frame_role: tcp
+        tcp_endpoint: {target_role: arm, frame_role: tcp}
         velocity_scale: 0.2
       value_sources:
         goal:
@@ -162,7 +162,7 @@ tree:
       parameters:
         target_role: arm
         base_frame_role: base
-        tcp_frame_role: tcp
+        tcp_endpoint: {target_role: arm, frame_role: tcp}
         target_mode: relative
         target_reference: {type: frame_role, frame_role_id: tcp}
         offset_reference: {type: frame_role, frame_role_id: base}
@@ -176,7 +176,7 @@ tree:
       parameters:
         target_role: arm
         base_frame_role: base
-        tcp_frame_role: tcp
+        tcp_endpoint: {target_role: arm, frame_role: tcp}
         goal:
           frame_ref: {kind: target_frame, target_role: arm, frame_role: base}
           position_m: [0.22, 0.0, 0.3]

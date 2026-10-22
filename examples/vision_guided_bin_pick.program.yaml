@@ -149,7 +149,7 @@ description: Vision-guided pick-and-place Program. A bounded model request selec
 name: vision_guided_bin_pick
 program_id: vision_guided_bin_pick
 program_profile: composable-cell-v1
-program_revision: sha256:cb83fcd4969ce3f7927d7e0f4f8e26ae8c3fcfdbd9d8c4462737238b093d9058
+program_revision: sha256:9ee39656882d20d0c92104151eedccc08896ec3f1e465828fcaa3cf4e6b2ca90
 scene:
   - pose:
       frame_ref:
@@ -363,7 +363,7 @@ tree:
                           - 0
                       search_strategy: first_feasible
                     target_role: arm
-                    tcp_frame_role: tcp
+                    tcp_endpoint: {target_role: arm, frame_role: tcp}
                     tool_position:
                       kind: named_preset
                       name: closed
@@ -375,7 +375,7 @@ tree:
                     base_frame_role: base
                     planning_profile: first_feasible
                     target_role: arm
-                    tcp_frame_role: tcp
+                    tcp_endpoint: {target_role: arm, frame_role: tcp}
                     velocity_scale: 0.4
                   value_sources:
                     goal:
@@ -390,7 +390,7 @@ tree:
                     contact_policy_id: selected_object_grasp
                     planning_profile: first_feasible
                     target_role: arm
-                    tcp_frame_role: tcp
+                    tcp_endpoint: {target_role: arm, frame_role: tcp}
                     velocity_scale: 0.4
                   value_sources:
                     contact_scene_resource_id:
@@ -431,7 +431,7 @@ tree:
                     base_frame_role: base
                     planning_profile: first_feasible
                     target_role: arm
-                    tcp_frame_role: tcp
+                    tcp_endpoint: {target_role: arm, frame_role: tcp}
                     velocity_scale: 0.4
                   value_sources:
                     path:
@@ -474,7 +474,7 @@ tree:
                     planning_profile: first_feasible
                     selected_object_id: left_part
                     target_role: arm
-                    tcp_frame_role: tcp
+                    tcp_endpoint: {target_role: arm, frame_role: tcp}
                     tool_position:
                       kind: named_preset
                       name: open
@@ -486,7 +486,7 @@ tree:
                     base_frame_role: base
                     planning_profile: first_feasible
                     target_role: arm
-                    tcp_frame_role: tcp
+                    tcp_endpoint: {target_role: arm, frame_role: tcp}
                     velocity_scale: 0.4
                   value_sources:
                     goal:
@@ -500,7 +500,7 @@ tree:
                     base_frame_role: base
                     planning_profile: first_feasible
                     target_role: arm
-                    tcp_frame_role: tcp
+                    tcp_endpoint: {target_role: arm, frame_role: tcp}
                     velocity_scale: 0.4
                   value_sources:
                     path:
@@ -534,7 +534,7 @@ tree:
                     base_frame_role: base
                     planning_profile: first_feasible
                     target_role: arm
-                    tcp_frame_role: tcp
+                    tcp_endpoint: {target_role: arm, frame_role: tcp}
                     velocity_scale: 0.4
                   value_sources:
                     path:
@@ -613,7 +613,7 @@ tree:
                           - 0
                       search_strategy: first_feasible
                     target_role: arm
-                    tcp_frame_role: tcp
+                    tcp_endpoint: {target_role: arm, frame_role: tcp}
                     tool_position:
                       kind: named_preset
                       name: closed
@@ -625,7 +625,7 @@ tree:
                     base_frame_role: base
                     planning_profile: first_feasible
                     target_role: arm
-                    tcp_frame_role: tcp
+                    tcp_endpoint: {target_role: arm, frame_role: tcp}
                     velocity_scale: 0.4
                   value_sources:
                     goal:
@@ -640,7 +640,7 @@ tree:
                     contact_policy_id: selected_object_grasp
                     planning_profile: first_feasible
                     target_role: arm
-                    tcp_frame_role: tcp
+                    tcp_endpoint: {target_role: arm, frame_role: tcp}
                     velocity_scale: 0.4
                   value_sources:
                     contact_scene_resource_id:
@@ -681,7 +681,7 @@ tree:
                     base_frame_role: base
                     planning_profile: first_feasible
                     target_role: arm
-                    tcp_frame_role: tcp
+                    tcp_endpoint: {target_role: arm, frame_role: tcp}
                     velocity_scale: 0.4
                   value_sources:
                     path:
@@ -724,7 +724,7 @@ tree:
                     planning_profile: first_feasible
                     selected_object_id: right_part
                     target_role: arm
-                    tcp_frame_role: tcp
+                    tcp_endpoint: {target_role: arm, frame_role: tcp}
                     tool_position:
                       kind: named_preset
                       name: open
@@ -736,7 +736,7 @@ tree:
                     base_frame_role: base
                     planning_profile: first_feasible
                     target_role: arm
-                    tcp_frame_role: tcp
+                    tcp_endpoint: {target_role: arm, frame_role: tcp}
                     velocity_scale: 0.4
                   value_sources:
                     goal:
@@ -750,7 +750,7 @@ tree:
                     base_frame_role: base
                     planning_profile: first_feasible
                     target_role: arm
-                    tcp_frame_role: tcp
+                    tcp_endpoint: {target_role: arm, frame_role: tcp}
                     velocity_scale: 0.4
                   value_sources:
                     path:
@@ -784,7 +784,7 @@ tree:
                     base_frame_role: base
                     planning_profile: first_feasible
                     target_role: arm
-                    tcp_frame_role: tcp
+                    tcp_endpoint: {target_role: arm, frame_role: tcp}
                     velocity_scale: 0.4
                   value_sources:
                     path:

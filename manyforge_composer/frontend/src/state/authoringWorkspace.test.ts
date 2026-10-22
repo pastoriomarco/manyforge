@@ -421,7 +421,7 @@ describe('authoringWorkspace', () => {
         graphRevision: 'graph.1',
         differsFromSaved: false,
       },
-      saved: { path: null, deploymentRevision: null },
+      saved: { path: null, deploymentRevision: null, differsFromApplied: null },
       managerApplied: { activationOrder: null, deploymentRevision: null, scenarioId: null },
       runAdmission: { ready: true, reason: null },
       binding: null,

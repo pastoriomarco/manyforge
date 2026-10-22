@@ -51,6 +51,7 @@ export interface ProgramFrameRoleBinding {
   model_instance_id: string;
   model_revision: string;
   compiled_frame_name: string;
+  contact_body_role_ids?: string[];
 }
 export interface ProgramResourceRoleBinding {
   resource_role_id: string;
@@ -92,13 +93,14 @@ export interface ProgramCommandSchemaRef {
   command_schema_id: string;
   command_schema_revision: string;
 }
-export interface ProgramContactGraspBinding {
+export interface ProgramContactGraspEnvelopeBinding {
   contact_policy_id: string;
   contact_policy_revision: string;
   runtime_object_id: string;
   allowed_body_bindings: ProgramContactGraspBodyBinding[];
   max_penetration_m: number;
   terminal_window_start_fraction: number;
+  bodies_from_motion_endpoint?: true;
 }
 export interface ProgramContactGraspBodyBinding {
   component_role_id: string;
@@ -130,3 +132,20 @@ export interface ProgramSignalRoleBinding {
   transition_capability: 'sampled_only' | 'captured';
   signal_descriptor_digest: string;
 }
+export interface ProgramContactReleaseBinding {
+  contact_policy_id: string;
+  contact_policy_revision: string;
+  runtime_object_id: string;
+  allowed_body_bindings: ProgramContactGraspBodyBinding[];
+  mode: 'contact_release';
+  release_evidence_mode: 'signed_penetration' | 'binary_contact';
+  enforce_max_start_penetration: boolean;
+  max_start_penetration_m: number;
+  min_release_progress_m: number;
+  release_tolerance_m: number;
+  require_strictly_decreasing_penetration: boolean;
+  require_separation_by_end: boolean;
+  allow_recontact: boolean;
+  bodies_from_motion_endpoint?: true;
+}
+export type ProgramContactGraspBinding = ProgramContactGraspEnvelopeBinding | ProgramContactReleaseBinding;

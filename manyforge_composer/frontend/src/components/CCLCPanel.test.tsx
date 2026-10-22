@@ -168,6 +168,17 @@ describe('CCLC presentation', () => {
     expect(html).toContain('observed_transport_ready: nonboolean');
     expect(failed.setControllableComponentId).not.toHaveBeenCalled();
   });
+  it('words a provider fault cause as a fault even without the robot-only fault fact', () => {
+    const failed = controller();
+    failed.activationRefusal = { controllableComponentId: 'plc_io', transactionId: 'prepare.1', error: {
+      code: 'component_lifecycle_transition_missing', message: 'No transition satisfied', details: {
+        reason: 'no_transition_satisfied', observed_state: 'faulted', observed_controller_loaded: 'missing',
+        observed_fault_present: 'missing', observed_transport_ready: 'missing', observed_blocking_cause: 'fault' } } };
+    const html = renderToStaticMarkup(createElement(CCLCPanelView, { enabled: true,
+      mutationAvailable: true, mutationUnavailableReason: null, controller: failed }));
+    expect(html).toContain('plc_io: Fault · intervention required');
+    expect(html).toContain('observed_blocking_cause: fault');
+  });
   it('retains the exact unknown activation request address for read-only reconciliation', () => {
     const unknown = controller();
     unknown.activationUnresolved = true;

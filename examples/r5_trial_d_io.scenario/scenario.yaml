@@ -11,7 +11,7 @@
     "deployment.yaml": "sha256:ef85b0869231b3e11b16ab1d006d9c39f81bbc1df046e43ab1b938daf7ef0cc0",
     "program.yaml": "sha256:186ca5b4355c55edc1f6f04fdcb9de7d31788f967f56158aa94dfd4d1d368dbb"
   },
-  "name": "R5 trial (d) I/O nodes",
+  "name": "r5_trial_d_io",
   "saved_status": {
     "checked_content_digest": "sha256:e818a74a860834eb1ad7e75ce88018d9d3fbb0411dbfa5607e65d0af41877bbf",
     "last_known_status": "unknown",

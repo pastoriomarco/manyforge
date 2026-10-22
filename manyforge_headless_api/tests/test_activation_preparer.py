@@ -4,6 +4,7 @@ import copy
 from functools import lru_cache
 import hashlib
 import json
+import logging
 import os
 from pathlib import Path
 import subprocess
@@ -111,7 +112,8 @@ def _result(program: object = ...) -> dict[str, object]:
     identity: dict[str, object] = {
         "schema_version": "manyforge.prepared_activation_input.v6",
         "origin": {"kind": "scenario", "scenario_id": "scenario_a",
-                   "source_document_digest": _DIGEST},
+                   "source_document_digest": _DIGEST,
+                   "project_path": "/projects/scenario_a.scenario"},
         "captured_input_digest": _DIGEST,
         "deployment_artifact_id": "cell_a",
         "deployment_revision": _DIGEST,
@@ -176,6 +178,7 @@ def test_preparer_passes_one_exact_canonical_input_without_a_shell(
     result = preparer.prepare(
         source_document_digest=_DIGEST,
         scenario_id="scenario_a",
+        project_path="/projects/scenario_a.scenario",
         captured_input_digest=_DIGEST,
         deployment={"z": 1, "a": "deployment"},
         model_source_closure=_CLOSURE,
@@ -191,6 +194,7 @@ def test_preparer_passes_one_exact_canonical_input_without_a_shell(
         "runtime_cell_id": "cell_a",
         "source_document_digest": _DIGEST,
         "scenario_id": "scenario_a",
+        "project_path": "/projects/scenario_a.scenario",
         "captured_input_digest": _DIGEST,
         "deployment": {"a": "deployment", "z": 1},
         "model_source_closure": _CLOSURE,
@@ -221,16 +225,28 @@ def test_preparer_failure_retains_bounded_diagnostic_and_input_identity(
         return SimpleNamespace(returncode=1)
 
     monkeypatch.setattr(subprocess, "run", run)
-    with pytest.raises(HeadlessApiError) as raised:
-        preparer.prepare(
-            source_document_digest=_DIGEST,
-            scenario_id="scenario_a",
-            captured_input_digest=_DIGEST,
-            deployment={},
-            model_source_closure=_CLOSURE,
-            program={},
-            program_role_assignment={},
-        )
+    # Capture directly: suite logger configuration can disable propagation.
+    module_logger = logging.getLogger(activation_preparer.__name__)
+    previous_level = module_logger.level
+    handler_already_attached = caplog.handler in module_logger.handlers
+    module_logger.addHandler(caplog.handler)
+    module_logger.setLevel(logging.ERROR)
+    try:
+        with pytest.raises(HeadlessApiError) as raised:
+            preparer.prepare(
+                source_document_digest=_DIGEST,
+                scenario_id="scenario_a",
+                project_path="/projects/scenario_a.scenario",
+                captured_input_digest=_DIGEST,
+                deployment={},
+                model_source_closure=_CLOSURE,
+                program={},
+                program_role_assignment={},
+            )
+    finally:
+        if not handler_already_attached:
+            module_logger.removeHandler(caplog.handler)
+        module_logger.setLevel(previous_level)
     assert raised.value.code == "activation_preparation_failed"
     assert raised.value.details == {"preparer_detail": diagnostic[:4096]}
     assert "origin_kind=scenario origin_id=scenario_a" in caplog.text
@@ -249,6 +265,7 @@ def test_preparer_is_capacity_one_and_reports_a_stable_conflict(
             preparer.prepare(
                 source_document_digest=_DIGEST,
                 scenario_id="scenario_a",
+                project_path="/projects/scenario_a.scenario",
                 captured_input_digest=_DIGEST,
                 deployment={"api_version": "manyforge.deployment.v1"},
                 model_source_closure=_CLOSURE,
@@ -281,6 +298,7 @@ def test_preparer_rejects_an_oversized_encoded_request_before_spawning(
         preparer.prepare(
             source_document_digest=_DIGEST,
             scenario_id="scenario_a",
+            project_path="/projects/scenario_a.scenario",
             captured_input_digest=_DIGEST,
             deployment={"api_version": "manyforge.deployment_intent.v2"},
             model_source_closure=_CLOSURE,
@@ -305,6 +323,7 @@ def test_preparer_rejects_timeout_and_invalid_output(
         preparer.prepare(
             source_document_digest=_DIGEST,
             scenario_id="scenario_a",
+            project_path="/projects/scenario_a.scenario",
             captured_input_digest=_DIGEST,
             deployment={"api_version": "manyforge.deployment.v1"},
             model_source_closure=_CLOSURE,
@@ -322,6 +341,7 @@ def test_preparer_rejects_timeout_and_invalid_output(
         preparer.prepare(
             source_document_digest=_DIGEST,
             scenario_id="scenario_a",
+            project_path="/projects/scenario_a.scenario",
             captured_input_digest=_DIGEST,
             deployment={"api_version": "manyforge.deployment.v1"},
             model_source_closure=_CLOSURE,
@@ -344,6 +364,7 @@ def _prepare_with_output(
     return preparer.prepare(
         source_document_digest=_DIGEST,
         scenario_id="scenario_a",
+        project_path="/projects/scenario_a.scenario",
         captured_input_digest=_DIGEST,
         deployment={"api_version": "manyforge.deployment.v1"},
         model_source_closure=_CLOSURE,

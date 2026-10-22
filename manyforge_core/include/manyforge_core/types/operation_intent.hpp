@@ -62,10 +62,18 @@ struct CapabilityCommandIntentDTO final {
                          const CapabilityCommandIntentDTO&) = default;
 };
 
+/// Portable owner-qualified selection of an existing modeled TCP frame.
+struct MotionEndpointReferenceDTO final {
+  TargetRoleId target_role_id;
+  FrameRoleId frame_role_id;
+  friend bool operator==(const MotionEndpointReferenceDTO&,
+                         const MotionEndpointReferenceDTO&) = default;
+};
+
 struct MotionParticipantIntentDTO final {
   MoveId move_id;
   FrameRoleId base_frame_role_id;
-  FrameRoleId tcp_frame_role_id;
+  MotionEndpointReferenceDTO tcp_endpoint;
   TolerancesDTO tolerances;
   SpeedProfileDTO speed_profile;
   TimeoutsDTO timeouts;

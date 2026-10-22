@@ -1,10 +1,12 @@
 #include "io_provider_lifecycle_product.hpp"
+#include <manyforge_core/types/component_incident.hpp>
 #include <manyforge_core/types/lifecycle_cause.hpp>
 #include <manyforge_roboplan/ros_mapped_boolean_input_provider.hpp>
 
 #include <algorithm>
 #include <limits>
 #include <set>
+#include <string_view>
 #include <tuple>
 #include <type_traits>
 
@@ -125,6 +127,62 @@ struct IoProviderDriverRecord::State final {
         return false;
     }
     return true;
+  }
+
+  // Presentation only: names the first configured transport that keeps
+  // TransportReady() false. It never enters facts, snapshots or decisions.
+  std::optional<core::ErrorDTO> TransportDiagnostic() const {
+    if (!installed || retired)
+      return std::nullopt;
+    const auto missing =
+        [](const std::vector<deployment::RetainedIoSignalConfiguration> &rows,
+           const char *kind, const std::optional<std::string> &name)
+        -> std::optional<core::ErrorDTO> {
+      // State only what TransportReady() checked for this transport.
+      const bool input = std::string_view(kind) == "input_topic";
+      core::ErrorDTO diagnostic{
+          "io_provider_transport_unavailable",
+          input ? "The ROS context for input topic " + name.value_or("?") +
+                      " is not valid"
+          : name ? "ROS " + std::string(kind) + " " + *name +
+                       " is not available"
+                 : "The configured I/O output is not available",
+          {{"transport_kind", kind}}};
+      if (name)
+        diagnostic.details.emplace("ros_name", *name);
+      if (!rows.empty())
+        diagnostic.details.emplace("signal_name",
+                                   rows.front().descriptor.signal_id.name);
+      if (!core::ComponentIncidentDiagnosticIsValid(diagnostic))
+        return std::nullopt;
+      return diagnostic;
+    };
+    for (const auto &input : inputs)
+      if (input.installation.node &&
+          !input.installation.node->get_node_base_interface()
+               ->get_context()
+               ->is_valid())
+        return missing(input.installation.rows, "input_topic",
+                       input.installation.rows.empty()
+                           ? std::nullopt
+                           : input.installation.rows.front().provider.topic);
+    for (const auto &output : outputs) {
+      const auto *ros =
+          std::get_if<std::shared_ptr<RosBooleanOutputProvider>>(
+              &output.provider);
+      const bool ready =
+          ros ? *ros && (*ros)->ServiceReady()
+              : static_cast<bool>(std::get<0>(output.provider));
+      if (ready)
+        continue;
+      const auto *row = output.rows.empty() ? nullptr : &output.rows.front();
+      const bool service = row && row->provider.service;
+      return missing(output.rows, service ? "service" : "topic",
+                     !row       ? std::nullopt
+                     : service ? row->provider.service
+                               : row->provider.topic);
+    }
+    return std::nullopt;
   }
 
   bool Advance() {
@@ -500,7 +558,7 @@ IoProviderDriverRecord::ReadLifecycleHealth(const core::ControlDomainId &domain,
        facts(state_->installed && !state_->retired, state_->enabled,
              state_->fault.has_value(), state_->TransportReady(),
              state_->retired),
-       state_->fault, true});
+       state_->fault ? state_->fault : state_->TransportDiagnostic(), true});
 }
 
 RetainedExternallyManagedPrimitiveOutcome IoProviderDriverRecord::Dispatch(

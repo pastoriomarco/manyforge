@@ -33,10 +33,25 @@ export function structuralResourceReducer<T>(
   }
 }
 
+// What a refusal waits for, as the owner's structured details name it.
+const WAITING_FOR_DETAILS = [
+  ['blocking_conditions', 'waiting for'],
+  ['active_operation_ids', 'operations'],
+  ['busy_resource_ids', 'resources'],
+] as const;
+
 export function errorMessage(error: unknown, fallback: string): string {
-  return error instanceof Error && error.message.trim()
+  const message = error instanceof Error && error.message.trim()
     ? error.message
     : fallback;
+  const details = (error as { structuredError?: { details?: Record<string, unknown> | null } } | null)
+    ?.structuredError?.details;
+  const waiting = WAITING_FOR_DETAILS.flatMap(([key, label]) => (
+    typeof details?.[key] === 'string' && details[key] !== ''
+      ? [`${label}: ${(details[key] as string).split(',').join(', ')}`]
+      : []
+  ));
+  return waiting.length === 0 ? message : `${message} (${waiting.join('; ')})`;
 }
 
 interface StructuralResourceOptions {

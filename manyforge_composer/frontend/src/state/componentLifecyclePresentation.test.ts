@@ -4,6 +4,7 @@ import {
   componentLifecyclePresentation,
   componentLifecycleToneClass,
   componentReadinessOccurrencePresentation,
+  readinessBlockerPresentation,
 } from './componentLifecyclePresentation';
 import type {
   CCLCComponentSnapshot,
@@ -92,6 +93,25 @@ describe('domain activation presentation', () => {
     expect(componentReadinessOccurrencePresentation(domain).state).toBe('No activation step · faulted');
     domain.health = null;
     expect(componentReadinessOccurrencePresentation(domain).state).toBe('No activation step · health unavailable');
+  });
+});
+
+describe('readiness blocker presentation', () => {
+  const owner = { code: 'component_lifecycle_transition_missing',
+    message: 'no lifecycle primitive is eligible for the fresh observation',
+    details: { reason: 'no_transition_satisfied' } };
+  it('puts the provider-domain diagnostic before the unchanged owner error', () => {
+    const domain = readinessDomain();
+    domain.health!.diagnostic = { code: 'io_provider_transport_unavailable',
+      message: 'ROS service /plc_io/start is not available', details: { ros_name: '/plc_io/start' } };
+    expect(readinessBlockerPresentation({ error: owner, providerOccurrences: [readinessDomain(), domain] })).toBe(
+      'ROS service /plc_io/start is not available · [component_lifecycle_transition_missing] '
+      + 'no lifecycle primitive is eligible for the fresh observation · no_transition_satisfied');
+  });
+  it('keeps the owner error alone without a diagnostic and null without either', () => {
+    expect(readinessBlockerPresentation({ error: owner, providerOccurrences: [readinessDomain()] })).toBe(
+      '[component_lifecycle_transition_missing] no lifecycle primitive is eligible for the fresh observation · no_transition_satisfied');
+    expect(readinessBlockerPresentation({ error: null, providerOccurrences: [] })).toBeNull();
   });
 });
 
@@ -254,6 +274,39 @@ describe('component lifecycle presentation', () => {
     expect(message(snapshot('prepared', null, { phase: 'cancelled', blockingCauseClass: 'none',
       nextIntent: null, blockingReason: 'operator cancelled request' }))).toBe('Lifecycle target cancelled');
   });
+});
+
+it('keeps an Active component Ready while cell admission closes lifecycle changes', () => {
+  // A running Program closes lifecycle requests; the component itself is healthy.
+  const closed = { code: 'authoring_not_ready', message: 'cell-authoring admission is not ready',
+    details: { reason: 'cell_admission_closed' } };
+  const running = snapshot('active', {}, { phase: 'satisfied', blockingCauseClass: 'none', nextIntent: null });
+  running.readiness = { ...running.readiness, ready: false, error: closed };
+  const presented = componentLifecyclePresentation(running);
+  expect(presented.message).toBe('Ready');
+  expect(presented.tone).toBe('ready');
+  expect(presented.readiness).toBe(
+    'Lifecycle changes closed · [authoring_not_ready] cell-authoring admission is not ready · cell_admission_closed');
+  // Closed admission in front of a real provider or measured-state failure:
+  // that failure still decides and is shown first.
+  const staleFeed = { code: 'measured_source_unavailable', message: 'Measured feed is stale', details: {} };
+  const measured = { ...running, readiness: { ...running.readiness,
+    measuredState: { required: true, available: false, error: staleFeed } } };
+  expect(componentLifecyclePresentation(measured).message).toBe('Not ready');
+  expect(componentLifecyclePresentation(measured).readiness).toBe(
+    'Not ready · [measured_source_unavailable] Measured feed is stale · [authoring_not_ready] cell-authoring admission is not ready · cell_admission_closed · Target wait duration unavailable');
+  const requiredOnly = { ...running, readiness: { ...running.readiness,
+    measuredState: { required: true, available: false, error: null } } };
+  expect(componentLifecyclePresentation(requiredOnly).message).toBe('Not ready');
+  const transport = { code: 'io_provider_transport_unavailable', message: 'ROS service /plc_io/start is not available', details: {} };
+  const provider = { ...running, readiness: { ...running.readiness, providerOccurrences: [{
+    ...readinessDomain(), health: { observedState: 'active' as const, facts: [], diagnostic: null }, error: transport }] } };
+  expect(componentLifecyclePresentation(provider).message).toBe('Not ready');
+  expect(componentLifecyclePresentation(provider).readiness).toContain('ROS service /plc_io/start is not available');
+  // Not yet Active, the same refusal still means it cannot proceed now.
+  const declared = snapshot('declared', {}, null);
+  declared.readiness = { ...declared.readiness, ready: false, error: closed };
+  expect(componentLifecyclePresentation(declared).message).toBe('Not ready');
 });
 
 it('shows actual degraded readiness even for durable Active and keeps a real health fault visible', () => {

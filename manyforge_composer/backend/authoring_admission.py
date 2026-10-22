@@ -586,8 +586,8 @@ class AuthoringAdmissionCoordinator:
         new Draft.
         """
 
-        if session not in {"program", "deployment"}:
-            raise ValueError("a Draft edit commits one Draft session")
+        if session not in {"program", "deployment", "scenario"}:
+            raise ValueError("a Draft edit commits a Draft session or the whole Scenario")
         if not callable(install):
             raise TypeError("Draft edit install must be callable")
         with self._local_mutation_lock:
@@ -611,21 +611,31 @@ class AuthoringAdmissionCoordinator:
                 )
             if validate is not None:
                 validate()
-            commit = (
-                workspace.commit_deployment
-                if session == "deployment"
-                else workspace.commit_program
+            context = AuthoringOperationContext(
+                operation=operation_kind,
+                request_owner_epoch=envelope.request_owner_epoch,
+                request_id=envelope.request_id,
             )
-            snapshot = commit(
-                draft_id=draft_id,
-                expected_identity=expected_identity,
-                install=install,
-                context=AuthoringOperationContext(
-                    operation=operation_kind,
-                    request_owner_epoch=envelope.request_owner_epoch,
-                    request_id=envelope.request_id,
-                ),
-            )
+            if session == "scenario":
+                # Both Drafts in one whole-workspace commit; each install
+                # fences its own Draft identity.
+                snapshot = workspace.replace(
+                    expected_identity=expected_identity,
+                    install=install,
+                    context=context,
+                )
+            else:
+                commit = (
+                    workspace.commit_deployment
+                    if session == "deployment"
+                    else workspace.commit_program
+                )
+                snapshot = commit(
+                    draft_id=draft_id,
+                    expected_identity=expected_identity,
+                    install=install,
+                    context=context,
+                )
             self._record_outcome(envelope, operation_kind)
             return LocalAuthoringCommit(
                 snapshot=snapshot,
@@ -657,13 +667,16 @@ class AuthoringAdmissionCoordinator:
         commit_before_submit: Callable[[], None] | None = None,
         after_release: Callable[[], None] | None = None,
         effects: OperationEffects | None = None,
+        workspace: "AuthoringWorkspace | None" = None,
     ) -> Any:
         """Fence one immutable submission; Manager owns it after acceptance.
 
         ``effects`` is the operation's effect record (see
         :meth:`execute_local_mutation`); a committed ``commit_before_submit``
         is recorded in it, so a later definite Manager rejection settles the
-        claim as ``owner_commit``, not ``proven_no_effect``.
+        claim as ``owner_commit``, not ``proven_no_effect``. ``workspace`` is
+        the owner ``commit_before_submit`` commits to; if that commit contains
+        it, the claim stays held for diagnosis.
         """
 
         if effects is None:
@@ -690,9 +703,20 @@ class AuthoringAdmissionCoordinator:
             try:
                 validate_under_claim(claim)
                 if commit_before_submit is not None:
+                    # As on the local path: from the commit on, the retained
+                    # claim settles as owner_commit; a refusal proven to leave
+                    # no effect still settles from its recorded effects below.
+                    with self._local_claim_lock:
+                        assert self._pending_local_claim is not None
+                        self._pending_local_claim.settlement_kind = "owner_commit"
                     commit_before_submit()
                     effects.workspace_committed()
-            except Exception:
+            except Exception as error:
+                if workspace is not None and workspace.failed_closed is not None:
+                    # A contained install is never a proven no-op.
+                    effects.workspace_committed()
+                    self._block(f"local install outcome is unknown: {error}")
+                    raise
                 self._settle_failed_operation(envelope, operation_kind, effects)
                 raise
             try:

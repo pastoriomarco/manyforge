@@ -699,7 +699,7 @@ function appliedResultFixture(): Record<string, unknown> {
     prepared_activation: {
       schema_version: 'manyforge.prepared_activation_input.v6',
       prepared_activation_id: digestC,
-      origin: { kind: 'scenario', scenario_id: 'fixture', source_document_digest: digestA },
+      origin: { kind: 'scenario', scenario_id: 'fixture', source_document_digest: digestA, project_path: '/projects/fixture.scenario' },
       captured_input_digest: digestB,
       deployment_artifact_id: 'cell-a',
       deployment_revision: digestB,
@@ -1017,8 +1017,7 @@ describe('structural API client', () => {
 
     await api.scenarioDocuments.list('/workspace/examples');
     await api.scenarioDocuments.save(scenarioFence, {
-      path: '/workspace/examples/cell',
-      scenarioId: 'cell',
+      directory: '/workspace/examples',
       name: 'Cell',
       description: '',
       confirmOverwrite: true,
@@ -1040,8 +1039,7 @@ describe('structural API client', () => {
       (fetchMock.mock.calls[1]?.[1] as RequestInit).body,
     ))).toEqual({
       ...scenarioFence,
-      path: '/workspace/examples/cell',
-      scenarioId: 'cell',
+      directory: '/workspace/examples',
       name: 'Cell',
       description: '',
       confirmOverwrite: true,

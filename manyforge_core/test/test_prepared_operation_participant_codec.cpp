@@ -530,6 +530,7 @@ TEST(PreparedOperationParticipantCodecTest, SealsAndRoundTripsBothPayloadTags) {
   const auto motion_bytes = EncodePreparedOperationParticipant(
       motion.value(), motion_inputs.binding, motion_inputs.readiness, DefaultLimits(), MotionInterruptNodeCategory::kGeneric);
   ASSERT_TRUE(motion_bytes.ok()) << motion_bytes.error().message;
+  EXPECT_EQ(motion_bytes.value().find("\"motion_endpoint\""), std::string::npos);
   const auto motion_decoded = DecodePreparedOperationParticipant(
       motion_bytes.value(), motion_inputs.binding, motion_inputs.readiness, DefaultLimits(), MotionInterruptNodeCategory::kGeneric);
   ASSERT_TRUE(motion_decoded.ok()) << motion_decoded.error().message;
@@ -1006,6 +1007,55 @@ TEST(PreparedOperationParticipantCodecTest,
   EXPECT_FALSE(EncodePreparedOperationParticipant(invalid, inputs.binding, inputs.readiness,
                                                   DefaultLimits(),
                                                   MotionInterruptNodeCategory::kGeneric)
+                   .ok());
+}
+
+TEST(PreparedOperationParticipantCodecTest, CapturesQualifiedTcpAndRejectsCrossedPreparedEndpoint) {
+  const auto base = BasePlan();
+  auto inputs = Inputs(base, false);
+  auto value = inputs.binding.value();
+  value.motion_endpoint =
+      RuntimeMotionEndpointBindingDTO{TargetRoleId("tool"),
+                                      CommandTargetId("gripper"),
+                                      {FrameRoleId("fingertip"), ModelInstanceId("robot.model"),
+                                       ModelRevision("model.revision"), "robot_fingertip"},
+                                      {}};
+  auto selected = verify_runtime_participant_binding(value);
+  ASSERT_TRUE(selected.ok()) << selected.error().message;
+  inputs.binding = std::move(selected.value());
+  auto payload = MotionPayload(inputs);
+  payload.plan_request.tcp_frame = ResolvedComponentModelFrameDTO{
+      value.controllable_component_id, value.motion_endpoint->frame.model_instance_id,
+      value.motion_endpoint->frame.frame_role_id, value.motion_endpoint->frame.compiled_frame_name,
+      value.motion_endpoint->frame.model_revision};
+  auto prepared = MakePreparedOperationParticipant(
+      Candidate(inputs.binding, inputs.readiness, payload), inputs.binding, inputs.readiness,
+      DefaultLimits(), MotionInterruptNodeCategory::kGeneric);
+  ASSERT_TRUE(prepared.ok()) << prepared.error().details.at("reason");
+  EXPECT_EQ(prepared.value().motion_endpoint, value.motion_endpoint);
+  const auto bytes =
+      EncodePreparedOperationParticipant(prepared.value(), inputs.binding, inputs.readiness,
+                                         DefaultLimits(), MotionInterruptNodeCategory::kGeneric);
+  ASSERT_TRUE(bytes.ok()) << bytes.error().message;
+  EXPECT_NE(bytes.value().find("\"motion_endpoint\""), std::string::npos);
+  const auto decoded =
+      DecodePreparedOperationParticipant(bytes.value(), inputs.binding, inputs.readiness,
+                                         DefaultLimits(), MotionInterruptNodeCategory::kGeneric);
+  ASSERT_TRUE(decoded.ok()) << decoded.error().message;
+  EXPECT_EQ(decoded.value().motion_endpoint, value.motion_endpoint);
+  auto crossed = prepared.value();
+  crossed.motion_endpoint->target_role_id = TargetRoleId("other_tool");
+  EXPECT_FALSE(VerifyPreparedOperationParticipant(crossed, inputs.binding, inputs.readiness,
+                                                  DefaultLimits(),
+                                                  MotionInterruptNodeCategory::kGeneric)
+                   .ok());
+  auto wrong_frame = payload;
+  wrong_frame.plan_request.tcp_frame = ResolvedComponentModelFrameDTO{
+      value.controllable_component_id, ModelInstanceId("robot.model"), FrameRoleId("tcp"),
+      "robot_tcp", ModelRevision("model.revision")};
+  EXPECT_FALSE(MakePreparedOperationParticipant(
+                   Candidate(inputs.binding, inputs.readiness, wrong_frame), inputs.binding,
+                   inputs.readiness, DefaultLimits(), MotionInterruptNodeCategory::kGeneric)
                    .ok());
 }
 

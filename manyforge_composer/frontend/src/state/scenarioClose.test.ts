@@ -12,6 +12,7 @@ const apiMock = vi.hoisted(() => ({ manager: { status: vi.fn(), canonicalEmptySe
 vi.mock('../api/client', () => ({ api: apiMock }));
 import { closeScenario, prepareSceneForClose, resetCloseSnapshot, type ClosePreparationInputs } from './scenarioClose';
 import { parseComponentProcessStopOffer } from '../api/processStopParsers';
+import { errorMessage } from './structuralResource';
 
 const scene = { scene_id: 'scene', revision_id: 1, content_hash: 'hash' };
 const active: ManagerActiveProjection = { canonicalEmpty: false, retainedBundleId: 'bundle.current',
@@ -1080,3 +1081,23 @@ it.each(['refused', 'unconfirmed'] as const)(
     expect(apiMock.scene.commit).not.toHaveBeenCalled();
   },
 );
+
+it('a refused lifecycle step keeps what the refusal waits for in the Close message', async () => {
+  // The API client's refusal carries the owner's structured details.
+  const refusal = Object.assign(new Error('lifecycle mutation requires settled physical and Program work'), {
+    structuredError: {
+      code: 'execution_rejected',
+      message: 'lifecycle mutation requires settled physical and Program work',
+      details: { blocking_conditions: 'resources_not_free', busy_resource_ids: 'resource.arm' },
+      origin: null,
+    },
+  });
+  apiMock.cclc.submitLifecycle.mockRejectedValue(refusal);
+  const caught = await closeScenario(inputs()).then(() => null, (error: unknown) => error);
+  // The Close surface renders every refusal through errorMessage().
+  expect(errorMessage(caught, 'Scenario replacement is unresolved.')).toBe(
+    'lifecycle mutation requires settled physical and Program work '
+    + '(waiting for: resources_not_free; resources: resource.arm)',
+  );
+  expect(apiMock.manager.applyCandidate).not.toHaveBeenCalled();
+});

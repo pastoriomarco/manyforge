@@ -1,6 +1,6 @@
 api_version: manyforge.program.v2
 program_id: pick_and_place_minimal
-program_revision: sha256:791b5d34239299d40a9869170dcf93889b9616e07fff462c163b51e81d2d5d73
+program_revision: sha256:64ad1acca0625cf6859abe6ebb7167e35e92f042cfa41aeb71680434b15aff7c
 program_profile: composable-cell-v1
 name: pick_and_place_minimal
 description: >-
@@ -79,7 +79,7 @@ tree:
       parameters:
         target_role: arm
         base_frame_role: base
-        tcp_frame_role: tcp
+        tcp_endpoint: {target_role: arm, frame_role: tcp}
         goal:
           - {joint_name: shoulder_pan_joint, position_rad: 0.2}
           - {joint_name: shoulder_lift_joint, position_rad: -1.2}

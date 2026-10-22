@@ -376,6 +376,12 @@ DecodeMotionPayload(const CanonicalValue &value) {
   Require(Text(value, "kind") == "motion",
           "operation payload kind is unsupported");
 
+  const auto &selected = Member(value, "tcp_endpoint");
+  RequireExactObjectSize(selected, 2U, "motion TCP endpoint");
+  core::MotionEndpointReferenceDTO endpoint{
+      core::TargetRoleId(Text(selected, "target_role_id")),
+      core::FrameRoleId(Text(selected, "frame_role_id"))};
+
   const auto &tolerances = Member(value, "tolerances");
   RequireExactObjectSize(tolerances, 3U, "motion tolerances");
   const auto &speed = Member(value, "speed_profile");
@@ -467,10 +473,10 @@ DecodeMotionPayload(const CanonicalValue &value) {
           core::SceneResourceId(Text(encoded, "scene_resource_id"))});
     }
   }
-  if (joint_goal) {
-    Require(
-        !contact_policy.has_value() && runtime_objects.empty(),
-        "joint motion cannot carry contact-policy or runtime-object bindings");
+
+  if (joint_goal && !contact_policy.has_value()) {
+    Require(runtime_objects.empty(),
+            "joint motion runtime-object bindings require an explicit contact policy");
   }
 
   const auto &dynamics = Member(value, "per_joint_dynamics_limits");
@@ -490,7 +496,7 @@ DecodeMotionPayload(const CanonicalValue &value) {
   return core::MotionParticipantIntentDTO{
       core::MoveId(Text(value, "move_id")),
       core::FrameRoleId(Text(value, "base_frame_role_id")),
-      core::FrameRoleId(Text(value, "tcp_frame_role_id")),
+      std::move(endpoint),
       core::TolerancesDTO{Number(tolerances, "joint_position_tol_rad"),
                           Number(tolerances, "translation_tol_m"),
                           Number(tolerances, "rotation_tol_rad")},
@@ -1428,14 +1434,20 @@ DecodeProgramMockSimulationSignals(const CanonicalValue& rows) {
     RequireExactObjectSize(request, 7U, "Mock input request");
     Require(Text(request, "schema_version") == "manyforge.mock_io_input_request.v1",
             "Mock input request schema is unsupported");
+    // Validate before nested aggregate construction so refusal unwinds only
+    // independent owning locals, preserving the original field order.
+    auto owner = core::RequestOwnerEpoch(Text(request, "owner_epoch"));
+    auto binding = core::ProgramBindingId(Text(request, "program_binding_id"));
+    auto target = core::TargetRoleId(Text(request, "target_role_id"));
+    auto resource = core::ResourceRoleId(Text(request, "resource_role_id"));
+    auto source_epoch =
+        core::IoSourceIncarnation(Text(request, "expected_source_epoch"));
+    const auto value = Boolean(request, "value");
     Command decoded{CommandKind::kSetMockIoInput};
     decoded.mock_io_input_set = MockIoInputSetRequest{
-        {core::RequestOwnerEpoch(Text(request, "owner_epoch")),
-         core::ProgramBindingId(Text(request, "program_binding_id")),
-         core::TargetRoleId(Text(request, "target_role_id")), {}, {}, {},
-         core::ResourceRoleId(Text(request, "resource_role_id"))},
-        core::IoSourceIncarnation(Text(request, "expected_source_epoch")),
-        Boolean(request, "value")};
+        {std::move(owner), std::move(binding), std::move(target), {}, {}, {},
+         std::move(resource)},
+        std::move(source_epoch), value};
     return decoded;
   }
   if (command == "register_io_watch" || command == "read_io_watch" ||

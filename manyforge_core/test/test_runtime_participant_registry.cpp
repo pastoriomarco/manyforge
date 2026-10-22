@@ -77,6 +77,8 @@ using namespace manyforge::core;
       {},
       {RuntimeUnitEpochBindingDTO{RuntimeUnitId("runtime.native"),
                                   RuntimeEpoch("runtime-epoch.1")}}};
+  value.motion_endpoint = RuntimeMotionEndpointBindingDTO{
+      value.target_role_id, value.command_target_id, value.frame_bindings.back(), {}};
   auto sealed = verify_runtime_participant_binding(std::move(value));
   if (!sealed.ok()) {
     throw std::logic_error(sealed.error().message);
@@ -84,22 +86,23 @@ using namespace manyforge::core;
   return std::move(sealed.value());
 }
 
-[[nodiscard]] MotionParticipantIntentDTO motion_payload() {
-  return MotionParticipantIntentDTO{MoveId("move.1"),
-                                    FrameRoleId("base"),
-                                    FrameRoleId("tcp"),
-                                    TolerancesDTO{0.01, 0.001, 0.01},
-                                    SpeedProfileDTO{},
-                                    TimeoutsDTO{},
-                                    CacheMode::kDefault,
-                                    PlanningProfileDTO::kBalanced,
-                                    MotionTargetModeDTO::kAbsolute,
-                                    std::nullopt,
-                                    std::nullopt,
-                                    JointGoalDTO{{"joint"}, {0.2}},
-                                    std::nullopt,
-                                    {},
-                                    {}};
+[[nodiscard]] MotionParticipantIntentDTO motion_payload(std::string owner = "arm") {
+  return MotionParticipantIntentDTO{
+      MoveId("move.1"),
+      FrameRoleId("base"),
+      MotionEndpointReferenceDTO{TargetRoleId(std::move(owner)), FrameRoleId("tcp")},
+      TolerancesDTO{0.01, 0.001, 0.01},
+      SpeedProfileDTO{},
+      TimeoutsDTO{},
+      CacheMode::kDefault,
+      PlanningProfileDTO::kBalanced,
+      MotionTargetModeDTO::kAbsolute,
+      std::nullopt,
+      std::nullopt,
+      JointGoalDTO{{"joint"}, {0.2}},
+      std::nullopt,
+      {},
+      {}};
 }
 
 [[nodiscard]] OperationIntentDTO operation_for(std::string target_role, std::string capability,
@@ -146,7 +149,8 @@ TEST(RuntimeParticipantRegistryTest, RejectsWrongProgramBindingContext) {
 TEST(RuntimeParticipantRegistryTest, RejectsTrajectoryMotionAgainstPrismaticCommandTarget) {
   RuntimeParticipantRegistry registry(
       {binding_for("gripper", "gripper", "planning.motion.joint_goal", CoordinateKind::kLinear)});
-  const auto operation = operation_for("gripper", "planning.motion.joint_goal", motion_payload());
+  const auto operation =
+      operation_for("gripper", "planning.motion.joint_goal", motion_payload("gripper"));
 
   auto resolved = registry.resolve(operation, 0U);
   ASSERT_FALSE(resolved.ok());
@@ -185,6 +189,7 @@ TEST(RuntimeParticipantRegistryTest, RejectsAmbiguousRegistrationAtStartup) {
   value.model_bindings.clear();
   value.model_groups.clear();
   value.frame_bindings.clear();
+  value.motion_endpoint.reset();
   value.resources.clear();
   value.control_path.reset();
   value.command_schema =
@@ -901,6 +906,37 @@ TEST(RuntimeParticipantRegistryTest, OutputKnownRejectionResetNeedsNoUncertainty
   EXPECT_TRUE(engine.reset_capability_command(target, prepared.value(), 1U).ok());
   EXPECT_EQ(provider.retires, 1U);
   EXPECT_EQ(provider.sends, 1U);
+}
+
+TEST(RuntimeParticipantRegistryTest,
+     QualifiedTcpMustMatchTheSelectedCaptureWithoutChangingArmOwnership) {
+  auto value =
+      binding_for("arm", "arm", "planning.motion.joint_goal", CoordinateKind::kAngular).value();
+  value.motion_endpoint =
+      RuntimeMotionEndpointBindingDTO{TargetRoleId("tool"),
+                                      CommandTargetId("gripper"),
+                                      {FrameRoleId("fingertip"), ModelInstanceId("robot.model"),
+                                       ModelRevision("model-revision"), "mf2_fingertip"},
+                                      {}};
+  auto selected = verify_runtime_participant_binding(value);
+  ASSERT_TRUE(selected.ok()) << selected.error().message;
+  RuntimeParticipantRegistry registry({selected.value()});
+  auto motion = motion_payload();
+  motion.tcp_endpoint = MotionEndpointReferenceDTO{TargetRoleId("tool"), FrameRoleId("fingertip")};
+  auto operation = operation_for("arm", "planning.motion.joint_goal", motion);
+  const auto resolved = registry.resolve(operation, 0U);
+  ASSERT_TRUE(resolved.ok()) << resolved.error().message;
+  EXPECT_EQ(resolved.value().value().command_target_id, CommandTargetId("arm"));
+  EXPECT_EQ(resolved.value().value().resources, value.resources);
+  auto& requested = std::get<MotionParticipantIntentDTO>(operation.participants.front().payload);
+  requested.tcp_endpoint.target_role_id = TargetRoleId("other_tool");
+  EXPECT_FALSE(registry.resolve(operation, 0U).ok());
+  requested.tcp_endpoint.target_role_id = TargetRoleId("tool");
+  requested.tcp_endpoint.frame_role_id = FrameRoleId("other_tip");
+  EXPECT_FALSE(registry.resolve(operation, 0U).ok());
+  requested = motion_payload();
+  EXPECT_FALSE(registry.resolve(operation, 0U)
+                   .ok());  // A different owner/frame cannot consume this captured TCP.
 }
 
 }  // namespace

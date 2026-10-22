@@ -14,6 +14,9 @@ struct RoboPlanCandidateProjectionDTO final {
   core::ProjectionLeaseBindingDTO projection_binding;
   core::CollisionWorldSnapshotPtr world;
   std::shared_ptr<const core::CollisionPolicySnapshot> policy;
+  /// Planning-only allowance for this operation's resolved grasp pairs.
+  /// Coordinator and runtime contact constraints remain authoritative.
+  std::optional<std::string> contact_policy_id{};
 };
 
 /// Private candidate-computation transport used by the addressed planner

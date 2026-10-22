@@ -713,6 +713,7 @@ describe('Program runtime authority requests', () => {
 describe('stored persistent value edits', () => {
   const values = (programRunId: string | null): PersistentKeyValues => ({
     scenarioId: 'cell-pick',
+    projectPath: '/projects/cell-pick.scenario',
     programRevision: digest('a'),
     programRunId,
     sequence: 7,

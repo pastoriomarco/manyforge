@@ -256,6 +256,21 @@ decode_frame_roles(const CanonicalValue& value) {
   std::vector<core::ComponentTypeFrameRoleDTO> result;
   result.reserve(source.size());
   for (const auto& item : source) {
+    std::vector<core::CollisionBodyRoleId> contact_body_role_ids;
+    if (const auto* contact_bodies =
+            item.find_object_member("contact_body_role_ids")) {
+      const auto& values =
+          require_array(*contact_bodies, "contact_body_role_ids");
+      if (values.size() > core::kMaxComponentTypeTargetRoleAliases) {
+        fail("component-type frame contact-body role list exceeds fixed "
+             "bound");
+      }
+      contact_body_role_ids.reserve(values.size());
+      for (const auto& value : values) {
+        contact_body_role_ids.emplace_back(require_string(
+            value, "contact_body_role_ids"));
+      }
+    }
     result.push_back({
         core::FrameRoleId(require_string(
             require_member(item, "frame_role_id"), "frame_role_id")),
@@ -264,6 +279,7 @@ decode_frame_roles(const CanonicalValue& value) {
         core::FrameRoleId(require_string(
             require_member(item, "asset_frame_role_id"),
             "asset_frame_role_id")),
+        std::move(contact_body_role_ids),
     });
   }
   return result;
@@ -559,6 +575,32 @@ void validate_target(
       [](const auto& row) -> const auto& {
         return row.asset_collision_body_role_id;
       });
+
+  for (const auto& frame : target.frame_roles) {
+    if (frame.contact_body_role_ids.size() >
+        core::kMaxComponentTypeTargetRoleAliases) {
+      fail("component-type frame contact-body role list exceeds fixed "
+           "bound");
+    }
+    std::set<std::string> associated_roles;
+    for (const auto& body_role_id : frame.contact_body_role_ids) {
+      if (body_role_id.empty() ||
+          !associated_roles.insert(body_role_id.value()).second) {
+        fail("component-type frame contact-body roles contain an empty or "
+             "duplicate role");
+      }
+      const auto body = std::find_if(
+          target.collision_body_roles.begin(), target.collision_body_roles.end(),
+          [&](const auto& candidate) {
+            return candidate.collision_body_role_id == body_role_id;
+          });
+      if (body == target.collision_body_roles.end() ||
+          body->model_role_id != frame.model_role_id) {
+        fail("component-type frame contact-body role is not exposed by the "
+             "same command target and model role");
+      }
+    }
+  }
 
   std::set<std::string> resource_aliases;
   std::set<ModelSourceKey> resource_sources;

@@ -1939,7 +1939,7 @@ void verify_scenarios(const std::filesystem::path &root,
              "maintained_deployment_sources.v1.json");
   if (deployment::sha256_digest(description_bytes) !=
       "sha256:"
-      "69e413dba1da8b41197322a848c9bc99de718bf065d74f383ebdf5b111ed1163") {
+      "9f175667e058441df1adb88405061b166e2391dc30c47548aeb72f6cae8058f8") {
     throw std::invalid_argument(
         "maintained runtime input source differs from its qualified source pin");
   }

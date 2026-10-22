@@ -1123,8 +1123,12 @@ template <typename StrongId>
        })},
       {"target_mode", CanonicalValue(target_mode)},
       {"target_reference", ReferenceValue(motion.target_reference)},
-      {"tcp_frame_role_id", CanonicalValue(motion.tcp_frame_role_id.value())},
-      {"timeouts", [&] {
+      {"tcp_endpoint",
+       CanonicalValue(CanonicalValue::Object{
+           {"frame_role_id", CanonicalValue(motion.tcp_endpoint.frame_role_id.value())},
+           {"target_role_id", CanonicalValue(motion.tcp_endpoint.target_role_id.value())}})},
+      {"timeouts",
+       [&] {
          CanonicalValue::Object timeouts{
              {"execution_timeout_s", CanonicalValue(motion.timeouts.execution_timeout_s)},
              {"planning_timeout_s", CanonicalValue(motion.timeouts.planning_timeout_s)},

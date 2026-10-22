@@ -906,7 +906,7 @@
         "record_kind": "component_type",
         "record_revision": "sha256:2c6a3ed8a3792542d9169e26bd116c01a8852ec7967a774b4a79d3509cc7ff94",
         "schema_id": "manyforge.component_type.v1",
-        "schema_revision": "sha256:8e728ad4442d46b98f0d0534f8189df9b7982f982ab99cb656e6fdbeef231009"
+        "schema_revision": "sha256:2f26f97a7454e620bfb39e16eeccc0b23ae2de61c32e3e8210eff46945d01fc4"
       },
       {
         "content_addressed_store_key": "catalog/maintained/control_interface_contract/manyforge.ros2_control_arm_position/d951ffd368654ba9998355a4b12844014469753c3c21e05df3b61f6f669cbb4b",
@@ -983,7 +983,7 @@
     ]
   },
   "deployment_artifact_id": "ur5_roboplan_local_pick_place",
-  "deployment_revision": "sha256:0a72da4fccab457960835074380c4c0d8ba303820ace8af8bf0f635381be9015",
+  "deployment_revision": "sha256:5f9b8c9968674dce5543a85bddd525bbf003dc99f8542621ce38e90d0f1cc852",
   "description": "Local deployment with native in-process RoboPlan planning and simulated execution for the backend-authoritative pick-and-place demo.",
   "desired_control_configurations": [
     {

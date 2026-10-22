@@ -220,9 +220,14 @@ def _selection_resource_ids(
 
 @dataclass(frozen=True, slots=True)
 class ProgramRunAdmission:
-    """One exact verified scenario closure admitted before tree construction."""
+    """One exact verified scenario closure admitted before tree construction.
+
+    ``project_path`` is the Applied Scenario project folder; it scopes the
+    run's persistent blackboard values.
+    """
 
     scenario_id: str
+    project_path: str
     applied_record_digest: str
     source_document_digest: str
     program: Program
@@ -238,6 +243,7 @@ class ProgramRunAdmission:
 
     def __post_init__(self) -> None:
         _text(self.scenario_id, field="scenario_id", maximum_bytes=128)
+        _text(self.project_path, field="project_path", maximum_bytes=4096)
         for field_name in (
             "applied_record_digest",
             "source_document_digest",
@@ -796,6 +802,7 @@ class ProgramRunOwner:
                     program=admission.program,
                     environment=admission.environment,
                     capture=capture,
+                    project_path=admission.project_path,
                     readiness=admission.readiness,
                     ports=self._ports,
                     program_clock=ProgramClock(self._program_clock_source),
@@ -3151,6 +3158,7 @@ def build_program_run_admission(
         "program_binding_id",
         "program_id",
         "program_revision",
+        "project_path",
         "retained_bundle_id",
         "source_document_digest",
         "scenario_id",
@@ -3179,6 +3187,9 @@ def build_program_run_admission(
     if assistant_mode == "forbidden" and assistant_projection is not None:
         raise ProgramRunOwnerError("scenario forbids a present assistant projection")
     scenario_id = _text(selection.get("scenario_id"), field="scenario_id")
+    project_path = _text(
+        selection.get("project_path"), field="project_path", maximum_bytes=4096
+    )
     source_document_digest = _digest(
         selection.get("source_document_digest"),
         field="source_document_digest",
@@ -3309,6 +3320,7 @@ def build_program_run_admission(
     )
     return ProgramRunAdmission(
         scenario_id=scenario_id,
+        project_path=project_path,
         applied_record_digest=_digest(
             selection.get("applied_record_digest"),
             field="applied_record_digest",
@@ -3354,6 +3366,7 @@ def build_applied_program_run_admission(
         "program_binding_id",
         "program_id",
         "program_revision",
+        "project_path",
         "retained_bundle_id",
         "source_document_digest",
         "scenario_id",
@@ -3399,6 +3412,7 @@ def build_applied_program_run_admission(
         "retained_bundle_id": applied["retained_bundle_id"],
         "source_document_digest": applied["source_document_digest"],
         "scenario_id": applied["scenario_id"],
+        "project_path": applied["project_path"],
         "schema_version": PROGRAM_RUN_INPUT_API,
     }
     return build_program_run_admission(

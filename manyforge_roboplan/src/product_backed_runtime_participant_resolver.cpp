@@ -1,5 +1,6 @@
 #include "product_backed_runtime_participant_resolver.hpp"
 #include "sealed_program_execution_capture.hpp"
+#include <manyforge_core/types/collision_world_snapshot.hpp>
 #include <manyforge_deployment/program_io_stop_response_validation.hpp>
 
 #include "manyforge_roboplan/retained_collision_world_projector.hpp"
@@ -557,14 +558,16 @@ ProductBackedRuntimeParticipantResolver::
 
 core::Result<deployment::CanonicalValue>
 ProductBackedRuntimeParticipantResolver::ReadQualifiedStopResponse(
-    const core::RuntimeParticipantBinding &binding) const {
+    const core::RuntimeParticipantBinding &binding,
+    const std::span<const core::RuntimeParticipantBinding> current_physical)
+    const {
   using Reply = core::Result<deployment::CanonicalValue>;
   const auto &value = binding.value();
   if (!value.control_path ||
       value.retained_bundle_id != retained_bundle_->retained_bundle_id() ||
       value.graph_revision !=
           retained_bundle_->value().cell_graph.graph_revision ||
-      std::none_of(physical_bindings_.begin(), physical_bindings_.end(),
+      std::none_of(current_physical.begin(), current_physical.end(),
                    [&](const auto &actual) {
                      const auto &installed = actual.value();
                      return installed.controllable_component_id ==
@@ -972,6 +975,60 @@ ProductBackedRuntimeParticipantResolver::Resolve(
       }
       if (precomposed->value().io_output_binding)
         return core::Result<core::RuntimeParticipantBinding>::Ok(*precomposed);
+      if (const auto *motion = std::get_if<core::MotionParticipantIntentDTO>(
+              &participant.payload)) {
+        auto value = precomposed->value();
+        const auto &selected = motion->tcp_endpoint;
+        const auto frame =
+            std::find_if(value.frame_bindings.begin(),
+                         value.frame_bindings.end(), [&](const auto &row) {
+                           return row.frame_role_id == selected.frame_role_id;
+                         });
+        if (selected.target_role_id != value.target_role_id ||
+            frame == value.frame_bindings.end())
+          return Reject<core::RuntimeParticipantBinding>(
+              "direct-control TCP endpoint differs from its exact compiled "
+              "target/frame",
+              "runtime_motion_endpoint_unresolved",
+              core::ErrorCode::kMissingReference);
+        core::RuntimeMotionEndpointBindingDTO endpoint{
+            value.target_role_id, value.command_target_id, *frame, {}};
+        for (const auto &role : frame->contact_body_role_ids) {
+          const auto &bodies = retained_model_map_.model_collision_bodies();
+          const auto body =
+              std::find_if(bodies.begin(), bodies.end(), [&](const auto &row) {
+                return row.owner_component_id ==
+                           value.controllable_component_id &&
+                       row.model_instance_id == frame->model_instance_id &&
+                       row.model_revision == frame->model_revision &&
+                       row.collision_body_role_id == role;
+              });
+          if (body == bodies.end())
+            return Reject<core::RuntimeParticipantBinding>(
+                "direct-control endpoint body is absent from its exact frame "
+                "model",
+                "runtime_motion_endpoint_body_unresolved",
+                core::ErrorCode::kInvariantViolation);
+          std::vector<std::string> ids;
+          for (std::size_t index = 0; index < body->compiled_link_names.size();
+               ++index)
+            ids.push_back(core::make_component_collision_body_id(
+                value.controllable_component_id, frame->model_instance_id, role,
+                index));
+          endpoint.contact_body_bindings.push_back(
+              {value.component_role_id, value.target_role_id,
+               value.controllable_component_id, value.command_target_id,
+               std::nullopt, role, frame->model_instance_id,
+               frame->model_revision, std::move(ids)});
+        }
+        value.motion_endpoint = std::move(endpoint);
+        auto captured =
+            core::verify_runtime_participant_binding(std::move(value));
+        if (!captured.ok())
+          return captured;
+        return core::bind_runtime_participant_collision_body_aliases(
+            captured.value(), collision_body_aliases_);
+      }
       return core::bind_runtime_participant_collision_body_aliases(
           *precomposed, collision_body_aliases_);
     }
@@ -1031,16 +1088,78 @@ ProductBackedRuntimeParticipantResolver::Resolve(
           retained_model_map_));
     }
     const auto &physical = RequirePhysicalBinding(target, physical_bindings_);
-    auto candidate = core::verify_runtime_participant_binding(
-        deployment::build_runtime_participant_binding_dto(
-            target,
-            ActiveFacts(
-                target,
-                std::span<const deployment::RuntimeProgramTargetBinding>(
-                    supporting),
-                physical),
-            std::span<const deployment::RuntimeProgramTargetBinding>(
-                supporting)));
+    auto candidate_value = deployment::build_runtime_participant_binding_dto(
+        target,
+        ActiveFacts(target,
+                    std::span<const deployment::RuntimeProgramTargetBinding>(
+                        supporting),
+                    physical),
+        std::span<const deployment::RuntimeProgramTargetBinding>(supporting));
+    if (const auto *motion =
+            std::get_if<core::MotionParticipantIntentDTO>(&participant.payload);
+        motion != nullptr) {
+      const auto &selected = motion->tcp_endpoint;
+      const auto &targets = binding->value().target_role_bindings;
+      const auto endpoint_target =
+          std::find_if(targets.begin(), targets.end(), [&](const auto &row) {
+            return row.target_role_id == selected.target_role_id;
+          });
+      if (endpoint_target == targets.end() ||
+          endpoint_target->controllable_component_id !=
+              candidate_value.controllable_component_id) {
+        return Reject<core::RuntimeParticipantBinding>(
+            "motion endpoint is not on the exact motion component",
+            "runtime_motion_endpoint_owner_mismatch",
+            core::ErrorCode::kInvalidRequest);
+      }
+      const auto frame = std::find_if(
+          endpoint_target->frame_role_bindings.begin(),
+          endpoint_target->frame_role_bindings.end(), [&](const auto &row) {
+            return row.frame_role_id == selected.frame_role_id;
+          });
+      if (frame == endpoint_target->frame_role_bindings.end()) {
+        return Reject<core::RuntimeParticipantBinding>(
+            "motion endpoint frame is absent from its exact Program target",
+            "runtime_motion_endpoint_unresolved",
+            core::ErrorCode::kMissingReference);
+      }
+      core::RuntimeMotionEndpointBindingDTO endpoint{
+          endpoint_target->target_role_id,
+          endpoint_target->command_target_id,
+          *frame,
+          {}};
+      for (const auto &role : frame->contact_body_role_ids) {
+        const auto body =
+            std::find_if(endpoint_target->collision_body_role_bindings.begin(),
+                         endpoint_target->collision_body_role_bindings.end(),
+                         [&](const auto &row) {
+                           return row.collision_body_role_id == role;
+                         });
+        if (body == endpoint_target->collision_body_role_bindings.end() ||
+            body->model_instance_id != frame->model_instance_id ||
+            body->model_revision != frame->model_revision) {
+          return Reject<core::RuntimeParticipantBinding>(
+              "motion endpoint body is absent from its exact frame model",
+              "runtime_motion_endpoint_body_unresolved",
+              core::ErrorCode::kInvariantViolation);
+        }
+        std::vector<std::string> ids;
+        for (std::size_t index = 0;
+             index < body->compiled_collision_body_names.size(); ++index)
+          ids.push_back(core::make_component_collision_body_id(
+              candidate_value.controllable_component_id,
+              body->model_instance_id, role, index));
+        endpoint.contact_body_bindings.push_back(
+            {endpoint_target->component_role_id,
+             endpoint_target->target_role_id,
+             endpoint_target->controllable_component_id,
+             endpoint_target->command_target_id, std::nullopt, role,
+             body->model_instance_id, body->model_revision, std::move(ids)});
+      }
+      candidate_value.motion_endpoint = std::move(endpoint);
+    }
+    auto candidate =
+        core::verify_runtime_participant_binding(std::move(candidate_value));
     if (!candidate.ok()) {
       return candidate;
     }

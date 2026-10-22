@@ -93,6 +93,9 @@ def _request(
     )
     captured = {
         "scenario_id": document["scenario_id"],
+        # The Scenario project folder: a fixed normalized absolute fixture
+        # path (native never reads it); part of captured_input_digest.
+        "project_path": f"/tmp/manyforge-test/{document['scenario_id']}.scenario",
         "source_document_digest": digest,
         "deployment": document["deployment_draft"],
         "model_source_closure": capture_deployment_model_sources(

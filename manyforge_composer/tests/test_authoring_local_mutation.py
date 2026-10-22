@@ -1069,6 +1069,105 @@ def test_idle_draft_edit_commits_without_a_cell_claim(tmp_path) -> None:
     }
 
 
+def _set_deployment(deployment, name: str) -> bool:
+    deployment._document = {"name": name}
+    deployment._revision += 1
+    return True
+
+
+def test_scenario_draft_edit_commits_both_drafts_in_one_revision(tmp_path) -> None:
+    workspace, program, deployment, headless, coordinator = _fixture(tmp_path)
+
+    commit = coordinator.execute_draft_edit(
+        _envelope(),
+        operation_kind="discard_scenario",
+        workspace=workspace,
+        draft_id=program.draft_id,
+        expected_identity=workspace.identity(),
+        install=lambda: _set_deployment(deployment, "applied") | program.install("rev-applied"),
+        session="scenario",
+    )
+
+    # One Draft-only commit: both Drafts changed, one workspace revision, no claim.
+    assert commit.snapshot.workspace_revision == 2
+    assert deployment.revision == 1 and program.revision == 1
+    assert headless.claims == [] and headless.settlements == []
+
+
+def test_scenario_draft_edit_failure_contains_instead_of_reporting_no_effect(tmp_path) -> None:
+    workspace, program, deployment, headless, coordinator = _fixture(tmp_path)
+
+    def install() -> bool:
+        _set_deployment(deployment, "applied")
+        raise RuntimeError("second Draft install failed")
+
+    with pytest.raises(AuthoringWorkspaceError) as failed:
+        coordinator.execute_draft_edit(
+            _envelope(),
+            operation_kind="discard_scenario",
+            workspace=workspace,
+            draft_id=program.draft_id,
+            expected_identity=workspace.identity(),
+            install=install,
+            session="scenario",
+        )
+    # A half-applied install is never a proven no-effect refusal: the
+    # workspace is contained and every later edit is refused.
+    assert failed.value.code == "composer_workspace_install_failed"
+    with pytest.raises(AuthoringWorkspaceError):
+        workspace.identity()
+
+
+def test_contained_commit_before_submit_holds_the_claim_instead_of_no_effect(
+    tmp_path,
+) -> None:
+    workspace, program, deployment, headless, coordinator = _fixture(tmp_path)
+
+    def install() -> bool:
+        _set_deployment(deployment, "saved")
+        raise RuntimeError("Program restore failed")
+
+    with pytest.raises(AuthoringWorkspaceError) as failed:
+        coordinator.execute_external_submission(
+            _envelope(),
+            operation_kind="revert_program",
+            draft_id=program.draft_id,
+            draft_revision=program.revision,
+            payload={},
+            validate_under_claim=lambda _claim: None,
+            commit_before_submit=lambda: workspace.replace(
+                expected_identity=workspace.identity(), install=install
+            ),
+            submit=lambda _claim: pytest.fail("a contained commit must not submit"),
+            workspace=workspace,
+        )
+
+    # As on the local path: never settled as proven no effect; the claim stays
+    # held for diagnosis and authoring is blocked.
+    assert failed.value.code == "composer_workspace_install_failed"
+    assert headless.settlements == []
+    assert coordinator.local_claim_pending is True
+    assert coordinator.mutation_ready is False
+
+    # The next submission settles the retained claim truthfully, never as
+    # proven no effect, and admits no dependent work.
+    with pytest.raises(HTTPException) as refused:
+        coordinator.execute_external_submission(
+            _envelope(),
+            operation_kind="revert_program",
+            draft_id=program.draft_id,
+            draft_revision=program.revision,
+            payload={},
+            validate_under_claim=lambda _claim: pytest.fail("contained authoring admitted work"),
+            submit=lambda _claim: pytest.fail("contained authoring admitted work"),
+            workspace=workspace,
+        )
+    assert refused.value.detail["code"] == "composer_authoring_recovery_blocked"
+    assert [body["settlement_kind"] for body in headless.settlements] == ["owner_commit"]
+    assert coordinator.local_claim_pending is False
+    assert coordinator.mutation_ready is False
+
+
 @pytest.mark.parametrize(
     "cycle",
     [

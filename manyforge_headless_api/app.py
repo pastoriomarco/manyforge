@@ -130,9 +130,6 @@ from .activation_preparer import ActivationPreparer
 
 _REQUEST_ID_PATTERN = re.compile(r"[^A-Za-z0-9._-]")
 _MAXIMUM_SAFE_INTEGER = 9_007_199_254_740_991
-ScenarioPath = Annotated[
-    str, Path(min_length=1, max_length=128, pattern=r"^[a-z][a-z0-9_.-]*$")
-]
 _MAXIMUM_SIGNED_64 = 9_223_372_036_854_775_807
 _MAXIMUM_ALARM_PAGE = 128
 _MAXIMUM_HISTORY_PAGE = 32
@@ -1313,42 +1310,30 @@ def create_app(
             transport_request=request,
         )
 
-    def require_scenario_path(scenario_id: str, request: Any) -> None:
-        if request.scenario_id != scenario_id:
-            raise HeadlessApiError(
-                "persistent_key_path_invalid",
-                "Scenario identity in path and body must match",
-            )
+    # Persistent blackboard values are state of the Applied Scenario project,
+    # kept by the Program runner; editing them is a value edit, not an
+    # execution command. An edit names the project folder the operator saw.
+    @app.get("/api/program/persistent-values")
+    def program_persistent_values() -> dict[str, Any]:
+        return service.program_persistent_values()
 
-    # Persistent blackboard values are Scenario state kept by the Program
-    # runner; editing them is a value edit, not an execution command.
-    @app.get("/api/program/scenarios/{scenario_id}/persistent-values")
-    def program_persistent_values(scenario_id: ScenarioPath) -> dict[str, Any]:
-        return service.program_persistent_values(scenario_id)
-
-    @app.post("/api/program/scenarios/{scenario_id}/persistent-values")
+    @app.post("/api/program/persistent-values")
     def set_program_persistent_value(
-        scenario_id: ScenarioPath,
         body: PersistentKeyValueSetRequest,
     ) -> dict[str, Any]:
-        require_scenario_path(scenario_id, body)
-        return service.program_persistent_value_action(scenario_id, "set", body)
+        return service.program_persistent_value_action("set", body)
 
-    @app.post("/api/program/scenarios/{scenario_id}/persistent-values/reset")
+    @app.post("/api/program/persistent-values/reset")
     def reset_program_persistent_value(
-        scenario_id: ScenarioPath,
         body: PersistentKeyValueResetRequest,
     ) -> dict[str, Any]:
-        require_scenario_path(scenario_id, body)
-        return service.program_persistent_value_action(scenario_id, "reset", body)
+        return service.program_persistent_value_action("reset", body)
 
-    @app.post("/api/program/scenarios/{scenario_id}/persistent-values/clear")
+    @app.post("/api/program/persistent-values/clear")
     def clear_program_persistent_values(
-        scenario_id: ScenarioPath,
         body: PersistentKeyValuesClearRequest,
     ) -> dict[str, Any]:
-        require_scenario_path(scenario_id, body)
-        return service.program_persistent_value_action(scenario_id, "clear", body)
+        return service.program_persistent_value_action("clear", body)
 
     @app.post("/api/program/runs/{program_run_id}/manual-result")
     async def stage_manual_result(

@@ -137,6 +137,9 @@ struct ComponentTypeFrameRoleDTO {
   FrameRoleId frame_role_id;
   ModelRoleId model_role_id;
   FrameRoleId asset_frame_role_id;
+  // Portable collision-body roles associated with this exposed endpoint.
+  // Empty preserves a motion-only frame role.
+  std::vector<CollisionBodyRoleId> contact_body_role_ids{};
 
   friend bool operator==(const ComponentTypeFrameRoleDTO&,
                          const ComponentTypeFrameRoleDTO&) = default;

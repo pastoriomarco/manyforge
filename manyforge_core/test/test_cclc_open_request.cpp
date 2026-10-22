@@ -1120,7 +1120,9 @@ TEST(CCLCOpenRequest, DomainResourcesAreCommonAndDoNotChangeSnapshotIdentity) {
         EXPECT_EQ(domain.find_object_member("output_resources"), nullptr);
         const auto& resources = Member(domain, "resources").as_array();
         EXPECT_EQ(resources.size(), has_output ? 1U : 0U);
-        if (has_output) EXPECT_EQ(resources.front().as_string(), "resource.arm");
+        if (has_output) {
+          EXPECT_EQ(resources.front().as_string(), "resource.arm");
+        }
         EXPECT_EQ(Member(value, "snapshot_digest").as_string(), expected_digest);
       }
       EXPECT_TRUE(VerifyComponentLifecycleCurrentSnapshot(snapshot).ok());

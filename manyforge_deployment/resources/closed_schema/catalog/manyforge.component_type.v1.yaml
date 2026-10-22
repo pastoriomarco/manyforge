@@ -1,6 +1,6 @@
 api_version: manyforge.closed_schema.v1
 schema_id: manyforge.component_type.v1
-schema_revision: sha256:8e728ad4442d46b98f0d0534f8189df9b7982f982ab99cb656e6fdbeef231009
+schema_revision: sha256:2f26f97a7454e620bfb39e16eeccc0b23ae2de61c32e3e8210eff46945d01fc4
 schema_purpose: artifact_document
 root_definition_id: component_type
 definitions:
@@ -511,6 +511,22 @@ definitions:
             constraints:
               - kind: string_format
                 value: portable_id
+        - field_id: contact_body_role_ids
+          presence: optional
+          default:
+            kind: absent
+          value_schema:
+            kind: array
+            min_items: 0
+            max_items: 4096
+            collection:
+              kind: scalar_set
+            item_schema:
+              kind: scalar
+              scalar_type: string
+              constraints:
+                - kind: string_format
+                  value: portable_id
   - definition_id: command_target_collision_body_role
     value_schema:
       kind: object

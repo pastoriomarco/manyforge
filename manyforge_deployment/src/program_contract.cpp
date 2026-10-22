@@ -1,3 +1,4 @@
+#include "program_contact_envelope_codec.hpp"
 #include "manyforge_deployment/program_contract.hpp"
 
 #include <algorithm>
@@ -697,8 +698,9 @@ declared_scene_resource_runtime_object(const CanonicalValue::Object &root,
 }
 
 struct ParsedContactPair final {
-  core::ProgramContactGraspBodySelectorDTO body_selector;
+  std::optional<core::ProgramContactGraspBodySelectorDTO> body_selector;
   core::RuntimeObjectId runtime_object_id;
+  bool bodies_from_motion_endpoint{};
 };
 
 [[nodiscard]] ParsedContactPair
@@ -708,6 +710,7 @@ parse_contact_grasp_pair(const CanonicalValue &value, std::string_view path) {
 
   std::optional<core::ProgramContactGraspBodySelectorDTO> body_selector;
   std::optional<core::RuntimeObjectId> runtime_object_id;
+  bool motion_endpoint = false;
   const auto parse_side = [&](const CanonicalValue &side_value,
                               std::string side_path) {
     const auto &side = require_object(side_value, side_path);
@@ -717,7 +720,7 @@ parse_contact_grasp_pair(const CanonicalValue &value, std::string_view path) {
       require_fields(side,
                      {"kind", "component_role_id", "collision_body_role_id"},
                      {"model_role_id"}, side_path);
-      if (body_selector.has_value()) {
+      if (body_selector.has_value() || motion_endpoint) {
         fail(std::string(path) +
              ": contact_grasp pair has two component-model sides");
       }
@@ -737,6 +740,14 @@ parse_contact_grasp_pair(const CanonicalValue &value, std::string_view path) {
               child_path(side_path, "collision_body_role_id"))};
       return;
     }
+    if (kind == "motion_endpoint") {
+      require_fields(side, {"kind"}, {}, side_path);
+      if (body_selector.has_value() || motion_endpoint) {
+        fail(std::string(path) + ": contact_grasp pair has two robot sides");
+      }
+      motion_endpoint = true;
+      return;
+    }
     if (kind == "runtime_object") {
       require_fields(side, {"kind", "runtime_object_id"}, {}, side_path);
       if (runtime_object_id.has_value()) {
@@ -748,18 +759,21 @@ parse_contact_grasp_pair(const CanonicalValue &value, std::string_view path) {
           child_path(side_path, "runtime_object_id"));
       return;
     }
-    fail(side_path + ": contact_grasp requires component_model_body or "
-                     "runtime_object");
+    fail(side_path +
+         ": contact_grasp requires component_model_body, motion_endpoint or "
+         "runtime_object");
   };
 
   parse_side(require_member(pair, "body_a", path), child_path(path, "body_a"));
   parse_side(require_member(pair, "body_b", path), child_path(path, "body_b"));
-  if (!body_selector.has_value() || !runtime_object_id.has_value()) {
+  if ((!body_selector.has_value() && !motion_endpoint) ||
+      !runtime_object_id.has_value()) {
     fail(std::string(path) +
          ": contact_grasp requires exactly one component body and one "
          "runtime object");
   }
-  return {std::move(*body_selector), std::move(*runtime_object_id)};
+  return {std::move(body_selector), std::move(*runtime_object_id),
+          motion_endpoint};
 }
 
 [[nodiscard]] std::vector<core::ProgramContactGraspTemplateDTO>
@@ -782,12 +796,13 @@ parse_contact_grasp_templates(
     const auto &policy = require_object(policies[index], path);
     const auto *mode_value = find_member(policy, "mode");
     if (mode_value == nullptr ||
-        require_string(*mode_value, child_path(path, "mode")) !=
-            "contact_grasp") {
+        (require_string(*mode_value, child_path(path, "mode")) != "contact_grasp" &&
+         require_string(*mode_value, child_path(path, "mode")) != "contact_release")) {
       // N5d adds one binding projection for contact-grasp. Other policy modes
       // retain their existing Program validation and runtime ownership.
       continue;
     }
+    const bool release = require_string(*mode_value, child_path(path, "mode")) == "contact_release";
     require_fields(policy,
                    {"api_version", "policy_id", "version", "mode",
                     "sensing_mode", "default_unmatched_response", "zones"},
@@ -830,10 +845,15 @@ parse_contact_grasp_templates(
     }
     const std::string zone_path = index_path(child_path(path, "zones"), 0U);
     const auto &zone = require_object(zones.front(), zone_path);
-    require_fields(zone,
-                   {"zone_id", "body_pairs", "violation_response",
-                    "max_penetration_m", "terminal_window_start_fraction"},
-                   {"notes"}, zone_path);
+    if (release) {
+      require_fields(zone, {"zone_id", "body_pairs", "violation_response", "release_evidence_mode"},
+          {"notes", "enforce_max_start_penetration", "max_start_penetration_m",
+           "min_release_progress_m", "release_tolerance_m",
+           "require_strictly_decreasing_penetration", "require_separation_by_end", "allow_recontact"}, zone_path);
+    } else {
+      require_fields(zone, {"zone_id", "body_pairs", "violation_response",
+                           "max_penetration_m", "terminal_window_start_fraction"}, {"notes"}, zone_path);
+    }
     require_program_local_identity(
         require_string(require_member(zone, "zone_id", zone_path),
                        child_path(zone_path, "zone_id")),
@@ -845,16 +865,19 @@ parse_contact_grasp_templates(
            ": contact_grasp violation must use hard_stop in this qualified "
            "profile");
     }
-    const double max_penetration =
-        require_number(require_member(zone, "max_penetration_m", zone_path),
-                       child_path(zone_path, "max_penetration_m"));
-    const double terminal_start = require_number(
-        require_member(zone, "terminal_window_start_fraction", zone_path),
-        child_path(zone_path, "terminal_window_start_fraction"));
-    if (max_penetration <= 0.0 || terminal_start < 0.0 ||
-        terminal_start > 1.0) {
-      fail(zone_path + ": contact_grasp bounds are outside their valid range");
-    }
+    const auto envelope = [&]() -> core::ContactZoneEnvelopeDTO {
+      if (release) return detail::parse_program_contact_envelope(zone, true, false);
+      const double max_penetration =
+          require_number(require_member(zone, "max_penetration_m", zone_path),
+                         child_path(zone_path, "max_penetration_m"));
+      const double terminal_start = require_number(
+          require_member(zone, "terminal_window_start_fraction", zone_path),
+          child_path(zone_path, "terminal_window_start_fraction"));
+      if (max_penetration <= 0.0 || terminal_start < 0.0 || terminal_start > 1.0) {
+        fail(zone_path + ": contact_grasp bounds are outside their valid range");
+      }
+      return core::ContactGraspEnvelopeDTO{max_penetration, terminal_start};
+    }();
 
     const auto &pairs =
         require_array(require_member(zone, "body_pairs", zone_path),
@@ -865,6 +888,7 @@ parse_contact_grasp_templates(
     std::vector<core::ProgramContactGraspBodySelectorDTO> selectors;
     selectors.reserve(pairs.size());
     std::optional<core::RuntimeObjectId> runtime_object_id;
+    bool bodies_from_motion_endpoint = false;
     for (std::size_t pair_index = 0U; pair_index < pairs.size(); ++pair_index) {
       auto parsed = parse_contact_grasp_pair(
           pairs[pair_index],
@@ -875,7 +899,15 @@ parse_contact_grasp_templates(
              ": every contact_grasp pair must bind the same runtime object");
       }
       runtime_object_id = parsed.runtime_object_id;
-      selectors.push_back(std::move(parsed.body_selector));
+      if (parsed.bodies_from_motion_endpoint) {
+        if (pairs.size() != 1U) {
+          fail(zone_path +
+               ": motion_endpoint cannot mix with other body selectors");
+        }
+        bodies_from_motion_endpoint = true;
+      } else {
+        selectors.push_back(std::move(*parsed.body_selector));
+      }
     }
     const auto selector_key = [](const auto &selector) {
       return std::tuple(selector.component_role_id.value(),
@@ -923,7 +955,7 @@ parse_contact_grasp_templates(
     }
     result.push_back(core::ProgramContactGraspTemplateDTO{
         policy_id, policy_revision, *runtime_object_id, std::move(selectors),
-        max_penetration, terminal_start});
+        envelope, bodies_from_motion_endpoint});
   }
   if (!std::is_sorted(result.begin(), result.end(),
                       [](const auto &left, const auto &right) {

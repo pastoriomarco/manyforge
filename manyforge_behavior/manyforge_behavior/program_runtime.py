@@ -73,7 +73,7 @@ class NodeInputProposalError(ValueError):
 # Parameters that name a captured Program Binding row by value. Required
 # capability parameters and declared blackboard-key parameters are read from
 # the catalog entry itself.
-_BINDING_SELECTION_PARAMETERS: Final = frozenset({"contact_policy_id"})
+_BINDING_SELECTION_PARAMETERS: Final = frozenset({"contact_policy_id", "tcp_endpoint"})
 
 
 def _require_text(value: object, *, field: str, maximum_bytes: int = 512) -> str:
@@ -333,7 +333,10 @@ class ExecutableProgramRun:
         ports: NodeAdapterPorts,
         program_clock: ProgramClock | None = None,
         motion_attention: Callable[[str, str], None] | None = None,
+        project_path: str | None = None,
     ) -> None:
+        # ``project_path``: the Applied Scenario project folder that scopes
+        # persistent blackboard values; required when the Program has any.
         if not isinstance(program, Program):
             raise TypeError("program must be one validated Program")
         if not isinstance(environment, NodeEnvironment):
@@ -410,7 +413,7 @@ class ExecutableProgramRun:
 
         self._value_store = ProgramValueStore.from_program(
             program,
-            scenario_id=capture.scenario_id,
+            project_path=project_path,
             register=ports.persistent_keys,
             program_run_id=capture.program_run_id,
         )

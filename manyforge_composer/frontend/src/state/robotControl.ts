@@ -1394,6 +1394,7 @@ function buildMotionIntent(
 ): DirectControlOperationIntent {
   const capability = `planning.motion.${motion.kind}`;
   requireMotionStatus(status, capability);
+  const selectedMotion = requireSelectedMotion(status).motion;
   if (requestId.trim() === '') {
     throw new Error('Robot Control request identity must not be empty.');
   }
@@ -1407,8 +1408,11 @@ function buildMotionIntent(
   const payload: MotionParticipantPayload = {
     kind: 'motion',
     move_id: `robot-control-${requestId}`,
-    base_frame_role_id: requireSelectedMotion(status).motion.baseFrameRoleId,
-    tcp_frame_role_id: requireSelectedMotion(status).motion.tcpFrameRoleId,
+    base_frame_role_id: selectedMotion.baseFrameRoleId,
+    tcp_endpoint: {
+      target_role_id: selectedMotion.targetRoleId,
+      frame_role_id: selectedMotion.tcpFrameRoleId,
+    },
     tolerances: {
       joint_position_tol_rad: 0.05,
       translation_tol_m: settings.cartesianTranslationToleranceM,

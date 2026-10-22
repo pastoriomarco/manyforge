@@ -80,7 +80,7 @@ export function PersistentKeyValuesView({
     <section className="runtime-control-section" aria-labelledby="stored-values-title">
       <div className="runtime-control-heading">
         <div>
-          <span>Kept between runs · Scenario {values.scenarioId}</span>
+          <span title={values.projectPath}>Kept between runs · Scenario {values.scenarioId}</span>
           <h3 id="stored-values-title">Stored values</h3>
         </div>
         <button type="button" className="quiet-button" disabled={pending} onClick={onRefresh}>
@@ -254,7 +254,8 @@ export function PersistentKeyValuesView({
 }
 
 export interface PersistentKeyValuesSectionProps {
-  scenarioId: string;
+  /** The Applied Scenario project folder: the values follow it. */
+  projectPath: string;
   /** Re-read when the Applied Program or the live run changes. */
   appliedRevision: string;
   runId: string | null;
@@ -265,7 +266,7 @@ export interface PersistentKeyValuesSectionProps {
 
 /** Reads and edits the stored values through the Program runner. */
 export function PersistentKeyValuesSection({
-  scenarioId,
+  projectPath,
   appliedRevision,
   runId,
   sceneResourceIds,
@@ -279,7 +280,7 @@ export function PersistentKeyValuesSection({
 
   useEffect(() => {
     const controller = new AbortController();
-    client.read(scenarioId, controller.signal)
+    client.read(controller.signal)
       .then((next) => {
         if (controller.signal.aborted) return;
         setValues(next);
@@ -291,7 +292,7 @@ export function PersistentKeyValuesSection({
         }
       });
     return () => controller.abort();
-  }, [appliedRevision, client, readSequence, runId, scenarioId]);
+  }, [appliedRevision, client, projectPath, readSequence, runId]);
 
   const perform = useCallback(async (
     action: () => Promise<PersistentKeyValues | null>,

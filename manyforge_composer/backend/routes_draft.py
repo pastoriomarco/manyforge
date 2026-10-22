@@ -8,7 +8,7 @@ import hashlib
 import math
 import uuid
 from pathlib import Path
-from typing import Any, Literal, NoReturn
+from typing import Any, Callable, Literal, NoReturn
 
 from fastapi import APIRouter, HTTPException
 from fastapi.responses import JSONResponse
@@ -18,7 +18,10 @@ from manyforge_behavior.canonical_artifact import (
     StrictArtifactError,
 )
 from manyforge_behavior.model_source_capture import capture_deployment_model_sources
-from manyforge_behavior.program import Program, ProgramValidationError
+from manyforge_behavior.program import (
+    Program,
+    ProgramValidationError,
+)
 from manyforge_headless_api.client import HeadlessClientError
 from manyforge_headless_api.program_binding_transport import ProgramBindingTransportError
 from manyforge_headless_api.program_binding_projection import (
@@ -45,6 +48,11 @@ from .program_artifacts import (
     normalize_program_save_path,
     save_program_artifact,
 )
+from .scenario_restore import (
+    saved_deployment_differs_from,
+    saved_deployment_restore,
+    saved_program_restore,
+)
 from .state import ComposerState
 from .authoring_admission import (
     AuthoringMutationEnvelope,
@@ -55,6 +63,7 @@ from .authoring_admission import (
     scenario_artifact_http_exception,
 )
 from .authoring_workspace import (
+    AuthoringOperationContext,
     AuthoringWorkspaceError,
     AuthoringWorkspaceIdentity,
     scenario_project_facts,
@@ -597,6 +606,8 @@ def _observed_move_arguments(
     # checks run from the Draft itself outward to the runtime owner, so each
     # refusal names the first thing the operator has to correct.
     parameters = node.get("parameters", {})
+    if not isinstance(parameters, dict):
+        parameters = {}
     node_target_role = parameters.get("target_role")
     if type(node_target_role) is not str:
         raise DraftSessionError(
@@ -604,10 +615,7 @@ def _observed_move_arguments(
             "the selected move has no target role; choose the robot target role first",
             status_code=409,
         )
-    frame_fields = (
-        (("base_frame_role", "base"), ("tcp_frame_role", "TCP"))
-        if observed_kind == "tcp_pose" else ()
-    )
+    frame_fields = (("base_frame_role", "base"),) if observed_kind == "tcp_pose" else ()
     for field, label in frame_fields:
         if type(parameters.get(field)) is not str:
             raise DraftSessionError(
@@ -616,6 +624,27 @@ def _observed_move_arguments(
                 "capturing the current robot pose",
                 status_code=409,
             )
+    tcp_endpoint = None
+    if observed_kind == "tcp_pose":
+        candidate_endpoint = (
+            parameters.get("tcp_endpoint") if isinstance(parameters, dict) else None
+        )
+        if (
+            not isinstance(candidate_endpoint, dict)
+            or set(candidate_endpoint) != {"target_role", "frame_role"}
+            or any(
+                type(candidate_endpoint.get(field)) is not str
+                or not candidate_endpoint[field]
+                for field in ("target_role", "frame_role")
+            )
+        ):
+            raise DraftSessionError(
+                "observed_move_role_missing",
+                "the selected move has no valid TCP endpoint; choose its target and frame "
+                "roles before capturing the current robot pose",
+                status_code=409,
+            )
+        tcp_endpoint = candidate_endpoint
     applied, unavailable = _applied_context(state)
     if applied is None and unavailable is not None:
         raise DraftSessionError(
@@ -673,31 +702,121 @@ def _observed_move_arguments(
     frame_ref = None
     if observed_kind == "tcp_pose":
         command = direct["command"]
-        bound_frames = {row["frame_role_id"]: row["compiled_frame_name"]
-                        for row in bound["frame_role_bindings"]}
-        manual_frames = {row["frame_role_id"]: row["compiled_frame_name"]
-                         for row in command["target_descriptor"]["frames"]}
-        for field, label in frame_fields:
-            role = parameters[field]
-            requested = bound_frames.get(role)
-            if requested is None:
-                raise DraftSessionError(
-                    "observed_move_target_unbound",
-                    f"{label} frame role {role!r} is not bound for target role "
-                    f"{node_target_role!r} in the Applied Program",
-                    status_code=409,
-                )
-            observed_frame = manual_frames.get(command.get(f"{field}_id"))
-            if requested != observed_frame:
-                raise DraftSessionError(
-                    "observed_move_frame_mismatch",
-                    (f"{label} frame role {role!r} resolves to {requested!r}, but the robot "
-                     f"reports its current pose with {label} frame {observed_frame!r}; "
-                     f"choose the robot's {label} frame role to capture its current pose"
-                     if observed_frame is not None else
-                     f"the robot target does not report a {label} frame for its current pose"),
-                    status_code=409,
-                )
+        base_row = next(
+            (row for row in bound["frame_role_bindings"]
+             if row["frame_role_id"] == parameters["base_frame_role"]),
+            None,
+        )
+        if base_row is None:
+            raise DraftSessionError(
+                "observed_move_target_unbound",
+                f"base frame role {parameters['base_frame_role']!r} is not bound for "
+                f"target role {node_target_role!r} in the Applied Program",
+                status_code=409,
+            )
+        assert tcp_endpoint is not None
+        endpoint_targets = [
+            row for row in applied.binding_document["target_role_bindings"]
+            if row["target_role_id"] == tcp_endpoint["target_role"]
+        ]
+        if len(endpoint_targets) != 1:
+            raise DraftSessionError(
+                "observed_move_target_unbound",
+                f"TCP endpoint target role {tcp_endpoint['target_role']!r} is not bound in "
+                "the Applied Program",
+                status_code=409,
+            )
+        endpoint_target = endpoint_targets[0]
+        if endpoint_target["controllable_component_id"] != bound["controllable_component_id"]:
+            raise DraftSessionError(
+                "observed_move_target_unbound",
+                f"TCP endpoint target role {tcp_endpoint['target_role']!r} does not share "
+                f"motion target role {node_target_role!r}'s component",
+                status_code=409,
+            )
+        tcp_frame_row = next(
+            (row for row in endpoint_target["frame_role_bindings"]
+             if row["frame_role_id"] == tcp_endpoint["frame_role"]),
+            None,
+        )
+        if tcp_frame_row is None:
+            raise DraftSessionError(
+                "observed_move_target_unbound",
+                f"TCP endpoint target role {tcp_endpoint['target_role']!r} frame role "
+                f"{tcp_endpoint['frame_role']!r} is not bound in the Applied Program",
+                status_code=409,
+            )
+        descriptor_frames = command["target_descriptor"]["frames"]
+        direct_base_role = command.get("base_frame_role_id")
+        direct_base_row = next(
+            (row for row in descriptor_frames
+             if row["frame_role_id"] == direct_base_role),
+            None,
+        )
+        requested_base = base_row.get("compiled_frame_name")
+        observed_base = (
+            direct_base_row.get("compiled_frame_name")
+            if isinstance(direct_base_row, dict) else None
+        )
+        if requested_base is None or requested_base != observed_base:
+            raise DraftSessionError(
+                "observed_move_frame_mismatch",
+                (f"base frame role {parameters['base_frame_role']!r} resolves to "
+                 f"{requested_base!r}, but the robot reports its current pose with base "
+                 f"frame {observed_base!r}; choose the robot's base frame role to capture "
+                 "its current pose"
+                 if observed_base is not None else
+                 "the robot target does not report a base frame for its current pose"),
+                status_code=409,
+            )
+        direct_tcp_role = command.get("tcp_frame_role_id")
+        direct_tcp_row = next(
+            (row for row in descriptor_frames
+             if row["frame_role_id"] == direct_tcp_role),
+            None,
+        )
+        observed_frame = (
+            direct_tcp_row.get("compiled_frame_name")
+            if isinstance(direct_tcp_row, dict) else None
+        )
+        requested = tcp_frame_row.get("compiled_frame_name")
+        if requested is None or requested != observed_frame:
+            message = (
+                f"TCP endpoint target role {tcp_endpoint['target_role']!r} frame role "
+                f"{tcp_endpoint['frame_role']!r} resolves to {requested!r}, but the robot "
+                f"reports its current pose with TCP frame {observed_frame!r}; current-pose "
+                "capture requires the selected endpoint to match the robot's current TCP"
+                if observed_frame is not None else
+                f"the robot target does not report its current TCP frame for endpoint target "
+                f"role {tcp_endpoint['target_role']!r} frame role "
+                f"{tcp_endpoint['frame_role']!r}"
+            )
+            raise DraftSessionError(
+                "observed_move_frame_mismatch",
+                message,
+                status_code=409,
+            )
+        model_identity = (
+            tcp_frame_row.get("model_instance_id"),
+            tcp_frame_row.get("model_revision"),
+        )
+        observed_model_identity = (
+            direct_tcp_row.get("model_instance_id")
+            if isinstance(direct_tcp_row, dict) else None,
+            direct_tcp_row.get("model_revision")
+            if isinstance(direct_tcp_row, dict) else None,
+        )
+        if (
+            any(type(value) is not str or not value for value in model_identity)
+            or model_identity != observed_model_identity
+        ):
+            raise DraftSessionError(
+                "observed_move_frame_mismatch",
+                f"TCP endpoint target role {tcp_endpoint['target_role']!r} frame role "
+                f"{tcp_endpoint['frame_role']!r} and the robot's current TCP do not share "
+                "the same retained model instance and revision",
+                status_code=409,
+            )
         frame_ref = {"kind": "target_frame", "target_role": node_target_role,
                      "frame_role": parameters["base_frame_role"]}
     matching_observed = [
@@ -1201,6 +1320,102 @@ def _source_resolved_mutation(
     return None
 
 
+def prepare_program_discard(
+    state: ComposerState, draft_id: str, expected_revision: int
+) -> tuple[Callable[[], None], Callable[[], bool]]:
+    """Prepare returning the Program Draft to the exact Applied Program.
+
+    Returns the under-commit validation and the no-I/O install, so the
+    Program Discard and the Scenario Discard commit it the same way.
+    """
+
+    def read_applied() -> tuple[Program | dict[str, Any], tuple[str, str, str]]:
+        context, reason = _applied_context(state)
+        if reason is not None and reason["code"] == "program_not_selected":
+            empty = _applied_empty_authoring(state)
+            if empty is not None:
+                return empty
+        if reason is not None or context is None:
+            raise DraftSessionError(
+                (
+                    reason["code"]
+                    if reason
+                    else "program_applied_selection_invalid"
+                ),
+                reason["message"] if reason else "Applied Program is absent",
+                status_code=(
+                    404
+                    if reason
+                    and reason["code"]
+                    == "program_applied_selection_not_found"
+                    else 502
+                    if reason
+                    and reason["code"]
+                    == "program_applied_selection_invalid"
+                    else 503
+                ),
+            )
+        try:
+            candidate = Program.from_dict(
+                context.program_document,
+                _active_catalog(state),
+                path="<composer-program-discard>",
+            )
+        except ProgramValidationError as error:
+            raise DraftSessionError(
+                "composer_applied_program_validation_failed",
+                str(error),
+                status_code=409,
+                detail=str(error),
+            ) from error
+        if candidate.program_revision != context.program_revision:
+            raise DraftSessionError(
+                "program_applied_selection_invalid",
+                "headless Applied Program content is divergent",
+                status_code=502,
+            )
+        return candidate, (
+            context.scenario_id,
+            context.program_revision,
+            context.record_digest,
+        )
+
+    applied_program, applied_identity = read_applied()
+    prepared = state.draft_session.prepare_discard_replacement(
+        applied_program, _active_catalog(state)
+    )
+
+    def validate_applied_unchanged() -> None:
+        _program, current_identity = read_applied()
+        if current_identity != applied_identity:
+            raise DraftSessionError(
+                "program_applied_changed",
+                "Applied Program changed before Discard committed",
+                status_code=409,
+            )
+
+    return validate_applied_unchanged, lambda: state.draft_session.install_prepared_replacement(
+        prepared,
+        expected_draft_id=draft_id,
+        expected_revision=expected_revision,
+    )
+
+
+def discard_program_draft(state: ComposerState, body: Any) -> None:
+    """Return the Program Draft to Applied (Draft-only, no Manager effect)."""
+
+    validate, install = prepare_program_discard(
+        state, body.draft_id, body.expected_draft_revision
+    )
+    commit_draft_edit(
+        state,
+        body,
+        operation_kind="discard_draft",
+        validate=validate,
+        install=install,
+    )
+
+
 def create_draft_router(state: ComposerState) -> APIRouter:
     """Expose revision-fenced authoring and thin authoritative Apply/Load."""
 
@@ -1211,8 +1426,13 @@ def create_draft_router(state: ComposerState) -> APIRouter:
         program_document: dict[str, Any] | None,
         *,
         correlation_id: str | None = None,
+        require_deployment: Callable[[dict[str, Any]], None] | None = None,
     ) -> tuple[dict[str, Any], dict[str, Any]]:
-        """Prepare one complete immutable activation for a Program change."""
+        """Prepare one complete immutable activation for a Program change.
+
+        ``require_deployment`` checks the Applied Deployment this activation
+        carries before any Manager read.
+        """
 
         if state.headless_client is None:
             raise DraftSessionError(
@@ -1231,12 +1451,17 @@ def create_draft_router(state: ComposerState) -> APIRouter:
         source_digest = context.get("source_document_digest") if context is not None else None
         scenario_id = context.get("scenario_id") if context is not None else None
         project_path = context.get("project_path") if context is not None else None
+        # The Applied Scenario project folder; Program Apply keeps it.
+        scenario_project_path = (
+            context.get("scenario_project_path") if context is not None else None
+        )
         if (
             not isinstance(deployment, dict)
             or not isinstance(assignment, dict)
             or not isinstance(source_digest, str)
             or not isinstance(scenario_id, str)
             or not isinstance(project_path, str)
+            or not isinstance(scenario_project_path, str)
         ):
             raise DraftSessionError(
                 "activation_input_incomplete",
@@ -1244,6 +1469,8 @@ def create_draft_router(state: ComposerState) -> APIRouter:
                 status_code=409,
             )
         assert context is not None
+        if require_deployment is not None:
+            require_deployment(deployment)
         source_closure = capture_deployment_model_sources(
             deployment, project_root=Path(project_path)
         )
@@ -1259,6 +1486,7 @@ def create_draft_router(state: ComposerState) -> APIRouter:
             canonical_json_bytes(
                 {
                     "scenario_id": scenario_id,
+                    "project_path": scenario_project_path,
                     "source_document_digest": source_digest,
                     "deployment": deployment,
                     "model_source_closure": source_closure,
@@ -1273,6 +1501,7 @@ def create_draft_router(state: ComposerState) -> APIRouter:
         intent = {
             "scene_initialization": "preserve",
             "scenario_id": scenario_id,
+            "project_path": scenario_project_path,
             "source_document_digest": source_digest,
             "captured_input_digest": captured_digest,
             "deployment": deepcopy(deployment),
@@ -1842,82 +2071,7 @@ def create_draft_router(state: ComposerState) -> APIRouter:
     @router.post("/api/program/discard")
     def discard_draft(body: DiscardDraftRequest) -> dict[str, Any]:
         try:
-            def read_applied() -> tuple[Program | dict[str, Any], tuple[str, str, str]]:
-                context, reason = _applied_context(state)
-                if reason is not None and reason["code"] == "program_not_selected":
-                    empty = _applied_empty_authoring(state)
-                    if empty is not None:
-                        return empty
-                if reason is not None or context is None:
-                    raise DraftSessionError(
-                        (
-                            reason["code"]
-                            if reason
-                            else "program_applied_selection_invalid"
-                        ),
-                        reason["message"] if reason else "Applied Program is absent",
-                        status_code=(
-                            404
-                            if reason
-                            and reason["code"]
-                            == "program_applied_selection_not_found"
-                            else 502
-                            if reason
-                            and reason["code"]
-                            == "program_applied_selection_invalid"
-                            else 503
-                        ),
-                    )
-                try:
-                    candidate = Program.from_dict(
-                        context.program_document,
-                        _active_catalog(state),
-                        path="<composer-program-discard>",
-                    )
-                except ProgramValidationError as error:
-                    raise DraftSessionError(
-                        "composer_applied_program_validation_failed",
-                        str(error),
-                        status_code=409,
-                        detail=str(error),
-                    ) from error
-                if candidate.program_revision != context.program_revision:
-                    raise DraftSessionError(
-                        "program_applied_selection_invalid",
-                        "headless Applied Program content is divergent",
-                        status_code=502,
-                    )
-                return candidate, (
-                    context.scenario_id,
-                    context.program_revision,
-                    context.record_digest,
-                )
-
-            applied_program, applied_identity = read_applied()
-            prepared = state.draft_session.prepare_discard_replacement(
-                applied_program, _active_catalog(state)
-            )
-
-            def validate_applied_unchanged() -> None:
-                _program, current_identity = read_applied()
-                if current_identity != applied_identity:
-                    raise DraftSessionError(
-                        "program_applied_changed",
-                        "Applied Program changed before Discard committed",
-                        status_code=409,
-                    )
-
-            commit_draft_edit(
-                state,
-                body,
-                operation_kind="discard_draft",
-                validate=validate_applied_unchanged,
-                install=lambda: state.draft_session.install_prepared_replacement(
-                    prepared,
-                    expected_draft_id=body.draft_id,
-                    expected_revision=body.expected_draft_revision,
-                ),
-            )
+            discard_program_draft(state, body)
             # The Program workspace carries its own Draft-matched identity; the
             # composite snapshot must not replace it (it breaks that contract).
             return _workspace(state)
@@ -1928,16 +2082,9 @@ def create_draft_router(state: ComposerState) -> APIRouter:
     def revert_draft(body: RevertDraftRequest) -> JSONResponse:
         try:
             retained = state.draft_session.retained_state()
-            saved_document = retained.get("saved_document")
-            if not isinstance(saved_document, dict):
-                raise DraftSessionError(
-                    "composer_saved_program_unavailable",
-                    "Composer has no retained Saved Program",
-                    status_code=404,
-                )
-            saved_empty = saved_document.get("forest") == [] and not saved_document.get("scene")
-            saved_program = None if saved_empty else Program.from_dict(
-                saved_document, _active_catalog(state), path="<composer-program-revert-saved>")
+            restore = saved_program_restore(state, retained, _active_catalog(state))
+            saved_document = restore.saved_document
+            saved_program = restore.saved_program
             # Revert exists only while Saved differs from Applied: refused
             # before preparation or admission, so no effect is possible. An
             # Applied Program that cannot be read now never proves a no-op.
@@ -1952,22 +2099,30 @@ def create_draft_router(state: ComposerState) -> APIRouter:
                     "Nothing to revert: the Saved Program already matches Applied",
                     status_code=409,
                 )
+            def require_saved_deployment(deployment: dict[str, Any]) -> None:
+                # A Program-only Revert keeps the Applied Deployment, so it can
+                # restore the Scenario only while the Saved Deployment is that
+                # one: checked on the activation's own Deployment, before the
+                # Manager preview.
+                if saved_deployment_differs_from(state, deployment):
+                    raise DraftSessionError(
+                        "scenario_revert_requires_deployment",
+                        "The Saved Deployment differs from Applied; Revert the whole "
+                        "Scenario through the Deployment Revert",
+                        status_code=409,
+                    )
+
             intent, prepared = prepare_program_activation(
-                body, saved_program.to_dict() if saved_program is not None else None
+                body,
+                saved_program.to_dict() if saved_program is not None else None,
+                require_deployment=require_saved_deployment,
             )
             if saved_program is None:
                 intent["program_authoring"] = deepcopy(saved_document)
-            replacement_state = deepcopy(retained)
-            restored_program = saved_program.to_dict() if saved_program is not None else None
-            restored_authoring = from_program(saved_program) if saved_program is not None else deepcopy(saved_document)
-            if replacement_state.get("authoring") != restored_authoring:
-                replacement_state["draft_revision"] += 1
-            replacement_state["program"] = restored_program
-            replacement_state["authoring"] = restored_authoring
-            replacement_state["diagnostics"] = derive_candidate(restored_authoring, _active_catalog(state))[1]
-            replacement = state.draft_session.prepare_load_replacement(
-                replacement_state, _active_catalog(state)
-            )
+            replacement = restore.replacement
+            # Revert restores the whole Scenario: a Deployment Draft that left
+            # Saved (which matches Applied here) returns to it in the same commit.
+            deployment_restore = saved_deployment_restore(state)
             coordinator = state.authoring_admission
             if coordinator is None:
                 raise DraftSessionError(
@@ -1988,15 +2143,27 @@ def create_draft_router(state: ComposerState) -> APIRouter:
                     )
 
             def commit_saved() -> None:
-                state.authoring_workspace.commit_program(
-                    draft_id=body.draft_id,
-                    expected_identity=identity,
-                    install=lambda: state.draft_session.install_prepared_replacement(
+                # One whole-workspace commit: both Drafts return to Saved
+                # together, or the workspace is contained.
+                def install() -> bool:
+                    changed = state.draft_session.install_prepared_replacement(
                         replacement,
                         expected_draft_id=body.draft_id,
                         expected_revision=body.expected_draft_revision,
-                    ),
+                    )
+                    if deployment_restore is not None:
+                        changed = deployment_restore(identity) or changed
+                    return changed
+
+                state.authoring_workspace.replace(
+                    expected_identity=identity,
+                    install=install,
                     notify=False,
+                    context=AuthoringOperationContext(
+                        operation="revert_program",
+                        request_owner_epoch=body.request_owner_epoch,
+                        request_id=body.request_id,
+                    ),
                 )
 
             result = coordinator.execute_external_submission(
@@ -2007,6 +2174,7 @@ def create_draft_router(state: ComposerState) -> APIRouter:
                 payload=body.model_dump(mode="json", by_alias=True),
                 validate_under_claim=validate_submission,
                 commit_before_submit=commit_saved,
+                workspace=state.authoring_workspace,
                 submit=lambda claim: state.execute_authored_deployment_candidate(
                     intent, claim, apply=True, prepared=prepared
                 ),

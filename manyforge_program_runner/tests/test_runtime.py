@@ -151,6 +151,7 @@ class _Headless:
         self.applied_reads += 1
         return {
             "scenario_id": "cell-pick",
+            "project_path": "/projects/cell-pick.scenario",
             "source_document_digest": _DIGEST_A,
             "program_revision": _DIGEST_A,
             "program": _timer_only_program(),
@@ -402,6 +403,11 @@ class _Snapshot:
     @property
     def run_revision(self) -> int:
         return self._value["run_revision"]
+
+    @property
+    def operation_failures(self) -> tuple[dict[str, Any], ...]:
+        # ProgramRunSnapshot's typed failure rows, as published by to_dict.
+        return tuple(deepcopy(self._value.get("operation_failures", [])))
 
     def to_dict(self) -> dict[str, Any]:
         return deepcopy(self._value)
@@ -1686,6 +1692,7 @@ def _bypass_reset_scene_preparation(monkeypatch: pytest.MonkeyPatch) -> None:
 class _PreparedRunAdmission:
     def __init__(self) -> None:
         self.program = SimpleNamespace(to_dict=_timer_only_program, interrupt_condition_keys=())
+        self.project_path = "/projects/cell-pick.scenario"
 
     def port_context(self, program_run_id: str) -> object:
         return SimpleNamespace(

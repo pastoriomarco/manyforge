@@ -153,7 +153,10 @@ class OrchestratorRunner:
                         "kind": "motion",
                         "move_id": move_id,
                         "base_frame_role_id": "base",
-                        "tcp_frame_role_id": "tcp",
+                        "tcp_endpoint": {
+                            "target_role_id": target_role_id,
+                            "frame_role_id": "tcp",
+                        },
                         "tolerances": {
                             "joint_position_tol_rad": 0.001,
                             "translation_tol_m": 0.001,

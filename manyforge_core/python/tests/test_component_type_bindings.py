@@ -14,7 +14,7 @@ CAPABILITY_SCHEMA_REVISION = (
     "sha256:2de23ede0e941349e90f0a3a344b7d240426703d250234f86e788343213727e0"
 )
 COMPONENT_TYPE_SCHEMA_REVISION = (
-    "sha256:8e728ad4442d46b98f0d0534f8189df9b7982f982ab99cb656e6fdbeef231009"
+    "sha256:2f26f97a7454e620bfb39e16eeccc0b23ae2de61c32e3e8210eff46945d01fc4"
 )
 
 
@@ -133,6 +133,22 @@ def _component_type_reference(document: str):
 
 
 def test_component_type_dto_surface_is_typed_read_only_and_uses_closed_union():
+    endpoint_frame = core.ComponentTypeFrameRoleDTO(
+        frame_role_id=core.FrameRoleId("tool.endpoint.grasp"),
+        model_role_id=core.ModelRoleId("tool"),
+        asset_frame_role_id=core.FrameRoleId("gripper_tcp"),
+        contact_body_role_ids=[core.CollisionBodyRoleId("fingers")],
+    )
+    assert endpoint_frame.contact_body_role_ids == [
+        core.CollisionBodyRoleId("fingers")
+    ]
+    legacy_frame = core.ComponentTypeFrameRoleDTO(
+        frame_role_id=core.FrameRoleId("tcp"),
+        model_role_id=core.ModelRoleId("arm"),
+        asset_frame_role_id=core.FrameRoleId("tcp"),
+    )
+    assert legacy_frame.contact_body_role_ids == []
+
     pose = core.PlacementPoseDTO(
         position_m=[0.0, 0.0, 0.1],
         orientation_xyzw=[0.0, 0.0, 0.0, 1.0],

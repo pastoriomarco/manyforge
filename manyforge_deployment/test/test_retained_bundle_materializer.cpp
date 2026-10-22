@@ -367,7 +367,7 @@ make_contact_policy_retention_fixture() {
       core::SchemaId("manyforge.contact_policy.v1"),
       core::SchemaRevision(
           "sha256:"
-          "79f101a9c8cc2acf8db6ecaffd3476b03723afd5a31cce2a503f7b8764b47912"),
+          "c7ad633867abbe4583dee2eda51dca5b33bd8e8827777a8ac9ab86b2aba20490"),
       core::ContentDigest(policy_digest),
       core::ContentAddressedStoreKey("sha256/" + policy_digest.substr(7U)),
   };

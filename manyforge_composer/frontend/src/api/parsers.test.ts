@@ -122,6 +122,8 @@ describe('editable Scenario document transport', () => {
         path: '/workspace/examples/cell',
         scenario_id: 'cell',
         name: 'Cell',
+        folder_name: 'cell',
+        location: 'examples',
         description: 'Editable cell',
         saved_manyforge_version: '1.0.0',
         display_status: 'changed',
@@ -132,6 +134,8 @@ describe('editable Scenario document transport', () => {
     expect(parsed.directory).toBe('/workspace/examples');
     expect(parsed.entries.map((entry) => entry.sourceKind)).toEqual(['saved']);
     expect(parsed.entries[0]?.displayStatus).toBe('changed');
+    expect(parsed.entries[0]?.folderName).toBe('cell');
+    expect(parsed.entries[0]?.location).toBe('examples');
   });
 
   it('parses accepted and already-applied Scenario Load responses', () => {
@@ -351,7 +355,7 @@ function deploymentWorkspaceFixture(): Record<string, unknown> {
       graphRevision: digestC,
       differsFromSaved: false,
     },
-    saved: { path: '/workspace/deployment.fixture.json', deploymentRevision: digestA },
+    saved: { path: '/workspace/deployment.fixture.json', deploymentRevision: digestA, differsFromApplied: null },
     managerApplied: { activationOrder: null, deploymentRevision: digestA, scenarioId: 'fixture' },
     runAdmission: { ready: true, reason: null },
     binding: programBindingFixture('fixture-program', digestB, digestA),
@@ -578,7 +582,7 @@ function managerApplyRecordFixture(): Record<string, unknown> {
     prepared_activation: {
       schema_version: 'manyforge.prepared_activation_input.v6',
       prepared_activation_id: `sha256:${'a'.repeat(64)}`,
-      origin: { kind: 'scenario', scenario_id: 'fixture', source_document_digest: `sha256:${'b'.repeat(64)}` },
+      origin: { kind: 'scenario', scenario_id: 'fixture', source_document_digest: `sha256:${'b'.repeat(64)}`, project_path: '/projects/fixture.scenario' },
       captured_input_digest: `sha256:${'c'.repeat(64)}`,
       deployment_artifact_id: 'deployment.fixture',
       deployment_revision: `sha256:${'d'.repeat(64)}`,
@@ -956,6 +960,7 @@ describe('Program product projections', () => {
       retained_bundle_id: digestB,
       source_document_digest: digestA,
       scenario_id: 'cell-pick',
+      project_path: '/projects/cell-pick.scenario',
       schema_version: 'manyforge.applied_program_selection.v3',
       source: {
         record_digest: digestC,
@@ -1861,7 +1866,7 @@ describe('Program product projections', () => {
       prepared_activation: {
         schema_version: 'manyforge.prepared_activation_input.v6',
         prepared_activation_id: digestC,
-        origin: { kind: 'scenario', scenario_id: 'fixture', source_document_digest: digestA },
+        origin: { kind: 'scenario', scenario_id: 'fixture', source_document_digest: digestA, project_path: '/projects/fixture.scenario' },
         captured_input_digest: digestB,
         deployment_artifact_id: 'deployment.fixture',
         deployment_revision: digestA,
@@ -1929,7 +1934,7 @@ describe('Applied Program status parser', () => {
     program_revision: digest,
     record_digest: digest,
     retained_bundle_id: digest,
-    origin: { kind: 'scenario', scenario_id: 'scenario-a', source_document_digest: digest },
+    origin: { kind: 'scenario', scenario_id: 'scenario-a', source_document_digest: digest, project_path: '/projects/scenario-a.scenario' },
     schema_version: 'manyforge.applied_program_status.v2',
   };
 
@@ -1997,6 +2002,18 @@ describe('Deployment workspace parser', () => {
     (applied.activationOrder as Record<string, unknown>).componentIds = ['z', 'z'];
     expect(() => parseDeploymentWorkspaceResponse(fixture)).toThrow('unique ordered components');
     delete applied.activationOrder;
+    expect(() => parseDeploymentWorkspaceResponse(fixture)).toThrow();
+  });
+
+  it('requires the nullable server Saved-vs-Applied comparison', () => {
+    const fixture = deploymentWorkspaceFixture();
+    const saved = fixture.saved as Record<string, unknown>;
+    expect(parseDeploymentWorkspaceResponse(fixture).saved.differsFromApplied).toBeNull();
+    saved.differsFromApplied = false;
+    expect(parseDeploymentWorkspaceResponse(fixture).saved.differsFromApplied).toBe(false);
+    saved.differsFromApplied = 'no';
+    expect(() => parseDeploymentWorkspaceResponse(fixture)).toThrow();
+    delete saved.differsFromApplied;
     expect(() => parseDeploymentWorkspaceResponse(fixture)).toThrow();
   });
 
@@ -2091,6 +2108,57 @@ describe('Deployment workspace parser', () => {
       .toThrow(/exactly/);
   });
 
+  it('accepts the exact Manager operation of an accepted Deployment Apply', () => {
+    const digestA = `sha256:${'a'.repeat(64)}`;
+    const digestB = `sha256:${'b'.repeat(64)}`;
+    const digestC = `sha256:${'c'.repeat(64)}`;
+    const reply = (result: Record<string, unknown>) => ({
+      schemaVersion: 'manyforge.composer_deployment_candidate_operation.v1',
+      workspace: deploymentWorkspaceFixture(),
+      result: {
+        status: 'accepted',
+        confirmation_token: null,
+        prepared_activation: {
+          schema_version: 'manyforge.prepared_activation_input.v6',
+          prepared_activation_id: digestC,
+          origin: { kind: 'scenario', scenario_id: 'fixture', source_document_digest: digestA,
+            project_path: '/projects/fixture.scenario' },
+          captured_input_digest: digestB,
+          deployment_artifact_id: 'deployment.fixture',
+          deployment_revision: digestA,
+          retained_bundle_id: digestB,
+          graph_revision: digestC,
+          program_id: 'fixture-program',
+          program_revision: digestB,
+          program_outcome: { kind: 'bound', program_binding_id: digestA },
+          node_environment_digest: digestC,
+          assistant_mode: 'forbidden',
+        },
+        candidate_preview: null,
+        manager_apply: {
+          api_version: 'manyforge.manager_command_response.v1',
+          apply_generation: 4, apply_id: 'apply-4',
+          candidate_projection_revision: null,
+          error: null, ok: true, replay_status: 'accepted_new',
+          request_id: 'request-4', request_owner_epoch: 'owner.1', state: 'pending',
+        },
+        preparation: null,
+        phases_ms: { preparation_ms: 1 },
+        apply_id: 'apply-4',
+        apply_generation: 4,
+        ...result,
+      },
+    });
+
+    // The backend's accepted reply (state.py) always names the Apply generation.
+    const parsed = parseDeploymentCandidateOperationResponse(reply({}));
+    expect(parsed.result.managerApply?.applyGeneration).toBe(4);
+    expect(() => parseDeploymentCandidateOperationResponse(reply({ apply_generation: 5 })))
+      .toThrow(/exact accepted Manager operation/);
+    expect(() => parseDeploymentCandidateOperationResponse(reply({ apply_id: 'apply-other' })))
+      .toThrow(/exact accepted Manager operation/);
+  });
+
   it('retains bounded Apply phase timings and preparation identity', () => {
     const digestA = `sha256:${'a'.repeat(64)}`;
     const digestB = `sha256:${'b'.repeat(64)}`;
@@ -2098,7 +2166,7 @@ describe('Deployment workspace parser', () => {
     const preparedActivation = {
       schema_version: 'manyforge.prepared_activation_input.v6',
       prepared_activation_id: digestC,
-      origin: { kind: 'scenario', scenario_id: 'fixture', source_document_digest: digestA },
+      origin: { kind: 'scenario', scenario_id: 'fixture', source_document_digest: digestA, project_path: '/projects/fixture.scenario' },
       captured_input_digest: digestB,
       deployment_artifact_id: 'deployment.fixture',
       deployment_revision: digestA,
@@ -2159,7 +2227,7 @@ describe('Deployment workspace parser', () => {
         prepared_activation: {
           schema_version: 'manyforge.prepared_activation_input.v6',
           prepared_activation_id: digestC,
-          origin: { kind: 'scenario', scenario_id: 'fixture', source_document_digest: digestA },
+          origin: { kind: 'scenario', scenario_id: 'fixture', source_document_digest: digestA, project_path: '/projects/fixture.scenario' },
           captured_input_digest: digestB,
           deployment_artifact_id: deploymentArtifactId,
           deployment_revision: digestA,
@@ -2207,7 +2275,7 @@ describe('Deployment workspace parser', () => {
     fixture.binding = null;
     fixture.scenarioCandidates = [];
     fixture.savedScenarioCandidates = [];
-    fixture.saved = { path: '/workspace/deployment.yaml', deploymentRevision: null };
+    fixture.saved = { path: '/workspace/deployment.yaml', deploymentRevision: null, differsFromApplied: null };
     const parsed = parseDeploymentWorkspaceResponse(fixture);
     expect(parsed.draft.document?.api_version).toBe('manyforge.deployment_intent.v2');
     expect(parsed.draft.graphRevision).toBeNull();
@@ -2288,7 +2356,7 @@ describe('Deployment workspace parser', () => {
       deploymentRevision: null,
       graphRevision: null,
     });
-    fixture.saved = { path: null, deploymentRevision: null };
+    fixture.saved = { path: null, deploymentRevision: null, differsFromApplied: null };
     fixture.managerApplied = { activationOrder: null, deploymentRevision: null, scenarioId: null };
     fixture.runAdmission = {
       ready: false, reason: 'Deployment Draft differs from Manager Applied',
@@ -3245,6 +3313,17 @@ describe('headless projection parsers', () => {
     }
   });
 
+  it('parses the optional startup-project notice', () => {
+    const health = {
+      status: 'ok', mode: 'headless_client', components: {}, runtimeAvailability: null, timestamp: 1,
+    };
+    const notice = { path: '/p/cell.scenario', code: 'scenario_close_required', message: 'Startup project /p/cell.scenario was not opened.' };
+    expect(parseHealthResponse(health).startupScenarioNotice).toBeNull();
+    expect(parseHealthResponse({ ...health, startup_scenario_notice: notice }).startupScenarioNotice).toEqual(notice);
+    expect(() => parseHealthResponse({ ...health, startup_scenario_notice: { ...notice, extra: 1 } }))
+      .toThrow('health.startup_scenario_notice');
+  });
+
   it('parses exact Manager status, graph, and diff identities', () => {
     const source = {
       available: true,
@@ -4106,12 +4185,14 @@ describe('addressed Robot Control parsers', () => {
         { stage_id: 'stage.hard', stage_kind: 'software_hard', command_kind: 'software_hard_stop' },
       ],
     };
-    const withStop = (patch: unknown) => {
+    const withStop = (patch: unknown, error?: unknown) => {
       const wire = structuredClone(targetsResponse) as {
         targets: { components: Array<{ targets: Array<{ presentation: string; command: Record<string, unknown> }> }> };
       };
-      wire.targets.components[0].targets
-        .find((row) => row.presentation === 'motion')!.command.stop_response = patch;
+      const command = wire.targets.components[0].targets
+        .find((row) => row.presentation === 'motion')!.command;
+      command.stop_response = patch;
+      if (error !== undefined) command.stop_response_error = error;
       return parseExecutionControlStatus(wire, controlResponse);
     };
     const chained = withStop(stopResponse);
@@ -4140,6 +4221,14 @@ describe('addressed Robot Control parsers', () => {
     ]) {
       expect(() => withStop(malformed)).toThrow();
     }
+    // An unreadable Stop metadata source is published as null plus the
+    // owner's error: a fact about the target, not a malformed snapshot.
+    const unreadable = {
+      code: 'invalid_request', details: {}, message: 'Stop metadata is outside the exact composed binding',
+    };
+    expect(withStop(null, unreadable).directControlTargets[0].stopResponse).toBeUndefined();
+    expect(() => withStop(stopResponse, unreadable)).toThrow(/only without a Stop response/);
+    expect(() => withStop(null, { code: 'x' })).toThrow();
 
     // Pneumatic dwell may be zero; position duration stays strictly positive.
     // The snapshot and paired targets/control delta use the same descriptor rule.
@@ -4598,7 +4687,7 @@ describe('addressed Robot Control parsers', () => {
       compiled_joint_names: ['robot-a__joint1'],
     });
     // The motion command allows only its fields (and the optional stop_response).
-    expect(() => parseExecutionOwnerStatus(composed(leaked))).toThrow(/optional \[stop_response\]/);
+    expect(() => parseExecutionOwnerStatus(composed(leaked))).toThrow(/optional \[stop_response, stop_response_error\]/);
 
     const crossedDescriptor = structuredClone(response);
     crossedDescriptor.status.direct_control.target_descriptor.frames.reverse();
@@ -4741,6 +4830,7 @@ describe('persistent key value parsers', () => {
   const listing = {
     schema_version: 'manyforge.persistent_key_values.v1',
     scenario_id: 'cell-pick',
+    project_path: '/projects/cell-pick.scenario',
     program_revision: `sha256:${'a'.repeat(64)}`,
     program_run_id: null,
     sequence: 3,
@@ -4755,12 +4845,12 @@ describe('persistent key value parsers', () => {
       },
     ],
     edits: [{
-      sequence: 2, scenario_id: 'cell-pick', key: 'layer', action: 'set',
+      sequence: 2, project_path: '/projects/cell-pick.scenario', key: 'layer', action: 'set',
       request_id: 'request.1', source_label: 'operator_ui',
       program_run_id: null, node_instance_id: null, node_attempt_id: null,
       reason: null, detail: null,
     }, {
-      sequence: 3, scenario_id: 'cell-pick', key: 'layer', action: 'set',
+      sequence: 3, project_path: '/projects/cell-pick.scenario', key: 'layer', action: 'set',
       request_id: null, source_label: 'program_node',
       program_run_id: 'program-cycle.1', node_instance_id: 'set_layer', node_attempt_id: null,
       reason: null, detail: null,
@@ -4799,11 +4889,14 @@ describe('persistent key value parsers', () => {
     expect(parsePersistentKeyEdit({
       schema_version: 'manyforge.persistent_key_edit.v1',
       request_id: 'request.2', action: 'reset', key: 'layer', values: listing,
-    }).scenarioId).toBe('cell-pick');
+    }).projectPath).toBe('/projects/cell-pick.scenario');
     expect(parsePersistentKeyValuesCleared({
       schema_version: 'manyforge.persistent_key_edit.v1',
-      request_id: 'request.3', action: 'clear', scenario_id: 'cell-pick', removed: 2,
-    })).toEqual({ requestId: 'request.3', scenarioId: 'cell-pick', removed: 2 });
+      request_id: 'request.3', action: 'clear',
+      project_path: '/projects/cell-pick.scenario', removed: 2,
+    })).toEqual({
+      requestId: 'request.3', projectPath: '/projects/cell-pick.scenario', removed: 2,
+    });
   });
 
   it('refuses inconsistent rows instead of guessing', () => {
@@ -4819,6 +4912,14 @@ describe('persistent key value parsers', () => {
     })).toThrow(/access/);
     expect(() => parsePersistentKeyValues({ ...listing, extra: true })).toThrow(/exactly/);
     expect(() => parsePersistentKeyValues({ ...listing, sequence: null })).toThrow(/sequence/);
+    for (const projectPath of [
+      'projects/cell.scenario', '/projects/../cell.scenario', '/projects/./cell.scenario',
+      '/projects//cell.scenario', '/projects/cell.scenario/', '/projects/\0cell',
+      `/${'p'.repeat(4096)}`,
+    ]) {
+      expect(() => parsePersistentKeyValues({ ...listing, project_path: projectPath }))
+        .toThrow(/project_path/);
+    }
     expect(() => parsePersistentKeyEdit({
       schema_version: 'manyforge.persistent_key_edit.v1',
       request_id: 'request.2', action: 'clear', key: 'layer', values: listing,
@@ -4827,7 +4928,7 @@ describe('persistent key value parsers', () => {
 
   it('parses dropped values with their reason and a storage fault', () => {
     const dropped = {
-      sequence: 4, scenario_id: 'cell-pick', key: null, action: 'dropped',
+      sequence: 4, project_path: '/projects/cell-pick.scenario', key: null, action: 'dropped',
       request_id: null, source_label: 'committed_apply',
       program_run_id: null, node_instance_id: null, node_attempt_id: null,
       reason: 'applied_program_not_observed', detail: null,
@@ -4859,7 +4960,7 @@ describe('persistent key value parsers', () => {
     const parsed = parsePersistentKeyValues({
       ...listing,
       edits: [{
-        sequence: 4, scenario_id: 'cell-pick', key: null, action: 'fault',
+        sequence: 4, project_path: '/projects/cell-pick.scenario', key: null, action: 'fault',
         request_id: null, source_label: 'committed_apply',
         program_run_id: null, node_instance_id: null, node_attempt_id: null,
         reason: 'applied_program_not_observed', detail: `committed Apply ${missed} was not observed`,

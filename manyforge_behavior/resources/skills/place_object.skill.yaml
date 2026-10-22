@@ -198,7 +198,7 @@
         "parameters": {
           "target_role": "${target:arm}",
           "base_frame_role": "base",
-          "tcp_frame_role": "tcp",
+          "tcp_endpoint": {"target_role": "${target:arm}", "frame_role": "tcp"},
           "target_mode": "relative",
           "target_reference": {
             "type": "pose",
@@ -230,7 +230,7 @@
         "parameters": {
           "target_role": "${target:arm}",
           "base_frame_role": "base",
-          "tcp_frame_role": "tcp",
+          "tcp_endpoint": {"target_role": "${target:arm}", "frame_role": "tcp"},
           "target_mode": "relative",
           "target_reference": {
             "type": "pose",
@@ -280,7 +280,7 @@
         "parameters": {
           "target_role": "${target:arm}",
           "base_frame_role": "base",
-          "tcp_frame_role": "tcp",
+          "tcp_endpoint": {"target_role": "${target:arm}", "frame_role": "tcp"},
           "target_mode": "relative",
           "target_reference": {
             "type": "pose",

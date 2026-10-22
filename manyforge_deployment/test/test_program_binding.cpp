@@ -14,6 +14,7 @@
 #include <variant>
 #include <vector>
 
+#include <manyforge_core/types/collision_world_snapshot.hpp>
 #include <manyforge_deployment/content_identity.hpp>
 #include <manyforge_deployment/initial_scene_projection.hpp>
 #include <manyforge_deployment/program_binding.hpp>
@@ -430,6 +431,125 @@ TEST(ProgramBindingTest,
   ASSERT_NE(reloaded, nullptr);
   EXPECT_EQ(reloaded->program_binding_id(), sealed->program_binding_id());
   EXPECT_EQ(reloaded->value(), sealed->value());
+}
+
+TEST(ProgramBindingTest, MotionEndpointReleaseBindingRoundTripsExactEnvelope) {
+  ScopedTrustedRoot root;
+  const auto context = make_context(root.path());
+  auto value = make_binding_value(context);
+  manyforge::core::ContactReleaseEnvelopeDTO release;
+  release.max_start_penetration_m = 0.002;
+  value.contact_grasp_bindings.push_back({
+      manyforge::core::ContactPolicyId("endpoint_release"),
+      manyforge::core::ContactPolicyRevision(std::string(kZeroDigest)),
+      manyforge::core::RuntimeObjectId("selected_object"), {}, release, true});
+  const auto sealed = ProgramBindingConstructionAuthority::seal(value);
+  EXPECT_NE(sealed->canonical_bytes().find("\"mode\":\"contact_release\""),
+            std::string::npos);
+  EXPECT_EQ(sealed->canonical_bytes().find("terminal_window_start_fraction"),
+            std::string::npos);
+  const auto loaded = reload_verified_program_binding(
+      sealed->canonical_bytes(), *context.bundle, context.model_map);
+  EXPECT_EQ(loaded->value(), sealed->value());
+  EXPECT_EQ(std::get<manyforge::core::ContactReleaseEnvelopeDTO>(
+                loaded->value().contact_grasp_bindings.front().envelope), release);
+}
+
+TEST(ProgramBindingTest,
+     MotionEndpointContactBindingRoundTripsWithoutExplicitBodies) {
+  ScopedTrustedRoot root;
+  const auto context = make_context(root.path());
+  auto value = make_binding_value(context);
+  value.contact_grasp_bindings.push_back(
+      manyforge::core::ProgramContactGraspBindingDTO{
+          manyforge::core::ContactPolicyId("endpoint_contact"),
+          manyforge::core::ContactPolicyRevision(std::string(kZeroDigest)),
+          manyforge::core::RuntimeObjectId("selected_object"),
+          {},
+          manyforge::core::ContactGraspEnvelopeDTO{0.002, 0.8},
+          true});
+  const auto sealed = ProgramBindingConstructionAuthority::seal(value);
+  EXPECT_NE(
+      sealed->canonical_bytes().find("\"bodies_from_motion_endpoint\":true"),
+      std::string::npos);
+  const auto loaded = reload_verified_program_binding(
+      sealed->canonical_bytes(), *context.bundle, context.model_map);
+  EXPECT_EQ(loaded->value(), sealed->value());
+  value.contact_grasp_bindings.front().bodies_from_motion_endpoint = false;
+  EXPECT_THROW(
+      static_cast<void>(ProgramBindingConstructionAuthority::seal(value)),
+      ProgramBindingError);
+  const auto &target = value.target_role_bindings.front();
+  const auto &body = target.collision_body_role_bindings.front();
+  std::vector<std::string> ids;
+  for (std::size_t i = 0U; i < body.compiled_collision_body_names.size(); ++i) {
+    ids.push_back(manyforge::core::make_component_collision_body_id(
+        target.controllable_component_id, body.model_instance_id,
+        body.collision_body_role_id, i));
+  }
+  value.contact_grasp_bindings.front().allowed_body_bindings.push_back(
+      {target.component_role_id, target.target_role_id,
+       target.controllable_component_id, target.command_target_id, std::nullopt,
+       body.collision_body_role_id, body.model_instance_id, body.model_revision,
+       std::move(ids)});
+  const auto legacy = ProgramBindingConstructionAuthority::seal(value);
+  EXPECT_EQ(legacy->canonical_bytes().find("bodies_from_motion_endpoint"),
+            std::string::npos);
+  EXPECT_EQ(reload_verified_program_binding(legacy->canonical_bytes(),
+                                            *context.bundle, context.model_map)
+                ->value(),
+            legacy->value());
+  value.contact_grasp_bindings.front().bodies_from_motion_endpoint = true;
+  EXPECT_THROW(
+      static_cast<void>(ProgramBindingConstructionAuthority::seal(value)),
+      ProgramBindingError);
+}
+
+TEST(ProgramBindingTest,
+     EndpointContactBodyAssociationsAreOptionalAndFrameScoped) {
+  ScopedTrustedRoot root;
+  const auto context = make_context(root.path());
+  auto value = make_binding_value(context);
+  const auto legacy = ProgramBindingConstructionAuthority::seal(value);
+  EXPECT_EQ(legacy->canonical_bytes().find("contact_body_role_ids"),
+            std::string::npos);
+
+  auto &target = value.target_role_bindings.front();
+  target.frame_role_bindings.front().contact_body_role_ids = {
+      CollisionBodyRoleId("arm_collision")};
+  const auto first_endpoint = ProgramBindingConstructionAuthority::seal(value);
+  EXPECT_NE(first_endpoint->canonical_bytes().find(
+                "\"contact_body_role_ids\":[\"arm_collision\"]"),
+            std::string::npos);
+  const auto reopened = reload_verified_program_binding(
+      first_endpoint->canonical_bytes(), *context.bundle, context.model_map);
+  EXPECT_EQ(reopened->value(), first_endpoint->value());
+
+  auto second_frame = target.frame_role_bindings.front();
+  second_frame.frame_role_id = manyforge::core::FrameRoleId("sibling_tcp");
+  second_frame.compiled_frame_name += "_sibling";
+  second_frame.contact_body_role_ids = {
+      CollisionBodyRoleId("sibling_collision")};
+  target.frame_role_bindings.push_back(std::move(second_frame));
+  auto second_body = target.collision_body_role_bindings.front();
+  second_body.collision_body_role_id = CollisionBodyRoleId("sibling_collision");
+  second_body.compiled_collision_body_names = {"sibling_left", "sibling_right"};
+  target.collision_body_role_bindings.push_back(std::move(second_body));
+  const auto two_endpoints = ProgramBindingConstructionAuthority::seal(value);
+  EXPECT_NE(two_endpoints->canonical_bytes().find("\"frame_role_id\":\"tcp\""),
+            std::string::npos);
+  EXPECT_NE(two_endpoints->canonical_bytes().find(
+                "\"frame_role_id\":\"sibling_tcp\""),
+            std::string::npos);
+  EXPECT_NE(two_endpoints->canonical_bytes().find(
+                "\"contact_body_role_ids\":[\"sibling_collision\"]"),
+            std::string::npos);
+
+  target.collision_body_role_bindings.back().model_revision =
+      manyforge::core::ModelRevision(std::string(kZeroDigest));
+  EXPECT_THROW(
+      static_cast<void>(ProgramBindingConstructionAuthority::seal(value)),
+      ProgramBindingError);
 }
 
 TEST(ProgramBindingTest, NodePoliciesAreRequiredSparseAndIdentitySensitive) {
