@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from contextlib import contextmanager
+import fcntl
 import os
 from pathlib import Path
 import stat
@@ -127,6 +128,31 @@ class PinnedRunRoot:
                     "private endpoint is not the exact same-user socket"
                 )
             yield f"/proc/self/fd/{descriptor}/{filename}"
+
+    def read_file(self, filename: str, maximum_bytes: int) -> bytes:
+        """Read one private immutable leaf while excluding store eviction."""
+        if not filename or filename in {".", ".."} or "/" in filename or "\\" in filename:
+            raise PrivateTransportCapabilityError("private file name is invalid")
+        with self._open(expected_identity=self._identity) as (directory, _identity):
+            try:
+                fcntl.flock(directory, fcntl.LOCK_SH | fcntl.LOCK_NB)
+                descriptor = os.open(filename, os.O_RDONLY | os.O_CLOEXEC | os.O_NOFOLLOW | os.O_NONBLOCK,
+                                     dir_fd=directory)
+                with os.fdopen(descriptor, "rb") as source:
+                    before = os.fstat(source.fileno())
+                    if (not stat.S_ISREG(before.st_mode) or before.st_uid != os.geteuid()
+                            or before.st_nlink != 1 or stat.S_IMODE(before.st_mode) != 0o600
+                            or not 0 < before.st_size <= maximum_bytes):
+                        raise PrivateTransportCapabilityError("private file is unsafe or exceeds its bound")
+                    payload = source.read(maximum_bytes + 1)
+                    after = os.fstat(source.fileno())
+                    if ((before.st_dev, before.st_ino, before.st_size, before.st_mtime_ns, before.st_ctime_ns)
+                            != (after.st_dev, after.st_ino, after.st_size, after.st_mtime_ns, after.st_ctime_ns)
+                            or len(payload) != before.st_size):
+                        raise PrivateTransportCapabilityError("private file changed during read")
+                    return payload
+            except OSError as error:
+                raise PrivateTransportCapabilityError(f"private file is unavailable: {error}") from error
 
 
 __all__ = ["PinnedRunRoot", "PrivateTransportCapabilityError"]

@@ -1,5 +1,7 @@
 #include "resource_addressed_execution_kernel_internal.hpp"
 
+#include <cstdio>
+
 namespace manyforge::core {
 namespace {
 // Unpublished capture storage. Required strong identities are filled from the
@@ -575,7 +577,9 @@ Result<void> ResourceAddressedExecutionKernel::advance_motion_takeover_impl(
     return Result<void>::Ok();
   }
 
+  const auto observe_started = clock_.now();
   const auto observed = prepared_engine->ObservePreparedMotion(candidate_execution_id);
+  const auto observe_finished = clock_.now();
   if (!observed.ok())
     return begin_motion_takeover_fallback(incumbent_id, candidate_id, observed.error());
   const auto& snapshot = observed.value();
@@ -595,11 +599,16 @@ Result<void> ResourceAddressedExecutionKernel::advance_motion_takeover_impl(
                                       "motion_takeover_preparation_failed")));
 
   if (snapshot.state == ResolvedPreparedMotionExecutionStateDTO::kPrepared) {
+    const auto commit_started = clock_.now();
     OperationCommitGuard commit(*this, incumbent_id);
+    const auto commit_acquired = clock_.now();
+    std::int64_t state_acquired{}, verify_started{}, verify_finished{};
     OperationStateDTO dispatch_state = empty_takeover_capture_storage();
     ContentDigest digest{std::string{}};
+    const auto state_lock_started = clock_.now();
     {
       std::lock_guard lock(state_mutex_);
+      state_acquired = clock_.now();
       auto* incumbent = find_active_operation_locked(incumbent_id);
       auto* candidate = find_pending_motion_operation_locked(candidate_id);
       if (!incumbent || !candidate || incumbent->state.active_stop_id ||
@@ -611,9 +620,11 @@ Result<void> ResourceAddressedExecutionKernel::advance_motion_takeover_impl(
       if (!snapshot.participant || !snapshot.backend_prepare_result)
         return reject<void>("takeover preparation has no exact product",
                             "prepared_motion_observation_invalid", ErrorCode::kInvariantViolation);
+      verify_started = clock_.now();
       const auto verified = VerifyPreparedOperationParticipant(
           *snapshot.participant, row.binding, *row.stop_readiness, row.retained_default_stop_limits,
           row.stop_node_category);
+      verify_finished = clock_.now();
       if (!verified.ok()) return verified;
       if (snapshot.participant->controller().ordinary_stop_plan != *row.ordinary_stop_plan ||
           !prepared_fault_stop_plan_matches(snapshot.participant->controller().fault_stop_plan,
@@ -660,6 +671,19 @@ Result<void> ResourceAddressedExecutionKernel::advance_motion_takeover_impl(
     }
     commit.release();
     const auto dispatched = prepared_engine->DispatchPreparedMotion(candidate_execution_id, digest);
+    (void)std::fprintf(stderr,
+        "manyforge_moving_owner_phase operation_id=%.160s execution_id=%llu "
+        "observe_started_ns=%lld state_updated_ns=%lld observe_wall_ns=%lld "
+        "commit_wait_wall_ns=%lld state_lock_wall_ns=%lld authority_wall_ns=%lld "
+        "verify_wall_ns=%lld post_verify_wall_ns=%lld\n",
+        candidate_id.value().c_str(), static_cast<unsigned long long>(candidate_execution_id),
+        static_cast<long long>(observe_started), static_cast<long long>(dispatch_state.updated_at_ns),
+        static_cast<long long>(observe_finished - observe_started),
+        static_cast<long long>(commit_acquired - commit_started),
+        static_cast<long long>(state_acquired - state_lock_started),
+        static_cast<long long>(verify_started - state_acquired),
+        static_cast<long long>(verify_finished - verify_started),
+        static_cast<long long>(dispatch_state.updated_at_ns - verify_finished));
     if (!dispatched.ok())
       return begin_motion_takeover_fallback(incumbent_id, candidate_id, dispatched.error());
     return Result<void>::Ok();

@@ -327,10 +327,28 @@ def test_plain_stop_reports_failed_stop_without_deleting(tmp_path: Path) -> None
 @pytest.mark.parametrize("selection", [[], ["--bootstrap-project", "examples/first.scenario"],
                                        ["--project", "examples/authored.scenario"]])
 @pytest.mark.parametrize("container_name", ["manyforge-development-workbench", "isolated-workbench"])
+@pytest.mark.parametrize("trace_enabled", [False, True])
+@pytest.mark.parametrize("experiment_enabled", [False, True])
 def test_start_preserves_ros_topology_by_default_and_refuses_removed_flag(
-    tmp_path: Path, explicit_ros_flag: bool, selection: list[str], container_name: str
+    tmp_path: Path, explicit_ros_flag: bool, selection: list[str], container_name: str,
+    trace_enabled: bool, experiment_enabled: bool,
 ) -> None:
     environment = _fake_docker_environment(tmp_path)
+    experiments = {
+        "MANYFORGE_EXPERIMENTAL_RELEASE_TIMER": "1",
+        "MANYFORGE_EXPERIMENTAL_MIDTICK_STAMP": "1",
+        "MANYFORGE_EXPERIMENTAL_V0_PAYLOAD": "0",
+        "MANYFORGE_EXPERIMENTAL_SCHEDULED_SPRING_BACK_FAST": "0",
+        "MANYFORGE_EXPERIMENTAL_RELEASE_TIMER_LATENCY_MS": "1.5",
+        "MANYFORGE_EXPERIMENTAL_REPLACEMENT_START_ALLOWANCE_MS": "30",
+    }
+    for name, value in experiments.items():
+        environment.pop(name, None)
+        if experiment_enabled:
+            environment[name] = value
+    environment.pop("MANYFORGE_MOTION_TRACE_DIR", None)
+    if trace_enabled:
+        environment["MANYFORGE_MOTION_TRACE_DIR"] = "/tmp/manyforge-state/motion-traces"
     workspace = tmp_path / "workspace"
     launcher = workspace / "scripts" / LAUNCHER.name
     launcher.parent.mkdir(parents=True)
@@ -382,6 +400,9 @@ esac
     assert completed.returncode == 0, completed.stderr
     calls = Path(environment["FAKE_DOCKER_CALLS"]).read_text().splitlines()
     command = next(call for call in calls if call.startswith("run "))
+    assert ("--env MANYFORGE_MOTION_TRACE_DIR" in command) is trace_enabled
+    for name in experiments:
+        assert (f"--env {name}" in command) is experiment_enabled
     assert os.access(workspace, os.W_OK)
     assert f"-v {workspace}:/workspace" in command
     runtime_root = tmp_path / "cache/runtime" / container_name

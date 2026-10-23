@@ -46,6 +46,11 @@ namespace {
 
 [[nodiscard]] bool resolved_scale_target_matches(const ResolvedRuntimeScaleCommandDTO& command,
                                                  const ResolvedExecutionBindingDTO& binding);
+[[nodiscard]] bool resolved_scale_command_well_formed(
+    const ResolvedRuntimeScaleCommandDTO& command);
+[[nodiscard]] ResolvedRuntimeScaleAcceptedDTO make_scale_acceptance(
+    const ResolvedRuntimeScaleCommandDTO& command, std::uint64_t sequence,
+    std::int64_t accepted_at_ns);
 
 std::optional<std::int64_t> motion_replacement_elapsed_ns(std::int64_t now,
                                                           std::int64_t started) noexcept {
@@ -3273,9 +3278,13 @@ ExecutionKernel::make_and_prepare_motion_participant(
     return reject("prepared_motion_evidence_incomplete",
                   "Prepared motion is missing planning or validation evidence");
   }
+  const bool trace_preparation = prepared_session->authority.replacement &&
+                                 !prepared_session->authority.replacement->spring_return;
+  const auto assembly_started = trace_preparation ? clock_.now() : 0;
   auto assembled = assemble_prepared_motion_participant(
       prepared_session->authority, request, trajectory, *plan_phase.plan_request,
       *plan_phase.planning_result, *validation_phase.validation_evidence);
+  const auto assembly_finished = trace_preparation ? clock_.now() : 0;
   if (!assembled.ok()) return assembled;
   auto participant = std::move(assembled.value());
   const bool cold_reuse = prepared_session->authority.replacement &&
@@ -3285,6 +3294,7 @@ ExecutionKernel::make_and_prepare_motion_participant(
     return reject("spring_return_sealed_product_changed",
                   "Cold activation changed its retained planning or validation evidence");
 
+  const auto backend_started = trace_preparation ? clock_.now() : 0;
   Result<PrepareParticipantResultDTO> backend_result = [&]() {
     try {
       return Result<PrepareParticipantResultDTO>::Ok(
@@ -3308,6 +3318,16 @@ ExecutionKernel::make_and_prepare_motion_participant(
                     {"exception", reason_codes::kUnknownNonStdException}}});
     }
   }();
+  const auto backend_finished = trace_preparation ? clock_.now() : 0;
+  if (trace_preparation)
+    (void)std::fprintf(stderr,
+        "manyforge_moving_core_phase source_goal=%.160s phase=participant_prepare "
+        "execution_id=%llu started_ns=%lld finished_ns=%lld assembly_wall_ns=%lld backend_wall_ns=%lld\n",
+        prepared_session->authority.replacement->source.goal.controller_goal_id.value().c_str(),
+        static_cast<unsigned long long>(prepared_session->execution_id),
+        static_cast<long long>(assembly_started), static_cast<long long>(backend_finished),
+        static_cast<long long>(assembly_finished - assembly_started),
+        static_cast<long long>(backend_finished - backend_started));
   if (!backend_result.ok()) {
     return Result<std::shared_ptr<const PreparedOperationParticipantDTO>>::Err(
         backend_result.error());
@@ -4259,7 +4279,8 @@ Result<void> ExecutionKernel::qualify_spring_motion_replacement(
       point.binding_epoch,
       source.last_dispatched_participant->prepared_contract_digest,
       point.trip,
-      {}};
+      {},
+      0};
   return Result<void>::Ok();
 }
 
@@ -4727,6 +4748,7 @@ void ExecutionKernel::compute_motion_replacement(const std::stop_token stop_toke
     return ErrorDTO{
         kErrorExecutionRejected, "Moving replacement preparation failed", {{"reason", reason}}};
   };
+  std::optional<std::int64_t> backend_prepared_at;
   auto compute = [&]() -> Result<void> {
     if (session->spring_cold_product) return compute_spring_motion_replacement(stop_token, session);
     const auto& context = *session->authority.replacement;
@@ -4767,9 +4789,13 @@ void ExecutionKernel::compute_motion_replacement(const std::stop_token stop_toke
       return Result<void>::Err(failed("motion_replacement_source_sample_invalid"));
     // Actual cursor and remaining lead are rechecked at send and adoption;
     // the backend owns the confirmed scale hold through the connector.
+    // The controller commands one unscaled period P ahead of its cursor. With
+    // P added, a takeover tick T at most budget + P after this sample's stamp
+    // S finds every earlier source command at or before D (nominal clock).
     const double cursor = static_cast<double>(captured.progress.trajectory_time_ns) / 1e9;
     const double divergence = cursor + static_cast<double>(context.preparation_budget_ns) / 1e9 *
-                                           *captured.controller_sample.applied_factor;
+                                           *captured.controller_sample.applied_factor +
+                              static_cast<double>(captured.controller_period_ns) / 1e9;
     if (!std::isfinite(divergence) || divergence <= cursor ||
         source->trajectory.waypoints.empty() ||
         divergence >= source->trajectory.waypoints.back().time_from_start_s)
@@ -4904,7 +4930,8 @@ void ExecutionKernel::compute_motion_replacement(const std::stop_token stop_toke
         validation.collision_decision};
     auto product =
         make_and_prepare_motion_participant(request, trajectory, planning, validated, session);
-    trace_moving_core_phase(&moving, "backend_prepared", start_ns, clock_.now(), trajectory.waypoints.size());
+    backend_prepared_at = clock_.now();
+    trace_moving_core_phase(&moving, "backend_prepared", start_ns, *backend_prepared_at, trajectory.waypoints.size());
     if (!product.ok()) return Result<void>::Err(product.error());
     auto projection =
         build_runtime_collision_state_projection(trajectory, validation.collision_trajectory);
@@ -4963,6 +4990,13 @@ void ExecutionKernel::compute_motion_replacement(const std::stop_token stop_toke
     // owner cleanup observes any retirement refusal and retains membership.
     (void)execution_backend_.RetirePreparedExecution(session->execution_id);
   }
+  if (backend_prepared_at)
+    (void)std::fprintf(stderr,
+        "manyforge_moving_core_phase source_goal=%.160s phase=preparation_finalized "
+        "execution_id=%llu started_ns=%lld finished_ns=%lld\n",
+        session->authority.replacement->source.goal.controller_goal_id.value().c_str(),
+        static_cast<unsigned long long>(session->execution_id),
+        static_cast<long long>(*backend_prepared_at), static_cast<long long>(clock_.now()));
   session->changed.notify_all();
   KernelEvent event;
   event.type = KernelEventType::kParticipantPrepared;
@@ -5191,6 +5225,10 @@ Result<bool> ExecutionKernel::CommitPreparedMotionReplacement(
         kErrorExecutionRejected, "Replacement adoption was refused", {{"reason", reason}}});
   };
   if (!commit.owner_commit) return reject("motion_replacement_commit_missing");
+  // A scale submission may synchronously notify the addressed owner. Never
+  // wait for it while that owner's state lock is held by this handover.
+  std::unique_lock submission_lock(resolved_runtime_scale_submission_mutex_, std::try_to_lock);
+  if (!submission_lock.owns_lock()) return Result<bool>::Ok(false);
   std::lock_guard owner_lock(prepared_motion_session_mutex_);
   auto pending = pending_prepared_motion_session_;
   auto incumbent = active_prepared_motion_session_;
@@ -5263,6 +5301,25 @@ Result<bool> ExecutionKernel::CommitPreparedMotionReplacement(
           ? static_cast<std::int64_t>(*next.request.timeouts.zero_speed_hold_timeout_s * 1e9)
           : 0;
   next.execution_progress_generation = pending->backend_execution_generation;
+  std::unique_lock scale_lock(resolved_runtime_scale_mutex_);
+  std::optional<ResolvedRuntimeScaleCommandDTO> successor_scale;
+  std::optional<ResolvedRuntimeScaleAcceptedDTO> successor_acceptance;
+  if (next.request.initial_runtime_scale) {
+    if (!accepted_resolved_runtime_scale_command_ ||
+        !resolved_scale_target_matches(*accepted_resolved_runtime_scale_command_,
+                                       current->request.binding) ||
+        !resolved_scale_command_well_formed(*next.request.initial_runtime_scale) ||
+        !resolved_scale_target_matches(*next.request.initial_runtime_scale, next.request.binding))
+      return reject("motion_replacement_scale_authority_stale");
+    if (runtime_scale_acceptance_sequence_ == std::numeric_limits<std::uint64_t>::max())
+      return reject("runtime_scale_acceptance_sequence_exhausted");
+    successor_scale = *next.request.initial_runtime_scale;
+    successor_scale->expected_runtime_scale_generation = RuntimeScaleGeneration(0U);
+    successor_scale->requested_runtime_scale_generation = RuntimeScaleGeneration(0U);
+    successor_scale->requested_scale = accepted_resolved_runtime_scale_command_->requested_scale;
+    successor_acceptance = make_scale_acceptance(
+        *successor_scale, runtime_scale_acceptance_sequence_ + 1U, clock_.now());
+  }
   const auto adopted = execution_backend_.AdoptReplacement(source, candidate_id, commit);
   if (!adopted.ok()) return Result<bool>::Err(adopted.error());
   static_assert(std::is_nothrow_swappable_v<ActiveMotionExecution>);
@@ -5271,7 +5328,17 @@ Result<bool> ExecutionKernel::CommitPreparedMotionReplacement(
   active_prepared_motion_session_ = pending;
   pending_prepared_motion_session_.reset();
   sm_.set_execution_id(candidate_id);
+  if (successor_scale) {
+    static_assert(std::is_nothrow_swappable_v<decltype(successor_scale)>);
+    static_assert(std::is_nothrow_swappable_v<decltype(successor_acceptance)>);
+    accepted_resolved_runtime_scale_command_.swap(successor_scale);
+    accepted_resolved_runtime_scale_result_.swap(successor_acceptance);
+    runtime_scale_acceptance_sequence_ = accepted_resolved_runtime_scale_result_->acceptance_sequence;
+    current->request.initial_runtime_scale->requested_scale =
+        accepted_resolved_runtime_scale_command_->requested_scale;
+  }
   active_correlation_.swap_prepared(*pending->replacement_correlation);
+  scale_lock.unlock();
   // Reuse the continuous immediate session/schedule: no teardown, no new
   // query engine and no contact-release re-baseline at handover.
   runtime_collision_protection_.execution_id = candidate_id;
@@ -7608,7 +7675,12 @@ Result<void> ExecutionKernel::collision_check_tick() {
   };
   if (observed_timestamp_invalid || observed_timestamp_stale) {
     std::map<std::string, std::string> monitor_details{{"reason_code", "runtime_collision_monitor"},
-                                                       {"reason", "stale_observed_robot_state"}};
+                                                       {"reason", "stale_observed_robot_state"},
+                                                       {"cause", "stale_observed_robot_state"},
+                                                       {"monitor_reason", observed_timestamp_invalid ?
+                                                           "invalid_observed_robot_timestamp" : "stale_observed_robot_state"},
+                                                       {"sample_age_ns", observed_timestamp_invalid ?
+                                                           "unknown" : std::to_string(observed_age_ns)}};
     append_observed_details(monitor_details);
     return publish_runtime_monitor_fault(CollisionCheckResultDTO{}, std::move(monitor_details));
   }
@@ -9013,17 +9085,18 @@ Result<ResolvedRuntimeScaleStatusDTO> ExecutionKernel::runtime_scale_status(
                  "runtime-scale status query has an empty exact identity",
                  {{"reason", "runtime_scale_status_query_invalid"}}});
   }
-  const auto binding = active_correlation_.resolved_binding();
-  if (!binding.has_value() || binding->operation_id != operation_id ||
-      binding->control_binding_id != control_binding_id) {
-    return Result<ResolvedRuntimeScaleStatusDTO>::Err(
-        ErrorDTO{std::string(to_string(ErrorCode::kMissingReference)),
-                 "runtime-scale status query does not name the active binding",
-                 {{"reason", "runtime_scale_status_binding_not_active"}}});
-  }
+  std::optional<ResolvedExecutionBindingDTO> binding;
   std::optional<ResolvedRuntimeScaleCommandDTO> command;
   {
     std::lock_guard scale_lock(resolved_runtime_scale_mutex_);
+    binding = active_correlation_.resolved_binding();
+    if (!binding.has_value() || binding->operation_id != operation_id ||
+        binding->control_binding_id != control_binding_id) {
+      return Result<ResolvedRuntimeScaleStatusDTO>::Err(
+          ErrorDTO{std::string(to_string(ErrorCode::kMissingReference)),
+                   "runtime-scale status query does not name the active binding",
+                   {{"reason", "runtime_scale_status_binding_not_active"}}});
+    }
     if (!accepted_resolved_runtime_scale_command_.has_value() ||
         accepted_resolved_runtime_scale_command_->operation_id != operation_id ||
         accepted_resolved_runtime_scale_command_->control_binding_id != control_binding_id) {

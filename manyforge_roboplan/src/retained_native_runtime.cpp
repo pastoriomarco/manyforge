@@ -973,64 +973,6 @@ rebase_program_alias(const core::RuntimeParticipantBinding &alias,
   return sealed;
 }
 
-[[nodiscard]] core::Result<core::RuntimeParticipantBinding>
-rebase_runtime_binding_to_predecessor(
-    const core::RuntimeParticipantBinding &binding,
-    const core::ActiveControlConfigurationDTO &configuration) {
-  const auto &value = binding.value();
-  if (!configuration.locally_valid() ||
-      !configuration.locally_valid() ||
-      configuration.state !=
-          core::ActiveControlConfigurationStateDTO::kReconciled ||
-      !value.control_path.has_value()) {
-    return route_publication_error<core::RuntimeParticipantBinding>(
-        "route_predecessor_rebind_input_invalid",
-        "durable route predecessor rebind has no exact control path",
-        core::ErrorCode::kInvalidRequest);
-  }
-  const auto &path = *value.control_path;
-  const auto selected =
-      std::find_if(configuration.binding_routes.begin(),
-                   configuration.binding_routes.end(), [&](const auto &row) {
-                     return row.control_binding_id == path.control_binding_id;
-                   });
-  if (path.control_domain_id != configuration.control_domain_id ||
-      path.control_domain_revision != configuration.control_domain_revision ||
-      path.controller_topology_id != configuration.controller_topology_id ||
-      path.topology_revision != configuration.topology_revision ||
-      path.provider_runtime_unit_id != configuration.source_runtime_unit_id ||
-      selected == configuration.binding_routes.end() ||
-      selected->control_binding_revision != path.control_binding_revision) {
-    return route_publication_error<core::RuntimeParticipantBinding>(
-        "route_predecessor_rebind_mismatch",
-        "durable route predecessor crosses its retained runtime binding",
-        core::ErrorCode::kInvalidRequest);
-  }
-  auto candidate = value;
-  candidate.control_path->control_route_id = selected->control_route_id;
-  candidate.control_path->activation_set_id = configuration.activation_set_id;
-  candidate.control_path->active_control_configuration_id =
-      configuration.active_control_configuration_id;
-  candidate.control_path->active_control_configuration_generation =
-      configuration.active_control_configuration_generation;
-  // Qualification comes from this already verified binding's retained route,
-  // not from the durable configuration or its generation. Re-adopting that
-  // same route must preserve the exact proof; another route stays unqualified
-  // until the retained readiness resolver supplies its own route proof.
-  if (candidate.control_path->runtime_scale_qualification.has_value() &&
-      candidate.control_path->runtime_scale_qualification->control_route_id !=
-          selected->control_route_id) {
-    candidate.control_path->runtime_scale_qualification.reset();
-  }
-  auto sealed = core::verify_runtime_participant_binding(std::move(candidate));
-  if (!sealed.ok()) {
-    return route_publication_error<core::RuntimeParticipantBinding>(
-        "route_predecessor_rebind_invalid", sealed.error().message,
-        core::ErrorCode::kInvalidRequest);
-  }
-  return sealed;
-}
-
 [[nodiscard]] core::RuntimeParticipantAdmissionResolver
 make_kernel_participant_resolver(
     RetainedRuntimeParticipantResolver binding_resolver,
@@ -1242,6 +1184,64 @@ build_retained_gripper_stop_surveillance_source(
 }
 
 namespace detail {
+
+[[nodiscard]] core::Result<core::RuntimeParticipantBinding>
+rebase_runtime_binding_to_predecessor(
+    const core::RuntimeParticipantBinding &binding,
+    const core::ActiveControlConfigurationDTO &configuration) {
+  const auto &value = binding.value();
+  if (!configuration.locally_valid() ||
+      !configuration.locally_valid() ||
+      configuration.state !=
+          core::ActiveControlConfigurationStateDTO::kReconciled ||
+      !value.control_path.has_value()) {
+    return route_publication_error<core::RuntimeParticipantBinding>(
+        "route_predecessor_rebind_input_invalid",
+        "durable route predecessor rebind has no exact control path",
+        core::ErrorCode::kInvalidRequest);
+  }
+  const auto &path = *value.control_path;
+  const auto selected =
+      std::find_if(configuration.binding_routes.begin(),
+                   configuration.binding_routes.end(), [&](const auto &row) {
+                     return row.control_binding_id == path.control_binding_id;
+                   });
+  if (path.control_domain_id != configuration.control_domain_id ||
+      path.control_domain_revision != configuration.control_domain_revision ||
+      path.controller_topology_id != configuration.controller_topology_id ||
+      path.topology_revision != configuration.topology_revision ||
+      path.provider_runtime_unit_id != configuration.source_runtime_unit_id ||
+      selected == configuration.binding_routes.end() ||
+      selected->control_binding_revision != path.control_binding_revision) {
+    return route_publication_error<core::RuntimeParticipantBinding>(
+        "route_predecessor_rebind_mismatch",
+        "durable route predecessor crosses its retained runtime binding",
+        core::ErrorCode::kInvalidRequest);
+  }
+  auto candidate = value;
+  candidate.control_path->control_route_id = selected->control_route_id;
+  candidate.control_path->activation_set_id = configuration.activation_set_id;
+  candidate.control_path->active_control_configuration_id =
+      configuration.active_control_configuration_id;
+  candidate.control_path->active_control_configuration_generation =
+      configuration.active_control_configuration_generation;
+  // Qualification comes from this already verified binding's retained route,
+  // not from the durable configuration or its generation. Re-adopting that
+  // same route must preserve the exact proof; another route stays unqualified
+  // until the retained readiness resolver supplies its own route proof.
+  if (candidate.control_path->runtime_scale_qualification.has_value() &&
+      candidate.control_path->runtime_scale_qualification->control_route_id !=
+          selected->control_route_id) {
+    candidate.control_path->runtime_scale_qualification.reset();
+  }
+  auto sealed = core::verify_runtime_participant_binding(std::move(candidate));
+  if (!sealed.ok()) {
+    return route_publication_error<core::RuntimeParticipantBinding>(
+        "route_predecessor_rebind_invalid", sealed.error().message,
+        core::ErrorCode::kInvalidRequest);
+  }
+  return sealed;
+}
 
 RetainedObservedStateChannelConfig select_retained_state_channel_config(
     std::optional<RetainedObservedStateChannelConfig> selected,
@@ -4601,7 +4601,7 @@ RetainedNativeRuntime::AdoptAndReadBackRouteConfigurationPredecessor(
               configuration.control_domain_id) {
         return core::Result<core::RuntimeParticipantBinding>::Ok(binding);
       }
-      return rebase_runtime_binding_to_predecessor(binding, configuration);
+      return detail::rebase_runtime_binding_to_predecessor(binding, configuration);
     };
     // Rebase each backend owner from its own retained participant binding.
     // Control-binding representatives may be distinct capability/Program

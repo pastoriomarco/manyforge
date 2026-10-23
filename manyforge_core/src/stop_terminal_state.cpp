@@ -102,6 +102,9 @@ template <typename Identity>
       stage.remaining_budget.stop_generation != accepted.stop_generation ||
       stage.remaining_budget.elapsed_since_stop_ns < 0 ||
       stage.remaining_budget.elapsed_since_stop_ns > kMaximumStopDurationNs ||
+      (stage.remaining_budget.stop_ingress_age_ns &&
+       (*stage.remaining_budget.stop_ingress_age_ns < 0 ||
+        *stage.remaining_budget.stop_ingress_age_ns > kMaximumStopDurationNs)) ||
       (stage.remaining_budget.remaining_controlled_deadline_ns.has_value() &&
        (*stage.remaining_budget.remaining_controlled_deadline_ns < 0 ||
         *stage.remaining_budget.remaining_controlled_deadline_ns > kMaximumStopDurationNs))) {

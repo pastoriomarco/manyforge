@@ -60,6 +60,12 @@ public:
                                              state.exact_configuration_seen));
     return result;
   }
+  /// Holds the handle's state lock: a poll that reads handle state blocks
+  /// inside it while holding its handle lease.
+  [[nodiscard]] static std::unique_lock<std::mutex>
+  LockState(const RetainedRos2ControlRuntimeHandle &handle) {
+    return std::unique_lock<std::mutex>(handle.mutex_);
+  }
 };
 
 namespace {
@@ -162,7 +168,8 @@ struct ArmWorld final {
       std::shared_ptr<core::IClock> receiver_clock = {},
       bool mock_reset_position = false,
       std::function<std::optional<std::string>()> process_fault = {},
-      ros2_control_execution::Ros2TransportResources::ContextProvider context_provider = {})
+      ros2_control_execution::Ros2TransportResources::ContextProvider context_provider = {},
+      std::size_t executor_threads = 3U)
       : owning_clock(receiver_clock ? std::move(receiver_clock)
                                     : std::make_shared<WallClock>()),
         clock(*owning_clock), binding(std::move(initial_binding)),
@@ -196,7 +203,7 @@ struct ArmWorld final {
         std::string(kMeasuredJointStateProfileId)};
     const auto bound = handle->Bind(
         std::make_unique<ros2_control_execution::Ros2TransportResources>(
-            "manyforge_handle_test_" + fake::unique_suffix(), "/", 3U,
+            "manyforge_handle_test_" + fake::unique_suffix(), "/", executor_threads,
             std::make_shared<NullSink>(), "arm", clock, std::move(context_provider)),
         clock, std::move(arm),
         [this, participant_constructions](
@@ -273,7 +280,7 @@ struct ArmWorld final {
   fake::FakeJtc jtc;
   fake::FakeControllerManager manager;
   std::shared_ptr<RetainedRos2ControlRuntimeHandle> handle =
-      std::make_shared<RetainedRos2ControlRuntimeHandle>();
+      RetainedRos2ControlRuntimeHandle::Create();
 };
 
 using State = core::ComponentLifecycleStateDTO;
@@ -514,7 +521,7 @@ struct GripperWorld final {
   fake::FakeJtc jtc;
   GripperControllerManager manager;
   std::shared_ptr<RetainedRos2ControlRuntimeHandle> handle =
-      std::make_shared<RetainedRos2ControlRuntimeHandle>();
+      RetainedRos2ControlRuntimeHandle::Create();
 };
 
 // The controller-manager peer hosts only the gripper controller. No JTC,
@@ -582,7 +589,7 @@ struct GripperOnlyWorld final {
   rclcpp_action::Server<control_msgs::action::GripperCommand>::SharedPtr action;
   core::IGripperCommandBackend *gripper{};
   std::shared_ptr<RetainedRos2ControlRuntimeHandle> handle =
-      std::make_shared<RetainedRos2ControlRuntimeHandle>();
+      RetainedRos2ControlRuntimeHandle::Create();
 };
 
 TEST(RetainedRos2ControlRuntimeHandleTest,
@@ -3443,7 +3450,7 @@ TEST(RetainedRos2ControlRuntimeHandleTest,
   config.group_id = "gripper";
   config.joint_name = "gripper_joint";
   backend->configure_gripper_action(tool.value().command_target_id.value(), config);
-  auto handle = std::make_shared<RetainedRos2ControlRuntimeHandle>();
+  auto handle = RetainedRos2ControlRuntimeHandle::Create();
   ASSERT_TRUE(handle->BindGripperOnly(std::move(resources), *clock,
       std::move(backend), tool,
       {prefix + "/controller_manager", "gripper_controller", "TestSystem"},
@@ -3560,7 +3567,7 @@ TEST(RetainedRos2ControlRuntimeHandleTest,
   config.joint_name = "gripper_joint";
   backend->configure_gripper_action(tool.value().command_target_id.value(), config);
   auto *const gripper = backend.get();
-  auto handle = std::make_shared<RetainedRos2ControlRuntimeHandle>();
+  auto handle = RetainedRos2ControlRuntimeHandle::Create();
   ASSERT_TRUE(handle->BindGripperOnly(std::move(resources), clock,
                                     std::move(backend), tool, {}, {}, {},
                                     std::nullopt).ok());
@@ -3676,7 +3683,7 @@ TEST(RetainedRos2ControlRuntimeHandleTest,
     EXPECT_TRUE(backend->validate_gripper_command(candidate).ok());
     candidate.completion_policy = no_output ? "dwell_elapsed" : "position_reached";
     EXPECT_FALSE(backend->validate_gripper_command(candidate).ok());
-    auto handle = std::make_shared<RetainedRos2ControlRuntimeHandle>();
+    auto handle = RetainedRos2ControlRuntimeHandle::Create();
     const RetainedRos2ControlArmController controller = no_output
         ? RetainedRos2ControlArmController{"/foreign/controller_manager", "gripper", "hardware"}
         : RetainedRos2ControlArmController{};
@@ -3782,6 +3789,120 @@ TEST(RetainedRos2ControlRuntimeHandleTest,
     }
     EXPECT_EQ(world.manager.reset_commands().size(), 1U);
   }
+}
+
+// stock-jtc-01 crash: a runtime weak callback can be in flight when the last
+// external owner releases. Its locked lease must never become the last owner:
+// the destructor would then run teardown on its own executor (spin thread:
+// join throws std::system_error inside noexcept quiesce, abort; a worker
+// thread was observed to complete, still under live callbacks). The releaser
+// must cancel, drain and join, then release every child before reset() returns.
+// One executor thread runs the callback on the spin thread; three threads
+// also put it on the executor's worker threads.
+TEST(RetainedRos2ControlRuntimeHandleTest,
+     LastExternalReleaseDuringOwnCallbackJoinsOnTheReleasingThread) {
+  for (const std::size_t executor_threads : {std::size_t{1}, std::size_t{3}}) {
+    for (int round = 0; round < (executor_threads == 1U ? 1 : 6); ++round) {
+      SCOPED_TRACE(testing::Message() << "threads=" << executor_threads
+                                      << " round=" << round);
+      // Declared before the world: the observer may run until teardown.
+      std::atomic<bool> armed{false};
+      std::promise<void> entered;
+      auto entered_future = entered.get_future();
+      std::weak_ptr<RetainedRos2ControlRuntimeHandle> external;
+      std::atomic<bool> lease_outlived_external{false};
+      ArmWorld world("arm_controller", std::nullopt, nullptr, ArmBinding(), {},
+                     false, {}, {}, executor_threads);
+      external = world.handle;
+      world.handle->InstallSampleObserver(
+          [&](const core::ExecutionControllerSampleDTO &) {
+            if (!armed.exchange(false))
+              return;
+            entered.set_value();
+            // The sample timer holds its locked lease across this call. Keep
+            // it until the external owner is gone; bounded, so the old
+            // ownership (this lease is then the last owner) still unwinds.
+            lease_outlived_external.store(
+                !fake::WaitUntil([&] { return external.expired(); }, 1s));
+          });
+      world.handle->StartBackend();
+      ASSERT_TRUE(fake::WaitUntil([&] {
+        const auto activity = world.handle->arm_activity();
+        return activity.observed && activity.controller_loaded &&
+               activity.hardware_active;
+      }));
+      // An observed setup refusal (kNotSent) sends nothing; retry only that.
+      ASSERT_TRUE(fake::WaitUntil([&] {
+        return world.handle->PrepareArmController().outcome ==
+               Outcome::kSucceeded;
+      }));
+      std::optional<RetainedRos2ControlSwitchResult> activated;
+      ASSERT_TRUE(fake::WaitUntil([&] {
+        activated = world.handle->ActivateArmController({});
+        return activated->outcome != Outcome::kNotSent;
+      }));
+      ASSERT_EQ(activated->outcome, Outcome::kSucceeded)
+          << SwitchFailureText(*activated);
+      ASSERT_TRUE(world.WaitForState(State::kActive));
+      const std::weak_ptr<RetainedRos2ControlRuntimeHandle> internal =
+          world.handle->weak_from_this();
+      const std::weak_ptr<core::ExecutionPortParticipant> participant =
+          world.handle->participant();
+      const std::weak_ptr<rclcpp::Node> node = world.handle->node();
+      armed.store(true);
+      ASSERT_EQ(entered_future.wait_for(10s), std::future_status::ready);
+      world.handle.reset(); // the last external owner, callback in flight
+      EXPECT_FALSE(lease_outlived_external.load());
+      EXPECT_TRUE(internal.expired());
+      EXPECT_TRUE(participant.expired());
+      EXPECT_TRUE(node.expired());
+      // Never unwind the fixture's borrowed lifetimes under a live handle.
+      ASSERT_TRUE(fake::WaitUntil([&] { return internal.expired(); }));
+    }
+  }
+}
+
+// Isaac lane (SX-3443): the guard worker, owned by this handle through its
+// hooks, polls the handle via its arm host every step. If the last external
+// owner releases while a poll holds its handle lease, that poll must not end
+// as the owner whose release destroys the guard binding on its own worker
+// (the binding's destructor joins that worker: std::system_error, abort).
+// No executor is started, so the guard worker is the only lease taker.
+TEST(RetainedRos2ControlRuntimeHandleTest,
+     LastExternalReleaseDuringGuardPollStopsTheGuardWorkerOffItsThread) {
+  std::weak_ptr<RetainedRos2ControlRuntimeHandle> external;
+  std::weak_ptr<RetainedRos2ControlRuntimeHandle> internal;
+  std::weak_ptr<RetainedIsaacArmGuardBinding> guard;
+  ArmWorld world;
+  const auto command_topic = world.prefix + "/isaac_joint_commands";
+  {
+    const auto binding = RetainedIsaacArmGuardBinding::Create(
+        {command_topic, command_topic + "_states", 250'000'000, 5'000'000},
+        world.handle->node(), make_retained_isaac_arm_host(world.handle),
+        world.clock);
+    world.handle->InstallGuardHooks(binding->hooks());
+    guard = binding;
+  }
+  external = world.handle;
+  internal = world.handle->weak_from_this();
+  std::jthread releaser;
+  bool poll_outlived_external = false;
+  {
+    // The next poll (ReadFacts -> current_port) blocks on this lock while
+    // holding its lease: one count above the external and internal owners.
+    auto state = RetainedRos2ControlRuntimeHandleTestAccess::LockState(*world.handle);
+    ASSERT_TRUE(fake::WaitUntil(
+        [&] { return external.use_count() + internal.use_count() == 3; }));
+    releaser = std::jthread(
+        [owner = std::move(world.handle)]() mutable { owner.reset(); });
+    // Bounded: with an external poll lease the owner never expires here.
+    poll_outlived_external =
+        !fake::WaitUntil([&] { return external.expired(); }, 1s);
+  }
+  releaser.join();
+  EXPECT_FALSE(poll_outlived_external);
+  EXPECT_TRUE(guard.expired());
+  EXPECT_TRUE(internal.expired());
 }
 
 } // namespace

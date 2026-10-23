@@ -1192,7 +1192,12 @@ Result<SoftOnPathResolvedInitialStateDTO> resolve_soft_on_path_stop_initial_stat
       resolve_stop_initial_state(accepted_trajectory, stop_profile, initial_state, config);
   if (!resolved.ok()) return Result<SoftOnPathResolvedInitialStateDTO>::Err(resolved.error());
   auto& value = resolved.value();
-  const auto at_return = value.cursor.sample(value.command_path_time_s);
+  const double return_cursor =
+      config.spring_back_return_path_time_s.value_or(value.command_path_time_s);
+  if (!std::isfinite(return_cursor))
+    return Result<SoftOnPathResolvedInitialStateDTO>::Err(ErrorDTO{
+        "spring_back_return_cursor_invalid", "Spring-back return cursor must be finite", {}});
+  const auto at_return = value.cursor.sample(return_cursor);
   const auto joints = accepted_trajectory.joint_names.size();
   return Result<SoftOnPathResolvedInitialStateDTO>::Ok(
       {value.command_path_time_s, value.path_time_rate,
@@ -1200,7 +1205,8 @@ Result<SoftOnPathResolvedInitialStateDTO> resolve_soft_on_path_stop_initial_stat
        TrajectoryWaypointDTO{0.0, at_return.position, std::vector<double>(joints, 0.0),
                              std::vector<double>(joints, 0.0)},
        value.projection.time_from_start_s, value.projection.distance_rad,
-       value.initial_velocity_deviation_rad_s, value.used_model_velocity});
+       value.initial_velocity_deviation_rad_s, value.used_model_velocity,
+       config.spring_back_return_path_time_s});
 }
 
 Result<SoftOnPathStopPlanDTO> plan_soft_on_path_stop(
@@ -1686,7 +1692,8 @@ Result<SoftOnPathStopPlanDTO> plan_spring_back_on_path_stop(
   return_start_s = *checked_return_start;
 
   const size_t joint_count = accepted_trajectory.joint_names.size();
-  const double trip_path_time_s = plan.command_path_time_s;
+  const double trip_path_time_s =
+      config.spring_back_return_path_time_s.value_or(plan.command_path_time_s);
   const double stop_path_time_s = plan.forward_stop_path_time_s;
   double return_distance_s = stop_path_time_s - trip_path_time_s;
   if (!std::isfinite(return_distance_s) || return_distance_s < -kEpsilon) {

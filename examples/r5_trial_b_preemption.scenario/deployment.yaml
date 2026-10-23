@@ -184,7 +184,7 @@
               "direction": "output",
               "provider": {
                 "profile": "ros_set_bool",
-                "service": "/plc_io/start"
+                "service": "/plc_io/in_0"
               },
               "resource_role_id": "plc_start",
               "signal_name": "plc_start",
@@ -358,6 +358,6 @@
         "scope": "all_motion"
       }
     ],
-    "motion_takeover_preparation_budget_s": 0.5
+    "motion_takeover_preparation_budget_s": 0.75
   }
 }

@@ -3,6 +3,7 @@ from __future__ import annotations
 import importlib.util
 import math
 from pathlib import Path
+import sys
 from types import SimpleNamespace
 
 from launch import LaunchContext
@@ -17,6 +18,8 @@ from rclpy.parameter import parameter_dict_from_yaml_file
 
 
 _PACKAGE_ROOT = Path(__file__).resolve().parents[1]
+if str(_PACKAGE_ROOT) not in sys.path:  # the launch files import manyforge_ros_bringup
+    sys.path.insert(0, str(_PACKAGE_ROOT))
 _LAUNCH_FILE = _PACKAGE_ROOT / "launch" / "isaac_topic_based_control.launch.py"
 
 

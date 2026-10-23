@@ -62,6 +62,7 @@ struct StopStageDispatchedGoalDTO final {
   StopEvidencePolicyRevision stop_evidence_policy_revision;
   /// Ordinary, fault and interrupt-scope plans admitted with the goal.
   std::vector<PreparedParticipantStopPlanDTO> stop_plans;
+  double planned_controller_offset_s{0.0};
 };
 
 /// Lane and deployment facts the helper needs. None has a helper default: each
@@ -123,7 +124,8 @@ class ParticipantStopStageHelper final : public IControlDomainExecutionPort {
   /// storage is reserved before the transport call; Record cannot allocate.
   [[nodiscard]] bool ReserveReplacement(const ExecutionGoalKey& source);
   void RecordReplacement(ExecutionGoalKey key, TrajectoryDTO trajectory,
-                         std::shared_ptr<ExecutionSampleAssociation> association) noexcept;
+                         std::shared_ptr<ExecutionSampleAssociation> association,
+                         double planned_controller_offset_s = 0.0) noexcept;
   [[nodiscard]] bool HasPendingReplacement() const;
   /// The owning participant has exact rejected/no-effect or scoped Stop proof.
   void RetireSettledReplacement(const ExecutionGoalKey& key) noexcept;
@@ -171,24 +173,31 @@ class ParticipantStopStageHelper final : public IControlDomainExecutionPort {
     bool moving_replacement{false};
     /// Exact terminal port fact read before the bounded native ring evicts it.
     std::optional<ExecutionGoalObservationDTO> terminal_observation{};
+    double planned_controller_offset_s{0.0};
   };
   struct Run;
 
   [[nodiscard]] ParticipantStopStageResultDTO RunControlledStage(Run& run);
   [[nodiscard]] ParticipantStopStageResultDTO RunReplacement(
       Run& run, const SoftOnPathStopPlanDTO& plan, const ExecutionControllerSampleDTO& trip,
-      double frozen_factor, TimePoint stop_deadline);
+      double frozen_factor, TimePoint stop_deadline,
+      const std::function<Result<SoftOnPathStopPlanDTO>(double)>& replan);
   /// Q130: the fast spring-back, sent at once with no planning or checks.
   [[nodiscard]] ParticipantStopStageResultDTO RunFastSpringBack(
       Run& run, const ExecutionControllerSampleDTO& trip,
       const std::vector<double>& trip_positions, double frozen_factor, TimePoint stop_deadline);
+  /// EXPERIMENTAL release timer: the cancellable pre-send hold; a result ends
+  /// the stage (cancelled or stale state), nullopt sends.
+  [[nodiscard]] std::optional<ParticipantStopStageResultDTO> HoldForRelease(
+      Run& run, StopReplacementStartDTO& start, TimePoint dispatched_at, TimePoint stop_deadline,
+      const std::string& mode);
   /// One dispatched Stop replacement, from its send result to its settlement.
   [[nodiscard]] ParticipantStopStageResultDTO FinishReplacement(
       Run& run, const ExecutionPortCommandResultDTO& sent, const ExecutionGoalKey& next,
       TrajectoryDTO sent_trajectory, std::optional<StopReplacementCursorMapDTO> cursor_map,
       const std::optional<ExecutionControllerSampleDTO>& baseline, TimePoint dispatched_at,
       const ExecutionControllerSampleDTO& trip, const std::string& mode,
-      double initial_path_deviation_rad, TimePoint stop_deadline);
+      double initial_path_deviation_rad, TimePoint stop_deadline, double controller_offset_s);
   [[nodiscard]] ParticipantStopStageResultDTO RunNaturalCompletion(Run& run,
                                                                    TimePoint stop_deadline,
                                                                    std::string basis);

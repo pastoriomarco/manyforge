@@ -380,5 +380,75 @@ TEST(BoundedStopStageAttemptExecutorTest,
   EXPECT_TRUE(executor.DrainFor(1s));
 }
 
+
+// Pause at the worker's clock read, after TryStart has queued the request.
+// Advancing time here proves age is captured on the worker, not at enqueue.
+TEST(BoundedStopStageAttemptExecutorTest, CapturesIngressAgeAfterQueueWithoutChangingDeadlines) {
+  class GatedClock final : public IClock {
+   public:
+    TimePoint now() const override {
+      std::unique_lock lock(mutex);
+      entered = true;
+      changed.notify_all();
+      changed.wait(lock, [&] { return released; });
+      return current;
+    }
+    bool WaitForRead() {
+      std::unique_lock lock(mutex);
+      return changed.wait_for(lock, 1s, [&] { return entered; });
+    }
+    void Release() {
+      std::lock_guard lock(mutex);
+      current = 9'075'000'000;
+      released = true;
+      changed.notify_all();
+    }
+    mutable std::mutex mutex;
+    mutable std::condition_variable changed;
+    mutable bool entered{};
+    bool released{};
+    TimePoint current{9'000'000'000};
+  } clock;
+  class CapturePort final : public IControlDomainExecutionPort {
+   public:
+    ParticipantStopStageResultDTO TranslateStopStage(
+        const ResolvedParticipantStopStageDTO& request, const RemainingStopBudgetDTO& timing,
+        std::stop_token) override {
+      received = timing;
+      return completed(request);
+    }
+    std::optional<RemainingStopBudgetDTO> received;
+  } port;
+  CompletionReceiver receiver;
+  BoundedStopStageAttemptExecutor executor(8U, 1U, receiver);
+  struct FinishExecutor {
+    GatedClock& clock;
+    BoundedStopStageAttemptExecutor& executor;
+    ~FinishExecutor() {
+      clock.Release();
+      executor.CloseIngress();
+      EXPECT_TRUE(executor.DrainFor(1s));
+    }
+  } guard{clock, executor};
+  auto timing = std::make_shared<RemainingStopBudgetDTO>(
+      RemainingStopBudgetDTO{StopId("stop.origin"), StopGeneration(1U), 40'000'000, 800'000'000});
+  const auto started = executor.TryStart(
+      {&port, stage("capture.age"), timing, false, &clock, 9'000'000'000});
+  ASSERT_EQ(started.status, StopStageAttemptStartStatus::kStarted);
+  ASSERT_TRUE(started.handle);
+  ASSERT_TRUE(clock.WaitForRead());
+  clock.Release();
+  const auto result = WaitForResult(executor, *started.handle);
+  ASSERT_EQ(result.status, StopStageAttemptTakeStatus::kCompleted);
+  ASSERT_TRUE(port.received);
+  EXPECT_EQ(port.received->stop_ingress_age_ns, 75'000'000);
+  EXPECT_EQ(port.received->elapsed_since_stop_ns, 40'000'000);
+  EXPECT_EQ(port.received->remaining_controlled_deadline_ns, 800'000'000);
+  EXPECT_FALSE(timing->stop_ingress_age_ns);
+  EXPECT_EQ(timing->elapsed_since_stop_ns, 40'000'000);
+  EXPECT_EQ(timing->remaining_controlled_deadline_ns, 800'000'000);
+  EXPECT_EQ(executor.Release(*started.handle), StopStageAttemptReleaseStatus::kReleased);
+}
+
 }  // namespace
 }  // namespace manyforge::core

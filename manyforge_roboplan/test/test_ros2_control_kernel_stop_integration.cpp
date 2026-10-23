@@ -1501,7 +1501,7 @@ TEST(Ros2ControlKernelStopIntegrationTest,
   arm.adapter = AdapterConfig(prefix + "/arm_controller");
   arm.controller = {prefix + "/controller_manager", "arm_controller", "TestSystem"};
   arm.compiled_joint_names = {"joint_1"};
-  auto handle = std::make_shared<RetainedRos2ControlRuntimeHandle>();
+  auto handle = RetainedRos2ControlRuntimeHandle::Create();
   ASSERT_TRUE(handle
                   ->Bind(std::make_unique<ros2_control_execution::Ros2TransportResources>(
                              "manyforge_epoch_cutover_" + fake::unique_suffix(), "/", 3U,
@@ -1677,7 +1677,7 @@ TEST(Ros2ControlKernelStopIntegrationTest,
   arm.adapter = AdapterConfig(controller);
   arm.controller = {prefix + "/controller_manager", "arm_controller", "TestSystem"};
   arm.compiled_joint_names = {"joint_1"};
-  auto handle = std::make_shared<RetainedRos2ControlRuntimeHandle>();
+  auto handle = RetainedRos2ControlRuntimeHandle::Create();
   ASSERT_TRUE(handle
                   ->Bind(std::make_unique<ros2_control_execution::Ros2TransportResources>(
                              "manyforge_epoch_cycles_" + fake::unique_suffix(), "/", 3U,

@@ -57,11 +57,52 @@ struct StopJoinElapsedInputDTO final {
 struct StopReplacementStartDTO final {
   double elapsed_path_s{0.0};
   std::optional<ExecutionReplacementStartDTO> scheduled{};
+  double controller_offset_s{0.0};
 };
 
+///
+/// EXPERIMENTAL lane flags (`lane.experiment`, scheduled lanes only): the
+/// whole-period start above is the target tick T. `midtick_stamp` stamps
+/// H = T + P/2 and computes the elapsed path time for H; `release_timer` adds
+/// the release instant T - P/2 - expected latency, mapped to the local clock
+/// through the sample's receipt. Any flag records `scheduled->experiment`.
 [[nodiscard]] Result<StopReplacementStartDTO> compute_stop_replacement_start(
     const StopJoinElapsedInputDTO& input, const ExecutionControllerSampleDTO& sample,
     const ExecutionLaneFactsDTO& lane);
+
+/// EXPERIMENTAL release timer: the instant to hold the finished replacement
+/// until, or nullopt to send at once. Reads `clock` only when `start` carries a
+/// release (timer-free paths keep their exact clock reads). Records the outcome
+/// in `start.scheduled->experiment->release_hold`: held; missed (already
+/// passed); or deadline (the release lies after `latest_send_ns`, the last send
+/// instant every existing deadline of the caller still admits).
+[[nodiscard]] std::optional<TimePoint> plan_replacement_release(StopReplacementStartDTO& start,
+                                                                const IClock& clock,
+                                                                TimePoint latest_send_ns);
+
+/// EXPERIMENTAL V0 payload (`midtick`-independent): `joined` (the past-point
+/// join above, time 0 at the stamp) without its negative-time prefix; the
+/// first point at time 0 is `joined` sampled there, i.e. the original path's
+/// own planned state at the stamp. Errors: `stop_join_input_invalid`.
+[[nodiscard]] Result<TrajectoryDTO> stop_replacement_v0_payload(
+    const TrajectoryDTO& joined, double first_time_s = 0.0);
+
+/// Best local sent-curve cursor from the same associated reference snapshot.
+/// Ambiguous or unavailable refinement keeps the planned offset; never refuses.
+[[nodiscard]] double estimate_stop_source_cursor(
+    const TrajectoryDTO& source, const ExecutionControllerSampleDTO& sample,
+    const ExecutionLaneFactsDTO& lane, double planned_offset_s);
+
+/// EXPERIMENTAL scheduled spring_back_fast (V0 shape, sent with a future stamp
+/// that maps to `start_path_s` on the active path): a first point at time 0
+/// with the active trajectory's own P/V/A at `start_path_s`, then the stop
+/// point (trip positions, zero velocity and acceleration) at the active-path
+/// time `stop_end_path_s`, expressed relative to `start_path_s`. Errors
+/// (`spring_back_fast_input_invalid`): the start lies outside the active
+/// trajectory, or the stop point is not strictly after the start.
+[[nodiscard]] Result<TrajectoryDTO> build_scheduled_spring_back_fast(
+    const TrajectoryDTO& active, double start_path_s, const std::vector<double>& stop_positions,
+    double stop_end_path_s);
 
 /// Q17/Q38: express a wall-time braking trajectory (the Stop planner's output,
 /// planned at the frozen factor) in path time at that factor, so that a
@@ -113,30 +154,6 @@ struct StopReplacementStartDTO final {
                                                                 const TrajectoryDTO& continuation,
                                                                 double continuation_origin_s,
                                                                 double trip_path_s);
-
-/// Experimental resident-timeline realization of the unchanged checked join,
-/// for a controller that replaces its whole timeline at once on the resident
-/// clock origin (JTC `replacement_time_reference: active_trajectory`).
-/// `resident_trajectory` is the full logical curve on the resident clock:
-/// `joined` (time 0 at `elapsed_s` on the active path) shifted by
-/// `elapsed_s - source_clock_offset_s`, where source_clock_offset_s maps the
-/// native resident cursor to the active trajectory's canonical path time.
-/// `delivery_trajectory` is the complete remaining curve sent to the
-/// controller: `resident_trajectory` from its last knot at or before
-/// `resident_cursor_s` (the actual sample cursor on the resident clock; the
-/// first knot when none is), through the connector, into the new motion.
-struct ResidentTimelineReplacementDTO final {
-  TrajectoryDTO resident_trajectory;
-  TrajectoryDTO delivery_trajectory;
-};
-[[nodiscard]] Result<ResidentTimelineReplacementDTO> build_resident_timeline_replacement(
-    const TrajectoryDTO& joined, double elapsed_s, double source_clock_offset_s,
-    double resident_cursor_s);
-
-/// The delivery view alone: `resident` (already on the resident clock) from
-/// its last knot at or before `cursor_s`, or from its first knot.
-[[nodiscard]] TrajectoryDTO resident_timeline_delivery(const TrajectoryDTO& resident,
-                                                       double cursor_s);
 
 /// §3.3 cursor mapping of one on-path Stop replacement built by
 /// `build_stop_replacement_join`: the controller's cursor on the replacement

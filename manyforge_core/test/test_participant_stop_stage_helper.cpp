@@ -3,15 +3,16 @@
 #include <algorithm>
 #include <cmath>
 #include <functional>
+#include <iomanip>
+#include <sstream>
 #include <manyforge_core/motion_interrupt/stop_profile_mapper.hpp>
 #include <manyforge_core/participant_stop_stage_helper.hpp>
 #include <manyforge_core/testing/fake_execution_port.hpp>
 #include <manyforge_core/time/fake_clock.hpp>
+#include <manyforge_core/trajectory/trajectory_sampler.hpp>
 #include <memory>
-#include <optional>
 #include <stdexcept>
 #include <string>
-#include <utility>
 #include <variant>
 #include <vector>
 
@@ -955,7 +956,7 @@ TEST(ParticipantStopStageHelperTest, JoinElapsedIsMeasuredAtTheReplacementSend) 
               -(0.5 + 0.5 * (static_cast<double>(dispatch_read - receipt) / 1e9 + 0.02)), 1e-9);
 }
 
-TEST(ParticipantStopStageHelperTest, ScheduledSoftAndSpringStopsPairTheirHeaderAndPastPrefix) {
+TEST(ParticipantStopStageHelperTest, ScheduledSoftAndSpringStopsStartAtTheFirstCommand) {
   for (const char* mode : {"soft_on_path", "spring_back_hold"}) {
     SCOPED_TRACE(mode);
     World world;
@@ -980,13 +981,230 @@ TEST(ParticipantStopStageHelperTest, ScheduledSoftAndSpringStopsPairTheirHeaderA
     EXPECT_EQ(advance_ns % 4'000'000, 0);
     EXPECT_EQ(replacement.active_key, kOriginal);
     EXPECT_EQ(replacement.next_key, kSecond);
-    // The original's point at t=0 stays in the prefix. Its shift must name
-    // the SAME origin as the controller-clock header at the observed factor.
-    EXPECT_NEAR(replacement.trajectory.waypoints.front().time_from_start_s,
-                -(source->cursor_s + world.frozen * static_cast<double>(advance_ns) / 1e9), 1e-12);
-    EXPECT_EQ(replacement.trajectory.waypoints.front().positions_rad, std::vector<double>{0.0});
+    EXPECT_NEAR(replacement.trajectory.waypoints.front().time_from_start_s, 0.004, 1e-12);
+    EXPECT_NEAR(replacement.trajectory.waypoints.front().positions_rad[0],
+                source->cursor_s + world.frozen * static_cast<double>(advance_ns) / 1e9 + 0.004,
+                1e-12);
+    ASSERT_TRUE(replacement.start->experiment);
+    EXPECT_EQ(replacement.start->experiment->release_hold, ExecutionReleaseHold::kHeld);
     EXPECT_EQ(world.freezes, 1U);
     EXPECT_TRUE(Cancels(world.port).empty());
+  }
+}
+
+// Scheduled Stops share timing and first-command placement regardless of old flags.
+TEST(ParticipantStopStageHelperTest, ScheduledStopsUseOneReleaseAndFirstCommandContract) {
+  struct Case {
+    bool timer, midtick, v0;
+  };
+  for (const char* mode : {"soft_on_path", "spring_back_hold"}) {
+    for (const auto flags : {Case{true, false, false}, Case{false, true, false},
+                             Case{false, false, true}, Case{true, true, true}}) {
+      SCOPED_TRACE(::testing::Message() << mode << " timer=" << flags.timer
+                                        << " midtick=" << flags.midtick << " v0=" << flags.v0);
+      World world;
+      auto lane = world.port.ReadLaneFacts();
+      lane.supports_scheduled_replacement = true;
+      lane.experiment.release_timer = flags.timer;
+      lane.experiment.midtick_stamp = flags.midtick;
+      lane.experiment.v0_payload = flags.v0;
+      world.port.SetLaneFacts(lane);
+      const auto stage = Stage(0U, Nominal::kControlled, Parameters(mode, false));
+      world.Dispatch(stage);
+      world.Sample(0.5, 0.5, 1.0);
+      const auto source = world.port.ReadSample();
+      ASSERT_TRUE(source);
+      ScriptReplacement(world, kSecond, 5U, ExecutionGoalResult::kSucceeded);
+      TimePoint unsent_until = 0;
+      auto scripted = world.on_tick;
+      world.on_tick = [&, scripted] {
+        if (Replaces(world.port).empty()) unsent_until = world.clock.now();
+        scripted();
+      };
+      const auto result = world.helper->TranslateStopStage(stage, Budget(stage), {});
+      ASSERT_EQ(result.outcome, ParticipantStopStageOutcomeDTO::kSucceeded);
+      const auto replacements = Replaces(world.port);
+      ASSERT_EQ(replacements.size(), 1U);
+      const auto& replacement = replacements.front();
+      ASSERT_TRUE(replacement.start);
+      ASSERT_TRUE(replacement.start->experiment);
+      const auto& experiment = *replacement.start->experiment;
+      constexpr TimePoint kPeriod = 4'000'000;  // 250 Hz
+      // The existing whole-period target: 20 ms allowance = 5 periods.
+      EXPECT_EQ(experiment.target_tick_ns, source->source_stamp_ns + 20'000'000);
+      const auto advance_ns = replacement.start->controller_start_stamp_ns - source->source_stamp_ns;
+      EXPECT_EQ(advance_ns, 20'000'000 + (flags.midtick ? kPeriod / 2 : 0));
+      EXPECT_EQ(experiment.midtick_stamp, flags.midtick);
+      EXPECT_EQ(experiment.v0_payload, flags.v0);
+      EXPECT_FALSE(experiment.spring_back_fast);
+      ASSERT_TRUE(experiment.release_local_ns);
+      const auto release = source->local_receipt_stamp_ns + 20'000'000 - kPeriod / 2 - 1'500'000;
+      EXPECT_EQ(*experiment.release_local_ns, release);
+      EXPECT_EQ(experiment.release_hold, ExecutionReleaseHold::kHeld);
+      EXPECT_GE(unsent_until, release);
+      const double first_time = 0.004 - (flags.midtick ? world.frozen * 0.002 : 0.0);
+      const auto& first = replacement.trajectory.waypoints.front();
+      EXPECT_NEAR(first.time_from_start_s, first_time, 1e-12);
+      EXPECT_NEAR(first.positions_rad[0], source->cursor_s + world.frozen * 0.020 + 0.004,
+                  1e-12);
+      if (std::string(mode) == "spring_back_hold") {
+        EXPECT_NEAR(replacement.trajectory.waypoints.back().positions_rad[0], 0.5, 1e-9);
+      }
+    }
+  }
+}
+
+TEST(ParticipantStopStageHelperTest, ReleaseHoldIsCancellableAndNeverCrossesTheStopDeadline) {
+  for (const bool cancel : {true, false}) {
+    SCOPED_TRACE(cancel ? "cancelled during hold" : "Stop deadline before release");
+    World world;
+    auto lane = world.port.ReadLaneFacts();
+    lane.supports_scheduled_replacement = true;
+    lane.experiment.release_timer = true;
+    world.port.SetLaneFacts(lane);
+    const auto stage = Stage(0U, Nominal::kControlled, Parameters("soft_on_path", false));
+    world.Dispatch(stage);
+    world.Sample(0.5, 0.5, 1.0);
+    ScriptReplacement(world, kSecond, 5U, ExecutionGoalResult::kSucceeded);
+    std::stop_source source;
+    auto scripted = world.on_tick;
+    world.on_tick = [&, scripted] {
+      if (cancel && Replaces(world.port).empty()) source.request_stop();
+      scripted();
+    };
+    auto budget = Budget(stage);
+    if (!cancel) {
+      // 10 ms of Stop time left; the release lies 16.5 ms after the dispatch.
+      const auto& command = stage.participant_stop_plan.stage_commands.at(stage.stage_index);
+      const auto deadline =
+          controlled_stop_deadline_from_contract_parameters(*command.validated_contract_parameters);
+      ASSERT_TRUE(deadline);
+      budget = Budget(stage, *deadline - 10'000'000);
+    }
+    const auto result = world.helper->TranslateStopStage(stage, budget, source.get_token());
+    const auto replacements = Replaces(world.port);
+    if (cancel) {
+      // Cancellation preempts the hold before anything is sent.
+      EXPECT_EQ(result.outcome, ParticipantStopStageOutcomeDTO::kSupersededNoEffect);
+      EXPECT_TRUE(replacements.empty());
+    } else {
+      EXPECT_EQ(result.outcome, ParticipantStopStageOutcomeDTO::kFailed);
+      EXPECT_TRUE(replacements.empty());
+      ASSERT_TRUE(result.error);
+      EXPECT_EQ(result.error->details.at("reason"), "soft_on_path_stop_delta_budget_exceeded");
+    }
+  }
+}
+
+TEST(ParticipantStopStageHelperTest, ReleaseHoldOversleepPastHalfAPeriodSendsNothing) {
+  // SX-3475: after waking, the ACTUAL time is checked against the existing
+  // release plus half-period, even inside the old 50ms lead-in: this is the
+  // existing lead-in budget refusal, before any send.
+  World world(false);
+  auto lane = world.port.ReadLaneFacts();
+  lane.supports_scheduled_replacement = true;
+  lane.experiment.release_timer = true;
+  world.port.SetLaneFacts(lane);
+  world.helper = std::make_unique<ParticipantStopStageHelper>(
+      world.port, world.clock,
+      [&world](TimePoint, const std::stop_token&) {
+        world.clock.advance(19'000'000);  // release16.5ms + halfperiod2ms is already past
+        ++world.ticks;
+      },
+      [&world] { return world.frozen; }, world.config);
+  const auto stage = Stage(0U, Nominal::kControlled, Parameters("soft_on_path", false));
+  world.Dispatch(stage);
+  world.Sample(0.5, 0.5, 1.0);
+  const auto result = world.helper->TranslateStopStage(stage, Budget(stage), {});
+  EXPECT_EQ(result.outcome, ParticipantStopStageOutcomeDTO::kFailed);
+  ASSERT_TRUE(result.error);
+  EXPECT_EQ(result.error->details.at("reason"), "soft_on_path_stop_delta_budget_exceeded");
+  EXPECT_TRUE(Replaces(world.port).empty());
+  EXPECT_EQ(world.ticks, 1U);
+}
+
+TEST(ParticipantStopStageHelperTest, ScheduledFastSpringBackSendsTheV0ShapeOnAFutureStamp) {
+  for (const bool other_flags : {false, true}) {
+    SCOPED_TRACE(other_flags ? "with timer and mid-tick" : "alone");
+    World world;
+    auto lane = world.port.ReadLaneFacts();
+    lane.supports_scheduled_replacement = true;
+    lane.experiment.scheduled_spring_back_fast = true;
+    lane.experiment.release_timer = other_flags;
+    lane.experiment.midtick_stamp = other_flags;
+    world.port.SetLaneFacts(lane);
+    const auto stage = Stage(0U, Nominal::kControlled, Parameters("spring_back_fast", false));
+    world.Dispatch(stage);
+    world.Sample(0.5, 0.5, 1.0);
+    const auto source = world.port.ReadSample();
+    ASSERT_TRUE(source);
+    ScriptReplacement(world, kSecond, 5U, ExecutionGoalResult::kSucceeded);
+    const auto result = world.helper->TranslateStopStage(stage, Budget(stage), {});
+    ASSERT_EQ(result.outcome, ParticipantStopStageOutcomeDTO::kSucceeded)
+        << result.error->message << " " << result.error->details.at("reason");
+    EXPECT_EQ(result.actual_provider_contract_mode, MotionControlledStopMode::kSpringBackFast);
+    const auto replaces = Replaces(world.port);
+    ASSERT_EQ(replaces.size(), 1U);
+    const auto& replacement = replaces.front();
+    ASSERT_TRUE(replacement.start);
+    ASSERT_TRUE(replacement.start->experiment);
+    EXPECT_TRUE(replacement.start->experiment->spring_back_fast);
+    EXPECT_TRUE(replacement.start->experiment->release_local_ns.has_value());
+    const auto advance_ns = replacement.start->controller_start_stamp_ns - source->source_stamp_ns;
+    EXPECT_EQ(advance_ns, 20'000'000 + (other_flags ? 2'000'000 : 0));
+    const auto& diagnostics =
+        std::get<JsonObjectDTO>(EvidenceObject(result).at("provider_diagnostics").value);
+    const double start = std::get<double>(diagnostics.at("scheduled_start_path_s").value);
+    EXPECT_NEAR(start, 0.5 + 0.5 * static_cast<double>(advance_ns) / 1e9, 1e-12);
+    EXPECT_EQ(Text(EvidenceObject(result), "actual_stop_mode"), "spring_back_fast");
+    EXPECT_EQ(std::get<double>(diagnostics.at("passed_points").value), 0.0);
+    const auto& points = replacement.trajectory.waypoints;
+    ASSERT_EQ(points.size(), 2U);
+    const double first_time = 0.004 - (other_flags ? 0.001 : 0.0);
+    EXPECT_NEAR(points.front().time_from_start_s, first_time, 1e-12);
+    EXPECT_NEAR(points.front().positions_rad[0], 0.514, 1e-12);
+    EXPECT_NEAR(points.front().velocities_rad_s[0], 1.0, 1e-12);
+    EXPECT_NEAR(points.back().time_from_start_s, first_time + 0.5, 1e-12);
+    EXPECT_NEAR(points.back().positions_rad[0], 0.5, 1e-12);
+    EXPECT_EQ(points.back().velocities_rad_s, std::vector<double>{0.0});
+    EXPECT_EQ(points.back().accelerations_rad_s2, std::vector<double>{0.0});
+  }
+}
+
+TEST(ParticipantStopStageHelperTest, OnlyUnscheduledFastSpringBackKeepsTheLegacyPrefix) {
+  // Capability, rather than a per-mode flag, chooses the common scheduled path.
+  for (const bool scheduled_lane : {false, true}) {
+    SCOPED_TRACE(scheduled_lane);
+    World world;
+    auto lane = world.port.ReadLaneFacts();
+    lane.supports_scheduled_replacement = scheduled_lane;
+    lane.experiment.scheduled_spring_back_fast = !scheduled_lane;
+    lane.experiment.release_timer = true;
+    lane.experiment.midtick_stamp = true;
+    lane.experiment.v0_payload = true;
+    world.port.SetLaneFacts(lane);
+    const auto stage = Stage(0U, Nominal::kControlled, Parameters("spring_back_fast", false));
+    world.Dispatch(stage);
+    world.Sample(0.5, 0.5, 1.0);
+    ScriptReplacement(world, kSecond, 5U, ExecutionGoalResult::kSucceeded);
+    const auto result = world.helper->TranslateStopStage(stage, Budget(stage), {});
+    ASSERT_EQ(result.outcome, ParticipantStopStageOutcomeDTO::kSucceeded);
+    const auto replaces = Replaces(world.port);
+    ASSERT_EQ(replaces.size(), 1U);
+    const auto& points = replaces.front().trajectory.waypoints;
+    ASSERT_GE(points.size(), 2U);
+    if (scheduled_lane) {
+      ASSERT_TRUE(replaces.front().start);
+      EXPECT_NEAR(points.front().time_from_start_s, 0.003, 1e-12);
+      EXPECT_NEAR(points.back().time_from_start_s, 0.503, 1e-12);
+    } else {
+      EXPECT_FALSE(replaces.front().start);
+      EXPECT_LT(points.front().time_from_start_s, 0.0);
+      EXPECT_NEAR(points.back().time_from_start_s, 0.5, 1e-12);
+      const auto& diagnostics =
+          std::get<JsonObjectDTO>(EvidenceObject(result).at("provider_diagnostics").value);
+      EXPECT_FALSE(diagnostics.contains("spring_back_fast_shape"));
+    }
   }
 }
 
@@ -1628,9 +1846,10 @@ TEST(ParticipantStopStageHelperTest, PathDeviationDuringTheStopIsMeasuredFromSam
 /// cursor restarts on the brake; the brake's own sampled reference stays
 /// nonzero; on tick `succeeded_tick` JTC reports kSucceeded and from the next
 /// tick on publishes its success hold (cursor reset, reference velocity 0).
-void ScriptBrake(World& world, const ExecutionGoalKey& key, std::size_t succeeded_tick = 4U) {
+void ScriptBrake(World& world, const ExecutionGoalKey& key, std::size_t succeeded_tick = 4U,
+                 double factor = 0.5) {
   auto started = std::make_shared<std::size_t>(0U);
-  world.on_tick = [&world, key, succeeded_tick, started] {
+  world.on_tick = [&world, key, succeeded_tick, started, factor] {
     const auto replaces = Replaces(world.port);
     if (replaces.empty() || replaces.back().next_key != key) return;
     if (*started == 0U) {
@@ -1641,10 +1860,10 @@ void ScriptBrake(World& world, const ExecutionGoalKey& key, std::size_t succeede
     }
     const auto tick = world.ticks - *started + 1U;
     if (tick <= succeeded_tick) {
-      world.Sample(0.004 * static_cast<double>(tick), 0.6, 0.04);  // braking, never 0
+      world.Sample(0.004 * static_cast<double>(tick), 0.6, 0.04, factor);  // braking, never 0
       if (tick == succeeded_tick) world.Finish(key, ExecutionGoalResult::kSucceeded);
     } else {
-      world.Sample(0.0, world.BrakeEnd(), 0.0);  // success hold at the brake's end
+      world.Sample(0.0, world.BrakeEnd(), 0.0, factor);  // success hold at the brake's end
     }
   };
 }
@@ -1705,7 +1924,7 @@ TEST(ParticipantStopStageHelperTest, ControlledHardStopBrakesFromTheLatestComman
   EXPECT_EQ(Text(EvidenceObject(result), "hard_stop_level"), "controlled_hard_stop");
 }
 
-TEST(ParticipantStopStageHelperTest, NoLeadControlledHardStopKeepsImmediateDeliveryOnScheduledLane) {
+TEST(ParticipantStopStageHelperTest, ScheduledHardStopUsesTheSameSourceEntryAndFullBrake) {
   World world;
   auto lane = world.port.ReadLaneFacts();
   lane.supports_scheduled_replacement = true;
@@ -1720,106 +1939,16 @@ TEST(ParticipantStopStageHelperTest, NoLeadControlledHardStopKeepsImmediateDeliv
   ASSERT_EQ(result.outcome, ParticipantStopStageOutcomeDTO::kSucceeded);
   const auto replacements = Replaces(world.port);
   ASSERT_EQ(replacements.size(), 1U);
-  // A past point does not establish shared future PVA at a scheduled handoff.
-  // This mode retains its old immediate command and elapsed-origin estimate.
-  EXPECT_FALSE(replacements.front().start);
-  EXPECT_NEAR(replacements.front().trajectory.waypoints.front().time_from_start_s, -0.51, 1e-12);
+  ASSERT_TRUE(replacements.front().start);
+  EXPECT_EQ(replacements.front().start->experiment->release_hold, ExecutionReleaseHold::kHeld);
+  const auto& points = replacements.front().trajectory.waypoints;
+  EXPECT_NEAR(points.front().time_from_start_s, 0.004, 1e-12);
+  EXPECT_NEAR(points.front().positions_rad[0], 0.514, 1e-12);
+  EXPECT_NEAR(points.front().velocities_rad_s[0], 1.0, 1e-12);
+  EXPECT_NEAR(points.front().accelerations_rad_s2[0], -16.0, 1e-12);
+  EXPECT_NEAR(points.back().time_from_start_s, 0.004 + 0.5 * 0.125, 1e-12);
   EXPECT_EQ(Scales(world.port), std::vector<double>{0.5});
   EXPECT_TRUE(Cancels(world.port).empty());
-}
-
-// JTC `replacement_time_reference: active_trajectory` (whole-timeline
-// replacement): every zero-stamp Replace on the resident lane carries the
-// SAME curve the stock lane sends, on the resident clock (stock time + the
-// join's elapsed), from the last knot at or before the trip sample's cursor.
-// The stock lane keeps its relative times (checked by the tests above).
-TEST(ParticipantStopStageHelperTest, ResidentLaneSendsEveryStopCurveOnTheResidentClock) {
-  struct Case {
-    const char* name;
-    std::size_t stage;
-    const char* mode;
-    double cursor;
-    double factor;
-  };
-  for (const auto& c : {Case{"soft", 0U, "soft_on_path", 0.5, 0.5},
-                        Case{"soft_f1", 0U, "soft_on_path", 0.62, 1.0},
-                        Case{"soft_f01", 0U, "soft_on_path", 0.62, 0.1},
-                        Case{"spring_back", 0U, "spring_back_hold", 0.5, 0.5},
-                        Case{"fast", 0U, "spring_back_fast", 0.62, 0.5},
-                        Case{"fast_no_passed_point", 0U, "spring_back_fast", 0.0, 0.5},
-                        Case{"hard", 1U, nullptr, 0.62, 0.5}}) {
-    SCOPED_TRACE(c.name);
-    const auto run = [&](bool resident) {
-      World world;
-      world.frozen = c.factor;
-      auto lane = world.port.ReadLaneFacts();
-      lane.supports_resident_timeline_replacement = resident;
-      world.port.SetLaneFacts(lane);
-      const auto stage = c.mode == nullptr
-                             ? Stage(c.stage)
-                             : Stage(c.stage, Nominal::kControlled, Parameters(c.mode, false));
-      world.Dispatch(stage);
-      world.Sample(c.cursor, c.cursor, 1.0, c.factor);
-      if (c.mode == nullptr) {
-        ScriptBrake(world, kSecond);
-      } else {
-        ScriptReplacement(world, kSecond, 5U, ExecutionGoalResult::kSucceeded);
-      }
-      const auto result = world.helper->TranslateStopStage(
-          stage, c.mode == nullptr ? Budget(stage, 1'800'000'000) : Budget(stage), {});
-      EXPECT_EQ(result.outcome, ParticipantStopStageOutcomeDTO::kSucceeded)
-          << (result.error ? result.error->details.at("reason") : "");
-      const auto replaces = Replaces(world.port);
-      EXPECT_EQ(replaces.size(), 1U);
-      EXPECT_FALSE(replaces.empty() || replaces.front().start.has_value());
-      std::optional<double> joined_elapsed;
-      if (c.mode != nullptr && result.outcome == ParticipantStopStageOutcomeDTO::kSucceeded) {
-        const auto& evidence = EvidenceObject(result);
-        const auto& diagnostics =
-            std::get<JsonObjectDTO>(evidence.at("provider_diagnostics").value);
-        joined_elapsed = std::get<double>(diagnostics.at("join_elapsed_path_s").value);
-      }
-      return std::pair{replaces.empty() ? TrajectoryDTO{} : replaces.front().trajectory,
-                       joined_elapsed};
-    };
-    const auto [stock, stock_elapsed] = run(false);
-    const auto [wire, wire_elapsed] = run(true);
-    EXPECT_EQ(stock_elapsed, wire_elapsed);
-    if (stock.waypoints.empty() || wire.waypoints.empty()) {
-      ADD_FAILURE() << "no replacement sent";
-      continue;  // every case runs even when an earlier one fails
-    }
-    // The stock message's time 0 is the join's elapsed (the hard brake reports
-    // none: its first point is the original knot 0 at -elapsed).
-    const double elapsed = stock_elapsed.value_or(-stock.waypoints.front().time_from_start_s);
-    EXPECT_GE(elapsed, c.cursor);
-    std::size_t first = 0U;
-    while (first + 1U < stock.waypoints.size() &&
-           stock.waypoints[first + 1U].time_from_start_s + elapsed <= c.cursor)
-      ++first;
-    if (wire.waypoints.size() != stock.waypoints.size() - first) {
-      ADD_FAILURE() << "wire has " << wire.waypoints.size() << " points, expected "
-                    << stock.waypoints.size() - first << " (first point "
-                    << wire.waypoints.front().time_from_start_s << ")";
-      continue;
-    }
-    for (std::size_t i = 0; i < wire.waypoints.size(); ++i) {
-      const auto& expected = stock.waypoints[first + i];
-      EXPECT_NEAR(wire.waypoints[i].time_from_start_s, expected.time_from_start_s + elapsed,
-                  1e-12);
-      EXPECT_EQ(wire.waypoints[i].positions_rad, expected.positions_rad);
-      EXPECT_EQ(wire.waypoints[i].velocities_rad_s, expected.velocities_rad_s);
-      EXPECT_EQ(wire.waypoints[i].accelerations_rad_s2, expected.accelerations_rad_s2);
-    }
-    // The delivery covers the actual cursor with a past knot (JTC keeps its
-    // origin and seed; nothing is spliced inside the controller).
-    if (c.cursor > 0.0) {
-      EXPECT_LE(wire.waypoints.front().time_from_start_s, c.cursor);
-    } else {
-      // Fast spring-back with no passed point: the trip point lands at elapsed.
-      EXPECT_NEAR(wire.waypoints.front().time_from_start_s, elapsed, 1e-12);
-    }
-  }
 }
 
 TEST(ParticipantStopStageHelperTest, ControlledHardStopFinishesOnItsSuccessThenTheFollowingHold) {
@@ -3164,6 +3293,740 @@ TEST(ParticipantStopStageHelperTest, FirstCycleStopCancelsAtOnceWhileOnlyTheComp
   // genuinely ended (4 samples, about 40 ms after the cancel).
   EXPECT_GE(world.clock.now() - started, 900'000'000);
   EXPECT_LE(world.clock.now() - started, world.config.hard_stop_completion_timeout_ns);
+}
+
+
+// Full precision actual Core payloads for the separate pristine-A receiver gate.
+std::string ReceiverCurve(const TrajectoryDTO& trajectory) {
+  std::ostringstream out;
+  out << std::setprecision(17);
+  for (const auto& point : trajectory.waypoints) {
+    out << point.time_from_start_s;
+    for (const auto* values : {&point.positions_rad, &point.velocities_rad_s,
+                               &point.accelerations_rad_s2})
+      for (const double value : *values) out << ',' << value;
+    out << ';';
+  }
+  return out.str();
+}
+
+// ACTUAL-C handover, against the commands actually issued: the controller
+// commands path C + k f P at tick k. Ticks k < 0 were the unmodified source
+// (Original(): x = path time, v = 1, a = 0); k >= 0 come from the sent payload
+// (its time 0 is E = C - r). Returns the wall finite differences (rad/s^2,
+// rad/s^3) at k = 0 and k = 1, which are NOT the analytic law jerk.
+struct Handover {
+  double fd_a[2];
+  double fd_j[2];
+  double analytic_a[2];
+};
+Handover ExpectActualC(const TrajectoryDTO& sent, double c, double r, double factor,
+                       double period) {
+  const auto& first = sent.waypoints.front();
+  EXPECT_NEAR(first.positions_rad[0], c, 2e-8);  // the receiver's source(C) check, unchanged
+  EXPECT_NEAR(first.positions_rad[0], c, 1e-10);
+  EXPECT_NEAR(first.velocities_rad_s[0], 1.0, 1e-10);
+  EXPECT_NEAR(first.accelerations_rad_s2[0], 0.0, 1e-8);
+  std::vector<double> q;
+  std::vector<double> a;
+  for (int k = -3; k <= 3; ++k) {
+    const double step = factor * period * static_cast<double>(k);
+    if (k < 0) {
+      q.push_back(c + step);
+      a.push_back(0.0);
+      continue;
+    }
+    const auto state = sample_trajectory(sent, r + step);
+    EXPECT_TRUE(state.ok());
+    if (!state.ok()) return {};
+    q.push_back(state.value().positions_rad[0]);
+    a.push_back(state.value().accelerations_rad_s2[0] * factor * factor);  // wall
+  }
+  Handover out{};
+  for (int i = 0; i < 2; ++i) {
+    const auto k = static_cast<std::size_t>(3 + i);
+    out.fd_a[i] = (q[k + 1] - 2.0 * q[k] + q[k - 1]) / (period * period);
+    out.fd_j[i] = (q[k + 1] - 3.0 * q[k] + 3.0 * q[k - 1] - q[k - 2]) / (period * period * period);
+    out.analytic_a[i] = a[k];
+  }
+  return out;
+}
+
+// Wall acceleration at every sent knot (analytic, from the planner's knots).
+double PeakKnotDeceleration(const TrajectoryDTO& sent, double factor) {
+  double peak = 0.0;
+  for (const auto& point : sent.waypoints)
+    peak = std::max(peak, std::abs(point.accelerations_rad_s2[0]) * factor * factor);
+  return peak;
+}
+
+TEST(ParticipantStopStageHelperTest, ProductionTimingMatrixExportsActualCorePayloads) {
+  for (const double rate : {100.0, 150.0}) for (const double factor : {1.0, 0.5, 0.1})
+    for (const char* mode : {"soft_on_path", "spring_back_hold", "spring_back_fast", "hard"}) {
+      SCOPED_TRACE(::testing::Message() << rate << ' ' << factor << ' ' << mode);
+      World world(false);
+      world.config.stop_traj_delta_s = 0.1;  // retained production value, never enlarged
+      auto lane = world.port.ReadLaneFacts();
+      lane.supports_scheduled_replacement = true;
+      lane.controller_update_rate_hz = rate;
+      lane.experiment.midtick_stamp = true;
+      world.port.SetLaneFacts(lane);
+      world.frozen = factor;
+      world.Build();
+      auto stage = Stage(std::string(mode) == "hard" ? 1U : 0U, Nominal::kControlled,
+                         Parameters(std::string(mode) == "hard" ? "soft_on_path" : mode,
+                                    false, std::nullopt, 10.0));
+      world.Dispatch(stage);
+      world.Sample(0.5, 0.5, 1.0, factor);
+      const auto source = *world.port.ReadSample();
+      ScriptBrake(world, kSecond, 4U, factor);
+      auto result = world.helper->TranslateStopStage(stage, Budget(stage), {});
+      // The C-lead bound includes one unscaled P: UR/.1 soft/hold no longer fall through.
+      const bool falls_through = result.outcome == ParticipantStopStageOutcomeDTO::kFailed;
+      ASSERT_EQ(result.outcome, ParticipantStopStageOutcomeDTO::kSucceeded)
+          << (result.error ? result.error->message : "");
+      const auto calls = Replaces(world.port);
+      ASSERT_EQ(calls.size(), 1U);
+      const auto& call = calls.front();
+      ASSERT_TRUE(call.start);
+      const auto& timing = *call.start->experiment;
+      const double period = static_cast<Duration>(1e9 / rate) / 1e9;
+      const double b = factor * static_cast<double>(static_cast<Duration>(1e9 / rate) / 2) / 1e9;
+      const double c = source.cursor_s + factor *
+          static_cast<double>(timing.target_tick_ns - source.source_stamp_ns) / 1e9 + period;
+      EXPECT_NEAR(call.trajectory.waypoints.front().time_from_start_s, period - b, 1e-12);
+      // ACTUAL-C: a C past the trip point re-plans from source(C), so every row
+      // starts at source(C) again.
+      EXPECT_NEAR(call.trajectory.waypoints.front().positions_rad[0], c, 1e-10);
+      EXPECT_NEAR(call.trajectory.waypoints.front().velocities_rad_s[0], 1.0, 1e-10);
+      EXPECT_TRUE(Cancels(world.port).empty());
+      const auto label = std::string(mode) + '_' + std::to_string(static_cast<int>(rate)) +
+                         '_' + std::to_string(factor);
+      std::ostringstream metadata;
+      metadata << std::setprecision(17) << rate << ',' << factor << ','
+               << call.start->controller_start_stamp_ns << ',' << timing.target_tick_ns << ','
+               << source.source_stamp_ns << ',' << source.cursor_s << ',' << c << ','
+               << period - b << ',' << falls_through;
+      RecordProperty(label + "_metadata", metadata.str());
+      RecordProperty(label + "_joints", "joint_1");
+      RecordProperty(label + "_source", ReceiverCurve(Original()));
+      RecordProperty(label + "_sent", ReceiverCurve(call.trajectory));
+    }
+}
+
+// LEAD-B: the soft/hold C-lead bound is the f-scaled lead plus one unscaled P.
+// A lead ending inside C's own P lookahead is eligible; a C past it is not.
+TEST(ParticipantStopStageHelperTest, SoftAndHoldCLeadBoundAddsOneUnscaledPeriod) {
+  for (const double rate : {100.0, 150.0}) for (const double factor : {1.0, 0.5, 0.1})
+    for (const char* mode : {"soft_on_path", "spring_back_hold"}) for (const bool late : {false, true}) {
+      SCOPED_TRACE(::testing::Message() << rate << ' ' << factor << ' ' << mode << " late=" << late);
+      const auto period_ns = static_cast<Duration>(1e9 / rate);
+      const double period = static_cast<double>(period_ns) / 1e9;
+      const auto ticks = (20'000'000 + period_ns - 1) / period_ns;  // existing A20 grid
+      const double advance = static_cast<double>(ticks * period_ns) / 1e9;  // T - S
+      World world(false);
+      // Lead end L = w + f*lead: inside (C - P, C) when eligible, before C - P when late.
+      world.config.stop_traj_delta_s = late ? 0.9 * advance : advance + 0.9 * period / factor;
+      auto lane = world.port.ReadLaneFacts();
+      lane.supports_scheduled_replacement = true;
+      lane.controller_update_rate_hz = rate;
+      lane.experiment.midtick_stamp = true;
+      world.port.SetLaneFacts(lane);
+      world.frozen = factor;
+      world.Build();
+      auto stage = Stage(0U, Nominal::kControlled, Parameters(mode, false, std::nullopt, 10.0));
+      world.Dispatch(stage);
+      world.Sample(0.5, 0.5, 1.0, factor);
+      const auto source = *world.port.ReadSample();
+      const double lead_end = source.cursor_s + factor * world.config.stop_traj_delta_s;
+      if (late) {
+        ScriptBrake(world, kSecond, 4U, factor);
+        auto result = world.helper->TranslateStopStage(stage, Budget(stage), {});
+        ASSERT_EQ(result.outcome, ParticipantStopStageOutcomeDTO::kFailed);
+        ASSERT_TRUE(result.error);
+        EXPECT_EQ(result.error->details.at("reason"), std::string(mode == std::string("soft_on_path")
+            ? "soft_on_path" : "spring_back") + "_stop_delta_budget_exceeded");
+        EXPECT_EQ(result.error->details.at("recommended_disposition"), "hard_stop");
+        EXPECT_TRUE(Replaces(world.port).empty());
+        stage.stage_index = 1U;  // existing Kernel fallback owner selects the hard stage
+        result = world.helper->TranslateStopStage(stage, Budget(stage), {});
+        ASSERT_EQ(result.outcome, ParticipantStopStageOutcomeDTO::kSucceeded)
+            << (result.error ? result.error->message : "");
+        const auto brakes = Replaces(world.port);
+        ASSERT_EQ(brakes.size(), 1U);
+        EXPECT_GE(brakes.front().trajectory.waypoints.front().positions_rad[0],
+                  lead_end + period);  // hard brake entry C
+        continue;
+      }
+      ScriptReplacement(world, kSecond, 5U, ExecutionGoalResult::kSucceeded);
+      const auto result = world.helper->TranslateStopStage(stage, Budget(stage), {});
+      ASSERT_EQ(result.outcome, ParticipantStopStageOutcomeDTO::kSucceeded)
+          << (result.error ? result.error->message : "");
+      const auto calls = Replaces(world.port);
+      ASSERT_EQ(calls.size(), 1U);
+      ASSERT_TRUE(calls.front().start);
+      EXPECT_EQ(calls.front().start->experiment->target_tick_ns - source.source_stamp_ns,
+                ticks * period_ns);
+      const double c = source.cursor_s + factor * advance + period;
+      const auto& first = calls.front().trajectory.waypoints.front();
+      EXPECT_GT(c, lead_end);  // the f-scaled lead alone would have refused this C
+      EXPECT_LT(c, lead_end + period);
+      (void)ExpectActualC(calls.front().trajectory, c, first.time_from_start_s, factor, period);
+      EXPECT_TRUE(Cancels(world.port).empty());
+    }
+}
+
+// ACTUAL-C: one scheduled soft/hold Stop on the production grid (midtick stamp,
+// A20). `lead` places L = w + f*lead; C = w + f(T-S) + P.
+struct ActualCRun {
+  std::unique_ptr<World> world;
+  ResolvedParticipantStopStageDTO stage;
+  ExecutionControllerSampleDTO source;
+  std::optional<ParticipantStopStageResultDTO> result;
+  double period{};
+  double advance{};
+  double c{};
+  double lead_end{};
+};
+ActualCRun RunActualC(double rate, double factor, double lead,
+                      JsonObjectDTO parameters, std::optional<Duration> remaining = std::nullopt) {
+  ActualCRun run{std::make_unique<World>(false),
+                 Stage(0U, Nominal::kControlled, std::move(parameters)), {}, {}, {}, {}, {}, {}};
+  const auto period_ns = static_cast<Duration>(1e9 / rate);
+  run.period = static_cast<double>(period_ns) / 1e9;
+  const auto ticks = (20'000'000 + period_ns - 1) / period_ns;  // existing A20 grid
+  run.advance = static_cast<double>(ticks * period_ns) / 1e9;   // T - S
+  auto& world = *run.world;
+  world.config.stop_traj_delta_s = lead;
+  auto lane = world.port.ReadLaneFacts();
+  lane.supports_scheduled_replacement = true;
+  lane.controller_update_rate_hz = rate;
+  lane.experiment.midtick_stamp = true;
+  world.port.SetLaneFacts(lane);
+  world.frozen = factor;
+  world.Build();
+  world.Dispatch(run.stage);
+  world.Sample(0.5, 0.5, 1.0, factor);
+  run.source = *world.port.ReadSample();
+  run.lead_end = run.source.cursor_s + factor * lead;
+  run.c = run.source.cursor_s + factor * run.advance + run.period;
+  ScriptReplacement(world, kSecond, 5U, ExecutionGoalResult::kSucceeded);
+  auto budget = Budget(run.stage);
+  if (remaining) budget.remaining_controlled_deadline_ns = *remaining;
+  run.result.emplace(world.helper->TranslateStopStage(run.stage, budget, {}));
+  return run;
+}
+
+JsonObjectDTO ActualCParameters(const char* mode, double deceleration, double duration,
+                                std::optional<double> jerk = std::nullopt) {
+  auto parameters = Parameters(mode, false, std::nullopt, deceleration);
+  parameters.insert_or_assign("deceleration_time_s", JsonValueDTO{duration});
+  if (jerk) {
+    parameters.insert_or_assign("jerk_limits_enabled", JsonValueDTO{true});
+    auto& row = std::get<JsonObjectDTO>(
+        std::get<JsonValueDTO::Array>(parameters.at("per_resource_limits").value).front().value);
+    row.emplace("max_jerk", JsonValueDTO{JsonObjectDTO{
+                                {"coordinate_kind", JsonValueDTO{std::string("angular_rad_s3")}},
+                                {"value_rad_s3", JsonValueDTO{*jerk}}}});
+  }
+  return parameters;
+}
+
+void ExpectHardTakesOver(ActualCRun& run, const std::string& reason) {
+  ASSERT_EQ(run.result->outcome, ParticipantStopStageOutcomeDTO::kFailed);
+  ASSERT_TRUE(run.result->error);
+  EXPECT_EQ(run.result->error->details.at("reason"), reason);
+  EXPECT_EQ(run.result->error->details.at("recommended_disposition"), "hard_stop");
+  EXPECT_TRUE(Replaces(run.world->port).empty());
+  auto& world = *run.world;
+  ScriptBrake(world, kSecond, 4U, world.frozen);
+  run.stage.stage_index = 1U;  // existing Kernel fallback owner selects the hard stage
+  const auto hard = world.helper->TranslateStopStage(run.stage, Budget(run.stage), {});
+  ASSERT_EQ(hard.outcome, ParticipantStopStageOutcomeDTO::kSucceeded)
+      << (hard.error ? hard.error->message : "");
+  const auto brakes = Replaces(world.port);
+  ASSERT_EQ(brakes.size(), 1U);
+  EXPECT_NEAR(brakes.front().trajectory.waypoints.front().positions_rad[0], run.c, 1e-10);
+}
+
+// ACTUAL-C (maintainer-approved): C < L keeps the unchanged law; C >= L
+// (including C == L and the top of the eligible range, tau = C - L near
+// P(1 - f/2)) re-plans from source(C): first command source(C), no catch-up
+// against the source commands already issued, original spring-return target,
+// law within its caps, and the soft stop point moved by exactly (C - L)/2.
+TEST(ParticipantStopStageHelperTest, ActualCReplansSoftAndHoldFromSourceAtTakeover) {
+  constexpr double kDuration = 1.0;
+  constexpr double kDeceleration = 10.0;
+  for (const double rate : {100.0, 150.0}) for (const double factor : {1.0, 0.5, 0.1})
+    for (const char* mode : {"soft_on_path", "spring_back_hold"})
+      for (const char* place : {"before", "equal", "inside", "top"}) {
+        SCOPED_TRACE(::testing::Message() << rate << ' ' << factor << ' ' << mode << ' ' << place);
+        const double period = static_cast<double>(static_cast<Duration>(1e9 / rate)) / 1e9;
+        const double advance = std::ceil(0.02 / period - 1e-9) * period;
+        // lead: L before C by >= P/2 ("before"), at C, C - L = 0.1 P, or E just before L.
+        const double lead = std::string(place) == "before"  ? advance + 1.5 * period / factor
+                            : std::string(place) == "equal" ? advance + period / factor
+                            : std::string(place) == "inside"
+                                ? advance + 0.9 * period / factor
+                                : advance + 0.55 * period;
+        auto run = RunActualC(rate, factor, lead,
+                              ActualCParameters(mode, kDeceleration, kDuration));
+        ASSERT_EQ(run.result->outcome, ParticipantStopStageOutcomeDTO::kSucceeded)
+            << (run.result->error ? run.result->error->message : "");
+        const auto calls = Replaces(run.world->port);
+        ASSERT_EQ(calls.size(), 1U);
+        const auto& sent = calls.front().trajectory;
+        const double r = sent.waypoints.front().time_from_start_s;
+        const double tau = run.c - run.lead_end;
+        if (std::string(place) == "before") {
+          ASSERT_LT(tau, 0.0);
+          // Unchanged law: the first knot is the source at C (C < L), and the
+          // law still leaves the source exactly at L.
+          EXPECT_NEAR(sent.waypoints.front().positions_rad[0], run.c, 1e-10);
+          continue;
+        }
+        if (std::string(place) == "equal") {
+          EXPECT_NEAR(tau, 0.0, 1e-12);
+        }
+        if (std::string(place) == "top") {
+          EXPECT_GT(tau, 0.0);
+          EXPECT_LT(tau, period * (1.0 - factor / 2.0));
+        }
+        const auto handover = ExpectActualC(sent, run.c, r, factor, period);
+        for (int i = 0; i < 2; ++i) {
+          // No catch-up: the finite-difference acceleration at the handover is
+          // the law's own analytic acceleration within O(jerk P), and in cap.
+          EXPECT_NEAR(handover.fd_a[i], handover.analytic_a[i], 0.05) << i;
+          EXPECT_LE(std::abs(handover.fd_a[i]), kDeceleration) << i;
+        }
+        EXPECT_LE(PeakKnotDeceleration(sent, factor), kDeceleration + 1e-9);
+        const auto label = std::string("actual_c_") + mode + '_' +
+                           std::to_string(static_cast<int>(rate)) + '_' + std::to_string(factor) +
+                           '_' + place;
+        std::ostringstream numbers;
+        numbers << std::setprecision(17) << "tau_path=" << tau << ",fd_a0=" << handover.fd_a[0]
+                << ",fd_a1=" << handover.fd_a[1] << ",fd_j0=" << handover.fd_j[0]
+                << ",fd_j1=" << handover.fd_j[1] << ",final=" << sent.waypoints.back().positions_rad[0];
+        const double end = sent.waypoints.back().positions_rad[0];
+        if (std::string(mode) == "spring_back_hold") {
+          // The return target stays the ORIGINAL seam (trip cursor), not C.
+          EXPECT_NEAR(end, run.source.cursor_s, 1e-12);
+        } else {
+          // Unchanged law: L + f(D - lead)/2. Re-planned: C + f(D - lead')/2,
+          // lead' = lead + tau/f, i.e. later by exactly tau/2 (path = rad here).
+          const double unchanged = run.lead_end + 0.5 * factor * (kDuration - lead);
+          EXPECT_NEAR(end - unchanged, 0.5 * tau, 1e-9);
+          numbers << ",stop_shift=" << end - unchanged;
+        }
+        RecordProperty(label, numbers.str());
+        EXPECT_TRUE(Cancels(run.world->port).empty());
+      }
+}
+
+// ACTUAL-C with authored jerk limits enabled, at the top of the eligible range
+// for f = 0.1: the re-planned law passes the planner's own analytic segment
+// jerk check; the handover finite differences are reported and stay in caps.
+TEST(ParticipantStopStageHelperTest, ActualCReplanKeepsAuthoredJerkLimits) {
+  constexpr double kJerk = 50.0;
+  for (const double rate : {100.0, 150.0}) for (const char* mode : {"soft_on_path", "spring_back_hold"}) {
+    SCOPED_TRACE(::testing::Message() << rate << ' ' << mode);
+    const double period = static_cast<double>(static_cast<Duration>(1e9 / rate)) / 1e9;
+    const double advance = std::ceil(0.02 / period - 1e-9) * period;
+    auto run = RunActualC(rate, 0.1, advance + 0.55 * period,
+                          ActualCParameters(mode, 10.0, 1.0, kJerk));
+    ASSERT_EQ(run.result->outcome, ParticipantStopStageOutcomeDTO::kSucceeded)
+        << (run.result->error ? run.result->error->message : "");
+    ASSERT_GT(run.c, run.lead_end);
+    const auto calls = Replaces(run.world->port);
+    ASSERT_EQ(calls.size(), 1U);
+    const auto& sent = calls.front().trajectory;
+    const auto handover =
+        ExpectActualC(sent, run.c, sent.waypoints.front().time_from_start_s, 0.1, period);
+    for (int i = 0; i < 2; ++i) {
+      EXPECT_LE(std::abs(handover.fd_a[i]), 10.0) << i;
+      EXPECT_LE(std::abs(handover.fd_j[i]), kJerk) << i;  // finite difference, not analytic
+    }
+    EXPECT_LE(PeakKnotDeceleration(sent, 0.1), 10.0 + 1e-9);
+  }
+}
+
+// ACTUAL-C: a re-plan that no longer fits refuses with the existing reasons and
+// the existing hard stage takes over; the same C just inside the boundary sends.
+TEST(ParticipantStopStageHelperTest, ActualCReplanOutsideTheRemainingBudgetFallsBackToHard) {
+  constexpr double kRate = 100.0;
+  constexpr double kFactor = 0.1;
+  const double period = 0.01;
+  const double advance = 0.02;
+  const double lead = advance + 0.55 * period;  // C - L = P - 0.55 f P
+  const double replanned_lead = advance + period / kFactor;
+  // (1) Deceleration cap: the unchanged soft ramp (D - lead) fits 5 rad/s^2,
+  // the re-planned ramp (D - lead') does not.
+  {
+    auto run = RunActualC(kRate, kFactor, lead,
+                          ActualCParameters("soft_on_path", 5.0, 0.14));
+    ASSERT_GT(run.c, run.lead_end);
+    ExpectHardTakesOver(run, "soft_on_path_acceleration_limit_exceeded");
+  }
+  // (2) Hold forward half: just below / above the re-planned lead-in.
+  for (const double half : {replanned_lead - 0.001, replanned_lead + 0.002}) {
+    SCOPED_TRACE(half);
+    auto run = RunActualC(kRate, kFactor, lead,
+                          ActualCParameters("spring_back_hold", 1000.0, 2.0 * half));
+    if (half < replanned_lead) {
+      ExpectHardTakesOver(run, "spring_back_phase_time_not_larger_than_handoff");
+      continue;
+    }
+    ASSERT_EQ(run.result->outcome, ParticipantStopStageOutcomeDTO::kSucceeded)
+        << (run.result->error ? run.result->error->message : "");
+    const auto calls = Replaces(run.world->port);
+    ASSERT_EQ(calls.size(), 1U);
+    const auto& sent = calls.front().trajectory;
+    (void)ExpectActualC(sent, run.c, sent.waypoints.front().time_from_start_s, kFactor, period);
+  }
+  // (3) Absolute deadline from the ORIGINAL request: the law ends at
+  // T + (D - lead'); one ms short of it refuses, one ms more sends.
+  for (const char* mode : {"soft_on_path", "spring_back_hold"}) for (const Duration slack : {-1'000'000, 1'000'000}) {
+    SCOPED_TRACE(::testing::Message() << mode << ' ' << slack);
+    const auto need = static_cast<Duration>(std::llround((advance + 1.0 - replanned_lead) * 1e9));
+    auto run = RunActualC(kRate, kFactor, lead, ActualCParameters(mode, 10.0, 1.0),
+                          need + slack);
+    if (slack < 0) {
+      ExpectHardTakesOver(run, std::string(mode == std::string("soft_on_path") ? "soft_on_path"
+                                                                               : "spring_back") +
+                                   "_stop_delta_budget_exceeded");
+      continue;
+    }
+    ASSERT_EQ(run.result->outcome, ParticipantStopStageOutcomeDTO::kSucceeded)
+        << (run.result->error ? run.result->error->message : "");
+  }
+}
+
+TEST(ParticipantStopStageHelperTest, ScheduledShortBrakeAndPastEndKeepTheWholeExistingLaw) {
+  for (const double speed : {0.0, 0.001, 1.0}) {
+    World world;
+    auto lane = world.port.ReadLaneFacts();
+    lane.supports_scheduled_replacement = true;
+    world.port.SetLaneFacts(lane);
+    const auto stage = Stage(1U);
+    auto goal = Goal(stage);
+    for (auto& point : goal.trajectory.waypoints) {
+      point.positions_rad[0] *= speed;
+      point.velocities_rad_s[0] *= speed;
+    }
+    world.helper->BindDispatchedGoal(goal, std::make_shared<ExecutionSampleAssociation>(
+        ExecutionBindingEpoch(1U), std::nullopt, world.clock.now()));
+    world.Executing(kOriginal);
+    const double cursor = speed == 0.0 ? 2.0 : 0.5;
+    world.Sample(cursor, speed * cursor, speed);
+    ScriptBrake(world, kSecond);
+    const auto result = world.helper->TranslateStopStage(stage, Budget(stage), {});
+    ASSERT_EQ(result.outcome, ParticipantStopStageOutcomeDTO::kSucceeded);
+    const auto points = Replaces(world.port).front().trajectory.waypoints;
+    EXPECT_NEAR(points.front().time_from_start_s, 0.004, 1e-12);
+    EXPECT_NEAR(points.front().positions_rad[0], speed * (cursor + 0.014), 1e-12);
+    EXPECT_NEAR(points.back().time_from_start_s - points.front().time_from_start_s,
+                0.5 * (0.5 * speed / 4.0), 1e-12);
+    EXPECT_TRUE(Cancels(world.port).empty());
+  }
+}
+
+TEST(ParticipantStopStageHelperTest, ScheduledMissedHardReleaseUsesTheExistingCancelFloor) {
+  World world(false);
+  world.config.replacement_start_allowance_s = 0.0;
+  world.Build();
+  auto lane = world.port.ReadLaneFacts();
+  lane.supports_scheduled_replacement = true;
+  world.port.SetLaneFacts(lane);
+  const auto stage = Stage(1U);
+  world.Dispatch(stage);
+  world.Sample(0.5, 0.5, 1.0);
+  world.on_tick = [&] {
+    if (Cancels(world.port).empty()) return;
+    world.port.MarkCancelSent(kOriginal, world.clock.now() - 1);
+    world.Cancelled(kOriginal);
+    world.Sample(0.001, 0.5, 0.0);
+  };
+  const auto result = world.helper->TranslateStopStage(stage, Budget(stage), {});
+  ASSERT_EQ(result.outcome, ParticipantStopStageOutcomeDTO::kSucceeded);
+  EXPECT_TRUE(Replaces(world.port).empty());
+  EXPECT_EQ(Cancels(world.port), std::vector<ExecutionGoalKey>{kOriginal});
+  EXPECT_EQ(Text(EvidenceObject(result), "hard_stop_fallback_reason"),
+            "controlled_hard_stop_release_expired");
+}
+
+TEST(ParticipantStopStageHelperTest, EarlierRefusalDoesNotConvertHardHoldTerminationToFallback) {
+  for (const bool cancel : {false, true}) {
+    World world(false);
+    world.config.stop_traj_delta_s = 0.019;  // LEAD-B: a genuinely late start still refuses
+    if (!cancel) world.config.controller_state_max_age_ns = 5'000'000;
+    world.Build();
+    auto lane = world.port.ReadLaneFacts();
+    lane.supports_scheduled_replacement = true;
+    world.port.SetLaneFacts(lane);
+    auto stage = Stage(0U, Nominal::kControlled, Parameters("soft_on_path", false));
+    world.Dispatch(stage);
+    world.Sample(0.5, 0.5, 1.0);
+    const auto refused = world.helper->TranslateStopStage(stage, Budget(stage), {});
+    ASSERT_EQ(refused.outcome, ParticipantStopStageOutcomeDTO::kFailed);
+    ASSERT_TRUE(refused.error);
+    EXPECT_EQ(refused.error->details.at("recommended_disposition"), "hard_stop");
+    std::stop_source cancellation;
+    world.on_tick = [&] { if (cancel) cancellation.request_stop(); };
+    stage.stage_index = 1U;
+    const auto result = world.helper->TranslateStopStage(stage, Budget(stage), cancellation.get_token());
+    EXPECT_EQ(result.outcome, cancel ? ParticipantStopStageOutcomeDTO::kSupersededNoEffect
+                                    : ParticipantStopStageOutcomeDTO::kFailed);
+    if (!cancel) {
+      ASSERT_TRUE(result.error);
+      EXPECT_EQ(result.error->details.at("reason"), "stale_controller_state");
+    }
+    EXPECT_TRUE(Replaces(world.port).empty());
+    EXPECT_TRUE(Cancels(world.port).empty());
+  }
+}
+
+TEST(ParticipantStopStageHelperTest, SourceOffsetSurvivesBindingRecordingAndAdoption) {
+  for (const bool adopted : {false, true}) {
+    World world;
+    auto lane = world.port.ReadLaneFacts();
+    lane.supports_scheduled_replacement = true;
+    world.port.SetLaneFacts(lane);
+    auto stage = Stage(1U);
+    world.Dispatch(stage);
+    auto goal = Goal(stage);
+    goal.planned_controller_offset_s = 0.001;
+    const auto association = std::make_shared<ExecutionSampleAssociation>(
+        ExecutionBindingEpoch(1U), std::nullopt, world.clock.now());
+    if (adopted) {
+      ASSERT_TRUE(world.helper->ReserveReplacement(kOriginal));
+      goal.key = kSecond;
+      world.helper->RecordReplacement(kSecond, goal.trajectory, association, 0.001);
+      world.port.FinishGoal(kOriginal, ExecutionGoalResult::kPreemptedBy, kSecond, world.clock.now());
+      std::optional<StopStageDispatchedGoalDTO> candidate(goal);
+      world.helper->AdoptReplacement(candidate);
+      stage.controller_goal_generation = kSecond.controller_goal_generation;
+      world.Executing(kSecond);
+    } else {
+      world.helper->BindDispatchedGoal(goal, association);
+    }
+    world.Sample(0.002, 0.001, 1.0);  // bridge guard: planned offset must be retained
+    ScriptBrake(world, adopted ? kThird : kSecond);
+    const auto result = world.helper->TranslateStopStage(stage, Budget(stage), {});
+    ASSERT_EQ(result.outcome, ParticipantStopStageOutcomeDTO::kSucceeded)
+        << (result.error ? result.error->message : "");
+    EXPECT_NEAR(Replaces(world.port).front().trajectory.waypoints.front().positions_rad[0],
+                0.001 + 0.5 * 0.020 + 0.004, 1e-12);
+  }
+}
+
+
+// Original Kernel ingress is intentionally earlier than the helper starts.
+// The receiver clock epoch is arbitrary; only the relative age is carried.
+TEST(ParticipantStopStageHelperTest, SpringReturnTargetsOriginalIngressAcrossRatesFactorsAndDelay) {
+  for (const double rate : {100.0, 150.0})
+    for (const double factor : {1.0, 0.5, 0.1})
+      for (const double phase : {0.0, 0.5, 1.0})
+        for (const char* mode : {"spring_back_fast", "spring_back_hold"}) {
+          SCOPED_TRACE(::testing::Message() << rate << ' ' << factor << ' ' << phase << ' ' << mode);
+          World world(false);
+          world.clock.set(71'000'000'000);  // not the Kernel's epoch
+          const auto period_ns = static_cast<Duration>(1e9 / rate);
+          const double period = static_cast<double>(period_ns) / 1e9;
+          const auto advance_ns = ((20'000'000 + period_ns - 1) / period_ns) * period_ns;
+          world.config.stop_traj_delta_s = static_cast<double>(advance_ns) / 1e9 + 0.55 * period;
+          const auto age = static_cast<Duration>(phase * period_ns);
+          const double old_target = 0.5 + factor * static_cast<double>(age) / 1e9;
+          const double expected = 0.5 + period;
+          auto lane = world.port.ReadLaneFacts();
+          lane.supports_scheduled_replacement = true;
+          lane.controller_update_rate_hz = rate;
+          lane.experiment.midtick_stamp = true;
+          world.port.SetLaneFacts(lane);
+          world.frozen = factor;
+          world.Build();
+          const auto stage = Stage(0U, Nominal::kControlled,
+                                   ActualCParameters(mode, 10.0, 1.0));
+          world.Dispatch(stage);
+          world.clock.advance(age);
+          world.Sample(old_target, old_target, 1.0, factor);
+          ScriptReplacement(world, kSecond, 5U, ExecutionGoalResult::kSucceeded);
+          SpringPointObserver observer(world);
+          auto budget = Budget(stage);
+          budget.stop_ingress_age_ns = age;
+          // Keep the original deadline values: the new age is target-only.
+          const auto original_elapsed = budget.elapsed_since_stop_ns;
+          const auto original_deadline = budget.remaining_controlled_deadline_ns;
+          const auto result = world.helper->TranslateStopStageForTakeover(
+              stage, budget, {}, observer);
+          ASSERT_EQ(result.outcome, ParticipantStopStageOutcomeDTO::kSucceeded)
+              << (result.error ? result.error->message : "");
+          const auto calls = Replaces(world.port);
+          ASSERT_EQ(calls.size(), 1U);
+          EXPECT_NEAR(calls.front().trajectory.waypoints.back().positions_rad[0], expected, 2e-8);
+          ASSERT_TRUE(observer.point);
+          ASSERT_TRUE(observer.point->initial.spring_back_return_path_time_s);
+          EXPECT_NEAR(*observer.point->initial.spring_back_return_path_time_s, expected, 2e-8);
+          EXPECT_NEAR(observer.point->initial.spring_back_return_point.positions_rad[0], expected, 2e-8);
+          EXPECT_EQ(budget.elapsed_since_stop_ns, original_elapsed);
+          EXPECT_EQ(budget.remaining_controlled_deadline_ns, original_deadline);
+          EXPECT_TRUE(Cancels(world.port).empty());
+          std::ostringstream numbers;
+          numbers << std::setprecision(17) << "arrival_to_sample_ns=" << age
+                  << ",old_target=" << old_target << ",new_target=" << expected
+                  << ",delta=" << expected - old_target;
+          const auto label = std::string(mode) + '_' + std::to_string(static_cast<int>(rate)) +
+                             '_' + std::to_string(factor) + "_arrival_" + std::to_string(age);
+          RecordProperty(label + "_result", numbers.str());
+          ASSERT_TRUE(calls.front().start);
+          const auto& start = *calls.front().start;
+          ASSERT_TRUE(start.experiment);
+          const auto source = 0.5 + factor * static_cast<double>(age) / 1e9;
+          const double c = source + factor * static_cast<double>(
+              start.experiment->target_tick_ns - (71'000'000'000 + age)) / 1e9 + period;
+          std::ostringstream metadata;
+          metadata << std::setprecision(17) << rate << ',' << factor << ','
+                   << start.controller_start_stamp_ns << ',' << start.experiment->target_tick_ns
+                   << ',' << 71'000'000'000 + age << ',' << source << ',' << c << ','
+                   << calls.front().trajectory.waypoints.front().time_from_start_s << ",0";
+          RecordProperty(label + "_metadata", metadata.str());
+          RecordProperty(label + "_joints", "joint_1");
+          RecordProperty(label + "_source", ReceiverCurve(Original()));
+          RecordProperty(label + "_sent", ReceiverCurve(calls.front().trajectory));
+        }
+}
+
+TEST(ParticipantStopStageHelperTest, FastSpringNearEndFollowsNaturalCompletionSetting) {
+  for (const bool natural : {true, false}) {
+    SCOPED_TRACE(natural);
+    World world;
+    const auto stage = Stage(0U, Nominal::kControlled, Parameters("spring_back_fast", natural));
+    world.Dispatch(stage);
+    world.clock.advance(20'000'000);
+    world.Sample(1.9, 1.9, 1.0);
+    auto budget = Budget(stage);
+    budget.stop_ingress_age_ns = 20'000'000;
+    if (natural) {
+      world.on_tick = [&] {
+        if (world.ticks == 5U) world.Finish(kOriginal, ExecutionGoalResult::kSucceeded);
+        world.Sample(1.95, 1.95, world.ticks >= 5U ? 0.0 : 1.0);
+      };
+    } else {
+      ScriptReplacement(world, kSecond, 5U, ExecutionGoalResult::kSucceeded);
+    }
+    const auto result = world.helper->TranslateStopStage(stage, budget, {});
+    ASSERT_EQ(result.outcome, ParticipantStopStageOutcomeDTO::kSucceeded)
+        << (result.error ? result.error->message : "");
+    const auto calls = Replaces(world.port);
+    if (natural) {
+      EXPECT_TRUE(calls.empty());
+      EXPECT_TRUE(std::get<bool>(EvidenceObject(result).at("completed_by_natural_completion").value));
+    } else {
+      ASSERT_EQ(calls.size(), 1U);
+      EXPECT_NEAR(calls.front().trajectory.waypoints.back().positions_rad[0], 1.89, 2e-8);
+      EXPECT_FALSE(std::get<bool>(EvidenceObject(result).at("completed_by_natural_completion").value));
+    }
+  }
+}
+
+
+TEST(ParticipantStopStageHelperTest, InvalidIngressAgeRejectsBeforeAnyControlledEffect) {
+  for (const auto age : {std::int64_t{-1}, kMaximumStopDurationNs + 1}) {
+    SCOPED_TRACE(age);
+    World world;
+    const auto stage = Stage(0U, Nominal::kControlled, Parameters("spring_back_fast", false));
+    world.Dispatch(stage);
+    world.Sample(0.5, 0.5, 1.0);
+    auto budget = Budget(stage);
+    budget.stop_ingress_age_ns = age;
+    const auto commands = world.CommandCount();
+    const auto result = world.helper->TranslateStopStage(stage, budget, {});
+    EXPECT_EQ(result.outcome, ParticipantStopStageOutcomeDTO::kFailed);
+    ASSERT_TRUE(result.error);
+    EXPECT_EQ(result.error->details.at("reason"), "resolved_stop_stage_budget_invalid");
+    EXPECT_EQ(world.CommandCount(), commands);
+    EXPECT_EQ(world.freezes, 0U);
+  }
+}
+
+
+TEST(ParticipantStopStageHelperTest, ScheduledNearEndSpringRespectsSettingAndExistingFeasibility) {
+  for (const double rate : {100.0, 150.0})
+    for (const char* mode : {"spring_back_fast", "spring_back_hold"})
+      for (const bool natural : {false, true}) {
+        SCOPED_TRACE(::testing::Message() << rate << ' ' << mode << ' ' << natural);
+        World world;
+        auto lane = world.port.ReadLaneFacts();
+        lane.supports_scheduled_replacement = true;
+        lane.controller_update_rate_hz = rate;
+        world.port.SetLaneFacts(lane);
+        const double period = static_cast<double>(static_cast<Duration>(1e9 / rate)) / 1e9;
+        const auto stage = Stage(0U, Nominal::kControlled, Parameters(mode, natural));
+        world.Dispatch(stage);
+        world.clock.advance(20'000'000);
+        world.Sample(1.9, 1.9, 1.0);
+        auto budget = Budget(stage);
+        budget.stop_ingress_age_ns = 20'000'000;
+        if (natural) {
+          world.on_tick = [&] {
+            if (world.ticks == 5U) world.Finish(kOriginal, ExecutionGoalResult::kSucceeded);
+            world.Sample(1.95, 1.95, world.ticks >= 5U ? 0.0 : 1.0);
+          };
+        } else {
+          ScriptReplacement(world, kSecond, 5U, ExecutionGoalResult::kSucceeded);
+        }
+        const auto result = world.helper->TranslateStopStage(stage, budget, {});
+        const auto calls = Replaces(world.port);
+        if (std::string(mode) == "spring_back_hold") {
+          // Existing limit-respecting hold cannot brake on this short source.
+          // Its planner recommends hard Stop for either setting; target-only
+          // work must neither bypass that check nor fabricate a successful return.
+          EXPECT_EQ(result.outcome, ParticipantStopStageOutcomeDTO::kFailed);
+          ASSERT_TRUE(result.error);
+          EXPECT_EQ(result.error->details.at("recommended_disposition"), "hard_stop");
+          EXPECT_TRUE(calls.empty());
+        } else if (natural) {
+          ASSERT_EQ(result.outcome, ParticipantStopStageOutcomeDTO::kSucceeded);
+          EXPECT_TRUE(calls.empty());
+          EXPECT_TRUE(std::get<bool>(EvidenceObject(result).at("completed_by_natural_completion").value));
+        } else {
+          ASSERT_EQ(result.outcome, ParticipantStopStageOutcomeDTO::kSucceeded)
+              << (result.error ? result.error->message : "");
+          ASSERT_EQ(calls.size(), 1U);
+          EXPECT_NEAR(calls.front().trajectory.waypoints.back().positions_rad[0], 1.89 + period, 2e-8);
+          EXPECT_FALSE(std::get<bool>(EvidenceObject(result).at("completed_by_natural_completion").value));
+        }
+      }
+}
+
+TEST(ParticipantStopStageHelperTest, SpringArrivalTargetSubtractsDeliveryOffsetOnlyOnce) {
+  for (const char* mode : {"spring_back_fast", "spring_back_hold"}) {
+    SCOPED_TRACE(mode);
+    World world;
+    auto lane = world.port.ReadLaneFacts();
+    lane.supports_scheduled_replacement = true;
+    lane.controller_update_rate_hz = 100.0;
+    world.port.SetLaneFacts(lane);
+    const auto stage = Stage(0U, Nominal::kControlled, ActualCParameters(mode, 10.0, 1.0));
+    auto goal = Goal(stage);
+    goal.planned_controller_offset_s = 0.02;
+    world.helper->BindDispatchedGoal(goal, std::make_shared<ExecutionSampleAssociation>(
+        ExecutionBindingEpoch(1U), world.port.ReadSample(), world.clock.now()));
+    world.Executing(kOriginal);
+    world.clock.advance(5'000'000);
+    world.Sample(0.52, 0.5, 1.0);
+    ScriptReplacement(world, kSecond, 5U, ExecutionGoalResult::kSucceeded);
+    SpringPointObserver observer(world);
+    auto budget = Budget(stage);
+    budget.stop_ingress_age_ns = 5'000'000;
+    const auto result = world.helper->TranslateStopStageForTakeover(stage, budget, {}, observer);
+    ASSERT_EQ(result.outcome, ParticipantStopStageOutcomeDTO::kSucceeded)
+        << (result.error ? result.error->message : "");
+    ASSERT_TRUE(observer.point);
+    EXPECT_NEAR(observer.point->initial.spring_back_return_path_time_s.value(), 0.5075, 2e-8);
+    const auto calls = Replaces(world.port);
+    ASSERT_EQ(calls.size(), 1U);
+    EXPECT_NEAR(calls.front().trajectory.waypoints.back().positions_rad[0], 0.5075, 2e-8);
+  }
 }
 
 }  // namespace

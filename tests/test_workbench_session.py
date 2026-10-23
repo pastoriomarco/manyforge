@@ -88,6 +88,23 @@ def test_fresh_selection_contains_only_marker_and_history_is_stable(tmp_path):
     assert set(report["journal_families"]) == {"program_cycle", "scene", "manager", "cclc", "kernel_operation"}
 
 
+def test_motion_trace_files_remain_stable_across_cold_sessions(tmp_path):
+    root = tmp_path / "runtime"
+    root.mkdir()
+    traces = root / "motion-traces"
+    traces.mkdir(mode=0o700)
+    trace = traces / ("trace-" + "a" * 64 + ".json")
+    trace.write_bytes(b"saved diagnostic evidence")
+    trace.chmod(0o600)
+    inode = trace.stat().st_ino
+    select(root, FIRST)
+    select(root, SECOND)
+    assert trace.read_bytes() == b"saved diagnostic evidence"
+    assert trace.stat().st_ino == inode
+    assert stat.S_IMODE(trace.stat().st_mode) == 0o600
+    assert not (root / "previous-sessions" / FIRST / "motion-traces").exists()
+
+
 def test_legacy_layout_moves_all_journals_without_opening_or_checkpointing_owners(tmp_path):
     root = tmp_path / "runtime"
     root.mkdir()

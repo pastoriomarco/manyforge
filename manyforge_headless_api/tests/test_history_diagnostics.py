@@ -1,8 +1,10 @@
 """On-demand diagnostics never infer missing effects or compare foreign clocks."""
 
 from copy import deepcopy
+import hashlib
 
 import pytest
+import rfc8785
 from pydantic import ValidationError
 
 from manyforge_headless_api.history_diagnostics import (
@@ -500,3 +502,65 @@ def test_execution_client_reads_volatile_trace_with_attributed_allowance():
             _trace_client(bad)[0].read_volatile_motion_trace(4096)
     with pytest.raises(ValueError):
         client.read_volatile_motion_trace(0)
+
+
+def _file_trace_client(tmp_path):
+    trace = {**deepcopy(_TRACE), "request_owner_epoch": "owner.file"}
+    payload = rfc8785.dumps(trace)
+    digest = hashlib.sha256(payload).hexdigest()
+    path = tmp_path / f"trace-{digest}.json"
+    path.write_bytes(payload)
+    path.chmod(0o600)
+    metadata = {
+        "schema_version": "manyforge.motion_trace_file.v1",
+        "file": path.name,
+        "bytes": len(payload),
+        "sha256": f"sha256:{digest}",
+        "request_owner_epoch": "owner.file",
+        "status": "complete",
+    }
+    client, sent = _trace_client({
+        "api_version": "manyforge.execution_command_response.v1",
+        "ok": True,
+        "command": "read_volatile_motion_trace",
+        "trace_file": metadata,
+    })
+    return client, sent, trace, path
+
+
+def test_debug_export_loads_opted_in_file_without_changing_historian(monkeypatch, tmp_path):
+    monkeypatch.setenv("MANYFORGE_MOTION_TRACE_DIR", str(tmp_path))
+    client, sent, trace, _path = _file_trace_client(tmp_path)
+    baseline = _baseline(monkeypatch)
+    service = _export_service(monkeypatch, client)
+    bundle = service.debug_export(HistorianQueryRequest())
+    assert bundle["volatile_motion_trace"] == {"available": True, "trace": trace}
+    assert _body(bundle).startswith(baseline[:-1] + b',"volatile_motion_trace":')
+    assert len(sent) == 1
+    assert sent[0]["allowance_bytes"] == VOLATILE_MOTION_TRACE_MAX_BYTES
+    # The normalized-trace-only route still performs no trace/file request.
+    without = service.debug_export(HistorianQueryRequest(), include_volatile_motion_trace=False)
+    assert _body(without) == baseline
+    assert len(sent) == 1
+
+
+@pytest.mark.parametrize("condition,reason", [
+    ("unconfigured", "motion_trace_file_invalid"),
+    ("missing", "motion_trace_file_unavailable"),
+    ("digest_changed", "motion_trace_file_invalid"),
+])
+def test_file_trace_failures_leave_export_available_with_explicit_reason(
+    monkeypatch, tmp_path, condition, reason
+):
+    monkeypatch.setenv("MANYFORGE_MOTION_TRACE_DIR", str(tmp_path))
+    client, _sent, _trace, path = _file_trace_client(tmp_path)
+    if condition == "unconfigured":
+        monkeypatch.delenv("MANYFORGE_MOTION_TRACE_DIR")
+    elif condition == "missing":
+        path.unlink()
+    else:
+        payload = path.read_bytes()
+        path.write_bytes(payload.replace(b"g.1", b"g.2", 1))
+    bundle = _export_service(monkeypatch, client).debug_export(HistorianQueryRequest())
+    assert bundle["schema_version"] == "manyforge.debug_export.v1"
+    assert bundle["volatile_motion_trace"] == {"available": False, "reason": reason}

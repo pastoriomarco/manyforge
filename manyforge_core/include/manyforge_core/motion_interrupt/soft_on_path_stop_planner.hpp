@@ -69,6 +69,9 @@ struct SoftOnPathPlannerConfig {
   /// forward braking end only while the whole Stop still ends by this time.
   /// Absent: the requested deceleration time is the deadline.
   std::optional<double> stop_deadline_s;
+  /// Frozen return target, separate from the braking seam. Absent preserves
+  /// the existing seam target. Expressed in the accepted trajectory clock.
+  std::optional<double> spring_back_return_path_time_s{};
 };
 
 /// Pure initial-condition resolution shared by Stop planning and speculative
@@ -82,13 +85,15 @@ struct SoftOnPathResolvedInitialStateDTO {
   /// Supplied factor provenance, without a new normalization or authority rule.
   double runtime_velocity_scale_at_trip = 1.0;
   std::vector<std::string> joint_names;
-  /// q at command_path_time_s with zero velocity/acceleration, in joint_names
-  /// order. time_from_start_s is zero; it does not predict physical arrival.
+  /// q at spring_back_return_path_time_s when supplied, otherwise at the
+  /// command seam, with zero velocity/acceleration, in joint_names order.
+  /// time_from_start_s is zero; it does not predict physical arrival.
   TrajectoryWaypointDTO spring_back_return_point{0.0, {}, {}, {}};
   double projected_time_from_start_s = 0.0;
   double initial_path_deviation_rad = 0.0;
   double initial_velocity_deviation_rad_s = 0.0;
   bool used_model_velocity = false;
+  std::optional<double> spring_back_return_path_time_s{};
 };
 
 /// Resolve the existing soft Stop initial-condition checks, in their original

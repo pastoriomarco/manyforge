@@ -138,17 +138,151 @@ Result<StopReplacementStartDTO> compute_stop_replacement_start(
   const auto requested_ns = static_cast<TimePoint>(std::llround(duration));
   auto ticks = requested_ns / period_ns;
   if (requested_ns % period_ns != 0) ++ticks;
-  if (ticks > (maximum - sample.source_stamp_ns) / period_ns) return invalid();
-  const auto advance_ns = ticks * period_ns;
+  const auto& flags = lane.experiment;
+  if (ticks + (flags.midtick_stamp ? 1 : 0) > (maximum - sample.source_stamp_ns) / period_ns)
+    return invalid();
+  const auto half_ns = period_ns / 2;
+  const auto advance_ns = ticks * period_ns + (flags.midtick_stamp ? half_ns : 0);
   auto aligned = input;
   aligned.wall_since_sample_s = static_cast<double>(advance_ns) / 1e9;
   aligned.start_allowance_s = 0.0;
   const auto elapsed = compute_stop_join_elapsed_s(aligned);
   if (!elapsed.ok()) return Result<StopReplacementStartDTO>::Err(elapsed.error());
   if (!finite(elapsed.value())) return invalid();
+  ExecutionReplacementStartDTO scheduled{sample.binding_epoch,
+                                         sample.source_stamp_ns + advance_ns};
+  if (flags.any()) {
+    if (!finite(flags.expected_latency_s) || flags.expected_latency_s < 0.0 ||
+        flags.expected_latency_s > 1.0)
+      return invalid();
+    const auto latency_ns = std::llround(flags.expected_latency_s * 1e9);
+    auto& experiment = scheduled.experiment.emplace();
+    experiment.source_stamp_ns = sample.source_stamp_ns;
+    experiment.target_tick_ns = sample.source_stamp_ns + ticks * period_ns;
+    experiment.expected_latency_ns = latency_ns;
+    experiment.start_allowance_ns = std::llround(input.start_allowance_s * 1e9);
+    experiment.start_allowance_override = flags.start_allowance_override;
+    experiment.factor = input.frozen_factor;
+    experiment.midtick_stamp = flags.midtick_stamp;
+    experiment.v0_payload = flags.v0_payload;
+    // Arrival (callback completion) aimed half a tick before T.
+    if (flags.release_timer)
+      experiment.release_local_ns =
+          sample.local_receipt_stamp_ns + ticks * period_ns - half_ns - latency_ns;
+  }
   return Result<StopReplacementStartDTO>::Ok(
-      {elapsed.value(), ExecutionReplacementStartDTO{
-                            sample.binding_epoch, sample.source_stamp_ns + advance_ns}});
+      {elapsed.value(), std::move(scheduled),
+       input.frozen_factor * static_cast<double>(flags.midtick_stamp ? half_ns : 0) / 1e9});
+}
+
+std::optional<TimePoint> plan_replacement_release(StopReplacementStartDTO& start,
+                                                  const IClock& clock,
+                                                  const TimePoint latest_send_ns) {
+  if (!start.scheduled || !start.scheduled->experiment ||
+      !start.scheduled->experiment->release_local_ns)
+    return std::nullopt;
+  auto& experiment = *start.scheduled->experiment;
+  const auto release = *experiment.release_local_ns;
+  if (!(clock.now() < release)) {
+    experiment.release_hold = ExecutionReleaseHold::kMissed;
+    return std::nullopt;
+  }
+  if (release > latest_send_ns) {
+    experiment.release_hold = ExecutionReleaseHold::kDeadline;
+    return std::nullopt;
+  }
+  experiment.release_hold = ExecutionReleaseHold::kHeld;
+  return release;
+}
+
+Result<TrajectoryDTO> stop_replacement_v0_payload(const TrajectoryDTO& joined,
+                                                 const double first_time_s) {
+  const auto state = sample_trajectory(joined, first_time_s);
+  if (!state.ok() || joined.waypoints.empty() ||
+      !(joined.waypoints.back().time_from_start_s > first_time_s + kJoinTimeEpsilonS)) {
+    return Result<TrajectoryDTO>::Err(stop_error(
+        "stop_join_input_invalid", "The V0 payload needs a joined trajectory past its start"));
+  }
+  auto v0 = joined;
+  v0.waypoints.clear();
+  v0.waypoints.push_back(TrajectoryWaypointDTO{first_time_s, state.value().positions_rad,
+                                               state.value().velocities_rad_s,
+                                               state.value().accelerations_rad_s2});
+  for (const auto& waypoint : joined.waypoints)
+    if (waypoint.time_from_start_s > first_time_s + kJoinTimeEpsilonS)
+      v0.waypoints.push_back(waypoint);
+  return Result<TrajectoryDTO>::Ok(std::move(v0));
+}
+
+double estimate_stop_source_cursor(const TrajectoryDTO& source,
+                                   const ExecutionControllerSampleDTO& sample,
+                                   const ExecutionLaneFactsDTO& lane, double offset) {
+  const double period = std::floor(1e9 / lane.controller_update_rate_hz) / 1e9;
+  const double cursor = sample.cursor_s - offset;
+  const auto order = joint_order(lane.joint_names, source.joint_names);
+  const auto size = source.joint_names.size();
+  if (!(period > 0.0) || !finite(period) || sample.cursor_s <= offset + period || !order ||
+      !complete_trajectory(source) || sample.reference_positions_rad.size() != size ||
+      sample.reference_velocities_rad_s.size() != size ||
+      cursor < source.waypoints.front().time_from_start_s ||
+      cursor > source.waypoints.back().time_from_start_s) return cursor;
+  TrajectorySampleResult state;
+  if (!sample_trajectory_prevalidated(source, cursor, state).ok()) return cursor;
+  double numerator = 0.0, denominator = 0.0, initial_error = 0.0;
+  for (std::size_t j = 0U; j < size; ++j) {
+    const double v = state.velocities_rad_s[j], a = state.accelerations_rad_s2[j];
+    const double dq = sample.reference_positions_rad[(*order)[j]] - state.positions_rad[j];
+    const double dv = sample.reference_velocities_rad_s[(*order)[j]] - v;
+    initial_error += dq * dq + period * period * dv * dv;
+    numerator += v * dq + period * period * a * dv;
+    denominator += v * v + period * period * a * a;
+  }
+  if (initial_error <= size * 1e-18 || period * period * denominator <= size * 1e-18 ||
+      !finite(numerator) || !finite(denominator)) return cursor;
+  const double candidate = sample.cursor_s -
+      std::max(0.0, offset - std::clamp(numerator / denominator, -period, period));
+  TrajectorySampleResult corrected;
+  if (candidate < source.waypoints.front().time_from_start_s ||
+      candidate > source.waypoints.back().time_from_start_s ||
+      !sample_trajectory_prevalidated(source, candidate, corrected).ok()) return cursor;
+  double corrected_error = 0.0;
+  for (std::size_t j = 0U; j < size; ++j) {
+    const double dq = sample.reference_positions_rad[(*order)[j]] - corrected.positions_rad[j];
+    const double dv = sample.reference_velocities_rad_s[(*order)[j]] - corrected.velocities_rad_s[j];
+    corrected_error += dq * dq + period * period * dv * dv;
+  }
+  return corrected_error < initial_error ? candidate : cursor;
+}
+
+Result<TrajectoryDTO> build_scheduled_spring_back_fast(const TrajectoryDTO& active,
+                                                       const double start_path_s,
+                                                       const std::vector<double>& stop_positions,
+                                                       const double stop_end_path_s) {
+  const auto width = active.joint_names.size();
+  const auto invalid = [&](std::string message) {
+    return Result<TrajectoryDTO>::Err(stop_error(
+        "spring_back_fast_input_invalid", std::move(message),
+        {{"start_path_s", format(start_path_s)}, {"stop_end_path_s", format(stop_end_path_s)}}));
+  };
+  if (!complete_trajectory(active) || stop_positions.size() != width || !finite(start_path_s) ||
+      !finite(stop_end_path_s) ||
+      start_path_s > active.waypoints.back().time_from_start_s + kJoinTimeEpsilonS)
+    return invalid("The scheduled fast spring-back start lies outside the active trajectory");
+  if (!(stop_end_path_s - start_path_s > kJoinTimeEpsilonS))
+    return invalid("The scheduled fast spring-back starts at or after its stop time");
+  const auto state = sample_trajectory(active, start_path_s);
+  if (!state.ok())
+    return invalid("The scheduled fast spring-back start cannot be sampled on the active path");
+  TrajectoryDTO stop;
+  stop.resources = active.resources;
+  stop.joint_names = active.joint_names;
+  stop.waypoints.push_back(TrajectoryWaypointDTO{0.0, state.value().positions_rad,
+                                                 state.value().velocities_rad_s,
+                                                 state.value().accelerations_rad_s2});
+  stop.waypoints.push_back(TrajectoryWaypointDTO{stop_end_path_s - start_path_s, stop_positions,
+                                                 std::vector<double>(width, 0.0),
+                                                 std::vector<double>(width, 0.0)});
+  return Result<TrajectoryDTO>::Ok(std::move(stop));
 }
 
 Result<TrajectoryDTO> convert_stop_trajectory_to_path_time(const TrajectoryDTO& wall_time_trajectory,
@@ -275,38 +409,6 @@ Result<TrajectoryDTO> build_stop_replacement_join(const TrajectoryDTO& active,
          {"trip_path_s", format(trip_path_s)}}));
   }
   return Result<TrajectoryDTO>::Ok(std::move(joined));
-}
-
-TrajectoryDTO resident_timeline_delivery(const TrajectoryDTO& resident,
-                                         const double cursor_s) {
-  // From the last knot at or before the cursor (or the first knot when none
-  // is): the controller's segment there keeps its own end points, so the
-  // command at the cursor and the reference lookahead stay on the same curve.
-  const auto& points = resident.waypoints;
-  const auto after = std::upper_bound(
-      points.begin(), points.end(), cursor_s,
-      [](double time, const TrajectoryWaypointDTO& point) {
-        return time < point.time_from_start_s;
-      });
-  TrajectoryDTO delivery = resident;
-  delivery.waypoints.assign(after == points.begin() ? after : std::prev(after), points.end());
-  return delivery;
-}
-
-Result<ResidentTimelineReplacementDTO> build_resident_timeline_replacement(
-    const TrajectoryDTO& joined, const double elapsed_s, const double source_clock_offset_s,
-    const double resident_cursor_s) {
-  if (!finite(elapsed_s) || !finite(source_clock_offset_s) || !finite(resident_cursor_s) ||
-      !complete_trajectory(joined))
-    return Result<ResidentTimelineReplacementDTO>::Err(stop_error(
-        "stop_join_input_invalid", "Resident replacement needs a complete checked join"));
-  ResidentTimelineReplacementDTO result{joined, {}};
-  const double shift = elapsed_s - source_clock_offset_s;
-  for (auto& point : result.resident_trajectory.waypoints)
-    point.time_from_start_s += shift;
-  result.delivery_trajectory =
-      resident_timeline_delivery(result.resident_trajectory, resident_cursor_s);
-  return Result<ResidentTimelineReplacementDTO>::Ok(std::move(result));
 }
 
 Result<ControlledHardStopBrakeDTO> plan_controlled_hard_stop_brake(

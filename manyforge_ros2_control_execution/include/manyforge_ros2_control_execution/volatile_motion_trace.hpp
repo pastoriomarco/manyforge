@@ -3,6 +3,7 @@
 #include <atomic>
 #include <control_msgs/action/follow_joint_trajectory.hpp>
 #include <deque>
+#include <filesystem>
 #include <manyforge_content_identity/content_identity.hpp>
 #include <manyforge_core/ports/iexecution_port.hpp>
 #include <manyforge_core/types/prepared_operation_participant.hpp>
@@ -47,7 +48,8 @@ public:
                  core::TimePoint attempted_at, Garbage &garbage) noexcept;
   void Attach(const TokenPtr &token, Goal &&goal, core::TimePoint returned_at,
               core::ExecutionPortDispatch disposition,
-              Garbage &garbage) noexcept;
+              Garbage &garbage, bool replacement = false,
+              const std::optional<core::ExecutionReplacementStartDTO> &start = {}) noexcept;
   void Observe(const TokenPtr &token,
                const core::ExecutionGoalObservationDTO &facts) noexcept;
   void Sample(const std::string &action,
@@ -58,6 +60,9 @@ public:
   core::Result<content_identity::CanonicalValue>
   Snapshot(const core::RequestOwnerEpoch &owner,
            std::size_t allowance_bytes) const;
+  core::Result<content_identity::CanonicalValue>
+  SnapshotFile(const core::RequestOwnerEpoch &owner, std::size_t allowance_bytes,
+               const std::filesystem::path &directory) const;
 
 private:
   struct Pending {
@@ -76,6 +81,8 @@ private:
     std::optional<core::TimePoint> first_own_feedback;
     std::shared_ptr<const Goal> payload;
     std::size_t bytes{};
+    bool replacement{};
+    std::optional<core::ExecutionReplacementStartDTO> replacement_start{};
   };
   struct SampleEntry {
     std::string action;

@@ -200,6 +200,14 @@ execution host is up. They are expected and stop once the start reports ready:
 
 ### Reference
 
+To save motion-trace snapshots when exporting debug data, set
+`MANYFORGE_MOTION_TRACE_DIR=/tmp/manyforge-state/motion-traces` before starting.
+Leave it unset for no disk snapshots. The directory survives Workbench restarts;
+files are limited to 3 MiB each and 64 MiB in total, with oldest-first eviction.
+These are snapshots of the bounded volatile window (16 goals, 1,024 controller
+samples), with explicit coverage and omission counts, not complete Run journals.
+Unavailable or invalid diagnostic files do not fail motion or the debug export.
+
 Frontend source edits update through HMR. Backend
 startup incrementally builds the current `manyforge_manager_daemon`,
 `manyforge_headless_py`, `manyforge_ros2_control_execution_host`,

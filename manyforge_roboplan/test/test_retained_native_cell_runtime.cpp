@@ -1876,7 +1876,7 @@ TEST(RetainedNativeCellRuntimeTest,
                                             channel_config.freshness_budget_ns));
   auto channel = std::make_shared<RetainedObservedStateChannel>(
       binding, projector, channel_config, clock.get());
-  auto handle = std::make_shared<RetainedRos2ControlRuntimeHandle>();
+  auto handle = RetainedRos2ControlRuntimeHandle::Create();
   RetainedRos2ControlBackendConfig config;
   config.node_name = "manyforge_gripper_cell_fixture";
   config.node_namespace = "/manyforge/gripper_cell_fixture";

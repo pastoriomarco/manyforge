@@ -8,12 +8,12 @@
   "description": "R5 trial (d): I/O nodes. Mock: read_part_initial scripts part_present false and reads it; wait_part scripts part_present false then true after 250 ms (timeout 2 s); check_part reads the value left true; set clamp and lamp. ROS: set plc_start (SetBool ack, 500 ms), wait for plc_ready (Bool topic, timeout 5 s). wait_operator_ack scripts operator_ack false with no change, so it times out after 5 s into a Fallback unless operator_ack is set true in the Tool & I/O panel during the wait.",
   "members": {
     "assignment.yaml": "sha256:96366a3e2c8984bfc53586b8897ca0e29addab3483aa30d8dec203d11b41923e",
-    "deployment.yaml": "sha256:ef85b0869231b3e11b16ab1d006d9c39f81bbc1df046e43ab1b938daf7ef0cc0",
+    "deployment.yaml": "sha256:fae26670e4448800d823a9804399a844b4e8f255dd7af58f9860e2aad426e039",
     "program.yaml": "sha256:186ca5b4355c55edc1f6f04fdcb9de7d31788f967f56158aa94dfd4d1d368dbb"
   },
   "name": "r5_trial_d_io",
   "saved_status": {
-    "checked_content_digest": "sha256:e818a74a860834eb1ad7e75ce88018d9d3fbb0411dbfa5607e65d0af41877bbf",
+    "checked_content_digest": "sha256:304f7046bb0f08ed569921463a75bb3eb1c320ec7e045a00aa30029639e1bdcd",
     "last_known_status": "unknown",
     "manyforge_version": "0.1.0"
   },

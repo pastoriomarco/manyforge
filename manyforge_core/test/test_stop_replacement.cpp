@@ -1,6 +1,7 @@
 #include <gtest/gtest.h>
 
 #include <cmath>
+#include <cstdio>
 #include <limits>
 #include <manyforge_core/motion_interrupt/stop_replacement.hpp>
 #include <manyforge_core/trajectory/trajectory_sampler.hpp>
@@ -560,6 +561,358 @@ TEST(StopReplacementStartTest, PreservesLegacyTimingAndRejectsInvalidOrExpiredSc
   }
 }
 
+// --- Experimental independent flags (stock JTC 6.10 recipe) --------------------
+
+constexpr TimePoint kP150 = 6'666'666;  // the controller's integer period at 150 Hz
+
+ExecutionLaneFactsDTO FlagLane(bool timer, bool midtick, bool v0 = false) {
+  ExecutionLaneFactsDTO lane;
+  lane.supports_scheduled_replacement = true;
+  lane.supports_scale = true;
+  lane.controller_update_rate_hz = 150.0;
+  lane.experiment.release_timer = timer;
+  lane.experiment.midtick_stamp = midtick;
+  lane.experiment.v0_payload = v0;
+  return lane;
+}
+
+ExecutionControllerSampleDTO FlagSample(TimePoint stamp, TimePoint receipt, double factor) {
+  ExecutionControllerSampleDTO sample;
+  sample.binding_epoch = ExecutionBindingEpoch(3U);
+  sample.source_stamp_ns = stamp;
+  sample.local_receipt_stamp_ns = receipt;  // unrelated local clock origin
+  sample.cursor_s = 1.0;
+  sample.applied_factor = factor;
+  return sample;
+}
+
+TEST(ReplacementExperimentTest, TimerOnlyKeepsTheStampAndAimsArrivalHalfATickBeforeIt) {
+  const auto sample = FlagSample(9'000'000'000, 600'000'000, 1.0);
+  const StopJoinElapsedInputDTO input{1.0, 1.0, 0.002, 0.02, {}};
+  const auto off = compute_stop_replacement_start(input, sample, FlagLane(false, false));
+  const auto timer = compute_stop_replacement_start(input, sample, FlagLane(true, false));
+  ASSERT_TRUE(off.ok() && timer.ok());
+  EXPECT_FALSE(off.value().scheduled->experiment);
+  // Same stamp policy (2 ms + 20 ms rounded up: 4 periods) and same D.
+  EXPECT_EQ(timer.value().scheduled->controller_start_stamp_ns,
+            off.value().scheduled->controller_start_stamp_ns);
+  EXPECT_EQ(off.value().scheduled->controller_start_stamp_ns, 9'000'000'000 + 4 * kP150);
+  EXPECT_EQ(timer.value().elapsed_path_s, off.value().elapsed_path_s);
+  const auto& experiment = *timer.value().scheduled->experiment;
+  EXPECT_EQ(experiment.source_stamp_ns, 9'000'000'000);
+  EXPECT_EQ(experiment.target_tick_ns, 9'000'000'000 + 4 * kP150);
+  ASSERT_TRUE(experiment.release_local_ns);
+  EXPECT_EQ(*experiment.release_local_ns, 600'000'000 + 4 * kP150 - kP150 / 2 - 1'500'000);
+  EXPECT_EQ(experiment.expected_latency_ns, 1'500'000);
+  EXPECT_EQ(experiment.factor, 1.0);
+  EXPECT_FALSE(experiment.midtick_stamp);
+  EXPECT_FALSE(experiment.v0_payload);
+}
+
+TEST(ReplacementExperimentTest, MidtickOnlyShiftsTheStampAndDByHalfAPeriod) {
+  const auto sample = FlagSample(9'000'000'000, 600'000'000, 0.5);
+  const StopJoinElapsedInputDTO input{1.0, 0.5, 0.002, 0.02, {}};
+  const auto midtick = compute_stop_replacement_start(input, sample, FlagLane(false, true));
+  ASSERT_TRUE(midtick.ok());
+  const auto& scheduled = *midtick.value().scheduled;
+  EXPECT_EQ(scheduled.controller_start_stamp_ns, 9'000'000'000 + 4 * kP150 + kP150 / 2);
+  EXPECT_NEAR(midtick.value().elapsed_path_s, 1.0 + 0.5 * (4.0 * kP150 + kP150 / 2) / 1e9, 1e-12);
+  ASSERT_TRUE(scheduled.experiment);
+  EXPECT_TRUE(scheduled.experiment->midtick_stamp);
+  EXPECT_FALSE(scheduled.experiment->release_local_ns);
+  EXPECT_EQ(scheduled.experiment->target_tick_ns, 9'000'000'000 + 4 * kP150);
+}
+
+TEST(ReplacementExperimentTest, V0OnlyRecordsTheFlagAndKeepsStampAndD) {
+  const auto sample = FlagSample(9'000'000'000, 600'000'000, 1.0);
+  const StopJoinElapsedInputDTO input{1.0, 1.0, 0.002, 0.02, {}};
+  const auto off = compute_stop_replacement_start(input, sample, FlagLane(false, false));
+  const auto v0 = compute_stop_replacement_start(input, sample, FlagLane(false, false, true));
+  ASSERT_TRUE(off.ok() && v0.ok());
+  EXPECT_EQ(v0.value().elapsed_path_s, off.value().elapsed_path_s);
+  EXPECT_EQ(v0.value().scheduled->controller_start_stamp_ns,
+            off.value().scheduled->controller_start_stamp_ns);
+  ASSERT_TRUE(v0.value().scheduled->experiment);
+  EXPECT_TRUE(v0.value().scheduled->experiment->v0_payload);
+  EXPECT_FALSE(v0.value().scheduled->experiment->release_local_ns);
+}
+
+TEST(ReplacementExperimentTest, GridMathHoldsForJitteredTicksDelaysFactorsAndFlagCombinations) {
+  // The sampled tick's own phase jitters (arbitrary stamps, up to +-6 % of P);
+  // decision delays sweep two periods and more; factors down to 0.1.
+  for (const bool timer : {false, true}) {
+    for (const bool midtick : {false, true}) {
+      const auto lane = FlagLane(timer, midtick);
+      for (const double factor : {1.0, 0.5, 0.1}) {
+        for (int jitter = -40; jitter <= 40; jitter += 13) {
+          const TimePoint stamp = 5'000'000'000 + jitter * 9'973;
+          for (int age_us = 0; age_us <= 25'000; age_us += 487) {
+            const auto sample = FlagSample(stamp, 42'000'000, factor);
+            const auto start = compute_stop_replacement_start(
+                {1.0, factor, age_us * 1e-6, 0.02, {}}, sample, lane);
+            ASSERT_TRUE(start.ok());
+            const auto& scheduled = *start.value().scheduled;
+            ASSERT_EQ(scheduled.experiment.has_value(), timer || midtick);
+            const TimePoint now = 42'000'000 + static_cast<TimePoint>(age_us) * 1'000;
+            const TimePoint tick = scheduled.controller_start_stamp_ns - (midtick ? kP150 / 2 : 0);
+            EXPECT_EQ((tick - stamp) % kP150, 0);
+            // Existing rule: the first grid tick at or after receipt age + allowance.
+            EXPECT_GE(tick - stamp, (now - 42'000'000) + 20'000'000 - 1);
+            EXPECT_LT(tick - stamp - kP150, (now - 42'000'000) + 20'000'000);
+            EXPECT_NEAR(start.value().elapsed_path_s,
+                        1.0 + factor * static_cast<double>(scheduled.controller_start_stamp_ns -
+                                                           stamp) / 1e9,
+                        1e-12);
+            if (!scheduled.experiment) continue;
+            EXPECT_EQ(scheduled.experiment->target_tick_ns, tick);
+            EXPECT_EQ(scheduled.experiment->factor, factor);
+            EXPECT_EQ(scheduled.experiment->release_local_ns.has_value(), timer);
+            if (!timer) continue;
+            // Release + latency maps to T - P/2 on the receipt-anchored clock.
+            EXPECT_EQ(*scheduled.experiment->release_local_ns + 1'500'000 - 42'000'000,
+                      tick - stamp - kP150 / 2);
+            EXPECT_GE(*scheduled.experiment->release_local_ns - now,
+                      20'000'000 - kP150 / 2 - 1'500'000 - 1);
+          }
+        }
+      }
+    }
+  }
+}
+
+TEST(ReplacementExperimentTest, AReleaseAlreadyPassedIsVisibleAndChangesNothingElse) {
+  // A zero allowance and an immediate decision put T on the sampled tick, so
+  // the release lies P/2 + latency in the past: the port then sends at once
+  // (missed), with the same stamp and D as without the timer.
+  const auto sample = FlagSample(9'000'000'000, 600'000'000, 1.0);
+  const StopJoinElapsedInputDTO input{1.0, 1.0, 0.0, 0.0, {}};
+  const auto off = compute_stop_replacement_start(input, sample, FlagLane(false, false));
+  const auto timer = compute_stop_replacement_start(input, sample, FlagLane(true, false));
+  ASSERT_TRUE(off.ok() && timer.ok());
+  EXPECT_LT(*timer.value().scheduled->experiment->release_local_ns, 600'000'000);
+  EXPECT_EQ(timer.value().scheduled->controller_start_stamp_ns,
+            off.value().scheduled->controller_start_stamp_ns);
+  EXPECT_EQ(timer.value().elapsed_path_s, off.value().elapsed_path_s);
+}
+
+class CountingClock final : public IClock {
+ public:
+  TimePoint now() const override {
+    ++reads;
+    return value;
+  }
+  TimePoint value{0};
+  mutable int reads{0};
+};
+
+TEST(ReplacementExperimentTest, ReleasePlanHoldsMissesOrRespectsTheLatestSendInstant) {
+  const auto sample = FlagSample(9'000'000'000, 600'000'000, 1.0);
+  const StopJoinElapsedInputDTO input{1.0, 1.0, 0.002, 0.02, {}};
+  CountingClock clock;
+  // No timer: no clock read, no hold, no outcome.
+  for (const auto& lane : {FlagLane(false, false), FlagLane(false, true, true)}) {
+    auto start = compute_stop_replacement_start(input, sample, lane);
+    ASSERT_TRUE(start.ok());
+    EXPECT_FALSE(plan_replacement_release(start.value(), clock, 0));
+    EXPECT_EQ(clock.reads, 0);
+  }
+  const TimePoint release = 600'000'000 + 4 * kP150 - kP150 / 2 - 1'500'000;
+  struct Case {
+    TimePoint now, latest;
+    ExecutionReleaseHold hold;
+  };
+  for (const auto& [now, latest, hold] :
+       {Case{602'000'000, release, ExecutionReleaseHold::kHeld},
+        Case{release, release + 1, ExecutionReleaseHold::kMissed},
+        Case{release + 1, release + 1, ExecutionReleaseHold::kMissed},
+        Case{602'000'000, release - 1, ExecutionReleaseHold::kDeadline}}) {
+    auto start = compute_stop_replacement_start(input, sample, FlagLane(true, false));
+    ASSERT_TRUE(start.ok());
+    clock.value = now;
+    const auto until = plan_replacement_release(start.value(), clock, latest);
+    EXPECT_EQ(until.has_value(), hold == ExecutionReleaseHold::kHeld);
+    if (until) {
+      EXPECT_EQ(*until, release);
+    }
+    EXPECT_EQ(start.value().scheduled->experiment->release_hold, hold);
+  }
+}
+
+TEST(ReplacementExperimentTest, AllowanceOverrideIsVisibleWithTimerOffAndAddsNoWaitOrClockRead) {
+  const auto sample = FlagSample(9'000'000'000, 600'000'000, 1.0);
+  CountingClock clock;
+  for (const double allowance : {0.020, 0.030, 0.040}) {
+    const StopJoinElapsedInputDTO input{1.0, 1.0, 0.002, allowance, {}};
+    const auto plain = compute_stop_replacement_start(input, sample, FlagLane(false, false));
+    auto lane = FlagLane(false, false);
+    lane.experiment.start_allowance_override = true;
+    auto observed = compute_stop_replacement_start(input, sample, lane);
+    ASSERT_TRUE(plain.ok() && observed.ok());
+    ASSERT_FALSE(plain.value().scheduled->experiment);
+    ASSERT_TRUE(observed.value().scheduled->experiment);
+    EXPECT_EQ(observed.value().scheduled->controller_start_stamp_ns,
+              plain.value().scheduled->controller_start_stamp_ns);
+    EXPECT_DOUBLE_EQ(observed.value().elapsed_path_s, plain.value().elapsed_path_s);
+    const auto& experiment = *observed.value().scheduled->experiment;
+    EXPECT_EQ(experiment.start_allowance_ns, std::llround(allowance * 1e9));
+    EXPECT_TRUE(experiment.start_allowance_override);
+    EXPECT_FALSE(experiment.release_local_ns);
+    EXPECT_FALSE(plan_replacement_release(observed.value(), clock, 0));
+    EXPECT_EQ(clock.reads, 0);
+    EXPECT_EQ(experiment.release_hold, ExecutionReleaseHold::kNone);
+  }
+}
+
+TEST(ReplacementExperimentTest, UnscheduledLanesIgnoreTheFlagsAndBadLatencyIsInvalid) {
+  auto lane = FlagLane(true, true, true);
+  lane.supports_scheduled_replacement = false;
+  const auto start = compute_stop_replacement_start({1.0, 0.5, 0.003, 0.02, {}},
+                                                    FlagSample(9'000'000'000, 1, 0.5), lane);
+  ASSERT_TRUE(start.ok());
+  EXPECT_FALSE(start.value().scheduled);
+  EXPECT_NEAR(start.value().elapsed_path_s, 1.0115, 1e-12);
+  for (const double latency : {-0.001, std::numeric_limits<double>::quiet_NaN(), 1.5}) {
+    auto bad = FlagLane(true, false);
+    bad.experiment.expected_latency_s = latency;
+    EXPECT_FALSE(compute_stop_replacement_start({1.0, 0.5, 0.003, 0.02, {}},
+                                                FlagSample(9'000'000'000, 1, 0.5), bad)
+                     .ok());
+  }
+}
+
+TEST(ReplacementExperimentTest, V0PayloadDropsThePrefixAndStartsWithThePlannedStateAtTheStamp) {
+  const auto active = Curved();
+  const double elapsed = 1.0125, factor = 0.5;
+  const auto continuation = Continuation(active, 1.0, factor, 0.2);
+  const auto joined =
+      build_stop_replacement_join(active, elapsed, continuation, 1.0, 1.0 + factor * 0.2);
+  ASSERT_TRUE(joined.ok());
+  ASSERT_LT(joined.value().waypoints.front().time_from_start_s, 0.0);  // today's V6 prefix
+  const auto v0 = stop_replacement_v0_payload(joined.value());
+  ASSERT_TRUE(v0.ok());
+  const auto& points = v0.value().waypoints;
+  EXPECT_EQ(points.front().time_from_start_s, 0.0);
+  for (std::size_t joint = 0; joint < active.joint_names.size(); ++joint) {
+    const auto planned = Evaluate(active, joint, elapsed);
+    EXPECT_NEAR(points.front().positions_rad[joint], planned.p, 1e-12);
+    EXPECT_NEAR(points.front().velocities_rad_s[joint], planned.v, 1e-11);
+    EXPECT_NEAR(points.front().accelerations_rad_s2[joint], planned.a, 1e-10);
+  }
+  std::size_t positive = 0;
+  for (const auto& point : joined.value().waypoints)
+    if (point.time_from_start_s > 1e-9) ++positive;
+  ASSERT_EQ(points.size(), positive + 1U);
+  for (std::size_t index = 1; index < points.size(); ++index) {
+    EXPECT_GT(points[index].time_from_start_s, points[index - 1U].time_from_start_s);
+    const auto& kept =
+        joined.value().waypoints[joined.value().waypoints.size() - positive + index - 1U];
+    EXPECT_EQ(points[index].time_from_start_s, kept.time_from_start_s);
+    EXPECT_EQ(points[index].positions_rad, kept.positions_rad);
+    EXPECT_EQ(points[index].velocities_rad_s, kept.velocities_rad_s);
+  }
+  // Commands after the stamp are unchanged: same polynomials from the first kept knot.
+  for (double t = points[1].time_from_start_s; t < points.back().time_from_start_s; t += 0.01)
+    for (std::size_t joint = 0; joint < 2U; ++joint)
+      EXPECT_NEAR(Evaluate(v0.value(), joint, t).p, Evaluate(joined.value(), joint, t).p, 1e-12);
+  EXPECT_FALSE(stop_replacement_v0_payload(TrajectoryDTO{}).ok());
+}
+
+// --- Experimental scheduled spring_back_fast (V0 shape) -------------------------
+
+TEST(ScheduledFastSpringBackTest, StartsOnTheActiveCurveAtDAndKeepsTheAbsoluteStopTime) {
+  const auto active = Curved();
+  const double elapsed = 1.0, stop_path_s = 0.5, start = 1.0125;
+  const std::vector<double> trip{0.4, -0.3};
+  const auto stop = build_scheduled_spring_back_fast(active, start, trip, elapsed + stop_path_s);
+  ASSERT_TRUE(stop.ok());
+  const auto& points = stop.value().waypoints;
+  ASSERT_EQ(points.size(), 2U);
+  EXPECT_EQ(points.front().time_from_start_s, 0.0);
+  const auto state = sample_trajectory(active, start).value();
+  EXPECT_EQ(points.front().positions_rad, state.positions_rad);
+  EXPECT_EQ(points.front().velocities_rad_s, state.velocities_rad_s);
+  EXPECT_EQ(points.front().accelerations_rad_s2, state.accelerations_rad_s2);
+  EXPECT_NEAR(points.back().time_from_start_s, elapsed + stop_path_s - start, 1e-15);
+  EXPECT_EQ(points.back().positions_rad, trip);
+  EXPECT_EQ(points.back().velocities_rad_s, std::vector<double>(2, 0.0));
+  EXPECT_EQ(points.back().accelerations_rad_s2, std::vector<double>(2, 0.0));
+  EXPECT_EQ(stop.value().joint_names, active.joint_names);
+}
+
+TEST(ScheduledFastSpringBackTest, RefusesAStartPastTheStopOrOutsideTheActivePath) {
+  const auto active = Curved();
+  const std::vector<double> trip{0.4, -0.3};
+  for (const auto& [start, end] : {std::pair{1.5, 1.5}, std::pair{1.6, 1.5},
+                                   std::pair{2.3, 2.8}, std::pair{1.0, 1.0 + 1e-10}}) {
+    const auto stop = build_scheduled_spring_back_fast(active, start, trip, end);
+    ASSERT_FALSE(stop.ok()) << start << " " << end;
+    EXPECT_EQ(stop.error().details.at("reason"), "spring_back_fast_input_invalid");
+  }
+  EXPECT_FALSE(build_scheduled_spring_back_fast(active, 1.0, {0.4}, 1.5).ok());
+}
+
+TEST(ScheduledFastSpringBackTest, ProfileDifferenceAgainstTheZeroStampShape) {
+  // Today: passed knots (shifted by -elapsed), then the stop point at the stop
+  // time; on 6.10 the JTC splines from the LAST PASSED KNOT. Scheduled: the
+  // spline starts at D on the active curve and ends at the same absolute time.
+  const auto active = Curved();
+  const double elapsed = 1.0, stop_path_s = 0.5, start = elapsed + 0.0125;  // H 12.5 ms ahead
+  const std::vector<double> trip{std::sin(1.3 * 0.98) + 0.2 * 0.98 * 0.98,
+                                 0.98 * std::cos(0.7 * 0.98)};
+  TrajectoryDTO today;
+  today.joint_names = active.joint_names;
+  for (const auto& point : active.waypoints) {
+    if (point.time_from_start_s >= elapsed) break;
+    auto passed = point;
+    passed.time_from_start_s -= elapsed;
+    today.waypoints.push_back(passed);
+  }
+  today.waypoints.push_back(Point(stop_path_s, trip, {0.0, 0.0}, {0.0, 0.0}));
+  const auto scheduled =
+      build_scheduled_spring_back_fast(active, start, trip, elapsed + stop_path_s).value();
+  const auto& from_today = today.waypoints[today.waypoints.size() - 2U];   // knot 0.9 -> -0.1
+  const auto& to_today = today.waypoints.back();
+  for (std::size_t joint = 0; joint < 2U; ++joint) {
+    // At the handoff instant D the zero-stamp spline is off the active curve
+    // (its segment began at the 0.9 s knot); the scheduled one is exactly on it.
+    const auto on_curve = Evaluate(active, joint, start);
+    const auto zero_stamp = Quintic(from_today, to_today, joint, start - elapsed);
+    const auto v0 = Quintic(scheduled.waypoints[0], scheduled.waypoints[1], joint, 0.0);
+    EXPECT_NEAR(v0.p, on_curve.p, 1e-12);
+    EXPECT_NEAR(v0.v, on_curve.v, 1e-11);
+    EXPECT_NEAR(v0.a, on_curve.a, 1e-10);
+    // Peak |a| over each spline (dense scan) and the overshoot beyond the trip.
+    double peak_today = 0.0, peak_scheduled = 0.0, over_today = 0.0, over_scheduled = 0.0;
+    const double direction = on_curve.v >= 0.0 ? 1.0 : -1.0;
+    for (int k = 0; k <= 20'000; ++k) {
+      const double t_today = from_today.time_from_start_s +
+                             (to_today.time_from_start_s - from_today.time_from_start_s) * k / 2e4;
+      const double t_sched = scheduled.waypoints[1].time_from_start_s * k / 2e4;
+      const auto a = Quintic(from_today, to_today, joint, t_today);
+      const auto b = Quintic(scheduled.waypoints[0], scheduled.waypoints[1], joint, t_sched);
+      if (t_today >= start - elapsed) peak_today = std::max(peak_today, std::abs(a.a));
+      peak_scheduled = std::max(peak_scheduled, std::abs(b.a));
+      over_today = std::max(over_today, direction * (a.p - trip[joint]));
+      over_scheduled = std::max(over_scheduled, direction * (b.p - trip[joint]));
+    }
+    RecordProperty("joint" + std::to_string(joint) + "_handoff_jump_rad",
+                   std::to_string(std::abs(zero_stamp.p - on_curve.p)));
+    RecordProperty("joint" + std::to_string(joint) + "_peak_acc_today",
+                   std::to_string(peak_today));
+    RecordProperty("joint" + std::to_string(joint) + "_peak_acc_scheduled",
+                   std::to_string(peak_scheduled));
+    RecordProperty("joint" + std::to_string(joint) + "_overshoot_today",
+                   std::to_string(over_today));
+    RecordProperty("joint" + std::to_string(joint) + "_overshoot_scheduled",
+                   std::to_string(over_scheduled));
+    std::printf("joint%zu handoff_jump=%.3e rad peak_acc today=%.4f scheduled=%.4f "
+                "overshoot today=%.5f scheduled=%.5f\n",
+                joint, std::abs(zero_stamp.p - on_curve.p), peak_today, peak_scheduled,
+                over_today, over_scheduled);
+    EXPECT_GT(std::abs(zero_stamp.p - on_curve.p), 1e-6);
+  }
+}
+
 // --- Q17/Q38 path-time conversion ----------------------------------------------
 
 TEST(StopPathTimeConversionTest, ReproducesTheWallTimeMotionAtTheFrozenFactor) {
@@ -579,129 +932,96 @@ TEST(StopPathTimeConversionTest, ReproducesTheWallTimeMotionAtTheFrozenFactor) {
   EXPECT_FALSE(convert_stop_trajectory_to_path_time(wall, 1.0).ok());
 }
 
-/// The new JTC contract: the delivery is the complete remaining curve on the
-/// resident clock, a literal sub-range of the retained resident curve that
-/// starts at its last knot at or before the actual cursor.
-void ExpectCompleteRemainingCurve(const ResidentTimelineReplacementDTO& result,
-                                  double resident_cursor_s) {
-  const auto& resident = result.resident_trajectory.waypoints;
-  const auto& delivery = result.delivery_trajectory.waypoints;
-  ASSERT_FALSE(delivery.empty());
-  EXPECT_EQ(result.delivery_trajectory.joint_names, result.resident_trajectory.joint_names);
-  ASSERT_LE(delivery.size(), resident.size());
-  const std::size_t first = resident.size() - delivery.size();
-  for (std::size_t i = 0; i < delivery.size(); ++i) {
-    EXPECT_EQ(delivery[i].time_from_start_s, resident[first + i].time_from_start_s);
-    EXPECT_EQ(delivery[i].positions_rad, resident[first + i].positions_rad);
-    EXPECT_EQ(delivery[i].velocities_rad_s, resident[first + i].velocities_rad_s);
-    EXPECT_EQ(delivery[i].accelerations_rad_s2, resident[first + i].accelerations_rad_s2);
-  }
-  if (resident.front().time_from_start_s <= resident_cursor_s) {
-    EXPECT_LE(delivery.front().time_from_start_s, resident_cursor_s);
-    if (delivery.size() > 1U) {
-      EXPECT_GT(delivery[1].time_from_start_s, resident_cursor_s);
-    }
-  } else {
-    // No knot before the cursor yet: the whole curve (JTC keeps its seed).
-    EXPECT_EQ(first, 0U);
-  }
-}
 
-TEST(ResidentTimelineReplacementTest, DeliversTheCompleteRemainingCurveFromTheCursorKnot) {
-  const auto active = Curved();
-  const double origin = 0.7;
-  const double trip = 1.05;
-  const auto continuation = Continuation(active, origin, 1.0, trip - origin);
-  // Speed factors 1 / 0.5 / 0.1 / 0: the projected start is the sample cursor
-  // advanced at the factor (0.66 + f * 0.07).
-  const double sample_cursor = 0.66;
-  for (const double factor : {1.0, 0.5, 0.1, 0.0}) {
-    const double elapsed = sample_cursor + factor * 0.07;
-    const auto joined = build_stop_replacement_join(active, elapsed, continuation, origin, trip);
-    ASSERT_TRUE(joined.ok()) << joined.error().message;
-    for (const double offset : {0.0, -1.073}) {
-      SCOPED_TRACE(::testing::Message() << "factor " << factor << " offset " << offset);
-      const double cursor = sample_cursor - offset;  // native resident clock
-      const auto result =
-          build_resident_timeline_replacement(joined.value(), elapsed, offset, cursor);
-      ASSERT_TRUE(result.ok()) << result.error().message;
-      // The retained curve is the checked join on the resident clock, unchanged.
-      const auto& resident = result.value().resident_trajectory;
-      ASSERT_EQ(resident.waypoints.size(), joined.value().waypoints.size());
-      for (std::size_t i = 0; i < resident.waypoints.size(); ++i) {
-        EXPECT_DOUBLE_EQ(resident.waypoints[i].time_from_start_s,
-                         joined.value().waypoints[i].time_from_start_s + elapsed - offset);
-        EXPECT_EQ(resident.waypoints[i].positions_rad, joined.value().waypoints[i].positions_rad);
-      }
-      ExpectCompleteRemainingCurve(result.value(), cursor);
-      // The active knot 0.55 covers the cursor 0.66 (no synthetic first point).
-      EXPECT_DOUBLE_EQ(result.value().delivery_trajectory.waypoints.front().time_from_start_s,
-                       0.55 - offset);
-      // Unchanged actual curve: the incumbent quintics from the cursor
-      // (reference plus lookahead) up to the trip point.
-      const auto& delivery = result.value().delivery_trajectory;
-      for (std::size_t joint = 0; joint < active.joint_names.size(); ++joint) {
-        for (const double time : {0.66, 0.664, 0.73, 0.78, 0.9, 0.98, 1.04}) {
-          const auto expected = Evaluate(active, joint, time);
-          const auto actual = Evaluate(delivery, joint, time - offset);
-          EXPECT_NEAR(actual.p, expected.p, 1e-11);
-          EXPECT_NEAR(actual.v, expected.v, 1e-10);
-          EXPECT_NEAR(actual.a, expected.a, 1e-9);
+TEST(StopSourceCursorTest, PlannedOffsetRefinesOnlyAgainstItsOwnReference) {
+  for (const double rate : {100.0, 150.0}) for (const double factor : {1.0, 0.5, 0.1}) {
+    ExecutionLaneFactsDTO lane;
+    lane.joint_names = {"j1"};
+    lane.controller_update_rate_hz = rate;
+    const auto period_ns = static_cast<TimePoint>(1e9 / rate);
+    const double planned = factor * static_cast<double>(period_ns / 2) / 1e9;
+    for (const int kind : {0, 1, 2, 3}) {
+      SCOPED_TRACE(::testing::Message() << rate << " factor=" << factor << " kind=" << kind);
+      auto source = Linear();
+      const double b = kind == 1 ? 0.0 : planned;
+      const double actual = kind == 2 ? 0.0 : b;
+      ExecutionControllerSampleDTO sample;
+      sample.cursor_s = 0.5;
+      sample.reference_positions_rad = {0.5 * (sample.cursor_s - actual)};
+      sample.reference_velocities_rad_s = {0.5};
+      if (kind == 3) {
+        for (auto& point : source.waypoints) {
+          point.positions_rad = {0.2 + 1e-12 * point.time_from_start_s};
+          point.velocities_rad_s = {1e-12};
         }
+        sample.reference_positions_rad = {0.2};
+        sample.reference_velocities_rad_s = {1e-12};
       }
+      EXPECT_NEAR(estimate_stop_source_cursor(source, sample, lane, b),
+                  sample.cursor_s - (kind == 3 ? b : actual), 1e-12);
     }
   }
 }
 
-TEST(ResidentTimelineReplacementTest, CursorOnAKnotOrBeforeTheFirstKnot) {
-  const auto active = Curved();
-  const auto continuation = Continuation(active, 0.7, 1.0, 0.35);
-  const auto joined = build_stop_replacement_join(active, 0.9, continuation, 0.7, 1.05);
-  ASSERT_TRUE(joined.ok()) << joined.error().message;
-  // Exactly on the knot 0.55: delivery starts there.
-  auto on_knot = build_resident_timeline_replacement(joined.value(), 0.9, 0.0, 0.55);
-  ASSERT_TRUE(on_knot.ok());
-  ExpectCompleteRemainingCurve(on_knot.value(), 0.55);
-  EXPECT_DOUBLE_EQ(on_knot.value().delivery_trajectory.waypoints.front().time_from_start_s, 0.55);
-  // Before the first knot (still in JTC's seed segment): the whole curve.
-  auto before = build_resident_timeline_replacement(joined.value(), 0.9, 0.0, -0.01);
-  ASSERT_TRUE(before.ok());
-  EXPECT_EQ(before.value().delivery_trajectory.waypoints.size(),
-            before.value().resident_trajectory.waypoints.size());
-  EXPECT_DOUBLE_EQ(before.value().delivery_trajectory.waypoints.front().time_from_start_s, 0.0);
-  EXPECT_FALSE(build_resident_timeline_replacement(
-                   joined.value(), 0.9, 0.0, std::numeric_limits<double>::quiet_NaN())
-                   .ok());
+TEST(StopSourceCursorTest, UsesJointOrderAndKeepsTheEstimateInsideTheStockBridge) {
+  auto source = Linear();
+  source.joint_names.push_back("j2");
+  for (auto& point : source.waypoints) {
+    point.positions_rad.push_back(-0.25 * point.time_from_start_s);
+    point.velocities_rad_s.push_back(-0.25);
+    point.accelerations_rad_s2.push_back(0.0);
+  }
+  ExecutionLaneFactsDTO lane;
+  lane.joint_names = {"j2", "j1"};
+  lane.controller_update_rate_hz = 100.0;
+  ExecutionControllerSampleDTO sample;
+  sample.cursor_s = 0.5;
+  sample.reference_positions_rad = {-0.125, 0.25};
+  sample.reference_velocities_rad_s = {-0.25, 0.5};
+  EXPECT_NEAR(estimate_stop_source_cursor(source, sample, lane, 0.005), 0.5, 1e-12);
+  sample.cursor_s = 0.014;
+  EXPECT_DOUBLE_EQ(estimate_stop_source_cursor(source, sample, lane, 0.005), 0.009);
+  sample.cursor_s = 0.5;
+  sample.reference_positions_rad[0] = std::numeric_limits<double>::quiet_NaN();
+  EXPECT_DOUBLE_EQ(estimate_stop_source_cursor(source, sample, lane, 0.005), 0.495);
+  source.waypoints[0].velocities_rad_s.clear();
+  EXPECT_DOUBLE_EQ(estimate_stop_source_cursor(source, sample, lane, 0.005), 0.495);
 }
 
-TEST(ResidentTimelineReplacementTest, ConsecutivePreemptsStayOnTheSameOriginAndCurve) {
-  // First takeover on the original goal (resident clock == active clock).
-  const auto active = Curved();
-  const auto first_continuation = Continuation(active, 0.7, 1.0, 0.35);
-  const auto first_join = build_stop_replacement_join(active, 0.73, first_continuation, 0.7, 1.05);
-  ASSERT_TRUE(first_join.ok());
-  const auto first = build_resident_timeline_replacement(first_join.value(), 0.73, 0.0, 0.66);
-  ASSERT_TRUE(first.ok());
-  ExpectCompleteRemainingCurve(first.value(), 0.66);
-  // Second takeover from the retained resident curve, cursor inside the first
-  // replacement's lead-in, before its trip point.
-  const auto& resident = first.value().resident_trajectory;
-  const auto second_continuation = Continuation(resident, 0.95, 1.0, 0.07);
-  const auto second_join =
-      build_stop_replacement_join(resident, 0.97, second_continuation, 0.95, 1.02);
-  ASSERT_TRUE(second_join.ok()) << second_join.error().message;
-  const auto second = build_resident_timeline_replacement(second_join.value(), 0.97, 0.0, 0.94);
-  ASSERT_TRUE(second.ok());
-  ExpectCompleteRemainingCurve(second.value(), 0.94);
-  EXPECT_DOUBLE_EQ(second.value().delivery_trajectory.waypoints.front().time_from_start_s, 0.9);
-  const auto& delivery = second.value().delivery_trajectory;
-  for (std::size_t joint = 0; joint < active.joint_names.size(); ++joint) {
-    for (const double time : {0.94, 0.944, 0.97, 1.0}) {
-      const auto expected = Evaluate(active, joint, time);
-      const auto actual = Evaluate(delivery, joint, time);
-      EXPECT_NEAR(actual.p, expected.p, 1e-11);
-      EXPECT_NEAR(actual.v, expected.v, 1e-10);
+TEST(StopReplacementStartTest, PlannedOffsetAndActualCoreClipPreserveTheRemainingCurve) {
+  for (const double rate : {100.0, 150.0}) for (const double factor : {1.0, 0.5, 0.1}) {
+    auto lane = FlagLane(true, true);
+    lane.controller_update_rate_hz = rate;
+    auto sample = FlagSample(9'000'000'000, 600'000'000, factor);
+    const auto start = compute_stop_replacement_start({1.0, factor, 0.0, 0.02, {}}, sample, lane);
+    ASSERT_TRUE(start.ok());
+    const auto period_ns = static_cast<TimePoint>(1e9 / rate);
+    const double period = static_cast<double>(period_ns) / 1e9;
+    EXPECT_NEAR(start.value().controller_offset_s,
+                factor * static_cast<double>(period_ns / 2) / 1e9, 1e-15);
+    const double first = period - start.value().controller_offset_s;
+    const auto active = Curved();
+    const auto continuation = Continuation(active, 1.0, factor, 0.2);
+    const auto joined = build_stop_replacement_join(active, start.value().elapsed_path_s,
+                                                    continuation, 1.0, 1.0 + factor * 0.2);
+    ASSERT_TRUE(joined.ok());
+    const auto clipped = stop_replacement_v0_payload(joined.value(), first);
+    ASSERT_TRUE(clipped.ok());
+    ASSERT_EQ(clipped.value().waypoints.front().time_from_start_s, first);
+    for (const double time : {first, first + 0.001,
+                             clipped.value().waypoints.back().time_from_start_s}) {
+      const auto original = sample_trajectory(joined.value(), time).value();
+      const auto actual = sample_trajectory(clipped.value(), time).value();
+      for (std::size_t j = 0; j < 2U; ++j) {
+        EXPECT_NEAR(original.positions_rad[j], actual.positions_rad[j], 1e-10);
+        EXPECT_NEAR(original.velocities_rad_s[j], actual.velocities_rad_s[j], 1e-9);
+        EXPECT_NEAR(original.accelerations_rad_s2[j], actual.accelerations_rad_s2[j], 1e-7);
+      }
     }
+    EXPECT_EQ(clipped.value().waypoints.back().positions_rad,
+              joined.value().waypoints.back().positions_rad);
+    EXPECT_EQ(clipped.value().waypoints.back().time_from_start_s,
+              joined.value().waypoints.back().time_from_start_s);
   }
 }
 

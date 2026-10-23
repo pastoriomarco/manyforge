@@ -5,6 +5,10 @@
 namespace manyforge::ros2_control_execution {
 namespace {
 using V = content_identity::CanonicalValue;
+V number(double value) {
+  // JSON has one zero; preserve the captured IEEE value until export.
+  return V(value == 0.0 ? 0.0 : value);
+}
 V ns(core::TimePoint n) {
   return n >= 0 ? content_identity::nonnegative_int64_value(n)
                 : V(std::to_string(n));
@@ -19,7 +23,7 @@ V numbers(const std::vector<double> &input) {
   V::Array out;
   out.reserve(input.size());
   for (double value : input)
-    out.emplace_back(value);
+    out.emplace_back(number(value));
   return V(std::move(out));
 }
 V optional_time(const std::optional<core::TimePoint> &value) {
@@ -32,6 +36,29 @@ V key_value(const VolatileMotionTrace::Token &t) {
                 {"controller_goal_id", V(t.key.controller_goal_id.value())},
                 {"controller_goal_generation",
                  count(t.key.controller_goal_generation.value())}});
+}
+V replacement_policy(bool replacement,
+                     const std::optional<core::ExecutionReplacementStartDTO> &start) {
+  if (!replacement) return V(nullptr);
+  V experiment(nullptr);
+  if (start && start->experiment) {
+    const auto &e = *start->experiment;
+    experiment = V(V::Object{
+        {"producer_policy", V(nullptr)},
+        {"release_policy", V(e.release_local_ns ? "timer" : "immediate")},
+        {"release_hold", V(e.release_hold == core::ExecutionReleaseHold::kHeld ? "held" :
+                           e.release_hold == core::ExecutionReleaseHold::kMissed ? "missed" :
+                           e.release_hold == core::ExecutionReleaseHold::kDeadline ? "deadline" : "none")},
+        {"stamp_policy", V(e.midtick_stamp ? "midtick" : "grid")},
+        {"payload_policy", V(e.spring_back_fast ? "spring_back_fast_v0" :
+                             e.v0_payload ? "v0" : "v6_prefix")},
+        {"start_allowance_override", V(e.start_allowance_override)},
+        {"start_allowance_ns", ns(e.start_allowance_ns)},
+        {"factor", number(e.factor)}});
+  }
+  return V(V::Object{{"schedule", V(start ? "controller_stamp" : "immediate")},
+                    {"controller_time_reference", V(nullptr)},
+                    {"experiment", std::move(experiment)}});
 }
 std::size_t payload_bytes(const VolatileMotionTrace::Goal &g) {
   std::size_t bytes =
@@ -201,7 +228,8 @@ VolatileMotionTrace::TokenPtr VolatileMotionTrace::Begin(
 void VolatileMotionTrace::Attach(const TokenPtr &token, Goal &&goal,
                                  core::TimePoint returned_at,
                                  core::ExecutionPortDispatch disposition,
-                                 Garbage &garbage) noexcept {
+                                 Garbage &garbage, bool replacement,
+                                 const std::optional<core::ExecutionReplacementStartDTO> &start) noexcept {
   if (!token)
     return;
   try {
@@ -222,6 +250,8 @@ void VolatileMotionTrace::Attach(const TokenPtr &token, Goal &&goal,
     }
     it->returned_at = returned_at;
     it->disposition = disposition;
+    it->replacement = replacement;
+    it->replacement_start = start;
     if (bytes > kGoalBytes - it->bytes) {
       ++omitted_;
       return;
@@ -460,6 +490,7 @@ VolatileMotionTrace::Snapshot(const core::RequestOwnerEpoch &owner,
           {"first_own_feedback_at_ns", optional_time(e.first_own_feedback)},
           {"installation", V("unknown")},
           {"execution_scope", V(nullptr)},
+          {"replacement_policy", replacement_policy(e.replacement, e.replacement_start)},
           {"terminal",
            e.facts.terminal_local_receipt_stamp
                ? V(V::Object{{"receipt_at_ns",
@@ -509,7 +540,7 @@ VolatileMotionTrace::Snapshot(const core::RequestOwnerEpoch &owner,
                     {"binding_epoch", count(s.binding_epoch.value())},
                     {"source_stamp_ns", ns(s.source_stamp_ns)},
                     {"local_receipt_stamp_ns", ns(s.local_receipt_stamp_ns)},
-                    {"cursor_s", V(s.cursor_s)},
+                    {"cursor_s", number(s.cursor_s)},
                     {"reference_p", numbers(s.reference_positions_rad)},
                     {"reference_v", numbers(s.reference_velocities_rad_s)},
                     {"reference_a", numbers(s.reference_accelerations_rad_s2)},
@@ -522,7 +553,7 @@ VolatileMotionTrace::Snapshot(const core::RequestOwnerEpoch &owner,
                                        ? numbers(*s.measured_velocities_rad_s)
                                        : V(nullptr)},
                     {"applied_factor",
-                     s.applied_factor ? V(*s.applied_factor) : V(nullptr)}});
+                     s.applied_factor ? number(*s.applied_factor) : V(nullptr)}});
       const auto bytes = content_identity::canonical_json(row).size() + 1U;
       if (used > allowance || bytes > allowance - used) {
         truncated = true;
@@ -537,7 +568,7 @@ VolatileMotionTrace::Snapshot(const core::RequestOwnerEpoch &owner,
           {"binding_epoch", count(it->epoch.value())},
           {"local_receipt_stamp_ns", ns(it->when)},
           {"kind", V(it->published ? "published" : "applied_observed")},
-          {"factor", V(it->factor)}});
+          {"factor", number(it->factor)}});
       const auto bytes = content_identity::canonical_json(row).size() + 1U;
       if (used > allowance || bytes > allowance - used) {
         truncated = true;

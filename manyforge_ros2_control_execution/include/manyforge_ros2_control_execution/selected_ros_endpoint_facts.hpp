@@ -17,6 +17,8 @@ namespace manyforge::ros2_control_execution {
 /// Observation of one lane-owned, exclusive ROS publisher role. Refresh is
 /// NRT; ReadError only copies maintained facts and checks the SDK graph event.
 /// A GID identifies a publisher endpoint, never an OS process/provider epoch.
+/// A graph event is domain-wide: Refresh settles it when a stable capture
+/// shows the cached publisher GIDs unchanged; a different GID set is a change.
 class SelectedRosEndpointFacts final {
 public:
   SelectedRosEndpointFacts(const rclcpp::Node::SharedPtr &node,
@@ -36,6 +38,15 @@ public:
   /// Called only by existing NRT observation/subscription checkpoints. No
   /// wait, timer, worker, retry or effect is introduced.
   void Refresh() {
+    RefreshWith([&](const auto &node) {
+      return node->get_publishers_info_by_topic(topic_);
+    });
+  }
+
+private:
+  friend class JtcExecutionPortTestPeer;
+
+  template <typename ReadEndpoints> void RefreshWith(ReadEndpoints &&read_endpoints) {
     // Multiple existing callbacks may observe the same graph edge. Serialize
     // only this NRT graph capture, never a lifecycle/command owner lock.
     std::lock_guard refresh_lock(refresh_mutex_);
@@ -48,13 +59,13 @@ public:
     }
     graph_event_->check_and_clear();
     std::optional<core::ErrorDTO> error;
+    Gids gids;
     const auto node = node_.lock();
     if (!node) {
       error = Unsettled("selected_endpoint_node_unavailable");
     } else {
       try {
-        const auto endpoints = node->get_publishers_info_by_topic(topic_);
-        std::set<std::array<std::uint8_t, RMW_GID_STORAGE_SIZE>> gids;
+        const auto endpoints = read_endpoints(node);
         std::string first, second;
         bool identifiable = true;
         for (const auto &endpoint : endpoints) {
@@ -102,12 +113,21 @@ public:
       // graph must never turn that observation into a clean result.
       if (!error || error->code != "duplicate_component_instance")
         error = Unsettled("selected_endpoint_graph_changed");
+    } else if (!error && established_gids_ && *established_gids_ != gids) {
+      // Stable capture of a different identity (also same-count replacement):
+      // commit it, but only a following stable capture may settle it.
+      established_gids_ = std::move(gids);
+      dirty_ = true;
+      error = Unsettled("selected_endpoint_graph_changed");
     } else {
+      if (!error)
+        established_gids_ = std::move(gids);
       dirty_ = false;
     }
     error_ = std::move(error);
   }
 
+public:
   [[nodiscard]] std::optional<core::ErrorDTO> ReadError() const {
     std::lock_guard lock(mutex_);
     if (error_ && error_->code == "duplicate_component_instance")
@@ -126,6 +146,8 @@ public:
   }
 
 private:
+  using Gids = std::set<std::array<std::uint8_t, RMW_GID_STORAGE_SIZE>>;
+
   [[nodiscard]] core::ErrorDTO Unsettled(std::string cause) const {
     return {"component_instance_graph_unsettled",
             "The selected ROS publisher role is not established.",
@@ -142,6 +164,8 @@ private:
   std::optional<int> matched_count_;
   std::uint64_t revision_{};
   bool dirty_{true};
+  // Publisher GIDs of the last stable, clean NRT capture.
+  std::optional<Gids> established_gids_;
   std::optional<core::ErrorDTO> error_;
 };
 

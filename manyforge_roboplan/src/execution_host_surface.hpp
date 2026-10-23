@@ -66,6 +66,7 @@ public:
   int Run(const std::stop_token stop_token = {});
 
 private:
+  [[nodiscard]] CanonicalValue ReadVolatileMotionTrace(const Command &command) const;
 #if defined(MANYFORGE_ROS2_CONTROL_EXECUTION_HOST)
   [[nodiscard]] CanonicalValue
   Ros2ControlLifecycleObservationValue(Composition &composition) const;

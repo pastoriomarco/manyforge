@@ -3935,6 +3935,7 @@ enum class Lite6AggregateCheck {
   kCompose,
   kMovingValidation,
   kResealInventory,
+  kRetainedRouteGenerationReseal,
   kRefreshCellModel,
   kDeploymentFaultStopProfile,
   kDeploymentFastFaultStopProfile,
@@ -5036,6 +5037,7 @@ void check_selected_core_lite6_aggregate(const Lite6AggregateCheck check) {
   if (check == Lite6AggregateCheck::kMeasuredPublication ||
       check == Lite6AggregateCheck::kResolverRebuildFailures ||
       check == Lite6AggregateCheck::kStopResponseFollowsRouteRebind ||
+      check == Lite6AggregateCheck::kRetainedRouteGenerationReseal ||
       moving_budget_check || mixed_output_check ||
       check == Lite6AggregateCheck::kMeasuredOptionalDomainRace ||
       check == Lite6AggregateCheck::kMeasuredNullOptionalDomainRace) {
@@ -5190,6 +5192,232 @@ void check_selected_core_lite6_aggregate(const Lite6AggregateCheck check) {
     auto installed = runtime->PublishAndReadBackRouteConfiguration(initial, std::move(initial_ready.value()));
     ASSERT_TRUE(installed.ok()) << installed.error().message;
     EXPECT_EQ(installed.value().active_configuration, initial);
+    if (check == Lite6AggregateCheck::kRetainedRouteGenerationReseal) {
+      // This lower-level regression uses the real retained runtime route
+      // publication and strict product reseal. It does not exercise the host
+      // Apply call site; that remains a separate private integration gate.
+      const auto generation_one_motion = arm_binding;
+      const auto generation_one_gripper = gripper_binding;
+      const auto generation_one_representatives =
+          runtime->control_binding_representatives;
+      const auto generation_one_registrations = runtime->participant_registrations;
+      ASSERT_TRUE(generation_one_motion.value().control_path->runtime_scale_qualification);
+      EXPECT_EQ(generation_one_motion.value().control_path
+                    ->active_control_configuration_generation,
+                core::ActiveControlConfigurationGeneration(1U));
+
+      const auto arm_successor = make_configuration(
+          runtime->motion_binding,
+          core::ActiveControlConfigurationGeneration(2U));
+      const auto arm_successor_ready = ready(arm_successor);
+      ASSERT_TRUE(arm_successor_ready.ok()) << arm_successor_ready.error().message;
+      const auto arm_published = runtime->PublishAndReadBackRouteConfiguration(
+          arm_successor, arm_successor_ready.value());
+      ASSERT_TRUE(arm_published.ok()) << arm_published.error().message;
+      EXPECT_EQ(arm_published.value().active_configuration, arm_successor);
+      ASSERT_EQ(runtime->motion_binding.value().control_path
+                    ->active_control_configuration_generation,
+                arm_successor.active_control_configuration_generation);
+
+      ASSERT_TRUE(runtime->gripper_binding.has_value());
+      const auto gripper_successor = make_configuration(
+          *runtime->gripper_binding,
+          core::ActiveControlConfigurationGeneration(2U));
+      const auto gripper_successor_ready = ready(gripper_successor);
+      ASSERT_TRUE(gripper_successor_ready.ok())
+          << gripper_successor_ready.error().message;
+      const auto gripper_published = runtime->PublishAndReadBackRouteConfiguration(
+          gripper_successor, gripper_successor_ready.value());
+      ASSERT_TRUE(gripper_published.ok()) << gripper_published.error().message;
+      EXPECT_EQ(gripper_published.value().active_configuration,
+                gripper_successor);
+      ASSERT_EQ(runtime->gripper_binding->value().control_path
+                    ->active_control_configuration_generation,
+                gripper_successor.active_control_configuration_generation);
+
+      const auto route_for = [&](const core::RuntimeParticipantBinding &binding)
+          -> const core::ActiveControlConfigurationDTO & {
+        return binding.value().control_path->control_domain_id ==
+                       arm_successor.control_domain_id
+                   ? arm_successor
+                   : gripper_successor;
+      };
+
+      auto unreconciled = arm_successor;
+      unreconciled.state = core::ActiveControlConfigurationStateDTO::
+          kExternalOrUnknownUnreconciled;
+      const auto unreconciled_result =
+          detail::rebase_runtime_binding_to_predecessor(
+              generation_one_motion, unreconciled);
+      ASSERT_FALSE(unreconciled_result.ok());
+      EXPECT_EQ(unreconciled_result.error().details.at("reason"),
+                "route_predecessor_rebind_input_invalid");
+      EXPECT_EQ(unreconciled_result.error().message,
+                "durable route predecessor rebind has no exact control path");
+
+      auto wrong_revision = arm_successor;
+      const auto motion_route = std::find_if(
+          wrong_revision.binding_routes.begin(),
+          wrong_revision.binding_routes.end(), [&](const auto &row) {
+            return row.control_binding_id ==
+                   generation_one_motion.value().control_path->control_binding_id;
+          });
+      ASSERT_NE(motion_route, wrong_revision.binding_routes.end());
+      motion_route->control_binding_revision =
+          core::ControlBindingRevision("foreign.binding.revision");
+      for (auto &projection : wrong_revision.kinematic_resource_source_projections) {
+        for (auto &contributor : projection.contributing_control_bindings) {
+          if (contributor.control_binding_id == motion_route->control_binding_id)
+            contributor.control_binding_revision =
+                motion_route->control_binding_revision;
+        }
+      }
+      ASSERT_TRUE(wrong_revision.locally_valid());
+      const auto wrong_revision_result =
+          detail::rebase_runtime_binding_to_predecessor(
+              generation_one_motion, wrong_revision);
+      ASSERT_FALSE(wrong_revision_result.ok());
+      EXPECT_EQ(wrong_revision_result.error().details.at("reason"),
+                "route_predecessor_rebind_mismatch");
+      EXPECT_EQ(wrong_revision_result.error().message,
+                "durable route predecessor crosses its retained runtime binding");
+
+      const auto rebase = [&](const core::RuntimeParticipantBinding &binding) {
+        return detail::rebase_runtime_binding_to_predecessor(
+            binding, route_for(binding));
+      };
+      const auto candidate_motion = rebase(generation_one_motion);
+      ASSERT_TRUE(candidate_motion.ok()) << candidate_motion.error().message;
+      const auto candidate_gripper = rebase(generation_one_gripper);
+      ASSERT_TRUE(candidate_gripper.ok()) << candidate_gripper.error().message;
+      EXPECT_EQ(candidate_motion.value().value().control_path
+                    ->active_control_configuration_generation,
+                arm_successor.active_control_configuration_generation);
+      EXPECT_EQ(candidate_motion.value().value().control_path
+                    ->runtime_scale_qualification,
+                generation_one_motion.value().control_path
+                    ->runtime_scale_qualification);
+      // A newly compiled binding with no retained route facts stays at the
+      // compiler's generation 1; only explicit authoritative retained-route
+      // rebasing moves the existing candidate to generation 2.
+      EXPECT_EQ(generation_one_motion.value().control_path
+                    ->active_control_configuration_generation,
+                core::ActiveControlConfigurationGeneration(1U));
+
+      std::vector<core::RuntimeParticipantBinding> candidate_representatives;
+      candidate_representatives.reserve(generation_one_representatives.size());
+      for (const auto &representative : generation_one_representatives) {
+        const auto rebased = rebase(representative);
+        ASSERT_TRUE(rebased.ok()) << rebased.error().message;
+        EXPECT_EQ(rebased.value().value().runtime_unit_epochs,
+                  representative.value().runtime_unit_epochs);
+        EXPECT_EQ(rebased.value().value().control_path,
+                  runtime->control_binding_representatives.at(
+                      candidate_representatives.size()).value().control_path);
+        candidate_representatives.push_back(rebased.value());
+      }
+      auto candidate_registrations = runtime->participant_registrations;
+      for (auto &candidate : candidate_registrations) {
+        const auto source = std::find_if(
+            generation_one_registrations.begin(),
+            generation_one_registrations.end(), [&](const auto &row) {
+              return row.binding.value().control_path->control_binding_id ==
+                     candidate.binding.value().control_path->control_binding_id;
+            });
+        ASSERT_NE(source, generation_one_registrations.end());
+        const auto predecessor_binding = candidate.binding;
+        const bool is_motion_registration =
+            source->binding.value().control_path->control_binding_id ==
+            generation_one_motion.value().control_path->control_binding_id;
+        if (is_motion_registration) {
+          ASSERT_TRUE(candidate.stop_readiness.has_value());
+        }
+        if (candidate.stop_readiness.has_value()) {
+          const auto &route = route_for(source->binding);
+          const auto desired = std::find_if(
+              materialized.bundle->value().desired_control_configurations.begin(),
+              materialized.bundle->value().desired_control_configurations.end(),
+              [&](const auto &row) {
+                return row.control_domain_id == route.control_domain_id;
+              });
+          ASSERT_NE(desired,
+                    materialized.bundle->value().desired_control_configurations.end());
+          const auto expected_domain =
+              deployment::load_verified_controller_lifecycle_expected_domain(
+                  *materialized.bundle, artifacts, *desired,
+                  route.source_runtime_unit_id, route.source_runtime_epoch);
+          const auto stale_readiness =
+              core::rebind_runtime_participant_stop_readiness_product(
+                  *candidate.stop_readiness, predecessor_binding,
+                  source->binding, expected_domain.sealed());
+          ASSERT_FALSE(stale_readiness.ok());
+          EXPECT_EQ(stale_readiness.error().details.at("reason"),
+                    "runtime_participant_stop_product_rebind_changes_controller");
+        }
+        const auto rebound = rebase(source->binding);
+        ASSERT_TRUE(rebound.ok()) << rebound.error().message;
+        if (candidate.stop_readiness.has_value()) {
+          const auto &route = route_for(source->binding);
+          const auto desired = std::find_if(
+              materialized.bundle->value().desired_control_configurations.begin(),
+              materialized.bundle->value().desired_control_configurations.end(),
+              [&](const auto &row) {
+                return row.control_domain_id == route.control_domain_id;
+              });
+          ASSERT_NE(desired,
+                    materialized.bundle->value().desired_control_configurations.end());
+          const auto expected_domain =
+              deployment::load_verified_controller_lifecycle_expected_domain(
+                  *materialized.bundle, artifacts, *desired,
+                  route.source_runtime_unit_id, route.source_runtime_epoch);
+          const auto rebound_readiness =
+              core::rebind_runtime_participant_stop_readiness_product(
+                  *candidate.stop_readiness, predecessor_binding,
+                  rebound.value(), expected_domain.sealed());
+          ASSERT_TRUE(rebound_readiness.ok()) << rebound_readiness.error().message;
+          candidate.stop_readiness = rebound_readiness.value();
+        }
+        candidate.binding = rebound.value();
+      }
+
+      const core::ConfigurationFenceId fence_id(
+          "retained-route-generation.reseal.apply");
+      const core::ConfigurationFenceScopeDTO scope{};
+      admission_gate.RestoreFence(fence_id, scope);
+      const auto reseal = [&](
+          const core::RuntimeParticipantBinding &motion,
+          const std::optional<core::RuntimeParticipantBinding> &gripper,
+          const std::vector<core::RuntimeParticipantBinding> &representatives,
+          auto candidates) {
+        return reseal_retained_native_runtime_for_apply(
+            *runtime,
+            RetainedNativeRuntimeResealInput{
+                motion, gripper, {}, {},
+                representatives, std::move(candidates), {}, nullptr,
+                runtime->reference_resolver, fence_id, scope, admission_gate});
+      };
+      const auto unreconciled_candidate =
+          reseal(generation_one_motion, generation_one_gripper,
+                 generation_one_representatives, generation_one_registrations);
+      ASSERT_FALSE(unreconciled_candidate.ok());
+      EXPECT_EQ(unreconciled_candidate.error().details.at("reason"),
+                "native_product_reseal_physical_identity_changed");
+
+      const auto accepted =
+          reseal(candidate_motion.value(), candidate_gripper.value(),
+                 candidate_representatives, candidate_registrations);
+      ASSERT_TRUE(accepted.ok()) << accepted.error().message;
+      EXPECT_EQ(runtime->motion_binding.value(), candidate_motion.value().value());
+      ASSERT_TRUE(runtime->gripper_binding.has_value());
+      EXPECT_EQ(runtime->gripper_binding->value(), candidate_gripper.value().value());
+      ASSERT_TRUE(runtime->motion_binding.value().control_path
+                      ->runtime_scale_qualification.has_value());
+      EXPECT_EQ(*runtime->motion_binding.value().control_path
+                     ->runtime_scale_qualification,
+                *generation_one_motion.value().control_path
+                     ->runtime_scale_qualification);
+      return;
+    }
     if (check == Lite6AggregateCheck::kResolverRebuildFailures) {
       auto *kernel = runtime->active_addressed_kernel();
       ASSERT_TRUE(kernel->SetRouteRecoveryPending(true).ok());
@@ -6442,6 +6670,12 @@ TEST(RetainedProductCrossConsumer,
 TEST(RetainedProductCrossConsumer,
      SameControllerCapabilityInventoryResealPreservesOwnersAndRejectsChangedRegistration) {
   check_selected_core_lite6_aggregate(Lite6AggregateCheck::kResealInventory);
+}
+
+TEST(RetainedProductCrossConsumer,
+     RetainedRouteGenerationRebasePreservesQualificationThroughStrictReseal) {
+  check_selected_core_lite6_aggregate(
+      Lite6AggregateCheck::kRetainedRouteGenerationReseal);
 }
 
 TEST(RetainedProductCrossConsumer,

@@ -28143,6 +28143,894 @@ TEST(ResourceAddressedExecutionKernelTest,
 }
 
 TEST(ResourceAddressedExecutionKernelTest,
+     PartialDispatchDoesNotReuseSubsetOfASelectedOperationsProof) {
+  FakeClock clock;
+  ManualScheduler scheduler;
+  FakeParticipantEngine first_engine;
+  first_engine.next_command_result.command_id = first_engine.next_execution_id;
+  first_engine.gripper_status.command_id = first_engine.next_execution_id;
+  FakeParticipantEngine second_engine;
+  FakeParticipantEngine third_engine;
+  third_engine.next_command_result.command_id = third_engine.next_execution_id;
+  third_engine.gripper_status.command_id = third_engine.next_execution_id;
+  second_engine.next_execute_result = Result<std::uint64_t>::Err(
+      ErrorDTO{std::string(to_string(ErrorCode::kExecutionRejected)),
+               "injected second motion dispatch failure", {}});
+  const auto first_binding = grouped_command_binding();
+  first_engine.gripper_status.gripper_id = first_binding.value().command_target_id.value();
+  const auto second_binding = coordinated_occurrence(
+      make_binding("arm", "arm", "execution.trajectory.execute", CoordinateKind::kAngular), "2");
+  const auto third_binding = coordinated_occurrence(grouped_command_binding(), "3");
+  third_engine.gripper_status.gripper_id = third_binding.value().command_target_id.value();
+  ResourceAddressedExecutionKernel kernel(
+      {registration(first_binding, first_engine), registration(second_binding, second_engine),
+       registration(third_binding, third_engine)},
+      clock, scheduler, default_journal,
+      {RequestOwnerEpoch("kernel.epoch.1"), CellId("cell.test"), 8U});
+  const auto accepted = kernel.execute(
+      grouped_motion_commands_operation("partial.proof.motion-and-commands", 3U, 1U));
+  ASSERT_TRUE(accepted.ok()) << accepted.error().message;
+  ASSERT_TRUE(wait_until([&] {
+    const auto status = kernel.get_stop_status(StopId("stop.kernel.epoch.1.1"));
+    return status.ok() && status.value().stop_certificate.has_value();
+  }));
+  const auto prior = kernel.get_stop_status(StopId("stop.kernel.epoch.1.1")).value();
+  ASSERT_TRUE(prior.stop_certificate);
+  const auto prior_certificate = kernel.get_stop_certificate(prior.stop_certificate->stop_certificate_id);
+  ASSERT_TRUE(prior_certificate.ok()) << prior_certificate.error().message;
+  const auto state = kernel.get_operation_state(accepted.value().operation_id).value();
+  ASSERT_EQ(state.participants.size(), 3U);
+  ASSERT_TRUE(state.active_stop_generation);
+  const auto& released_id = state.participants[0].participant_id;
+  const auto released_row = std::find_if(
+      prior_certificate.value().scope_entries.begin(), prior_certificate.value().scope_entries.end(),
+      [&](const auto& row) {
+        const auto* subject = std::get_if<StopParticipantScopeKeyDTO>(&row.key.subject);
+        return subject != nullptr && row.key.origin_stop_id == prior.accepted.stop_id &&
+               row.key.origin_stop_generation == prior.accepted.stop_generation &&
+               subject->operation_id == accepted.value().operation_id &&
+               subject->participant_id == released_id;
+      });
+  ASSERT_NE(released_row, prior_certificate.value().scope_entries.end());
+  ASSERT_EQ(released_row->dispatch_state, StopScopeDispatchStateDTO::kDispatched);
+  ASSERT_TRUE(std::holds_alternative<StopParticipantScopeFactsDTO>(released_row->facts));
+  EXPECT_EQ(std::get<StopParticipantScopeFactsDTO>(released_row->facts).terminal_settlement,
+            StopParticipantScopeFactsDTO::TerminalSettlementState::kSettled);
+  const auto error = prior_certificate.value().terminal_error;
+  EXPECT_FALSE(error.has_value() && error->details.contains("operation_id") &&
+               error->details.at("operation_id") == accepted.value().operation_id.value());
+  const auto& unreleased_id = state.participants[2].participant_id;
+  EXPECT_FALSE(std::any_of(prior_certificate.value().scope_entries.begin(),
+                           prior_certificate.value().scope_entries.end(), [&](const auto& row) {
+    const auto* subject = std::get_if<StopParticipantScopeKeyDTO>(&row.key.subject);
+    if (subject == nullptr || subject->operation_id != accepted.value().operation_id ||
+        subject->participant_id != unreleased_id ||
+        row.dispatch_state != StopScopeDispatchStateDTO::kDispatched ||
+        !std::holds_alternative<StopParticipantScopeFactsDTO>(row.facts)) return false;
+    return std::get<StopParticipantScopeFactsDTO>(row.facts).terminal_settlement ==
+           StopParticipantScopeFactsDTO::TerminalSettlementState::kSettled;
+  }));
+  EXPECT_EQ(third_engine.translate_stop_stage_calls, 0);
+  const auto calls_before_retry = first_engine.translate_stop_stage_calls.load();
+
+  const auto retry = kernel.stop(stop_request(
+      "partial.proof.retry", accepted.value(), state.operation_revision.value(),
+      state.active_stop_generation->value()));
+  ASSERT_TRUE(retry.ok()) << retry.error().message;
+  ASSERT_EQ(retry.value().affected_operation_revisions.size(), 1U);
+  ASSERT_TRUE(wait_until([&] {
+    return first_engine.translate_stop_stage_calls.load() > calls_before_retry;
+  }));
+}
+
+TEST(ResourceAddressedExecutionKernelTest,
+     PartialRepeatStopSkipsReleasedSiblingReacquiredByAnotherOperation) {
+  FakeClock clock;
+  ManualScheduler scheduler;
+  FakeParticipantEngine first_engine;
+  first_engine.next_command_result.command_id = first_engine.next_execution_id;
+  first_engine.gripper_status.command_id = first_engine.next_execution_id;
+  FakeParticipantEngine second_engine;
+  FakeParticipantEngine third_engine;
+  third_engine.next_command_result.command_id = third_engine.next_execution_id;
+  third_engine.gripper_status.command_id = third_engine.next_execution_id;
+  second_engine.next_execute_result = Result<std::uint64_t>::Err(
+      ErrorDTO{std::string(to_string(ErrorCode::kExecutionRejected)),
+               "injected second motion dispatch failure", {}});
+  const auto first_binding = grouped_command_binding();
+  first_engine.gripper_status.gripper_id = first_binding.value().command_target_id.value();
+  const auto second_binding = coordinated_occurrence(
+      make_binding("arm", "arm", "execution.trajectory.execute", CoordinateKind::kAngular), "2");
+  const auto third_binding = coordinated_occurrence(grouped_command_binding(), "3");
+  third_engine.gripper_status.gripper_id = third_binding.value().command_target_id.value();
+  ResourceAddressedExecutionKernel kernel(
+      {registration(first_binding, first_engine), registration(second_binding, second_engine),
+       registration(third_binding, third_engine)},
+      clock, scheduler, default_journal,
+      {RequestOwnerEpoch("kernel.epoch.1"), CellId("cell.test"), 8U});
+  const auto accepted = kernel.execute(
+      grouped_motion_commands_operation("partial.reacquired.motion-and-commands", 3U, 1U));
+  ASSERT_TRUE(accepted.ok()) << accepted.error().message;
+  ASSERT_TRUE(wait_until([&] {
+    const auto status = kernel.get_stop_status(StopId("stop.kernel.epoch.1.1"));
+    return status.ok() && status.value().stop_certificate.has_value();
+  }));
+  const auto state = kernel.get_operation_state(accepted.value().operation_id).value();
+  ASSERT_EQ(state.participants.size(), 3U);
+  ASSERT_TRUE(state.active_stop_generation);
+  const auto third_resources = third_binding.value().resources;
+  ASSERT_EQ(third_resources.size(), 1U);
+  const auto& released_resource = third_resources.front().resource_id;
+
+  // The cancelled sibling's released resource now belongs to a new operation.
+  auto slots = std::const_pointer_cast<ResourceSlotTable>(kernel.resource_admission_table());
+  const auto before = slots->coherent_snapshot();
+  const auto free_slot = std::find_if(before.slots.begin(), before.slots.end(), [&](const auto& slot) {
+    return slot.resource_id == released_resource;
+  });
+  ASSERT_NE(free_slot, before.slots.end());
+  ASSERT_FALSE(free_slot->owner.has_value());
+  ASSERT_EQ(free_slot->state, ResourceSlotState::kFree);
+  const auto owned_slot = std::find_if(before.slots.begin(), before.slots.end(), [](const auto& slot) {
+    return slot.owner.has_value();
+  });
+  ASSERT_NE(owned_slot, before.slots.end());
+  auto foreign = *owned_slot->owner;
+  foreign.operation_id = OperationId("reacquired.foreign");
+  foreign.operation_revision = OperationRevision(1U);
+  foreign.participant_id = OperationParticipantId("reacquired.foreign.participant");
+  const std::vector<ResourceId> reacquired{released_resource};
+  const auto reserved = slots->reserve(foreign, reacquired);
+  ASSERT_TRUE(reserved.ok()) << reserved.error().message;
+  const auto third_calls = third_engine.translate_stop_stage_calls.load();
+  const auto calls_before_retry = first_engine.translate_stop_stage_calls.load();
+
+  const auto retry = kernel.stop(stop_request(
+      "partial.reacquired.retry", accepted.value(), state.operation_revision.value(),
+      state.active_stop_generation->value()));
+  ASSERT_TRUE(retry.ok()) << retry.error().message;
+  ASSERT_EQ(retry.value().affected_operation_revisions.size(), 1U);
+  ASSERT_TRUE(wait_until([&] {
+    return first_engine.translate_stop_stage_calls.load() > calls_before_retry;
+  }));
+  EXPECT_EQ(third_engine.translate_stop_stage_calls.load(), third_calls);
+  const auto after = slots->coherent_snapshot();
+  const auto still_foreign = std::find_if(after.slots.begin(), after.slots.end(), [&](const auto& slot) {
+    return slot.resource_id == released_resource;
+  });
+  ASSERT_NE(still_foreign, after.slots.end());
+  ASSERT_TRUE(still_foreign->owner.has_value());
+  EXPECT_EQ(*still_foreign->owner, foreign);
+  EXPECT_EQ(still_foreign->state, ResourceSlotState::kReserved);
+  EXPECT_EQ(still_foreign->stop_generation, free_slot->stop_generation);
+}
+
+TEST(ResourceAddressedExecutionKernelTest, StopOwnerDriftRefusesBeforeReserveAndClosesAdmission) {
+  FakeClock clock;
+  ManualScheduler scheduler;
+  FakeParticipantEngine engine;
+  FakeParticipantEngine other_engine;
+  const auto binding =
+      make_binding("arm", "arm", "execution.trajectory.execute", CoordinateKind::kAngular);
+  ResourceAddressedExecutionKernel kernel(
+      {registration(binding, engine), registration(coordinated_occurrence(binding, "2"), other_engine)},
+      clock, scheduler, default_journal,
+      {RequestOwnerEpoch("kernel.epoch.1"), CellId("cell.test"), 8U});
+  const auto accepted = kernel.execute(motion_operation("drift.motion"));
+  ASSERT_TRUE(accepted.ok()) << accepted.error().message;
+  const auto state = kernel.get_operation_state(accepted.value().operation_id).value();
+
+  // Adversarial seam: the slot owner revision drifts from the Kernel's record.
+  auto slots = std::const_pointer_cast<ResourceSlotTable>(kernel.resource_admission_table());
+  const auto snapshot = slots->coherent_snapshot();
+  const auto owned = std::find_if(snapshot.slots.begin(), snapshot.slots.end(), [](const auto& slot) {
+    return slot.owner.has_value();
+  });
+  ASSERT_NE(owned, snapshot.slots.end());
+  const auto revised = slots->revise_owner(
+      *owned->owner, {owned->resource_id},
+      OperationRevision(owned->owner->operation_revision.value() + 7U));
+  ASSERT_TRUE(revised.ok()) << revised.error().message;
+  const auto generation_before = slots->coherent_snapshot().operation_resource_generation;
+
+  const auto refused =
+      kernel.stop(stop_request("drift.stop", accepted.value(), state.operation_revision.value()));
+  ASSERT_FALSE(refused.ok());
+  EXPECT_EQ(refused.error().code, std::string(to_string(ErrorCode::kInvariantViolation)));
+  EXPECT_EQ(refused.error().details.at("reason"), "stop_operation_not_fenceable");
+  EXPECT_EQ(slots->coherent_snapshot().operation_resource_generation, generation_before);
+  EXPECT_EQ(engine.translate_stop_stage_calls.load(), 0);
+
+  auto next = motion_operation("drift.after");
+  next.participants.front().component_role_id = ComponentRoleId("robot_2");
+  next.participants.front().target_role_id = TargetRoleId("arm_2");
+  std::get<MotionParticipantIntentDTO>(next.participants.front().payload).tcp_endpoint.target_role_id =
+      TargetRoleId("arm_2");
+  const auto blocked = kernel.execute(next);
+  ASSERT_FALSE(blocked.ok());
+  EXPECT_EQ(blocked.error().details.at("reason"), "motion_admission_closed");
+  EXPECT_EQ(other_engine.execute_calls, 0);
+}
+
+namespace {
+// Adversarial seam shared by the owner-drift tests: the slot owner revision
+// of one operation drifts from the Kernel's own record.
+void drift_operation_owner(ResourceAddressedExecutionKernel& kernel, const OperationId& operation_id) {
+  auto slots = std::const_pointer_cast<ResourceSlotTable>(kernel.resource_admission_table());
+  const auto snapshot = slots->coherent_snapshot();
+  const auto owned = std::find_if(snapshot.slots.begin(), snapshot.slots.end(), [&](const auto& slot) {
+    return slot.owner.has_value() && slot.owner->operation_id == operation_id;
+  });
+  ASSERT_NE(owned, snapshot.slots.end());
+  const auto revised = slots->revise_owner(
+      *owned->owner, {owned->resource_id},
+      OperationRevision(owned->owner->operation_revision.value() + 7U));
+  ASSERT_TRUE(revised.ok()) << revised.error().message;
+}
+
+// Unresolvable target: refused by admission when closed, by resolution otherwise.
+OperationIntentDTO admission_probe(std::string request_id) {
+  auto probe = motion_operation(std::move(request_id));
+  probe.participants.front().component_role_id = ComponentRoleId("robot_9");
+  probe.participants.front().target_role_id = TargetRoleId("arm_9");
+  std::get<MotionParticipantIntentDTO>(probe.participants.front().payload).tcp_endpoint.target_role_id =
+      TargetRoleId("arm_9");
+  return probe;
+}
+}  // namespace
+
+TEST(ResourceAddressedExecutionKernelTest, ScopedStopIgnoresOwnerDriftInUnrelatedOperation) {
+  FakeClock clock;
+  ManualScheduler scheduler;
+  FakeParticipantEngine engine;
+  FakeParticipantEngine other_engine;
+  const auto binding =
+      make_binding("arm", "arm", "execution.trajectory.execute", CoordinateKind::kAngular);
+  ResourceAddressedExecutionKernel kernel(
+      {registration(binding, engine), registration(coordinated_occurrence(binding, "2"), other_engine)},
+      clock, scheduler, default_journal,
+      {RequestOwnerEpoch("kernel.epoch.1"), CellId("cell.test"), 8U});
+  const auto target = kernel.execute(motion_operation("unrelated-drift.target"));
+  ASSERT_TRUE(target.ok()) << target.error().message;
+  auto unrelated_intent = motion_operation("unrelated-drift.other");
+  unrelated_intent.participants.front().component_role_id = ComponentRoleId("robot_2");
+  unrelated_intent.participants.front().target_role_id = TargetRoleId("arm_2");
+  std::get<MotionParticipantIntentDTO>(unrelated_intent.participants.front().payload)
+      .tcp_endpoint.target_role_id = TargetRoleId("arm_2");
+  const auto unrelated = kernel.execute(unrelated_intent);
+  ASSERT_TRUE(unrelated.ok()) << unrelated.error().message;
+  drift_operation_owner(kernel, unrelated.value().operation_id);
+
+  const auto request = stop_request("unrelated-drift.stop", target.value(), 1U);
+  const auto stopped = kernel.stop(request);
+  ASSERT_TRUE(stopped.ok()) << stopped.error().message;
+  ASSERT_EQ(stopped.value().affected_operation_revisions.size(), 1U);
+  EXPECT_EQ(stopped.value().affected_operation_revisions.front().operation_id,
+            target.value().operation_id);
+  const auto replayed = kernel.stop(request);
+  ASSERT_TRUE(replayed.ok()) << replayed.error().message;
+  EXPECT_EQ(replayed.value().replay_status, RequestReplayStatusDTO::kReplayedExact);
+  EXPECT_EQ(replayed.value().stop_id, stopped.value().stop_id);
+  ASSERT_TRUE(wait_until([&] { return engine.translate_stop_stage_calls.load() > 0; }));
+  EXPECT_EQ(other_engine.translate_stop_stage_calls.load(), 0);
+  EXPECT_FALSE(kernel.get_operation_state(unrelated.value().operation_id).value().active_stop_id);
+  const auto probe = kernel.execute(admission_probe("unrelated-drift.probe"));
+  ASSERT_FALSE(probe.ok());
+  EXPECT_NE(probe.error().details.at("reason"), "motion_admission_closed");
+}
+
+TEST(ResourceAddressedExecutionKernelTest, ScopedStopCoalescedToFullRefusesOwnerDriftBeforeReserve) {
+  FakeClock clock;
+  ManualScheduler scheduler;
+  clock.set(100);
+  FakeParticipantEngine first_engine;
+  FakeParticipantEngine second_engine;
+  FakeParticipantEngine third_engine;
+  FakeOperationJournal journal;
+  const auto first_binding =
+      make_binding("arm", "arm", "execution.trajectory.execute", CoordinateKind::kAngular);
+  const auto second_binding = second_same_type_occurrence(first_binding);
+  ResourceAddressedExecutionKernel kernel(
+      {registration(first_binding, first_engine), registration(second_binding, second_engine),
+       registration(coordinated_occurrence(first_binding, "3"), third_engine)},
+      clock, scheduler, journal,
+      ResourceAddressedExecutionKernelConfig{RequestOwnerEpoch("kernel.epoch.1"),
+                                             CellId("cell.test"),
+                                             32U,
+                                             {},
+                                             nullptr,
+                                             std::nullopt,
+                                             1U});
+  const auto first = kernel.execute(motion_operation("coalesce-drift.first"));
+  ASSERT_TRUE(first.ok()) << first.error().message;
+  auto second_intent = motion_operation("coalesce-drift.second");
+  second_intent.program_binding_id = second_binding.value().program_binding_id;
+  const auto second = kernel.execute(second_intent);
+  ASSERT_TRUE(second.ok()) << second.error().message;
+  auto third_intent = motion_operation("coalesce-drift.third");
+  third_intent.participants.front().component_role_id = ComponentRoleId("robot_3");
+  third_intent.participants.front().target_role_id = TargetRoleId("arm_3");
+  std::get<MotionParticipantIntentDTO>(third_intent.participants.front().payload)
+      .tcp_endpoint.target_role_id = TargetRoleId("arm_3");
+  const auto third = kernel.execute(third_intent);
+  ASSERT_TRUE(third.ok()) << third.error().message;
+
+  std::promise<void> first_stage_entered_promise;
+  auto first_stage_entered = first_stage_entered_promise.get_future();
+  std::promise<void> release_first_stage_promise;
+  const auto release_first_stage = release_first_stage_promise.get_future().share();
+  first_engine.translate_stop_stage_hook = [&] {
+    first_stage_entered_promise.set_value();
+    release_first_stage.wait();
+  };
+  const auto predecessor = kernel.stop(stop_request("coalesce-drift.first.stop", first.value(), 1U));
+  ASSERT_TRUE(predecessor.ok()) << predecessor.error().message;
+  if (first_stage_entered.wait_for(std::chrono::seconds(10)) != std::future_status::ready) {
+    release_first_stage_promise.set_value();
+    FAIL() << "predecessor did not reach its blocking stage";
+  }
+  const auto open_probe = kernel.execute(admission_probe("coalesce-drift.probe.before"));
+  drift_operation_owner(kernel, third.value().operation_id);
+  auto slots = kernel.resource_admission_table();
+  const auto generation_before = slots->coherent_snapshot().operation_resource_generation;
+
+  // The healthy scoped target finds no free correlation slot and the reserve
+  // coalesces it into Full, which would name the drifted third operation.
+  const auto refused = kernel.stop(stop_request("coalesce-drift.second.stop", second.value(), 1U));
+  const auto closed_probe = kernel.execute(admission_probe("coalesce-drift.probe.after"));
+  const auto generation_after = slots->coherent_snapshot().operation_resource_generation;
+  release_first_stage_promise.set_value();
+  ASSERT_FALSE(open_probe.ok());
+  EXPECT_NE(open_probe.error().details.at("reason"), "motion_admission_closed");
+  ASSERT_FALSE(refused.ok());
+  EXPECT_EQ(refused.error().code, std::string(to_string(ErrorCode::kInvariantViolation)));
+  EXPECT_EQ(refused.error().details.at("reason"), "stop_operation_not_fenceable");
+  EXPECT_EQ(generation_after, generation_before);
+  EXPECT_FALSE(kernel.get_stop_status(StopId("stop.kernel.epoch.1.2")).ok());
+  ASSERT_FALSE(closed_probe.ok());
+  EXPECT_EQ(closed_probe.error().details.at("reason"), "motion_admission_closed");
+  EXPECT_FALSE(kernel.get_operation_state(second.value().operation_id).value().active_stop_id);
+  EXPECT_FALSE(kernel.get_operation_state(third.value().operation_id).value().active_stop_id);
+  EXPECT_EQ(second_engine.translate_stop_stage_calls.load(), 0);
+  EXPECT_EQ(third_engine.translate_stop_stage_calls.load(), 0);
+}
+
+TEST(ResourceAddressedExecutionKernelTest,
+     FullAggregateClearsProofAndKeepsPhysicalUnion) {
+  // A is a fault-tripped kInterventionRequired proof candidate (r02 shape),
+  // so the full selector re-captures it. B runs on the disjoint companion
+  // engine and is admitted before A trips.
+  IoRuleIntegrationFixture fixture(true, true, 18, false, false, false, false, 0,
+                                   std::nullopt, std::nullopt, false, true);
+  ASSERT_TRUE(fixture.Publish(1, false).ok());
+  ASSERT_TRUE(fixture.PublishOther(1, false).ok());
+  const auto settled = fixture.kernel->execute(fixture.TwoScopeIntent());
+  ASSERT_TRUE(settled.ok()) << settled.error().message;
+  ASSERT_TRUE(fixture.Registered(settled.value().operation_id, 2U));
+
+  const auto second = fixture.kernel->execute(fixture.OtherIntent(false));
+  ASSERT_TRUE(second.ok()) << second.error().message;
+  fixture.other_engine.emit_transition(ExecutionState::kPlanning, ExecutionState::kExecuting);
+
+  ASSERT_TRUE(fixture.PublishOther(2, true).ok());
+  ASSERT_TRUE(fixture.kernel->ProcessIoRuleEvidence().ok());
+  ASSERT_TRUE(wait_until([&] {
+    const auto state = fixture.kernel->get_operation_state(settled.value().operation_id);
+    return state.ok() && state.value().active_stop_id.has_value() &&
+           std::any_of(state.value().participants.front().io_rule_outcomes.begin(),
+                       state.value().participants.front().io_rule_outcomes.end(),
+                       [](const auto& outcome) { return outcome.stop_certificate_id.has_value(); });
+  }));
+  const auto first_state = fixture.kernel->get_operation_state(settled.value().operation_id).value();
+  ASSERT_EQ(first_state.state, OperationStateKind::kInterventionRequired);
+  const auto first_status = fixture.kernel->get_stop_status(*first_state.active_stop_id).value();
+  ASSERT_TRUE(first_status.stop_certificate);
+  ASSERT_TRUE(fixture.kernel->get_stop_certificate(
+      first_status.stop_certificate->stop_certificate_id).ok());
+  const auto first_calls = fixture.engine.translate_stop_stage_calls.load();
+
+  HeldSettlementCall held;
+  fixture.other_engine.translate_stop_stage_hook = held.Blocker();
+  const auto resident =
+      fixture.kernel->stop(stop_request("aggregate.proof.resident", second.value(), 1U));
+  ASSERT_TRUE(resident.ok()) << resident.error().message;
+  ASSERT_TRUE(held.Entered());
+
+  const auto aggregate = fixture.kernel->full_stop(FullStopIntentDTO{
+      {RequestId("aggregate.proof.full"), RequestOwnerEpoch("kernel.epoch.1"), "test", {}},
+      StopGeneration(0U), {}});
+  ASSERT_TRUE(aggregate.ok()) << aggregate.error().message;
+  ASSERT_EQ(aggregate.value().affected_operation_revisions.size(), 2U);
+  ASSERT_TRUE(wait_until([&] { return fixture.engine.translate_stop_stage_calls > first_calls; }));
+  held.Release();
+  ASSERT_TRUE(wait_until([&] {
+    const auto status = fixture.kernel->get_stop_status(aggregate.value().stop_id);
+    return status.ok() && status.value().stop_certificate.has_value();
+  }));
+  const auto aggregate_status = fixture.kernel->get_stop_status(aggregate.value().stop_id).value();
+  ASSERT_TRUE(aggregate_status.stop_certificate);
+  const auto aggregate_certificate = fixture.kernel->get_stop_certificate(
+      aggregate_status.stop_certificate->stop_certificate_id);
+  ASSERT_TRUE(aggregate_certificate.ok()) << aggregate_certificate.error().message;
+  const auto has_operation_row = [&](const OperationId& operation_id) {
+    return std::any_of(aggregate_certificate.value().scope_entries.begin(),
+                       aggregate_certificate.value().scope_entries.end(),
+                       [&](const auto& row) {
+      const auto* participant = std::get_if<StopParticipantScopeKeyDTO>(&row.key.subject);
+      return participant != nullptr && participant->operation_id == operation_id;
+    });
+  };
+  EXPECT_TRUE(has_operation_row(settled.value().operation_id));
+  EXPECT_TRUE(has_operation_row(second.value().operation_id));
+  EXPECT_TRUE(std::any_of(aggregate_certificate.value().attempted_stage_results.begin(),
+                          aggregate_certificate.value().attempted_stage_results.end(),
+                          [&](const auto& row) {
+    const auto* participant = std::get_if<StopParticipantScopeKeyDTO>(&row.scope_key.subject);
+    return participant != nullptr && participant->operation_id == settled.value().operation_id;
+  }));
+  EXPECT_GT(fixture.engine.translate_stop_stage_calls, first_calls);
+  EXPECT_EQ(fixture.other_engine.translate_stop_stage_calls, 1);
+}
+
+TEST(ResourceAddressedExecutionKernelTest,
+     EvictedSettledProofFallsBackToOriginalPhysicalCapturePath) {
+  // A is a fault-tripped kInterventionRequired proof candidate (r02 shape), so
+  // a later Stop re-captures it. "Other" runs on the disjoint companion engine
+  // and is admitted before A trips.
+  IoRuleIntegrationFixture fixture(true, true, 18, false, false, false, false, 0,
+                                   std::nullopt, std::nullopt, false, true);
+  ASSERT_TRUE(fixture.Publish(1, false).ok());
+  ASSERT_TRUE(fixture.PublishOther(1, false).ok());
+  const auto accepted = fixture.kernel->execute(fixture.TwoScopeIntent());
+  ASSERT_TRUE(accepted.ok()) << accepted.error().message;
+  ASSERT_TRUE(fixture.Registered(accepted.value().operation_id, 2U));
+  const auto other_accepted = fixture.kernel->execute(fixture.OtherIntent(false));
+  ASSERT_TRUE(other_accepted.ok()) << other_accepted.error().message;
+
+  ASSERT_TRUE(fixture.PublishOther(2, true).ok());
+  ASSERT_TRUE(fixture.kernel->ProcessIoRuleEvidence().ok());
+  ASSERT_TRUE(wait_until([&] {
+    const auto state = fixture.kernel->get_operation_state(accepted.value().operation_id);
+    return state.ok() && state.value().active_stop_id.has_value() &&
+           std::any_of(state.value().participants.front().io_rule_outcomes.begin(),
+                       state.value().participants.front().io_rule_outcomes.end(),
+                       [](const auto& outcome) { return outcome.stop_certificate_id.has_value(); });
+  }));
+  const auto operation_after_first_stop =
+      fixture.kernel->get_operation_state(accepted.value().operation_id).value();
+  ASSERT_EQ(operation_after_first_stop.state, OperationStateKind::kInterventionRequired);
+  const auto first_stop_id = *operation_after_first_stop.active_stop_id;
+  const auto first_status = fixture.kernel->get_stop_status(first_stop_id).value();
+  ASSERT_TRUE(first_status.stop_certificate);
+  const auto first_certificate = fixture.kernel->get_stop_certificate(
+      first_status.stop_certificate->stop_certificate_id);
+  ASSERT_TRUE(first_certificate.ok()) << first_certificate.error().message;
+  ASSERT_EQ(first_certificate.value().result, StopCertificateResultDTO::kSucceededNominal);
+  // Resident-history compaction only evicts a recorded record without an
+  // uncleared fault latch; make that precondition explicit for A's record.
+  ASSERT_TRUE(wait_until([&] {
+    const auto status = fixture.kernel->get_stop_status(first_stop_id);
+    return status.ok() &&
+           status.value().terminal_projection.state == StopDurableProjectionStateDTO::kRecorded;
+  }));
+  EXPECT_FALSE(fixture.kernel->get_stop_status(first_stop_id).value().fault_latch);
+
+  const auto other_first = fixture.kernel->stop(
+      stop_request("request.eviction.other-physical", other_accepted.value(), 1U));
+  ASSERT_TRUE(other_first.ok()) << other_first.error().message;
+  ASSERT_TRUE(wait_until([&] {
+    const auto status = fixture.kernel->get_stop_status(other_first.value().stop_id);
+    return status.ok() && status.value().stop_certificate.has_value();
+  }));
+  const auto other_operation =
+      fixture.kernel->get_operation_state(other_accepted.value().operation_id).value();
+  // "Other" is now cleanly Stopped, so each repeated Stop is a NO-EFFECT Stop.
+  // Each still records one resident terminal certificate; together with A's
+  // and other's physical records this exceeds the resident cap and evicts
+  // the oldest compactable record, A's.
+  for (std::size_t index = 0; index < 63U; ++index) {
+    const auto no_effect_repeat = fixture.kernel->stop(stop_request(
+        "request.eviction.other-no-effect." + std::to_string(index), other_accepted.value(),
+        other_operation.operation_revision.value(),
+        other_operation.active_stop_generation->value()));
+    ASSERT_TRUE(no_effect_repeat.ok()) << no_effect_repeat.error().message;
+    ASSERT_TRUE(no_effect_repeat.value().affected_operation_revisions.empty());
+    ASSERT_TRUE(wait_until([&] {
+      const auto status = fixture.kernel->get_stop_status(no_effect_repeat.value().stop_id);
+      return status.ok() && status.value().stop_certificate.has_value();
+    }));
+  }
+
+  const auto no_longer_resident =
+      fixture.kernel->get_stop_certificate(first_certificate.value().stop_certificate_id);
+  ASSERT_FALSE(no_longer_resident.ok());
+  EXPECT_EQ(no_longer_resident.error().code, "missing_reference");
+  ASSERT_EQ(no_longer_resident.error().details.count("reason"), 1U);
+  EXPECT_EQ(no_longer_resident.error().details.at("reason"), "stop_certificate_not_resident");
+  const auto operation = fixture.kernel->get_operation_state(accepted.value().operation_id).value();
+  EXPECT_EQ(operation, operation_after_first_stop);
+  const auto calls_before_fallback = fixture.engine.translate_stop_stage_calls.load();
+  const auto fallback = fixture.kernel->stop(stop_request(
+      "request.eviction.after-cap", accepted.value(), operation.operation_revision.value(),
+      operation.active_stop_generation->value()));
+  ASSERT_TRUE(fallback.ok()) << fallback.error().message;
+  ASSERT_EQ(fallback.value().affected_operation_revisions.size(), 1U);
+  ASSERT_TRUE(wait_until([&] {
+    return fixture.engine.translate_stop_stage_calls.load() > calls_before_fallback;
+  }));
+  ASSERT_TRUE(wait_until([&] {
+    const auto status = fixture.kernel->get_stop_status(fallback.value().stop_id);
+    return status.ok() && status.value().stop_certificate.has_value();
+  }));
+  const auto fallback_status = fixture.kernel->get_stop_status(fallback.value().stop_id).value();
+  ASSERT_TRUE(fallback_status.stop_certificate);
+  const auto fallback_certificate =
+      fixture.kernel->get_stop_certificate(fallback_status.stop_certificate->stop_certificate_id);
+  ASSERT_TRUE(fallback_certificate.ok()) << fallback_certificate.error().message;
+  EXPECT_TRUE(fallback_certificate.value().predecessor_certificates.empty());
+}
+
+TEST(ResourceAddressedExecutionKernelTest,
+     ProgramRunContainmentPhysicallyStopsSourceErrorAttributedToOperation) {
+  IoRuleIntegrationFixture fixture(true, true);
+  ASSERT_TRUE(claim_program_execution(*fixture.kernel).ok());
+  ASSERT_TRUE(fixture.kernel->register_program_run_capture(program_execution_capture()).ok());
+  start_program_motion(*fixture.kernel);
+  ASSERT_TRUE(fixture.Publish(1, false).ok());
+  ASSERT_TRUE(fixture.PublishOther(1, false).ok());
+  auto intent = fixture.TwoScopeIntent();
+  intent.participants.front().execution_scope =
+      ProgramNodeExecutionScopeDTO{ProgramNodeInstanceId("move"), "move.attempt.1"};
+  const auto accepted = fixture.kernel->execute(std::move(intent));
+  ASSERT_TRUE(accepted.ok()) << accepted.error().message;
+  ASSERT_TRUE(fixture.Registered(accepted.value().operation_id, 2U));
+  fixture.engine.next_stop_result = StopResultDTO{
+      false, ErrorDTO{"source_stop_failed", "Source Stop failed",
+                      {{"operation_id", accepted.value().operation_id.value()}}}};
+  ASSERT_TRUE(fixture.PublishOther(2, true).ok());
+  ASSERT_TRUE(fixture.kernel->ProcessIoRuleEvidence().ok());
+  ASSERT_TRUE(wait_until([&] {
+    const auto state = fixture.kernel->get_operation_state(accepted.value().operation_id);
+    if (!state.ok() || !state.value().active_stop_id) return false;
+    const auto status = fixture.kernel->get_stop_status(*state.value().active_stop_id);
+    return status.ok() && status.value().stop_certificate.has_value();
+  }));
+  const auto prior_operation =
+      fixture.kernel->get_operation_state(accepted.value().operation_id).value();
+  const auto prior_status = fixture.kernel->get_stop_status(*prior_operation.active_stop_id).value();
+  ASSERT_TRUE(prior_status.stop_certificate);
+  const auto prior_certificate =
+      fixture.kernel->get_stop_certificate(prior_status.stop_certificate->stop_certificate_id);
+  ASSERT_TRUE(prior_certificate.ok()) << prior_certificate.error().message;
+  ASSERT_TRUE(prior_certificate.value().terminal_error);
+  EXPECT_EQ(prior_certificate.value().terminal_error->details.at("operation_id"),
+            accepted.value().operation_id.value());
+  const auto calls_before_containment = fixture.engine.translate_stop_stage_calls.load();
+
+  const auto containment = fixture.kernel->stop(
+      program_run_stop_request("reset.source-error", "run.1"));
+  ASSERT_TRUE(containment.ok()) << containment.error().message;
+  ASSERT_EQ(containment.value().affected_operation_revisions.size(), 1U);
+  ASSERT_TRUE(wait_until([&] {
+    return fixture.engine.translate_stop_stage_calls.load() > calls_before_containment;
+  }));
+}
+
+// An escalated P1 whose stronger stage contained the motion but whose
+// settlement is unproven stays a non-proof, as the nominal one does.
+TEST(ResourceAddressedExecutionKernelTest,
+     ProgramRunContainmentPhysicallyStopsUnsettledPriorEvidence) {
+  for (const bool escalated : {false, true}) {
+    SCOPED_TRACE(escalated ? "escalated P1" : "nominal P1");
+    IoRuleIntegrationFixture fixture(true, true);
+    fixture.engine.participant_stop_settlement_error = ErrorDTO{
+        "prior_settlement_unproven", "Prior participant settlement is unproven", {}};
+    ASSERT_TRUE(claim_program_execution(*fixture.kernel).ok());
+    ASSERT_TRUE(fixture.kernel->register_program_run_capture(program_execution_capture()).ok());
+    start_program_motion(*fixture.kernel);
+    ASSERT_TRUE(fixture.Publish(1, false).ok());
+    ASSERT_TRUE(fixture.PublishOther(1, false).ok());
+    auto intent = fixture.TwoScopeIntent();
+    intent.participants.front().execution_scope =
+        ProgramNodeExecutionScopeDTO{ProgramNodeInstanceId("move"), "move.attempt.1"};
+    const auto accepted = fixture.kernel->execute(std::move(intent));
+    ASSERT_TRUE(accepted.ok()) << accepted.error().message;
+    ASSERT_TRUE(fixture.Registered(accepted.value().operation_id, 2U));
+    if (escalated) {
+      fixture.engine.next_stop_result = {false,
+                                         ErrorDTO{"nominal_rejected", "nominal refused", {}}};
+      fixture.engine.translate_stop_stage_hook = [&] {
+        if (fixture.engine.translate_stop_stage_calls >= 2)
+          fixture.engine.next_stop_result = {true, std::nullopt};
+      };
+    }
+    ASSERT_TRUE(fixture.PublishOther(2, true).ok());
+    ASSERT_TRUE(fixture.kernel->ProcessIoRuleEvidence().ok());
+    ASSERT_TRUE(wait_until([&] {
+      const auto state = fixture.kernel->get_operation_state(accepted.value().operation_id);
+      if (!state.ok() || !state.value().active_stop_id) return false;
+      const auto status = fixture.kernel->get_stop_status(*state.value().active_stop_id);
+      return status.ok() && status.value().stop_certificate.has_value();
+    }));
+    const auto prior_operation =
+        fixture.kernel->get_operation_state(accepted.value().operation_id).value();
+    const auto prior_status =
+        fixture.kernel->get_stop_status(*prior_operation.active_stop_id).value();
+    ASSERT_TRUE(prior_status.stop_certificate);
+    const auto prior_certificate =
+        fixture.kernel->get_stop_certificate(prior_status.stop_certificate->stop_certificate_id);
+    ASSERT_TRUE(prior_certificate.ok()) << prior_certificate.error().message;
+    ASSERT_FALSE(prior_certificate.value().unsettled.empty());
+    const auto calls_before_containment = fixture.engine.translate_stop_stage_calls.load();
+
+    const auto containment = fixture.kernel->stop(
+        program_run_stop_request("reset.unsettled-source", "run.1"));
+    ASSERT_TRUE(containment.ok()) << containment.error().message;
+    ASSERT_EQ(containment.value().affected_operation_revisions.size(), 1U);
+    ASSERT_TRUE(wait_until([&] {
+      return fixture.engine.translate_stop_stage_calls.load() > calls_before_containment;
+    }));
+    if (escalated) {
+      EXPECT_GE(calls_before_containment, 2);
+    }
+    fixture.engine.translate_stop_stage_hook = {};
+  }
+}
+
+// A source loss that persisted through a settled P1 leaves its own
+// interrupt_source_unavailable terminal error, not the degraded-Stop
+// diagnostic. Neither the nominal nor the escalated P1 is then a proof.
+TEST(ResourceAddressedExecutionKernelTest,
+     ProgramRunContainmentPhysicallyStopsSettledSourceLossEvidence) {
+  for (const bool escalated : {false, true}) {
+    SCOPED_TRACE(escalated ? "escalated P1" : "nominal P1");
+    IoRuleIntegrationFixture fixture;
+    ASSERT_TRUE(claim_program_execution(*fixture.kernel).ok());
+    ASSERT_TRUE(fixture.kernel->register_program_run_capture(program_execution_capture()).ok());
+    start_program_motion(*fixture.kernel);
+    ASSERT_TRUE(fixture.Publish(1, false).ok());
+    auto intent = fixture.Intent();
+    intent.participants.front().execution_scope =
+        ProgramNodeExecutionScopeDTO{ProgramNodeInstanceId("move"), "move.attempt.1"};
+    const auto accepted = fixture.kernel->execute(std::move(intent));
+    ASSERT_TRUE(accepted.ok()) << accepted.error().message;
+    ASSERT_TRUE(fixture.Registered(accepted.value().operation_id));
+    if (escalated) {
+      fixture.engine.next_stop_result = {false,
+                                         ErrorDTO{"nominal_rejected", "nominal refused", {}}};
+      fixture.engine.translate_stop_stage_hook = [&] {
+        if (fixture.engine.translate_stop_stage_calls >= 2)
+          fixture.engine.next_stop_result = {true, std::nullopt};
+      };
+    }
+    ASSERT_TRUE(fixture.service
+                    ->ReportIngressOverflow(InterruptSourceId("gpio.source"),
+                                            IoSourceIncarnation("gpio.1"),
+                                            {"actual_overflow", "queue lost an acquisition", {}})
+                    .ok());
+    ASSERT_TRUE(fixture.Publish(2, true).ok());
+    ASSERT_TRUE(fixture.kernel->ProcessIoRuleEvidence().ok());
+    ASSERT_TRUE(wait_until([&] { return fixture.Certified(accepted.value().operation_id); }));
+    const auto prior = fixture.kernel->get_operation_state(accepted.value().operation_id).value();
+    ASSERT_EQ(prior.state, OperationStateKind::kInterventionRequired);
+    const auto& row = prior.participants.front();
+    ASSERT_TRUE(row.terminal_fact);
+    EXPECT_EQ(row.terminal_fact->effect, ParticipantEffectKnowledge::kEffectSettled);
+    ASSERT_TRUE(row.terminal_fact->error);
+    EXPECT_EQ(row.terminal_fact->error->code, "interrupt_source_unavailable");
+    ASSERT_EQ(row.io_rule_outcomes.size(), 1U);
+    ASSERT_TRUE(row.io_rule_outcomes.front().stop_certificate_id);
+    const auto prior_certificate =
+        fixture.kernel->get_stop_certificate(*row.io_rule_outcomes.front().stop_certificate_id);
+    ASSERT_TRUE(prior_certificate.ok()) << prior_certificate.error().message;
+    EXPECT_EQ(prior_certificate.value().result,
+              escalated ? StopCertificateResultDTO::kSucceededEscalated
+                        : StopCertificateResultDTO::kSucceededNominal);
+    const auto calls_before_containment = fixture.engine.translate_stop_stage_calls.load();
+
+    const auto containment = fixture.kernel->stop(
+        program_run_stop_request("reset.settled-source-loss", "run.1"));
+    ASSERT_TRUE(containment.ok()) << containment.error().message;
+    ASSERT_EQ(containment.value().affected_operation_revisions.size(), 1U);
+    ASSERT_TRUE(wait_until([&] {
+      return fixture.engine.translate_stop_stage_calls.load() > calls_before_containment;
+    }));
+    fixture.engine.translate_stop_stage_hook = {};
+  }
+}
+
+// A plain operator Stop leaves this single motion operation cleanly Stopped:
+// terminal and not effect-uncertain. The ProgramRun selector therefore does
+// not capture it, so the later containment is a no-effect Stop with no proof
+// reuse and no predecessor. Operator-ORIGIN physical proof reuse is not
+// reachable on this path and is not covered here.
+TEST(ResourceAddressedExecutionKernelTest,
+     ProgramRunContainmentOfOperatorStoppedOperationIsNoEffect) {
+  IoRuleIntegrationFixture fixture;
+  ASSERT_TRUE(claim_program_execution(*fixture.kernel).ok());
+  ASSERT_TRUE(fixture.kernel->register_program_run_capture(program_execution_capture()).ok());
+  start_program_motion(*fixture.kernel);
+  ASSERT_TRUE(fixture.Publish(1, false).ok());
+  auto intent = fixture.Intent();
+  intent.participants.front().execution_scope =
+      ProgramNodeExecutionScopeDTO{ProgramNodeInstanceId("move"), "move.attempt.1"};
+  const auto accepted = fixture.kernel->execute(std::move(intent));
+  ASSERT_TRUE(accepted.ok()) << accepted.error().message;
+  ASSERT_TRUE(fixture.Registered(accepted.value().operation_id));
+  const auto first = fixture.kernel->stop(stop_request("operator.physical-stop", accepted.value(), 1U));
+  ASSERT_TRUE(first.ok()) << first.error().message;
+  ASSERT_TRUE(wait_until([&] {
+    const auto status = fixture.kernel->get_stop_status(first.value().stop_id);
+    return status.ok() && status.value().stop_certificate.has_value();
+  }));
+  const auto first_status = fixture.kernel->get_stop_status(first.value().stop_id).value();
+  const auto first_certificate =
+      fixture.kernel->get_stop_certificate(first_status.stop_certificate->stop_certificate_id);
+  ASSERT_TRUE(first_certificate.ok()) << first_certificate.error().message;
+  ASSERT_EQ(first_certificate.value().result, StopCertificateResultDTO::kSucceededNominal);
+  const auto calls_after_physical_stop = fixture.engine.translate_stop_stage_calls.load();
+
+  const auto containment = fixture.kernel->stop(
+      program_run_stop_request("program-run.operator-stopped.no-effect", "run.1"));
+  ASSERT_TRUE(containment.ok()) << containment.error().message;
+  EXPECT_TRUE(containment.value().affected_operation_revisions.empty());
+  EXPECT_EQ(fixture.engine.translate_stop_stage_calls, calls_after_physical_stop);
+  ASSERT_TRUE(wait_until([&] {
+    const auto status = fixture.kernel->get_stop_status(containment.value().stop_id);
+    return status.ok() && status.value().stop_certificate.has_value();
+  }));
+  const auto second_status = fixture.kernel->get_stop_status(containment.value().stop_id).value();
+  const auto second_certificate =
+      fixture.kernel->get_stop_certificate(second_status.stop_certificate->stop_certificate_id);
+  ASSERT_TRUE(second_certificate.ok()) << second_certificate.error().message;
+  EXPECT_TRUE(second_certificate.value().predecessor_certificates.empty());
+  ASSERT_FALSE(second_certificate.value().capture_history.empty());
+  EXPECT_TRUE(second_certificate.value().capture_history.back()
+                  .newly_fenced_operation_revisions.empty());
+}
+
+// Both terminal outcomes of the physical P1 Stop are exercised: nominal, and
+// escalated through the existing injected first-stage refusal. The escalated
+// P1 settles with the degraded-Stop diagnostic that this same Stop recorded;
+// that exact error is accepted as settled proof and the result stays escalated.
+// The attributed variant's refusal names the operation, so P1's certificate
+// terminal error may be attributed to it.
+TEST(ResourceAddressedExecutionKernelTest,
+     ProgramRunContainmentReusesExactSettledIoRuleStopProof) {
+  struct Variant final {
+    bool escalated;
+    bool refusal_names_operation;
+    const char* name;
+  };
+  for (const auto& variant : {Variant{false, false, "nominal P1"},
+                              Variant{true, false, "escalated P1"},
+                              Variant{true, true, "escalated P1, refusal names operation"}}) {
+    SCOPED_TRACE(variant.name);
+    const bool escalated = variant.escalated;
+    const auto expected_result = escalated ? StopCertificateResultDTO::kSucceededEscalated
+                                           : StopCertificateResultDTO::kSucceededNominal;
+    IoRuleIntegrationFixture fixture(true, true);
+    ASSERT_TRUE(claim_program_execution(*fixture.kernel).ok());
+    ASSERT_TRUE(fixture.kernel->register_program_run_capture(program_execution_capture()).ok());
+    start_program_motion(*fixture.kernel);
+    ASSERT_TRUE(fixture.Publish(1, false).ok());
+    ASSERT_TRUE(fixture.PublishOther(1, false).ok());
+    auto intent = fixture.TwoScopeIntent();
+    intent.participants.front().execution_scope =
+        ProgramNodeExecutionScopeDTO{ProgramNodeInstanceId("move"), "move.attempt.1"};
+    const auto accepted = fixture.kernel->execute(std::move(intent));
+    ASSERT_TRUE(accepted.ok()) << accepted.error().message;
+    ASSERT_TRUE(fixture.Registered(accepted.value().operation_id, 2U));
+    if (escalated) {
+      ErrorDTO refusal{"nominal_rejected", "nominal refused", {}};
+      if (variant.refusal_names_operation)
+        refusal.details.emplace("operation_id", accepted.value().operation_id.value());
+      fixture.engine.next_stop_result = {false, std::move(refusal)};
+      fixture.engine.translate_stop_stage_hook = [&] {
+        if (fixture.engine.translate_stop_stage_calls >= 2)
+          fixture.engine.next_stop_result = {true, std::nullopt};
+      };
+    }
+    ASSERT_TRUE(fixture.PublishOther(2, true).ok());
+    ASSERT_TRUE(fixture.kernel->ProcessIoRuleEvidence().ok());
+    ASSERT_TRUE(wait_until([&] {
+      const auto state = fixture.kernel->get_operation_state(accepted.value().operation_id);
+      return state.ok() && state.value().active_stop_id.has_value() &&
+             std::any_of(state.value().participants.front().io_rule_outcomes.begin(),
+                         state.value().participants.front().io_rule_outcomes.end(),
+                         [](const auto& outcome) {
+                           return outcome.stop_certificate_id.has_value();
+                         });
+    }));
+    const auto stopped_operation =
+        fixture.kernel->get_operation_state(accepted.value().operation_id).value();
+    ASSERT_EQ(stopped_operation.state, OperationStateKind::kInterventionRequired);
+    ASSERT_TRUE(stopped_operation.active_stop_generation);
+    const auto first_stop_id = *stopped_operation.active_stop_id;
+    const auto first_status = fixture.kernel->get_stop_status(first_stop_id).value();
+    ASSERT_TRUE(first_status.stop_certificate);
+    const auto first_certificate =
+        fixture.kernel->get_stop_certificate(first_status.stop_certificate->stop_certificate_id);
+    ASSERT_TRUE(first_certificate.ok()) << first_certificate.error().message;
+    ASSERT_EQ(first_certificate.value().result, expected_result);
+    if (variant.refusal_names_operation) {
+      // Recorded in the XML: the P1 certificate terminal error this variant probes.
+      const auto& terminal_error = first_certificate.value().terminal_error;
+      ::testing::Test::RecordProperty("p1_certificate_terminal_error",
+                                      terminal_error ? terminal_error->code : "<none>");
+      if (terminal_error) {
+        const auto detail = terminal_error->details.find("operation_id");
+        ::testing::Test::RecordProperty(
+            "p1_certificate_terminal_error_operation_id",
+            detail != terminal_error->details.end() ? detail->second : "<none>");
+      }
+    }
+    if (escalated) {
+      EXPECT_GE(fixture.engine.translate_stop_stage_calls, 2);
+      // The reused P1 proof carries the degraded-Stop diagnostic.
+      const auto& p1_fact = stopped_operation.participants.front().terminal_fact;
+      ASSERT_TRUE(p1_fact);
+      EXPECT_EQ(p1_fact->effect, ParticipantEffectKnowledge::kEffectSettled);
+      ASSERT_TRUE(p1_fact->error);
+      EXPECT_EQ(p1_fact->error->code, kErrorMotionInterruptBackendStopFailed);
+    }
+    const auto calls_before_containment = fixture.engine.translate_stop_stage_calls.load();
+
+    const auto containment = fixture.kernel->stop(
+        program_run_stop_request("reset.settled-proof", "run.1"));
+    ASSERT_TRUE(containment.ok()) << containment.error().message;
+    EXPECT_TRUE(containment.value().affected_operation_revisions.empty());
+    EXPECT_GT(containment.value().stop_generation, first_status.accepted.stop_generation);
+    EXPECT_EQ(fixture.engine.translate_stop_stage_calls, calls_before_containment);
+    ASSERT_TRUE(wait_until([&] {
+      const auto status = fixture.kernel->get_stop_status(containment.value().stop_id);
+      return status.ok() && status.value().stop_certificate.has_value();
+    }));
+    // Re-checked after P2's terminal proof settled: the worker is asynchronous.
+    EXPECT_EQ(fixture.engine.translate_stop_stage_calls, calls_before_containment);
+    const auto second_status = fixture.kernel->get_stop_status(containment.value().stop_id).value();
+    const auto second_certificate =
+        fixture.kernel->get_stop_certificate(second_status.stop_certificate->stop_certificate_id);
+    ASSERT_TRUE(second_certificate.ok()) << second_certificate.error().message;
+    EXPECT_EQ(second_certificate.value().result, expected_result);
+    ASSERT_EQ(second_certificate.value().predecessor_certificates.size(), 1U);
+    EXPECT_EQ(second_certificate.value().predecessor_certificates.front().stop_id, first_stop_id);
+    ASSERT_FALSE(second_certificate.value().capture_history.empty());
+    EXPECT_TRUE(second_certificate.value().capture_history.back()
+                    .newly_fenced_operation_revisions.empty());
+    EXPECT_EQ(fixture.kernel->get_operation_state(accepted.value().operation_id).value(),
+              stopped_operation);
+
+    // A later operation-scoped operator REQUEST must still reuse the original
+    // physical P1 proof; P2 added only the fresh Run fence and did not rewrite
+    // operation A. P1 is IO-rule ORIGIN, so this covers operator-request reuse
+    // of an IO-origin proof, not an operator-ORIGIN physical proof.
+    const auto repeated = fixture.kernel->stop(stop_request(
+        "operator.repeated-settled-proof", accepted.value(),
+        stopped_operation.operation_revision.value(),
+        stopped_operation.active_stop_generation->value()));
+    ASSERT_TRUE(repeated.ok()) << repeated.error().message;
+    EXPECT_TRUE(repeated.value().affected_operation_revisions.empty());
+    EXPECT_EQ(fixture.engine.translate_stop_stage_calls, calls_before_containment);
+    ASSERT_TRUE(wait_until([&] {
+      const auto status = fixture.kernel->get_stop_status(repeated.value().stop_id);
+      return status.ok() && status.value().stop_certificate.has_value();
+    }));
+    EXPECT_EQ(fixture.engine.translate_stop_stage_calls, calls_before_containment);
+    const auto repeated_status = fixture.kernel->get_stop_status(repeated.value().stop_id).value();
+    const auto repeated_certificate =
+        fixture.kernel->get_stop_certificate(repeated_status.stop_certificate->stop_certificate_id);
+    ASSERT_TRUE(repeated_certificate.ok()) << repeated_certificate.error().message;
+    EXPECT_EQ(repeated_certificate.value().result, expected_result);
+    ASSERT_EQ(repeated_certificate.value().predecessor_certificates.size(), 1U);
+    EXPECT_EQ(repeated_certificate.value().predecessor_certificates.front().stop_id, first_stop_id);
+    EXPECT_EQ(fixture.kernel->get_operation_state(accepted.value().operation_id).value(),
+              stopped_operation);
+    fixture.engine.translate_stop_stage_hook = {};
+  }
+}
+
+TEST(ResourceAddressedExecutionKernelTest,
      IoRuleIntegrationFaultFirstUsesOrdinaryPreparedStopPlan) {
   IoRuleIntegrationFixture fixture(true, true);
   ASSERT_TRUE(fixture.Publish(1, false).ok());
@@ -33005,6 +33893,42 @@ TEST(ResourceAddressedExecutionKernelTest,
   const auto certificate = fixture.kernel->get_stop_certificate(
       status.stop_certificate->stop_certificate_id).value();
   ASSERT_EQ(certificate.scope_entries.size(), 1U);
+  const auto calls_before_reuse = fixture.engine.translate_stop_stage_calls.load();
+  const auto repeated = fixture.kernel->stop(stop_request(
+      "global.scope.settled-proof.reuse", motion.value(), stopped.operation_revision.value(),
+      stopped.active_stop_generation->value()));
+  ASSERT_TRUE(repeated.ok()) << repeated.error().message;
+  EXPECT_EQ(repeated.value().affected_operation_revisions.size(), 1U);
+  ASSERT_TRUE(wait_until([&] {
+    return fixture.engine.translate_stop_stage_calls.load() > calls_before_reuse;
+  }));
+  ASSERT_TRUE(wait_until([&] {
+    const auto status = fixture.kernel->get_stop_status(repeated.value().stop_id);
+    return status.ok() && status.value().stop_certificate.has_value();
+  }));
+  const auto repeated_status = fixture.kernel->get_stop_status(repeated.value().stop_id).value();
+  ASSERT_TRUE(repeated_status.stop_certificate);
+  const auto repeated_certificate = fixture.kernel->get_stop_certificate(
+      repeated_status.stop_certificate->stop_certificate_id);
+  ASSERT_TRUE(repeated_certificate.ok()) << repeated_certificate.error().message;
+  EXPECT_TRUE(repeated_certificate.value().predecessor_certificates.empty());
+  // The global-scoped Stop above preserved the sibling. This later explicit
+  // whole-operation Stop owns every Stop-owned participant's effect, so it
+  // must also contain the still-Executing command sibling.
+  ASSERT_TRUE(wait_until([&] {
+    if (fixture.other_engine.translate_stop_stage_calls.load() < 1) return false;
+    const auto state = fixture.kernel->get_operation_state(motion.value().operation_id);
+    if (!state.ok()) return false;
+    const auto current = std::find_if(state.value().participants.begin(),
+                                      state.value().participants.end(),
+        [&](const auto& row) { return row.participant_id == sibling->participant_id; });
+    return current != state.value().participants.end() &&
+           (current->state == OperationStateKind::kStopping ||
+            current->state == OperationStateKind::kStopped);
+  }));
+  EXPECT_EQ(
+      fixture.kernel->get_operation_state(motion.value().operation_id).value().active_stop_id,
+      repeated.value().stop_id);
 }
 
 TEST(ResourceAddressedExecutionKernelTest,

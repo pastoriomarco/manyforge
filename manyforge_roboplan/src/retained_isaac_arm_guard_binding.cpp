@@ -324,6 +324,14 @@ RetainedRos2ControlArmGuardHooks RetainedIsaacArmGuardBinding::hooks() {
     if (!guard_.Tripped()) return std::nullopt;
     return trip_reason_.value_or("isaac_command_guard_tripped");
   };
+  // The handle's last external owner stops the worker before releasing its
+  // lease; the worker never joins itself (the destructor keeps its join).
+  hooks.stop = [this, self] {
+    worker_.request_stop();
+    wake_.notify_all();
+    if (worker_.joinable() && worker_.get_id() != std::this_thread::get_id())
+      worker_.join();
+  };
   return hooks;
 }
 
@@ -336,8 +344,10 @@ namespace {
 
 class HandleArmHost final : public IRetainedIsaacArmHost {
 public:
-  explicit HandleArmHost(std::weak_ptr<RetainedRos2ControlRuntimeHandle> handle)
-      : handle_(std::move(handle)) {}
+  // The guard worker is owned by the handle (through its hooks) and is joined
+  // by the handle's last external owner: it takes internal leases only.
+  explicit HandleArmHost(const std::weak_ptr<RetainedRos2ControlRuntimeHandle> &handle)
+      : handle_(InternalLease(handle)) {}
 
   IsaacArmGuardFacts ReadFacts() override {
     IsaacArmGuardFacts facts;
@@ -372,6 +382,12 @@ public:
   }
 
 private:
+  static std::weak_ptr<RetainedRos2ControlRuntimeHandle>
+  InternalLease(const std::weak_ptr<RetainedRos2ControlRuntimeHandle> &handle) {
+    const auto owner = handle.lock();
+    return owner ? owner->weak_from_this()
+                 : std::weak_ptr<RetainedRos2ControlRuntimeHandle>{};
+  }
   std::weak_ptr<RetainedRos2ControlRuntimeHandle> handle_;
 };
 

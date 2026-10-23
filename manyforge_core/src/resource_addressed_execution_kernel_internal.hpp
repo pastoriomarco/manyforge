@@ -20,6 +20,7 @@
 #include <manyforge_core/motion_interrupt/stop_profile_mapper.hpp>
 #include <manyforge_core/stop_scope_resolver.hpp>
 #include <manyforge_core/stop_terminal_reducer.hpp>
+#include "stop_terminal_reducer_internal.hpp"
 #include <manyforge_core/component_lifecycle_admission.hpp>
 
 #include "component_lifecycle_journal_codec_internal.hpp"
@@ -1706,6 +1707,14 @@ struct ActiveOperationParticipant final {
   /// Q58: a Stop that did not wait for this command's still-returning dispatch
   /// leaves its exact local settlement here; the dispatch return performs it.
   std::optional<AddressedParticipantStopSettlementRequestDTO> deferred_stop_settlement{};
+  /// The degraded-Stop error (item 25) exactly as the settling Stop recorded
+  /// it, with that Stop's scope key. Settled-Stop proof reuse accepts this
+  /// one terminal error, from that one Stop, as settled containment.
+  struct DegradedStopTerminal final {
+    StopScopeEntryKeyDTO key;
+    ErrorDTO error;
+  };
+  std::optional<DegradedStopTerminal> degraded_stop_terminal{};
   /// Q60: a Stop that closed without waiting for this never-dispatched
   /// participant's prepared cancellation to return leaves its exact local
   /// settlement here. The cancellation's own terminal hands it to the Stop
@@ -2525,6 +2534,7 @@ struct ResourceAddressedExecutionKernel::StopTransaction final {
   /// existing transaction without changing this plan, membership or budget.
   std::optional<GlobalInterruptStopSelection> global_interrupt_selection{};
   std::vector<GlobalInterruptStopSelection> global_interrupt_winners{};
+  std::vector<internal::StopProofPredecessorScope> proof_predecessor_scopes{};
 };
 
 // A scoped global Stop owns only its captured physical/logical participants.
@@ -2576,6 +2586,7 @@ struct ResourceAddressedExecutionKernel::StopTerminalRecord final {
   std::optional<StopControlWorkToken> surveillance_projection_token;
   std::int64_t next_surveillance_sample_ns{};
   std::int64_t next_surveillance_checkpoint_ns{};
+  std::optional<StopAcceptedDTO> accepted{};
 };
 
 struct ResourceAddressedExecutionKernel::StopProjectionJob final {

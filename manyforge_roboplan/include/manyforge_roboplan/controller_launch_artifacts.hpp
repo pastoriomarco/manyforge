@@ -126,7 +126,9 @@ struct ControllerLaunchArtifactsRequest final {
   std::string component_runtime_identity{};
 };
 
-enum class ControllerLaunchLane { kMock, kIsaac };
+/// kSimulatedPlc: a ManyForge-owned simulated PLC process (sim-plc design);
+/// never produced by controller artifact generation.
+enum class ControllerLaunchLane { kMock, kIsaac, kSimulatedPlc };
 
 /// One configuration-scoped stock writer. Its topic is never reused for a
 /// different provider, ordered joint set or Deployment initial target.
@@ -174,8 +176,7 @@ struct ControllerLaunchArtifacts final {
     const std::map<std::string, double, std::less<>>
         &max_deceleration_on_cancel_rad_s2,
     const std::optional<std::string> &gripper_joint_name,
-    core::GripperOutputMode gripper_output_mode = core::GripperOutputMode::kCommanded,
-    bool resident_timeline_replacement = false);
+    core::GripperOutputMode gripper_output_mode = core::GripperOutputMode::kCommanded);
 
 /// The retained Isaac controller file of one Isaac profile, unchanged.
 [[nodiscard]] std::string_view retained_isaac_controllers_yaml(

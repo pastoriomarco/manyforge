@@ -1,3 +1,4 @@
+#include <algorithm>
 #include <atomic>
 #include <condition_variable>
 #include <cstdlib>
@@ -331,13 +332,18 @@ class BoundedStopStageAttemptExecutor::Impl final {
       std::optional<ParticipantStopStageResultDTO> result;
       bool infrastructure_failure = false;
       try {
+        auto budget = *request.budget;
+        if (request.stop_ingress_clock) {
+          budget.stop_ingress_age_ns = std::max<Duration>(
+              0, request.stop_ingress_clock->now() - request.stop_ingress_at_ns);
+        }
         if (request.force_spring_return) {
           SpringObserver observer(*this, slot, {slot_index, slot.generation});
           result.emplace(request.port->TranslateStopStageForTakeover(
-              *request.stage, *request.budget, cancellation, observer));
+              *request.stage, budget, cancellation, observer));
         } else {
           result.emplace(
-              request.port->TranslateStopStage(*request.stage, *request.budget, cancellation));
+              request.port->TranslateStopStage(*request.stage, budget, cancellation));
         }
       } catch (...) {
         infrastructure_failure = true;

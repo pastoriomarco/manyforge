@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import importlib.util
 from pathlib import Path
+import sys
 
 from launch import LaunchContext
 from launch.actions import DeclareLaunchArgument
@@ -12,6 +13,8 @@ import yaml
 
 
 ROOT = Path(__file__).resolve().parents[1]
+if str(ROOT) not in sys.path:  # the launch files import manyforge_ros_bringup
+    sys.path.insert(0, str(ROOT))
 
 
 def _module():

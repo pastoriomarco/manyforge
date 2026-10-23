@@ -104,9 +104,47 @@ struct ExecutionPortCommandResultDTO final {
 /// One replacement's start on the SAME controller clock as its associated
 /// source sample. The shifted trajectory's time zero and this stamp are one
 /// command; this is neither a local-clock timestamp nor installation proof.
+/// EXPERIMENTAL release-timer outcome of one replacement (Core holds before
+/// the send through its injected waiter; the port never sleeps).
+enum class ExecutionReleaseHold {
+  kNone,      // no release timer
+  kHeld,      // held until the release instant, then the existing checks ran
+  kMissed,    // the instant had already passed: sent at once (timer-free path)
+  kDeadline,  // holding would cross an existing deadline: sent at once
+};
+
+/// EXPERIMENTAL producer-policy record of one scheduled replacement, present
+/// only when a lane experiment flag is set (diagnostics and the release
+/// instant). Controller-clock stamps except `release_local_ns`, which is on
+/// the local clock of the sample receipts.
+struct ExecutionReplacementExperimentDTO final {
+  /// Controller update stamp (`controller_state` header) the grid comes from.
+  TimePoint source_stamp_ns{0};
+  /// Target tick T: the existing whole-period start; the stamp is T, or
+  /// T + P/2 with the mid-tick flag.
+  TimePoint target_tick_ns{0};
+  /// Release timer only: send at T - P/2 - expected latency (receipt-mapped).
+  std::optional<TimePoint> release_local_ns{};
+  ExecutionReleaseHold release_hold{ExecutionReleaseHold::kNone};
+  Duration expected_latency_ns{0};
+  Duration start_allowance_ns{0};
+  double factor{0.0};
+  /// Flags applied to this replacement.
+  bool midtick_stamp{false};
+  bool v0_payload{false};
+  bool spring_back_fast{false};
+  bool start_allowance_override{false};
+
+  friend bool operator==(const ExecutionReplacementExperimentDTO&,
+                         const ExecutionReplacementExperimentDTO&) = default;
+};
+
 struct ExecutionReplacementStartDTO final {
   ExecutionBindingEpoch binding_epoch{0U};
   TimePoint controller_start_stamp_ns{0};
+  /// Present only with a lane experiment flag (diagnostics; the port logs it
+  /// and sends exactly as without it).
+  std::optional<ExecutionReplacementExperimentDTO> experiment{};
 
   friend bool operator==(const ExecutionReplacementStartDTO&,
                          const ExecutionReplacementStartDTO&) = default;
@@ -325,6 +363,33 @@ enum class ExecutionGoalTolerancePolicy {
   kKept,
 };
 
+/// EXPERIMENTAL independent opt-ins for scheduled replacements (stock JTC 6.10
+/// A/B tests), all default off; set only from the Mock lane's environment.
+struct ExecutionReplacementExperimentFlagsDTO final {
+  /// `MANYFORGE_EXPERIMENTAL_RELEASE_TIMER`: hold until T - P/2 - latency.
+  bool release_timer{false};
+  /// `MANYFORGE_EXPERIMENTAL_MIDTICK_STAMP`: stamp T + P/2, D for that stamp.
+  bool midtick_stamp{false};
+  /// `MANYFORGE_EXPERIMENTAL_V0_PAYLOAD`: no negative-time prefix; the first
+  /// point at 0 holds the planned state at the stamp.
+  bool v0_payload{false};
+  /// `MANYFORGE_EXPERIMENTAL_SCHEDULED_SPRING_BACK_FAST`: spring_back_fast as
+  /// a scheduled V0 replacement instead of a zero-stamp one.
+  bool scheduled_spring_back_fast{false};
+  /// `MANYFORGE_EXPERIMENTAL_RELEASE_TIMER_LATENCY_MS`: send to callback
+  /// completion plus `controller_state` transport (the receipt mapping's bias).
+  double expected_latency_s{0.0015};
+  /// Diagnostic only: the effective allowance remains the Stop config's value.
+  bool start_allowance_override{false};
+
+  [[nodiscard]] bool any() const {
+    return release_timer || midtick_stamp || v0_payload || scheduled_spring_back_fast ||
+           start_allowance_override;
+  }
+  friend bool operator==(const ExecutionReplacementExperimentFlagsDTO&,
+                         const ExecutionReplacementExperimentFlagsDTO&) = default;
+};
+
 /// Static facts of the bound lane; fixed per binding epoch.
 struct ExecutionLaneFactsDTO final {
   /// The binding's controller joint order. Sample vectors follow it;
@@ -343,8 +408,8 @@ struct ExecutionLaneFactsDTO final {
   /// Qualified binding supports one atomic replacement trajectory/start stamp
   /// command. Unqualified lanes retain their existing immediate replacement.
   bool supports_scheduled_replacement{false};
-  /// Experimental Mock binding samples replacements on the resident path origin.
-  bool supports_resident_timeline_replacement{false};
+  /// EXPERIMENTAL, default off; acts only with `supports_scheduled_replacement`.
+  ExecutionReplacementExperimentFlagsDTO experiment{};
 
   friend bool operator==(const ExecutionLaneFactsDTO&,
                          const ExecutionLaneFactsDTO&) = default;

@@ -117,6 +117,9 @@ struct RetainedRos2ControlArmGuardHooks final {
   std::function<void()> on_recover;
   /// A guard fault awaiting the operator (reported as a `fault` cause).
   std::function<std::optional<std::string>()> fault;
+  /// Optional: stops and joins the guard's own worker, which polls this
+  /// handle. The last external owner calls it first, off that worker.
+  std::function<void()> stop{};
 };
 
 /// Build-owned measured JointState role of the selected lane. Instance
@@ -204,12 +207,25 @@ struct RetainedRos2ControlArmTransport final {
 /// its CCLC deactivation.
 class RetainedRos2ControlRuntimeHandle final
     : public std::enable_shared_from_this<RetainedRos2ControlRuntimeHandle> {
+  struct ConstructionKey final {
+    explicit ConstructionKey() = default;
+  };
+  struct ExternalOwner;
+
 public:
   using ParticipantFactory =
       std::function<std::shared_ptr<core::ExecutionPortParticipant>(
           std::shared_ptr<core::IExecutionPort>)>;
 
-  RetainedRos2ControlRuntimeHandle() = default;
+  /// The only owner a host or test holds. Runtime callbacks lock
+  /// `weak_from_this()`, a separate internal lease. When the last external
+  /// owner releases, that releasing (non-executor) thread stops the guard
+  /// and children and quiesces the transport (cancel, drain, join), and
+  /// only then drops its lease. A callback lease in flight therefore ends
+  /// before that join returns and is never the last owner on the executor.
+  [[nodiscard]] static std::shared_ptr<RetainedRos2ControlRuntimeHandle>
+  Create();
+  explicit RetainedRos2ControlRuntimeHandle(ConstructionKey) {}
   ~RetainedRos2ControlRuntimeHandle();
 
   RetainedRos2ControlRuntimeHandle(const RetainedRos2ControlRuntimeHandle &) =
@@ -485,6 +501,12 @@ private:
     bool exact_configuration_seen{false};
   };
 
+  /// Guard stop, child shutdown and transport quiescence. Idempotent; run by
+  /// the last external owner and again by the destructor.
+  void StopAndQuiesce() noexcept;
+
+  /// Set once by Create(): owners handed out by the handle are external.
+  std::weak_ptr<RetainedRos2ControlRuntimeHandle> external_owner_;
   mutable std::mutex mutex_;
   /// Serializes CCLC switch primitives (one controller switch at a time).
   std::mutex switch_mutex_;

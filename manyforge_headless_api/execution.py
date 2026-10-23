@@ -5,6 +5,7 @@ from __future__ import annotations
 import hashlib
 import logging
 import math
+import os
 import re
 import socket
 import sys
@@ -1807,6 +1808,10 @@ class ExecutionCommandClient:
                 }
             )
         )
+        if response.get("command") != "read_volatile_motion_trace":
+            raise HeadlessApiError("execution_command_response_invalid", "native trace command differs")
+        if "trace_file" in response:
+            return self._read_motion_trace_file(response["trace_file"], allowance_bytes)
         trace = response.get("trace")
         if (
             response.get("command") != "read_volatile_motion_trace"
@@ -1817,6 +1822,38 @@ class ExecutionCommandClient:
                 "execution_command_response_invalid",
                 "native volatile motion trace response is invalid",
             )
+        return trace
+
+    def _read_motion_trace_file(self, metadata: Any, allowance_bytes: int) -> dict[str, Any]:
+        directory = os.environ.get("MANYFORGE_MOTION_TRACE_DIR", "")
+        if (not directory or not isinstance(metadata, dict)
+                or set(metadata) != {"schema_version", "file", "bytes", "sha256", "request_owner_epoch", "status"}
+                or metadata.get("schema_version") != "manyforge.motion_trace_file.v1"
+                or not isinstance(metadata.get("file"), str)
+                or re.fullmatch(r"trace-[0-9a-f]{64}\.json", metadata["file"]) is None
+                or type(metadata.get("bytes")) is not int
+                or not 0 < metadata["bytes"] <= min(allowance_bytes, 3 * 1024 * 1024)
+                or metadata.get("sha256") != "sha256:" + metadata["file"][6:-5]
+                or not isinstance(metadata.get("request_owner_epoch"), str)
+                or not 0 < len(metadata["request_owner_epoch"].encode("utf-8")) <= 2048
+                or not isinstance(metadata.get("status"), str)
+                or metadata.get("status") not in {"complete", "partial"}):
+            raise HeadlessApiError("motion_trace_file_invalid", "native trace file metadata is invalid or disk traces are unconfigured")
+        try:
+            payload = PinnedRunRoot(Path(directory)).read_file(metadata["file"], metadata["bytes"])
+        except PrivateTransportCapabilityError as error:
+            raise HeadlessApiError("motion_trace_file_unavailable", str(error)) from error
+        if (len(payload) != metadata["bytes"]
+                or "sha256:" + hashlib.sha256(payload).hexdigest() != metadata["sha256"]):
+            raise HeadlessApiError("motion_trace_file_invalid", "trace file size or digest differs")
+        try:
+            trace = strict_json_object(payload.decode("utf-8", errors="strict"), label="motion trace file")
+            if (rfc8785.dumps(trace) != payload
+                    or trace.get("schema_version") != VOLATILE_MOTION_TRACE_VERSION
+                    or trace.get("request_owner_epoch") != metadata["request_owner_epoch"]):
+                raise ValueError("trace schema, owner or canonical bytes differ")
+        except (HeadlessApiError, ValueError, UnicodeError, rfc8785.CanonicalizationError) as error:
+            raise HeadlessApiError("motion_trace_file_invalid", "trace file content is invalid") from error
         return trace
 
     def operation_recovery(self, operation_id: str) -> dict[str, Any]:

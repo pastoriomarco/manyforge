@@ -125,6 +125,16 @@ def test_unbound_docker_crash_is_preserved(state, monkeypatch):
     assert sessions._marker(root / "current")["session_id"] == marker["session_id"]
 
 
+def test_simulated_plc_settings_survive_a_session_switch(state):
+    root, descriptor = state
+    settings = root / "sim_plc"
+    settings.mkdir()
+    (settings / "plc_io.yaml").write_text("ready: false\n")
+    sessions.prepare_session(root, uuid.uuid4().hex, lock_fd=descriptor)
+    sessions.prepare_session(root, uuid.uuid4().hex, lock_fd=descriptor)
+    assert (settings / "plc_io.yaml").read_text() == "ready: false\n"
+
+
 def test_unknown_root_needs_exact_stopped_capture(state):
     root, descriptor = state
     (root / "program-cycle.sqlite3").write_bytes(b"preserved legacy")

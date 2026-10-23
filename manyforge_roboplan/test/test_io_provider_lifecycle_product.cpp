@@ -1,8 +1,15 @@
 #include "../src/component_runtime_pins.hpp"
 #include "../src/host_io_signal_runtime.hpp"
 #include "../src/io_provider_lifecycle_product.hpp"
+#include "../src/simulated_plc_readiness.hpp"
 
 #include <algorithm>
+#include <csignal>
+#include <cstdlib>
+#include <filesystem>
+#include <fstream>
+#include <thread>
+#include <unistd.h>
 #include <chrono>
 #include <control_msgs/msg/dynamic_interface_group_values.hpp>
 #include <gtest/gtest.h>
@@ -1053,6 +1060,235 @@ TEST_F(IoProviderLifecycleProductTest,
     ingress->frames.clear();
     ingress->losses.clear();
   }
+}
+
+TEST_F(IoProviderLifecycleProductTest,
+       SupervisedSimulatedPlcExitIsADriverFaultUntilItsSourceIsReplaced) {
+  Build();
+  InstallInput();
+  auto exit_reason = std::make_shared<std::optional<std::string>>();
+  driver->SetSupervisedProcessFaultSource([exit_reason] { return *exit_reason; });
+  ASSERT_EQ(Step("prepare").known,
+            core::LifecyclePrimitiveKnownResultDTO::kSucceeded);
+  ASSERT_EQ(Step("enable").known,
+            core::LifecyclePrimitiveKnownResultDTO::kSucceeded);
+  const auto running = driver->ReadLifecycleHealth(kDomain, clock->now());
+  ASSERT_TRUE(running.ok());
+  EXPECT_EQ(running.value().observed_state,
+            core::ComponentLifecycleStateDTO::kActive);
+  EXPECT_EQ(cause(running.value().facts),
+            core::LifecycleBlockingCauseClassDTO::kNone);
+
+  // The simulated PLC process exits (e.g. endpoint occupied, status 3).
+  *exit_reason = "controller_launch_exited: controller launch exited with "
+                 "status 3 component=plc_io";
+  const auto health = driver->ReadLifecycleHealth(kDomain, clock->now());
+  ASSERT_TRUE(health.ok());
+  EXPECT_TRUE(health.value().locally_valid());
+  EXPECT_EQ(health.value().observed_state,
+            core::ComponentLifecycleStateDTO::kFaulted);
+  EXPECT_EQ(cause(health.value().facts),
+            core::LifecycleBlockingCauseClassDTO::kFault);
+  ASSERT_TRUE(health.value().diagnostic.has_value());
+  EXPECT_EQ(health.value().diagnostic->code, "simulated_plc_exited");
+  EXPECT_NE(health.value().diagnostic->message.find("status 3"),
+            std::string::npos);
+  const auto snapshot = driver->ReadLifecycleSnapshot(kDomain, clock->now());
+  ASSERT_TRUE(snapshot.ok());
+  EXPECT_TRUE(snapshot.value().locally_valid());
+  EXPECT_EQ(snapshot.value().component_state,
+            core::ComponentLifecycleStateDTO::kFaulted);
+  EXPECT_EQ(cause(snapshot.value().facts),
+            core::LifecycleBlockingCauseClassDTO::kFault);
+  // No local recovery while the process is gone; only Apply restarts it.
+  EXPECT_EQ(Step("recover").dispatch,
+            core::LifecyclePrimitiveDispatchStateDTO::kNotDispatched);
+  ASSERT_EQ(Step("disable").known,
+            core::LifecyclePrimitiveKnownResultDTO::kSucceeded);
+  EXPECT_EQ(Step("prepare").dispatch,
+            core::LifecyclePrimitiveDispatchStateDTO::kNotDispatched);
+
+  // The next Apply installs the restarted process's source.
+  driver->SetSupervisedProcessFaultSource(
+      [] { return std::optional<std::string>{}; });
+  const auto restarted = driver->ReadLifecycleHealth(kDomain, clock->now());
+  ASSERT_TRUE(restarted.ok());
+  EXPECT_EQ(restarted.value().observed_state,
+            core::ComponentLifecycleStateDTO::kDisabled);
+  EXPECT_EQ(cause(restarted.value().facts),
+            core::LifecycleBlockingCauseClassDTO::kNone);
+  EXPECT_EQ(Step("prepare").known,
+            core::LifecyclePrimitiveKnownResultDTO::kSucceeded);
+}
+
+TEST_F(IoProviderLifecycleProductTest,
+       FailedSimulatedPlcCandidateKeepsTheInstalledCrashFault) {
+  using namespace std::chrono_literals;
+  // A fake `ros2` that runs until interrupted, first on PATH for this test.
+  const auto root = std::filesystem::temp_directory_path() /
+                    ("manyforge-sim-plc-candidate-" + std::to_string(::getpid()));
+  std::filesystem::remove_all(root);
+  std::filesystem::create_directories(root / "bin");
+  {
+    std::ofstream script(root / "bin/ros2");
+    script << "#!/bin/sh\ntrap 'exit 0' INT TERM\nwhile :; do sleep 0.05; done\n";
+  }
+  std::filesystem::permissions(root / "bin/ros2", std::filesystem::perms::owner_all);
+  const std::string previous_path = std::getenv("PATH") ? std::getenv("PATH") : "";
+  ::setenv("PATH", ((root / "bin").string() + ":" + previous_path).c_str(), 1);
+  struct Restore {
+    std::string path;
+    std::filesystem::path root;
+    ~Restore() {
+      ::setenv("PATH", path.c_str(), 1);
+      std::error_code ignored;
+      std::filesystem::remove_all(root, ignored);
+    }
+  } restore{previous_path, root};
+
+  Build();
+  InstallInput();
+  const auto installed_driver = driver;
+  const IoProviderDriverGroup installed_drivers{installed_driver};
+  const auto plan = plan_simulated_plc(
+      "commanded_sim", "plc_io", {{"ros_bool", "/plc_io/ready", std::nullopt}},
+      root / "sim_plc");
+  ASSERT_TRUE(plan.has_value());
+  ControllerLaunchSupervisor supervisor(2s);
+  const SimulatedPlcWait ready = [](const auto &) { return SimulatedPlcReadiness{}; };
+  const SimulatedPlcWait not_ready = [&](const auto &) {
+    return SimulatedPlcReadiness{{}, plan->subscribed_topics};
+  };
+  const auto artifacts = root / "artifacts";
+  const auto fault_message = [&](const std::shared_ptr<IoProviderDriverRecord> &record)
+      -> std::optional<std::string> {
+    const auto health = record->ReadLifecycleHealth(kDomain, clock->now());
+    if (!health.ok() || !health.value().diagnostic ||
+        health.value().diagnostic->code != "simulated_plc_exited")
+      return std::nullopt;
+    return health.value().diagnostic->message;
+  };
+
+  // Installed (fresh drivers observe their process), then the PLC crashes.
+  const auto installed = StartSimulatedPlcCandidate(
+      supervisor, *plan, artifacts, "", installed_drivers, false, nullptr, ready);
+  ASSERT_EQ(Step("prepare").known, core::LifecyclePrimitiveKnownResultDTO::kSucceeded);
+  ASSERT_EQ(Step("enable").known, core::LifecyclePrimitiveKnownResultDTO::kSucceeded);
+  const auto crashed_pid = std::to_string(installed.process->pid());
+  ASSERT_EQ(::kill(-installed.process->pid(), SIGKILL), 0);
+  std::optional<std::string> original;
+  for (int attempt = 0; attempt < 300 && !original; ++attempt) {
+    original = fault_message(installed_driver);
+    if (!original) std::this_thread::sleep_for(10ms);
+  }
+  ASSERT_TRUE(original.has_value());
+  EXPECT_NE(original->find("pid=" + crashed_pid), std::string::npos);
+  const auto refused = [](const std::function<void()> &start) {
+    try {
+      start();
+    } catch (const std::runtime_error &error) {
+      return std::string(error.what()).find("simulated_plc_not_ready") !=
+             std::string::npos;
+    }
+    return false;
+  };
+
+  // A candidate that borrows the installed drivers may only keep exactly the
+  // installed process; the dead one forces a refusal, drivers untouched.
+  EXPECT_TRUE(refused([&] {
+    (void)StartSimulatedPlcCandidate(supervisor, *plan, artifacts, "",
+                                     installed_drivers, true, installed.process,
+                                     ready);
+  }));
+  EXPECT_EQ(fault_message(installed_driver), original);
+
+  // The rebuild candidate has fresh drivers; when it fails readiness, its
+  // fresh process is discarded and the installed driver still reports the crash.
+  Build();
+  InstallInput();
+  const IoProviderDriverGroup fresh_drivers{driver};
+  EXPECT_TRUE(refused([&] {
+    (void)StartSimulatedPlcCandidate(supervisor, *plan, artifacts, "",
+                                     fresh_drivers, false, nullptr, not_ready);
+  }));
+  EXPECT_EQ(fault_message(installed_driver), original);
+  EXPECT_EQ(cause(installed_driver->ReadLifecycleHealth(kDomain, clock->now()).value().facts),
+            core::LifecycleBlockingCauseClassDTO::kFault);
+  {
+    const auto snapshot = installed_driver->ReadLifecycleSnapshot(kDomain, clock->now());
+    ASSERT_TRUE(snapshot.ok());
+    for (const char *primitive : {"prepare", "enable", "recover"})
+      EXPECT_EQ(installed_driver
+                    ->Dispatch(Intent(primitive, snapshot.value().source_generation), {})
+                    .dispatch,
+                core::LifecyclePrimitiveDispatchStateDTO::kNotDispatched)
+          << primitive;
+  }
+
+  // A successful rebuild: the restarted process serves the fresh drivers.
+  const auto restarted = StartSimulatedPlcCandidate(
+      supervisor, *plan, artifacts, "", fresh_drivers, false, nullptr, ready);
+  EXPECT_NE(restarted.process, installed.process);
+  EXPECT_FALSE(fault_message(driver).has_value());
+  EXPECT_EQ(Step("prepare").known, core::LifecyclePrimitiveKnownResultDTO::kSucceeded);
+  // An unchanged retained device keeps exactly that process.
+  const auto kept = StartSimulatedPlcCandidate(
+      supervisor, *plan, artifacts, "", fresh_drivers, true, restarted.process, ready);
+  EXPECT_EQ(kept.decision, ControllerLaunchDecision::kKeep);
+  EXPECT_EQ(kept.process, restarted.process);
+  supervisor.stop_all();
+}
+
+TEST_F(IoProviderLifecycleProductTest,
+       ThrowingSimulatedPlcWaitDiscardsTheFreshProcess) {
+  using namespace std::chrono_literals;
+  const auto root = std::filesystem::temp_directory_path() /
+                    ("manyforge-sim-plc-throw-" + std::to_string(::getpid()));
+  std::filesystem::remove_all(root);
+  std::filesystem::create_directories(root / "bin");
+  {
+    std::ofstream script(root / "bin/ros2");
+    script << "#!/bin/sh\ntrap 'exit 0' INT TERM\nwhile :; do sleep 0.05; done\n";
+  }
+  std::filesystem::permissions(root / "bin/ros2", std::filesystem::perms::owner_all);
+  const std::string previous_path = std::getenv("PATH") ? std::getenv("PATH") : "";
+  ::setenv("PATH", ((root / "bin").string() + ":" + previous_path).c_str(), 1);
+  struct Restore {
+    std::string path;
+    std::filesystem::path root;
+    ~Restore() {
+      ::setenv("PATH", path.c_str(), 1);
+      std::error_code ignored;
+      std::filesystem::remove_all(root, ignored);
+    }
+  } restore{previous_path, root};
+  Build();
+  InstallInput();
+  const IoProviderDriverGroup drivers{driver};
+  const auto plan = plan_simulated_plc(
+      "commanded_sim", "plc_io", {{"ros_bool", "/plc_io/ready", std::nullopt}},
+      root / "sim_plc");
+  ASSERT_TRUE(plan.has_value());
+  ControllerLaunchSupervisor supervisor(2s);
+  std::shared_ptr<ControllerLaunchProcess> started;
+  // E.g. the ContextProvider or the ROS probe throws inside the wait.
+  const SimulatedPlcWait throwing = [&](const auto &process) -> SimulatedPlcReadiness {
+    started = process;
+    throw std::runtime_error("probe failed");
+  };
+  EXPECT_THROW((void)StartSimulatedPlcCandidate(supervisor, *plan, root / "artifacts",
+                                                "", drivers, false, nullptr, throwing),
+               std::runtime_error);
+  ASSERT_NE(started, nullptr);
+  EXPECT_TRUE(started->exited().has_value());
+  EXPECT_FALSE(supervisor.observe("plc_io").has_value() &&
+               supervisor.observe("plc_io")->running);
+  EXPECT_FALSE(ControllerLaunchSupervisor::fault_source(started)());
+  // The drivers never observed the discarded process.
+  const auto health = driver->ReadLifecycleHealth(kDomain, clock->now());
+  ASSERT_TRUE(health.ok());
+  EXPECT_FALSE(health.value().diagnostic.has_value());
+  supervisor.stop_all();
 }
 
 } // namespace manyforge::roboplan_backend::host_detail

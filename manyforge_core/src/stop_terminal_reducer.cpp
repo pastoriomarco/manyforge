@@ -1,6 +1,7 @@
 #include <algorithm>
 #include <manyforge_content_identity/content_identity.hpp>
 #include <manyforge_core/stop_terminal_reducer.hpp>
+#include "stop_terminal_reducer_internal.hpp"
 #include <set>
 #include <tuple>
 #include <utility>
@@ -640,13 +641,6 @@ struct DerivedTerminal final {
                    })) {
     return "stop_certificate_predecessors_invalid";
   }
-  if (!certificate.predecessor_certificates.empty() &&
-      certificate.resolution_disposition != StopResolutionDispositionDTO::kPromotedToFull &&
-      !((certificate.resolution_disposition == StopResolutionDispositionDTO::kExact ||
-         certificate.resolution_disposition == StopResolutionDispositionDTO::kStaleButUnambiguouslyResolved) &&
-        certificate.resolution_reason == StopScopeResolutionReasonDTO::kExplicitFullStop)) {
-    return "stop_certificate_predecessor_resolution_invalid";
-  }
   if (certificate.scope_entries.size() > kMaximumStopTerminalScopeEntries ||
       !canonical_rows(
           certificate.scope_entries,
@@ -743,13 +737,6 @@ std::optional<std::string_view> stop_terminal_reduction_input_field_error(
                    })) {
     return "stop_terminal_predecessor_certificate_invalid";
   }
-  if (!input.predecessor_certificates.empty() &&
-      input.resolution_disposition != StopResolutionDispositionDTO::kPromotedToFull &&
-      !((input.resolution_disposition == StopResolutionDispositionDTO::kExact ||
-         input.resolution_disposition == StopResolutionDispositionDTO::kStaleButUnambiguouslyResolved) &&
-        input.resolution_reason == StopScopeResolutionReasonDTO::kExplicitFullStop)) {
-    return "stop_terminal_predecessor_resolution_invalid";
-  }
   if (!canonical_rows(
           input.newly_captured_scope_entries,
           [](const auto& left, const auto& right) { return key_less(left.key, right.key); }) ||
@@ -770,7 +757,10 @@ std::optional<std::string_view> stop_certificate_field_error(
   return certificate_shape_error(certificate, true);
 }
 
-Result<StopCertificateDTO> ReduceStopTerminal(const StopTerminalReductionInputDTO& input) {
+namespace {
+Result<StopCertificateDTO> reduce_stop_terminal_impl(
+    const StopTerminalReductionInputDTO& input,
+    const std::span<const internal::StopProofPredecessorScope> proof_scopes) {
   if (const auto field = stop_terminal_reduction_input_field_error(input); field.has_value()) {
     return Result<StopCertificateDTO>::Err(
         terminal_input_error(std::string(*field), "Stop terminal reduction input is invalid"));
@@ -781,18 +771,73 @@ Result<StopCertificateDTO> ReduceStopTerminal(const StopTerminalReductionInputDT
   std::vector<StopAttemptedStageResultDTO> attempts;
   std::vector<StopScopeEntryKeyDTO> lane_hard_stop_requested;
   for (const auto& predecessor : input.predecessor_certificates) {
+    const auto proof = std::find_if(proof_scopes.begin(), proof_scopes.end(),
+                                    [&](const auto& row) {
+                                      return row.certificate.stop_id == predecessor.stop_id &&
+                                             row.certificate.stop_generation ==
+                                                 predecessor.stop_generation &&
+                                             row.certificate.stop_certificate_id ==
+                                                 predecessor.stop_certificate_id &&
+                                             row.certificate.stop_certificate_revision ==
+                                                 predecessor.stop_certificate_revision;
+                                    });
     predecessor_refs.push_back(StopCertificateRefDTO{
         predecessor.stop_certificate_id, predecessor.stop_certificate_revision, predecessor.stop_id,
         predecessor.stop_generation});
-    predecessor_refs.insert(predecessor_refs.end(), predecessor.predecessor_certificates.begin(),
-                            predecessor.predecessor_certificates.end());
-    scope_entries.insert(scope_entries.end(), predecessor.scope_entries.begin(),
-                         predecessor.scope_entries.end());
-    attempts.insert(attempts.end(), predecessor.attempted_stage_results.begin(),
-                    predecessor.attempted_stage_results.end());
-    lane_hard_stop_requested.insert(lane_hard_stop_requested.end(),
-                                    predecessor.lane_hard_stop_requested.begin(),
-                                    predecessor.lane_hard_stop_requested.end());
+    if (proof == proof_scopes.end()) {
+      predecessor_refs.insert(predecessor_refs.end(), predecessor.predecessor_certificates.begin(),
+                              predecessor.predecessor_certificates.end());
+      scope_entries.insert(scope_entries.end(), predecessor.scope_entries.begin(),
+                           predecessor.scope_entries.end());
+      attempts.insert(attempts.end(), predecessor.attempted_stage_results.begin(),
+                      predecessor.attempted_stage_results.end());
+      lane_hard_stop_requested.insert(lane_hard_stop_requested.end(),
+                                      predecessor.lane_hard_stop_requested.begin(),
+                                      predecessor.lane_hard_stop_requested.end());
+      continue;
+    }
+    for (const auto& key : proof->matched_scope_rows) {
+      const auto entry = std::find_if(predecessor.scope_entries.begin(),
+                                      predecessor.scope_entries.end(),
+                                      [&](const auto& candidate) { return candidate.key == key; });
+      if (entry == predecessor.scope_entries.end()) {
+        return Result<StopCertificateDTO>::Err(
+            terminal_input_error("stop_terminal_proof_row_missing",
+                                 "Settled proof row is absent from its source certificate"));
+      }
+      if (!std::holds_alternative<StopParticipantScopeKeyDTO>(key.subject) ||
+          !std::holds_alternative<StopParticipantScopeFactsDTO>(entry->facts) ||
+          std::get<StopParticipantScopeFactsDTO>(entry->facts).terminal_settlement !=
+              StopParticipantScopeFactsDTO::TerminalSettlementState::kSettled ||
+          std::find(predecessor.unsettled.begin(), predecessor.unsettled.end(), key) !=
+              predecessor.unsettled.end() ||
+          std::find(predecessor.failed.begin(), predecessor.failed.end(), key) !=
+              predecessor.failed.end()) {
+        return Result<StopCertificateDTO>::Err(
+            terminal_input_error("stop_terminal_proof_scope_invalid",
+                                 "Settled proof mapping contains an unqualified row"));
+      }
+      scope_entries.push_back(*entry);
+      if (key.origin_stop_id != predecessor.stop_id ||
+          key.origin_stop_generation != predecessor.stop_generation) {
+        const auto origin = std::find_if(
+            predecessor.predecessor_certificates.begin(), predecessor.predecessor_certificates.end(),
+            [&](const auto& reference) {
+              return reference.stop_id == key.origin_stop_id &&
+                     reference.stop_generation == key.origin_stop_generation;
+            });
+        if (origin == predecessor.predecessor_certificates.end()) {
+          return Result<StopCertificateDTO>::Err(
+              terminal_input_error("stop_terminal_proof_origin_missing",
+                                   "Settled proof row origin is absent from its source certificate"));
+        }
+        predecessor_refs.push_back(*origin);
+      }
+      for (const auto& attempt : predecessor.attempted_stage_results)
+        if (attempt.scope_key == key) attempts.push_back(attempt);
+      for (const auto& requested : predecessor.lane_hard_stop_requested)
+        if (requested == key) lane_hard_stop_requested.push_back(requested);
+    }
   }
   predecessor_refs.erase(
       std::remove_if(predecessor_refs.begin(), predecessor_refs.end(),
@@ -892,6 +937,43 @@ Result<StopCertificateDTO> ReduceStopTerminal(const StopTerminalReductionInputDT
         terminal_input_error(std::string(*field), "Reduced Stop certificate is invalid"));
   }
   return Result<StopCertificateDTO>::Ok(std::move(certificate));
+}
+}  // namespace
+
+Result<StopCertificateDTO> ReduceStopTerminal(const StopTerminalReductionInputDTO& input) {
+  return reduce_stop_terminal_impl(input, {});
+}
+
+Result<StopCertificateDTO> internal::ReduceStopTerminalWithProofScopes(
+    const StopTerminalReductionInputDTO& input,
+    const std::span<const internal::StopProofPredecessorScope> proof_scopes) {
+  if (proof_scopes.size() > input.predecessor_certificates.size() ||
+      !std::is_sorted(proof_scopes.begin(), proof_scopes.end(), [](const auto& left, const auto& right) {
+        return left.certificate.stop_id < right.certificate.stop_id;
+      }) ||
+      std::adjacent_find(proof_scopes.begin(), proof_scopes.end(), [](const auto& left, const auto& right) {
+        return left.certificate.stop_id == right.certificate.stop_id;
+      }) != proof_scopes.end())
+    return Result<StopCertificateDTO>::Err(
+        terminal_input_error("stop_terminal_proof_scope_invalid",
+                             "Settled proof scope mapping is not canonical"));
+  for (const auto& proof : proof_scopes) {
+    const auto parent = std::find_if(input.predecessor_certificates.begin(),
+                                     input.predecessor_certificates.end(), [&](const auto& cert) {
+                                       return cert.stop_id == proof.certificate.stop_id &&
+                                              cert.stop_generation == proof.certificate.stop_generation &&
+                                              cert.stop_certificate_id ==
+                                                  proof.certificate.stop_certificate_id &&
+                                              cert.stop_certificate_revision ==
+                                                  proof.certificate.stop_certificate_revision;
+                                     });
+    if (parent == input.predecessor_certificates.end() || proof.matched_scope_rows.empty() ||
+        !canonical_rows(proof.matched_scope_rows, key_less))
+      return Result<StopCertificateDTO>::Err(
+          terminal_input_error("stop_terminal_proof_scope_invalid",
+                               "Settled proof mapping does not identify a source certificate"));
+  }
+  return reduce_stop_terminal_impl(input, proof_scopes);
 }
 
 }  // namespace manyforge::core

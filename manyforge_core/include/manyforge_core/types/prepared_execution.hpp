@@ -25,6 +25,9 @@ struct PreparedMotionReplacementSourceDTO final {
   /// Existing canonical prepared-trajectory cursor, joined to the exact
   /// controller sample. Raw controller time can have a delivery-origin offset.
   ExecutionProgressCursorSnapshotDTO progress;
+  /// The lane's integer-ns controller period: the unscaled one-period command
+  /// lookahead of the stock controller. 0 for unscheduled lanes or no usable rate.
+  std::int64_t controller_period_ns{0};
 };
 
 /// Computed observation of the existing candidate membership and goal facts;

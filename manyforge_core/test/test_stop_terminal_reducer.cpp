@@ -7,6 +7,7 @@
 #include <manyforge_core/resolved_stop_base_plan_codec.hpp>
 #include <manyforge_core/runtime_participant_binding.hpp>
 #include <manyforge_core/stop_terminal_reducer.hpp>
+#include "../src/stop_terminal_reducer_internal.hpp"
 #include <sstream>
 
 namespace manyforge::core {
@@ -298,6 +299,19 @@ TEST(StopTerminalReducerTest, DerivesNominalCertificateAndExactFlattenedEvidence
   EXPECT_FALSE(stop_certificate_field_error(reduced.value()).has_value());
 }
 
+TEST(StopTerminalReducerTest, NonproofReductionKeepsOneToOneFreshScope) {
+  const auto input = Input();
+  const auto reduced = ReduceStopTerminal(input);
+  ASSERT_TRUE(reduced.ok()) << reduced.error().message;
+  ASSERT_EQ(input.capture_history.back().newly_fenced_operation_revisions.size(), 1U);
+  EXPECT_EQ(input.capture_history.back().newly_fenced_operation_revisions.front().operation_id,
+            OperationId("operation.1"));
+  ASSERT_EQ(reduced.value().scope_entries.size(), 1U);
+  EXPECT_EQ(reduced.value().scope_entries.front().key,
+            input.newly_captured_scope_entries.front().key);
+  EXPECT_TRUE(reduced.value().predecessor_certificates.empty());
+}
+
 TEST(StopTerminalReducerTest,
      RetainsPhysicalContainmentButRefusesSuccessWhenParticipantIsUnsettled) {
   auto input = Input();
@@ -486,6 +500,201 @@ TEST(StopTerminalReducerTest, ExplicitFullMergesPredecessorWithoutRepeatingStage
   EXPECT_EQ(reduced.value().scope_entries, predecessor.value().scope_entries);
   EXPECT_EQ(reduced.value().attempted_stage_results, predecessor.value().attempted_stage_results);
   EXPECT_EQ(reduced.value().result, StopCertificateResultDTO::kSucceededNominal);
+}
+
+TEST(StopTerminalReducerTest, ProofProjectionKeepsExactOriginRowsFromPartialPromotedAncestor) {
+  const auto retarget = [](StopTerminalReductionInputDTO input, StopId stop_id,
+                           StopGeneration generation, StopCertificateId certificate_id,
+                           OperationId operation_id) {
+    input.stop_id = stop_id;
+    input.stop_generation = generation;
+    input.stop_certificate_id = std::move(certificate_id);
+    auto& stage = input.newly_completed_stage_results.front().result.request;
+    stage.stop_id = stop_id;
+    stage.stop_generation = generation;
+    stage.operation_id = operation_id;
+    input.newly_captured_scope_entries.front().key = ParticipantKey(stage);
+    input.newly_completed_stage_results.front().scope_key = ParticipantKey(stage);
+    input.capture_history.front().newly_fenced_operation_revisions.front().operation_id = operation_id;
+    auto& targets = std::get<std::vector<StopOperationTargetDTO>>(
+        *input.requested_selector.selector);
+    targets.front().operation_id = operation_id;
+    return input;
+  };
+  auto a_input = retarget(Input(), StopId("stop.origin.a"), StopGeneration(1U),
+                          StopCertificateId("certificate.origin.a"), OperationId("operation.1"));
+  const auto a = ReduceStopTerminal(a_input);
+  ASSERT_TRUE(a.ok()) << a.error().message;
+
+  auto b_input = retarget(Input(), StopId("stop.origin.b"), StopGeneration(2U),
+                          StopCertificateId("certificate.origin.b"), OperationId("operation.2"));
+  auto& b_facts =
+      std::get<StopParticipantScopeFactsDTO>(b_input.newly_captured_scope_entries.front().facts);
+  b_facts.terminal_settlement =
+      StopParticipantScopeFactsDTO::TerminalSettlementState::kContainedUnsettled;
+  b_input.terminal_error =
+      ErrorDTO{"participant_stop_settlement_failed", "B was not settled", {{"operation_id", "operation.2"}}};
+  const auto b = ReduceStopTerminal(b_input);
+  ASSERT_TRUE(b.ok()) << b.error().message;
+  ASSERT_EQ(b.value().result, StopCertificateResultDTO::kPartial);
+
+  auto p2_input = Input();
+  p2_input.stop_id = StopId("stop.promoted.p2");
+  p2_input.stop_generation = StopGeneration(3U);
+  p2_input.stop_certificate_id = StopCertificateId("certificate.promoted.p2");
+  p2_input.requested_selector = StopRequestedSelectorSnapshotDTO{
+      StopRequestedSelectorKindDTO::kExplicitFull, ContentDigest(kDigestC), std::nullopt,
+      std::nullopt};
+  p2_input.resolution_reason = StopScopeResolutionReasonDTO::kExplicitFullStop;
+  p2_input.newly_captured_scope_entries.clear();
+  p2_input.newly_completed_stage_results.clear();
+  p2_input.capture_history = {Capture(
+      {{a.value().stop_id, a.value().stop_generation, ContentDigest(kDigestA)},
+       {b.value().stop_id, b.value().stop_generation, ContentDigest(kDigestB)}},
+      {}, {}, StopResolutionDispositionDTO::kExact,
+      StopScopeResolutionReasonDTO::kExplicitFullStop)};
+  p2_input.predecessor_certificates = {a.value(), b.value()};
+  const auto p2 = ReduceStopTerminal(p2_input);
+  ASSERT_TRUE(p2.ok()) << p2.error().message;
+  ASSERT_EQ(p2.value().result, StopCertificateResultDTO::kPartial);
+  ASSERT_EQ(p2.value().scope_entries.size(), 2U);
+  ASSERT_EQ(p2.value().predecessor_certificates.size(), 2U);
+  EXPECT_TRUE(std::any_of(p2.value().predecessor_certificates.begin(),
+                          p2.value().predecessor_certificates.end(), [&](const auto& ref) {
+                            return ref.stop_id == a.value().stop_id;
+                          }));
+
+  auto next = Input();
+  next.stop_id = StopId("stop.next.a");
+  next.stop_generation = StopGeneration(4U);
+  next.stop_certificate_id = StopCertificateId("certificate.next.a");
+  next.newly_captured_scope_entries.clear();
+  next.newly_completed_stage_results.clear();
+  const auto ref_for = [](const StopCertificateDTO& cert) {
+    return StopPredecessorAcceptanceRefDTO{cert.stop_id, cert.stop_generation,
+                                           ContentDigest(kDigestC)};
+  };
+  next.capture_history = {Capture(
+      {ref_for(a.value()), ref_for(p2.value())}, {}, {},
+      StopResolutionDispositionDTO::kExact,
+      StopScopeResolutionReasonDTO::kExactCurrentScope)};
+  next.predecessor_certificates = {p2.value()};
+  const auto a_row = a.value().scope_entries.front().key;
+  const internal::StopProofPredecessorScope proof{
+      StopCertificateRefDTO{p2.value().stop_certificate_id,
+                            p2.value().stop_certificate_revision,
+                            p2.value().stop_id, p2.value().stop_generation},
+      {a_row}};
+  const auto reused = internal::ReduceStopTerminalWithProofScopes(next, {&proof, 1U});
+  ASSERT_TRUE(reused.ok()) << reused.error().message;
+  EXPECT_EQ(reused.value().result, StopCertificateResultDTO::kSucceededNominal);
+  ASSERT_EQ(reused.value().scope_entries.size(), 1U);
+  EXPECT_EQ(reused.value().scope_entries.front().key, a_row);
+  ASSERT_EQ(reused.value().attempted_stage_results.size(), 1U);
+  EXPECT_EQ(reused.value().attempted_stage_results.front().scope_key, a_row);
+  ASSERT_EQ(reused.value().predecessor_certificates.size(), 2U);
+  EXPECT_TRUE(std::any_of(reused.value().predecessor_certificates.begin(),
+                          reused.value().predecessor_certificates.end(), [&](const auto& ref) {
+                            return ref.stop_id == a.value().stop_id;
+                          }));
+  EXPECT_TRUE(std::any_of(reused.value().predecessor_certificates.begin(),
+                          reused.value().predecessor_certificates.end(), [&](const auto& ref) {
+                            return ref.stop_id == p2.value().stop_id;
+                          }));
+  EXPECT_TRUE(std::none_of(reused.value().predecessor_certificates.begin(),
+                           reused.value().predecessor_certificates.end(), [&](const auto& ref) {
+                             return ref.stop_id == b.value().stop_id;
+                           }));
+  ASSERT_EQ(reused.value().capture_history.back().predecessor_stops.size(), 2U);
+  EXPECT_TRUE(std::any_of(reused.value().capture_history.back().predecessor_stops.begin(),
+                          reused.value().capture_history.back().predecessor_stops.end(),
+                          [&](const auto& ref) { return ref.predecessor_stop_id == a.value().stop_id; }));
+  EXPECT_TRUE(std::any_of(reused.value().capture_history.back().predecessor_stops.begin(),
+                          reused.value().capture_history.back().predecessor_stops.end(),
+                          [&](const auto& ref) { return ref.predecessor_stop_id == p2.value().stop_id; }));
+
+  auto over_cap = next;
+  const auto p2_acceptance = ref_for(p2.value());
+  over_cap.capture_history = {Capture(
+      std::vector<StopPredecessorAcceptanceRefDTO>(65U, p2_acceptance), {}, {},
+      StopResolutionDispositionDTO::kExact,
+      StopScopeResolutionReasonDTO::kExactCurrentScope)};
+  over_cap.predecessor_certificates.assign(65U, p2.value());
+  const auto rejected_over_cap =
+      internal::ReduceStopTerminalWithProofScopes(over_cap, {&proof, 1U});
+  ASSERT_FALSE(rejected_over_cap.ok());
+  EXPECT_EQ(rejected_over_cap.error().code, "stop_terminal_reduction_input_invalid");
+
+  auto c_input = retarget(Input(), StopId("stop.origin.c"), StopGeneration(5U),
+                          StopCertificateId("certificate.origin.c"), OperationId("operation.3"));
+  const auto c = ReduceStopTerminal(c_input);
+  ASSERT_TRUE(c.ok()) << c.error().message;
+
+  auto aggregate = Input();
+  aggregate.stop_id = StopId("stop.aggregate.p3");
+  aggregate.stop_generation = StopGeneration(6U);
+  aggregate.stop_certificate_id = StopCertificateId("certificate.aggregate.p3");
+  aggregate.requested_selector = StopRequestedSelectorSnapshotDTO{
+      StopRequestedSelectorKindDTO::kExplicitFull, ContentDigest(kDigestC), std::nullopt,
+      std::nullopt};
+  aggregate.resolution_reason = StopScopeResolutionReasonDTO::kExplicitFullStop;
+  aggregate.newly_captured_scope_entries.clear();
+  aggregate.newly_completed_stage_results.clear();
+  aggregate.capture_history = {Capture(
+      {ref_for(a.value()), ref_for(c.value()), ref_for(p2.value())}, {}, {},
+      StopResolutionDispositionDTO::kExact,
+      StopScopeResolutionReasonDTO::kExplicitFullStop)};
+  aggregate.predecessor_certificates = {c.value(), p2.value()};
+  const internal::StopProofPredecessorScope aggregate_proof{
+      proof.certificate, {a_row}};
+  const auto mixed =
+      internal::ReduceStopTerminalWithProofScopes(aggregate, {&aggregate_proof, 1U});
+  ASSERT_TRUE(mixed.ok()) << mixed.error().message;
+  EXPECT_EQ(mixed.value().result, StopCertificateResultDTO::kSucceededNominal);
+  ASSERT_EQ(mixed.value().scope_entries.size(), 2U);
+  EXPECT_TRUE(std::any_of(mixed.value().scope_entries.begin(), mixed.value().scope_entries.end(),
+                          [&](const auto& row) { return row.key == a_row; }));
+  EXPECT_TRUE(std::any_of(mixed.value().scope_entries.begin(), mixed.value().scope_entries.end(),
+                          [&](const auto& row) {
+                            return row.key == c.value().scope_entries.front().key;
+                          }));
+  EXPECT_TRUE(std::none_of(mixed.value().scope_entries.begin(), mixed.value().scope_entries.end(),
+                           [&](const auto& row) {
+                             return row.key == b.value().scope_entries.front().key;
+                           }));
+
+  auto full_aggregate = aggregate;
+  full_aggregate.capture_history = {Capture(
+      {ref_for(a.value()), ref_for(b.value()), ref_for(c.value()), ref_for(p2.value())}, {}, {},
+      StopResolutionDispositionDTO::kExact,
+      StopScopeResolutionReasonDTO::kExplicitFullStop)};
+  const auto full_union = ReduceStopTerminal(full_aggregate);
+  ASSERT_TRUE(full_union.ok()) << full_union.error().message;
+  EXPECT_EQ(full_union.value().result, StopCertificateResultDTO::kPartial);
+  ASSERT_EQ(full_union.value().scope_entries.size(), 3U);
+  EXPECT_TRUE(std::any_of(full_union.value().scope_entries.begin(), full_union.value().scope_entries.end(),
+                          [&](const auto& row) {
+                            return row.key == b.value().scope_entries.front().key;
+                          }));
+
+  const auto stale_b_row = b.value().scope_entries.front().key;
+  const internal::StopProofPredecessorScope stale_b_proof{
+      proof.certificate, {stale_b_row}};
+  const auto rejected = internal::ReduceStopTerminalWithProofScopes(next, {&stale_b_proof, 1U});
+  EXPECT_FALSE(rejected.ok());
+
+  auto unsettled_capture = next;
+  unsettled_capture.capture_history = {Capture(
+      {ref_for(b.value())}, {}, {}, StopResolutionDispositionDTO::kExact,
+      StopScopeResolutionReasonDTO::kExactCurrentScope)};
+  unsettled_capture.predecessor_certificates = {b.value()};
+  const internal::StopProofPredecessorScope unsettled_proof{
+      StopCertificateRefDTO{b.value().stop_certificate_id, b.value().stop_certificate_revision,
+                            b.value().stop_id, b.value().stop_generation},
+      {b.value().scope_entries.front().key}};
+  const auto unsettled =
+      internal::ReduceStopTerminalWithProofScopes(unsettled_capture, {&unsettled_proof, 1U});
+  EXPECT_FALSE(unsettled.ok());
 }
 
 TEST(StopTerminalReducerTest, ExternalUncontainedResourceFailsWithoutInventedParticipant) {

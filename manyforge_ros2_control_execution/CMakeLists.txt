@@ -31,6 +31,7 @@ add_library(manyforge_ros2_control_execution
   src/ros2_control_capability.cpp
   src/ros2_control_execution_backend.cpp
   src/volatile_motion_trace.cpp
+  src/volatile_motion_trace_file.cpp
   src/ros2_gripper_command_backend.cpp
   src/ros2_transport_resources.cpp
   src/scene_projection_worker.cpp

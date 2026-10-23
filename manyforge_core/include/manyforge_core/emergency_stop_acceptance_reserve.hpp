@@ -9,6 +9,7 @@
 #include <mutex>
 #include <optional>
 #include <string_view>
+#include <type_traits>
 
 namespace manyforge::core {
 
@@ -37,6 +38,7 @@ enum class EmergencyStopProjectionStateDTO {
 enum class EmergencyStopReserveError {
   kNone,
   kInvalidCandidate,
+  kPrecommitRefused,
 };
 
 /// Allocation-free view prepared by the Stop ingress/resolver before it enters
@@ -100,6 +102,16 @@ struct EmergencyStopAcceptanceOutcome final {
   friend class EmergencyStopAcceptanceReserve;
 };
 
+/// The reserve's own selection for one candidate, shown to the caller's
+/// pre-commit check before any slot changes. A resident token names the
+/// already-resident transaction the published outcome will carry.
+struct EmergencyStopReservePlan final {
+  bool replay{};
+  bool joined_resident{};
+  bool full_stop{};
+  std::optional<StopControlWorkToken> resident_work_token;
+};
+
 /// Kernel-owned fixed emergency acceptance storage. Construction allocates no
 /// per-request state. reserve_or_join(), projection updates, and terminal
 /// release perform only bounded array/string copies while holding one short
@@ -116,7 +128,36 @@ class EmergencyStopAcceptanceReserve final {
   EmergencyStopAcceptanceReserve& operator=(const EmergencyStopAcceptanceReserve&) = delete;
 
   [[nodiscard]] EmergencyStopAcceptanceOutcome reserve_or_join(
-      const EmergencyStopAcceptanceCandidate& candidate) noexcept;
+      const EmergencyStopAcceptanceCandidate& candidate) noexcept {
+    return reserve_or_join(candidate, [](const EmergencyStopReservePlan&) noexcept { return true; });
+  }
+
+  /// Same selection, computed once under the reserve lock. A false pre-commit
+  /// check returns kPrecommitRefused and leaves every slot unchanged.
+  ///
+  /// Contract: for a valid candidate the noexcept check is called once while the
+  /// reserve lock is held. It must not re-enter this reserve (any member,
+  /// including find()) and must not mutate the candidate or the storage its
+  /// views name; the selection it judges is the one that is committed.
+  template <typename PrecommitCheck>
+  [[nodiscard]] EmergencyStopAcceptanceOutcome reserve_or_join(
+      const EmergencyStopAcceptanceCandidate& candidate, PrecommitCheck&& precommit) noexcept {
+    static_assert(std::is_nothrow_invocable_r_v<bool, PrecommitCheck&, const EmergencyStopReservePlan&>,
+                  "reserve pre-commit check must be noexcept and return bool");
+    std::lock_guard lock(mutex_);
+    const auto selection = select_locked(candidate);
+    if (selection.kind == Selection::Kind::kInvalid) {
+      EmergencyStopAcceptanceOutcome outcome;
+      outcome.error = EmergencyStopReserveError::kInvalidCandidate;
+      return outcome;
+    }
+    if (!precommit(plan_locked(selection))) {
+      EmergencyStopAcceptanceOutcome outcome;
+      outcome.error = EmergencyStopReserveError::kPrecommitRefused;
+      return outcome;
+    }
+    return commit_locked(candidate, selection);
+  }
 
   /// Update the forensic projection state for every resident correlation that
   /// joined the Stop. This does not release or otherwise change containment.
@@ -165,6 +206,18 @@ class EmergencyStopAcceptanceReserve final {
     std::array<char, kMaximumEmergencyStopDigestBytes> scope_digest{};
     std::size_t scope_digest_size{};
   };
+
+  struct Selection final {
+    enum class Kind { kInvalid, kReplay, kCoalesceFull, kSlot } kind{Kind::kInvalid};
+    /// Replayed correlation slot, or the free slot a kSlot selection fills.
+    StopControlSlotIndex index{kInvalidStopControlSlot};
+    const Slot* joined{};
+  };
+  [[nodiscard]] Selection select_locked(
+      const EmergencyStopAcceptanceCandidate& candidate) const noexcept;
+  [[nodiscard]] EmergencyStopReservePlan plan_locked(const Selection& selection) const noexcept;
+  [[nodiscard]] EmergencyStopAcceptanceOutcome commit_locked(
+      const EmergencyStopAcceptanceCandidate& candidate, const Selection& selection) noexcept;
 
   std::size_t correlation_capacity_{};
   mutable std::mutex mutex_;

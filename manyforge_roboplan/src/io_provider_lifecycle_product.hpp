@@ -96,6 +96,14 @@ public:
   Dispatch(const core::BrandLifecyclePrimitiveIntentDTO &intent,
            std::stop_token cancellation);
 
+  // sim-plc: the exact Manager-owned simulated PLC process serving this
+  // device. Its exit reason (absent while it runs or after an ordered stop)
+  // is a driver fault: prepare/enable/recover are refused and the standard
+  // cause is `fault`. A later Apply installs the restarted process's source,
+  // replacing this one; an empty source removes it.
+  void SetSupervisedProcessFaultSource(
+      std::function<std::optional<std::string>()> source);
+
   // Only the actual retiring driver owner calls this. An old activation that
   // transferred this retained record must release its pointer without it.
   void Shutdown();

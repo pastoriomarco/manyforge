@@ -3,9 +3,7 @@
 #include <gtest/gtest.h>
 
 #include <algorithm>
-#include <array>
 #include <atomic>
-#include <cstdlib>
 #include <filesystem>
 #include <fstream>
 #include <map>
@@ -57,23 +55,6 @@ public:
 
 private:
   std::filesystem::path path_;
-};
-
-class ResidentTimelineEnvironment final {
-public:
-  explicit ResidentTimelineEnvironment(const char *value) {
-    if (const auto *old = std::getenv(kName)) old_ = old;
-    if (value) ::setenv(kName, value, 1);
-    else ::unsetenv(kName);
-  }
-  ~ResidentTimelineEnvironment() {
-    if (old_) ::setenv(kName, old_->c_str(), 1);
-    else ::unsetenv(kName);
-  }
-
-private:
-  static constexpr auto kName = "MANYFORGE_EXPERIMENTAL_JTC_RESIDENT_TIMELINE";
-  std::optional<std::string> old_;
 };
 
 const std::vector<std::string> kUFactoryArm{"joint1", "joint2", "joint3",
@@ -223,27 +204,19 @@ TEST(ControllerLaunchArtifacts, Lite6MockControllersFileIsTheTemplatesFilledIn) 
       "    allow_stalling: false\n");
 }
 
-TEST(ControllerLaunchArtifacts, ResidentTimelineOptInIsWrittenToActualMockArtifacts) {
-  for (const char *flag : std::array<const char *, 3>{nullptr, "0", "1"}) {
-    const ResidentTimelineEnvironment environment(flag);
-    for (const auto &profile : offline_profiles()) {
-      SCOPED_TRACE(profile.mock_profile);
-      const TemporaryRoot root;
-      const auto model = read_repository_file(profile.model_path);
-      const auto written = write_controller_launch_artifacts(
-          mock_request(root.path(), "robot", profile, model));
-      const auto yaml = read_file(written.controllers_file);
-      EXPECT_EQ(yaml, written.controllers_yaml);
-      EXPECT_EQ(count(yaml, "replacement_time_reference: active_trajectory"),
-                flag && std::string_view(flag) == "1" ? 1U : 0U);
-      EXPECT_EQ(count(yaml, "allow_trajectory_replacement: true"), 1U);
-      // The low-level generator keeps upstream's receipt default unless the
-      // caller explicitly selects the resident timeline, regardless of env.
-      const auto defaults = generate_mock_controllers_yaml(
-          mock_controller_profile_facts(profile.mock_profile), "robot", profile.arm,
-          cancel_limits(profile.arm, 10.0), profile.gripper_joint);
-      EXPECT_EQ(defaults.find("replacement_time_reference:"), std::string::npos);
-    }
+TEST(ControllerLaunchArtifacts, MockArtifactsKeepStockJtcReplacementOptIn) {
+  for (const auto &profile : offline_profiles()) {
+    SCOPED_TRACE(profile.mock_profile);
+    const TemporaryRoot root;
+    const auto model = read_repository_file(profile.model_path);
+    const auto written = write_controller_launch_artifacts(
+        mock_request(root.path(), "robot", profile, model));
+    const auto yaml = read_file(written.controllers_file);
+    EXPECT_EQ(yaml, written.controllers_yaml);
+    // Stock JTC scheduled replacement (Mock option1) needs only the upstream
+    // opt-in; nothing else selects a replacement timeline.
+    EXPECT_EQ(count(yaml, "allow_trajectory_replacement: true"), 1U);
+    EXPECT_EQ(yaml.find("replacement_time_reference"), std::string::npos);
   }
 }
 

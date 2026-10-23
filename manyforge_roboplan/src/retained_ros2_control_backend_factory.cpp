@@ -156,7 +156,7 @@ RetainedRuntimeBackendFactory make_retained_ros2_control_backend_factory(
   auto single_use =
       std::make_shared<SingleUseRos2ControlBackendConfig>(std::move(config));
   if (!runtime_handle) {
-    runtime_handle = std::make_shared<RetainedRos2ControlRuntimeHandle>();
+    runtime_handle = RetainedRos2ControlRuntimeHandle::Create();
   }
   return
       [single_use = std::move(single_use),
@@ -222,7 +222,9 @@ RetainedRuntimeBackendFactory make_retained_ros2_control_backend_factory(
           // The pneumatic backend never calls this authoritative sink; its
           // concrete display callback below uses the separate render cache.
           if (selected.gripper->actuation_kind == core::GripperActuationKind::kPneumatic) {
-            const std::weak_ptr<RetainedRos2ControlRuntimeHandle> owner = runtime_handle;
+            // Gripper callbacks run on the handle's executor: internal lease.
+            const std::weak_ptr<RetainedRos2ControlRuntimeHandle> owner =
+                runtime_handle->weak_from_this();
             selected.gripper->publish_display_position = [owner](const double position) {
               const auto current = owner.lock();
               return current ? current->PublishGripperDisplayPosition(position)
@@ -377,7 +379,9 @@ make_retained_ros2_control_gripper_backend(
   // paths never publish through it; they use the display callback only.
   std::vector<RetainedExecutionStateSinkBinding> sinks{{group, channel, true}};
   if (pneumatic) {
-    const std::weak_ptr<RetainedRos2ControlRuntimeHandle> owner = handle;
+    // Gripper callbacks run on the handle's executor: internal lease.
+    const std::weak_ptr<RetainedRos2ControlRuntimeHandle> owner =
+        handle->weak_from_this();
     config.gripper->publish_display_position = [owner](const double position) {
       const auto current = owner.lock();
       return current ? current->PublishGripperDisplayPosition(position)

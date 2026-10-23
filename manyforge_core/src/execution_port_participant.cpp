@@ -1,6 +1,7 @@
 #include <algorithm>
 #include <cmath>
 #include <cstdio>
+#include <limits>
 #include <manyforge_core/execution_port_participant.hpp>
 #include <manyforge_core/execution_sample_association.hpp>
 #include <manyforge_core/motion_interrupt/stop_replacement.hpp>
@@ -88,7 +89,8 @@ bool same_replacement_source(const PreparedMotionReplacementSourceDTO& a,
   return a.execution_id == b.execution_id && a.execution_generation == b.execution_generation &&
          a.goal == b.goal && a.binding_epoch == b.binding_epoch &&
          a.prepared_contract_digest == b.prepared_contract_digest &&
-         a.controller_sample == b.controller_sample && x.sequence == y.sequence &&
+         a.controller_sample == b.controller_sample &&
+         a.controller_period_ns == b.controller_period_ns && x.sequence == y.sequence &&
          x.execution_generation == y.execution_generation &&
          x.trajectory_time_ns == y.trajectory_time_ns && x.source_kind == y.source_kind &&
          x.authority_profile == y.authority_profile &&
@@ -445,6 +447,11 @@ Result<PreparedMotionReplacementSourceDTO> ExecutionPortParticipant::CaptureRepl
   PreparedMotionReplacementSourceDTO source{
       execution_id, generation, goal, execution_ ? execution_->epoch : ExecutionBindingEpoch{0U},
       digest,       {},         {}};
+  const double period_ns = lane_.controller_update_rate_hz > 0.0
+                               ? 1e9 / lane_.controller_update_rate_hz : 0.0;
+  if (lane_.supports_scheduled_replacement && std::isfinite(period_ns) && period_ns >= 1.0 &&
+      period_ns < static_cast<double>(std::numeric_limits<std::int64_t>::max()))
+    source.controller_period_ns = static_cast<std::int64_t>(period_ns);
   if (!SourceMatchesLocked(source) || execution_->terminal || execution_->stopping ||
       execution_->critical_fault || stop_stages_in_flight_ != 0U ||
       helper_->HasPendingReplacement() || !execution_->published_progress_sample)
@@ -659,36 +666,46 @@ PreparedMotionReplacementDispatchDTO ExecutionPortParticipant::DispatchReplaceme
                std::move(details))},
         std::nullopt};
   };
-  std::lock_guard lock(mutex_);
-  if (!replacement_ || replacement_->candidate_id != candidate_id ||
-      !same_replacement_source(replacement_->source, source) ||
-      !(prepared_membership_.replacement_matches(candidate_id, participant) ||
-        (prepared_membership_.active_execution_id() == candidate_id &&
-         prepared_membership_.matches(participant))))
-    return reject("motion_replacement_membership_changed");
-  if (replacement_->command) {
-    const auto& replay_goal = prepared_membership_.active_execution_id() == candidate_id
-                                  ? prepared_goal_
-                                  : replacement_->prepared_goal;
-    if (!replay_goal || replay_goal->goal_id != successor.controller_goal_id ||
-        replay_goal->generation != successor.controller_goal_generation)
-      return reject("motion_replacement_goal_conflict");
-    return {*replacement_->command, replay_goal->handle, replacement_->submitted_at_ns};
-  }
-  if (!SourceMatchesLocked(source) || execution_->terminal || execution_->stopping ||
-      execution_->critical_fault || stop_stages_in_flight_ != 0U || successor == source.goal ||
-      successor.controller_goal_id.empty() || !successor.controller_goal_generation.nonzero() ||
-      !config_.stop.replacement_start_allowance_s)
-    return reject("motion_replacement_source_changed");
+  std::unique_lock lock(mutex_);
+  // The existing dispatch decision (membership, replay / goal conflict,
+  // source). The experimental release timer reruns it after its unlocked wait.
+  const auto guards = [&]() -> std::optional<PreparedMotionReplacementDispatchDTO> {
+    if (!replacement_ || replacement_->candidate_id != candidate_id ||
+        !same_replacement_source(replacement_->source, source) ||
+        !(prepared_membership_.replacement_matches(candidate_id, participant) ||
+          (prepared_membership_.active_execution_id() == candidate_id &&
+           prepared_membership_.matches(participant))))
+      return reject("motion_replacement_membership_changed");
+    if (replacement_->command) {
+      const auto& replay_goal = prepared_membership_.active_execution_id() == candidate_id
+                                    ? prepared_goal_
+                                    : replacement_->prepared_goal;
+      if (!replay_goal || replay_goal->goal_id != successor.controller_goal_id ||
+          replay_goal->generation != successor.controller_goal_generation)
+        return reject("motion_replacement_goal_conflict");
+      return PreparedMotionReplacementDispatchDTO{*replacement_->command, replay_goal->handle,
+                                                  replacement_->submitted_at_ns};
+    }
+    if (!SourceMatchesLocked(source) || execution_->terminal || execution_->stopping ||
+        execution_->critical_fault || stop_stages_in_flight_ != 0U || successor == source.goal ||
+        successor.controller_goal_id.empty() || !successor.controller_goal_generation.nonzero() ||
+        !config_.stop.replacement_start_allowance_s)
+      return reject("motion_replacement_source_changed");
+    return std::nullopt;
+  };
+  if (auto decided = guards()) return std::move(*decided);
   auto& pending = *replacement_;
   auto candidate = pending.execution;
   // Stage the goal/handle and failure receipt before choosing the actual join
   // origin. None of these allocations consumes unaccounted source lead.
-  candidate->key = successor;
-  candidate->snapshot.state = ExecutionState::kExecuting;
-  candidate->snapshot.state_source = "execution_port";
-  pending.record_key = successor;
-  pending.stop_goal->key = successor;
+  const auto stage_keys = [&] {
+    candidate->key = successor;
+    candidate->snapshot.state = ExecutionState::kExecuting;
+    candidate->snapshot.state_source = "execution_port";
+    pending.record_key = successor;
+    pending.stop_goal->key = successor;
+  };
+  stage_keys();
   ExecutionHandle handle{
       [this, candidate](std::int64_t timeout) { return WaitForCompletion(candidate, timeout); },
       [this, candidate] {
@@ -791,7 +808,7 @@ PreparedMotionReplacementDispatchDTO ExecutionPortParticipant::DispatchReplaceme
   // Scheduled lanes pair the header with the SAME estimated source origin.
   // Moving takeover retains its existing instantaneous-factor extrapolation;
   // a compatible evolving ramp is not frozen or newly refused here.
-  const auto start = compute_stop_replacement_start(
+  auto start = compute_stop_replacement_start(
       {original_path_cursor(execution_->delivery_clock, baseline->cursor_s),
        lane_.supports_scale ? baseline->applied_factor.value_or(-1.0) : 1.0,
        static_cast<double>(join_started_at - baseline->local_receipt_stamp_ns) / 1e9,
@@ -799,27 +816,55 @@ PreparedMotionReplacementDispatchDTO ExecutionPortParticipant::DispatchReplaceme
       *baseline, lane_);
   if (!start.ok()) return reject("motion_replacement_delivery_lead_expired");
   const auto elapsed = start.value().elapsed_path_s;
-  candidate->association =
-      std::make_shared<ExecutionSampleAssociation>(source.binding_epoch, baseline, join_started_at);
   auto delivery =
       build_stop_replacement_join(execution_->trajectory, elapsed, candidate->trajectory,
                                   pending.source_cursor_s, pending.divergence_cursor_s);
+  // EXPERIMENTAL (MANYFORGE_EXPERIMENTAL_V0_PAYLOAD): no negative-time prefix.
+  if (delivery.ok() && start.value().scheduled && start.value().scheduled->experiment &&
+      start.value().scheduled->experiment->v0_payload)
+    delivery = stop_replacement_v0_payload(delivery.value());
   if (!delivery.ok()) return reject("motion_replacement_delivery_join_failed");
-  // The resident-timeline controller keeps its clock origin for every such
-  // message, at any factor (0 included).
-  const bool resident_timeline = lane_.supports_resident_timeline_replacement;
-  std::optional<TrajectoryDTO> resident_wire;
-  if (resident_timeline) {
-    auto resident = build_resident_timeline_replacement(
-        delivery.value(), elapsed, execution_->delivery_clock.elapsed_s, baseline->cursor_s);
-    if (!resident.ok()) return reject("motion_replacement_delivery_join_failed");
-    delivery.value() = std::move(resident.value().resident_trajectory);
-    resident_wire = std::move(resident.value().delivery_trajectory);
-    candidate->delivery_clock.elapsed_s =
-        execution_->delivery_clock.elapsed_s - pending.source_cursor_s;
-  } else {
-    candidate->delivery_clock.elapsed_s = elapsed - pending.source_cursor_s;
+  // EXPERIMENTAL release timer: wait WITHOUT the participant lock, before
+  // anything of this attempt is committed to the pending replacement. Then the
+  // existing decision runs again (a Stop, retirement or a duplicate dispatch
+  // that already sent wins, the latter as a replay), the pending state is
+  // rebound by identity, and every existing check below runs at the actual
+  // send. `join_started_at` stays before the wait, so the allowance and the
+  // preparation deadline charge for it. The timer may charge one nominal
+  // period for grid rounding; every other source and deadline check stays.
+  auto join_allowance_s = *config_.stop.replacement_start_allowance_s;
+  auto allowance_ns =
+      static_cast<TimePoint>(std::floor(*config_.stop.replacement_start_allowance_s * 1e9));
+  if (start.value().scheduled && start.value().scheduled->experiment &&
+      start.value().scheduled->experiment->release_local_ns) {
+    // compute_stop_replacement_start already validated this positive period.
+    const auto period_ns = static_cast<TimePoint>(1e9 / lane_.controller_update_rate_hz);
+    if (allowance_ns > INT64_MAX - period_ns ||
+        join_started_at > INT64_MAX - allowance_ns - period_ns)
+      return reject("motion_replacement_delivery_lead_expired");
+    allowance_ns += period_ns;
+    join_allowance_s += static_cast<double>(period_ns) / 1e9;
   }
+  if (const auto until = plan_replacement_release(
+          start.value(), clock_,
+          std::min(join_started_at + allowance_ns, preparation_deadline_ns - 1))) {
+    const auto* const staged = replacement_.get();
+    lock.unlock();
+    while (clock_.now() < *until) waiter_(*until, std::stop_token{});
+    lock.lock();
+    if (auto decided = guards()) return std::move(*decided);
+    if (replacement_.get() != staged || replacement_->execution != candidate)
+      return reject("motion_replacement_membership_changed");
+    // Another attempt (any successor) may have staged its keys and handle
+    // meanwhile; this attempt sends, so its own staging is restored.
+    stage_keys();
+    pending.prepared_goal = PreparedGoalRecord{successor.controller_goal_id,
+                                               successor.controller_goal_generation,
+                                               participant.prepared_contract_digest, handle};
+  }
+  candidate->association =
+      std::make_shared<ExecutionSampleAssociation>(source.binding_epoch, baseline, join_started_at);
+  candidate->delivery_clock.elapsed_s = elapsed - pending.source_cursor_s;
   // Only the delivery origin changes; canonical product/evidence stays intact.
   delivery.value().runtime_scale_bounds = candidate->trajectory.runtime_scale_bounds;
   delivery.value().cartesian_fidelity_metrics = candidate->trajectory.cartesian_fidelity_metrics;
@@ -828,6 +873,7 @@ PreparedMotionReplacementDispatchDTO ExecutionPortParticipant::DispatchReplaceme
     milestone -= candidate->delivery_clock.elapsed_s;
   pending.record_trajectory = std::move(delivery.value());
   pending.stop_goal->trajectory = pending.record_trajectory;
+  pending.stop_goal->planned_controller_offset_s = start.value().controller_offset_s;
   if (config_.observe_goal_context) {
     try { config_.observe_goal_context(successor, participant, source.binding_epoch); } catch (...) {}
   }
@@ -853,12 +899,12 @@ PreparedMotionReplacementDispatchDTO ExecutionPortParticipant::DispatchReplaceme
       return reject("motion_replacement_recognition_window_invalid");
     pending.recognition_budget_ns = static_cast<std::int64_t>(association_window_ns);
   }
-  // Bound remaining join/copy/proof work using the EXISTING lane allowance.
+  // Bound join/copy/proof work by the same allowance used for the timer hold.
   // This preserves the chosen join estimate; it is not zero-latency proof or
   // an additional allowance for controller delivery.
   const auto submitted_at = clock_.now();
   if (submitted_at < join_started_at || static_cast<double>(submitted_at - join_started_at) / 1e9 >
-                                            *config_.stop.replacement_start_allowance_s)
+                                            join_allowance_s)
     return reject("motion_replacement_join_origin_expired");
   if (submitted_at >= preparation_deadline_ns)
     return reject("motion_replacement_preparation_deadline_expired");
@@ -866,17 +912,15 @@ PreparedMotionReplacementDispatchDTO ExecutionPortParticipant::DispatchReplaceme
   ExecutionPortCommandResultDTO command;
   try {
     command = start.value().scheduled
-                  ? port_->ReplaceScheduled(source.goal, successor,
-                                            resident_wire ? *resident_wire : pending.record_trajectory,
+                  ? port_->ReplaceScheduled(source.goal, successor, pending.record_trajectory,
                                              *start.value().scheduled)
-                  : port_->Replace(source.goal, successor,
-                                   resident_wire ? *resident_wire : pending.record_trajectory);
+                  : port_->Replace(source.goal, successor, pending.record_trajectory);
   } catch (...) {
     command = std::move(uncertain);
   }
   if (command.dispatch != ExecutionPortDispatch::kNotDispatched) {
     helper_->RecordReplacement(std::move(pending.record_key), std::move(pending.record_trajectory),
-                               candidate->association);
+                               candidate->association, pending.stop_goal->planned_controller_offset_s);
     pending.submitted_at_ns = submitted_at;
   }
   // The possible effect is already in sent_ before any reply copy can fail.
@@ -1758,6 +1802,9 @@ ParticipantStopStageResultDTO ExecutionPortParticipant::TranslateStopStageForTak
 ParticipantStopStageResultDTO ExecutionPortParticipant::TranslateStopStageImpl(
     const ResolvedParticipantStopStageDTO& stage, const RemainingStopBudgetDTO& budget,
     std::stop_token cancellation, IStopStageSpringReturnObserver* observer) {
+  const auto received_at = clock_.now();
+  // Copy before participant state changes: allocation failure has no effect.
+  auto timed_budget = budget;
   std::shared_ptr<ParticipantStopStageHelper> helper;
   std::shared_ptr<Execution> execution;
   {
@@ -1785,7 +1832,9 @@ ParticipantStopStageResultDTO ExecutionPortParticipant::TranslateStopStageImpl(
               !std::isfinite(point.initial.command_path_time_s))
             return false;
           canonical =
-              original_path_cursor(source_->delivery_clock, point.initial.command_path_time_s);
+              original_path_cursor(source_->delivery_clock,
+                  point.initial.spring_back_return_path_time_s.value_or(
+                      point.initial.command_path_time_s));
         }
         if (!std::isfinite(canonical)) return false;
         auto qualified = point;
@@ -1803,9 +1852,16 @@ ParticipantStopStageResultDTO ExecutionPortParticipant::TranslateStopStageImpl(
     std::shared_ptr<Execution> source_;
     IStopStageSpringReturnObserver* receiver_;
   } qualified_observer(*this, execution, observer);
-  auto result = observer ? helper->TranslateStopStageForTakeover(stage, budget, cancellation,
+  if (timed_budget.stop_ingress_age_ns && *timed_budget.stop_ingress_age_ns >= 0 &&
+      *timed_budget.stop_ingress_age_ns <= kMaximumStopDurationNs) {
+    // Saturate to an invalid age rather than overflow on malformed timing.
+    *timed_budget.stop_ingress_age_ns += std::min<Duration>(
+        std::max<Duration>(0, clock_.now() - received_at),
+        kMaximumStopDurationNs + 1 - *timed_budget.stop_ingress_age_ns);
+  }
+  auto result = observer ? helper->TranslateStopStageForTakeover(stage, timed_budget, cancellation,
                                                                  qualified_observer)
-                         : helper->TranslateStopStage(stage, budget, cancellation);
+                         : helper->TranslateStopStage(stage, timed_budget, cancellation);
   std::lock_guard lock(mutex_);
   if (replacement_ && prepared_membership_.active_execution_id() != replacement_->candidate_id &&
       result.outcome == ParticipantStopStageOutcomeDTO::kSucceeded) {

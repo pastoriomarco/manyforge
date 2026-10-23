@@ -7,6 +7,7 @@
 #include "host_io_signal_runtime.hpp"
 #include "io_provider_lifecycle_product.hpp"
 #include "program_reset_position_observation.hpp"
+#include "simulated_plc_readiness.hpp"
 #include <manyforge_core/io_provider_lifecycle_catalog.hpp>
 #include <manyforge_deployment/execution_runtime_contract.hpp>
 
@@ -96,6 +97,7 @@
 #include <manyforge_roboplan/retained_native_runtime.hpp>
 #include <manyforge_roboplan/controller_launch_artifacts.hpp>
 #include <manyforge_roboplan/controller_launch_process.hpp>
+#include <manyforge_roboplan/simulated_plc_launch.hpp>
 #include <manyforge_roboplan/retained_isaac_ros2_control_profile.hpp>
 #include "managed_ros2_component_installation.hpp"
 #include <manyforge_roboplan/retained_ros2_control_lifecycle_product.hpp>
@@ -147,6 +149,7 @@
 #include "native_projection_rpc_internal.hpp"
 #include "owner_settlement_readers.hpp"
 #include "product_backed_runtime_participant_resolver.hpp"
+#include "retained_native_runtime_internal.hpp"
 #include "selected_runtime_composition_rpc_internal.hpp"
 #include <manyforge_component_manager/kernel_cell_admission_rpc_internal.hpp>
 #include <manyforge_core/ports/ikernel_cell_admission_port.hpp>
@@ -2027,6 +2030,7 @@ struct CompositionBuildInput final {
   std::optional<detail::SelectedProgramProducts> selected_program_products{};
   ros2_control_execution::Ros2TransportResources::ContextProvider ros_context_provider{};
   std::shared_ptr<ros2_control_execution::VolatileMotionTrace> motion_trace{};
+  std::vector<core::RuntimeRouteConfigurationReadbackDTO> retained_routes{};
 };
 
 [[nodiscard]] core::CellAdmissionSettlementValidator
@@ -2183,7 +2187,9 @@ struct NativePhysicalBindingSet final {
 template <typename PhysicalBindingInput>
 [[nodiscard]] NativePhysicalBindingSet ResolveNativePhysicalBindings(
     const PhysicalBindingInput &input,
-    const deployment::DirectControlProgramBindingInventory &inventory) {
+    const deployment::DirectControlProgramBindingInventory &inventory,
+    std::span<const core::RuntimeRouteConfigurationReadbackDTO> retained_routes =
+        {}) {
   const auto select_optional_binding =
       [&](const auto &bindings, const std::string_view capability_id) {
         std::shared_ptr<const deployment::ProgramBinding> selected;
@@ -2408,6 +2414,33 @@ template <typename PhysicalBindingInput>
         std::make_move_iterator(gripper_representatives.begin()),
         std::make_move_iterator(gripper_representatives.end()));
   }
+  const auto rebase_retained = [&](core::RuntimeParticipantBinding &binding) {
+    if (!binding.value().control_path.has_value())
+      return;
+    const auto &path = *binding.value().control_path;
+    const auto retained = std::find_if(
+        retained_routes.begin(), retained_routes.end(), [&](const auto &row) {
+          return row.active_configuration.control_domain_id ==
+                 path.control_domain_id;
+        });
+    if (retained == retained_routes.end())
+      return;
+    Require(retained->active_configuration.source_runtime_epoch ==
+                path.provider_runtime_epoch,
+            "retained native candidate route crosses its provider epoch");
+    auto rebound = detail::rebase_runtime_binding_to_predecessor(
+        binding, retained->active_configuration);
+    if (!rebound.ok())
+      Fail("retained native candidate route cannot be rebased: " +
+           rebound.error().message);
+    binding = std::move(rebound.value());
+  };
+  if (motion.has_value())
+    rebase_retained(*motion);
+  if (gripper.has_value())
+    rebase_retained(*gripper);
+  for (auto &representative : representatives)
+    rebase_retained(representative);
   std::sort(representatives.begin(), representatives.end(),
             [](const auto &left, const auto &right) {
       return left.value().control_path->control_binding_id <
@@ -2475,9 +2508,14 @@ ResealRetainedNativeCandidateRegistrations(
           core::rebind_runtime_participant_stop_readiness_product(
               *old->stop_readiness, old->binding, binding,
               expected.sealed());
-      if (!readiness.ok())
+      if (!readiness.ok()) {
+        const auto reason = readiness.error().details.find("reason");
         Fail("retained native Stop readiness cannot be re-sealed: " +
-             readiness.error().message);
+             readiness.error().message +
+             (reason == readiness.error().details.end()
+                  ? std::string{}
+                  : " [reason=" + reason->second + "]"));
+      }
       registration.stop_readiness = std::move(readiness.value());
     }
     result.push_back(std::move(registration));
@@ -2562,7 +2600,8 @@ BuildRetainedProductComposition(CompositionBuildInput input) {
     const auto inventory =
         deployment::compile_direct_control_program_binding_inventory(
             *input.bundle, input.model_map, catalog_store);
-    auto physical = ResolveNativePhysicalBindings(input, inventory);
+    auto physical = ResolveNativePhysicalBindings(
+        input, inventory, input.retained_routes);
     Require(!physical.motion.has_value() && physical.gripper.has_value() &&
                 physical.gripper_program != nullptr &&
                 retained_bindings_share_backend_owner(
@@ -2689,7 +2728,8 @@ BuildRetainedProductComposition(CompositionBuildInput input) {
   const auto inventory =
       deployment::compile_direct_control_program_binding_inventory(
           *input.bundle, input.model_map, catalog_store);
-  auto physical = ResolveNativePhysicalBindings(input, inventory);
+  auto physical = ResolveNativePhysicalBindings(
+      input, inventory, input.retained_routes);
   Require(physical.motion.has_value() &&
               physical.status_motion_role.has_value() &&
               physical.gripper.has_value() ==
@@ -2973,7 +3013,7 @@ BuildGripperOnlyProductComposition(CompositionBuildInput input, NativePhysicalBi
     owned_launch.receipt = &*launch;
     acquired_guard.receipt = nullptr;
   }
-  auto handle = std::make_shared<RetainedRos2ControlRuntimeHandle>();
+  auto handle = RetainedRos2ControlRuntimeHandle::Create();
   if (launch) handle->InstallControllerProcessFaultSource(
       ControllerLaunchSupervisor::fault_source(launch->process, CachedControllerLaunchReadinessSource(handle)),
       [process = launch->process] { return core::Result<std::optional<std::string>>::Ok(
@@ -3679,7 +3719,7 @@ BuildSingleProductComposition(CompositionBuildInput input) {
     }
   }
   auto ros2_control_runtime_handle =
-      std::make_shared<RetainedRos2ControlRuntimeHandle>();
+      RetainedRos2ControlRuntimeHandle::Create();
   if (controller_process != nullptr) {
     ros2_control_runtime_handle->InstallControllerProcessFaultSource(
         ControllerLaunchSupervisor::fault_source(
@@ -3987,6 +4027,101 @@ BuildSingleProductComposition(CompositionBuildInput input) {
   return composition;
 }
 
+// The simulated PLC plan `bundle` authors for `component`: its unit's mode
+// and its own I/O rows (ROS-free selection in plan_simulated_plc).
+[[nodiscard]] std::optional<SimulatedPlcPlan> SimulatedPlcPlanFor(
+    const deployment::RetainedBundle &bundle,
+    const std::vector<deployment::RetainedIoSignalConfiguration> &io_rows,
+    const core::ControllableComponentId &component) {
+  std::vector<SimulatedPlcRow> rows;
+  std::optional<core::RuntimeUnitId> unit_id;
+  for (const auto &row : io_rows) {
+    if (row.descriptor.signal_id.controllable_component_id != component)
+      continue;
+    if (!unit_id) unit_id = row.runtime_unit_id;
+    if (row.runtime_unit_id != *unit_id) return std::nullopt;
+    rows.push_back({row.provider.profile, row.provider.topic,
+                    row.provider.service});
+  }
+  if (!unit_id) return std::nullopt;
+  std::string mode;
+  for (const auto &unit : bundle.value().cell_graph.runtime_units) {
+    if (unit.runtime_unit_id != *unit_id) continue;
+    const auto found = unit.configuration.find("mode");
+    if (found == unit.configuration.end()) continue;
+    if (const auto *text = std::get_if<std::string>(&found->second.value))
+      mode = *text;
+  }
+  return plan_simulated_plc(mode, component.value(), rows,
+                            simulated_plc_config_dir_from_environment());
+}
+
+// D4 (keep like external hardware): a rebuilt device keeps its running PLC
+// process when the candidate's launch identity is unchanged.
+[[nodiscard]] bool SimulatedPlcSurvivesRebuild(
+    const std::shared_ptr<ControllerLaunchProcess> &process,
+    const deployment::RetainedBundle &candidate,
+    const core::ControllableComponentId &component) {
+  if (!process || process->command().lane != ControllerLaunchLane::kSimulatedPlc)
+    return false;
+  const auto rows = deployment::ResolveRetainedIoSignalCatalog(candidate.value().cell_graph);
+  return rows.ok() && simulated_plc_launch_survives(
+      process.get(), SimulatedPlcPlanFor(candidate, rows.value(), component));
+}
+
+// sim-plc-peer-design-02/03 §4: a pure generic ROS I/O device in a
+// `commanded_sim` unit gets a Manager-owned simulated PLC process, started
+// before Prepare by the same supervisor as the mock robot. Equal launch
+// identity keeps it (and its values); a changed one restarts it; its exit is
+// the device's component fault; removal/Close retire it via controller_process.
+// `installed_process` is set when the drivers are borrowed from the exact
+// retained installed owner: that owner's PLC must be kept unchanged.
+void EnsureSimulatedPlc(
+    Composition &view, const deployment::RetainedBundle &bundle,
+    const std::vector<deployment::RetainedIoSignalConfiguration> &io_rows,
+    const ros2_control_execution::Ros2TransportResources::ContextProvider
+        &ros_context,
+    const std::filesystem::path &execution_run_root,
+    const std::string &request_context, const std::string &bootstrap_context,
+    const bool borrowed_drivers,
+    const std::shared_ptr<ControllerLaunchProcess> &installed_process) {
+  if (view.runtime || view.gripper_runtime || !view.io_provider_drivers ||
+      view.io_provider_drivers->empty())
+    return;
+  const auto plan =
+      SimulatedPlcPlanFor(bundle, io_rows, view.controllable_component_id);
+  if (!plan) return;
+  Require(static_cast<bool>(ros_context),
+          "simulated_plc_not_ready: device=" + plan->device_id +
+              " has no host ROS context");
+  const auto artifacts_root =
+      execution_run_root / "controller-launch-artifacts" / plan->device_id;
+  std::filesystem::create_directories(artifacts_root);
+  const auto ensured = host_detail::StartSimulatedPlcCandidate(
+      host_controller_launch_supervisor(), *plan, artifacts_root,
+      request_context.empty() ? bootstrap_context : request_context,
+      *view.io_provider_drivers, borrowed_drivers, installed_process,
+      [&](const std::shared_ptr<ControllerLaunchProcess> &process) {
+        return host_detail::WaitForSimulatedPlcEndpoints(
+            ros_context(), *plan, std::chrono::seconds(5),
+            [process] { return process->exited().has_value(); });
+      });
+  // A later build failure's ~Composition discards a fresh start; a kept
+  // (borrowed) process is never discarded by this candidate.
+  view.controller_process = ensured.process;
+  view.controller_request_context = request_context;
+  view.prepared_controller_launch = ensured;
+  std::cerr << "manyforge simulated PLC launch: component=" << plan->device_id
+            << " decision="
+            << (ensured.decision == ControllerLaunchDecision::kKeep
+                    ? "kept"
+                    : ensured.decision == ControllerLaunchDecision::kStart
+                          ? "started"
+                          : "restarted")
+            << " pid=" << ensured.process->pid()
+            << " config_dir=" << plan->config_dir.string() << std::endl;
+}
+
 [[nodiscard]] std::unique_ptr<Composition>
 BuildProductComposition(CompositionBuildInput input) {
   if (input.managed_component_delta.has_value()) {
@@ -4040,7 +4175,10 @@ BuildProductComposition(CompositionBuildInput input) {
       epoch = input.runtime_epoch, snapshots = input.retained_component_snapshots,
       io_rows = io_catalog.value(), io_component_ids, make_io_view,
       origin = input.origin_named_apply,
-      selected_program = input.selected_program_products](std::unique_ptr<Composition> composition) {
+      selected_program = input.selected_program_products,
+      ros_context = input.ros_context_provider,
+      run_root = input.execution_run_root,
+      request_context = input.controller_request_context](std::unique_ptr<Composition> composition) {
     composition->origin_named_apply = origin;
     if (selected_program) {
       composition->program = selected_program->program;
@@ -4118,6 +4256,12 @@ BuildProductComposition(CompositionBuildInput input) {
         view->component_runtime_pins = std::make_shared<const ComponentRuntimePins>(
             ComponentRuntimePins{view->runtime, view->gripper_runtime, view->io_provider_drivers});
       }
+      EnsureSimulatedPlc(*view, *bundle, io_rows, ros_context, run_root,
+          request_context, "Bootstrap runtime=" +
+              (runtime_unit ? runtime_unit->value() : std::string("unmanaged")) +
+              " epoch=" + epoch.value(),
+          previous != snapshots.end(),
+          previous != snapshots.end() ? previous->second.controller_process : nullptr);
     }
     return composition;
   };
@@ -10816,12 +10960,12 @@ RunManagedRuntimeChild(const ManagedRuntimeChildConfig &config) {
                 !owner->io_provider_drivers->empty() &&
                 std::all_of(owner->io_provider_drivers->begin(), owner->io_provider_drivers->end(),
                     [](const auto& driver) { return driver && driver->resources_installed(); });
-            const bool owned_launch_live = !owns_physical || (owner->controller_process
-                ? !owner->controller_process->exited() &&
-                      owner->controller_process->cleanup_observation().state ==
-                          ControllerLaunchCleanupState::kNotRequested
-                : IsLocalNoOutputGripperOwner(*owner));
-            if (wanted == installed && owned_launch_live && (!owns_io || owned_io_live)) {
+            // A dead simulated PLC (pure I/O owner) is not a keeper either:
+            // its component is rebuilt and the PLC restarted by this Apply.
+            const bool launch_live = owned_launch_live(
+                owner->controller_process.get(), owns_physical,
+                IsLocalNoOutputGripperOwner(*owner));
+            if (wanted == installed && launch_live && (!owns_io || owned_io_live)) {
               const auto [existing, inserted] =
                   actual_keepers.emplace(id, owner);
               Require(inserted ||
@@ -10874,7 +11018,9 @@ RunManagedRuntimeChild(const ManagedRuntimeChildConfig &config) {
                     "actual_installed_state_unknown: actual process retirement "
                     "is outside the accepted fence scope");
             if (owner->controller_process &&
-                included_processes.insert(owner->controller_process.get()).second)
+                included_processes.insert(owner->controller_process.get()).second &&
+                !SimulatedPlcSurvivesRebuild(owner->controller_process,
+                                             *actual_candidate->bundle, id))
               processes_to_retire.push_back(owner->controller_process);
           }
         preparing_composition_request = request;
@@ -11024,6 +11170,8 @@ RunManagedRuntimeChild(const ManagedRuntimeChildConfig &config) {
                     if (!recorded.ok())
                       Fail("managed CCLC could not record Apply before preparation: " +
                            recorded.error().message);
+                    if (input)
+                      input->retained_routes = std::move(retained_routes);
                     if (linked_children) {
                       Require(recorded.value().component_bring_up == linked_children,
                               "managed Apply plan differs from its actual accepted child receipts");

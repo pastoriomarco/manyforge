@@ -3937,23 +3937,10 @@ void ExecutionCommandSurface::HandleOneClient(const CommandSocket &socket, const
                     "Stop status and Stop-fault reads are served by the "
                     "independent Stop control socket");
               } else if (command.kind == CommandKind::kReadVolatileMotionTrace) {
-#if defined(MANYFORGE_ROS2_CONTROL_EXECUTION_HOST)
-                const auto trace = composition_access_.motion_trace;
-                auto snapshot = trace
-                    ? trace->Snapshot(owner_epoch_, command.trace_allowance_bytes)
-                    : core::Result<CanonicalValue>::Err({"volatile_motion_trace_unavailable",
-                        "this execution host has no volatile trace collector", {}});
-                response = snapshot.ok()
-                    ? CanonicalValue(CanonicalValue::Object{
-                        {"api_version", CanonicalValue(std::string(kResponseApiVersion))},
-                        {"command", CanonicalValue("read_volatile_motion_trace")},
-                        {"ok", CanonicalValue(true)}, {"trace", std::move(snapshot.value())}})
-                    : ErrorResponse(snapshot.error().code, snapshot.error().message,
-                                    snapshot.error().details);
-#else
-                response = ErrorResponse("volatile_motion_trace_unavailable",
-                    "this execution host has no ROS trajectory collector");
-#endif
+                if (ordinary)
+                  deferred.emplace(&scene_read_lane_, command);
+                else
+                  response = ReadVolatileMotionTrace(command);
               } else if (command.kind == CommandKind::kEvents) {
                 response = EventsResponse(command);
               } else if (command.kind == CommandKind::kRecoverStopFault &&
@@ -4169,9 +4156,37 @@ void ExecutionCommandSurface::SendResponse(
     }
   }
 
+CanonicalValue ExecutionCommandSurface::ReadVolatileMotionTrace(const Command &command) const {
+#if defined(MANYFORGE_ROS2_CONTROL_EXECUTION_HOST)
+    const auto trace = composition_access_.motion_trace;
+    const auto *directory = std::getenv("MANYFORGE_MOTION_TRACE_DIR");
+    const bool disk = directory && *directory;
+    auto snapshot = trace
+        ? disk ? trace->SnapshotFile(owner_epoch_, command.trace_allowance_bytes, directory)
+               : trace->Snapshot(owner_epoch_, command.trace_allowance_bytes)
+        : core::Result<CanonicalValue>::Err({"volatile_motion_trace_unavailable",
+            "this execution host has no volatile trace collector", {}});
+    return snapshot.ok()
+        ? CanonicalValue(CanonicalValue::Object{
+            {"api_version", CanonicalValue(std::string(kResponseApiVersion))},
+            {"command", CanonicalValue("read_volatile_motion_trace")},
+            {"ok", CanonicalValue(true)},
+            {disk ? "trace_file" : "trace", std::move(snapshot.value())}})
+        : ErrorResponse(snapshot.error().code, snapshot.error().message,
+                        snapshot.error().details);
+#else
+    (void)command;
+    return ErrorResponse("volatile_motion_trace_unavailable",
+        "this execution host has no ROS trajectory collector");
+#endif
+  }
+
 [[nodiscard]] CanonicalValue
   ExecutionCommandSurface::DeferredResponse(const Command &command, const std::stop_token cancellation,
                    const std::stop_token lane_stop_token) {
+    // Diagnostic encoding and disk I/O never retain a composition or command lock.
+    if (command.kind == CommandKind::kReadVolatileMotionTrace)
+      return ReadVolatileMotionTrace(command);
     std::shared_lock composition_lock(composition_access_.mutex);
     if (composition_access_.product() == nullptr)
       return OwnerNotReadyResponse(command);

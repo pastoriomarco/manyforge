@@ -61,6 +61,12 @@ struct RemainingStopBudgetDTO final {
   /// participant bounds them with its lane's stop-completion timeout) and for
   /// fire-and-forget gripper cancels (Q58).
   std::optional<std::int64_t> remaining_controlled_deadline_ns;
+  /// Return-target timing only: age of original Kernel Stop ingress, captured
+  /// after the executor queue. Relative duration, never a cross-clock stamp.
+  /// Absent on legacy/direct callers; does not change any deadline budget.
+  /// Transient worker/receiver copy only, not the Kernel's retained budget.
+  /// Target provenance is emitted in provider diagnostics, not Stop journal timing.
+  std::optional<std::int64_t> stop_ingress_age_ns{};
 
   friend bool operator==(const RemainingStopBudgetDTO&, const RemainingStopBudgetDTO&) = default;
 };

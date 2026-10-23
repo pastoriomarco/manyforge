@@ -1251,14 +1251,6 @@ std::optional<std::string_view> stop_accepted_field_error(
                    })) {
     return "stop_accepted_predecessors_invalid";
   }
-  if (!accepted.joined_predecessor_stops.empty() &&
-      accepted.resolution_disposition != StopResolutionDispositionDTO::kPromotedToFull &&
-      !((accepted.resolution_disposition == StopResolutionDispositionDTO::kExact ||
-         accepted.resolution_disposition ==
-             StopResolutionDispositionDTO::kStaleButUnambiguouslyResolved) &&
-        accepted.resolution_reason == StopScopeResolutionReasonDTO::kExplicitFullStop)) {
-    return "stop_accepted_predecessor_resolution_invalid";
-  }
   if (accepted.resolution_disposition == StopResolutionDispositionDTO::kAlreadyTerminalNoEffect &&
       !accepted.affected_operation_revisions.empty()) {
     return "stop_accepted_no_effect_operation_revision_present";

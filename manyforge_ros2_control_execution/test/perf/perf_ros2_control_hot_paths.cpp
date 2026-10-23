@@ -235,7 +235,7 @@ struct IdleRig {
   std::atomic<std::size_t> observer_updates{0};
   std::atomic<std::uint64_t> observed_epoch{0}, observed_receipt{0};
   std::shared_ptr<runtime::RetainedRos2ControlRuntimeHandle> handle =
-      std::make_shared<runtime::RetainedRos2ControlRuntimeHandle>();
+      runtime::RetainedRos2ControlRuntimeHandle::Create();
 
   IdleRig() {
     runtime::RetainedRos2ControlArmTransport arm;

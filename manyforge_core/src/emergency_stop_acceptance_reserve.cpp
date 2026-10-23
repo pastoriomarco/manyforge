@@ -134,16 +134,11 @@ EmergencyStopAcceptanceReserve::EmergencyStopAcceptanceReserve(std::size_t corre
   }
 }
 
-EmergencyStopAcceptanceOutcome EmergencyStopAcceptanceReserve::reserve_or_join(
-    const EmergencyStopAcceptanceCandidate& candidate) noexcept {
-  EmergencyStopAcceptanceOutcome outcome;
+EmergencyStopAcceptanceReserve::Selection EmergencyStopAcceptanceReserve::select_locked(
+    const EmergencyStopAcceptanceCandidate& candidate) const noexcept {
   if (!candidate_valid(candidate)) {
-    outcome.error = EmergencyStopReserveError::kInvalidCandidate;
-    return outcome;
+    return {};
   }
-
-  std::lock_guard lock(mutex_);
-
   const auto exact_request = [&](const Slot& slot) {
     return view(slot.request_id, slot.request_id_size) == candidate.request_id &&
            optional_equal(slot.normalized_request_digest_present,
@@ -159,6 +154,89 @@ EmergencyStopAcceptanceOutcome EmergencyStopAcceptanceReserve::reserve_or_join(
   const auto same_request_id = [&](const Slot& slot) {
     return slot.active && view(slot.request_id, slot.request_id_size) == candidate.request_id;
   };
+  const auto replay = [](StopControlSlotIndex index) {
+    return Selection{Selection::Kind::kReplay, index, nullptr};
+  };
+  const Selection coalesce_full{Selection::Kind::kCoalesceFull, kInvalidStopControlSlot, nullptr};
+
+  bool request_id_conflict = false;
+  for (std::size_t index = 0U; index < correlation_capacity_; ++index) {
+    const auto& slot = slots_[index];
+    if (!same_request_id(slot)) {
+      continue;
+    }
+    if (exact_request(slot)) {
+      return replay(static_cast<StopControlSlotIndex>(index));
+    }
+    request_id_conflict = true;
+  }
+  if (same_request_id(full_stop_slot_)) {
+    if (exact_request(full_stop_slot_)) {
+      return replay(static_cast<StopControlSlotIndex>(correlation_capacity_));
+    }
+    request_id_conflict = true;
+  }
+  if (request_id_conflict) {
+    return coalesce_full;
+  }
+
+  if (candidate.full_stop) {
+    return coalesce_full;
+  }
+
+  const Slot* joined = nullptr;
+  if (candidate.overlapping_stop_id.has_value()) {
+    if (full_stop_slot_.active && view(full_stop_slot_.stop_id, full_stop_slot_.stop_id_size) ==
+                                      *candidate.overlapping_stop_id) {
+      joined = &full_stop_slot_;
+    }
+    for (std::size_t index = 0U; joined == nullptr && index < correlation_capacity_; ++index) {
+      if (slots_[index].active && view(slots_[index].stop_id, slots_[index].stop_id_size) ==
+                                      *candidate.overlapping_stop_id) {
+        joined = &slots_[index];
+      }
+    }
+    if (joined == nullptr) {
+      return coalesce_full;
+    }
+  }
+
+  const auto available = std::find_if(slots_.begin(), slots_.begin() + correlation_capacity_,
+                                      [](const Slot& slot) { return !slot.active; });
+  if (available == slots_.begin() + correlation_capacity_) {
+    return coalesce_full;
+  }
+  return Selection{Selection::Kind::kSlot,
+                   static_cast<StopControlSlotIndex>(std::distance(slots_.begin(), available)),
+                   joined};
+}
+
+EmergencyStopReservePlan EmergencyStopAcceptanceReserve::plan_locked(
+    const Selection& selection) const noexcept {
+  EmergencyStopReservePlan plan;
+  switch (selection.kind) {
+    case Selection::Kind::kReplay:
+      plan.replay = true;
+      break;
+    case Selection::Kind::kCoalesceFull:
+      plan.full_stop = true;
+      if (full_stop_slot_.active) plan.resident_work_token = full_stop_slot_.work_token;
+      break;
+    case Selection::Kind::kSlot:
+      if (selection.joined != nullptr) {
+        plan.joined_resident = true;
+        plan.full_stop = selection.joined->full_stop;
+        plan.resident_work_token = selection.joined->work_token;
+      }
+      break;
+    case Selection::Kind::kInvalid:
+      break;
+  }
+  return plan;
+}
+
+EmergencyStopAcceptanceOutcome EmergencyStopAcceptanceReserve::commit_locked(
+    const EmergencyStopAcceptanceCandidate& candidate, const Selection& selection) noexcept {
   const auto publish = [&](const Slot& slot, StopControlSlotIndex correlation_slot,
                            RequestReplayStatusDTO replay, EmergencyStopAcceptancePathDTO path,
                            bool correlation_retained) {
@@ -251,65 +329,32 @@ EmergencyStopAcceptanceOutcome EmergencyStopAcceptanceReserve::reserve_or_join(
     return coalesced;
   };
 
-  bool request_id_conflict = false;
-  for (std::size_t index = 0U; index < correlation_capacity_; ++index) {
-    const auto& slot = slots_[index];
-    if (!same_request_id(slot)) {
-      continue;
+  switch (selection.kind) {
+    case Selection::Kind::kReplay: {
+      const auto& slot = selection.index == correlation_capacity_ ? full_stop_slot_
+                                                                  : slots_[selection.index];
+      return publish(slot, selection.index, RequestReplayStatusDTO::kReplayedExact,
+                     slot.acceptance_path, true);
     }
-    if (exact_request(slot)) {
-      return publish(slot, static_cast<StopControlSlotIndex>(index),
-                     RequestReplayStatusDTO::kReplayedExact, slot.acceptance_path, true);
-    }
-    request_id_conflict = true;
-  }
-  if (same_request_id(full_stop_slot_)) {
-    if (exact_request(full_stop_slot_)) {
-      return publish(full_stop_slot_, static_cast<StopControlSlotIndex>(correlation_capacity_),
-                     RequestReplayStatusDTO::kReplayedExact, full_stop_slot_.acceptance_path, true);
-    }
-    request_id_conflict = true;
-  }
-  if (request_id_conflict) {
-    return coalesce_full();
-  }
-
-  if (candidate.full_stop) {
-    return coalesce_full();
-  }
-
-  const Slot* joined = nullptr;
-  if (candidate.overlapping_stop_id.has_value()) {
-    if (full_stop_slot_.active && view(full_stop_slot_.stop_id, full_stop_slot_.stop_id_size) ==
-                                      *candidate.overlapping_stop_id) {
-      joined = &full_stop_slot_;
-    }
-    for (std::size_t index = 0U; joined == nullptr && index < correlation_capacity_; ++index) {
-      if (slots_[index].active && view(slots_[index].stop_id, slots_[index].stop_id_size) ==
-                                      *candidate.overlapping_stop_id) {
-        joined = &slots_[index];
-      }
-    }
-    if (joined == nullptr) {
+    case Selection::Kind::kCoalesceFull:
       return coalesce_full();
+    case Selection::Kind::kSlot:
+      break;
+    case Selection::Kind::kInvalid: {
+      EmergencyStopAcceptanceOutcome outcome;
+      outcome.error = EmergencyStopReserveError::kInvalidCandidate;
+      return outcome;
     }
   }
-
-  const auto available = std::find_if(slots_.begin(), slots_.begin() + correlation_capacity_,
-                                      [](const Slot& slot) { return !slot.active; });
-  if (available == slots_.begin() + correlation_capacity_) {
-    return coalesce_full();
-  }
-
+  const auto* joined = selection.joined;
+  auto& available = slots_[selection.index];
   const auto path = joined == nullptr ? EmergencyStopAcceptancePathDTO::kFreshReserved
                                       : EmergencyStopAcceptancePathDTO::kJoinedResident;
-  const auto available_index =
-      static_cast<StopControlSlotIndex>(std::distance(slots_.begin(), available));
-  fill(*available, available_index, joined, joined != nullptr && joined->full_stop,
+  fill(available, selection.index, joined, joined != nullptr && joined->full_stop,
        candidate.disposition, path,
        joined != nullptr ? view(joined->scope_digest, joined->scope_digest_size)
                          : candidate.captured_scope_digest);
-  return publish(*available, available_index, RequestReplayStatusDTO::kAcceptedNew, path, true);
+  return publish(available, selection.index, RequestReplayStatusDTO::kAcceptedNew, path, true);
 }
 
 bool EmergencyStopAcceptanceReserve::mark_projection(

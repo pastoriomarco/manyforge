@@ -653,23 +653,60 @@ RetainedRos2ControlRuntimeHandle::StageMeasuredStateSources(
       std::move(replacement), std::move(readers))));
 }
 
-RetainedRos2ControlRuntimeHandle::~RetainedRos2ControlRuntimeHandle() {
+// Holds the internal lease of every external owner. Its destructor runs on
+// the thread that releases the last external owner, which is never one of the
+// handle's executor threads: runtime callbacks hold internal leases only.
+struct RetainedRos2ControlRuntimeHandle::ExternalOwner final {
+  explicit ExternalOwner(std::shared_ptr<RetainedRos2ControlRuntimeHandle> owned)
+      : handle(std::move(owned)) {}
+  ExternalOwner(const ExternalOwner &) = delete;
+  ExternalOwner &operator=(const ExternalOwner &) = delete;
+  // Quiesce while this lease still keeps every child alive; a callback lease
+  // in flight ends inside the join. Destruction then follows on this thread
+  // unless a non-executor lease (a gripper command's display) still runs.
+  ~ExternalOwner() { handle->StopAndQuiesce(); }
+  const std::shared_ptr<RetainedRos2ControlRuntimeHandle> handle;
+};
+
+std::shared_ptr<RetainedRos2ControlRuntimeHandle>
+RetainedRos2ControlRuntimeHandle::Create() {
+  auto owner = std::make_shared<ExternalOwner>(
+      std::make_shared<RetainedRos2ControlRuntimeHandle>(ConstructionKey{}));
+  auto *const handle = owner->handle.get();
+  std::shared_ptr<RetainedRos2ControlRuntimeHandle> external(std::move(owner),
+                                                             handle);
+  handle->external_owner_ = external;
+  return external;
+}
+
+void RetainedRos2ControlRuntimeHandle::StopAndQuiesce() noexcept {
   // The lane guard stops first (it calls back into this handle). Children
   // then close admission while callbacks and borrowed resources are
-  // quiesced; destructors repeat only their idempotent local shutdown.
+  // quiesced; repeated calls repeat only their idempotent local shutdown.
   std::optional<RetainedRos2ControlArmGuardHooks> hooks;
+  std::shared_ptr<ros2_control_execution::Ros2ControlExecutionBackend> adapter;
   {
     std::lock_guard lock(mutex_);
     hooks = std::move(guard_hooks_);
     guard_hooks_.reset();
+    if (arm_)
+      adapter = arm_->adapter;
   }
+  // A guard worker in a poll holds an internal lease; joining it here, while
+  // this owner still holds one, keeps that poll from being the last owner.
+  if (hooks && hooks->stop)
+    hooks->stop();
   hooks.reset();
-  if (arm_ && arm_->adapter)
-    arm_->adapter->shutdown();
+  if (adapter)
+    adapter->shutdown();
   if (gripper_)
     gripper_->shutdown();
   if (resources_)
     resources_->quiesce();
+}
+
+RetainedRos2ControlRuntimeHandle::~RetainedRos2ControlRuntimeHandle() {
+  StopAndQuiesce();
   sample_timer_.reset();
   sample_observer_ = {};
   participant_.reset();
@@ -2107,7 +2144,9 @@ RetainedRos2ControlRuntimeHandle::SwitchGripperController(
 
 RetainedExternallyManagedPrimitiveDispatcher
 RetainedRos2ControlRuntimeHandle::lifecycle_primitive_dispatcher() {
-  const std::weak_ptr<RetainedRos2ControlRuntimeHandle> weak = weak_from_this();
+  // Primitives run on lifecycle threads, never on this executor; a dispatch
+  // in flight keeps an external owner, so the transport stays live for it.
+  const std::weak_ptr<RetainedRos2ControlRuntimeHandle> weak = external_owner_;
   return [weak](const core::ControlDomainId &domain,
                 const core::LifecyclePrimitiveId &primitive,
                 const std::stop_token cancellation) {
@@ -2179,7 +2218,8 @@ RetainedRos2ControlRuntimeHandle::motion_domain() const {
 
 RetainedExternallyManagedDomainSnapshotSource
 RetainedRos2ControlRuntimeHandle::lifecycle_snapshot_source() {
-  const auto self = shared_from_this();
+  // The lifecycle registry retains this source as an existing external owner.
+  const std::shared_ptr<RetainedRos2ControlRuntimeHandle> self(external_owner_);
   return [self](const core::ControlDomainId &domain_id,
                 const core::TimePoint now_ns) {
     return self->ReadLifecycleSnapshot(domain_id, now_ns);

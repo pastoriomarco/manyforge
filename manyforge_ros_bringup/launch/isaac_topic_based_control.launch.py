@@ -27,6 +27,8 @@ from launch.substitutions import LaunchConfiguration
 from launch_ros.actions import Node
 from launch_ros.substitutions import FindPackageShare
 
+from manyforge_ros_bringup.launch_signals import keep_sigint_out_of_tasks
+
 
 DEFAULT_WORLD_URI = (
     "file:/home/tndlux/workspaces/isaac_ros-dev/src/"
@@ -201,6 +203,7 @@ def generate_launch_description() -> LaunchDescription:
 
 
 def _launch_setup(context, *_, **__) -> list[object]:
+    keep_sigint_out_of_tasks(context)  # Q116: before any Node action exists.
     manager_cell_world_owned = _parse_bool_launch_value(
         LaunchConfiguration("manager_cell_world_owned").perform(context),
         name="manager_cell_world_owned",

@@ -467,6 +467,14 @@ private:
   bool host_shutdown_started_{false};
 };
 
+/// Apply keeper rule for one installed owner. An owner with its own launch
+/// (mock/Isaac controller or simulated PLC) is live only while that exact
+/// process runs and no cleanup was requested; an owner without one is live
+/// when it needs none (I/O-only) or is a local no-output gripper.
+[[nodiscard]] bool owned_launch_live(ControllerLaunchProcess *process,
+                                     bool owns_physical,
+                                     bool local_no_output_owner);
+
 /// The host's one supervisor (created on first use, lives until exit).
 [[nodiscard]] ControllerLaunchSupervisor &host_controller_launch_supervisor();
 

@@ -4,6 +4,7 @@
 #include <cstddef>
 #include <cstdint>
 #include <manyforge_core/ports/icontrol_domain_execution_port.hpp>
+#include <manyforge_core/time/iclock.hpp>
 #include <memory>
 #include <optional>
 
@@ -30,6 +31,9 @@ struct StopStageAttemptRequest final {
   std::shared_ptr<const RemainingStopBudgetDTO> budget;
   /// Transient private selection; never changes the sealed stage command.
   bool force_spring_return{};
+  /// Same Kernel clock; referents outlive the attempt's Release/Drain.
+  const IClock* stop_ingress_clock{};
+  TimePoint stop_ingress_at_ns{};
 };
 
 enum class StopStageAttemptStartStatus : std::uint8_t {

@@ -184,7 +184,7 @@
               "direction": "output",
               "provider": {
                 "profile": "ros_set_bool",
-                "service": "/plc_io/start"
+                "service": "/plc_io/in_0"
               },
               "resource_role_id": "plc_start",
               "signal_name": "plc_start",

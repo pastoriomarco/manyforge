@@ -99,9 +99,38 @@ struct IoProviderDriverRecord::State final {
   bool enabled{};
   bool retired{};
   std::optional<core::ErrorDTO> fault;
+  std::function<std::optional<std::string>()> process_fault_source;
   std::vector<core::LifecycleFactDTO> last_facts;
   std::optional<std::vector<IoProviderInputSourceInstallation>> last_rebind;
   std::optional<core::ErrorDTO> last_rebind_error;
+
+  // The supervised simulated PLC's exit, never latched into `fault`: the
+  // restarted process's source replaces it at the next Apply.
+  std::optional<core::ErrorDTO> ProcessFault() const {
+    if (retired || !process_fault_source)
+      return std::nullopt;
+    auto reason = process_fault_source();
+    if (!reason)
+      return std::nullopt;
+    if (reason->size() > core::kMaxLifecycleErrorMessageBytes) {
+      auto end = core::kMaxLifecycleErrorMessageBytes;
+      while (end > 0U &&
+             (static_cast<unsigned char>((*reason)[end]) & 0xC0U) == 0x80U)
+        --end;
+      reason->resize(end);
+    }
+    return core::ErrorDTO{"simulated_plc_exited", std::move(*reason), {}};
+  }
+
+  std::optional<core::ErrorDTO> EffectiveFault() const {
+    return fault ? fault : ProcessFault();
+  }
+
+  core::ComponentLifecycleStateDTO EffectiveState(
+      const std::optional<core::ErrorDTO> &effective) const {
+    return effective && !fault ? core::ComponentLifecycleStateDTO::kFaulted
+                               : state;
+  }
 
   bool TransportReady() const {
     if (!installed || retired)
@@ -193,12 +222,13 @@ struct IoProviderDriverRecord::State final {
   }
 
   void CommitFacts() {
-    last_facts = facts(installed && !retired, enabled, fault.has_value(),
-                       TransportReady(), retired);
+    last_facts = facts(installed && !retired, enabled,
+                       EffectiveFault().has_value(), TransportReady(), retired);
   }
 
   core::Result<RetainedExternallyManagedDomainSnapshot> Snapshot() {
-    auto current = facts(installed && !retired, enabled, fault.has_value(),
+    auto effective = EffectiveFault();
+    auto current = facts(installed && !retired, enabled, effective.has_value(),
                          TransportReady(), retired);
     if (current != last_facts) {
       if (!Advance())
@@ -207,7 +237,8 @@ struct IoProviderDriverRecord::State final {
       last_facts = current;
     }
     return core::Result<RetainedExternallyManagedDomainSnapshot>::Ok(
-        {generation, state, false, std::move(current), fault, {}});
+        {generation, EffectiveState(effective), false, std::move(current),
+         std::move(effective), {}});
   }
 
   bool Owns(const deployment::RetainedIoSignalConfiguration &row) const {
@@ -553,12 +584,13 @@ IoProviderDriverRecord::ReadLifecycleHealth(const core::ControlDomainId &domain,
   if (domain != state_->domain.control_domain_id || now < 0)
     return core::Result<core::LifecycleDomainHealthDTO>::Err(
         error("driver_domain_not_owned"));
+  const auto effective = state_->EffectiveFault();
   return core::Result<core::LifecycleDomainHealthDTO>::Ok(
-      {state_->state,
+      {state_->EffectiveState(effective),
        facts(state_->installed && !state_->retired, state_->enabled,
-             state_->fault.has_value(), state_->TransportReady(),
+             effective.has_value(), state_->TransportReady(),
              state_->retired),
-       state_->fault ? state_->fault : state_->TransportDiagnostic(), true});
+       effective ? effective : state_->TransportDiagnostic(), true});
 }
 
 RetainedExternallyManagedPrimitiveOutcome IoProviderDriverRecord::Dispatch(
@@ -604,7 +636,8 @@ RetainedExternallyManagedPrimitiveOutcome IoProviderDriverRecord::Dispatch(
                         state_->state == Lifecycle::kFaulted);
   if ((!prepare && !enable && !disable && !recover) || !state_->installed ||
       (!disable && !state_->TransportReady()) ||
-      ((prepare || enable) && state_->fault))
+      ((prepare || enable) && state_->fault) ||
+      ((prepare || enable || recover) && state_->ProcessFault()))
     return refused("driver_primitive_precondition_changed");
   if (state_->generation == std::numeric_limits<std::uint64_t>::max())
     return refused("driver_generation_exhausted");
@@ -676,6 +709,12 @@ RetainedExternallyManagedPrimitiveOutcome IoProviderDriverRecord::Dispatch(
                             : Lifecycle::kPrepared;
   state_->CommitFacts();
   return {Dispatch::kDispatchedKnown, Effect::kObserved, Known::kSucceeded, {}};
+}
+
+void IoProviderDriverRecord::SetSupervisedProcessFaultSource(
+    std::function<std::optional<std::string>()> source) {
+  auto lock = AcquireDelivery();
+  state_->process_fault_source = std::move(source);
 }
 
 void IoProviderDriverRecord::Shutdown() {

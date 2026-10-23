@@ -18,6 +18,8 @@ from launch.events import Shutdown
 from launch.substitutions import LaunchConfiguration
 from launch_ros.actions import Node
 
+from manyforge_ros_bringup.launch_signals import keep_sigint_out_of_tasks
+
 
 def _artifact(context, name: str) -> Path:
     path = Path(LaunchConfiguration(name).perform(context))
@@ -27,6 +29,7 @@ def _artifact(context, name: str) -> Path:
 
 
 def launch_setup(context, *args, **kwargs):
+    keep_sigint_out_of_tasks(context)  # Q116: before any Node action exists.
     description_path = _artifact(context, "robot_description_file")
     controllers_path = _artifact(context, "controllers_file")
     description = description_path.read_text(encoding="utf-8")

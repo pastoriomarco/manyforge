@@ -324,5 +324,114 @@ TEST(EmergencyStopAcceptanceReserveTest,
   EXPECT_EQ(reserve.release_after_terminal_handoff("invalid stop id"), 0U);
 }
 
+struct RecordingPrecommit final {
+  bool admit{};
+  int* calls{};
+  EmergencyStopReservePlan* seen{};
+  bool operator()(const EmergencyStopReservePlan& plan) const noexcept {
+    ++*calls;
+    *seen = plan;
+    return admit;
+  }
+};
+
+TEST(EmergencyStopAcceptanceReserveTest, RefusedPrecommitLeavesGenerationAndCapacityForRegularAndFull) {
+  for (const bool full : {false, true}) {
+    SCOPED_TRACE(full ? "full" : "regular");
+    EmergencyStopAcceptanceReserve reserve(1U);
+    auto request = candidate("request.precommit");
+    request.full_stop = full;
+    int calls = 0;
+    EmergencyStopReservePlan seen;
+    const auto refused = reserve.reserve_or_join(request, RecordingPrecommit{false, &calls, &seen});
+    EXPECT_EQ(calls, 1);
+    EXPECT_FALSE(refused.accepted());
+    EXPECT_EQ(refused.error, EmergencyStopReserveError::kPrecommitRefused);
+    EXPECT_FALSE(seen.replay);
+    EXPECT_FALSE(seen.joined_resident);
+    EXPECT_EQ(seen.full_stop, full);
+    EXPECT_FALSE(seen.resident_work_token.has_value());
+    EXPECT_EQ(reserve.active_correlation_count(), 0U);
+    EXPECT_FALSE(reserve.full_stop_active());
+    EXPECT_FALSE(reserve.find("request.precommit").has_value());
+
+    const auto accepted = reserve.reserve_or_join(request, RecordingPrecommit{true, &calls, &seen});
+    EXPECT_EQ(calls, 2);
+    ASSERT_TRUE(accepted.accepted());
+    EXPECT_EQ(accepted.replay_status, RequestReplayStatusDTO::kAcceptedNew);
+    EXPECT_EQ(accepted.full_stop, full);
+    // The refused attempt minted no physical work generation.
+    EXPECT_EQ(accepted.work_token, (StopControlWorkToken{full ? 1U : 0U, 1U}));
+    EXPECT_EQ(accepted.stop_generation, StopGeneration(1U));
+    EXPECT_EQ(reserve.active_correlation_count(), full ? 0U : 1U);
+    EXPECT_EQ(reserve.full_stop_active(), full);
+  }
+}
+
+TEST(EmergencyStopAcceptanceReserveTest, PrecommitRunsOnceOnReplayAndResidentJoinIncludingFull) {
+  EmergencyStopAcceptanceReserve reserve(3U);
+  int calls = 0;
+  EmergencyStopReservePlan seen;
+  const auto first = reserve.reserve_or_join(candidate("request.first"));
+  ASSERT_TRUE(first.accepted());
+
+  const auto replay =
+      reserve.reserve_or_join(candidate("request.first"), RecordingPrecommit{true, &calls, &seen});
+  EXPECT_EQ(calls, 1);
+  EXPECT_TRUE(seen.replay);
+  EXPECT_EQ(replay.replay_status, RequestReplayStatusDTO::kReplayedExact);
+  EXPECT_EQ(replay.work_token, first.work_token);
+
+  auto overlapping = candidate("request.overlap", "stop.unused", 2U);
+  overlapping.overlapping_stop_id = first.stop_id();
+  const auto joined = reserve.reserve_or_join(overlapping, RecordingPrecommit{true, &calls, &seen});
+  EXPECT_EQ(calls, 2);
+  EXPECT_FALSE(seen.replay);
+  EXPECT_TRUE(seen.joined_resident);
+  EXPECT_FALSE(seen.full_stop);
+  ASSERT_TRUE(seen.resident_work_token.has_value());
+  EXPECT_EQ(*seen.resident_work_token, first.work_token);
+  EXPECT_EQ(joined.acceptance_path, EmergencyStopAcceptancePathDTO::kJoinedResident);
+  EXPECT_EQ(joined.work_token, first.work_token);
+
+  auto full = candidate("request.full", "stop.full", 3U);
+  full.full_stop = true;
+  const auto full_first = reserve.reserve_or_join(full);
+  ASSERT_TRUE(full_first.accepted());
+  const auto full_replay = reserve.reserve_or_join(full, RecordingPrecommit{true, &calls, &seen});
+  EXPECT_EQ(calls, 3);
+  EXPECT_TRUE(seen.replay);
+  EXPECT_EQ(full_replay.replay_status, RequestReplayStatusDTO::kReplayedExact);
+  EXPECT_EQ(full_replay.work_token, full_first.work_token);
+
+  auto full_overlap = candidate("request.full.overlap", "stop.unused.overlap", 4U);
+  full_overlap.overlapping_stop_id = full_first.stop_id();
+  const auto joined_full =
+      reserve.reserve_or_join(full_overlap, RecordingPrecommit{true, &calls, &seen});
+  EXPECT_EQ(calls, 4);
+  EXPECT_FALSE(seen.replay);
+  EXPECT_TRUE(seen.joined_resident);
+  EXPECT_TRUE(seen.full_stop);
+  ASSERT_TRUE(seen.resident_work_token.has_value());
+  EXPECT_EQ(*seen.resident_work_token, full_first.work_token);
+  ASSERT_TRUE(joined_full.accepted());
+  EXPECT_EQ(joined_full.acceptance_path, EmergencyStopAcceptancePathDTO::kJoinedResident);
+  EXPECT_EQ(joined_full.work_token, full_first.work_token);
+
+  auto full_join = candidate("request.full.join", "stop.unused.full", 4U);
+  full_join.full_stop = true;
+  const auto coalesced = reserve.reserve_or_join(full_join, RecordingPrecommit{true, &calls, &seen});
+  EXPECT_EQ(calls, 5);
+  EXPECT_FALSE(seen.replay);
+  EXPECT_FALSE(seen.joined_resident);
+  EXPECT_TRUE(seen.full_stop);
+  ASSERT_TRUE(seen.resident_work_token.has_value());
+  EXPECT_EQ(*seen.resident_work_token, full_first.work_token);
+  ASSERT_TRUE(coalesced.accepted());
+  EXPECT_EQ(coalesced.acceptance_path, EmergencyStopAcceptancePathDTO::kCoalescedFull);
+  EXPECT_EQ(coalesced.work_token, full_first.work_token);
+  EXPECT_EQ(coalesced.stop_id(), full_first.stop_id());
+}
+
 }  // namespace
 }  // namespace manyforge::core

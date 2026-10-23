@@ -1,6 +1,7 @@
 #include <manyforge_core/time/manual_scheduler.hpp>
 #include <manyforge_roboplan/controller_launch_process.hpp>
 #include <manyforge_roboplan/native_runtime_support.hpp>
+#include <manyforge_roboplan/simulated_plc_launch.hpp>
 
 #include <gtest/gtest.h>
 
@@ -529,7 +530,8 @@ private:
 };
 
 void check_parent_death(const std::string &role, const std::string &selector,
-                        const bool managed_shutdown) {
+                        const bool managed_shutdown,
+                        const int extra_launch_sigints = 0) {
   if (const char *root_value = ::getenv("MANYFORGE_Q116_HOST_ROOT")) {
     const std::filesystem::path root(root_value);
     const std::string host_role(::getenv("MANYFORGE_Q116_HOST_ROLE"));
@@ -544,6 +546,13 @@ void check_parent_death(const std::string &role, const std::string &selector,
           "q116_cell_fixture"};
       cell = supervisor.start_cell_process(command, root / "artifacts");
       pid = cell->pid();
+    } else if (host_role == "sim_plc") {
+      const auto plan = plan_simulated_plc(
+          "commanded_sim", "plc_io",
+          {{"ros_bool", "/plc_io/ready", std::nullopt}}, root / "sim_plc");
+      pid = supervisor.ensure(simulated_plc_launch_command(*plan),
+                              root / "artifacts")
+                .process->pid();
     } else {
       auto command =
           host_role == "isaac"
@@ -585,13 +594,16 @@ void check_parent_death(const std::string &role, const std::string &selector,
   } evidence_capture{root};
   // Replace only this fixture's PATH entry. The installed launch SDK owns a
   // genuine ExecuteProcess child; the canonical robot launch files are unused.
+  // Their first OpaqueFunction step (manyforge_ros_bringup/launch_signals.py,
+  // keep_sigint_out_of_tasks) is mirrored here so the fixture launch handles a
+  // repeated SIGINT like the product launches.
   std::ofstream(root / "bin/ros2") << R"PY(#!/usr/bin/python3
 import ctypes
 import os
 from pathlib import Path
 import sys
 from launch import LaunchDescription, LaunchService
-from launch.actions import ExecuteProcess, RegisterEventHandler
+from launch.actions import ExecuteProcess, OpaqueFunction, RegisterEventHandler
 from launch.event_handlers import OnProcessExit
 root = Path(__file__).resolve().parent.parent
 value = ctypes.c_int()
@@ -604,7 +616,15 @@ child = ExecuteProcess(cmd=[sys.executable, str(root / 'child.py'), str(root)])
 def child_exited(event, context):
     (root / 'child_exit_pid').write_text(str(event.pid))
     (root / 'child_exit_code').write_text(str(event.returncode))
+def keep_sigint_out_of_tasks(context):
+    import signal
+    import threading
+    if (context.asyncio_loop is not None
+            and threading.current_thread() is threading.main_thread()
+            and signal.getsignal(signal.SIGINT) is signal.default_int_handler):
+        signal.signal(signal.SIGINT, lambda signum, frame: None)
 service.include_launch_description(LaunchDescription([
+    OpaqueFunction(function=keep_sigint_out_of_tasks),
     RegisterEventHandler(OnProcessExit(target_action=child, on_exit=child_exited)),
     child,
 ]))
@@ -642,6 +662,13 @@ while True:
   EXPECT_EQ(read_file(root / "parent_death_signal"), std::to_string(expected));
   ::testing::Test::RecordProperty("parent_death_signal", expected);
   ASSERT_TRUE(host.kill_host());
+  // The kernel repeats PR_SET_PDEATHSIG when the launch is reparented while a
+  // multi-threaded host exits; the regression case adds that burst explicitly,
+  // spaced so each lands while launch may still be handling the previous one.
+  for (int extra = 0; extra < extra_launch_sigints; ++extra) {
+    std::this_thread::sleep_for(300us);
+    ASSERT_EQ(::kill(host.read_pid("launch_pid"), SIGINT), 0);
+  }
   ::testing::Test::RecordProperty("host_exit_signal", SIGKILL);
   if (managed_shutdown) {
     ASSERT_TRUE(fake.wait_for(root / "child_signal"));
@@ -681,6 +708,14 @@ TEST(ControllerLaunchSupervisor, IsaacParentDeathInterruptsManagedLaunchChild) {
                      true);
 }
 
+TEST(ControllerLaunchSupervisor,
+     SimulatedPlcParentDeathInterruptsManagedLaunchChild) {
+  check_parent_death("sim_plc",
+                     "ControllerLaunchSupervisor."
+                     "SimulatedPlcParentDeathInterruptsManagedLaunchChild",
+                     true);
+}
+
 TEST(ControllerLaunchSupervisor, OtherLaunchRolesKeepParentDeathSigterm) {
   for (const auto *role : {"other", "foreign_package", "mismatched_lane", "cell"}) {
     SCOPED_TRACE(role);
@@ -688,6 +723,16 @@ TEST(ControllerLaunchSupervisor, OtherLaunchRolesKeepParentDeathSigterm) {
                              "OtherLaunchRolesKeepParentDeathSigterm",
                        false);
   }
+}
+
+TEST(ControllerLaunchSupervisor,
+     RepeatedParentDeathSigintStillInterruptsManagedLaunchChild) {
+  // sim-plc-flake-01: a second SIGINT while launch handles the first must not
+  // drop its Shutdown (child never interrupted) or keep the launch alive.
+  check_parent_death("mock",
+                     "ControllerLaunchSupervisor."
+                     "RepeatedParentDeathSigintStillInterruptsManagedLaunchChild",
+                     true, 2);
 }
 
 // A node in the fake launch's process group. The test keeps parenthood so it
@@ -2868,4 +2913,243 @@ TEST(ControllerLaunchSupervisor,
                                                           scheduler, 0));
   EXPECT_EQ(scheduler.attempts, 1);
   EXPECT_TRUE(ControllerLaunchSupervisor::fault_source(started.process)());
+}
+
+// sim-plc-peer-design-02/03: the simulated PLC lane (ROS-free parts).
+namespace {
+
+[[nodiscard]] std::vector<SimulatedPlcRow> plc_rows() {
+  return {{"ros_set_bool", std::nullopt, "/plc_io/in_0"},
+          {"ros_bool", "/plc_io/ready", std::nullopt},
+          {"mock", std::nullopt, std::nullopt},
+          {"ros_bool", "/plc_io/out_0", std::nullopt},
+          {"ros_bool", "/plc_io/ready", std::nullopt}};
+}
+
+[[nodiscard]] SimulatedPlcPlan plc_plan(const std::filesystem::path &dir) {
+  auto plan = plan_simulated_plc("commanded_sim", "plc_io", plc_rows(), dir);
+  if (!plan) throw std::logic_error("fixture plan absent");
+  return *plan;
+}
+
+} // namespace
+
+TEST(SimulatedPlcPlan, OnlyACommandedSimUnitGetsASimulatedPlc) {
+  // D6 structural Real-lane guard: no other unit mode yields a PLC.
+  for (const auto *mode :
+       {"", "real", "measured", "commanded_simulation", "Commanded_sim"}) {
+    SCOPED_TRACE(mode);
+    EXPECT_FALSE(
+        plan_simulated_plc(mode, "plc_io", plc_rows(), "/cfg").has_value());
+  }
+  const auto plan =
+      plan_simulated_plc("commanded_sim", "plc_io", plc_rows(), "/cfg");
+  ASSERT_TRUE(plan.has_value());
+  EXPECT_EQ(plan->device_id, "plc_io");
+  EXPECT_EQ(plan->config_dir, std::filesystem::path("/cfg"));
+  // Sorted, unique, Mock rows ignored.
+  EXPECT_EQ(plan->subscribed_topics,
+            (std::vector<std::string>{"/plc_io/out_0", "/plc_io/ready"}));
+  EXPECT_EQ(plan->served_services,
+            std::vector<std::string>{"/plc_io/in_0"});
+}
+
+TEST(SimulatedPlcPlan, OnlyGenericRosDevicesGetOne) {
+  EXPECT_FALSE(plan_simulated_plc("commanded_sim", "station_io",
+                                  {{"mock", std::nullopt, std::nullopt},
+                                   {"mock_output", std::nullopt, std::nullopt}},
+                                  "/cfg"));
+  EXPECT_FALSE(plan_simulated_plc("commanded_sim", "plc_io", {}, "/cfg"));
+  // Robot-provided I/O is served by the robot's own peer, never a sim PLC.
+  for (const auto *profile :
+       {"ur_io_states", "ur_set_io", "ros2_control_gpio",
+        "xarm_controller_input"}) {
+    SCOPED_TRACE(profile);
+    auto rows = plc_rows();
+    rows.push_back({profile, "/io_states", std::nullopt});
+    EXPECT_FALSE(plan_simulated_plc("commanded_sim", "plc_io", rows, "/cfg"));
+  }
+  // A generic row without its address is not a generic ROS endpoint.
+  EXPECT_FALSE(plan_simulated_plc("commanded_sim", "plc_io",
+                                  {{"ros_bool", std::nullopt, std::nullopt}},
+                                  "/cfg"));
+}
+
+TEST(SimulatedPlcPlan, ConfigDirectoryPrefersTheOverrideThenTheStateRoot) {
+  EXPECT_EQ(resolve_simulated_plc_config_dir("/site/plc", "/state"),
+            std::filesystem::path("/site/plc"));
+  EXPECT_EQ(resolve_simulated_plc_config_dir("", "/state"),
+            std::filesystem::path("/state/sim_plc"));
+  EXPECT_EQ(resolve_simulated_plc_config_dir(nullptr, nullptr),
+            std::filesystem::path("/tmp/manyforge-state/sim_plc"));
+  EXPECT_EQ(resolve_simulated_plc_config_dir(nullptr, ""),
+            std::filesystem::path("/tmp/manyforge-state/sim_plc"));
+}
+
+TEST(SimulatedPlcLaunchCommand, ContractArgvLaneAndKeepAcrossApply) {
+  const auto command = simulated_plc_launch_command(plc_plan("/cfg/sim_plc"));
+  EXPECT_EQ(command.argv,
+            (std::vector<std::string>{"ros2", "launch", "manyforge_ros_bringup",
+                                      "sim_plc.launch.py", "device:=plc_io",
+                                      "config_dir:=/cfg/sim_plc"}));
+  EXPECT_EQ(command.controllable_component_id, "plc_io");
+  EXPECT_EQ(command.lane, ControllerLaunchLane::kSimulatedPlc);
+  EXPECT_TRUE(command.keep_across_apply);
+  EXPECT_THROW((void)simulated_plc_launch_command(SimulatedPlcPlan{}),
+               ControllerLaunchProcessError);
+}
+
+TEST(SimulatedPlcLaunchCommand, IdentityIsLaunchInputsNotTheSettingsFile) {
+  TemporaryRoot root;
+  const auto dir = root.path() / "sim_plc";
+  std::filesystem::create_directories(dir);
+  const auto settings = dir / "plc_io.yaml";
+  std::ofstream(settings) << "inputs: 8\n";
+  const auto first = simulated_plc_launch_command(plc_plan(dir));
+  std::ofstream(settings, std::ios::trunc) << "inputs: 2\nready: false\n";
+  const auto edited = simulated_plc_launch_command(plc_plan(dir));
+  EXPECT_EQ(first.identity, edited.identity);
+  EXPECT_EQ(first.argv, edited.argv);
+
+  auto other_device = plc_plan(dir);
+  other_device.device_id = "plc_b";
+  auto other_dir = plc_plan(root.path() / "elsewhere");
+  auto other_topic = plc_plan(dir);
+  other_topic.subscribed_topics.push_back("/plc_io/out_1");
+  auto other_service = plc_plan(dir);
+  other_service.served_services = {"/plc_io/in_1"};
+  for (const auto &changed : {other_device, other_dir, other_topic, other_service})
+    EXPECT_NE(simulated_plc_launch_command(changed).identity, first.identity);
+}
+
+TEST(SimulatedPlcLaunchCommand, KeepRestartRulesFollowTheIdentity) {
+  const auto command = simulated_plc_launch_command(plc_plan("/cfg"));
+  EXPECT_EQ(decide_controller_launch(std::nullopt, command),
+            ControllerLaunchDecision::kStart);
+  EXPECT_EQ(decide_controller_launch(
+                ControllerLaunchObservation{command.identity, true, true},
+                command),
+            ControllerLaunchDecision::kKeep);
+  EXPECT_EQ(decide_controller_launch(
+                ControllerLaunchObservation{"changed", true, true}, command),
+            ControllerLaunchDecision::kRestart);
+  EXPECT_EQ(decide_controller_launch(
+                ControllerLaunchObservation{command.identity, true, false},
+                command),
+            ControllerLaunchDecision::kRestart);
+}
+
+TEST(SimulatedPlcSupervisor, StartsKeepsRestartsAndRetiresWithoutAFault) {
+  FakeLaunch fake;
+  ControllerLaunchSupervisor supervisor(2s);
+  const auto log = fake.root() / "launch.artifacts";
+  const auto plan = plc_plan(fake.root() / "sim_plc");
+  const auto first = supervisor.ensure(simulated_plc_launch_command(plan), log);
+  EXPECT_EQ(first.decision, ControllerLaunchDecision::kStart);
+  ASSERT_TRUE(fake.wait_for(fake.out(first.process->pid(), ".args")));
+  EXPECT_NE(read_file(fake.out(first.process->pid(), ".args"))
+                .find("sim_plc.launch.py\ndevice:=plc_io\n"),
+            std::string::npos);
+  const auto kept = supervisor.ensure(simulated_plc_launch_command(plan), log);
+  EXPECT_EQ(kept.decision, ControllerLaunchDecision::kKeep);
+  EXPECT_EQ(kept.process, first.process);
+
+  auto changed_plan = plan;
+  changed_plan.served_services.push_back("/plc_io/in_1");
+  const auto changed =
+      supervisor.ensure(simulated_plc_launch_command(changed_plan), log);
+  EXPECT_EQ(changed.decision, ControllerLaunchDecision::kRestart);
+  EXPECT_TRUE(first.process->exited().has_value());
+  EXPECT_FALSE(ControllerLaunchSupervisor::fault_source(first.process)());
+
+  // Removal/Close retire the exact occurrence; an ordered stop is no fault.
+  ASSERT_TRUE(supervisor.retire_exact(changed.process));
+  EXPECT_TRUE(changed.process->exited().has_value());
+  EXPECT_FALSE(ControllerLaunchSupervisor::fault_source(changed.process)());
+  EXPECT_FALSE(supervisor.observe("plc_io").has_value() &&
+               supervisor.observe("plc_io")->running);
+}
+
+TEST(SimulatedPlcSupervisor, ANonZeroExitIsAFaultNamingTheCode) {
+  FakeLaunch fake;
+  ::setenv("FAKE_LAUNCH_EXIT", "3", 1); // endpoint occupied
+  ControllerLaunchSupervisor supervisor(2s);
+  const auto started =
+      supervisor.ensure(simulated_plc_launch_command(plc_plan(fake.root())),
+                        fake.root() / "launch.artifacts");
+  const auto fault = ControllerLaunchSupervisor::fault_source(started.process);
+  std::optional<std::string> reason;
+  for (int attempt = 0; attempt < 300 && !reason; ++attempt) {
+    reason = fault();
+    if (!reason) std::this_thread::sleep_for(10ms);
+  }
+  ASSERT_TRUE(reason.has_value());
+  EXPECT_NE(reason->find("exited with status 3"), std::string::npos) << *reason;
+  EXPECT_NE(reason->find("component=\"plc_io\""), std::string::npos) << *reason;
+  ::unsetenv("FAKE_LAUNCH_EXIT");
+  // The next Apply restarts it (never the supervisor by itself).
+  const auto again =
+      supervisor.ensure(simulated_plc_launch_command(plc_plan(fake.root())),
+                        fake.root() / "launch.artifacts");
+  EXPECT_EQ(again.decision, ControllerLaunchDecision::kRestart);
+  supervisor.stop_all();
+}
+
+TEST(SimulatedPlcSupervisor, ADeadSimulatedPlcIsNotAnApplyKeeper) {
+  FakeLaunch fake;
+  ControllerLaunchSupervisor supervisor(2s);
+  const auto started =
+      supervisor.ensure(simulated_plc_launch_command(plc_plan(fake.root())),
+                        fake.root() / "launch.artifacts");
+  ASSERT_TRUE(fake.wait_for(fake.out(started.process->pid(), ".args")));
+  // A running pure-I/O owner's simulated PLC keeps its component.
+  EXPECT_TRUE(owned_launch_live(started.process.get(), false, false));
+  ASSERT_EQ(::kill(-started.process->pid(), SIGKILL), 0);
+  for (int attempt = 0; attempt < 300 && !started.process->exited(); ++attempt)
+    std::this_thread::sleep_for(10ms);
+  ASSERT_TRUE(started.process->exited());
+  // Dead: not a keeper, so the next (even Program-only) Apply rebuilds the
+  // device and restarts its PLC.
+  EXPECT_FALSE(owned_launch_live(started.process.get(), false, false));
+  // Unchanged rules for owners without their own launch.
+  EXPECT_TRUE(owned_launch_live(nullptr, false, false));
+  EXPECT_FALSE(owned_launch_live(nullptr, true, false));
+  EXPECT_TRUE(owned_launch_live(nullptr, true, true));
+  const auto again =
+      supervisor.ensure(simulated_plc_launch_command(plc_plan(fake.root())),
+                        fake.root() / "launch.artifacts");
+  EXPECT_EQ(again.decision, ControllerLaunchDecision::kRestart);
+  EXPECT_TRUE(owned_launch_live(again.process.get(), false, false));
+  supervisor.stop_all();
+}
+
+TEST(SimulatedPlcSupervisor, ARebuiltDeviceKeepsItsPlcWhileTheLaunchIdentityHolds) {
+  FakeLaunch fake;
+  ControllerLaunchSupervisor supervisor(2s);
+  const auto plan = plc_plan(fake.root());
+  const auto started = supervisor.ensure(simulated_plc_launch_command(plan),
+                                         fake.root() / "launch.artifacts");
+  ASSERT_TRUE(fake.wait_for(fake.out(started.process->pid(), ".args")));
+  EXPECT_TRUE(simulated_plc_launch_survives(started.process.get(), plan));
+  auto changed = plan;
+  changed.served_services.push_back("/plc_io/in_1");
+  EXPECT_FALSE(simulated_plc_launch_survives(started.process.get(), changed));
+  // Device removed or Close: no candidate plan.
+  EXPECT_FALSE(simulated_plc_launch_survives(started.process.get(), std::nullopt));
+  EXPECT_FALSE(simulated_plc_launch_survives(nullptr, plan));
+  // The supervisor's ensure-by-identity then keeps the same process.
+  const auto kept = supervisor.ensure(simulated_plc_launch_command(plan),
+                                      fake.root() / "launch.artifacts");
+  EXPECT_EQ(kept.decision, ControllerLaunchDecision::kKeep);
+  EXPECT_EQ(kept.process, started.process);
+  ASSERT_EQ(::kill(-started.process->pid(), SIGKILL), 0);
+  for (int attempt = 0; attempt < 300 && !started.process->exited(); ++attempt)
+    std::this_thread::sleep_for(10ms);
+  EXPECT_FALSE(simulated_plc_launch_survives(started.process.get(), plan));
+  // Another lane's process never survives as a simulated PLC.
+  const auto mock = supervisor.ensure(
+      mock_controller_launch_command(mock_artifacts(fake.root())),
+      fake.root() / "launch.artifacts");
+  EXPECT_FALSE(simulated_plc_launch_survives(mock.process.get(), plan));
+  supervisor.stop_all();
 }

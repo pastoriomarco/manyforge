@@ -42,6 +42,7 @@ constexpr std::string_view kBringupPackage = "manyforge_ros_bringup";
 constexpr std::string_view kMockLaunchFile = "mock_control.launch.py";
 constexpr std::string_view kIsaacLaunchFile =
     "isaac_topic_based_control.launch.py";
+constexpr std::string_view kSimulatedPlcLaunchFile = "sim_plc.launch.py";
 
 [[nodiscard]] int parent_death_signal(const ControllerLaunchCommand &command) {
   const auto &argv = command.argv;
@@ -52,7 +53,9 @@ constexpr std::string_view kIsaacLaunchFile =
       ((command.lane == ControllerLaunchLane::kMock &&
         argv[3] == kMockLaunchFile) ||
        (command.lane == ControllerLaunchLane::kIsaac &&
-        argv[3] == kIsaacLaunchFile)))
+        argv[3] == kIsaacLaunchFile) ||
+       (command.lane == ControllerLaunchLane::kSimulatedPlc &&
+        argv[3] == kSimulatedPlcLaunchFile)))
     return SIGINT;
   return SIGTERM;
 }
@@ -555,6 +558,16 @@ q80_interim_apply_brings_up_an_exited_launch() {
 }
 
 } // namespace
+
+bool owned_launch_live(ControllerLaunchProcess *const process,
+                       const bool owns_physical,
+                       const bool local_no_output_owner) {
+  if (process != nullptr)
+    return !process->exited() &&
+           process->cleanup_observation().state ==
+               ControllerLaunchCleanupState::kNotRequested;
+  return !owns_physical || local_no_output_owner;
+}
 
 ControllerLaunchDecision decide_controller_launch(
     const std::optional<ControllerLaunchObservation> &current,

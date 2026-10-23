@@ -71,7 +71,7 @@ TEST(RetainedLifecycleProductTest,
   arm.controller = {"/product_health/controller_manager", "arm", "TestSystem"};
   arm.compiled_joint_names = joints;
   unsigned observes = 0, pure_reads = 0;
-  auto handle = std::make_shared<RetainedRos2ControlRuntimeHandle>();
+  auto handle = RetainedRos2ControlRuntimeHandle::Create();
   const auto bound = handle->Bind(
       std::make_unique<ros2_control_execution::Ros2TransportResources>(
           "manyforge_product_health", "/", 1U, std::make_shared<ProductSink>(),

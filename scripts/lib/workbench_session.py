@@ -38,6 +38,10 @@ _LEGACY = frozenset({
 })
 _STABLE = frozenset({
     "current", "previous-sessions", "session-reports", "evidence",
+    # The simulated PLC's own per-device settings, kept across sessions.
+    "sim_plc",
+    # Optional, bounded diagnostic snapshots survive cold Workbench sessions.
+    "motion-traces",
     ".legacy-session-transition.json", ".session-selection.json",
     *("history.sqlite3" + suffix for suffix in ("", "-wal", "-shm", "-journal", ".headless-owner.lock")),
 })

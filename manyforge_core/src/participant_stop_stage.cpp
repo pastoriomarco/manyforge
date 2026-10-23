@@ -536,6 +536,9 @@ template <typename ProviderPath>
   if (command == nullptr || budget.stop_id != stage.stop_id ||
       budget.stop_generation != stage.stop_generation || budget.elapsed_since_stop_ns < 0 ||
       budget.elapsed_since_stop_ns > kMaximumStopDurationNs ||
+      (budget.stop_ingress_age_ns &&
+       (*budget.stop_ingress_age_ns < 0 ||
+        *budget.stop_ingress_age_ns > kMaximumStopDurationNs)) ||
       (budget.remaining_controlled_deadline_ns.has_value() &&
        (command->resolved_stage.containment_command.command_kind !=
             StopContainmentCommandKind::kMotionControlledStop ||

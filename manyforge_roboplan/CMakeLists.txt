@@ -269,7 +269,8 @@ target_link_libraries(manyforge_roboplan_controller_launch_artifacts
 # Q78/§7.5: command and process ownership of the controller launches the
 # execution host starts per component (ROS-free).
 add_library(manyforge_roboplan_controller_launch_process
-  src/controller_launch_process.cpp)
+  src/controller_launch_process.cpp
+  src/simulated_plc_launch.cpp)
 target_include_directories(manyforge_roboplan_controller_launch_process
   PUBLIC
     $<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}/include>
@@ -409,6 +410,7 @@ if(MANYFORGE_BUILD_ROS2_CONTROL_RUNTIME)
   find_package(pal_statistics_msgs REQUIRED)
   add_library(manyforge_roboplan_ros2_control_runtime
     src/io_provider_lifecycle_product.cpp
+    src/simulated_plc_readiness.cpp
     src/retained_isaac_arm_guard_binding.cpp
     src/retained_isaac_ros2_control_profile.cpp
     src/retained_ros2_control_backend_factory.cpp
@@ -914,6 +916,7 @@ if(BUILD_TESTING)
       # Isaac guard binding against in-process ROS stand-ins.
       add_executable(test_retained_ros2_control_runtime_handle
         test/test_io_provider_lifecycle_product.cpp
+        test/test_simulated_plc_readiness.cpp
         test/test_retained_ros2_control_runtime_handle.cpp
         test/test_retained_ros2_control_lifecycle_product.cpp
         test/test_retained_native_lifecycle_product.cpp)

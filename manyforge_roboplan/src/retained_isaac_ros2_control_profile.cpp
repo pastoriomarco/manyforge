@@ -1,11 +1,13 @@
-#include <cstdlib>
 #include <manyforge_roboplan/retained_isaac_ros2_control_profile.hpp>
 
 #include <manyforge_roboplan/controller_launch_artifacts.hpp>
 
 #include <algorithm>
 #include <array>
+#include <charconv>
 #include <cmath>
+#include <cstdio>
+#include <cstdlib>
 #include <set>
 #include <span>
 #include <stdexcept>
@@ -176,6 +178,36 @@ sole_compiled_group(const core::RuntimeParticipantBinding &binding,
   result.push_back('/');
   result.append(relative_name);
   return result;
+}
+
+// EXPERIMENTAL independent opt-ins for live A/B tests on stock JTC 6.10, read
+// where the scheduled (Mock) lane is configured; all default off and only "1"
+// enables one. The timer's expected latency is optional milliseconds.
+core::ExecutionReplacementExperimentFlagsDTO experimental_replacement_flags() {
+  const auto enabled = [](const char *name) {
+    const char *value = std::getenv(name);
+    return value != nullptr && std::string_view(value) == "1";
+  };
+  core::ExecutionReplacementExperimentFlagsDTO flags;
+  flags.release_timer = enabled("MANYFORGE_EXPERIMENTAL_RELEASE_TIMER");
+  flags.midtick_stamp = enabled("MANYFORGE_EXPERIMENTAL_MIDTICK_STAMP");
+  flags.v0_payload = enabled("MANYFORGE_EXPERIMENTAL_V0_PAYLOAD");
+  flags.scheduled_spring_back_fast =
+      enabled("MANYFORGE_EXPERIMENTAL_SCHEDULED_SPRING_BACK_FAST");
+  constexpr auto kLatency = "MANYFORGE_EXPERIMENTAL_RELEASE_TIMER_LATENCY_MS";
+  if (const char *value = std::getenv(kLatency)) {
+    const std::string_view text(value);
+    double milliseconds{};
+    const auto [end, error] =
+        std::from_chars(text.data(), text.data() + text.size(), milliseconds);
+    if (error != std::errc{} || end != text.data() + text.size() ||
+        !std::isfinite(milliseconds) || milliseconds < 0.0 ||
+        milliseconds > 1000.0)
+      throw std::invalid_argument(std::string(kLatency) +
+                                  " must be milliseconds in [0, 1000]");
+    flags.expected_latency_s = milliseconds / 1000.0;
+  }
+  return flags;
 }
 
 // Shared JTC wiring and retained simulation policy. Lane builders still own
@@ -647,11 +679,23 @@ make_retained_mock_ros2_control_backend_config(
       profile.hard_stop_completion_timeout_s);
   // Only the generated Mock controllers enable stock JTC scheduled replacement.
   config.arm.adapter.lane_facts.supports_scheduled_replacement = true;
-  const char* resident_trial = std::getenv("MANYFORGE_EXPERIMENTAL_JTC_RESIDENT_TIMELINE");
-  config.arm.adapter.lane_facts.supports_resident_timeline_replacement =
-      resident_trial && std::string_view(resident_trial) == "1";
-  if (config.arm.adapter.lane_facts.supports_resident_timeline_replacement)
-    config.arm.adapter.lane_facts.supports_scheduled_replacement = false;
+  config.arm.adapter.lane_facts.experiment = experimental_replacement_flags();
+  constexpr auto kAllowance = "MANYFORGE_EXPERIMENTAL_REPLACEMENT_START_ALLOWANCE_MS";
+  if (const char *value = std::getenv(kAllowance)) {
+    const std::string_view text(value);
+    double milliseconds{};
+    const auto [end, error] =
+        std::from_chars(text.data(), text.data() + text.size(), milliseconds);
+    if (error != std::errc{} || end != text.data() + text.size() ||
+        !std::isfinite(milliseconds) || milliseconds <= 0.0 || milliseconds > 200.0)
+      throw std::invalid_argument(std::string(kAllowance) +
+                                  " must be finite milliseconds in (0, 200]");
+    config.participant.stop.replacement_start_allowance_s = milliseconds / 1000.0;
+    config.arm.adapter.lane_facts.experiment.start_allowance_override = true;
+    static_cast<void>(std::fprintf(stderr,
+        "manyforge_replacement_start_allowance component=%.160s allowance_ms=%.17g\n",
+        motion_binding.value().controllable_component_id.value().c_str(), milliseconds));
+  }
   config.arm.measured_joint_state_lane = RetainedMeasuredJointStateLane{
       runtime_namespace + "/joint_states",
       config.participant.stop.controller_state_max_age_ns,

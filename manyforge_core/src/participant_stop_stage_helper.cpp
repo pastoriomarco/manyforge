@@ -10,6 +10,7 @@
 #include <manyforge_core/motion_interrupt/stop_replacement.hpp>
 #include <manyforge_core/participant_stop_stage_helper.hpp>
 #include <manyforge_core/stop_timing.hpp>
+#include <manyforge_core/trajectory/trajectory_sampler.hpp>
 #include <stdexcept>
 #include <string_view>
 #include <utility>
@@ -222,6 +223,11 @@ struct ParticipantStopStageHelper::Run {
   std::optional<SpringBackReturnPointDTO> spring_return_point{};
   std::vector<std::string> refused_modes{};
   bool mode_not_carried_out{};
+  double source_offset_s{0.0};
+  std::optional<TimePoint> stop_ingress_at{};
+  std::optional<double> spring_return_cursor{};
+  std::vector<double> spring_return_positions{};
+  bool spring_return_target_frozen{};
 };
 
 ParticipantStopStageHelper::ParticipantStopStageHelper(IExecutionPort& port, const IClock& clock,
@@ -252,7 +258,8 @@ void ParticipantStopStageHelper::BindDispatchedGoal(
     StopStageDispatchedGoalDTO goal, std::shared_ptr<ExecutionSampleAssociation> association) {
   if (!association) throw std::invalid_argument("A dispatched goal requires its association");
   std::lock_guard lock(mutex_);
-  sent_.assign(1U, SentGoal{goal.key, goal.trajectory, std::nullopt, std::move(association)});
+  sent_.assign(1U, SentGoal{goal.key, goal.trajectory, std::nullopt, std::move(association),
+                           false, {}, goal.planned_controller_offset_s});
   goal_ = std::move(goal);
 }
 
@@ -280,10 +287,11 @@ bool ParticipantStopStageHelper::ReserveReplacement(const ExecutionGoalKey& sour
 
 void ParticipantStopStageHelper::RecordReplacement(
     ExecutionGoalKey key, TrajectoryDTO trajectory,
-    std::shared_ptr<ExecutionSampleAssociation> association) noexcept {
+    std::shared_ptr<ExecutionSampleAssociation> association,
+    double planned_controller_offset_s) noexcept {
   std::lock_guard lock(mutex_);
-  sent_.push_back(
-      SentGoal{std::move(key), std::move(trajectory), std::nullopt, std::move(association), true});
+  sent_.push_back(SentGoal{std::move(key), std::move(trajectory), std::nullopt,
+                           std::move(association), true, {}, planned_controller_offset_s});
 }
 
 void ParticipantStopStageHelper::RetireSettledReplacement(const ExecutionGoalKey& key) noexcept {
@@ -408,7 +416,7 @@ std::optional<double> ParticipantStopStageHelper::OriginalPathCursor(
       !std::isfinite(sample->cursor_s) || !newest.association->Observe(*sample, goal)) {
     return std::nullopt;
   }
-  return original_path_cursor(map, sample->cursor_s);
+  return original_path_cursor(map, sample->cursor_s - newest.planned_controller_offset_s);
 }
 
 ParticipantStopStageResultDTO ParticipantStopStageHelper::TranslateStopStage(
@@ -436,6 +444,8 @@ ParticipantStopStageResultDTO ParticipantStopStageHelper::TranslateStopStageImpl
   if (stage.stage_index >= stage.participant_stop_plan.stage_commands.size() ||
       budget.stop_id != stage.stop_id || budget.stop_generation != stage.stop_generation ||
       budget.elapsed_since_stop_ns < 0 ||
+      (budget.stop_ingress_age_ns &&
+       (*budget.stop_ingress_age_ns < 0 || *budget.stop_ingress_age_ns > kMaximumStopDurationNs)) ||
       (budget.remaining_controlled_deadline_ns.has_value() &&
        *budget.remaining_controlled_deadline_ns <= 0)) {
     return refuse("resolved_stop_stage_budget_invalid",
@@ -528,6 +538,9 @@ ParticipantStopStageResultDTO ParticipantStopStageHelper::TranslateStopStageImpl
           std::nullopt,
           std::nullopt};
   run.spring_observer = observer;
+  if (budget.stop_ingress_age_ns)
+    run.stop_ingress_at = started - *budget.stop_ingress_age_ns;
+  if (run.lane.supports_scheduled_replacement) run.lane.experiment.release_timer = true;
   // Q42: the lane's hard stop is the controlled hard stop (level 3) with the
   // cancel (level 4) as its floor; a controller-goal cancel is level 4 itself.
   if (!controlled) return RunHardStage(run, software_hard);
@@ -881,6 +894,9 @@ ParticipantStopStageResultDTO ParticipantStopStageHelper::RunControlledStage(Run
                                  "frozen factor before the Stop deadline"));
   }
   run.trip_measured_positions = trip->measured_positions_rad;
+  if (run.lane.supports_scheduled_replacement)
+    run.source_offset_s = trip->cursor_s - estimate_stop_source_cursor(
+        run.goal.trajectory, *trip, run.lane, run.goal.planned_controller_offset_s);
 
   // §4.2 step 1: trip evidence per authority.
   SoftOnPathInitialStateDTO initial;
@@ -894,9 +910,10 @@ ParticipantStopStageResultDTO ParticipantStopStageHelper::RunControlledStage(Run
   initial.position_source = SoftOnPathStateSource::kMeasuredFeedback;
   initial.velocity_source = measured_velocity ? SoftOnPathStateSource::kMeasuredFeedback
                                               : SoftOnPathStateSource::kModelDerived;
-  initial.trajectory_time_from_start_s = trip->cursor_s;
+  initial.trajectory_time_from_start_s = trip->cursor_s - run.source_offset_s;
   initial.runtime_velocity_scale_at_trip = factor;
   initial.sample_age_ns = std::max<std::int64_t>(0, clock_.now() - trip->local_receipt_stamp_ns);
+
 
   // At most the primary and two enabled lower controlled modes. The hard
   // stage remains the Kernel's existing final escalation, never a retry here.
@@ -984,8 +1001,55 @@ ParticipantStopStageResultDTO ParticipantStopStageHelper::RunControlledStage(Run
     run.spring_return_point.reset();
     run.mode_not_carried_out = false;
     std::optional<ParticipantStopStageResultDTO> result;
+    if (attempt.stop_mode != MotionInterruptStopMode::kSoftOnPath &&
+        !run.spring_return_target_frozen) {
+      // Preserve trip evidence and braking; only freeze the return target at
+      // original Kernel ingress, including the stock controller's unscaled P.
+      run.spring_return_positions = initial.state.positions_rad;
+      if (run.stop_ingress_at && !measured) {
+        const double period_s = run.lane.supports_scheduled_replacement
+            ? std::trunc(1e9 / run.lane.controller_update_rate_hz) / 1e9 : 0.0;
+        const double cursor = trip->cursor_s - run.source_offset_s - factor *
+            static_cast<double>(trip->local_receipt_stamp_ns - *run.stop_ingress_at) / 1e9 +
+            period_s;
+        const auto target = sample_trajectory(run.goal.trajectory, cursor);
+        if (!target.ok() || run.goal.trajectory.waypoints.empty())
+          return Fail(run, stage_error("spring_back_return_target_invalid",
+                                       "The Stop arrival target cannot be sampled"));
+        run.spring_return_cursor = std::clamp(cursor,
+            run.goal.trajectory.waypoints.front().time_from_start_s,
+            run.goal.trajectory.waypoints.back().time_from_start_s);
+        // Source is in trajectory order; the fast builder accepts lane order.
+        for (std::size_t j = 0; j < run.goal.trajectory.joint_names.size(); ++j) {
+          const auto found = std::find(run.lane.joint_names.begin(),
+              run.lane.joint_names.end(), run.goal.trajectory.joint_names[j]);
+          if (found == run.lane.joint_names.end())
+            return Fail(run, stage_error("spring_back_fast_joint_mapping_invalid",
+                                         "The return target does not cover the active joints"));
+          run.spring_return_positions.at(found - run.lane.joint_names.begin()) =
+              target.value().positions_rad.at(j);
+        }
+      }
+      run.spring_return_target_frozen = true;
+    }
+    if (attempt.stop_mode != MotionInterruptStopMode::kSoftOnPath) {
+      put(run.outcome->diagnostics, "spring_return_target_source", interrupt_structured_string(
+          run.spring_return_cursor ? "kernel_stop_ingress_command_model"
+                                   : measured ? "measured_trip_approximation"
+                                              : "legacy_trip_target"));
+      if (run.spring_return_cursor)
+        put(run.outcome->diagnostics, "spring_return_path_time_s",
+            interrupt_structured_number(*run.spring_return_cursor));
+      if (run.stop_ingress_at)
+        put(run.outcome->diagnostics, "spring_return_ingress_age_ns",
+            interrupt_structured_number(static_cast<double>(run.started - *run.stop_ingress_at)));
+      double delta = 0.0;
+      for (std::size_t j = 0; j < run.spring_return_positions.size(); ++j)
+        delta = std::max(delta, std::abs(run.spring_return_positions[j] - initial.state.positions_rad[j]));
+      put(run.outcome->diagnostics, "spring_return_vs_trip_max_rad", interrupt_structured_number(delta));
+    }
     if (attempt.stop_mode == MotionInterruptStopMode::kSpringBackFast) {
-      result = RunFastSpringBack(run, *trip, initial.state.positions_rad, factor, stop_deadline);
+      result = RunFastSpringBack(run, *trip, run.spring_return_positions, factor, stop_deadline);
     } else {
       SoftOnPathPlannerConfig planner;
       planner.stop_traj_delta_s = config_.stop_traj_delta_s;
@@ -994,6 +1058,8 @@ ParticipantStopStageResultDTO ParticipantStopStageHelper::RunControlledStage(Run
       planner.max_initial_path_deviation_rad = config_.max_initial_path_deviation_rad;
       planner.max_initial_velocity_deviation_rad_s = config_.max_initial_velocity_deviation_rad_s;
       planner.jerk_limits_enabled = attempt.jerk_limits_enabled == true;
+      if (attempt.stop_mode == MotionInterruptStopMode::kSpringBackHold)
+        planner.spring_back_return_path_time_s = run.spring_return_cursor;
       if (planner.jerk_limits_enabled) {
         for (const auto& [joint, jerk] : attempt.per_joint_max_jerk) {
           planner.per_joint_max_jerk_rad_s3.emplace(joint,
@@ -1036,7 +1102,23 @@ ParticipantStopStageResultDTO ParticipantStopStageHelper::RunControlledStage(Run
       for (const auto& [key, value] : planned.value().diagnostics)
         put(run.outcome->diagnostics, key, value);
       run.outcome->initial_path_deviation_rad = planned.value().initial_path_deviation_rad;
-      result = RunReplacement(run, planned.value(), *trip, factor, stop_deadline);
+      // Actual C: the same attempt, limits and trip evidence, planned from the
+      // command state at the same seam (rate f), so its lead-in ends at C and
+      // the separately frozen return target stays unchanged.
+      const auto replan = [&](const double lead_in_s) {
+        auto later = planner;
+        later.stop_traj_delta_s = lead_in_s;
+        later.allow_model_velocity_fallback = true;
+        auto command = initial;
+        command.velocity_source = SoftOnPathStateSource::kModelDerived;
+        command.trajectory_time_from_start_s = planned.value().command_path_time_s;
+        auto law = attempt.stop_mode == MotionInterruptStopMode::kSoftOnPath
+                       ? plan_soft_on_path_stop(run.goal.trajectory, attempt, command, later)
+                       : plan_spring_back_on_path_stop(run.goal.trajectory, attempt, command, later);
+        if (!law.ok()) run.mode_not_carried_out = cannot_carry_out(law.error());
+        return law;
+      };
+      result = RunReplacement(run, planned.value(), *trip, factor, stop_deadline, replan);
     }
     if (result->outcome != ParticipantStopStageOutcomeDTO::kFailed || run.dispatched ||
         run.stale_state_error || run.cancellation.stop_requested() || !result->error ||
@@ -1058,14 +1140,15 @@ ParticipantStopStageResultDTO ParticipantStopStageHelper::RunControlledStage(Run
 
 ParticipantStopStageResultDTO ParticipantStopStageHelper::RunReplacement(
     Run& run, const SoftOnPathStopPlanDTO& plan, const ExecutionControllerSampleDTO& trip,
-    const double frozen_factor, const TimePoint stop_deadline) {
+    const double frozen_factor, const TimePoint stop_deadline,
+    const std::function<Result<SoftOnPathStopPlanDTO>(double)>& replan) {
   const std::string mode =
       run.outcome->executed_stop_mode == MotionInterruptStopMode::kSoftOnPath ? "soft_on_path"
                                                                               : "spring_back";
   // §4.2 steps 3-4 (Q17, Q20): the original trajectory's own points up to the
   // trip point (the lead-in end), then the checked ramp in path time at the
   // frozen factor.
-  const auto lead_in_end =
+  auto lead_in_end =
       stop_trip_path_s(plan.command_path_time_s, frozen_factor, plan.stop_traj_delta_s);
   auto continuation = convert_stop_trajectory_to_path_time(plan.replacement_trajectory,
                                                            frozen_factor);
@@ -1078,10 +1161,19 @@ ParticipantStopStageResultDTO ParticipantStopStageHelper::RunReplacement(
   // `main`'s acceptance-within-lead-in rule (Q22): the mechanism must start
   // the replacement before the planned trip point.
   const auto dispatched_at = clock_.now();
-  const auto start = compute_stop_replacement_start(
-      {trip.cursor_s, frozen_factor,
+  auto start = compute_stop_replacement_start(
+      {trip.cursor_s - run.source_offset_s, frozen_factor,
        static_cast<double>(dispatched_at - trip.local_receipt_stamp_ns) / 1e9,
        *config_.replacement_start_allowance_s, lead_in_end}, trip, run.lane);
+  double first_time_s = 0.0;
+  if (start.ok() && start.value().scheduled) {
+    const double period_s = static_cast<Duration>(1e9 / run.lane.controller_update_rate_hz) / 1e9;
+    first_time_s = period_s - start.value().controller_offset_s;
+    // C carries one unscaled lookahead P, so its bound adds the same P.
+    const auto eligible = compute_stop_join_elapsed_s(
+        {start.value().elapsed_path_s + first_time_s, 1.0, 0.0, 0.0, lead_in_end + period_s});
+    if (!eligible.ok()) start = Result<StopReplacementStartDTO>::Err(eligible.error());
+  }
   if (!start.ok()) {
     const auto reason = start.error().details.find("reason");
     run.mode_not_carried_out =
@@ -1089,38 +1181,70 @@ ParticipantStopStageResultDTO ParticipantStopStageHelper::RunReplacement(
     return Fail(run, stage_error(mode + "_stop_delta_budget_exceeded", start.error().message,
                                  start.error().details));
   }
+  // Actual C: a takeover cursor C at or past the trip point re-plans the law
+  // from the command state source(C), with its lead-in ending at C; C, the
+  // seam, the return target and every deadline stay fixed.
+  std::optional<SoftOnPathStopPlanDTO> replanned;
+  if (start.value().scheduled && !(start.value().elapsed_path_s + first_time_s < lead_in_end)) {
+    const double lead_in_s =
+        (start.value().elapsed_path_s + first_time_s - plan.command_path_time_s) / frozen_factor;
+    auto law = replan(lead_in_s);
+    if (!law.ok()) {
+      auto cause = law.error();
+      if (soft_on_path_error_recommends_hard_stop(cause))
+        cause.details.insert_or_assign("stop_disposition", "planner_selected_hard_stop");
+      return Fail(run, stage_error(cause, "controlled_stop_planner_failed"));
+    }
+    // The law runs its remaining time from the takeover tick T (local clock
+    // through the trip sample's receipt); it must end by the Stop deadline.
+    const auto takeover_ns =
+        trip.local_receipt_stamp_ns +
+        (start.value().scheduled->controller_start_stamp_ns - trip.source_stamp_ns) -
+        std::llround(start.value().controller_offset_s / frozen_factor * 1e9);
+    const auto end_ns = takeover_ns + std::llround(
+        (law.value().replacement_trajectory.waypoints.back().time_from_start_s - lead_in_s) * 1e9);
+    if (end_ns > std::min(stop_deadline, run.terminal_deadline)) {
+      run.mode_not_carried_out = true;
+      return Fail(run, stage_error(mode + "_stop_delta_budget_exceeded",
+                                   "The re-planned Stop law ends past the Stop deadline",
+                                   {{"recommended_disposition", "hard_stop"}}));
+    }
+    continuation =
+        convert_stop_trajectory_to_path_time(law.value().replacement_trajectory, frozen_factor);
+    if (!continuation.ok())
+      return Fail(run, stage_error(continuation.error(), mode + "_join_failed"));
+    lead_in_end = stop_trip_path_s(plan.command_path_time_s, frozen_factor, lead_in_s);
+    for (const auto& [key, value] : law.value().diagnostics)
+      put(run.outcome->diagnostics, key, value);
+    replanned = std::move(law.value());
+  }
+  const auto& law = replanned ? *replanned : plan;
   const auto elapsed = start.value().elapsed_path_s;
   auto joined = build_stop_replacement_join(run.goal.trajectory, elapsed,
                                             continuation.value(), plan.command_path_time_s,
                                             lead_in_end);
+  if (joined.ok() && start.value().scheduled)
+    joined = stop_replacement_v0_payload(joined.value(), first_time_s);
   if (!joined.ok()) return Fail(run, stage_error(joined.error(), mode + "_join_failed"));
-  std::optional<TrajectoryDTO> resident_wire;
-  if (run.lane.supports_resident_timeline_replacement) {
-    auto resident =
-        build_resident_timeline_replacement(joined.value(), elapsed, 0.0, trip.cursor_s);
-    if (!resident.ok()) return Fail(run, stage_error(resident.error(), mode + "_join_failed"));
-    joined.value() = std::move(resident.value().resident_trajectory);
-    resident_wire = std::move(resident.value().delivery_trajectory);
+  if (const auto held = HoldForRelease(run, start.value(), dispatched_at, stop_deadline, mode)) {
+    return *held;
   }
   const auto sent = start.value().scheduled
-                        ? port_.ReplaceScheduled(run.goal.key, next,
-                                                 resident_wire ? *resident_wire : joined.value(),
+                        ? port_.ReplaceScheduled(run.goal.key, next, joined.value(),
                                                  *start.value().scheduled)
-                        : port_.Replace(run.goal.key, next,
-                                        resident_wire ? *resident_wire : joined.value());
+                        : port_.Replace(run.goal.key, next, joined.value());
   std::optional<StopReplacementCursorMapDTO> cursor_map;
   if (sent.dispatch != ExecutionPortDispatch::kNotDispatched &&
-      plan.replacement_path_time_s.size() == continuation.value().waypoints.size()) {
+      law.replacement_path_time_s.size() == continuation.value().waypoints.size()) {
     std::vector<double> continuation_times;
     continuation_times.reserve(continuation.value().waypoints.size());
     for (const auto& point : continuation.value().waypoints) {
       continuation_times.push_back(point.time_from_start_s);
     }
-    cursor_map = StopReplacementCursorMapDTO{
-        run.lane.supports_resident_timeline_replacement ? 0.0 : elapsed, lead_in_end,
+    cursor_map = StopReplacementCursorMapDTO{elapsed, lead_in_end,
                                              plan.command_path_time_s,
                                              std::move(continuation_times),
-                                             plan.replacement_path_time_s};
+                                             law.replacement_path_time_s};
   }
   if (sent.dispatch != ExecutionPortDispatch::kNotDispatched) {
     put(run.outcome->diagnostics, "join_elapsed_path_s", interrupt_structured_number(elapsed));
@@ -1130,7 +1254,7 @@ ParticipantStopStageResultDTO ParticipantStopStageHelper::RunReplacement(
   }
   return FinishReplacement(run, sent, next, std::move(joined.value()), std::move(cursor_map),
                            baseline, dispatched_at, trip, mode, plan.path_deviation_max_rad,
-                           stop_deadline);
+                           stop_deadline, start.value().controller_offset_s);
 }
 
 // Q130 (maintainer): ManyMove's controlled stop for searches and probes stopped
@@ -1163,7 +1287,7 @@ ParticipantStopStageResultDTO ParticipantStopStageHelper::RunFastSpringBack(
       motion_interrupt_deceleration_time_or_default(profile) * frozen_factor;
   const auto dispatched_at = clock_.now();
   const double elapsed =
-      trip.cursor_s +
+      trip.cursor_s - run.source_offset_s +
       frozen_factor * static_cast<double>(dispatched_at - trip.local_receipt_stamp_ns) / 1e9;
   if (!std::isfinite(stop_path_s) || stop_path_s <= 0.0 || !std::isfinite(elapsed) ||
       active.waypoints.empty()) {
@@ -1177,15 +1301,47 @@ ParticipantStopStageResultDTO ParticipantStopStageHelper::RunFastSpringBack(
     return RunNaturalCompletion(run, stop_deadline, "spring_back_fast_remaining_path_short");
   }
   TrajectoryDTO stop;
-  stop.resources = active.resources;
-  stop.joint_names = active.joint_names;
-  for (const auto& point : active.waypoints) {
-    if (point.time_from_start_s >= elapsed) break;
-    auto passed = point;
-    passed.time_from_start_s -= elapsed;
-    stop.waypoints.push_back(std::move(passed));
+  StopReplacementStartDTO scheduled_start;
+  if (run.lane.supports_scheduled_replacement) {
+    // The same scheduled first-command placement as every capable Stop;
+    // preserve the complete fast curve and the frozen return target.
+    auto start = compute_stop_replacement_start(
+        {trip.cursor_s - run.source_offset_s, frozen_factor,
+         static_cast<double>(dispatched_at - trip.local_receipt_stamp_ns) / 1e9,
+         *config_.replacement_start_allowance_s, std::nullopt},
+        trip, run.lane);
+    const double first_time_s = start.ok()
+        ? static_cast<Duration>(1e9 / run.lane.controller_update_rate_hz) / 1e9 -
+              start.value().controller_offset_s : 0.0;
+    const double entry = start.ok() ? start.value().elapsed_path_s + first_time_s : 0.0;
+    auto built = start.ok() ? build_scheduled_spring_back_fast(active, entry, stop_positions,
+                                                               entry + stop_path_s)
+                            : Result<TrajectoryDTO>::Err(start.error());
+    if (!built.ok()) {
+      return Fail(run, stage_error("spring_back_fast_input_invalid", built.error().message,
+                                   built.error().details));
+    }
+    for (auto& point : built.value().waypoints)
+      point.time_from_start_s += first_time_s;
+    start.value().scheduled->experiment->spring_back_fast = true;
+    if (const auto held = HoldForRelease(run, start.value(), dispatched_at, stop_deadline,
+                                         "spring_back_fast")) {
+      return *held;
+    }
+    stop = std::move(built.value());
+    scheduled_start = std::move(start.value());
+  } else {
+    stop.resources = active.resources;
+    stop.joint_names = active.joint_names;
+    for (const auto& point : active.waypoints) {
+      if (point.time_from_start_s >= elapsed) break;
+      auto passed = point;
+      passed.time_from_start_s -= elapsed;
+      stop.waypoints.push_back(std::move(passed));
+    }
   }
-  const auto passed_points = stop.waypoints.size();
+  const auto& scheduled = scheduled_start.scheduled;
+  const auto passed_points = scheduled ? 0U : stop.waypoints.size();
   if (stop.waypoints.empty()) {
     // Nothing passed yet: the message starts now, at the trip position, so the
     // controller takes it at once (only a first point in the future is a
@@ -1194,14 +1350,17 @@ ParticipantStopStageResultDTO ParticipantStopStageHelper::RunFastSpringBack(
                                                    std::vector<double>(width, 0.0),
                                                    std::vector<double>(width, 0.0)});
   }
-  stop.waypoints.push_back(TrajectoryWaypointDTO{stop_path_s, stop_positions,
-                                                 std::vector<double>(width, 0.0),
-                                                 std::vector<double>(width, 0.0)});
+  if (!scheduled) {
+    stop.waypoints.push_back(TrajectoryWaypointDTO{stop_path_s, stop_positions,
+                                                   std::vector<double>(width, 0.0),
+                                                   std::vector<double>(width, 0.0)});
+  }
   if (run.cancellation.stop_requested()) return superseded_result(run.stage);
   run.outcome->stop_command_source = MotionInterruptStopCommandSource::kFjtPreemptHold;
   if (run.spring_observer) {
     SoftOnPathResolvedInitialStateDTO return_state;
-    return_state.command_path_time_s = trip.cursor_s;
+    return_state.command_path_time_s = trip.cursor_s - run.source_offset_s;
+    return_state.spring_back_return_path_time_s = run.spring_return_cursor;
     return_state.path_time_rate = frozen_factor;
     return_state.runtime_velocity_scale_at_trip = frozen_factor;
     return_state.joint_names = active.joint_names;
@@ -1215,22 +1374,83 @@ ParticipantStopStageResultDTO ParticipantStopStageHelper::RunFastSpringBack(
   put(run.outcome->diagnostics, "frozen_factor", interrupt_structured_number(frozen_factor));
   put(run.outcome->diagnostics, "passed_points",
       interrupt_structured_number(static_cast<double>(passed_points)));
-  // The resident-timeline controller keeps its clock origin for this message
-  // too: the same literal curve on the resident clock, from the knot covering
-  // the trip cursor (the first point at 0 lands at `elapsed`).
-  std::optional<TrajectoryDTO> resident_wire;
-  if (run.lane.supports_resident_timeline_replacement) {
-    auto resident = build_resident_timeline_replacement(stop, elapsed, 0.0, trip.cursor_s);
-    if (!resident.ok())
-      return Fail(run, stage_error(resident.error(), "spring_back_fast_input_invalid"));
-    stop = std::move(resident.value().resident_trajectory);
-    resident_wire = std::move(resident.value().delivery_trajectory);
+  if (scheduled) {
+    put(run.outcome->diagnostics, "spring_back_fast_shape",
+        interrupt_structured_string("scheduled_v0"));
+    put(run.outcome->diagnostics, "scheduled_start_path_s",
+        interrupt_structured_number(scheduled_start.elapsed_path_s));
   }
   const auto next = NextKey();
   const auto baseline = port_.ReadSample();
-  const auto sent = port_.Replace(run.goal.key, next, resident_wire ? *resident_wire : stop);
+  const auto sent = scheduled ? port_.ReplaceScheduled(run.goal.key, next, stop, *scheduled)
+                              : port_.Replace(run.goal.key, next, stop);
   return FinishReplacement(run, sent, next, std::move(stop), std::nullopt, baseline,
-                           dispatched_at, trip, "spring_back_fast", 0.0, stop_deadline);
+                           dispatched_at, trip, "spring_back_fast", 0.0, stop_deadline,
+                           scheduled_start.controller_offset_s);
+}
+
+// EXPERIMENTAL release timer: hold before the send through the stage's own
+// cancellable wait (no lock held, no port call). The ceiling is the existing
+// Stop deadline, terminal deadline and lead-in acceptance window
+// (`FinishReplacement`), all from the same `dispatched_at`. A release beyond it
+// is not held; cancellation or stale state during the hold ends the stage as
+// in any other wait; a wake past the ceiling (oversleep) sends nothing and is
+// refused as the existing lead-in budget refusal, before any effect.
+std::optional<ParticipantStopStageResultDTO> ParticipantStopStageHelper::HoldForRelease(
+    Run& run, StopReplacementStartDTO& start, const TimePoint dispatched_at,
+    const TimePoint stop_deadline, const std::string& mode) {
+  if (!start.scheduled) return std::nullopt;
+  const auto period_ns = static_cast<Duration>(1e9 / run.lane.controller_update_rate_hz);
+  const auto ceiling = std::min({stop_deadline, run.terminal_deadline, dispatched_at +
+      static_cast<Duration>(*config_.replacement_start_allowance_s * 1e9) + period_ns});
+  const auto until = plan_replacement_release(start, clock_, ceiling);
+  if (!until) {
+    run.mode_not_carried_out = true;
+    return Fail(run, stage_error(mode + "_stop_delta_budget_exceeded",
+                                 "The scheduled Stop release is no longer available"));
+  }
+  (void)Await(run, *until, [] { return false; });
+  if (run.cancellation.stop_requested()) return superseded_result(run.stage);
+  if (run.stale_state_error) {
+    return Fail(run, stage_error("release_hold_ended", "Stale controller state during the hold"));
+  }
+  if (const auto woke = clock_.now(); woke > std::min(ceiling, *until + period_ns / 2)) {
+    run.mode_not_carried_out = true;
+    return Fail(run, stage_error(mode + "_stop_delta_budget_exceeded",
+                                 "The release hold ended past the Stop's existing ceiling",
+                                 {{"recommended_disposition", "hard_stop"},
+                                  {"release_overslept_ns", std::to_string(woke - *until)}}));
+  }
+  return std::nullopt;
+}
+
+// EXPERIMENTAL release timer: hold before the send through the stage's own
+// cancellable wait (no lock held, no port call). The ceiling is the existing
+// Stop deadline, terminal deadline and lead-in acceptance window
+// (`FinishReplacement`), all from the same `dispatched_at`. A release beyond it
+// is not held; cancellation or stale state during the hold ends the stage as
+// in any other wait; a wake past the ceiling (oversleep) sends nothing and is
+// refused as the existing lead-in budget refusal, before any effect.
+std::optional<ParticipantStopStageResultDTO> ParticipantStopStageHelper::HoldForRelease(
+    Run& run, StopReplacementStartDTO& start, const TimePoint dispatched_at,
+    const TimePoint stop_deadline, const std::string& mode) {
+  const auto lead_in_ns = static_cast<Duration>(config_.stop_traj_delta_s * 1e9);
+  const auto ceiling = std::min({stop_deadline, run.terminal_deadline, dispatched_at + lead_in_ns});
+  const auto until = plan_replacement_release(start, clock_, ceiling);
+  if (!until) return std::nullopt;
+  (void)Await(run, *until, [] { return false; });
+  if (run.cancellation.stop_requested()) return superseded_result(run.stage);
+  if (run.stale_state_error) {
+    return Fail(run, stage_error("release_hold_ended", "Stale controller state during the hold"));
+  }
+  if (const auto woke = clock_.now(); woke > ceiling) {
+    run.mode_not_carried_out = true;
+    return Fail(run, stage_error(mode + "_stop_delta_budget_exceeded",
+                                 "The release hold ended past the Stop's existing ceiling",
+                                 {{"recommended_disposition", "hard_stop"},
+                                  {"release_overslept_ns", std::to_string(woke - *until)}}));
+  }
+  return std::nullopt;
 }
 
 ParticipantStopStageResultDTO ParticipantStopStageHelper::FinishReplacement(
@@ -1238,7 +1458,7 @@ ParticipantStopStageResultDTO ParticipantStopStageHelper::FinishReplacement(
     TrajectoryDTO sent_trajectory, std::optional<StopReplacementCursorMapDTO> cursor_map,
     const std::optional<ExecutionControllerSampleDTO>& baseline, const TimePoint dispatched_at,
     const ExecutionControllerSampleDTO& trip, const std::string& mode,
-    const double initial_path_deviation_rad, const TimePoint stop_deadline) {
+    const double initial_path_deviation_rad, const TimePoint stop_deadline, double controller_offset_s) {
   if (sent.dispatch == ExecutionPortDispatch::kNotDispatched) {
     const auto original = port_.ReadGoal(run.goal.key);
     if (original.has_value() && original->result == ExecutionGoalResult::kSucceeded &&
@@ -1259,7 +1479,8 @@ ParticipantStopStageResultDTO ParticipantStopStageHelper::FinishReplacement(
   run.finish_goal = next;
   const auto association = std::make_shared<ExecutionSampleAssociation>(
       port_.ReadReadiness().binding_epoch, baseline, dispatched_at);
-  Record(SentGoal{next, std::move(sent_trajectory), std::move(cursor_map), association});
+  Record(SentGoal{next, std::move(sent_trajectory), std::move(cursor_map), association,
+                  false, {}, controller_offset_s});
   if (sent.dispatch == ExecutionPortDispatch::kEffectUncertain) {
     return Fail(run, stage_error(mode + "_path_ramp_dispatch_uncertain",
                                  "The Stop replacement may already affect the controller"));
@@ -1526,14 +1747,38 @@ std::optional<ParticipantStopStageResultDTO> ParticipantStopStageHelper::TryCont
     return std::nullopt;
   }
   const auto& names = live.trajectory.joint_names;
-  const auto positions = reorder(sample.reference_positions_rad, run.lane.joint_names, names);
-  const auto velocities = reorder(sample.reference_velocities_rad_s, run.lane.joint_names, names);
+  auto positions = reorder(sample.reference_positions_rad, run.lane.joint_names, names);
+  auto velocities = reorder(sample.reference_velocities_rad_s, run.lane.joint_names, names);
   if (!positions.has_value() || !velocities.has_value()) {
     fallback_reason = "controlled_hard_stop_joint_mismatch";
     return std::nullopt;
   }
-  // Q42: the closed-form brake from the latest commanded state, the factor
-  // applied once, delivered through the Q20 join.
+  const auto join_started_at = run.lane.supports_scheduled_replacement ? clock_.now() : 0;
+  std::optional<StopReplacementStartDTO> start;
+  double first_time_s = 0.0;
+  if (run.lane.supports_scheduled_replacement) {
+    auto planned = compute_stop_replacement_start(
+        {estimate_stop_source_cursor(live.trajectory, sample, run.lane,
+                                     live.planned_controller_offset_s), factor,
+         static_cast<double>(join_started_at - sample.local_receipt_stamp_ns) / 1e9,
+         *config_.replacement_start_allowance_s, std::nullopt}, sample, run.lane);
+    if (!planned.ok()) {
+      fallback_reason = "controlled_hard_stop_elapsed_invalid";
+      return std::nullopt;
+    }
+    start = std::move(planned.value());
+    first_time_s = static_cast<Duration>(1e9 / run.lane.controller_update_rate_hz) / 1e9 -
+                   start->controller_offset_s;
+    const auto source = sample_trajectory(live.trajectory, start->elapsed_path_s + first_time_s);
+    if (!source.ok()) {
+      fallback_reason = "controlled_hard_stop_brake_invalid";
+      return std::nullopt;
+    }
+    positions = source.value().positions_rad;
+    velocities = source.value().velocities_rad_s;
+  }
+  // Q42's unchanged law uses the first commanded source P/V, including the
+  // existing sampler endpoint clamp. Its initial A is the brake's own law.
   const auto brake = plan_controlled_hard_stop_brake(
       {names, *positions, *velocities, factor, config_.max_deceleration_on_cancel_rad_s2,
        1.0 / run.lane.controller_update_rate_hz});
@@ -1545,11 +1790,9 @@ std::optional<ParticipantStopStageResultDTO> ParticipantStopStageHelper::TryCont
   const auto pre_dispatch = port_.ReadSample();
   // Q26: the join is computed immediately before the send (local time since
   // the sample measured at the dispatch itself).
-  const auto dispatched_at = clock_.now();
-  // This brake starts at the captured sample, with no future shared source
-  // prefix. Keep its existing immediate delivery; scheduling it would delay
-  // onto a brake already in progress, unlike a lead-bearing replacement.
-  const auto elapsed = compute_stop_join_elapsed_s(
+  const auto dispatched_at = start ? join_started_at : clock_.now();
+  const auto elapsed = start ? Result<double>::Ok(start->elapsed_path_s)
+                            : compute_stop_join_elapsed_s(
       {sample.cursor_s, factor,
        static_cast<double>(dispatched_at - sample.local_receipt_stamp_ns) / 1e9,
        *config_.replacement_start_allowance_s, std::nullopt});
@@ -1557,29 +1800,26 @@ std::optional<ParticipantStopStageResultDTO> ParticipantStopStageHelper::TryCont
     fallback_reason = "controlled_hard_stop_elapsed_invalid";
     return std::nullopt;
   }
-  // The brake leaves the path at the sample itself (no lead-in).
-  auto joined = build_stop_replacement_join(live.trajectory, elapsed.value(),
-                                            brake.value().trajectory, sample.cursor_s,
-                                            sample.cursor_s);
+  auto joined = start ? Result<TrajectoryDTO>::Ok(brake.value().trajectory)
+                      : build_stop_replacement_join(live.trajectory, elapsed.value(),
+                          brake.value().trajectory, sample.cursor_s, sample.cursor_s);
+  if (start) {
+    for (auto& point : joined.value().waypoints)
+      point.time_from_start_s += first_time_s;
+    run.mode_not_carried_out = false;
+    if (const auto held = HoldForRelease(run, *start, dispatched_at, run.terminal_deadline,
+                                         "controlled_hard_stop")) {
+      if (!run.mode_not_carried_out) return held;
+      fallback_reason = "controlled_hard_stop_release_expired";
+      return std::nullopt;
+    }
+  }
   if (!joined.ok()) {
     fallback_reason = "controlled_hard_stop_join_failed";
     return std::nullopt;
   }
-  // The resident-timeline controller keeps its clock origin: the same curve
-  // on the resident clock, from the knot covering the sample cursor.
-  std::optional<TrajectoryDTO> resident_wire;
-  if (run.lane.supports_resident_timeline_replacement) {
-    auto resident =
-        build_resident_timeline_replacement(joined.value(), elapsed.value(), 0.0, sample.cursor_s);
-    if (!resident.ok()) {
-      fallback_reason = "controlled_hard_stop_join_failed";
-      return std::nullopt;
-    }
-    joined.value() = std::move(resident.value().resident_trajectory);
-    resident_wire = std::move(resident.value().delivery_trajectory);
-  }
-  const auto sent =
-      port_.Replace(live.key, next, resident_wire ? *resident_wire : joined.value());
+  const auto sent = start ? port_.ReplaceScheduled(live.key, next, joined.value(), *start->scheduled)
+                          : port_.Replace(live.key, next, joined.value());
   if (sent.dispatch == ExecutionPortDispatch::kNotDispatched) {
     fallback_reason = "controlled_hard_stop_refused";
     return std::nullopt;
@@ -1588,7 +1828,8 @@ std::optional<ParticipantStopStageResultDTO> ParticipantStopStageHelper::TryCont
   run.finish_goal = next;
   const auto association =
       std::make_shared<ExecutionSampleAssociation>(goal->binding_epoch, pre_dispatch, dispatched_at);
-  Record(SentGoal{next, joined.value(), std::nullopt, association});
+  Record(SentGoal{next, joined.value(), std::nullopt, association, false, {},
+                  start ? start->controller_offset_s : 0.0});
   // The brake's final point in lane joint order (Q50 level-3 finish).
   const auto final_point =
       reorder(joined.value().waypoints.back().positions_rad, names, run.lane.joint_names);
@@ -1597,7 +1838,7 @@ std::optional<ParticipantStopStageResultDTO> ParticipantStopStageHelper::TryCont
     return std::nullopt;
   }
 
-  // Q59: the brake is sent at once and has taken over only when its own
+  // Q59: the brake has taken over only when its own
   // first anchor (Q50: its feedback, or its own terminal result when that
   // arrives first) is observed within the lane lead-in (`stop_traj_delta_s`);
   // otherwise level 4 (the cancel) follows. Acceptance alone is never proof

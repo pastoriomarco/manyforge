@@ -399,6 +399,8 @@ ExecutionPortCommandResultDTO Ros2ControlExecutionBackend::SendGoal(
   if (!action_client_ || !action_client_->action_server_is_ready())
     return refused(ExecutionPortRefusal::kNotReady,
                    "FJT action server is not discovered");
+  const auto *const experiment =
+      start && start->experiment ? &*start->experiment : nullptr;
   VolatileMotionTrace::TokenPtr trace_token;
   {
     std::lock_guard facts_lock(state_->mutex);
@@ -447,18 +449,64 @@ ExecutionPortCommandResultDTO Ros2ControlExecutionBackend::SendGoal(
     if (const auto state = weak.lock())
       ReceiveResult(state, key, result);
   };
+  const auto send_ns = experiment ? state_->clock.now() : TimePoint{0};
   try {
     (void)action_client_->async_send_goal(goal, options);
   } catch (const std::exception &error) {
     if (state_->config.motion_trace) {
       try { state_->config.motion_trace->Attach(trace_token, std::move(goal), state_->clock.now(),
-              ExecutionPortDispatch::kEffectUncertain, trace_garbage); } catch (...) {}
+              ExecutionPortDispatch::kEffectUncertain, trace_garbage,
+              active_key.has_value(), start); } catch (...) {}
     }
     return uncertain(error.what());
   }
+  if (experiment) {
+    // EXPERIMENTAL diagnostics for the live harness, one line per replacement:
+    // the wire policy actually sent (each control labelled on its own; more
+    // than one active is a combined producer policy) and what arrival and
+    // install are computed from, with the controller_state stamps.
+    const auto hold = [&] {
+      switch (experiment->release_hold) {
+      case ExecutionReleaseHold::kHeld: return "held";
+      case ExecutionReleaseHold::kMissed: return "missed";
+      case ExecutionReleaseHold::kDeadline: return "deadline";
+      case ExecutionReleaseHold::kNone: break;
+      }
+      return "none";
+    }();
+    const bool timer = experiment->release_local_ns.has_value();
+    const int controls = (timer ? 1 : 0) + (experiment->midtick_stamp ? 1 : 0) +
+                         (experiment->v0_payload ? 1 : 0) +
+                         (experiment->spring_back_fast ? 1 : 0) +
+                         (experiment->start_allowance_override ? 1 : 0);
+    const auto written = std::fprintf(
+        stderr,
+        "manyforge_replacement_experiment goal=%.160s generation=%llu "
+        "producer_policy=%s release_policy=%s stamp_policy=%s payload_policy=%s "
+        "release_hold=%s source_stamp_ns=%lld target_tick_ns=%lld stamp_ns=%lld "
+        "planned_release_ns=%lld send_ns=%lld returned_ns=%lld "
+        "expected_latency_ns=%lld start_allowance_ns=%lld allowance_override=%d factor=%.17g\n",
+        key.controller_goal_id.value().c_str(),
+        static_cast<unsigned long long>(key.controller_goal_generation.value()),
+        controls > 1 ? "combined" : "single", timer ? "timer" : "immediate",
+        experiment->midtick_stamp ? "midtick" : "grid",
+        experiment->spring_back_fast ? "spring_back_fast_v0"
+        : experiment->v0_payload     ? "v0"
+                                     : "v6_prefix",
+        hold, static_cast<long long>(experiment->source_stamp_ns),
+        static_cast<long long>(experiment->target_tick_ns),
+        static_cast<long long>(start->controller_start_stamp_ns),
+        static_cast<long long>(experiment->release_local_ns.value_or(0)),
+        static_cast<long long>(send_ns), static_cast<long long>(state_->clock.now()),
+        static_cast<long long>(experiment->expected_latency_ns),
+        static_cast<long long>(experiment->start_allowance_ns),
+        experiment->start_allowance_override ? 1 : 0, experiment->factor);
+    static_cast<void>(written);
+  }
   if (state_->config.motion_trace) {
     try { state_->config.motion_trace->Attach(trace_token, std::move(goal), state_->clock.now(),
-            ExecutionPortDispatch::kDispatched, trace_garbage); } catch (...) {}
+            ExecutionPortDispatch::kDispatched, trace_garbage,
+            active_key.has_value(), start); } catch (...) {}
   }
   return sent();
 }

@@ -15,6 +15,7 @@
 #include <algorithm>
 #include <atomic>
 #include <chrono>
+#include <cstdlib>
 #include <map>
 #include <memory>
 #include <mutex>
@@ -587,7 +588,7 @@ TEST(RetainedRos2ControlBackendFactoryTest,
     config.node_name = "invalid/node/name";
     if (foreign_owner)
       config.measured_receiver_clock = std::make_shared<core::FakeClock>();
-    auto handle = std::make_shared<RetainedRos2ControlRuntimeHandle>();
+    auto handle = RetainedRos2ControlRuntimeHandle::Create();
     auto factory = make_retained_ros2_control_backend_factory(
         std::move(config), handle);
     try {
@@ -615,7 +616,7 @@ TEST(RetainedRos2ControlBackendFactoryTest,
   auto config = test_factory_config(false);
   const auto motion_channel = test_projected_channel(
       motion, retained_ros2_control_motion_state_config(config), clock);
-  auto handle = std::make_shared<RetainedRos2ControlRuntimeHandle>();
+  auto handle = RetainedRos2ControlRuntimeHandle::Create();
   auto factory = make_retained_ros2_control_backend_factory(
       std::move(config), handle);
   const auto backend = factory(motion, std::nullopt, motion_channel, nullptr,
@@ -630,7 +631,7 @@ TEST(RetainedRos2ControlBackendFactoryTest,
   const auto sink = std::make_shared<NullExecutionStateSink>();
   auto resources = make_test_transport_resources(
       "manyforge_bind_clock_fixture", sink, clock);
-  auto handle = std::make_shared<RetainedRos2ControlRuntimeHandle>();
+  auto handle = RetainedRos2ControlRuntimeHandle::Create();
   bool participant_constructed = false;
   const auto bound = handle->Bind(
       std::move(resources), clock, test_arm_transport("/manyforge/robot_1"),
@@ -671,7 +672,7 @@ TEST(RetainedRos2ControlBackendFactoryTest,
         motion, retained_ros2_control_motion_state_config(config), *clock);
     auto gripper_channel = test_projected_channel(
         tool, retained_ros2_control_gripper_state_config(tool), *clock);
-    auto handle = std::make_shared<RetainedRos2ControlRuntimeHandle>();
+    auto handle = RetainedRos2ControlRuntimeHandle::Create();
     const std::weak_ptr<RetainedRos2ControlRuntimeHandle> weak_handle = handle;
     auto factory = make_retained_ros2_control_backend_factory(
         std::move(config), handle);
@@ -728,7 +729,7 @@ struct InitialRosInstallationFixture final {
   core::IExecutionBackend *backend = nullptr;
   ros2_control_execution::Ros2GripperCommandBackend *gripper = nullptr;
   std::shared_ptr<RetainedRos2ControlRuntimeHandle> handle =
-      std::make_shared<RetainedRos2ControlRuntimeHandle>();
+      RetainedRos2ControlRuntimeHandle::Create();
   // The test-only receipt engine borrows the handle's transport resources.
   std::unique_ptr<ros2_control_execution::Ros2GripperCommandBackend>
       receipt_engine_backend;
@@ -1014,7 +1015,7 @@ struct GripperOnlyInstallationFixture final {
   std::shared_ptr<RetainedObservedStateChannel> channel = test_projected_channel(
       tool, retained_ros2_control_gripper_state_config(tool), clock);
   std::shared_ptr<RetainedRos2ControlRuntimeHandle> handle =
-      std::make_shared<RetainedRos2ControlRuntimeHandle>();
+      RetainedRos2ControlRuntimeHandle::Create();
   std::shared_ptr<core::IGripperCommandBackend> gripper =
       make_retained_ros2_control_gripper_backend(
           gripper_only_factory_config(tool.value().controllable_component_id.value()),
@@ -1143,7 +1144,7 @@ TEST(RetainedRos2ControlBackendFactoryTest,
   for (const int invalid : {0, 1, 2, 3}) {
     SCOPED_TRACE(invalid);
     auto config = gripper_only_factory_config();
-    auto handle = std::make_shared<RetainedRos2ControlRuntimeHandle>();
+    auto handle = RetainedRos2ControlRuntimeHandle::Create();
     if (invalid == 0) config.measured_receiver_clock = std::make_shared<core::FakeClock>();
     if (invalid == 2)
       config.successor_occurrence = core::SelectedControllerOccurrenceDTO{
@@ -1224,7 +1225,7 @@ TEST(RetainedRos2ControlBackendFactoryTest,
   const auto binding = commanded_gripper_binding();
   auto channel = test_projected_channel(
       binding, retained_ros2_control_gripper_state_config(binding), *clock);
-  auto handle = std::make_shared<RetainedRos2ControlRuntimeHandle>();
+  auto handle = RetainedRos2ControlRuntimeHandle::Create();
   auto config = gripper_only_factory_config();
   config.measured_receiver_clock = clock;
   auto backend = make_retained_ros2_control_gripper_backend(
@@ -1901,6 +1902,81 @@ TEST(RetainedRos2ControlBackendFactoryTest,
             "measured_source_coordinate_mapping_invalid");
 }
 
+class ReplacementAllowanceEnvironment {
+public:
+  static constexpr const char *name =
+      "MANYFORGE_EXPERIMENTAL_REPLACEMENT_START_ALLOWANCE_MS";
+  ReplacementAllowanceEnvironment() {
+    if (const auto *value = std::getenv(name)) previous_ = value;
+    set(nullptr);
+  }
+  ~ReplacementAllowanceEnvironment() {
+    set(previous_ ? previous_->c_str() : nullptr);
+  }
+  void set(const char *value) {
+    if (value) static_cast<void>(::setenv(name, value, 1));
+    else static_cast<void>(::unsetenv(name));
+  }
+private:
+  std::optional<std::string> previous_;
+};
+
+TEST(RetainedRos2ControlBackendFactoryTest,
+     MockReplacementAllowanceDefaultsOverridesAndLogsWithoutTimingFlags) {
+  ReplacementAllowanceEnvironment env;
+  const auto build = [] {
+    return make_retained_mock_ros2_control_backend_config(
+        mock_runtime_configuration("lite6_lite_gripper"), commanded_binding(),
+        commanded_gripper_binding(), kMockCancel);
+  };
+  testing::internal::CaptureStderr();
+  const auto baseline = build();
+  EXPECT_EQ(testing::internal::GetCapturedStderr(), "");
+  EXPECT_DOUBLE_EQ(*baseline.participant.stop.replacement_start_allowance_s, 0.020);
+  EXPECT_FALSE(baseline.arm.adapter.lane_facts.experiment.any());
+  for (const char *value : {"20", "30", "40", "200"}) {
+    SCOPED_TRACE(value);
+    env.set(value);
+    testing::internal::CaptureStderr();
+    const auto configured = build();
+    const auto log = testing::internal::GetCapturedStderr();
+    EXPECT_DOUBLE_EQ(*configured.participant.stop.replacement_start_allowance_s,
+                     std::stod(value) / 1000.0);
+    const auto &flags = configured.arm.adapter.lane_facts.experiment;
+    EXPECT_TRUE(flags.any());
+    EXPECT_TRUE(flags.start_allowance_override);
+    EXPECT_FALSE(flags.release_timer || flags.midtick_stamp || flags.v0_payload ||
+                 flags.scheduled_spring_back_fast);
+    EXPECT_NE(log.find("manyforge_replacement_start_allowance component=robot_1 allowance_ms=" +
+                       std::string(value)), std::string::npos);
+  }
+}
+
+TEST(RetainedRos2ControlBackendFactoryTest,
+     MockReplacementAllowanceRejectsInvalidInputButDoesNotAffectIsaac) {
+  ReplacementAllowanceEnvironment env;
+  for (const char *value : {"", "0", "-1", "200.001", "nan", "inf", "-inf",
+                            "1e309", "twenty", "20x"}) {
+    SCOPED_TRACE(value);
+    env.set(value);
+    try {
+      static_cast<void>(make_retained_mock_ros2_control_backend_config(
+          mock_runtime_configuration("lite6_lite_gripper"), commanded_binding(),
+          commanded_gripper_binding(), kMockCancel));
+      FAIL() << "Invalid allowance was accepted";
+    } catch (const std::invalid_argument &error) {
+      EXPECT_NE(std::string(error.what()).find(ReplacementAllowanceEnvironment::name),
+                std::string::npos);
+      EXPECT_NE(std::string(error.what()).find("(0, 200]"), std::string::npos);
+    }
+  }
+  // The same invalid experimental environment is never read by the Isaac lane.
+  const auto isaac = make_retained_isaac_ros2_control_backend_config(
+      isaac_runtime_configuration("lite6"), commanded_binding(), commanded_gripper_binding());
+  EXPECT_DOUBLE_EQ(*isaac.participant.stop.replacement_start_allowance_s, 0.020);
+  EXPECT_FALSE(isaac.arm.adapter.lane_facts.experiment.any());
+}
+
 TEST(RetainedRos2ControlBackendFactoryTest,
      Lite6MockProfileUsesIsaacLaneFactsAndItsOwnControllers) {
   const auto config = make_retained_mock_ros2_control_backend_config(
@@ -2070,7 +2146,7 @@ TEST(
   const auto tool = commanded_gripper_binding();
   auto channel = test_projected_channel(
       tool, retained_ros2_control_gripper_state_config(tool), clock);
-  auto handle = std::make_shared<RetainedRos2ControlRuntimeHandle>();
+  auto handle = RetainedRos2ControlRuntimeHandle::Create();
   auto config = gripper_only_factory_config();
   config.arm.gripper_controller.reset();
   config.gripper->actuation_kind = core::GripperActuationKind::kPneumatic;
@@ -2158,24 +2234,24 @@ TEST(RetainedRos2ControlBackendFactoryTest,
   none.gripper->completion_policy = "no_output";
   EXPECT_THROW(static_cast<void>(make_retained_ros2_control_gripper_backend(
                    none, tool, foreign_channel, clock, scheduler,
-                   std::make_shared<RetainedRos2ControlRuntimeHandle>())),
+                   RetainedRos2ControlRuntimeHandle::Create())),
                std::invalid_argument);
   auto physical = none;
   physical.arm.gripper_controller = RetainedRos2ControlArmController{};
   EXPECT_THROW(static_cast<void>(make_retained_ros2_control_gripper_backend(
                    physical, tool, channel, clock, scheduler,
-                   std::make_shared<RetainedRos2ControlRuntimeHandle>())),
+                   RetainedRos2ControlRuntimeHandle::Create())),
                std::invalid_argument);
   auto commanded = none;
   commanded.gripper->output_mode = core::GripperOutputMode::kCommanded;
   EXPECT_THROW(static_cast<void>(make_retained_ros2_control_gripper_backend(
                    commanded, tool, channel, clock, scheduler,
-                   std::make_shared<RetainedRos2ControlRuntimeHandle>())),
+                   RetainedRos2ControlRuntimeHandle::Create())),
                std::invalid_argument);
   commanded.arm.gripper_controller = gripper_only_factory_config().arm.gripper_controller;
   EXPECT_THROW(static_cast<void>(make_retained_ros2_control_gripper_backend(
                    commanded, tool, channel, clock, scheduler,
-                   std::make_shared<RetainedRos2ControlRuntimeHandle>())),
+                   RetainedRos2ControlRuntimeHandle::Create())),
                std::invalid_argument);
 }
 
