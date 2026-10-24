@@ -6,7 +6,7 @@ import {
   programWorkspaceReducer,
 } from './programWorkspace';
 
-it('keeps the draft and reports a refused edit without an error or success', () => {
+it('keeps the draft and reports a refused edit as a persistent dismissible error', () => {
   const current = workspace('draft-1', 7);
   const ready = programWorkspaceReducer(INITIAL_PROGRAM_WORKSPACE_STATE, {
     type: 'request_succeeded', generation: 0, workspace: current,
@@ -17,10 +17,15 @@ it('keeps the draft and reports a refused edit without an error or success', () 
     type: 'request_refused', generation: 1, message: 'Edit not applied',
   });
   expect(refused.workspace).toBe(current);
-  expect(refused.error).toBeNull();
-  expect(refused.message).toBe('Edit not applied');
+  expect(refused.error).toBe('Edit not applied');
+  expect(refused.message).toBeNull();
   expect(refused.pendingAction).toBeNull();
   expect(refused.transitionStatus).toBeNull();
+  const synchronized = programWorkspaceReducer(refused, {
+    type: 'authoring_synced', workspace: workspace('draft-1', 8),
+  });
+  expect(synchronized.error).toBe('Edit not applied');
+  expect(programWorkspaceReducer(synchronized, { type: 'clear_feedback' }).error).toBeNull();
 });
 
 function workspace(draftId: string, revision: number): ProgramWorkspaceResponse {

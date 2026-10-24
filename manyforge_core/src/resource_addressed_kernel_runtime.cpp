@@ -2442,10 +2442,8 @@ ResourceAddressedExecutionKernel::bind_captured_node_io_rule(
       *plan.escalation_stages.front().default_contract_parameters, binding.resources,
       selected->policy_id.value());
   if (!profile.ok()) return Reply::Err(profile.error());
-  auto requested_profile = profile.value();
-  requested_profile.stop_mode = semantics.stop_mode;
-  const auto nominal = ValidateIoRuleNominalStopMode(plan, requested_profile);
-  if (!nominal.ok()) return Reply::Err(nominal.error());
+  profile = SelectIoRuleStopProfile(profile.value(), semantics.stop_mode);
+  if (!profile.ok()) return Reply::Err(profile.error());
   std::vector<IoRuleStopEntryRowDTO> rows;
   rows.reserve(plan.escalation_stages.size());
   for (const auto& stage : plan.escalation_stages)

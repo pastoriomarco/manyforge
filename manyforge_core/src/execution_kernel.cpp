@@ -3085,12 +3085,6 @@ ExecutionKernel::assemble_prepared_motion_participant(
         (fault && action->success_through_stage_id))
       return reject("prepared_motion_interrupt_stop_profile_invalid",
                     "Interrupt profile does not match its admitted action");
-    if (desired) {
-      const auto mode = ValidateIoRuleNominalStopMode(
-          authority.stop_readiness.value().resolved_stop_base_plan, *scope.stop_profile);
-      if (!mode.ok())
-        return Result<std::shared_ptr<const PreparedOperationParticipantDTO>>::Err(mode.error());
-    }
     auto stop_plan = [&]() -> Result<PreparedParticipantStopPlanDTO> {
       if (fault) {
         if (!authority.ordinary_stop_plan)

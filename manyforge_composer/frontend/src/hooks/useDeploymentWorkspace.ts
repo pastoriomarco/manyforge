@@ -247,7 +247,7 @@ export function useDeploymentWorkspace(
       // refresh below, so it is never handled as a plain refusal.
       const refusal = isStaleWorkspaceError(reason) ? null : authoringRefusalMessage(reason);
       if (refusal !== null) {
-        if (mounted.current) setFeedback(refusal);
+        if (mounted.current) setError(refusal);
         return null;
       }
       if (isStaleWorkspaceError(reason)) {
@@ -344,7 +344,7 @@ export function useDeploymentWorkspace(
       // refresh below, so it is never handled as a plain refusal.
       const refusal = isStaleWorkspaceError(reason) ? null : authoringRefusalMessage(reason);
       if (refusal !== null) {
-        if (mounted.current) setFeedback(refusal);
+        if (mounted.current) setError(refusal);
         return null;
       }
       if (isStaleWorkspaceError(reason)) {

@@ -198,6 +198,8 @@ template <typename Predicate>
       core::ProgramFrameRoleBindingDTO{
           core::FrameRoleId("base"), core::ModelInstanceId("robot.model"),
           core::ModelRevision("model-revision"), "base"});
+  value.motion_endpoint = core::RuntimeMotionEndpointBindingDTO{
+      value.target_role_id, value.command_target_id, value.frame_bindings.back(), {}};
   auto &path = *value.control_path;
   path.control_domain_revision = core::ControlDomainRevision(Sha('8'));
   path.control_binding_revision = core::ControlBindingRevision(Sha('9'));

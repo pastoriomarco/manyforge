@@ -660,7 +660,7 @@ Result<void> ValidateParticipantStopStageResult(
       const auto& profile = result.request.participant_stop_plan.participant_stop_profile;
       const auto actual = *result.actual_provider_contract_mode;
       if (!result.recoverable_substitution_reason.has_value() || !contract.has_value() ||
-          !profile.has_value() || contract->requested_stop_mode != *expected_mode ||
+          !profile.has_value() ||
           std::find(contract->fallback_stop_modes.begin(), contract->fallback_stop_modes.end(),
                     actual) == contract->fallback_stop_modes.end() ||
           std::none_of(profile->fallback_stop_modes.begin(), profile->fallback_stop_modes.end(),

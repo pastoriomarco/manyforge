@@ -2,6 +2,7 @@
 
 #include <filesystem>
 #include <fstream>
+#include <manyforge_core/io_rule_stop_response.hpp>
 #include <manyforge_core/prepared_participant_stop_plan_codec.hpp>
 #include <manyforge_core/resolved_stop_base_plan_codec.hpp>
 #include <manyforge_core/runtime_participant_binding.hpp>
@@ -128,16 +129,20 @@ namespace {
   return limits;
 }
 
-[[nodiscard]] PreparedParticipantStopPlanDTO Plan(const ResolvedStopBasePlanDTO& base,
-                                                  const RuntimeParticipantBinding& binding) {
+[[nodiscard]] PreparedParticipantStopPlanDTO Plan(
+    const ResolvedStopBasePlanDTO& base, const RuntimeParticipantBinding& binding,
+    std::optional<MotionInterruptStopProfileDTO> profile = std::nullopt) {
   const auto plan = MakePreparedParticipantStopPlan(
       base,
       PreparedParticipantStopPlanContextDTO{
           OperationId("operation.1"), OperationRevision(4U),
           OperationParticipantId("participant.1"), binding.value().program_id,
           binding.value().program_revision, binding.value().program_binding_id,
-          ProgramRunId("program-run.1"), std::nullopt, ParticipantStopProfilePurposeDTO::kOrdinary,
-          std::nullopt, MotionInterruptNodeCategory::kGeneric},
+          ProgramRunId("program-run.1"), profile,
+          profile ? ParticipantStopProfilePurposeDTO::kMotionInterruptScope
+                  : ParticipantStopProfilePurposeDTO::kOrdinary,
+          profile ? std::optional<std::string>("scope.selected") : std::nullopt,
+          MotionInterruptNodeCategory::kGeneric},
       binding.value().resources, DefaultLimits());
   EXPECT_TRUE(plan.ok()) << plan.error().message;
   return plan.value();
@@ -166,10 +171,25 @@ struct ExactFixture final {
   ResolvedParticipantStopStageDTO stage;
 };
 
-[[nodiscard]] ExactFixture Fixture(const std::size_t stage_index = 0U) {
+[[nodiscard]] ExactFixture Fixture(
+    const std::size_t stage_index = 0U,
+    std::optional<MotionInterruptStopProfileDTO> profile = std::nullopt) {
   auto base = BasePlan();
+  if (profile &&
+      std::find(profile->fallback_stop_modes.begin(), profile->fallback_stop_modes.end(),
+                MotionInterruptStopMode::kSpringBackFast) != profile->fallback_stop_modes.end()) {
+    auto& fallbacks =
+        base.escalation_stages.front()
+            .command_qualification.controlled_substitution_contract->fallback_stop_modes;
+    if (std::find(fallbacks.begin(), fallbacks.end(), MotionControlledStopMode::kSpringBackFast) ==
+        fallbacks.end())
+      fallbacks.push_back(MotionControlledStopMode::kSpringBackFast);
+    auto remade = MakeResolvedStopBasePlan(std::move(base));
+    EXPECT_TRUE(remade.ok()) << remade.error().message;
+    base = std::move(remade.value());
+  }
   auto binding = Binding(base);
-  auto plan = Plan(base, binding);
+  auto plan = Plan(base, binding, std::move(profile));
   const auto& selected = plan.stage_commands.at(stage_index).resolved_stage;
   ResolvedParticipantStopStageDTO stage{StopId("stop.1"),
                                         StopGeneration(7U),
@@ -432,6 +452,33 @@ TEST(ParticipantStopStageTest, RequiresAnExplainedDeclaredSubstitution) {
 
   result = Success(fixture.stage);
   result.recoverable_substitution_reason = "reason_without_mode_change";
+  EXPECT_FALSE(ValidateResult(fixture, result).ok());
+}
+
+TEST(ParticipantStopStageTest, SelectedPrimaryAcceptsItsQualifiedConfiguredLowerFallback) {
+  MotionInterruptStopProfileDTO defaults;
+  defaults.profile_id = "deployment.arm.stop";
+  defaults.stop_mode = MotionInterruptStopMode::kSoftOnPath;
+  defaults.deceleration_time_s = 0.5;
+  defaults.per_joint_max_deceleration = {{"joint_1", AngularAccelerationDTO{2.0}},
+                                         {"joint_2", AngularAccelerationDTO{2.0}}};
+  defaults.fallback_stop_modes = {MotionInterruptStopMode::kSpringBackHold,
+                                  MotionInterruptStopMode::kSpringBackFast};
+  defaults.jerk_limits_enabled = false;
+  const auto selected = SelectIoRuleStopProfile(defaults, MotionInterruptStopMode::kSpringBackHold);
+  ASSERT_TRUE(selected.ok()) << selected.error().message;
+  ASSERT_EQ(selected.value().fallback_stop_modes,
+            (std::vector{MotionInterruptStopMode::kSpringBackFast}));
+  const auto fixture = Fixture(0U, selected.value());
+  auto result = Success(fixture.stage);
+  result.actual_provider_contract_mode = MotionControlledStopMode::kSpringBackFast;
+  result.recoverable_substitution_reason = "selected_hold_unavailable";
+  EXPECT_TRUE(ValidateResult(fixture, result).ok());
+
+  result.recoverable_substitution_reason.reset();
+  EXPECT_FALSE(ValidateResult(fixture, result).ok());
+  result.recoverable_substitution_reason = "mode_above_selected";
+  result.actual_provider_contract_mode = MotionControlledStopMode::kSoftOnPath;
   EXPECT_FALSE(ValidateResult(fixture, result).ok());
 }
 

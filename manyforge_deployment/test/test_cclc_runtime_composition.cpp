@@ -1065,8 +1065,7 @@ TEST(CCLCRuntimeComposition,
       previous,
       component,
       current.value().provider_occurrences.front(),
-      current.value().domains.front(),
-      [](const auto &, auto) { return true; }};
+      current.value().domains.front()};
   bool invoked{};
   const auto reset = composition.value()->WithProgramResetPositionScope(
       request, [&](const auto &) -> core::Result<void> {
@@ -1143,9 +1142,8 @@ TEST(CCLCRuntimeComposition, ExchangesVerifiedNonemptyToEmptyOnSameFacadeAndReta
 
   // Materialize a real populated predecessor for the same cell; no graph or
   // retained identity is spliced to manufacture an empty successor.
-  const auto retained = test::materialize_lite6_retained_consumer_fixture_from(
-      root.path(), test::make_lite6_controllable_retention_fixture(false, false, 1U, false, false,
-                                                                   empty_graph.cell_id.value()));
+  const auto retained = test::materialize_lite6_ros2_control_motion_retained_consumer_fixture_for_cell(
+      root.path(), empty_graph.cell_id.value());
   const auto previous = publication(*retained.bundle);
   const auto& graph = retained.bundle->value().cell_graph;
   ASSERT_FALSE(graph.controllable_components.empty());

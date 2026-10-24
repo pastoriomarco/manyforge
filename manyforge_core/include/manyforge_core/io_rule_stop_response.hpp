@@ -19,8 +19,10 @@ namespace manyforge::core {
     std::span<const IoRuleStopEntryRowDTO> rows,
     const std::optional<StopEscalationStageId>& entry_stage_id,
     const std::optional<StopEscalationStageId>& success_through_stage_id);
-[[nodiscard]] Result<void> ValidateIoRuleNominalStopMode(
-    const JsonObjectDTO& nominal_defaults, const MotionInterruptStopProfileDTO& profile);
+/// Select a node's primary mode using the robot's limits and only its enabled
+/// lower fallbacks. The Deployment's ordinary Stop profile is unchanged.
+[[nodiscard]] Result<MotionInterruptStopProfileDTO> SelectIoRuleStopProfile(
+    const MotionInterruptStopProfileDTO& defaults, MotionInterruptStopMode mode);
 
 /// Resolve only inside an already qualified immutable prepared chain. No stage
 /// is removed or renumbered, and the software floor must remain reachable.
@@ -36,10 +38,5 @@ namespace manyforge::core {
 [[nodiscard]] Result<void> VerifyPreparedIoRuleSuccessThrough(
     const PreparedParticipantStopPlanDTO& plan, const IoRulePreparedStopEntryDTO& entry,
     const IoRulePreparedStopEntryDTO& success_through);
-
-/// Requested node mode equals the retained nominal row. Existing qualified
-/// soft-to-spring substitution remains an internal execution of that same row.
-[[nodiscard]] Result<void> ValidateIoRuleNominalStopMode(
-    const ResolvedStopBasePlanDTO& plan, const MotionInterruptStopProfileDTO& profile);
 
 }  // namespace manyforge::core

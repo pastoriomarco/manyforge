@@ -60,6 +60,9 @@ public:
                                              state.exact_configuration_seen));
     return result;
   }
+  static void RefreshEndpointFacts(RetainedRos2ControlRuntimeHandle &handle) {
+    handle.RefreshEndpointFacts();
+  }
   /// Holds the handle's state lock: a poll that reads handle state blocks
   /// inside it while holding its handle lease.
   [[nodiscard]] static std::unique_lock<std::mutex>
@@ -692,8 +695,15 @@ TEST(RetainedRos2ControlRuntimeHandleTest,
                            "external.controller_configuration_ready"),
             false);
   EXPECT_TRUE(world.manager.Requests().empty());
-  ASSERT_TRUE(world.Dispatch("prepare", "domain.arm").known ==
-              core::LifecyclePrimitiveKnownResultDTO::kSucceeded);
+  ASSERT_TRUE(fake::WaitUntil([&] {
+    static_cast<void>(world.Snapshot("domain.arm"));
+    const auto health = world.handle->ReadLifecycleHealth(
+        core::ControlDomainId("domain.arm"), world.clock.now());
+    return health.ok() && health.value().observed_state == State::kDeclared;
+  }));
+  const auto arm_prepared = world.Dispatch("prepare", "domain.arm");
+  ASSERT_EQ(arm_prepared.known, core::LifecyclePrimitiveKnownResultDTO::kSucceeded)
+      << (arm_prepared.error ? arm_prepared.error->message : std::string{"no error detail"});
   ASSERT_TRUE(world.Dispatch("prepare").known ==
               core::LifecyclePrimitiveKnownResultDTO::kSucceeded);
   ASSERT_TRUE(world.WaitForState(State::kPrepared));
@@ -1947,9 +1957,28 @@ TEST(RetainedRos2ControlRuntimeHandleTest,
   const auto before =
       RetainedRos2ControlRuntimeHandleTestAccess::Capture(*world.handle);
   const auto domain = core::ControlDomainId("domain.arm");
+  const auto read_settled_health = [&] {
+    core::Result<core::LifecycleDomainHealthDTO> result;
+    const bool settled = fake::WaitUntil([&] {
+      RetainedRos2ControlRuntimeHandleTestAccess::RefreshEndpointFacts(*world.handle);
+      const auto bookkeeping =
+          RetainedRos2ControlRuntimeHandleTestAccess::Capture(*world.handle);
+      result = world.handle->ReadLifecycleHealth(domain, world.clock.now());
+      EXPECT_EQ(RetainedRos2ControlRuntimeHandleTestAccess::Capture(*world.handle),
+                bookkeeping);
+      return result.ok() || result.error().code != "component_instance_graph_unsettled";
+    });
+    if (!settled || !result.ok()) {
+      std::ostringstream diagnostic;
+      diagnostic << result.error().code << ": " << result.error().message;
+      for (const auto &[key, value] : result.error().details)
+        diagnostic << '\n' << key << '=' << value;
+      ADD_FAILURE() << diagnostic.str();
+    }
+    return result;
+  };
   for (int read = 0; read < 3; ++read) {
-    const auto health =
-        world.handle->ReadLifecycleHealth(domain, world.clock.now());
+    const auto health = read_settled_health();
     ASSERT_TRUE(health.ok()) << health.error().message;
     EXPECT_EQ(health.value().observed_state, State::kDeclared);
     EXPECT_TRUE(health.value().locally_valid());
@@ -1958,16 +1987,14 @@ TEST(RetainedRos2ControlRuntimeHandleTest,
             before);
   EXPECT_EQ(world.manager.switch_requests(), 0U);
   const auto first = world.Snapshot();
-  const auto same =
-      world.handle->ReadLifecycleHealth(domain, world.clock.now());
+  const auto same = read_settled_health();
   ASSERT_TRUE(same.ok());
   EXPECT_EQ(same.value().observed_state, first.component_state);
   EXPECT_EQ(same.value().facts, first.facts);
   const auto observed =
       RetainedRos2ControlRuntimeHandleTestAccess::Capture(*world.handle);
   guard_fault = "actual cached guard fault";
-  const auto fault =
-      world.handle->ReadLifecycleHealth(domain, world.clock.now());
+  const auto fault = read_settled_health();
   ASSERT_TRUE(fault.ok());
   EXPECT_EQ(fault.value().observed_state, State::kFaulted);
   EXPECT_EQ(RetainedRos2ControlRuntimeHandleTestAccess::Capture(*world.handle),
@@ -3707,10 +3734,17 @@ TEST(RetainedRos2ControlRuntimeHandleTest,
     world.handle->InstallSampleObserver(
         [](const core::ExecutionControllerSampleDTO &) {});
     world.handle->StartBackend();
+    ASSERT_TRUE(fake::WaitUntil([&] {
+      static_cast<void>(world.Snapshot());
+      const auto health = world.handle->ReadLifecycleHealth(
+          core::ControlDomainId("domain.arm"), world.clock.now());
+      return health.ok() && health.value().observed_state == State::kDeclared;
+    }));
     ASSERT_TRUE(fake::WaitUntil(
         [&] { return world.handle->mock_reset_writer_inactive(); }));
-    ASSERT_EQ(world.handle->ActivateArmController({}).outcome,
-              Outcome::kSucceeded);
+    const auto activated = world.handle->ActivateArmController({});
+    ASSERT_EQ(activated.outcome, Outcome::kSucceeded)
+        << (activated.error ? activated.error->message : std::string{"no error detail"});
     ASSERT_TRUE(world.WaitForState(State::kActive));
     rclcpp::Publisher<control_msgs::msg::JointTrajectoryControllerState>::SharedPtr conflict;
     bool checked_availability = false;

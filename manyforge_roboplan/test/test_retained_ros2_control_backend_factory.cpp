@@ -1906,24 +1906,31 @@ class ReplacementAllowanceEnvironment {
 public:
   static constexpr const char *name =
       "MANYFORGE_EXPERIMENTAL_REPLACEMENT_START_ALLOWANCE_MS";
-  ReplacementAllowanceEnvironment() {
-    if (const auto *value = std::getenv(name)) previous_ = value;
+  explicit ReplacementAllowanceEnvironment(const char *variable = name)
+      : variable_(variable) {
+    if (const auto *value = std::getenv(variable_)) previous_ = value;
     set(nullptr);
   }
   ~ReplacementAllowanceEnvironment() {
     set(previous_ ? previous_->c_str() : nullptr);
   }
   void set(const char *value) {
-    if (value) static_cast<void>(::setenv(name, value, 1));
-    else static_cast<void>(::unsetenv(name));
+    if (value) static_cast<void>(::setenv(variable_, value, 1));
+    else static_cast<void>(::unsetenv(variable_));
   }
 private:
+  const char *variable_;
   std::optional<std::string> previous_;
 };
 
 TEST(RetainedRos2ControlBackendFactoryTest,
      MockReplacementAllowanceDefaultsOverridesAndLogsWithoutTimingFlags) {
   ReplacementAllowanceEnvironment env;
+  ReplacementAllowanceEnvironment release_timer("MANYFORGE_EXPERIMENTAL_RELEASE_TIMER");
+  ReplacementAllowanceEnvironment midtick_stamp("MANYFORGE_EXPERIMENTAL_MIDTICK_STAMP");
+  ReplacementAllowanceEnvironment v0_payload("MANYFORGE_EXPERIMENTAL_V0_PAYLOAD");
+  ReplacementAllowanceEnvironment scheduled_spring_back(
+      "MANYFORGE_EXPERIMENTAL_SCHEDULED_SPRING_BACK_FAST");
   const auto build = [] {
     return make_retained_mock_ros2_control_backend_config(
         mock_runtime_configuration("lite6_lite_gripper"), commanded_binding(),

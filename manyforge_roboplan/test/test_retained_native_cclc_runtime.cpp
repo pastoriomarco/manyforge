@@ -400,6 +400,9 @@ make_runtime_context(
       std::move(planner_paths),
       std::move(runtime_unit_epochs),
       {}};
+  if (motion)
+    candidate.motion_endpoint = core::RuntimeMotionEndpointBindingDTO{
+        candidate.target_role_id, candidate.command_target_id, candidate.frame_bindings.back(), {}};
   auto sealed = core::verify_runtime_participant_binding(std::move(candidate));
   if (!sealed.ok()) {
     throw std::runtime_error(sealed.error().message);
@@ -1727,13 +1730,6 @@ private:
                      "fake prepared scope has no Stop profile",
                      {{"reason", "stop_profile_missing"}}});
       }
-      if (desired) {
-        const auto mode = ValidateIoRuleNominalStopMode(
-            authority.stop_readiness.value().resolved_stop_base_plan,
-            *scope.stop_profile);
-        if (!mode.ok())
-          return Result<PreparedOperationParticipantDTO>::Err(mode.error());
-      }
       PreparedParticipantStopPlanContextDTO context{
           request.binding.operation_id,
           authority.operation_revision,
@@ -2541,8 +2537,29 @@ void CheckCapturedNodeExecution(
   ASSERT_TRUE(capture.ok()) << capture.error().message;
   ASSERT_NE(capture.value().io_conditions, nullptr);
   ASSERT_EQ(capture.value().io_conditions->program_node_conditions.size(), 1U);
-  const auto &node =
-      capture.value().io_conditions->program_node_conditions.front();
+  const auto &retained_nominal = physical.stop_readiness.value()
+                                     .resolved_stop_base_plan
+                                     .escalation_stages.front();
+  ASSERT_TRUE(retained_nominal.default_contract_parameters);
+  const auto retained_profile =
+      core::map_motion_controlled_stop_contract_parameters_to_profile(
+          *retained_nominal.default_contract_parameters,
+          physical.participant_binding.value().resources,
+          "captured.fixture.default");
+  ASSERT_TRUE(retained_profile.ok()) << retained_profile.error().message;
+  ASSERT_EQ(retained_profile.value().stop_mode,
+            core::MotionInterruptStopMode::kSoftOnPath);
+  auto selected_capture = capture.value();
+  auto selected_conditions =
+      std::make_shared<core::ProgramIoConditionProjectionDTO>(
+          *selected_capture.io_conditions);
+  auto &node = selected_conditions->program_node_conditions.front();
+  ASSERT_TRUE(node.node_rule);
+  // Exercise the actual captured-registration boundary with a node-selected
+  // primary distinct from the retained Deployment default (soft_on_path).
+  node.node_rule->stop_mode =
+      core::MotionInterruptStopMode::kSpringBackHold;
+  selected_capture.io_conditions = std::move(selected_conditions);
   auto made = core::IoSignalSubsystem::Create(
       {kernel_owner, 1U, {}}, {1U, 1U, 16U, 8U, 512U, 1024U}, clock);
   ASSERT_TRUE(made.ok()) << made.error().message;
@@ -2554,7 +2571,7 @@ void CheckCapturedNodeExecution(
                                                  identity.graph_revision)
                   .ok());
 
-  ASSERT_TRUE(kernel.register_program_run_capture(capture.value()).ok());
+  ASSERT_TRUE(kernel.register_program_run_capture(selected_capture).ok());
   const auto held = kernel.get_program_execution_scope(run);
   ASSERT_TRUE(held.ok());
   const core::ProgramExecutionSelectionRequestDTO start{
@@ -2587,10 +2604,10 @@ void CheckCapturedNodeExecution(
       identity.program_binding_id,
       identity.retained_bundle_id,
       identity.graph_revision,
-      capture.value().binding,
-      capture.value().blackboard_key_declarations,
-      capture.value().io_conditions,
-      capture.value().io_conditions->referenced_program_blackboard_keys,
+      selected_capture.binding,
+      selected_capture.blackboard_key_declarations,
+      selected_capture.io_conditions,
+      selected_capture.io_conditions->referenced_program_blackboard_keys,
       1024U};
   ASSERT_TRUE(
       kernel.InstallAppliedProgramBlackboardContext(context, service).ok());
@@ -2630,6 +2647,12 @@ void CheckCapturedNodeExecution(
   EXPECT_EQ(scope.interrupt_policy_id, node.policy_id);
   EXPECT_EQ(scope.preemption_action,
             core::InterruptPreemptionAction::kCompleteMoveOnSignal);
+  ASSERT_TRUE(scope.stop_profile);
+  EXPECT_EQ(scope.stop_profile->stop_mode,
+            core::MotionInterruptStopMode::kSpringBackHold);
+  ASSERT_TRUE(scope.stop_plan.participant_stop_profile);
+  EXPECT_EQ(scope.stop_plan.participant_stop_profile->stop_mode,
+            core::MotionInterruptStopMode::kSpringBackHold);
   ASSERT_TRUE(scope.stop_entry);
   ASSERT_TRUE(scope.success_through);
   EXPECT_EQ(*scope.stop_entry, *scope.success_through);

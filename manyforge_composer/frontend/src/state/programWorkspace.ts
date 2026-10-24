@@ -140,7 +140,7 @@ export function programWorkspaceReducer(
     return {
       status: 'ready', requestGeneration: action.generation,
       pendingAction: null, workspace: state.workspace,
-      message: action.message, transitionStatus: null, error: null,
+      message: null, transitionStatus: null, error: action.message,
     };
   }
   if (action.type === 'request_succeeded') {

@@ -1595,11 +1595,6 @@ class FakeParticipantEngine final : public IResolvedParticipantExecutionEngine,
                      "fake prepared scope has no Stop profile",
                      {{"reason", "stop_profile_missing"}}});
       }
-      if (desired) {
-        const auto mode = ValidateIoRuleNominalStopMode(
-            authority.stop_readiness.value().resolved_stop_base_plan, *scope.stop_profile);
-        if (!mode.ok()) return Result<PreparedOperationParticipantDTO>::Err(mode.error());
-      }
       PreparedParticipantStopPlanContextDTO context{
           request.binding.operation_id,
           authority.operation_revision,

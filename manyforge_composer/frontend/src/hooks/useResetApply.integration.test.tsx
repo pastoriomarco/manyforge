@@ -488,6 +488,40 @@ describe('A refused stale Deployment fence', () => {
   });
 });
 
+describe('A refused Deployment Apply preparation', () => {
+  it('keeps the Draft and backend cause as a dismissible error without retrying', async () => {
+    await mount({
+      ...HELD, hold: 'idle', cycle: idleCycle(null), deploymentRevision: 2,
+      deploymentContent: digest('e'),
+    });
+    const reads = apiMock.deploymentWorkspace.get.mock.calls.length;
+    const draft = hooks!.deployment.workspace?.draft;
+    const cause = 'Program is missing compatibility with target role arm';
+    apiMock.deploymentWorkspace.applyDraft.mockRejectedValueOnce(new ApiError(
+      'candidate could not be prepared',
+      409,
+      { detail: {
+        code: 'activation_preparation_failed',
+        message: 'candidate could not be prepared',
+        effect: 'none',
+        details: { preparer_detail: `manyforge_prepare_activation: ${cause}` },
+      } },
+    ));
+
+    await act(async () => { await hooks!.deployment.applyDraft(); });
+
+    expect(apiMock.deploymentWorkspace.applyDraft).toHaveBeenCalledTimes(1);
+    expect(apiMock.deploymentWorkspace.get).toHaveBeenCalledTimes(reads);
+    expect(hooks!.deployment.workspace?.draft).toBe(draft);
+    expect(hooks!.deployment.feedback).toBeNull();
+    expect(hooks!.deployment.error).toBe(
+      `Not applied: the candidate could not be prepared (${cause}). Correct it and try again.`,
+    );
+    act(() => hooks!.deployment.dismissError());
+    expect(hooks!.deployment.error).toBeNull();
+  });
+});
+
 describe('Draft editing while a Program run exists', () => {
   it.each<Hold>(STOPPED_HOLDS)(
     'is editable when all motion is confirmed stopped (%s)',

@@ -921,35 +921,35 @@ TEST(PreparedOperationParticipantCodecTest,
 }
 
 TEST(PreparedOperationParticipantCodecTest,
-     RuleNominalModeRefusesCrossModeWithoutDisablingQualifiedSubstitution) {
-  const auto base = BasePlan();
-  MotionInterruptStopProfileDTO profile;
-  profile.stop_mode = MotionInterruptStopMode::kSoftOnPath;
-  EXPECT_TRUE(ValidateIoRuleNominalStopMode(base, profile).ok());
-  profile.fallback_stop_modes = {MotionInterruptStopMode::kSpringBackHold};
-  EXPECT_TRUE(ValidateIoRuleNominalStopMode(base, profile).ok());
-  profile.stop_mode = MotionInterruptStopMode::kSpringBackHold;
-  EXPECT_FALSE(ValidateIoRuleNominalStopMode(base, profile).ok());
-  profile.stop_mode = MotionInterruptStopMode::kHardDeceleration;
-  EXPECT_FALSE(ValidateIoRuleNominalStopMode(base, profile).ok());
-}
-
-TEST(PreparedOperationParticipantCodecTest,
-     RulePreparedEntryRoundTripSealsTupleAndFallbackWithoutRenumberingChain) {
-  const auto inputs = Inputs(BasePlan(), false);
+     RuleSelectedModeRoundTripSealsParametersFallbackAndOriginalStageChain) {
+  auto base_candidate = BasePlan();
+  base_candidate.escalation_stages.front()
+      .command_qualification.controlled_substitution_contract->fallback_stop_modes.push_back(
+          MotionControlledStopMode::kSpringBackFast);
+  const auto remade_base = MakeResolvedStopBasePlan(std::move(base_candidate));
+  ASSERT_TRUE(remade_base.ok()) << remade_base.error().message;
+  const auto base = remade_base.value();
+  const auto inputs = Inputs(base, false);
   auto candidate = Candidate(inputs.binding, inputs.readiness, MotionPayload(inputs));
   auto made =
       MakePreparedOperationParticipant(candidate, inputs.binding, inputs.readiness, DefaultLimits(),
                                        MotionInterruptNodeCategory::kGeneric);
   ASSERT_TRUE(made.ok());
   candidate = made.value();
-  MotionInterruptStopProfileDTO profile;
-  profile.profile_id = "entry.nominal";
-  profile.stop_mode = MotionInterruptStopMode::kSoftOnPath;
-  profile.jerk_limits_enabled = false;
-  profile.deceleration_time_s = 1.0;
-  profile.per_joint_max_deceleration = {{"joint_1", AngularAccelerationDTO{2.0}},
-                                        {"joint_2", AngularAccelerationDTO{2.0}}};
+  MotionInterruptStopProfileDTO defaults;
+  defaults.profile_id = "entry.selected";
+  defaults.stop_mode = MotionInterruptStopMode::kSoftOnPath;
+  defaults.jerk_limits_enabled = false;
+  defaults.deceleration_time_s = 1.0;
+  defaults.max_stop_time_s = 1.5;
+  defaults.per_joint_max_deceleration = {{"joint_1", AngularAccelerationDTO{2.0}},
+                                         {"joint_2", AngularAccelerationDTO{2.0}}};
+  defaults.fallback_stop_modes = {MotionInterruptStopMode::kSpringBackHold,
+                                  MotionInterruptStopMode::kSpringBackFast};
+  const auto selected = SelectIoRuleStopProfile(defaults, MotionInterruptStopMode::kSpringBackHold);
+  ASSERT_TRUE(selected.ok()) << selected.error().message;
+  const auto profile = selected.value();
+  EXPECT_EQ(profile.fallback_stop_modes, (std::vector{MotionInterruptStopMode::kSpringBackFast}));
   PreparedParticipantStopPlanContextDTO context{
       candidate.operation_id,
       candidate.operation_revision,
@@ -965,7 +965,20 @@ TEST(PreparedOperationParticipantCodecTest,
   const auto plan =
       MakePreparedParticipantStopPlan(inputs.readiness.value().resolved_stop_base_plan, context,
                                       inputs.binding.value().resources, DefaultLimits());
-  ASSERT_TRUE(plan.ok());
+  ASSERT_TRUE(plan.ok()) << plan.error().message;
+  ASSERT_EQ(plan.value().stage_commands.size(), base.escalation_stages.size());
+  for (std::size_t index = 0; index < base.escalation_stages.size(); ++index)
+    EXPECT_EQ(plan.value().stage_commands[index].resolved_stage, base.escalation_stages[index]);
+  ASSERT_TRUE(plan.value().participant_stop_profile);
+  EXPECT_EQ(plan.value().participant_stop_profile->stop_mode,
+            MotionInterruptStopMode::kSpringBackHold);
+  EXPECT_EQ(plan.value().participant_stop_profile->fallback_stop_modes,
+            (std::vector{MotionInterruptStopMode::kSpringBackFast}));
+  ASSERT_TRUE(plan.value().stage_commands.front().validated_contract_parameters);
+  EXPECT_EQ(plan.value().stage_commands.front().validated_contract_parameters->at("stop_mode"),
+            JsonValueDTO{std::string("spring_back_hold")});
+  EXPECT_EQ(plan.value().stage_commands.front().parameter_source,
+            StopStageParameterSourceDTO::kParticipantProfileMapping);
   const auto entry = ResolvePreparedIoRuleStopEntry(
       plan.value(), plan.value().stage_commands.back().resolved_stage.stop_escalation_stage_id);
   ASSERT_TRUE(entry.ok());
@@ -997,6 +1010,10 @@ TEST(PreparedOperationParticipantCodecTest,
   ASSERT_TRUE(decoded.ok()) << decoded.error().message;
   const auto& scope =
       std::get<PreparedMotionExecutionDTO>(decoded.value().payload).interrupt_scopes.front();
+  ASSERT_TRUE(scope.stop_profile);
+  EXPECT_EQ(scope.stop_profile->stop_mode, MotionInterruptStopMode::kSpringBackHold);
+  EXPECT_EQ(scope.stop_profile->fallback_stop_modes,
+            (std::vector{MotionInterruptStopMode::kSpringBackFast}));
   EXPECT_EQ(scope.stop_entry, entry.value());
   EXPECT_EQ(scope.success_through, entry.value());
   EXPECT_EQ(scope.stop_plan.stage_commands, plan.value().stage_commands);

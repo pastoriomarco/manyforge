@@ -439,30 +439,16 @@ core::Result<void> validate_program_io_stop_responses(
           core::ResolveIoRuleSuccessThroughIndex(rows, entry, success_through);
       if (!selection.ok())
         throw Invalid(selection.error().details.at("reason"));
-      core::MotionInterruptStopProfileDTO requested;
       const auto &mode = member(parameters, "stop_mode").as_string();
-      if (mode == "soft_on_path")
-        requested.stop_mode = core::MotionInterruptStopMode::kSoftOnPath;
-      else if (mode == "spring_back_hold")
-        requested.stop_mode = core::MotionInterruptStopMode::kSpringBackHold;
-      else if (mode == "spring_back_fast")
-        requested.stop_mode = core::MotionInterruptStopMode::kSpringBackFast;
-      else if (mode == "hard_deceleration")
-        requested.stop_mode = core::MotionInterruptStopMode::kHardDeceleration;
-      else
-        throw Invalid("io_rule_nominal_mode_mismatch");
-      const auto &stages = member(*stop, "escalation_stages").as_array();
-      // Exact saved nominal mode only. This does not invent/copy a full node
-      // Stop profile or reinterpret a fallback stage as its nominal profile.
-      const auto &defaults =
-          member(stages.front(), "default_contract_parameters");
-      const core::JsonObjectDTO actual{
-          {"stop_mode",
-           core::JsonValueDTO{member(defaults, "stop_mode").as_string()}}};
-      const auto qualified =
-          core::ValidateIoRuleNominalStopMode(actual, requested);
-      if (!qualified.ok())
-        throw Invalid(qualified.error().details.at("reason"));
+      if (mode != "soft_on_path" && mode != "spring_back_hold" &&
+          mode != "spring_back_fast" && mode != "hard_deceleration")
+        throw Invalid("io_rule_stop_mode_invalid");
+      const auto &defaults = member(
+          member(*stop, "escalation_stages").as_array().front(),
+          "default_contract_parameters");
+      if (mode != "hard_deceleration" &&
+          member(defaults, "stop_mode").as_string() == "hard_deceleration")
+        throw Invalid("io_rule_stop_mode_parameters_unavailable");
     });
     return core::Result<void>::Ok();
   } catch (const std::exception &error) {

@@ -95,10 +95,17 @@ values (they cannot come from a key):
 | `priority` | 0 to 100 | 0 |
 | `stop_entry_stage_id` | The Stop stage to start from (section 5) | the robot's first stage |
 | `success_through_stage_id` | The last Stop stage that still counts as a clean trip (section 5) | only the entry stage counts |
-| `stop_mode` | Must match the robot's first qualified Stop stage | required |
+| `stop_mode` | Selects this node's Stop mode independently of the robot's default, using its configured limits | required |
 | `activation_mode` | `require_inactive_at_arm` (the signal must be off when the move starts), `fresh_edge_after_arm` (only a new change after the start counts) or `trip_if_already_active` | `require_inactive_at_arm` (Probe search allows only this one) |
 
 What happens:
+
+- The node's `stop_mode` selects its primary mode; it does not change the
+  Deployment's operator Stop. The robot's configured deceleration, jerk,
+  settle limits and Stop-stage chain still apply. Only already-enabled
+  fallback modes below the selected primary are retained; the hard final
+  stage remains mandatory. A controlled mode requires configured controlled
+  Stop limits: a hard-only profile cannot supply them.
 
 - **The condition trips**, and the robot stops at a stage up to
   `success_through_stage_id`: the node result follows `on_signal`. Its

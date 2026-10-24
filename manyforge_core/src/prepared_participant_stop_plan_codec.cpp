@@ -681,8 +681,7 @@ Result<PreparedParticipantStopPlanDTO> MakePreparedParticipantStopPlan(
       }
       if (!context.participant_stop_profile->fallback_stop_modes.empty()) {
         const auto& qualification = nominal.command_qualification.controlled_substitution_contract;
-        if (!qualification || interrupt_mode_string(context.participant_stop_profile->stop_mode) !=
-                                  to_string(qualification->requested_stop_mode))
+        if (!qualification)
           fail("participant profile requests an unsupported fallback");
         for (const auto mode : context.participant_stop_profile->fallback_stop_modes) {
           if (std::none_of(qualification->fallback_stop_modes.begin(),

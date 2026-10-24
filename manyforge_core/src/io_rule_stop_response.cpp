@@ -138,36 +138,31 @@ Result<void> VerifyPreparedIoRuleSuccessThrough(const PreparedParticipantStopPla
   return Result<void>::Ok();
 }
 
-Result<void> ValidateIoRuleNominalStopMode(const ResolvedStopBasePlanDTO& plan,
-                                           const MotionInterruptStopProfileDTO& profile) {
-  if (plan.escalation_stages.empty() || !plan.escalation_stages.front().default_contract_parameters)
-    return Result<void>::Err(invalid("io_rule_nominal_mode_unqualified"));
-  return ValidateIoRuleNominalStopMode(*plan.escalation_stages.front().default_contract_parameters,
-                                       profile);
-}
-
-Result<void> ValidateIoRuleNominalStopMode(const JsonObjectDTO& parameters,
-                                           const MotionInterruptStopProfileDTO& profile) {
-  const auto found = parameters.find("stop_mode");
-  const auto* retained =
-      found == parameters.end() ? nullptr : std::get_if<std::string>(&found->second.value);
-  const char* requested = nullptr;
-  switch (profile.stop_mode) {
-    case MotionInterruptStopMode::kSoftOnPath:
-      requested = "soft_on_path";
-      break;
-    case MotionInterruptStopMode::kSpringBackHold:
-      requested = "spring_back_hold";
-      break;
-    case MotionInterruptStopMode::kHardDeceleration:
-      requested = "hard_deceleration";
-      break;
-    case MotionInterruptStopMode::kSpringBackFast:
-      requested = "spring_back_fast";
-      break;
+Result<MotionInterruptStopProfileDTO> SelectIoRuleStopProfile(
+    const MotionInterruptStopProfileDTO& defaults, MotionInterruptStopMode mode) {
+  using Reply = Result<MotionInterruptStopProfileDTO>;
+  if (!motion_interrupt_stop_profile_field_error(defaults).empty())
+    return Reply::Err(invalid("io_rule_stop_profile_invalid"));
+  if (!motion_interrupt_stop_fallbacks_valid(mode, {}))
+    return Reply::Err(invalid("io_rule_stop_mode_invalid"));
+  if (mode != MotionInterruptStopMode::kHardDeceleration &&
+      defaults.per_joint_max_deceleration.empty())
+    return Reply::Err(invalid("io_rule_stop_mode_parameters_unavailable"));
+  auto profile = defaults;
+  profile.stop_mode = mode;
+  std::erase_if(profile.fallback_stop_modes, [mode](const auto fallback) {
+    return !motion_interrupt_stop_fallbacks_valid(mode, {fallback});
+  });
+  if (mode == MotionInterruptStopMode::kHardDeceleration) {
+    profile.deceleration_time_s.reset();
+    profile.max_stop_time_s.reset();
+    profile.per_joint_max_deceleration.clear();
+    profile.jerk_limits_enabled = false;
+    profile.per_joint_max_jerk.clear();
+    profile.allow_natural_completion_on_short_path = false;
   }
-  if (!retained || !requested || *retained != requested)
-    return Result<void>::Err(invalid("io_rule_nominal_mode_mismatch"));
-  return Result<void>::Ok();
+  if (!motion_interrupt_stop_profile_field_error(profile).empty())
+    return Reply::Err(invalid("io_rule_stop_profile_invalid"));
+  return Reply::Ok(std::move(profile));
 }
 }  // namespace manyforge::core

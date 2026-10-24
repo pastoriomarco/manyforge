@@ -1424,35 +1424,6 @@ std::optional<ParticipantStopStageResultDTO> ParticipantStopStageHelper::HoldFor
   return std::nullopt;
 }
 
-// EXPERIMENTAL release timer: hold before the send through the stage's own
-// cancellable wait (no lock held, no port call). The ceiling is the existing
-// Stop deadline, terminal deadline and lead-in acceptance window
-// (`FinishReplacement`), all from the same `dispatched_at`. A release beyond it
-// is not held; cancellation or stale state during the hold ends the stage as
-// in any other wait; a wake past the ceiling (oversleep) sends nothing and is
-// refused as the existing lead-in budget refusal, before any effect.
-std::optional<ParticipantStopStageResultDTO> ParticipantStopStageHelper::HoldForRelease(
-    Run& run, StopReplacementStartDTO& start, const TimePoint dispatched_at,
-    const TimePoint stop_deadline, const std::string& mode) {
-  const auto lead_in_ns = static_cast<Duration>(config_.stop_traj_delta_s * 1e9);
-  const auto ceiling = std::min({stop_deadline, run.terminal_deadline, dispatched_at + lead_in_ns});
-  const auto until = plan_replacement_release(start, clock_, ceiling);
-  if (!until) return std::nullopt;
-  (void)Await(run, *until, [] { return false; });
-  if (run.cancellation.stop_requested()) return superseded_result(run.stage);
-  if (run.stale_state_error) {
-    return Fail(run, stage_error("release_hold_ended", "Stale controller state during the hold"));
-  }
-  if (const auto woke = clock_.now(); woke > ceiling) {
-    run.mode_not_carried_out = true;
-    return Fail(run, stage_error(mode + "_stop_delta_budget_exceeded",
-                                 "The release hold ended past the Stop's existing ceiling",
-                                 {{"recommended_disposition", "hard_stop"},
-                                  {"release_overslept_ns", std::to_string(woke - *until)}}));
-  }
-  return std::nullopt;
-}
-
 ParticipantStopStageResultDTO ParticipantStopStageHelper::FinishReplacement(
     Run& run, const ExecutionPortCommandResultDTO& sent, const ExecutionGoalKey& next,
     TrajectoryDTO sent_trajectory, std::optional<StopReplacementCursorMapDTO> cursor_map,

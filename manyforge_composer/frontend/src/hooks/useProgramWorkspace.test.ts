@@ -510,7 +510,7 @@ describe('useProgramWorkspace Draft policy interaction', () => {
     expect(latest?.state.workspace?.applied.matchesDraft).toBe(true);
   });
 
-  it.each(['authoring_not_ready', 'stale_generation'])('does not retry or report a fault for %s', async (code) => {
+  it.each(['authoring_not_ready', 'stale_generation'])('does not retry and keeps a refused edit dismissible for %s', async (code) => {
     const initial = deferred<ProgramWorkspaceResponse>();
     await mountHarness(initial, authoringSnapshot(workspace(1)), testPublication(workspace(1)));
     await act(async () => initial.resolve(workspace(1)));
@@ -521,9 +521,38 @@ describe('useProgramWorkspace Draft policy interaction', () => {
       await latest?.mutate('program_draft_update_node_policies', {});
     });
     expect(apiMock.programWorkspace.mutate).toHaveBeenCalledTimes(1);
-    expect(latest?.state.error).toBeNull();
-    expect(latest?.state.message).toContain('Edit not applied');
+    expect(latest?.state.error).toContain('Edit not applied');
+    expect(latest?.state.message).toBeNull();
     expect(latest?.state.workspace?.draft.draftRevision).toBe(1);
+  });
+
+  it('keeps an Apply preparation refusal and its backend cause until dismissed', async () => {
+    const initial = deferred<ProgramWorkspaceResponse>();
+    await mountHarness(initial, authoringSnapshot(workspace(2)), testPublication(workspace(2)));
+    await act(async () => initial.resolve(workspace(2)));
+    const cause = 'Program is missing compatibility with target role arm';
+    apiMock.programWorkspace.apply.mockRejectedValueOnce(new ApiError(
+      'candidate could not be prepared',
+      409,
+      { detail: {
+        code: 'activation_preparation_failed',
+        message: 'candidate could not be prepared',
+        effect: 'none',
+        details: { preparer_detail: `manyforge_prepare_activation: ${cause}` },
+      } },
+    ));
+
+    const retained = latest?.state.workspace;
+    await act(async () => { await latest?.apply(); });
+
+    expect(apiMock.programWorkspace.apply).toHaveBeenCalledTimes(1);
+    expect(latest?.state.workspace).toBe(retained);
+    expect(latest?.state.message).toBeNull();
+    expect(latest?.state.error).toBe(
+      `Not applied: the candidate could not be prepared (${cause}). Correct it and try again.`,
+    );
+    act(() => latest?.clearFeedback());
+    expect(latest?.state.error).toBeNull();
   });
 
   it.each(['composer_draft_revision_stale', 'composer_workspace_stale'])(

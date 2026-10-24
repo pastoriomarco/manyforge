@@ -334,15 +334,16 @@ TEST_F(ProgramIoStopResponseTest,
 }
 
 TEST_F(ProgramIoStopResponseTest,
-       ApplyCheckRefusesCrossModeAndUnknownEntryBeforeRuntimePreparation) {
-  const auto mismatch =
-      Program(nominal == "soft_on_path" ? "hard_deceleration" : "soft_on_path");
-  const auto mismatch_binding = Binding(*mismatch);
-  const auto wrong_mode = d::validate_program_io_stop_responses(
-      *mismatch, *mismatch_binding, *bundle, *map, artifacts);
-  ASSERT_FALSE(wrong_mode.ok());
-  EXPECT_EQ(wrong_mode.error().details.at("reason"),
-            "io_rule_nominal_mode_mismatch");
+       ApplyAcceptsLiteralSelectedModeAndStillRejectsUnknownEntry) {
+  for (const auto *mode : {"soft_on_path", "spring_back_hold",
+                           "spring_back_fast", "hard_deceleration"}) {
+    SCOPED_TRACE(mode);
+    const auto selected = Program(mode);
+    const auto selected_binding = Binding(*selected);
+    const auto accepted = d::validate_program_io_stop_responses(
+        *selected, *selected_binding, *bundle, *map, artifacts);
+    ASSERT_TRUE(accepted.ok()) << accepted.error().details.at("reason");
+  }
   const auto unknown = Program(nominal, "foreign");
   const auto unknown_binding = Binding(*unknown);
   const auto wrong_entry = d::validate_program_io_stop_responses(

@@ -678,8 +678,6 @@ template <class Id>
   if (fault)
     fields.emplace_back("preemption_action", CanonicalValue(std::string("preempt_trajectory")));
   if (value.stop_entry) {
-    if (desired && !ValidateIoRuleNominalStopMode(base, *value.stop_profile).ok())
-      fail("interrupt_scope_nominal_mode_mismatch");
     if (!value.success_through ||
         !VerifyPreparedIoRuleSuccessThrough(value.stop_plan, *value.stop_entry,
                                             *value.success_through)
