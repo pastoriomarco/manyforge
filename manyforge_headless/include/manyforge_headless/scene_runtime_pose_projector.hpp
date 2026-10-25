@@ -5,6 +5,7 @@
 #include <manyforge_core/ports/iscene_authority.hpp>
 #include <manyforge_core/types/deployment_applicability.hpp>
 
+#include <cstdint>
 #include <optional>
 #include <span>
 #include <string_view>
@@ -31,6 +32,15 @@ enum class SceneRuntimePoseApplicationStatus {
 
 [[nodiscard]] std::string_view
 ToString(SceneRuntimePoseApplicationStatus status) noexcept;
+
+/// Whether the scene's retained provider sequence proves the exact successful
+/// application outcome used by the before-planning latch. A freshness-only
+/// confirmation intentionally advances the observation without rewriting the
+/// committed scene evidence.
+[[nodiscard]] bool SceneRuntimePoseApplicationRetainsPlanningEvidence(
+    SceneRuntimePoseApplicationStatus status,
+    std::uint64_t retained_provider_source_sequence,
+    std::uint64_t observation_source_sequence) noexcept;
 
 struct SceneRuntimePoseApplicationResult final {
   SceneRuntimePoseApplicationStatus status;

@@ -2088,13 +2088,19 @@ void ResourceAddressedExecutionKernel::on_engine_event(IResolvedParticipantExecu
       auto* participant = operation == nullptr ? nullptr : operation->participant_for(engine);
       if (operation != nullptr && participant != nullptr && !terminal(operation->state.state)) {
         auto collision_details = event.details;
+        std::string collision_message =
+            "Runtime collision containment stopped the operation";
         if (const auto reason = collision_details.find("reason");
             reason != collision_details.end()) {
           collision_details["runtime_collision_reason"] = reason->second;
+          if (reason->second == "stale_dynamic_collision_body") {
+            collision_message =
+                "Scene pose evidence is stale or invalid; runtime collision containment stopped the operation";
+          }
         }
         collision_details["reason"] = "runtime_collision_fault";
         ErrorDTO collision_error{std::string(to_string(ErrorCode::kExecutionAborted)),
-                                 "Runtime collision containment stopped the operation",
+                                 std::move(collision_message),
                                  std::move(collision_details)};
         // A collision fact during an active Stop is escalation input for that
         // Stop's participant work, never dropped and never a second Stop.

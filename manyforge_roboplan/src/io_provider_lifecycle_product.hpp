@@ -4,6 +4,7 @@
 #include <manyforge_core/fixed_cclc_port_registry.hpp>
 #include <manyforge_core/io_provider_lifecycle_catalog.hpp>
 #include <manyforge_deployment/io_signal_catalog.hpp>
+#include <manyforge_roboplan/geometric_contact_input_provider.hpp>
 #include <manyforge_roboplan/mock_boolean_input_provider.hpp>
 #include <manyforge_roboplan/mock_boolean_output_provider.hpp>
 #include <manyforge_roboplan/retained_externally_managed_lifecycle_ports.hpp>
@@ -11,6 +12,7 @@
 #include <manyforge_roboplan/ros_boolean_output_provider.hpp>
 #include <memory>
 #include <mutex>
+#include <span>
 #include <variant>
 
 namespace manyforge::roboplan_backend::host_detail {
@@ -20,6 +22,7 @@ struct IoProviderInputSourceInstallation final {
   rclcpp::Node::SharedPtr node;
   std::shared_ptr<core::IIoSignalIngress> ingress;
   core::IoSourceIncarnation incarnation;
+  std::optional<GeometricContactInputBinding> geometric_contact;
 };
 
 struct IoProviderOutputChannelInstallation final {
@@ -32,6 +35,12 @@ struct IoProviderOutputChannelInstallation final {
       provider;
 };
 
+struct IoProviderInputAcquisitionBaseline final {
+  core::IoSourceIncarnation incarnation;
+  std::uint64_t source_sequence{};
+  std::vector<core::IoSignalId> signals;
+};
+
 /// The actual generic I/O driver occurrence. The existing CCLC transaction
 /// remains the lifecycle authority; this record owns its real driver facts,
 /// delivery mutex, leaves and retained brand-port observation sequence.
@@ -41,6 +50,8 @@ class IoProviderDriverRecord final
 public:
   using InputLifecycleHook = std::function<core::Result<void>(
       const core::LifecycleTransactionId &, bool planned_disabled)>;
+  using InputAcquisitionHook = std::function<core::Result<void>(
+      std::span<const IoProviderInputAcquisitionBaseline>)>;
   static core::Result<std::shared_ptr<IoProviderDriverRecord>>
   Create(core::ResolvedLifecycleControlDomainScopeDTO domain,
          core::ResolvedLifecycleProviderOccurrenceDTO occurrence,
@@ -74,7 +85,8 @@ public:
       std::vector<IoProviderInputSourceInstallation> inputs,
       std::vector<IoProviderOutputChannelInstallation> outputs,
       std::function<void()> cancel_pending_answers,
-      InputLifecycleHook input_lifecycle = {});
+      InputLifecycleHook input_lifecycle = {},
+      InputAcquisitionHook input_acquisition = {});
   core::Result<MockBooleanInputSetReceipt>
   SetMockValueLocked(const core::IoSignalId &signal, bool value);
 
@@ -84,7 +96,8 @@ public:
   core::Result<void>
   RebindInputsLocked(std::vector<IoProviderInputSourceInstallation> inputs,
                      std::function<void()> cancel_pending_answers,
-                     InputLifecycleHook input_lifecycle = {});
+                     InputLifecycleHook input_lifecycle = {},
+                     InputAcquisitionHook input_acquisition = {});
 
   core::Result<RetainedExternallyManagedDomainSnapshot>
   ReadLifecycleSnapshot(const core::ControlDomainId &domain,

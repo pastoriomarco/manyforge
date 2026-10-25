@@ -770,6 +770,7 @@ class Workbench:
     def _isaac_manager_arguments(self) -> tuple[str, ...]:
         if self.isaac_site_settings is None:
             return ()
+        _regular_file(self.isaac_site_settings, "Isaac site settings")
         observer = (BUILD_ROOT / "isaac/ros-overlay/install/manyforge_ros_bringup"
                     / "lib/manyforge_ros_bringup/pose_source_snapshot_publisher")
         _regular_file(observer, "installed Isaac pose observer", executable=True)
@@ -797,8 +798,6 @@ class Workbench:
             _regular_file(self.operator_install_root / self.operator_admission, "qualified operator admission")
             if self.composer_static_dir is not None:
                 _regular_file(self.composer_static_dir / "index.html", "built Composer frontend")
-            if self.isaac_site_settings is not None:
-                _regular_file(self.isaac_site_settings, "Isaac site settings")
         ros_capture: dict[str, Any] | None = None
         if self.ros2_control and not operator_mode:
             intended_project = self.bootstrap_project_path or self.project_path

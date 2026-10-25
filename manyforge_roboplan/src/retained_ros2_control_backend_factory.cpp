@@ -313,12 +313,6 @@ RetainedRuntimeBackendFactory make_retained_ros2_control_backend_factory(
                   motion_group, sample.reference_positions_rad,
                   core::ExecutionStateUpdateMode::kBestEffort);
             });
-        if (selected.isaac_guard.has_value()) {
-          const auto binding = RetainedIsaacArmGuardBinding::Create(
-              *selected.isaac_guard, runtime_handle->node(),
-              make_retained_isaac_arm_host(runtime_handle), clock);
-          runtime_handle->InstallGuardHooks(binding->hooks());
-        }
         if (!selected.defer_ros_start) {
           runtime_handle->StartBackend();
         }
@@ -366,7 +360,7 @@ make_retained_ros2_control_gripper_backend(
   const bool no_output = config.gripper && config.gripper->output_mode == core::GripperOutputMode::kNone &&
       config.gripper->actuation_kind == core::GripperActuationKind::kPneumatic;
   if (!handle || !channel || !config.gripper || (!no_output && !config.arm.gripper_controller) ||
-      (no_output && config.arm.gripper_controller) || config.isaac_guard || !binding.value().control_path ||
+      (no_output && config.arm.gripper_controller) || !binding.value().control_path ||
       binding.value().control_path->state_authority_class != core::StateAuthorityClass::kCommanded ||
       channel->binding().value() != binding.value() || binding.value().resources.size() != 1U)
     throw std::invalid_argument("ROS gripper-only backend requires its exact commanded binding/transport");

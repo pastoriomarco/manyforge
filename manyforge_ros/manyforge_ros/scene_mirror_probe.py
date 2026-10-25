@@ -11,6 +11,7 @@ import argparse
 import importlib
 import json
 import math
+import threading
 import time
 from collections.abc import Sequence
 from dataclasses import asdict, dataclass
@@ -139,9 +140,41 @@ class SimulationSceneMirrorClient:
         self.node = node
         self.service_names = service_names or SimulationServiceNames()
         self.service_timeout_s = _bounded_timeout(service_timeout_s)
+        self._retained_clients: dict[tuple[str, type], object] = {}
+        self._closed = False
+        self._cancelled = threading.Event()
         self._rclpy = importlib.import_module("rclpy")
         self._srv = importlib.import_module("simulation_interfaces.srv")
         self._msg = importlib.import_module("simulation_interfaces.msg")
+
+    def __enter__(self) -> "SimulationSceneMirrorClient":
+        if self._closed:
+            raise RuntimeError("simulation scene-mirror client is closed")
+        return self
+
+    def __exit__(self, *_exc: object) -> None:
+        self.close()
+
+    def close(self) -> None:
+        """Release any long-lived typed clients after their caller stops."""
+
+        self.cancel()
+        self._closed = True
+        clients = tuple(self._retained_clients.values())
+        self._retained_clients.clear()
+        for client in clients:
+            self.node.destroy_client(client)
+
+    def cancel(self) -> None:
+        """Request that one in-flight bounded capture return between calls."""
+
+        self._cancelled.set()
+
+    def _require_active(self) -> None:
+        if self._closed:
+            raise RuntimeError("simulation scene-mirror client is closed")
+        if self._cancelled.is_set():
+            raise RuntimeError("simulation scene-mirror capture was cancelled")
 
     def capture(
         self,
@@ -155,6 +188,7 @@ class SimulationSceneMirrorClient:
     ) -> SceneMirrorSnapshot:
         """Capture one bounded service-backed scene snapshot."""
 
+        self._require_active()
         normalized_filter = _bounded_optional_text(
             entity_filter,
             label="entity filter",
@@ -190,9 +224,11 @@ class SimulationSceneMirrorClient:
         if include_bounds:
             required.add("get_entity_bounds")
         service_names = self._resolve_service_names(required)
+        self._prune_service_clients(service_names)
         features, spawn_formats, custom_info, feature_errors = (
             self._capture_features(service_names)
         )
+        self._require_active()
 
         if explicit_entities is not None:
             entities = explicit_entities
@@ -230,16 +266,19 @@ class SimulationSceneMirrorClient:
             and service_names.get_entity_bounds is not None
             and feature_enabled_or_unknown(feature_set, "ENTITY_BOUNDS")
         )
-        snapshots = tuple(
-            self._capture_entity(
-                entity,
-                service_names=service_names,
-                query_info=query_info,
-                query_state=query_state,
-                query_bounds=query_bounds,
+        snapshots = []
+        for entity in entities:
+            self._require_active()
+            snapshots.append(
+                self._capture_entity(
+                    entity,
+                    service_names=service_names,
+                    query_info=query_info,
+                    query_state=query_state,
+                    query_bounds=query_bounds,
+                )
             )
-            for entity in entities
-        )
+        self._require_active()
         missing_requested = tuple(
             f"{field_name} service not available"
             for field_name in sorted(required)
@@ -250,7 +289,7 @@ class SimulationSceneMirrorClient:
             features=features,
             spawn_formats=spawn_formats,
             custom_info=custom_info,
-            entities=snapshots,
+            entities=tuple(snapshots),
             errors=feature_errors + entity_errors + missing_requested,
         )
 
@@ -260,6 +299,7 @@ class SimulationSceneMirrorClient:
     ) -> SimulationServiceNames:
         deadline = time.monotonic() + self.service_timeout_s
         while True:
+            self._require_active()
             graph_by_type = _simulation_service_graph_by_type(
                 self.node.get_service_names_and_types()
             )
@@ -274,7 +314,8 @@ class SimulationSceneMirrorClient:
                 return selected
             if time.monotonic() >= deadline:
                 return selected
-            time.sleep(0.05)
+            if self._cancelled.wait(0.05):
+                self._require_active()
 
     def _capture_features(
         self,
@@ -436,20 +477,56 @@ class SimulationSceneMirrorClient:
         request.entity = entity
         return self._call_service(service_name, service_type, request)
 
+    def _prune_service_clients(
+        self,
+        service_names: SimulationServiceNames,
+    ) -> None:
+        selected = {
+            (name, service_type)
+            for name, service_type in (
+                (
+                    service_names.get_simulator_features,
+                    self._srv.GetSimulatorFeatures,
+                ),
+                (service_names.get_entities, self._srv.GetEntities),
+                (service_names.get_entity_info, self._srv.GetEntityInfo),
+                (service_names.get_entity_state, self._srv.GetEntityState),
+                (service_names.get_entity_bounds, self._srv.GetEntityBounds),
+            )
+            if name is not None
+        }
+        retired = [
+            key for key in self._retained_clients if key not in selected
+        ]
+        for key in retired:
+            self.node.destroy_client(self._retained_clients.pop(key))
+
     def _call_service(
         self,
         service_name: str,
         service_type: type,
         request: object,
     ) -> object:
-        client = self.node.create_client(service_type, service_name)
+        key = (service_name, service_type)
+        self._require_active()
+        client = self._retained_clients.get(key)
+        created = client is None
+        if client is None:
+            client = self.node.create_client(service_type, service_name)
         try:
-            if not client.wait_for_service(timeout_sec=self.service_timeout_s):
+            if created and not client.wait_for_service(
+                timeout_sec=self.service_timeout_s
+            ):
                 raise TimeoutError(f"service unavailable: {service_name}")
+            self._require_active()
+            if created:
+                self._retained_clients[key] = client
             future = client.call_async(request)
             return self._wait_for_future(future)
-        finally:
-            self.node.destroy_client(client)
+        except Exception:
+            retained = self._retained_clients.pop(key, None)
+            self.node.destroy_client(retained if retained is not None else client)
+            raise
 
     def _wait_for_future(self, future: object) -> object:
         deadline = time.monotonic() + self.service_timeout_s
@@ -462,7 +539,8 @@ class SimulationSceneMirrorClient:
             )
         else:
             while time.monotonic() < deadline and not future.done():
-                time.sleep(0.01)
+                if self._cancelled.wait(0.01):
+                    self._require_active()
         if not future.done():
             raise TimeoutError("simulation_interfaces response timed out")
         response = future.result()
@@ -629,14 +707,18 @@ def main() -> int:
         rclpy.init(args=None)
     node = rclpy.create_node("manyforge_scene_mirror_probe")
     try:
-        snapshot = SimulationSceneMirrorClient(
+        client = SimulationSceneMirrorClient(
             node,
             service_timeout_s=args.timeout,
-        ).capture(
-            entity_filter=args.filter,
-            entity_names=args.entity,
-            entity_limit=args.limit,
         )
+        try:
+            snapshot = client.capture(
+                entity_filter=args.filter,
+                entity_names=args.entity,
+                entity_limit=args.limit,
+            )
+        finally:
+            client.close()
         print(
             json.dumps(
                 snapshot.to_dict(),

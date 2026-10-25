@@ -373,7 +373,7 @@ case "$command" in
     if [[ "$operator_mode" != true ]]; then
       mkdir -p "$runtime_root"
     fi
-    operator_mounts=()
+    startup_mounts=()
     operator_labels=()
     if [[ "$operator_mode" == true ]]; then
       [[ "$ros2_control" == true && -z "$project" && -z "$bootstrap_project" ]] || { echo "G requires ROS and no auto-Load" >&2; exit 64; }
@@ -389,7 +389,7 @@ case "$command" in
         --canonical-empty-admission-filename "${MANYFORGE_DEV_OPERATOR_ADMISSION:?qualified admission required}"
         --package-aggregate-sha256 "${MANYFORGE_DEV_OPERATOR_PACKAGE_SHA256:?qualified package digest required}"
         --composer-port 9000 --composer-bind-host 0.0.0.0)
-      operator_mounts=(-v "$install_root:$install_root:ro")
+      startup_mounts=(-v "$install_root:$install_root:ro")
       for option in COMPOSER_STATIC_DIR SIMULATION_CONTROL_CONFIG ISAAC_SITE_SETTINGS OPERATOR_NODE_CATALOG OPERATOR_ALARM_CATALOG; do
         variable="MANYFORGE_DEV_$option"
         if [[ -n ${!variable:-} ]]; then
@@ -402,12 +402,19 @@ case "$command" in
             OPERATOR_NODE_CATALOG) [[ -f "$path" ]] || exit 64; option_name=--node-catalog-path; parent=$(dirname "$path") ;;
             OPERATOR_ALARM_CATALOG) [[ -f "$path" ]] || exit 64; option_name=--alarm-catalog-path; parent=$(dirname "$path") ;;
           esac
-          operator_mounts+=(-v "$parent:$parent:ro")
+          startup_mounts+=(-v "$parent:$parent:ro")
           serve_args+=("$option_name" "$path")
         fi
       done
       operator_labels=(--log-driver json-file --label "manyforge.launch-instance=$operator_instance"
         --label "manyforge.launch-input-digest=$operator_digest")
+    elif [[ -n ${MANYFORGE_DEV_ISAAC_SITE_SETTINGS:-} ]]; then
+      path=$MANYFORGE_DEV_ISAAC_SITE_SETTINGS
+      [[ "$path" == /* ]] || { echo "Development Isaac site settings must be an absolute path" >&2; exit 64; }
+      [[ -f "$path" ]] || { echo "Development Isaac site settings file is unavailable: $path" >&2; exit 64; }
+      parent=$(dirname "$path")
+      startup_mounts+=(-v "$parent:$parent:ro")
+      serve_args+=(--isaac-site-settings "$path")
     fi
     ros_environment=()
     ros_identity=()
@@ -473,7 +480,7 @@ case "$command" in
       "${session_environment[@]}" \
       "${ros_identity[@]}" \
       "${ros_environment[@]}" \
-      "${operator_mounts[@]}" \
+      "${startup_mounts[@]}" \
       -v "$repo_root:/workspace" \
       -v "$runtime_root:/tmp/manyforge-state" \
       -v "$cache_root:/runner" \

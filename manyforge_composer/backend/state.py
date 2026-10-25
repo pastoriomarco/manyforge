@@ -1218,6 +1218,13 @@ class ComposerState:
                     "manager_apply_submission_uncertain",
                     "Manager Apply acceptance could not be determined",
                 ) from error
+            if error.details.get("effect") == "none":
+                raise AuthoringOperationError(
+                    "manager_apply_rejected",
+                    _manager_refusal_message(
+                        "Manager rejected the exact Deployment candidate", error.response
+                    ),
+                ) from error
             raise
         if response.get("ok") is not True:
             raise AuthoringOperationError(

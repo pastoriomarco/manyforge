@@ -71,6 +71,14 @@ class IGripperCommandBackend {
   /// admission. Implementations must invalidate any preflight work captured
   /// before the preceding close/open boundary.
   virtual void authorize_gripper_commands() noexcept = 0;
+
+  /// Atomically open command admission, or report why the preceding
+  /// invalidation has not settled enough to reopen it. Legacy backends whose
+  /// authorization is unconditional retain their existing behavior.
+  virtual Result<void> try_authorize_gripper_commands() noexcept {
+    authorize_gripper_commands();
+    return Result<void>::Ok();
+  }
 };
 
 }  // namespace manyforge::core

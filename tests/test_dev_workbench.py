@@ -835,6 +835,11 @@ def test_g_static_composer_preserves_endpoint_and_forwards_exact_site_executable
     observer.unlink()
     with pytest.raises(dev_workbench.WorkbenchError, match="installed Isaac pose observer"):
         workbench._isaac_manager_arguments()
+    observer.write_text("#!/bin/sh\n")
+    observer.chmod(0o755)
+    site.unlink()
+    with pytest.raises(dev_workbench.WorkbenchError, match="Isaac site settings"):
+        workbench._isaac_manager_arguments()
     workbench.isaac_site_settings = None
     assert workbench._isaac_manager_arguments() == ()
 

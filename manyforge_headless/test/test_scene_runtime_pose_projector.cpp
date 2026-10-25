@@ -417,6 +417,10 @@ TEST(SceneRuntimePoseProjector,
             committed_evidence.provider_manifest_revision);
   EXPECT_EQ(evidence.provider_source_epoch,
             committed_evidence.provider_source_epoch);
+  EXPECT_TRUE(SceneRuntimePoseApplicationRetainsPlanningEvidence(
+      confirmed.value().status,
+      committed_evidence.provider_source_sequence,
+      newer.source_sequence));
 
   // A replay of the accepted confirmation neither re-confirms nor commits.
   const auto replay = ApplyTo(projector, scene, providers, newer,
@@ -437,6 +441,33 @@ TEST(SceneRuntimePoseProjector,
             SceneRuntimePoseApplicationStatus::kAlreadyApplied);
   EXPECT_EQ(scene.confirmation_count, 1U);
   EXPECT_EQ(scene.commit_count, 1U);
+}
+
+TEST(SceneRuntimePoseProjector,
+     PlanningEvidenceSequenceRuleIsStatusSensitiveAndFailClosed) {
+  EXPECT_TRUE(SceneRuntimePoseApplicationRetainsPlanningEvidence(
+      SceneRuntimePoseApplicationStatus::kCommitted, 7U, 7U));
+  EXPECT_TRUE(SceneRuntimePoseApplicationRetainsPlanningEvidence(
+      SceneRuntimePoseApplicationStatus::kAlreadyApplied, 7U, 7U));
+  EXPECT_FALSE(SceneRuntimePoseApplicationRetainsPlanningEvidence(
+      SceneRuntimePoseApplicationStatus::kCommitted, 6U, 7U));
+  EXPECT_FALSE(SceneRuntimePoseApplicationRetainsPlanningEvidence(
+      SceneRuntimePoseApplicationStatus::kAlreadyApplied, 7U, 8U));
+
+  EXPECT_TRUE(SceneRuntimePoseApplicationRetainsPlanningEvidence(
+      SceneRuntimePoseApplicationStatus::kFreshnessConfirmed, 7U, 8U));
+  EXPECT_FALSE(SceneRuntimePoseApplicationRetainsPlanningEvidence(
+      SceneRuntimePoseApplicationStatus::kFreshnessConfirmed, 8U, 8U));
+  EXPECT_FALSE(SceneRuntimePoseApplicationRetainsPlanningEvidence(
+      SceneRuntimePoseApplicationStatus::kFreshnessConfirmed, 9U, 8U));
+  EXPECT_FALSE(SceneRuntimePoseApplicationRetainsPlanningEvidence(
+      SceneRuntimePoseApplicationStatus::kNotRequested, 7U, 7U));
+  EXPECT_FALSE(SceneRuntimePoseApplicationRetainsPlanningEvidence(
+      SceneRuntimePoseApplicationStatus::kDeferredBeforePlanning, 7U, 7U));
+  EXPECT_FALSE(SceneRuntimePoseApplicationRetainsPlanningEvidence(
+      SceneRuntimePoseApplicationStatus::kBuffered, 7U, 7U));
+  EXPECT_FALSE(SceneRuntimePoseApplicationRetainsPlanningEvidence(
+      SceneRuntimePoseApplicationStatus::kSkippedAttached, 7U, 7U));
 }
 
 TEST(SceneRuntimePoseProjector, CommitsChangedPoseBudgetOrOriginInstead) {

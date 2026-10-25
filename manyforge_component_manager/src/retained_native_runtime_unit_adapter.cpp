@@ -2907,21 +2907,23 @@ RetainedNativeRuntimeUnitAdapter::~RetainedNativeRuntimeUnitAdapter() = default;
 
 IsaacPoseObserverCheckedConfiguration
 RetainedNativeRuntimeUnitAdapter::CheckIsaacPoseObserverConfiguration(
-    const std::filesystem::path &config_path, const double scene_startup_timeout_s) {
+    const std::filesystem::path &config_path,
+    const double observer_configuration_timeout_s) {
   const auto owner = impl_;  // Keep the existing process adapter/root alive while waiting.
-  if (!std::isfinite(scene_startup_timeout_s) || scene_startup_timeout_s <= 0.0)
-    Fail("observer config check requires the supplied positive scene startup budget");
+  if (!std::isfinite(observer_configuration_timeout_s) ||
+      observer_configuration_timeout_s <= 0.0)
+    Fail("observer config check requires the supplied positive budget");
   const auto started = std::chrono::steady_clock::now();
   const auto maximum = std::chrono::duration<double>(std::chrono::steady_clock::time_point::max() - started).count();
-  const auto deadline = scene_startup_timeout_s >= maximum
+  const auto deadline = observer_configuration_timeout_s >= maximum
       ? std::chrono::steady_clock::time_point::max()
       : started + std::chrono::duration_cast<std::chrono::steady_clock::duration>(
-          std::chrono::duration<double>(scene_startup_timeout_s));
+          std::chrono::duration<double>(observer_configuration_timeout_s));
   if (!owner->isaac_pose_observer_executable)
     Fail("configured Isaac observer needs --isaac-pose-observer-executable");
   const auto check_deadline = [&] {
     if (std::chrono::steady_clock::now() >= deadline)
-      Fail("observer config capture exceeded the supplied scene startup budget");
+      Fail("observer config capture exceeded the supplied budget");
   };
   check_deadline();
   struct stat before {};

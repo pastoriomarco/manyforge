@@ -82,6 +82,28 @@ describe('Draft Scene preview notice', () => {
   });
 });
 
+describe('unavailable live Scene facts', () => {
+  it('shows the owner-contract reason independently of the live object count', () => {
+    const workspace = readFileSync(
+      new URL('./SceneAuthoringWorkspace.tsx', import.meta.url),
+      'utf8',
+    );
+    const objectPanelStart = workspace.indexOf('const liveObjectPanel = objects.length === 0 ? undefined');
+    const viewerSurfaceStart = workspace.indexOf('const viewerSurface = (', objectPanelStart);
+    const objectPanel = workspace.slice(objectPanelStart, viewerSurfaceStart);
+    const editorSurfaceStart = workspace.indexOf('const editorSurface = (', viewerSurfaceStart);
+    const editorSurfaceEnd = workspace.indexOf('\n  return (', editorSurfaceStart);
+    const editorSurface = workspace.slice(editorSurfaceStart, editorSurfaceEnd);
+
+    expect(objectPanelStart).toBeGreaterThanOrEqual(0);
+    expect(objectPanel).not.toContain('factsResult.reason');
+    expect(editorSurface).toContain('data-testid="scene-owner-facts-error"');
+    expect(editorSurface).toContain('{factsResult.reason}');
+    expect(editorSurface).toContain('!factsResult.available');
+    expect(editorSurface).toContain('liveObjectPanel ?? (factsResult.available ? (');
+  });
+});
+
 describe('Copy current position to Draft', () => {
   const box: LogicalSceneObject['collision_shapes'][number] = {
     type: 'box', dimensions_m: { x: 0.1, y: 0.1, z: 0.1 },

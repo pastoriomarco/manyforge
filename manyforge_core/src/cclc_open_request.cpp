@@ -1094,8 +1094,7 @@ template <typename StrongCounter>
   if ((!measured.required && (measured.available || !measured.error)) ||
       (measured.required && !*measured.required && (measured.available || measured.error)) ||
       (measured.required && *measured.required &&
-       (!measured.available || *measured.available == measured.error.has_value())) ||
-      (value.ready && (!measured.required || measured.error)))
+       (!measured.available || *measured.available == measured.error.has_value())))
     fail("component readiness measured applicability or verdict is invalid");
   return CanonicalValue(CanonicalValue::Object{
       {"domains", CanonicalValue(std::move(domains))},

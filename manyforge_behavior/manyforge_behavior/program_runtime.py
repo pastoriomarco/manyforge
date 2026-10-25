@@ -944,6 +944,19 @@ class ExecutableProgramRun:
             or not 0 <= scope["selection_revision"] <= 2**53 - 1
         ):
             raise ProgramRuntimeError("operator Stop projection changed its capture")
+        release_block_reason = scope.get("selection_release_block_reason")
+        if release_block_reason is not None and (
+            not isinstance(release_block_reason, str)
+            or release_block_reason not in {
+                "cell_motion_admission_closed",
+                "cell_motion_admission_unreconciled",
+                "program_run_admission_pending",
+                "program_halt_active",
+            }
+        ):
+            raise ProgramRuntimeError(
+                "operator Stop projection has an invalid selection release blocker"
+            )
         identity = (
             scope["request_owner_epoch"],
             runner_epoch,

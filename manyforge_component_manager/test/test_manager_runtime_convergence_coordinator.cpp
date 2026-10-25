@@ -231,6 +231,18 @@ MaterializeRosRuntimePackage(const std::filesystem::path &root,
   if (bundle == nullptr) {
     throw std::runtime_error("ROS continuity fixture produced no retained bundle");
   }
+  if (empty) {
+    const auto configuration =
+        deployment::ros2_control_execution_runtime_contract::
+            require_configuration(*bundle, bundle->value().cell_graph.runtime_units.front().runtime_unit_id);
+    if (!configuration.controller_profiles.empty() ||
+        !configuration.initial_joint_positions_rad.empty() ||
+        !configuration.motion_target_limits.empty() ||
+        !configuration.default_fault_stop_profiles.empty()) {
+      throw std::runtime_error(
+          "derived canonical-empty ROS host retained component configuration");
+    }
+  }
   return {
       std::move(bundle),
       std::make_unique<deployment::FilesystemVerifiedRetainedBundleSource>(root),
@@ -246,7 +258,7 @@ MaterializeRosRuntimePackage(const std::filesystem::path &root,
       ? deployment::test::make_lite6_controllable_retention_fixture(
           false, false, 1U, true, true, {}, false, true, "resource", true,
           {}, {}, true, feedback_alias, !include_arm, std::nullopt, false,
-          deployment::test::kLite6ArmTargetId, std::nullopt, std::nullopt, {}, {}, true, {},
+          deployment::test::kLite6ArmTargetId, std::nullopt, std::nullopt, {}, true, {},
           "manyforge.provider.ros2_control", true, true, nullptr, nullptr,
           false, false, actuation_kind, 0.2, output_mode)
       : deployment::test::make_lite6_ros2_control_gripper_only_cclc_product_retention_fixture(
@@ -277,6 +289,25 @@ MaterializeRosRuntimePackage(const std::filesystem::path &root,
   return {std::move(bundle),
           std::make_unique<deployment::FilesystemVerifiedRetainedBundleSource>(root),
           std::make_unique<deployment::FilesystemVerifiedRetainedProductArtifactSource>(root)};
+}
+
+TEST(ManagerRuntimeConvergenceFixture,
+     PopulatedDeploymentDerivesADecodableCanonicalEmptyRosHost) {
+  ScopedPackageRoot package_root;
+  const auto package = MaterializeRosRuntimePackage(package_root.path(), true);
+  ASSERT_NE(package.bundle, nullptr);
+  const auto &graph = package.bundle->value().cell_graph;
+  EXPECT_TRUE(graph.controllable_components.empty());
+  EXPECT_TRUE(graph.control_bindings.empty());
+  ASSERT_EQ(graph.runtime_units.size(), 1U);
+  const auto configuration =
+      deployment::ros2_control_execution_runtime_contract::
+          require_configuration(*package.bundle,
+                                graph.runtime_units.front().runtime_unit_id);
+  EXPECT_TRUE(configuration.controller_profiles.empty());
+  EXPECT_TRUE(configuration.initial_joint_positions_rad.empty());
+  EXPECT_TRUE(configuration.motion_target_limits.empty());
+  EXPECT_TRUE(configuration.default_fault_stop_profiles.empty());
 }
 
 [[nodiscard]] ManagerApplyIntentDTO

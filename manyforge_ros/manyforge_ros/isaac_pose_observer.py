@@ -710,6 +710,7 @@ class ObservationDispatcher:
                 )
                 retry_delay = self._retry_initial_s
                 continue
+            observe_started_ns = self._clock_ns()
             try:
                 assert self._session is not None
                 result = self._client.observe(
@@ -718,6 +719,15 @@ class ObservationDispatcher:
                     intent=pending.intent,
                 )
             except SceneRuntimeManagerError as exc:
+                observe_elapsed_ns = max(0, self._clock_ns() - observe_started_ns)
+                cause = exc.__cause__
+                cause_errno = getattr(cause, "errno", None)
+                detail = (
+                    f"{str(exc)[:160]}; enqueue_age_ns={age_ns}; "
+                    f"observe_rpc_elapsed_ns={observe_elapsed_ns}; "
+                    f"cause_type={type(cause).__name__ if cause is not None else 'none'}; "
+                    f"cause_errno={cause_errno if type(cause_errno) is int else 'none'}"
+                )
                 with self._condition:
                     self._retries += 1
                     self._last_error_code = exc.code
@@ -734,7 +744,7 @@ class ObservationDispatcher:
                     "retry",
                     pending,
                     code=exc.code,
-                    detail=str(exc),
+                    detail=detail,
                 )
                 remaining_s = max(
                     0.0,

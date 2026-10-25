@@ -70,7 +70,6 @@ COMMON_ROW_CHECKS: Final = frozenset(
         "cclc_route_ready",
         "controller_ready",
         "cross_host_clock_payload",
-        "exact_world_readback",
         "execution_owner_exact",
         "joint_command_payload",
         "joint_state_payload",
@@ -93,7 +92,6 @@ MATRIX_CHECKS: Final = frozenset(
         "no_cross_drive",
         "provider_loss_recovery_bounded",
         "representative_chained_controller_route",
-        "scene_reload_exact",
         "structured_alarm_correlation",
         "two_same_type_instances_isolated",
     }
@@ -806,7 +804,6 @@ def validate_recovery_evidence(
     required = {
         "component_id",
         "dds",
-        "exact_world_after_rejoin",
         "output_sample",
         "passed",
         "provider",
@@ -900,10 +897,6 @@ def validate_recovery_evidence(
     output_digest = _sha256(
         output["sha256"], label="recovery output sha256"
     )
-    exact_world = _boolean(
-        recovery["exact_world_after_rejoin"],
-        label="exact world after rejoin",
-    )
     stopped_during = _boolean(
         recovery["simulation_stopped_during_outage"],
         label="simulation stopped during outage",
@@ -919,7 +912,6 @@ def validate_recovery_evidence(
         and output_seen
         and output_returncode == 0
         and output_bytes > 0
-        and exact_world
         and stopped_during
         and stopped_after
     )
@@ -934,7 +926,6 @@ def validate_recovery_evidence(
             "loss_elapsed_s": dds_loss,
             "rejoin_elapsed_s": dds_rejoin,
         },
-        "exact_world_after_rejoin": exact_world,
         "output_sample": {
             "bytes": output_bytes,
             "returncode": output_returncode,
@@ -987,9 +978,6 @@ def reduce_matrix(
         and row["checks"]["execution_owner_exact"]
         for row in ordered
     )
-    exact_world_checks = all(
-        row["checks"]["exact_world_readback"] for row in ordered
-    )
     same_type_isolated = probe_checks["two_same_type_instances_isolated"]
     matrix_checks = {
         "clock_synchronized": clock_passed,
@@ -1005,9 +993,6 @@ def reduce_matrix(
         "representative_chained_controller_route": probe_checks[
             "representative_chained_controller_route"
         ],
-        "scene_reload_exact": bool(
-            exact_world_checks and recovery["exact_world_after_rejoin"]
-        ),
         "structured_alarm_correlation": bool(
             collision_checks["collision_stop_kernel_owned"]
             and collision_checks["collision_stop_terminal"]

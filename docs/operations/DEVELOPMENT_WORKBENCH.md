@@ -93,6 +93,14 @@ does not choose peers or load a simulator world. Those prerequisites remain
 separate, explicitly operated processes. Stop an existing Workbench before
 changing its selected runtime capabilities.
 
+For a development workbench with configured Isaac object observers, set
+`MANYFORGE_DEV_ISAAC_SITE_SETTINGS` to the absolute path of the caller-written
+site-settings file before `start`. The launcher mounts that file's directory
+read-only and forwards the existing Manager `--isaac-site-settings` input. It
+does not select an observer configuration or timeout by default, and this input
+does not start, load, Play, Pause, Reset, or qualify Isaac Sim. The operator
+opens the scene; ManyForge attaches its inactive controller infrastructure.
+
 The retained `examples/isaac-ur10e-light-scene.scenario` is an aggregate
 robot/gripper development input. Its explicit 0.25 m/s authored TCP ceiling is
 demo policy, never a default for a missing limit. Live Isaac qualification remains unavailable;

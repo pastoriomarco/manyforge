@@ -2339,20 +2339,6 @@ void verify_scenarios(const std::filesystem::path &root,
          core::JsonValueDTO{std::string("commanded_sim")}},
         {"planner_rng_seed", core::JsonValueDTO{12345.0}},
     };
-    // Q81: retained Isaac configurations include the approved logical cell
-    // world. Keep this exact maintained-input check alongside the old facts.
-    if (scenario.ros2_control_execution && !scenario.isaac_profile.empty()) {
-      const std::string world =
-          scenario.source ==
-                  std::string_view("examples/trocar_lite6_foundationpose_pick."
-                                   "deployment.yaml")
-              ? "test_scene_realsense_foundationpose_trocar"
-              : scenario.isaac_profile == std::string_view("lite6")
-                    ? "lite6_grf_ros2"
-                    : "isaac_manipulator_scene_light";
-      expected_runtime_configuration.emplace("isaac_world",
-                                             core::JsonValueDTO{world});
-    }
     const auto motion_targets =
         runtime.configuration.find("motion_target_limits");
     const auto *motion_target_rows =

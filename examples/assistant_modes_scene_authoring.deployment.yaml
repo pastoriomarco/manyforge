@@ -1181,11 +1181,11 @@
         "schema_revision": "sha256:b242431032bf183f81718ae1b7b8501ee5f705e52d455732e0052215565bf4cc"
       },
       {
-        "content_addressed_store_key": "catalog/maintained/runtime_profile/manyforge.ros2_control_execution_runtime/b08fa170fe4df131f2cd7d85e1302e178d74ea46d31b03dd877cba5dc74e96c1",
-        "content_digest": "sha256:5874d7126a55d4d429a901a41af28bca2b06bfa6a57ebadc1b398f03f11d52eb",
+        "content_addressed_store_key": "catalog/maintained/runtime_profile/manyforge.ros2_control_execution_runtime/802d8cb56c078b62da66e3177df128b2e5d0479018efaadbed0fe476ba3343b2",
+        "content_digest": "sha256:a9b9016a2a1264f3922a136ac2f92b3aa73a7c791964f32438fa3599175f6f0f",
         "record_id": "manyforge.ros2_control_execution_runtime",
         "record_kind": "runtime_profile",
-        "record_revision": "sha256:b08fa170fe4df131f2cd7d85e1302e178d74ea46d31b03dd877cba5dc74e96c1",
+        "record_revision": "sha256:802d8cb56c078b62da66e3177df128b2e5d0479018efaadbed0fe476ba3343b2",
         "schema_id": "manyforge.runtime_profile.v1",
         "schema_revision": "sha256:c254afa8c2bfcc803f12a7af63b1f09a8ee804b1ffa2a65b7361ad9309b87ae7"
       },
@@ -1223,7 +1223,7 @@
     ]
   },
   "deployment_artifact_id": "ur10e_robotiq_assistant_modes_scene_authoring",
-  "deployment_revision": "sha256:ba1922c35ba2eb17832a7499dbb1c7d26ebd35cc666295e30aa0f258ba43f760",
+  "deployment_revision": "sha256:3ac8d8d73b4af24957d83a87c96e7a533bdc9c73f0fb7aca23052d166e1d7b8c",
   "description": "Local deployment fixture for assistant-mode catalog plumbing on the UR10e + Robotiq 2F-140 preview stack. It keeps the deterministic scene-authoring provider enabled while declaring the finite tools visible to query and composer-assistant requests.",
   "desired_control_configurations": [
     {
@@ -2068,7 +2068,7 @@
         },
         "dependency_runtime_unit_ids": [],
         "runtime_profile_id": "manyforge.ros2_control_execution_runtime",
-        "runtime_profile_revision": "sha256:b08fa170fe4df131f2cd7d85e1302e178d74ea46d31b03dd877cba5dc74e96c1",
+        "runtime_profile_revision": "sha256:802d8cb56c078b62da66e3177df128b2e5d0479018efaadbed0fe476ba3343b2",
         "runtime_unit_id": "robot_cell.ros2_control_execution"
       }
     ]

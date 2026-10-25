@@ -892,6 +892,21 @@ def create_scenario_document_router(state: ComposerState) -> APIRouter:
                 # Preserve that observable partial result; never report Load as
                 # complete or silently roll it back when Manager rejects or its
                 # acceptance cannot be observed.
+                if getattr(error, "code", None) == "manager_apply_rejected":
+                    raise HTTPException(
+                        status_code=409,
+                        detail={
+                            "code": "manager_apply_rejected",
+                            "message": (
+                                "The Scenario workspace was replaced, but "
+                                f"{error}. Refresh the workspace before another action."
+                            ),
+                            "path": committed_path,
+                            "managerOutcome": "rejected",
+                            "causeCode": "manager_apply_rejected",
+                            "workspace": committed_snapshot.identity.as_dict(),
+                        },
+                    ) from error
                 manager_outcome = (
                     "accepted"
                     if isinstance(activation, dict)

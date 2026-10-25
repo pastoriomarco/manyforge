@@ -258,7 +258,6 @@ native_execution_configuration(std::string_view controllable_component_id,
     bool include_gripper = false, bool motion = true) {
   CanonicalValue::Object configuration{
       {"mode", CanonicalValue("commanded_sim")},
-      {"isaac_world", CanonicalValue("lite6_grf_ros2")},
       {"controller_profiles",
        CanonicalValue(
            CanonicalValue::Array{CanonicalValue(CanonicalValue::Object{
@@ -2172,7 +2171,6 @@ assistant_source(const bool composer_draft_enabled = false) {
     const std::optional<CanonicalValue> &ros_default_fault_stop_profiles =
         std::nullopt,
     std::string_view first_ros_frame_prefix = {},
-    std::string_view isaac_world = "lite6_grf_ros2",
     bool ros_mock_peers = true,
     std::string_view empty_ros_configuration_field = {},
     bool ros_mock_first = false,
@@ -2507,8 +2505,6 @@ assistant_source(const bool composer_draft_enabled = false) {
         for (auto &[field, selected] : configuration) {
           if (field == empty_ros_configuration_field)
             selected = CanonicalValue(CanonicalValue::Array{});
-          if (field == "isaac_world")
-            selected = CanonicalValue(std::string(isaac_world));
           if (field == "gripper_target_configurations") {
             auto rows = selected.as_array();
             for (auto &row : rows) {
@@ -2536,10 +2532,6 @@ assistant_source(const bool composer_draft_enabled = false) {
             selected = CanonicalValue(
                 CanonicalValue::Array{CanonicalValue(std::move(profile))});
           }
-        }
-        if (ros_mock_first && isaac_world.empty()) {
-          std::erase_if(configuration,
-                        [](const auto &row) { return row.first == "isaac_world"; });
         }
         value = CanonicalValue(std::move(configuration));
       }
@@ -2600,9 +2592,7 @@ assistant_source(const bool composer_draft_enabled = false) {
         {"runtime_profile_id", CanonicalValue(profile.value().runtime_profile_id.value())},
         {"runtime_profile_revision", CanonicalValue(profile.value().runtime_profile_revision.value())},
         {"dependency_runtime_unit_ids", CanonicalValue(CanonicalValue::Array{})},
-        {"configuration", ros2_control_execution_runtime_contract::empty_host_configuration(
-            isaac_world.empty() ? std::nullopt
-                                : std::optional<std::string>(isaac_world))},
+        {"configuration", ros2_control_execution_runtime_contract::empty_host_configuration()},
     });
   }
   CanonicalValue::Object graph_members{
@@ -3008,7 +2998,7 @@ make_lite6_controllable_retention_fixture(
         std::nullopt,
     const std::optional<double> arm_max_stop_time_s = std::nullopt,
     std::string_view first_ros_frame_prefix = {},
-    std::string_view isaac_world = "lite6_grf_ros2", bool ros_mock_peers = true,
+    bool ros_mock_peers = true,
     std::string_view empty_ros_configuration_field = {},
     std::string_view direct_provider_id = "lite6_arm_provider",
     bool include_lifecycle_recover = false, bool ros_mock_first = false,
@@ -3127,7 +3117,7 @@ make_lite6_controllable_retention_fixture(
       structural, catalog, instance_count, cell_id, containment_granularity,
       gripper_only, initial_joint1_position_rad, shared_native_domain,
       ros_motion_limit_target_id, ros_default_fault_stop_profiles,
-      first_ros_frame_prefix, isaac_world, ros_mock_peers,
+      first_ros_frame_prefix, ros_mock_peers,
       empty_ros_configuration_field, ros_mock_first, graph_input_mapper,
       independent_scalar_peer, scalar_peer_type.has_value() ? &*scalar_peer_type : nullptr,
       ros_gripper_actuation_kind, ros_gripper_dwell_s, ros_gripper_output_mode);
@@ -3442,7 +3432,7 @@ make_lite6_ros2_control_chained_catalog_retention_fixture() {
   return make_lite6_controllable_retention_fixture(
       true, false, 1U, false, true, {}, false, false, "resource", false, {}, {},
       true, false, false, std::nullopt, false, kLite6ArmTargetId, std::nullopt,
-      std::nullopt, {}, {}, true, {}, "manyforge.provider.ros2_control", false,
+      std::nullopt, {}, true, {}, "manyforge.provider.ros2_control", false,
       true);
 }
 
@@ -3493,7 +3483,7 @@ make_lite6_ros2_control_motion_retention_fixture(
       false, false, 1U, false, true, {}, false, stoppable, "resource", false,
       lifecycle_semantic_digest, {}, true, false, false, std::nullopt, false,
       motion_limit_target_id, default_fault_stop_profiles, std::nullopt, {},
-      "lite6_grf_ros2", true, {}, provider_id, include_lifecycle_recover);
+      true, {}, provider_id, include_lifecycle_recover);
 }
 
 /// Single addressed ROS arm with the selected product's exact lifecycle anchor.
@@ -3504,7 +3494,7 @@ make_lite6_ros2_control_arm_only_cclc_product_retention_fixture(
   return make_lite6_controllable_retention_fixture(
       false, false, 1U, false, true, {}, false, true, "resource", true,
       lifecycle_semantic_digest, {}, true, false, false, std::nullopt, false,
-      kLite6ArmTargetId, std::nullopt, std::nullopt, {}, {}, true,
+      kLite6ArmTargetId, std::nullopt, std::nullopt, {}, true,
       {}, "manyforge.provider.ros2_control", true, true);
 }
 
@@ -3515,7 +3505,7 @@ make_lite6_stop_qualified_ros_motion_retention_fixture(
   return make_lite6_controllable_retention_fixture(
       false, false, 1U, false, true, {}, false, true, "resource", true, {}, {},
       true, false, false, std::nullopt, false, kLite6ArmTargetId, std::nullopt,
-      arm_max_stop_time_s, {}, {}, true, {}, "manyforge.provider.ros2_control",
+      arm_max_stop_time_s, {}, true, {}, "manyforge.provider.ros2_control",
       false, true);
 }
 
@@ -3545,7 +3535,7 @@ make_lite6_ros2_control_cclc_product_retention_fixture(
       false, false, 1U, true, true, {}, false, true, "resource", true,
       lifecycle_semantic_digest, lifecycle_semantic_digest, true,
       gripper_feedback, false, initial_joint1_position_rad, false,
-      kLite6ArmTargetId, std::nullopt, std::nullopt, {}, {}, true,
+      kLite6ArmTargetId, std::nullopt, std::nullopt, {}, true,
       {}, "manyforge.provider.ros2_control", true, true);
 }
 
@@ -3574,7 +3564,7 @@ make_lite6_ros2_control_gripper_only_cclc_product_retention_fixture(
       false, false, 1U, true, true, {}, false, true, "resource", true,
       lifecycle_semantic_digest, lifecycle_semantic_digest, true,
       false, true, std::nullopt, false, kLite6ArmTargetId,
-      std::nullopt, std::nullopt, {}, {}, true, {},
+      std::nullopt, std::nullopt, {}, true, {},
       "manyforge.provider.ros2_control", true, true, nullptr, graph_input_mapper,
       false, false, actuation_kind, dwell_s, output_mode);
 }
@@ -3599,7 +3589,7 @@ make_lite6_ros2_control_scalar_peer_retention_fixture(
       false, true, "resource", true,
       lifecycle_semantic_digest, lifecycle_semantic_digest, true,
       false, !arm_root, std::nullopt, false, kLite6ArmTargetId,
-      std::nullopt, std::nullopt, {}, {}, true, {},
+      std::nullopt, std::nullopt, {}, true, {},
       "manyforge.provider.ros2_control", true, true, nullptr, nullptr, false, true);
 }
 
@@ -3669,7 +3659,7 @@ make_lite6_ros2_control_composer_assistant_retention_fixture() {
   return make_lite6_controllable_retention_fixture(
       false, true, 1U, false, true, {}, true, false, "resource", false,
       {}, {}, true, false, false, std::nullopt, false, kLite6ArmTargetId,
-      std::nullopt, std::nullopt, {}, {}, true, {},
+      std::nullopt, std::nullopt, {}, true, {},
       "lite6_arm_provider", false, true);
 }
 
@@ -3680,7 +3670,7 @@ make_lite6_ros2_control_cclc_assistant_product_retention_fixture(
       false, true, 1U, true, true, {}, true, true, "resource", true,
       lifecycle_semantic_digest, lifecycle_semantic_digest, true,
       false, false, std::nullopt, false, kLite6ArmTargetId,
-      std::nullopt, std::nullopt, {}, {}, true, {},
+      std::nullopt, std::nullopt, {}, true, {},
       "manyforge.provider.ros2_control", true, true);
 }
 
@@ -3693,7 +3683,7 @@ make_lite6_ros2_control_shared_consumer_retention_fixture(
       false, false, instance_count, aggregate_gripper, true, cell_id, false,
       stoppable, "resource", stoppable, {}, {}, true, false, false,
       std::nullopt, false, kLite6ArmTargetId, std::nullopt, std::nullopt,
-      {}, {}, true, {}, "manyforge.provider.ros2_control", false, true);
+      {}, true, {}, "manyforge.provider.ros2_control", false, true);
 }
 
 /// Genuine ROS execution owner with a distinct retained read-only StateObserved binding.
@@ -3705,7 +3695,7 @@ make_lite6_ros2_control_observed_consumer_retention_fixture(
   return make_lite6_controllable_retention_fixture(
       false, false, 1U, aggregate_gripper, true, {}, false, false, "resource",
       false, {}, {}, true, false, false, std::nullopt, false, kLite6ArmTargetId,
-      std::nullopt, std::nullopt, {}, {}, true, {},
+      std::nullopt, std::nullopt, {}, true, {},
       "manyforge.provider.ros2_control", false, true, nullptr, nullptr, true,
       false, "pneumatic", std::nullopt, "commanded", nullptr, nullptr,
       associate_tcp_contact_bodies, shared_arm_endpoint_bodies);

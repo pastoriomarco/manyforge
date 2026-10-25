@@ -699,6 +699,13 @@ ProductBackedRuntimeParticipantResolver::LoadProgramBinding(
                                 retained_model_map_);
 }
 
+core::Result<core::RuntimeParticipantBinding>
+ProductBackedRuntimeParticipantResolver::BindCollisionBodyAliases(
+    core::RuntimeParticipantBinding binding) const {
+  return core::bind_runtime_participant_collision_body_aliases(
+      std::move(binding), collision_body_aliases_);
+}
+
 std::shared_ptr<const deployment::ProgramBindingContract>
 ProductBackedRuntimeParticipantResolver::LoadProgram(
     const core::ProgramId &program_id,

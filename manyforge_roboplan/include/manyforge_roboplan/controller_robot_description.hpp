@@ -69,8 +69,9 @@ struct IsaacControllerLane final {
   std::string hardware_component_name;
   std::string joint_commands_topic;
   std::string joint_states_topic;
-  /// The Isaac profile's fixed initial values (they carry no behaviour, Q47),
-  /// paired with the arm joints by order.
+  /// The selected deployment's backend-commanded initial pose, paired with the
+  /// arm joints by order. TopicBasedSystem seeds both command and state
+  /// interfaces from these values before JTC activation.
   std::vector<double> initial_joint_positions_rad;
 };
 

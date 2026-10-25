@@ -786,7 +786,13 @@ ProgramExecutionScopeValue(const core::ProgramExecutionScopeStateDTO &value) {
       {"held_node_indices", CanonicalValue(std::move(held))},
       {"stopping_node_indices", CanonicalValue(std::move(stopping))},
       {"faulted_node_indices", CanonicalValue(std::move(faulted))},
-      {"pending_effects", CanonicalValue(std::move(pending))}});
+      {"pending_effects", CanonicalValue(std::move(pending))},
+      {"selection_release_block_reason",
+       value.selection_release_block_reason.has_value()
+           ? CanonicalValue(std::string(
+                 core::program_selection_release_block_reason_token(
+                     *value.selection_release_block_reason)))
+           : CanonicalValue(nullptr)}});
 }
 
 [[nodiscard]] CanonicalValue ProgramSelectionAcceptedValue(

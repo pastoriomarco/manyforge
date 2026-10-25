@@ -59,7 +59,6 @@ def recovery_for(runner: ModuleType, scenario) -> dict[str, object]:
         "schema_version": runner.RECOVERY_EVIDENCE_SCHEMA,
         "component_id": scenario.component_id,
         "dds": {"loss_elapsed_s": 1.0, "rejoin_elapsed_s": 2.0},
-        "exact_world_after_rejoin": True,
         "output_sample": {
             "bytes": 128,
             "returncode": 0,
@@ -310,6 +309,11 @@ def test_row_validation_rejects_world_component_and_obligation_substitution(
     with pytest.raises(runner.QualificationError, match="frozen set"):
         runner.validate_row(missing)
 
+    obsolete_check = row_for(runner, scenario)
+    obsolete_check["checks"]["exact_world_readback"] = True
+    with pytest.raises(runner.QualificationError, match="frozen set"):
+        runner.validate_row(obsolete_check)
+
 
 def test_reducer_derives_all_checks_from_structured_evidence(
     runner: ModuleType,
@@ -323,6 +327,7 @@ def test_reducer_derives_all_checks_from_structured_evidence(
     assert result["matrix_checks"] == {
         check: True for check in sorted(runner.MATRIX_CHECKS)
     }
+    assert "scene_reload_exact" not in result["matrix_checks"]
     assert [row["scenario_id"] for row in result["rows"]] == [
         scenario.scenario_id for scenario in runner.SCENARIOS
     ]
@@ -392,6 +397,13 @@ def test_clock_and_recovery_evidence_are_recomputed_fail_closed(
             rows,
             matrix_evidence_for(runner),
             preflight=preflight_for(runner),
+        )
+
+    recovery = recovery_for(runner, runner.SCENARIOS[1])
+    recovery["exact_world_after_rejoin"] = True
+    with pytest.raises(runner.QualificationError, match="recovery fields differ"):
+        runner.validate_recovery_evidence(
+            {"details": {"recovery": recovery}}
         )
 
 

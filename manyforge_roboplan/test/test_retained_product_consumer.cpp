@@ -67,6 +67,8 @@
 #include <vector>
 
 #ifdef MANYFORGE_RETAINED_ROS2_CONTROL_TEST_FACTORY
+#include "host_io_provider_installation.hpp"
+#include "host_io_signal_runtime.hpp"
 #include "host_io_output_channels.hpp"
 #include "io_provider_lifecycle_product.hpp"
 #include "maintained_activation_fixture.hpp"
@@ -2299,7 +2301,7 @@ TEST(RetainedProductCrossConsumer,
               false, false, 1U, true, true, {}, false, true, "resource", true,
               {}, {}, true, true, false, std::nullopt, false,
               deployment::test::kLite6ArmTargetId, std::nullopt, std::nullopt,
-              {}, {}, true, {}, "manyforge.provider.ros2_control", false, true,
+              {}, true, {}, "manyforge.provider.ros2_control", false, true,
               nullptr, nullptr, false, false, "pneumatic", 0.8, "commanded"));
   ASSERT_NE(materialized.bundle, nullptr);
   const auto &bundle = *materialized.bundle;
@@ -3957,10 +3959,66 @@ enum class Lite6AggregateCheck {
   kMovingBudgetPublication,
 #ifdef MANYFORGE_RETAINED_ROS2_CONTROL_TEST_FACTORY
   kMixedOutputPublication,
+  kGeometricHostInstallation,
 #endif
   kMeasuredOptionalDomainRace,
   kMeasuredNullOptionalDomainRace
 };
+
+#ifdef MANYFORGE_RETAINED_ROS2_CONTROL_TEST_FACTORY
+void select_geometric_contact_station(
+    deployment::CanonicalValue::Object &root) {
+  using deployment::CanonicalValue;
+  const auto components =
+      std::find_if(root.begin(), root.end(),
+                   [](const auto &row) { return row.first == "components"; });
+  if (components == root.end())
+    throw std::logic_error("maintained geometric fixture has no components");
+  auto rows = components->second.as_array();
+  std::erase_if(rows, [](const auto &row) {
+    const auto *id = row.find_object_member("component_id");
+    return id == nullptr || (id->as_string() != "lite6_robot" &&
+                             id->as_string() != "station_io");
+  });
+  const auto station =
+      std::find_if(rows.begin(), rows.end(), [](const auto &row) {
+        const auto *id = row.find_object_member("component_id");
+        return id != nullptr && id->as_string() == "station_io";
+      });
+  if (station == rows.end())
+    throw std::logic_error("maintained geometric fixture has no station I/O");
+  auto station_fields = station->as_object();
+  auto configuration = std::find_if(
+      station_fields.begin(), station_fields.end(),
+      [](const auto &row) { return row.first == "configuration"; });
+  auto configuration_fields = configuration->second.as_object();
+  auto runtime_configuration = std::find_if(
+      configuration_fields.begin(), configuration_fields.end(),
+      [](const auto &row) { return row.first == "runtime_configuration"; });
+  auto runtime_fields = runtime_configuration->second.as_object();
+  auto signals =
+      std::find_if(runtime_fields.begin(), runtime_fields.end(),
+                   [](const auto &row) { return row.first == "io_signals"; });
+  signals->second = deployment::parse_strict_json_model_yaml(R"([{
+    "command_target_id":"io","controllable_component_id":"station_io",
+    "direction":"input",
+    "freshness":{"mode":"sample_age","maximum_age_ns":5000000000},
+    "provider":{"profile":"geometric_contact","ingress_depth":4,
+      "endpoint":{"controllable_component_id":"lite6_robot",
+        "command_target_id":"gripper","frame_role_id":"tcp"},
+      "target_scene_resource_id":"geometric_target"},
+    "resource_role_id":"probe_contact","signal_name":"probe_contact",
+    "source_id":"station_io.probe_contact",
+    "transition_capability":"sampled_only","update_mode":"sampled",
+    "value_type":"bool"
+  }])")
+                        .root();
+  runtime_configuration->second = CanonicalValue(std::move(runtime_fields));
+  configuration->second = CanonicalValue(std::move(configuration_fields));
+  *station = CanonicalValue(std::move(station_fields));
+  components->second = CanonicalValue(std::move(rows));
+}
+#endif
 
 void check_refreshed_cell_model(
     RetainedNativeRuntime &runtime, ManagedKernelAdmissionGate &admission_gate,
@@ -4128,21 +4186,32 @@ private:
 
 void check_selected_core_lite6_aggregate(const Lite6AggregateCheck check) {
 #ifdef MANYFORGE_RETAINED_ROS2_CONTROL_TEST_FACTORY
-  const bool mixed_output_check = check == Lite6AggregateCheck::kMixedOutputPublication;
-  const bool ros_jerk_rejection = check == Lite6AggregateCheck::kRosOrdinaryJerkRejection;
+  const bool mixed_output_check =
+      check == Lite6AggregateCheck::kMixedOutputPublication;
+  const bool geometric_host_check =
+      check == Lite6AggregateCheck::kGeometricHostInstallation;
+  const bool ros_jerk_rejection =
+      check == Lite6AggregateCheck::kRosOrdinaryJerkRejection;
 #else
   const bool mixed_output_check = false;
+  const bool geometric_host_check = false;
   const bool ros_jerk_rejection = false;
 #endif
+  const bool maintained_product_check =
+      mixed_output_check || geometric_host_check;
   const bool reseal_capability_inventory =
       check == Lite6AggregateCheck::kResealInventory;
   const bool authored_fault_check =
       check == Lite6AggregateCheck::kDeploymentFaultStopProfile ||
       check == Lite6AggregateCheck::kDeploymentFastFaultStopProfile ||
-      check == Lite6AggregateCheck::kDeploymentFaultStopProfileWithExtraJoints ||
-      check == Lite6AggregateCheck::kDeploymentFaultStopProfileWithOnlyExtraSettleOverrides ||
-      check == Lite6AggregateCheck::kDeploymentFaultStopProfileWithSparseSettleOverrides ||
-      check == Lite6AggregateCheck::kDeploymentFaultStopProfileMissingArmJoint ||
+      check ==
+          Lite6AggregateCheck::kDeploymentFaultStopProfileWithExtraJoints ||
+      check == Lite6AggregateCheck::
+                   kDeploymentFaultStopProfileWithOnlyExtraSettleOverrides ||
+      check == Lite6AggregateCheck::
+                   kDeploymentFaultStopProfileWithSparseSettleOverrides ||
+      check ==
+          Lite6AggregateCheck::kDeploymentFaultStopProfileMissingArmJoint ||
       check == Lite6AggregateCheck::kDeploymentFaultStopProfileWithoutArmJoints;
   ScopedTemporaryRoot temporary;
   const std::filesystem::path package_root =
@@ -4155,26 +4224,49 @@ void check_selected_core_lite6_aggregate(const Lite6AggregateCheck check) {
   ASSERT_TRUE(std::filesystem::create_directory(staging_parent));
   ASSERT_TRUE(std::filesystem::create_directory(empty_ambient_root));
 
-  struct SelectedBundle { std::shared_ptr<const deployment::RetainedBundle> bundle; };
+  struct SelectedBundle {
+    std::shared_ptr<const deployment::RetainedBundle> bundle;
+  };
   const auto materialized = [&]() -> SelectedBundle {
 #ifdef MANYFORGE_RETAINED_ROS2_CONTROL_TEST_FACTORY
+    if (geometric_host_check)
+      return {deployment::test::MaterializeMaintainedInterruptDeployment(
+                  package_root,
+                  deployment::parse_strict_json_model_yaml(
+                      R"({"interrupt_rules":[]})")
+                      .root(),
+                  "examples/r5_trial_e_signal.scenario",
+                  select_geometric_contact_station)
+                  .bundle};
     if (mixed_output_check)
       return {deployment::test::MaterializeMaintainedInterruptDeployment(
-          package_root, deployment::parse_strict_json_model_yaml(R"({"interrupt_rules":[]})").root(),
-          "examples/r5_trial_e_signal.scenario").bundle};
+                  package_root,
+                  deployment::parse_strict_json_model_yaml(
+                      R"({"interrupt_rules":[]})")
+                      .root(),
+                  "examples/r5_trial_e_signal.scenario")
+                  .bundle};
     if (ros_jerk_rejection) {
       const auto plans = detail::ros2_control_lifecycle_plans_internal::
           retained_ros2_control_lifecycle_plans();
-      const auto semantic = core::ComputeBrandLifecyclePlanCatalogSemanticDigest(
-          core::ProviderManifestId("manyforge.provider.ros2_control"), plans);
-      if (!semantic.ok()) throw std::logic_error(semantic.error().message);
-      return {deployment::test::
-          materialize_lite6_ros2_control_cclc_product_retained_consumer_fixture(
-              package_root, semantic.value().value()).bundle};
+      const auto semantic =
+          core::ComputeBrandLifecyclePlanCatalogSemanticDigest(
+              core::ProviderManifestId("manyforge.provider.ros2_control"),
+              plans);
+      if (!semantic.ok())
+        throw std::logic_error(semantic.error().message);
+      return {
+          deployment::test::
+              materialize_lite6_ros2_control_cclc_product_retained_consumer_fixture(
+                  package_root, semantic.value().value())
+                  .bundle};
     }
 #endif
-    return {deployment::test::
-        materialize_lite6_ros2_control_motion_arm_gripper_retained_consumer_fixture(package_root).bundle};
+    return {
+        deployment::test::
+            materialize_lite6_ros2_control_motion_arm_gripper_retained_consumer_fixture(
+                package_root)
+                .bundle};
   }();
   ASSERT_NE(materialized.bundle, nullptr);
   const auto &products = materialized.bundle->value().compiled_products;
@@ -4189,36 +4281,68 @@ void check_selected_core_lite6_aggregate(const Lite6AggregateCheck check) {
                         products.symbol_role_maps.front().product_id});
 
   const core::ControllableComponentId component_id(
-      mixed_output_check ? "lite6_robot" : std::string(deployment::test::kLite6ControllableComponentId));
+      maintained_product_check
+          ? "lite6_robot"
+          : std::string(deployment::test::kLite6ControllableComponentId));
   const core::CommandTargetId arm_target_id(
       std::string(deployment::test::kLite6ArmTargetId));
   const core::CommandTargetId gripper_target_id(
       std::string(deployment::test::kLite6GripperTargetId));
   const auto &graph = materialized.bundle->value().cell_graph;
-  if (!mixed_output_check) {
+  if (!maintained_product_check) {
     ASSERT_EQ(graph.runtime_units.size(), 1U);
   }
-  const auto& arm_control = require_fixture_one(graph.control_bindings, [&](const auto& row) {
-    return row.controllable_component_id == component_id && row.command_target_id == arm_target_id &&
-           row.capability_id == core::CapabilityId("execution.trajectory.execute");
-  }, "actual arm execution control binding");
+  const auto &arm_control = require_fixture_one(
+      graph.control_bindings,
+      [&](const auto &row) {
+        return row.controllable_component_id == component_id &&
+               row.command_target_id == arm_target_id &&
+               row.capability_id ==
+                   core::CapabilityId("execution.trajectory.execute");
+      },
+      "actual arm execution control binding");
   const core::RuntimeEpoch local_runtime_epoch(
-      "epoch." + (mixed_output_check ? arm_control.provider_runtime_unit_id
-                                     : graph.runtime_units.front().runtime_unit_id).value());
+      "epoch." + (maintained_product_check
+                      ? arm_control.provider_runtime_unit_id
+                      : graph.runtime_units.front().runtime_unit_id)
+                     .value());
   const auto state_authority = core::StateAuthorityClass::kCommanded;
   const auto arm_binding = make_fixture_runtime_participant(
       *materialized.bundle, model_map, component_id, arm_target_id,
       state_authority, std::nullopt, local_runtime_epoch,
-      mixed_output_check ? std::optional(arm_control.capability_id) : std::nullopt);
+      maintained_product_check ? std::optional(arm_control.capability_id)
+                               : std::nullopt);
   const core::ProgramCommandSchemaRefDTO command_schema{
       core::CommandSchemaId(std::string(core::kGripperPositionCommandSchemaId)),
       core::CommandSchemaRevision(
           std::string(core::kGripperPositionCommandSchemaRevision))};
-  const auto gripper_binding = make_fixture_runtime_participant(
+  auto gripper_binding = make_fixture_runtime_participant(
       *materialized.bundle, model_map, component_id, gripper_target_id,
       state_authority, command_schema, local_runtime_epoch,
-      mixed_output_check ? std::optional(core::CapabilityId("tool.gripper.command"))
-                         : std::nullopt);
+      maintained_product_check
+          ? std::optional(core::CapabilityId("tool.gripper.command"))
+          : std::nullopt);
+  if (geometric_host_check) {
+    deployment::FilesystemCatalogArtifactStore artifacts(package_root);
+    const auto direct =
+        deployment::compile_direct_control_program_binding_inventory(
+            *materialized.bundle, model_map, artifacts);
+    const auto direct_gripper = require_fixture_one(
+        direct.gripper,
+        [&](const auto &binding) {
+          return binding != nullptr &&
+                 std::any_of(
+                     binding->value().target_role_bindings.begin(),
+                     binding->value().target_role_bindings.end(),
+                     [&](const auto &target) {
+                       return target.controllable_component_id == component_id &&
+                              target.command_target_id == gripper_target_id;
+                     });
+        },
+        "actual direct gripper Program Binding");
+    gripper_binding =
+        with_program_binding_identity(gripper_binding, *direct_gripper);
+  }
 
   if (check == Lite6AggregateCheck::kQualifiedEndpointPlannerFrames) {
     const auto *tool = model_map.find_target(component_id, gripper_target_id);
@@ -4367,8 +4491,15 @@ void check_selected_core_lite6_aggregate(const Lite6AggregateCheck check) {
       stage.srdf_path(), stage.package_paths(), arm_group.compiled_group_name);
   auto collision_projector = RetainedCollisionWorldProjector::create_verified(
       shared_collision_model, *materialized.bundle, model_map, retained);
-  const auto initial_scene = make_projection_runtime_shadow_snapshot(
+  auto initial_scene = make_projection_runtime_shadow_snapshot(
       materialized.bundle->value().cell_graph.cell_id);
+  if (geometric_host_check) {
+    initial_scene = core::LogicalSceneSnapshotRoot(
+        std::make_shared<const core::LogicalSceneSnapshotDTO>(
+            make_collision_scene_snapshot(
+                materialized.bundle->value().cell_graph.cell_id, 2U,
+                core::SceneResourceId("geometric_target"), 0.0, 10.0)));
+  }
   ASSERT_FALSE(arm_binding.value().runtime_unit_epochs.empty());
   const auto local_runtime = arm_binding.value().runtime_unit_epochs.front();
   const core::ProjectionNativeRuntimeBindingDTO native_binding{
@@ -4681,65 +4812,87 @@ void check_selected_core_lite6_aggregate(const Lite6AggregateCheck check) {
   const bool moving_budget_check =
       check == Lite6AggregateCheck::kMovingBudgetPublication;
 #ifdef MANYFORGE_RETAINED_ROS2_CONTROL_TEST_FACTORY
-  if (mixed_output_check) {
-    runtime_input.participant_resolver_factory =
-        [package_root, bundle = materialized.bundle, model_map](auto composed) {
-          auto resolver = std::make_shared<ProductBackedRuntimeParticipantResolver>(
-              package_root, bundle, model_map, std::move(composed),
-              std::vector<core::ProgramBindingId>{});
-          return RetainedRuntimeParticipantResolver{
-              [resolver](const auto& operation, auto index) {
-                return resolver->ResolveExecutionParticipant(operation, index);
-              }};
-        };
+  if (maintained_product_check) {
+    runtime_input.participant_resolver_factory = [package_root,
+                                                  bundle = materialized.bundle,
+                                                  model_map](auto composed) {
+      auto resolver = std::make_shared<ProductBackedRuntimeParticipantResolver>(
+          package_root, bundle, model_map, std::move(composed),
+          std::vector<core::ProgramBindingId>{});
+      return RetainedRuntimeParticipantResolver{
+          [resolver](const auto &operation, auto index) {
+            return resolver->ResolveExecutionParticipant(operation, index);
+          }};
+    };
   }
 #endif
-  auto runtime = (moving_budget_check || mixed_output_check)
-                     ? create_retained_native_runtime_participants(
-                           std::move(runtime_input), std::move(runtime_config))
-                     : create_retained_native_runtime(
-                           std::move(runtime_input), std::move(runtime_config));
+  const auto configured_collision_monitor_period_ns =
+      runtime_config.kernel.collision_monitor_period_ns;
+  const auto configured_immediate_query_budget_ns =
+      runtime_config.kernel.runtime_collision_immediate_query_budget_ns;
+  const auto configured_dynamic_body_max_age_cap_ns =
+      runtime_config.kernel.runtime_dynamic_body_max_age_cap_ns;
+  auto runtime =
+      (moving_budget_check || mixed_output_check || geometric_host_check)
+          ? create_retained_native_runtime_participants(
+                std::move(runtime_input), std::move(runtime_config))
+          : create_retained_native_runtime(std::move(runtime_input),
+                                           std::move(runtime_config));
+  if (geometric_host_check) {
+    runtime->collision_monitor_period_ns =
+        configured_collision_monitor_period_ns;
+    runtime->runtime_collision_immediate_query_budget_ns =
+        configured_immediate_query_budget_ns;
+    runtime->runtime_dynamic_body_max_age_cap_ns =
+        configured_dynamic_body_max_age_cap_ns > 0
+            ? std::optional<core::Duration>(
+                  configured_dynamic_body_max_age_cap_ns)
+            : std::nullopt;
+  }
   // Match managed composition: one stable cell Kernel, subordinate engines,
   // and an already sealed cell policy in its current registration snapshot.
 #ifdef MANYFORGE_RETAINED_ROS2_CONTROL_TEST_FACTORY
   std::shared_ptr<host_detail::IoProviderDriverRecord> mixed_driver;
-  std::shared_ptr<std::vector<host_detail::HostIoOutputChannelEntry>> mixed_channels;
+  std::shared_ptr<std::vector<host_detail::HostIoOutputChannelEntry>>
+      mixed_channels;
   std::function<void()> dispatch_mixed_output;
   std::optional<core::ComponentLifecycleGeneration> mixed_arm_generation;
 #endif
   std::unique_ptr<RetainedNativeCellRuntime> budget_cell;
-  if (moving_budget_check || mixed_output_check) {
+  if (moving_budget_check || mixed_output_check || geometric_host_check) {
     auto rows = runtime->participant_registrations;
-    if (moving_budget_check) for (auto &row : rows) {
-      row.motion_takeover_preparation_budget_s =
-          row.binding.value().capability_id.value() ==
-                  "execution.trajectory.execute"
-              ? std::optional<double>(3.5)
-              : std::nullopt;
-    }
-    if (moving_budget_check) runtime->participant_resolver_factory = [](auto) {
-      return RetainedRuntimeParticipantResolver{
-          [](const core::OperationIntentDTO &, std::size_t) {
-            return core::Result<RetainedResolvedParticipant>::Err(
-                {"unused_route_fixture",
-                 "route fixture dispatches no operations",
-                 {}});
-          }};
-    };
-    const auto resolver = mixed_output_check ? runtime->participant_resolver
-        : make_retained_cell_kernel_participant_resolver(
-            runtime->participant_resolver_factory({runtime->motion_binding}), rows);
+    if (moving_budget_check)
+      for (auto &row : rows) {
+        row.motion_takeover_preparation_budget_s =
+            row.binding.value().capability_id.value() ==
+                    "execution.trajectory.execute"
+                ? std::optional<double>(3.5)
+                : std::nullopt;
+      }
+    if (moving_budget_check)
+      runtime->participant_resolver_factory = [](auto) {
+        return RetainedRuntimeParticipantResolver{
+            [](const core::OperationIntentDTO &, std::size_t) {
+              return core::Result<RetainedResolvedParticipant>::Err(
+                  {"unused_route_fixture",
+                   "route fixture dispatches no operations",
+                   {}});
+            }};
+      };
+    const auto resolver = maintained_product_check
+                              ? runtime->participant_resolver
+                              : make_retained_cell_kernel_participant_resolver(
+                                    runtime->participant_resolver_factory(
+                                        {runtime->motion_binding}),
+                                    rows);
     RetainedNativeCellRuntimeInput cell_input{
         runtime->clock,
         runtime->scheduler,
         temporary.path() / "budget-cell.sqlite3",
         std::move(rows),
         core::ResourceAddressedExecutionKernelConfig{
-            owner_epoch,
-            materialized.bundle->value().cell_graph.cell_id,
-            1024U,
-            resolver,
-            &admission_gate,
+            owner_epoch, materialized.bundle->value().cell_graph.cell_id, 1024U,
+            resolver, &admission_gate,
             materialized.bundle->value().cell_graph.graph_revision},
         runtime->stop_surveillance_owner->SnapshotSources()};
     budget_cell =
@@ -4751,16 +4904,268 @@ void check_selected_core_lite6_aggregate(const Lite6AggregateCheck check) {
         materialized.bundle->value().cell_graph.cell_id.value());
   }
 #ifdef MANYFORGE_RETAINED_ROS2_CONTROL_TEST_FACTORY
+  if (geometric_host_check) {
+    const auto take = []<class T>(core::Result<T> value) {
+      if (!value.ok())
+        throw std::logic_error(value.error().code + ": " +
+                               value.error().message);
+      return std::move(value.value());
+    };
+    const core::ControllableComponentId station("station_io");
+    const auto catalog =
+        take(deployment::ResolveRetainedIoSignalCatalog(graph));
+    ASSERT_EQ(catalog.size(), 1U);
+    const auto &signal = catalog.front();
+    EXPECT_EQ(signal.provider.profile, "geometric_contact");
+    ASSERT_TRUE(signal.provider.endpoint);
+    EXPECT_EQ(signal.provider.endpoint->controllable_component_id,
+              component_id);
+    EXPECT_EQ(signal.provider.endpoint->command_target_id, gripper_target_id);
+    EXPECT_EQ(signal.provider.endpoint->frame_role_id,
+              core::FrameRoleId("tcp"));
+    const auto &domain = require_fixture_one(
+        graph.control_domains,
+        [&](const auto &row) {
+          return row.provider() &&
+                 row.provider()->controllable_component_id == station;
+        },
+        "actual geometric provider domain");
+    const auto &provider = *domain.provider();
+    deployment::FilesystemVerifiedRetainedProviderManifestSource manifests(
+        package_root);
+    const auto manifest = manifests.get_verified(
+        {materialized.bundle->retained_bundle_id(),
+         provider.provider_manifest_id, provider.provider_manifest_revision});
+    ASSERT_TRUE(manifest);
+    const core::RuntimeEpoch station_epoch("geometric.actual.station.driver");
+    auto driver = take(host_detail::IoProviderDriverRecord::Create(
+        {domain.control_domain_id, domain.control_domain_revision,
+         core::ResolvedProviderDomainScopeDTO{provider, station_epoch, {}, {}}},
+        {domain.control_domain_id, domain.control_domain_revision,
+         provider.provider_instance_id, provider.provider_manifest_id,
+         provider.provider_manifest_revision, provider.provider_runtime_unit_id,
+         station_epoch, provider.lifecycle_plan_catalog_digest},
+        manifest->value(), runtime->clock, 1'000'000'000LL));
+    auto drivers = std::make_shared<const host_detail::IoProviderDriverGroup>(
+        host_detail::IoProviderDriverGroup{driver});
+
+    const core::ProjectionRevisionDTO product_projection{
+        materialized.bundle->retained_bundle_id(), graph.graph_revision,
+        initial_scene.shared()->revision};
+    constexpr std::uint64_t kPublicationGeneration = 1U;
+    auto composition = std::make_unique<host_detail::Composition>(
+        component_id, materialized.bundle, nullptr, nullptr, nullptr, nullptr,
+        runtime->motion_binding, runtime->gripper_binding, std::nullopt,
+        deployment::CanonicalValue(deployment::CanonicalValue::Object{}),
+        deployment::CanonicalValue(deployment::CanonicalValue::Object{}),
+        nullptr, runtime, product_projection,
+        core::ActiveBundlePublicationGeneration(kPublicationGeneration),
+        std::nullopt, std::nullopt);
+    composition->cell_runtime = budget_cell.get();
+    composition->target_resolver =
+        std::make_shared<ProductBackedRuntimeParticipantResolver>(
+            package_root, materialized.bundle, model_map,
+            std::vector<core::RuntimeParticipantBinding>{
+                runtime->motion_binding, *runtime->gripper_binding},
+            std::vector<core::ProgramBindingId>{});
+    deployment::FilesystemCatalogArtifactStore artifacts(package_root);
+    composition->direct_control_io_program_bindings =
+        deployment::compile_direct_control_program_binding_inventory(
+            *materialized.bundle, model_map, artifacts)
+            .io;
+    auto station_view = std::make_unique<host_detail::Composition>(
+        station, materialized.bundle, nullptr, nullptr, nullptr, nullptr,
+        std::nullopt, std::nullopt, std::nullopt,
+        deployment::CanonicalValue(deployment::CanonicalValue::Object{}),
+        deployment::CanonicalValue(deployment::CanonicalValue::Object{}),
+        nullptr, nullptr, product_projection,
+        core::ActiveBundlePublicationGeneration(kPublicationGeneration),
+        std::nullopt, std::nullopt);
+    station_view->cell_runtime = budget_cell.get();
+    station_view->io_provider_drivers = drivers;
+    station_view->component_runtime_pins =
+        std::make_shared<const host_detail::ComponentRuntimePins>(
+            host_detail::ComponentRuntimePins{nullptr, nullptr, drivers});
+    composition->participant_compositions.push_back(std::move(station_view));
+
+    const auto prepared = host_detail::PrepareCompositionIoProviderResources(
+        *composition, *budget_cell, {}, {});
+    ASSERT_TRUE(prepared.ok()) << prepared.error().message;
+    ASSERT_NE(composition->io_signal_runtime, nullptr);
+    const auto &installations =
+        composition->io_signal_runtime->driver_input_installations();
+    ASSERT_EQ(installations.size(), 1U);
+    ASSERT_EQ(installations.begin()->second.size(), 1U);
+    const auto &geometric =
+        installations.begin()->second.front().geometric_contact;
+    ASSERT_TRUE(geometric);
+    EXPECT_EQ(geometric->endpoint.command_target_id, gripper_target_id);
+    ASSERT_EQ(geometric->endpoint.contact_body_bindings.size(), 1U);
+    EXPECT_EQ(geometric->endpoint.contact_body_bindings.front()
+                  .collision_body_role_id,
+              core::CollisionBodyRoleId("gripper_fingers"));
+    EXPECT_EQ(geometric->observed_states.size(), 2U);
+    const auto query =
+        std::dynamic_pointer_cast<collision::ManyForgeCollisionEngine>(
+            geometric->collision_engine);
+    ASSERT_NE(query, nullptr);
+    EXPECT_TRUE(query->runtime_query_covers_full_configuration());
+
+    composition->io_signal_runtime->Start();
+    composition->io_signal_service = composition->io_signal_runtime->service();
+    std::uint64_t lifecycle_sequence = 0U;
+    const auto step = [&](std::string_view primitive) {
+      const auto sequence = ++lifecycle_sequence;
+      const auto snapshot = take(driver->ReadLifecycleSnapshot(
+          domain.control_domain_id, runtime->clock->now()));
+      const auto &actual = driver->occurrence();
+      const core::BrandLifecyclePrimitiveIntentDTO intent{
+          core::LifecycleTransactionId("geometric.driver." +
+                                       std::string(primitive) + "." +
+                                       std::to_string(sequence)),
+          core::LifecycleTransactionGeneration(sequence),
+          station,
+          actual.control_domain_id,
+          actual.control_domain_revision,
+          actual.provider_instance_id,
+          actual.provider_manifest_id,
+          actual.provider_manifest_revision,
+          actual.provider_runtime_unit_id,
+          actual.provider_runtime_epoch,
+          core::LifecyclePrimitiveId("io.provider." + std::string(primitive)),
+          core::LifecyclePrimitiveAttemptId("geometric.attempt." +
+                                            std::string(primitive) + "." +
+                                            std::to_string(sequence)),
+          snapshot.source_generation,
+          1'000'000'000LL};
+      const auto outcome = driver->Dispatch(intent, {});
+      ASSERT_EQ(outcome.known,
+                core::LifecyclePrimitiveKnownResultDTO::kSucceeded)
+          << (outcome.error ? outcome.error->message : "missing result");
+    };
+    const core::IoSignalId signal_id{station, "probe_contact"};
+    EXPECT_EQ(take(composition->io_signal_service->ReadSignal(signal_id))
+                  .availability,
+              core::IoSignalAvailability::kMissing);
+    step("prepare");
+    step("enable");
+    ASSERT_TRUE(composition->io_signal_runtime->DrainPending().ok());
+    const auto contact =
+        take(composition->io_signal_service->ReadSignal(signal_id));
+    ASSERT_EQ(contact.availability, core::IoSignalAvailability::kFresh);
+    ASSERT_TRUE(contact.latest_sample);
+    // Compare the contained level; bool conversion only tests optional presence.
+    EXPECT_EQ(contact.latest_sample->publication.value,
+              std::optional<bool>(true));
+    const auto initial_bundle =
+        geometric->collision_publisher
+            ->published_runtime_collision_query_bundle();
+    ASSERT_NE(initial_bundle, nullptr);
+    ASSERT_NE(initial_bundle->world, nullptr);
+    const auto target_body_id = core::make_scene_collision_body_id(
+        core::SceneResourceId("geometric_target"), 0U);
+    const auto &initial_target = require_fixture_one(
+        initial_bundle->world->bodies,
+        [&](const auto &body) { return body.body_id == target_body_id; },
+        "initial geometric target collision body");
+    EXPECT_DOUBLE_EQ(initial_target.pose.position_m.x_m, 0.0);
+    const auto initial_world_revision = initial_bundle->world->revision;
+    const auto initial_prepared_scene = query->internal_prepared_scene_identity();
+    ASSERT_NE(initial_prepared_scene, nullptr);
+    const auto initial_scene_build_count =
+        query->internal_prepared_scene_build_count();
+    const auto initial_source_sequence =
+        contact.latest_sample->publication.source_sequence;
+
+    step("disable");
+    auto separated_scene = *projection->logical_snapshot();
+    ASSERT_EQ(separated_scene.objects.size(), 1U);
+    const auto prior_revision = product_projection;
+    separated_scene.objects.front().placement =
+        core::CellFixedSceneObjectPlacementDTO{
+            graph.cell_id, {{100.0, 0.0, 0.0}, {0.0, 0.0, 0.0, 1.0}}};
+    ++separated_scene.transaction_sequence;
+    ++separated_scene.topology_epoch;
+    ++separated_scene.revision.revision_id;
+    separated_scene.revision.content_hash =
+        core::logical_scene_identity::ComputeLogicalSceneContentHash(
+            separated_scene);
+    const core::ProjectionRevisionDTO separated_revision{
+        materialized.bundle->retained_bundle_id(), graph.graph_revision,
+        separated_scene.revision};
+    const core::SceneTransactionDTO separation{
+        core::RequestId("geometric-separate-target"),
+        {},
+        separated_scene.transaction_sequence,
+        prior_revision,
+        separated_revision,
+        core::ContentDigest(std::string(kZeroDigest)),
+        core::ResolvedUpsertSceneObjectDTO{separated_scene.objects.front()},
+        core::ContentDigest(std::string(kZeroDigest))};
+    const auto moved = projection->ApplyTransaction(separation);
+    ASSERT_EQ(moved.result, core::ProjectionCommitResultStateDTO::kCommitted);
+    ASSERT_NE(projection->logical_snapshot(), nullptr);
+    EXPECT_EQ(projection->logical_snapshot()->revision,
+              separated_scene.revision);
+    const auto &logical_target = require_fixture_one(
+        projection->logical_snapshot()->objects,
+        [&](const auto &object) {
+          return object.scene_resource_id ==
+                 core::SceneResourceId("geometric_target");
+        },
+        "moved logical geometric target");
+    const auto *logical_fixed =
+        std::get_if<core::CellFixedSceneObjectPlacementDTO>(
+            &logical_target.placement);
+    ASSERT_NE(logical_fixed, nullptr);
+    EXPECT_DOUBLE_EQ(logical_fixed->pose_in_cell.position_m.x_m, 100.0);
+    const auto separated_bundle =
+        geometric->collision_publisher
+            ->published_runtime_collision_query_bundle();
+    ASSERT_NE(separated_bundle, nullptr);
+    ASSERT_NE(separated_bundle->world, nullptr);
+    EXPECT_NE(separated_bundle, initial_bundle);
+    EXPECT_GT(separated_bundle->world->revision.revision_id,
+              initial_world_revision.revision_id);
+    EXPECT_NE(separated_bundle->world->revision.content_hash,
+              initial_world_revision.content_hash);
+    const auto &separated_target = require_fixture_one(
+        separated_bundle->world->bodies,
+        [&](const auto &body) { return body.body_id == target_body_id; },
+        "moved geometric target collision body");
+    EXPECT_DOUBLE_EQ(separated_target.pose.position_m.x_m, 100.0);
+    step("prepare");
+    step("enable");
+    ASSERT_TRUE(composition->io_signal_runtime->DrainPending().ok());
+    const auto separated =
+        take(composition->io_signal_service->ReadSignal(signal_id));
+    ASSERT_EQ(separated.availability, core::IoSignalAvailability::kFresh);
+    ASSERT_TRUE(separated.latest_sample);
+    EXPECT_GT(separated.latest_sample->publication.source_sequence,
+              initial_source_sequence);
+    EXPECT_NE(query->internal_prepared_scene_identity(),
+              initial_prepared_scene);
+    EXPECT_GT(query->internal_prepared_scene_build_count(),
+              initial_scene_build_count);
+    EXPECT_EQ(separated.latest_sample->publication.value,
+              std::optional<bool>(false));
+    composition->io_signal_runtime->Shutdown();
+    driver->Shutdown();
+    return;
+  }
+
   if (mixed_output_check) {
     // Same genuine maintained arm + model-free station product as the process
     // trial. The current snapshot supplies the construction generation; no
     // component Active state or Kernel output admission is fabricated here.
     const auto take = []<class T>(core::Result<T> value) {
       if (!value.ok()) {
-        const auto& error = value.error();
+        const auto &error = value.error();
         const auto reason = error.details.find("reason");
         throw std::logic_error(error.code + ": " + error.message +
-            (reason == error.details.end() ? std::string{} : " [" + reason->second + "]"));
+                               (reason == error.details.end()
+                                    ? std::string{}
+                                    : " [" + reason->second + "]"));
       }
       return std::move(value.value());
     };
@@ -4859,7 +5264,8 @@ void check_selected_core_lite6_aggregate(const Lite6AggregateCheck check) {
     std::shared_ptr<core::IoSignalIngress> ingress(take(core::IoSignalIngress::Create(inputs)));
     std::vector<host_detail::IoProviderInputSourceInstallation> installed_inputs;
     for (const auto& [source, rows] : input_rows)
-      installed_inputs.push_back({rows, {}, ingress, incarnations.at(source)});
+      installed_inputs.push_back(
+          {rows, {}, ingress, incarnations.at(source), std::nullopt});
     std::vector<host_detail::HostIoOutputAliasInstallation> aliases;
     {
       auto delivery = mixed_driver->AcquireDelivery();
@@ -6630,7 +7036,14 @@ TEST(RetainedNativeMeasuredRoutePublication,
 #ifdef MANYFORGE_RETAINED_ROS2_CONTROL_TEST_FACTORY
 TEST(RetainedNativeMeasuredRoutePublication,
      ActualMixedOutputResolvesAndDispatchesAcrossArmReadinessAndRouteAdoption) {
-  check_selected_core_lite6_aggregate(Lite6AggregateCheck::kMixedOutputPublication);
+  check_selected_core_lite6_aggregate(
+      Lite6AggregateCheck::kMixedOutputPublication);
+}
+
+TEST(RetainedProductCrossConsumer,
+     ActualGeometricContactInstallsMaintainedGripperEndpointThroughHostIo) {
+  check_selected_core_lite6_aggregate(
+      Lite6AggregateCheck::kGeometricHostInstallation);
 }
 #endif
 

@@ -3,7 +3,6 @@
 #include <manyforge_roboplan/controller_launch_artifacts.hpp>
 
 #include <algorithm>
-#include <array>
 #include <charconv>
 #include <cmath>
 #include <cstdio>
@@ -36,12 +35,6 @@ struct IsaacProfileFacts final {
   double gripper_close_effort;
   bool gripper_publish_nominal_position;
   double gripper_result_timeout_s;
-  /// Controller robot_description `initial_value`s, in arm-joint binding
-  /// order: the fixed values the Isaac launch used as its argument defaults
-  /// (no caller overrode them). They carry no behaviour: activation holds at
-  /// Isaac's measured joints and the guard stays closed until authorization
-  /// (Q41, Q47, Q69).
-  std::array<double, 6> initial_joint_positions_rad;
 };
 
 // Lane facts common to both Isaac profiles: the controller YAML
@@ -75,7 +68,6 @@ constexpr IsaacProfileFacts kLite6Profile{
     -5.0,
     true,
     5.0,
-    {0.0, 0.0, 1.57, 0.0, 0.0, 0.0},
 };
 
 constexpr IsaacProfileFacts kUr10eProfile{
@@ -94,8 +86,6 @@ constexpr IsaacProfileFacts kUr10eProfile{
     40.0,
     false,
     15.0,
-    {2.63422544, -0.875980752, 1.551074106, -2.29231544, -1.560498884,
-     -2.038544566},
 };
 
 [[nodiscard]] const IsaacProfileFacts &
@@ -377,21 +367,15 @@ std::string retained_isaac_ros_namespace(
 }
 
 IsaacControllerLane
-retained_isaac_controller_lane(const std::string_view isaac_profile) {
+retained_isaac_controller_lane(
+    const std::string_view isaac_profile,
+    const std::span<const double> initial_joint_positions_rad) {
   const auto &profile = profile_facts(isaac_profile);
   return IsaacControllerLane{
       std::string(profile.hardware_component_name),
       std::string(kArmJointCommandsTopic), std::string(kIsaacJointStatesTopic),
-      std::vector<double>(profile.initial_joint_positions_rad.begin(),
-                          profile.initial_joint_positions_rad.end())};
-}
-
-std::vector<std::string>
-retained_isaac_scene_required_topics(const std::string_view isaac_profile) {
-  const auto &profile = profile_facts(isaac_profile);
-  return {"/clock", std::string(kArmJointCommandsTopic),
-          std::string(kIsaacJointStatesTopic),
-          std::string(profile.gripper_command_topic)};
+      std::vector<double>(initial_joint_positions_rad.begin(),
+                          initial_joint_positions_rad.end())};
 }
 
 RetainedRos2ControlBackendConfig
@@ -461,12 +445,8 @@ make_retained_isaac_ros2_control_backend_config(
     participant.stop.max_deceleration_on_cancel_rad_s2.emplace(
         joint, profile.cancel_deceleration_rad_s2);
   }
-  config.isaac_guard = RetainedIsaacArmGuardBindingConfig{
-      std::string(kArmJointCommandsTopic), std::string(kIsaacJointStatesTopic),
-      static_cast<core::Duration>(kJointStateMaxAgeS * 1e9),
-      static_cast<core::Duration>(1e9 / rates.state_publish_rate_hz)};
   config.arm.measured_joint_state_lane = RetainedMeasuredJointStateLane{
-      config.isaac_guard->joint_states_topic,
+      std::string(kIsaacJointStatesTopic),
       config.participant.stop.controller_state_max_age_ns,
       core::StateAuthorityId(std::string(kMeasuredJointStateAuthorityId)),
       std::string(kMeasuredJointStateProfileId)};

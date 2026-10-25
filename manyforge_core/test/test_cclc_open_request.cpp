@@ -553,6 +553,24 @@ TEST(CCLCOpenRequest, ReadinessPreservesTaggedHealthFactsAndFullWidthEvaluationT
   EXPECT_THROW(static_cast<void>(SnapshotResult(port)), std::logic_error);
 }
 
+TEST(CCLCOpenRequest, LifecycleReadyPreservesUnavailableMeasuredStateWarning) {
+  TargetViewPort port;
+  port.mutate_read = [](CCLCComponentReadDTO& value) {
+    MakeReady(value);
+    value.readiness.measured_state = {
+        true, false,
+        ErrorDTO{"observation_stale", "Required measured state is stale", {}}};
+  };
+  const auto result = SnapshotResult(port);
+  const auto& readiness = Member(result, "readiness");
+  EXPECT_TRUE(Member(readiness, "ready").as_bool());
+  const auto& measured = Member(readiness, "measured_state");
+  EXPECT_TRUE(Member(measured, "required").as_bool());
+  EXPECT_FALSE(Member(measured, "available").as_bool());
+  EXPECT_EQ(Member(Member(measured, "error"), "code").as_string(),
+            "observation_stale");
+}
+
 TEST(CCLCOpenRequest, ReadinessKeepsGeneralErrorsFullWhileHealthDiagnosticUsesLifecycleBound) {
   TargetViewPort port;
   ErrorDTO source_error{"measured_source_unavailable", "actual source error", {}};

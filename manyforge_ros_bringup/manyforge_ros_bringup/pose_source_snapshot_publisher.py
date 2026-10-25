@@ -18,7 +18,7 @@ from typing import Any, Protocol
 
 import rclpy
 from rclpy.context import Context
-from rclpy.executors import MultiThreadedExecutor
+from rclpy.executors import SingleThreadedExecutor
 from rclpy.node import Node
 from rclpy.time import Time
 
@@ -205,31 +205,48 @@ class PoseSourceSnapshotPublisher(Node):
             return True
         self._stopped = True
         self._stop_event.set()
+        if self._simulation_client is not None:
+            cancel_client = getattr(self._simulation_client, "cancel", None)
+            if callable(cancel_client):
+                cancel_client()
         for adapter in self._source_adapters:
             adapter.close()
         self._source_adapters.clear()
         thread_stopped = True
         if self._simulation_thread is not None:
             self._simulation_thread.join(
-                timeout=self._simulation_service_timeout_s + 1.0
+                timeout=self._simulation_service_timeout_s * 2.0 + 1.0
             )
             thread_stopped = not self._simulation_thread.is_alive()
+        simulation_client_stopped = thread_stopped
+        if thread_stopped and self._simulation_client is not None:
+            close_client = getattr(self._simulation_client, "close", None)
+            if callable(close_client):
+                try:
+                    close_client()
+                except Exception:
+                    simulation_client_stopped = False
         dispatcher_stopped = self._dispatcher.close(
             timeout_s=self._manager_timeout_s + 1.0
         )
-        if not thread_stopped or not dispatcher_stopped:
+        if (
+            not thread_stopped
+            or not simulation_client_stopped
+            or not dispatcher_stopped
+        ):
             self.get_logger().error(
                 "isaac_pose_observer_shutdown_incomplete "
                 + json.dumps(
                     {
                         "dispatcher_stopped": dispatcher_stopped,
+                        "simulation_client_stopped": simulation_client_stopped,
                         "simulation_thread_stopped": thread_stopped,
                     },
                     separators=(",", ":"),
                     sort_keys=True,
                 )
             )
-        return thread_stopped and dispatcher_stopped
+        return thread_stopped and simulation_client_stopped and dispatcher_stopped
 
     def _configure_joint_state(self) -> None:
         binding = self._config.joint_state
@@ -412,6 +429,8 @@ class PoseSourceSnapshotPublisher(Node):
                     tf_buffer=self._tf_buffer,
                     lookup_time=Time(),
                 )
+                if self._stop_event.is_set():
+                    break
                 observed_entities: set[str] = set()
                 failed_entities: set[str] = set()
                 for observation in batch.observations:
@@ -445,6 +464,8 @@ class PoseSourceSnapshotPublisher(Node):
                             source_key=entity,
                         )
             except Exception as error:
+                if self._stop_event.is_set():
+                    break
                 normalized = ObservationNormalizationError(
                     "source_error", str(error)[:512] or "simulation poll failed"
                 )
@@ -570,7 +591,7 @@ def main(args: list[str] | None = None) -> int:
                 raise ValueError("--check-config requires exactly one site config path")
             config = load_isaac_pose_observer_site_config(Path(invocation[1]))
             # Only metadata from the existing bounded strict parser. The host
-            # captures stdout losslessly before running any world barrier;
+            # captures stdout losslessly before attaching the observer;
             # this is neither an Open session nor an observation receipt.
             print(
                 json.dumps(
@@ -580,6 +601,15 @@ def main(args: list[str] | None = None) -> int:
                         "bindings": [
                             binding.to_value() for binding in config.observer_bindings
                         ],
+                        "expected_joint_state": (
+                            None
+                            if config.joint_state is None
+                            else {
+                                "object_id": config.joint_state.object_id,
+                                "policy_id": config.joint_state.policy_id,
+                                "topic": config.joint_state.topic,
+                            }
+                        ),
                     },
                     separators=(",", ":"),
                     sort_keys=True,
@@ -594,11 +624,14 @@ def main(args: list[str] | None = None) -> int:
     context = Context()
     rclpy.init(args=args, context=context)
     node: PoseSourceSnapshotPublisher | None = None
-    executor: MultiThreadedExecutor | None = None
+    executor: SingleThreadedExecutor | None = None
+    node_stopped = True
     result = 0
     try:
         node = PoseSourceSnapshotPublisher(context=context)
-        executor = MultiThreadedExecutor(num_threads=2, context=context)
+        # Service waits and Manager I/O run on their own workers. Execute the
+        # short ROS callbacks inline, avoiding thread-pool/GIL contention.
+        executor = SingleThreadedExecutor(context=context)
         executor.add_node(node)
         for auxiliary in node.auxiliary_nodes:
             executor.add_node(auxiliary)
@@ -611,20 +644,22 @@ def main(args: list[str] | None = None) -> int:
         result = 78
     finally:
         if node is not None:
-            if not node.stop() and result == 0:
+            node_stopped = node.stop()
+            if not node_stopped and result == 0:
                 result = 1
-            if executor is not None:
-                for auxiliary in node.auxiliary_nodes:
-                    executor.remove_node(auxiliary)
-                    auxiliary.destroy_node()
-                executor.remove_node(node)
-            else:
-                for auxiliary in node.auxiliary_nodes:
-                    auxiliary.destroy_node()
-            node.destroy_node()
-        if executor is not None:
+            if node_stopped:
+                if executor is not None:
+                    for auxiliary in node.auxiliary_nodes:
+                        executor.remove_node(auxiliary)
+                        auxiliary.destroy_node()
+                    executor.remove_node(node)
+                else:
+                    for auxiliary in node.auxiliary_nodes:
+                        auxiliary.destroy_node()
+                node.destroy_node()
+        if executor is not None and node_stopped:
             executor.shutdown(timeout_sec=2.0)
-        if context.ok():
+        if context.ok() and node_stopped:
             rclpy.shutdown(context=context)
     return result
 

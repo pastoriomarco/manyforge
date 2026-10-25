@@ -20,6 +20,7 @@ from manyforge_composer.backend.routes_scenario_documents import (
 from manyforge_composer.backend.authoring_admission import (
     AuthoringAdmissionCoordinator,
     AuthoringMutationEnvelope,
+    AuthoringOperationError,
     LocalAuthoringCommit,
 )
 from manyforge_composer.backend.authoring_forest import from_program, derive_candidate
@@ -935,6 +936,143 @@ def test_scenario_load_uses_one_claim_for_workspace_commit_and_activation(
     assert loaded["program"]["saved"]["path"] == str(target / "program.yaml")
     assert loaded["deployment"]["differsFromSaved"] is False
     assert loaded["deployment"]["savedPath"] == str(target / "deployment.yaml")
+
+
+@pytest.mark.parametrize(
+    ("failure_code", "settled"),
+    [
+        ("manager_apply_rejected", True),
+        ("manager_apply_submission_uncertain", False),
+        ("manager_apply_acceptance_invalid", False),
+    ],
+)
+def test_scenario_load_settles_only_proven_preacceptance_rejection(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    failure_code: str,
+    settled: bool,
+) -> None:
+    target = Path(
+        save_scenario_artifact(
+            _document("loaded-project"),
+            str(tmp_path / "loaded-project.scenario"),
+            allowed_roots=[str(tmp_path)],
+            overwrite=False,
+        )
+    )
+    state = ComposerState(allowed_fs_roots=[str(tmp_path)])
+    claim_owner = _SettlingHeadless()
+    coordinator = AuthoringAdmissionCoordinator(claim_owner)  # type: ignore[arg-type]
+    state.authoring_admission = coordinator  # type: ignore[assignment]
+    state.headless_client = type(
+        "ManagerStub",
+        (),
+        {
+            "manager_status": lambda _self: {
+                "status": {"active": {"canonical_empty": True}}
+            }
+        },
+    )()  # type: ignore[assignment]
+    client = _scenario_client(state)
+    before = state.authoring_workspace.snapshot()
+
+    candidate = {
+        "schema_version": "manyforge.prepared_activation_input.v6",
+        "prepared_activation_id": "prepared-load-test",
+        "origin": {
+            "kind": "scenario",
+            "scenario_id": "loaded-project",
+            "source_document_digest": "sha256:" + "1" * 64,
+            "project_path": str(target),
+        },
+        "captured_input_digest": "sha256:" + "2" * 64,
+        "deployment_artifact_id": "fixture_deployment",
+        "deployment_revision": "deployment-revision",
+        "retained_bundle_id": "bundle-load-test",
+        "graph_revision": "graph-load-test",
+        "program_id": "program-load-test",
+        "program_revision": "program-revision",
+        "program_outcome": {
+            "kind": "bound",
+            "program_binding_id": "binding-load-test",
+        },
+        "node_environment_digest": "sha256:" + "a" * 64,
+        "assistant_mode": "forbidden",
+    }
+
+    def prepare_or_reject(
+        _intent,
+        _claim,
+        *,
+        apply,
+        prepared=None,
+        prepare_only=False,
+        confirmed=False,
+    ):
+        assert apply is True
+        if prepare_only:
+            assert confirmed is True
+            return {
+                "prepared_activation": candidate,
+                "candidate_preview": {"diff": {}},
+                "manager_apply": {"request_id": "isaac-load.1"},
+                "confirmation_required": False,
+                "confirmation_token": None,
+                "preparation": None,
+                "phases_ms": {},
+            }
+        assert prepared is not None
+        raise AuthoringOperationError(
+            failure_code,
+            (
+                "Manager rejected the exact Deployment candidate: "
+                "apply_rejected: "
+                "named Isaac world requires --isaac-site-settings"
+            ),
+        )
+
+    monkeypatch.setattr(
+        state,
+        "_manager_current",
+        lambda _status: ("current-bundle", "current-graph", "manager-epoch"),
+    )
+    monkeypatch.setattr(
+        state, "execute_authored_deployment_candidate", prepare_or_reject
+    )
+    response = client.post(
+        "/api/scenario-documents/load",
+        json={**_fence(state), "path": str(target), "confirmDiscard": False},
+    )
+
+    assert state.authoring_workspace.snapshot().identity != before.identity
+    if settled:
+        assert response.status_code == 409, response.text
+        detail = response.json()["detail"]
+        assert detail["code"] == "manager_apply_rejected"
+        assert detail["managerOutcome"] == "rejected"
+        assert detail["causeCode"] == "manager_apply_rejected"
+        assert "effect" not in detail
+        assert "named Isaac world requires --isaac-site-settings" in detail["message"]
+        assert claim_owner.settlements == ["owner_commit"]
+        assert coordinator.local_claim_pending is False
+        assert coordinator.mutation_ready is True
+        outcome = coordinator.submission_outcome(
+            AuthoringMutationEnvelope(
+                expected_admission_generation=1,
+                request_owner_epoch="browser-test-epoch",
+                request_id="scenario-test-request",
+            )
+        )
+        assert outcome["outcome"]["kind"] == "settled"
+    else:
+        assert response.status_code == 503, response.text
+        detail = response.json()["detail"]
+        assert detail["code"] == "scenario_load_activation_not_confirmed"
+        assert detail["managerOutcome"] == "not_confirmed"
+        assert detail["causeCode"] == failure_code
+        assert claim_owner.settlements == []
+        assert coordinator.local_claim_pending is True
+        assert coordinator.mutation_ready is False
 
 
 def test_scenario_load_partial_contained_install_keeps_the_claim(

@@ -1263,7 +1263,7 @@ class ProgramRuntime:
                 )
             return configuration, rows(configuration.get("controller_profiles"))
 
-        def isaac_profile(profile: Mapping[str, Any], configuration: Mapping[str, Any]) -> bool:
+        def isaac_profile(profile: Mapping[str, Any]) -> bool:
             isaac, mock = profile.get("isaac_profile"), profile.get("mock_profile")
             if (("isaac_profile" in profile) == ("mock_profile" in profile)
                 or not isinstance(isaac if "isaac_profile" in profile else mock, str)
@@ -1271,9 +1271,6 @@ class ProgramRuntime:
                 raise ProgramRunOwnerError("Program simulation dependency has invalid typed lane")
             if "isaac_profile" not in profile:
                 return False
-            world = configuration.get("isaac_world")
-            if not isinstance(world, str) or not world:
-                raise ProgramRunOwnerError("Program simulation dependency has no declared Isaac world")
             return True
 
         if simulator_node:
@@ -1291,7 +1288,7 @@ class ProgramRuntime:
                         or unit.get("runtime_unit_id") not in matches[0].get("runtime_unit_ids", ())):
                         raise ProgramRunOwnerError("Program global simulator profile has foreign runtime ownership")
                     seen.add(component)
-                    eligible |= isaac_profile(profile, configuration)
+                    eligible |= isaac_profile(profile)
             return True, configured if eligible else unavailable
 
         targets = rows(program_binding.get("target_role_bindings"))
@@ -1351,7 +1348,7 @@ class ProgramRuntime:
                 if len(matches) != 1 or seen_profile:
                     raise ProgramRunOwnerError("Program simulation dependency has no unique ROS controller profile")
                 seen_profile = True
-                required |= isaac_profile(matches[0], configuration)
+                required |= isaac_profile(matches[0])
         return required, configured if required else unavailable
 
     def _current_node_owner_availability(
@@ -3515,6 +3512,72 @@ class ProgramRuntime:
                     f"Required component {component_id} is {state!r}, not active",
                 )
 
+    def _verify_selected_motion_feedback(
+        self, program_run_id: str, group_ids: Sequence[str]
+    ) -> None:
+        """Transient preflight; command-time Kernel/port checks remain authoritative."""
+
+        try:
+            component_ids, retained_bundle_id, graph_revision = (
+                self._owner.execution_selection_motion_readiness_scope(
+                    program_run_id, group_ids
+                )
+            )
+        except ProgramRunOwnerError as error:
+            raise ProgramRunnerError(
+                "program_motion_readiness_invalid", str(error)
+            ) from error
+        if not component_ids:
+            return
+        for component_id in component_ids:
+            try:
+                observed = self._headless.cclc_component(component_id)
+            except HeadlessClientError as error:
+                raise ProgramRunnerError(
+                    "program_motion_component_readiness_unavailable",
+                    str(error),
+                    details={
+                        **error.details,
+                        "controllable_component_id": component_id,
+                    },
+                ) from error
+            if (
+                not isinstance(observed, Mapping)
+                or observed.get("controllable_component_id") != component_id
+                or observed.get("retained_bundle_id") != retained_bundle_id
+                or observed.get("graph_revision") != graph_revision
+            ):
+                raise ProgramRunnerError(
+                    "program_motion_component_readiness_stale",
+                    f"Selected component {component_id} has no current readiness identity",
+                )
+            readiness = observed.get("readiness")
+            measured = (
+                readiness.get("measured_state")
+                if isinstance(readiness, Mapping)
+                else None
+            )
+            if not isinstance(measured, Mapping):
+                raise ProgramRunnerError(
+                    "program_motion_component_readiness_unavailable",
+                    f"Selected component {component_id} has no measured-state verdict",
+                )
+            required = measured.get("required")
+            available = measured.get("available")
+            error = measured.get("error")
+            if required is False and available is None and error is None:
+                continue
+            if required is True and available is True and error is None:
+                continue
+            reason = error.get("message") if isinstance(error, Mapping) else None
+            raise ProgramRunnerError(
+                "program_motion_component_readiness_unavailable",
+                reason
+                if isinstance(reason, str) and reason
+                else f"Selected component {component_id} has no fresh measured state",
+                details={"controllable_component_id": component_id},
+            )
+
     def start_run(self, request: ProgramRunStartRequest) -> dict[str, Any]:
         if not isinstance(request, ProgramRunStartRequest):
             raise TypeError("start_run requires one ProgramRunStartRequest")
@@ -4314,8 +4377,38 @@ class ProgramRuntime:
             "recovery_offers": self._recovery_offers(
                 program_run_id, cycle_generation=self._current_cycle_generation()
             ),
-            "execution_selections": execution_selections,
+            "execution_selections": self._motion_feedback_controls(
+                program_run_id, execution_selections
+            ),
         }
+
+    def _motion_feedback_controls(
+        self, program_run_id: str, execution_selections: Mapping[str, Any]
+    ) -> dict[str, Any]:
+        """Advisory controls projection from the same preflight as dispatch."""
+
+        projected = deepcopy(dict(execution_selections))
+        groups = projected.get("groups")
+        if not isinstance(groups, list):
+            return projected
+        for group in groups:
+            if not isinstance(group, dict) or not (
+                group.get("start_allowed") is True
+                or group.get("resume_allowed") is True
+            ):
+                continue
+            group_id = group.get("group_id")
+            if not isinstance(group_id, str):
+                continue
+            try:
+                self._verify_selected_motion_feedback(program_run_id, (group_id,))
+            except (ProgramRunnerError, ProgramRunOwnerError) as error:
+                reason = str(error) or "Selected motion feedback is unavailable"
+                group["start_allowed"] = False
+                group["resume_allowed"] = False
+                group["start_unavailable_reason"] = reason
+                group["resume_unavailable_reason"] = reason
+        return projected
 
     def _current_cycle_generation(self) -> int:
         return 1 if self._journal is None else self._journal.read().cycle_generation
@@ -5964,6 +6057,7 @@ class ProgramRuntime:
             )
 
         def effect() -> dict[str, Any]:
+            self._verify_selected_motion_feedback(program_run_id, request.group_ids)
             try:
                 snapshot = self._host.resume_motion(
                     program_run_id,
@@ -6000,6 +6094,7 @@ class ProgramRuntime:
             )
 
         def effect() -> dict[str, Any]:
+            self._verify_selected_motion_feedback(program_run_id, request.group_ids)
             snapshot = self._host.start_motion(
                 program_run_id,
                 expected_run_revision=request.expected_run_revision,

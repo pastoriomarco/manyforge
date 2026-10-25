@@ -192,6 +192,14 @@ target_include_directories(manyforge_mock_boolean_input_provider PUBLIC
   $<INSTALL_INTERFACE:include>)
 target_link_libraries(manyforge_mock_boolean_input_provider PUBLIC manyforge_core)
 
+add_library(manyforge_geometric_contact_input_provider
+  src/geometric_contact_input_provider.cpp)
+target_include_directories(manyforge_geometric_contact_input_provider PUBLIC
+  $<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}/include>
+  $<INSTALL_INTERFACE:include>)
+target_link_libraries(manyforge_geometric_contact_input_provider PUBLIC
+  manyforge_core PRIVATE Threads::Threads)
+
 add_library(manyforge_roboplan_native_runtime_support
   src/native_runtime_support.cpp
   src/retained_externally_managed_lifecycle_ports.cpp)
@@ -339,7 +347,6 @@ target_link_libraries(manyforge_roboplan_planner_backend PUBLIC
   manyforge_roboplan_native_candidate)
 
 add_library(manyforge_roboplan_native_runtime
-  src/isaac_arm_guard.cpp
   src/retained_native_gripper_runtime.cpp
   src/retained_native_gripper_route_publication_owner.cpp
   src/retained_native_runtime.cpp
@@ -406,12 +413,10 @@ if(MANYFORGE_BUILD_ROS2_CONTROL_RUNTIME)
     manyforge_core rclcpp::rclcpp ${std_msgs_TARGETS}
     ${ur_msgs_TARGETS} ${control_msgs_TARGETS})
 
-  find_package(diagnostic_msgs REQUIRED)
   find_package(pal_statistics_msgs REQUIRED)
   add_library(manyforge_roboplan_ros2_control_runtime
     src/io_provider_lifecycle_product.cpp
     src/simulated_plc_readiness.cpp
-    src/retained_isaac_arm_guard_binding.cpp
     src/retained_isaac_ros2_control_profile.cpp
     src/retained_ros2_control_backend_factory.cpp
     src/retained_ros2_control_lifecycle_product.cpp
@@ -421,6 +426,7 @@ if(MANYFORGE_BUILD_ROS2_CONTROL_RUNTIME)
     $<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}/include>
     $<INSTALL_INTERFACE:include>)
   target_link_libraries(manyforge_roboplan_ros2_control_runtime PUBLIC
+    manyforge_geometric_contact_input_provider
     manyforge_mock_boolean_input_provider
     manyforge_ros_boolean_input_provider
     manyforge_mock_boolean_output_provider
@@ -430,7 +436,6 @@ if(MANYFORGE_BUILD_ROS2_CONTROL_RUNTIME)
     manyforge_roboplan_controller_launch_artifacts
     manyforge_roboplan_controller_launch_process
     manyforge_ros2_control_execution
-    ${diagnostic_msgs_TARGETS}
     ${pal_statistics_msgs_TARGETS}
     manyforge::content_identity)
 endif()
@@ -763,6 +768,13 @@ if(BUILD_TESTING)
     gtest_discover_tests(test_mock_boolean_input_provider
       PROPERTIES TIMEOUT ${MANYFORGE_GTEST_TIMEOUT_SECONDS})
 
+    add_executable(test_geometric_contact_input_provider
+      test/test_geometric_contact_input_provider.cpp)
+    target_link_libraries(test_geometric_contact_input_provider PRIVATE
+      manyforge_geometric_contact_input_provider GTest::gtest_main)
+    gtest_discover_tests(test_geometric_contact_input_provider
+      PROPERTIES TIMEOUT ${MANYFORGE_GTEST_TIMEOUT_SECONDS})
+
     add_executable(test_native_runtime_support
       test/test_native_runtime_support.cpp)
     target_link_libraries(test_native_runtime_support PRIVATE
@@ -912,8 +924,8 @@ if(BUILD_TESTING)
         GTest::gtest_main)
       gtest_discover_tests(test_retained_ros2_control_backend_factory)
 
-      # Runtime handle (CCLC controller switching, binding epochs) and the
-      # Isaac guard binding against in-process ROS stand-ins.
+      # Runtime handle, CCLC controller switching and binding epochs against
+      # in-process ROS stand-ins.
       add_executable(test_retained_ros2_control_runtime_handle
         test/test_io_provider_lifecycle_product.cpp
         test/test_simulated_plc_readiness.cpp
@@ -945,10 +957,6 @@ if(BUILD_TESTING)
       gtest_discover_tests(test_ros2_control_kernel_stop_integration
         PROPERTIES TIMEOUT 120)
     endif()
-
-    add_executable(test_isaac_arm_guard test/test_isaac_arm_guard.cpp)
-    target_link_libraries(test_isaac_arm_guard PRIVATE
-      manyforge_roboplan_native_runtime GTest::gtest_main)
 
     add_executable(test_retained_stop_surveillance_owner
       test/test_retained_stop_surveillance_owner.cpp)
@@ -1647,8 +1655,17 @@ if(BUILD_TESTING)
 
     if(TARGET manyforge_roboplan_ros2_control_runtime)
       target_sources(test_retained_product_consumer PRIVATE
-        src/host_io_output_channels.cpp)
+        src/applied_global_io_rule_installation.cpp
+        src/applied_program_blackboard_installation.cpp
+        src/applied_program_owner_reader.cpp
+        src/execution_host_commands.cpp
+        src/execution_host_posix.cpp
+        src/host_io_output_channels.cpp
+        src/host_io_provider_installation.cpp
+        src/ros_host_composition.cpp)
       target_link_libraries(test_retained_product_consumer PRIVATE
+        manyforge_roboplan_cell_admission_command_codec
+        manyforge_roboplan_native_cclc_runtime
         manyforge_roboplan_ros2_control_runtime
         manyforge::component_manager
         manyforge::core_sqlite_cclc_journal
@@ -1809,10 +1826,6 @@ if(BUILD_TESTING)
         ENVIRONMENT "LD_LIBRARY_PATH=${_LIB_PATHS}"
         TIMEOUT ${MANYFORGE_GTEST_TIMEOUT_SECONDS})
     gtest_discover_tests(test_retained_native_backends
-      PROPERTIES
-        ENVIRONMENT "LD_LIBRARY_PATH=${_LIB_PATHS}"
-        TIMEOUT ${MANYFORGE_GTEST_TIMEOUT_SECONDS})
-    gtest_discover_tests(test_isaac_arm_guard
       PROPERTIES
         ENVIRONMENT "LD_LIBRARY_PATH=${_LIB_PATHS}"
         TIMEOUT ${MANYFORGE_GTEST_TIMEOUT_SECONDS})

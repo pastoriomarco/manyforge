@@ -61,7 +61,8 @@ protected:
     std::map<core::InterruptSourceId, HostIoSignalRuntime::SourceInput> sources;
     sources.emplace(kSource,
                     HostIoSignalRuntime::SourceInput{
-                        {row}, {}, driver->runtime_unit_epoch(), driver});
+                        {row}, {}, driver->runtime_unit_epoch(), std::nullopt,
+                        driver});
     runtime = HostIoSignalRuntime::Create(
         core::RequestOwnerEpoch("host"), 1, std::move(sources), clock,
         runtime_scheduler ? std::move(runtime_scheduler) : scheduler);
@@ -381,7 +382,7 @@ TEST_F(HostIoSignalRuntimeTest,
       core::RequestOwnerEpoch("host"), 1U,
       {{kSource,
         HostIoSignalRuntime::SourceInput{
-            {row}, node, driver->runtime_unit_epoch(), driver}}},
+            {row}, node, driver->runtime_unit_epoch(), std::nullopt, driver}}},
       clock, scheduler);
   for (const auto &[actual, inputs] : runtime->driver_input_installations()) {
     auto delivery = actual->AcquireDelivery();

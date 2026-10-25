@@ -1749,9 +1749,16 @@ SceneRuntimeOwnerReadResponse(const std::string_view cell_id,
   });
 }
 
+struct ManagedIsaacPoseObserverJointState final {
+  std::string object_id;
+  std::string policy_id;
+  std::string topic;
+};
+
 struct ManagedIsaacPoseObserverExpectation final {
   component_manager::ManagerIsaacPoseObserverLaunchFactsDTO launch_facts;
   std::vector<PoseObserverBinding> bindings;
+  std::optional<ManagedIsaacPoseObserverJointState> expected_joint_state{};
   bool available{true};
   bool inspection_current{false};
   // Only the current configured bindings, updated after actual pose commits.
@@ -1767,13 +1774,23 @@ DecodeCheckedIsaacPoseObserverConfiguration(
     const core::CellId &cell_id, const SceneRuntimeIdentity &runtime_identity,
     std::string source_epoch_base) {
   const auto root = deployment::parse_strict_json_model_yaml(checked.metadata).root();
-  RequireExactObjectSize(root, 3U, "checked observer metadata");
+  RequireExactObjectSize(root, 4U, "checked observer metadata");
   Require(RequiredString(root, "cell_id") == cell_id.value(),
           "checked observer cell differs from the verified deployment");
+  const auto &joint_state = RequiredMember(root, "expected_joint_state");
+  std::optional<ManagedIsaacPoseObserverJointState> expected_joint_state;
+  if (!std::holds_alternative<std::nullptr_t>(joint_state.storage())) {
+    RequireExactObjectSize(joint_state, 3U, "checked expected joint state");
+    expected_joint_state = ManagedIsaacPoseObserverJointState{
+        RequiredString(joint_state, "object_id"),
+        RequiredString(joint_state, "policy_id"),
+        RequiredString(joint_state, "topic")};
+  }
   ManagedIsaacPoseObserverExpectation result{
       {checked.retained_snapshot.string(), RequiredString(root, "source_id"),
        std::move(source_epoch_base)},
-      RequiredPoseObserverBindings(RequiredMember(root, "bindings"))};
+      RequiredPoseObserverBindings(RequiredMember(root, "bindings")),
+      std::move(expected_joint_state)};
   Require(result.launch_facts.valid(), "checked observer launch facts are invalid");
   // Exercise the unchanged Open grammar and total packet cap with the widest
   // existing generation encodings. This is only a local grammar probe; the
@@ -2073,6 +2090,24 @@ CanonicalValue ApplyErrorResponse(const ManagerCommand &command,
   });
 }
 
+CanonicalValue ApplyKnownNoEffectErrorResponse(
+    const ManagerCommand &command, const std::string_view code,
+    const std::string_view message) {
+  Require(command.request_id.has_value() &&
+              command.request_owner_epoch.has_value(),
+          "decoded Apply command lacks request identity");
+  return CanonicalValue(CanonicalValue::Object{
+      {"api_version",
+       CanonicalValue(std::string(kManagerCommandResponseApiVersion))},
+      {"error", ErrorValue(core::ErrorDTO{
+                    std::string(code), std::string(message),
+                    {{"effect", "none"}}})},
+      {"ok", CanonicalValue(false)},
+      {"request_id", CanonicalValue(*command.request_id)},
+      {"request_owner_epoch", CanonicalValue(*command.request_owner_epoch)},
+  });
+}
+
 CanonicalValue ApplyDetailedErrorResponse(const ManagerCommand &command,
                                           const core::ErrorDTO &error) {
   Require(command.request_id.has_value() &&
@@ -2088,8 +2123,15 @@ CanonicalValue ApplyDetailedErrorResponse(const ManagerCommand &command,
   });
 }
 
+CanonicalValue ApplyKnownNoEffectDetailedErrorResponse(
+    const ManagerCommand &command, const core::ErrorDTO &error) {
+  auto marked = error;
+  marked.details["effect"] = "none";
+  return ApplyDetailedErrorResponse(command, marked);
+}
+
 CanonicalValue ApplyUnavailableResponse(const ManagerCommand &command) {
-  return ApplyErrorResponse(
+  return ApplyKnownNoEffectErrorResponse(
       command, kKernelOwnerUnavailableReasonCode,
       "operational Apply requires one converged managed Kernel execution "
       "host");
@@ -3323,63 +3365,65 @@ private:
   [[nodiscard]] std::optional<ManagedIsaacPoseObserverExpectation>
   CheckConfiguredIsaacPoseObserver(const deployment::RetainedBundle &bundle,
                                   const SceneRuntimeIdentity &identity) {
+    bool uses_isaac = false;
     for (const auto &unit : bundle.value().cell_graph.runtime_units) {
       if (unit.runtime_profile_id.value() !=
           deployment::ros2_control_execution_runtime_contract::kRuntimeProfileId)
         continue;
-      // Canonical-empty ROS retains infrastructure configuration, including
-      // future robot rows. No named world means no observer preflight; actual
-      // robot construction still uses the strict populated configuration read.
-      if (!unit.configuration.contains("isaac_world")) continue;
       const auto configuration =
           deployment::ros2_control_execution_runtime_contract::require_configuration(
               bundle, unit.runtime_unit_id);
-      if (!configuration.isaac_world) continue;
-      Require(isaac_site_settings_.has_value(),
-              "named Isaac world requires --isaac-site-settings");
-      static_cast<void>(isaac_site_settings_->value.ResolveWorld(*configuration.isaac_world));
-      const auto *observer = isaac_site_settings_->value.FindPoseObserver(
-          bundle.value().cell_graph.cell_id.value());
-      Require(observer != nullptr,
-              "named Isaac world has no supplied cell pose observer mapping");
-      const auto checked = native_runtime_adapter_.CheckIsaacPoseObserverConfiguration(
-          observer->site_config, isaac_site_settings_->value.scene_startup_timeout_s());
-      return DecodeCheckedIsaacPoseObserverConfiguration(
-          checked, bundle.value().cell_graph.cell_id, identity,
-          RandomToken("isaac-source-"));
+      uses_isaac = std::any_of(
+          configuration.controller_profiles.begin(),
+          configuration.controller_profiles.end(), [](const auto &profile) {
+            return profile.isaac_profile.has_value();
+          });
+      if (uses_isaac) break;
     }
-    return std::nullopt;
+    if (!uses_isaac || !isaac_site_settings_)
+      return std::nullopt;
+    const auto *observer = isaac_site_settings_->value.FindPoseObserver(
+        bundle.value().cell_graph.cell_id.value());
+    if (!observer)
+      return std::nullopt;
+    const auto checked = native_runtime_adapter_.CheckIsaacPoseObserverConfiguration(
+        observer->site_config,
+        isaac_site_settings_->value.observer_configuration_timeout_s());
+    return DecodeCheckedIsaacPoseObserverConfiguration(
+        checked, bundle.value().cell_graph.cell_id, identity,
+        RandomToken("isaac-source-"));
   }
 
   [[nodiscard]] std::optional<ManagedIsaacPoseObserverExpectation>
   CaptureOriginalApplyPoseObserver(
       const deployment::RetainedBundle &predecessor,
       const deployment::RetainedBundle &candidate) {
-    const auto world = [](const deployment::RetainedBundle &bundle) {
+    const auto uses_isaac = [](const deployment::RetainedBundle &bundle) {
       for (const auto &unit : bundle.value().cell_graph.runtime_units) {
         if (unit.runtime_profile_id.value() ==
             deployment::ros2_control_execution_runtime_contract::kRuntimeProfileId) {
-          if (!unit.configuration.contains("isaac_world"))
-            return std::optional<std::string>{};
-          return deployment::ros2_control_execution_runtime_contract::
-              require_configuration(bundle, unit.runtime_unit_id).isaac_world;
+          const auto configuration = deployment::ros2_control_execution_runtime_contract::
+              require_configuration(bundle, unit.runtime_unit_id);
+          return std::any_of(
+              configuration.controller_profiles.begin(),
+              configuration.controller_profiles.end(), [](const auto &profile) {
+                return profile.isaac_profile.has_value();
+              });
         }
       }
-      return std::optional<std::string>{};
+      return false;
     };
-    const auto candidate_world = world(candidate);
-    if (candidate_world == world(predecessor)) {
-      if (!candidate_world)
+    const bool candidate_uses_isaac = uses_isaac(candidate);
+    if (candidate_uses_isaac == uses_isaac(predecessor)) {
+      if (!candidate_uses_isaac)
         return std::nullopt;
       // Robot-only Apply retains the original immutable observer input and
       // Manager base, including when the last robot is removed. Availability
       // is observation, never permission to restart the observer here.
       std::lock_guard lock(manager_source_mutex_);
-      Require(managed_pose_observer_expectation_.has_value(),
-              "unchanged Isaac world has no retained checked observer input");
       return managed_pose_observer_expectation_;
     }
-    if (!candidate_world)
+    if (!candidate_uses_isaac)
       return std::nullopt;
     const auto current = scene_runtime_owner_.Snapshot();
     Require(current.runtime_identity.has_value(),
@@ -3391,6 +3435,22 @@ private:
     // This identity is only the existing Open grammar/cap probe. No successor
     // runtime generation or source expectation is published before Prepare.
     return CheckConfiguredIsaacPoseObserver(candidate, grammar_identity);
+  }
+
+  [[nodiscard]] CanonicalValue ApplyErrorResponseFromJournalEvidence(
+      const ManagerCommand &command, const std::string_view code,
+      const std::string_view message) {
+    try {
+      const auto accepted = stores_.apply_journal().ReadRequest(
+          core::RequestOwnerEpoch(*command.request_owner_epoch),
+          core::RequestId(*command.request_id));
+      if (!accepted.has_value()) {
+        return ApplyKnownNoEffectErrorResponse(command, code, message);
+      }
+    } catch (...) {
+      // A failed journal observation cannot prove whether acceptance happened.
+    }
+    return ApplyErrorResponse(command, code, message);
   }
 
   // Only the first managed observer for this live Manager. A predecessor
@@ -4894,6 +4954,14 @@ private:
                                   : present           ? "available"
                                   : !observation      ? "pending"
                                                       : "unknown";
+        CanonicalValue expected_joint_state(nullptr);
+        if (expected.expected_joint_state) {
+          expected_joint_state = CanonicalValue(CanonicalValue::Object{
+              {"object_id", CanonicalValue(expected.expected_joint_state->object_id)},
+              {"policy_id", CanonicalValue(expected.expected_joint_state->policy_id)},
+              {"topic", CanonicalValue(expected.expected_joint_state->topic)},
+          });
+        }
         CanonicalValue exit(nullptr);
         if (observation && observation->exit) {
           const auto &fact = *observation->exit;
@@ -4920,6 +4988,7 @@ private:
                 {"source_epoch_base",
                  CanonicalValue(expected.launch_facts.source_epoch_base)},
                 {"availability", CanonicalValue(availability)},
+                {"expected_joint_state", std::move(expected_joint_state)},
                 {"observation_current",
                  CanonicalValue(expected.inspection_current)},
                 {"process_presence",
@@ -5417,15 +5486,11 @@ private:
               replay->second.runtime_identity != runtime_identity ||
               replay->second.observation != observation->observation ||
               !replay->second.application ||
-              (replay->second.application->status !=
-                   SceneRuntimePoseApplicationStatus::kCommitted &&
-               replay->second.application->status !=
-                   SceneRuntimePoseApplicationStatus::kAlreadyApplied &&
-               replay->second.application->status !=
-                   SceneRuntimePoseApplicationStatus::kFreshnessConfirmed) ||
               !object.provider_evidence ||
-              object.provider_evidence->provider_source_sequence !=
-                  observation->observation.source_sequence)
+              !SceneRuntimePoseApplicationRetainsPlanningEvidence(
+                  replay->second.application->status,
+                  object.provider_evidence->provider_source_sequence,
+                  observation->observation.source_sequence))
             return failure(
                 "scene_runtime_pose_observation_unretained",
                 "continuous planning evidence has no successful exact pose "
@@ -5847,7 +5912,7 @@ private:
               *command.request_owner_epoch != manager_owner_epoch_) {
             TrySendResponse(
                 client.get(),
-                ApplyErrorResponse(
+                ApplyKnownNoEffectErrorResponse(
                     command, "stale_request_owner_epoch",
                     "Apply request targets a stale Manager owner epoch"));
             return false;
@@ -5879,7 +5944,7 @@ private:
                    *command.deployment_revision)) {
             TrySendResponse(
                 client.get(),
-                ApplyErrorResponse(
+                ApplyKnownNoEffectErrorResponse(
                     command, "deployment_candidate_receipt_mismatch",
                     "Apply does not match its exact candidate preview"));
             return false;
@@ -5896,7 +5961,7 @@ private:
                                                  *command.prepared_activation, &admission_)) {
             TrySendResponse(
                 client.get(),
-                ApplyErrorResponse(
+                ApplyKnownNoEffectErrorResponse(
                     command, "prepared_activation_unverified",
                     "Apply names no stored, reverified prepared activation "
                     "equal to its summary"));
@@ -5912,7 +5977,7 @@ private:
                 deployment_candidate_receipts_.end()) {
               TrySendResponse(
                   client.get(),
-                  ApplyErrorResponse(
+                  ApplyKnownNoEffectErrorResponse(
                       command, "deployment_candidate_receipt_unknown",
                       "Apply receipt was not issued by this Manager owner"));
               return false;
@@ -5928,7 +5993,7 @@ private:
                 current_pointer.candidate_graph_revision !=
                     candidate_receipt.expected_current_graph_revision) {
               TrySendResponse(client.get(),
-                              ApplyErrorResponse(
+                              ApplyKnownNoEffectErrorResponse(
                                   command, "deployment_candidate_receipt_stale",
                                   "Deployment candidate or current graph "
                                   "changed after preview"));
@@ -5950,8 +6015,8 @@ private:
             if (!host_continuity.ok()) {
               TrySendResponse(
                   client.get(),
-                  ApplyDetailedErrorResponse(command,
-                                             host_continuity.error()));
+                  ApplyKnownNoEffectDetailedErrorResponse(
+                      command, host_continuity.error()));
               return false;
             }
             auto impact = DeploymentApplyImpact(
@@ -5961,18 +6026,20 @@ private:
                 candidate_receipt.impact_digest) {
               TrySendResponse(
                   client.get(),
-                  ApplyErrorResponse(command, "confirmation_stale",
-                                     "Deployment Apply impact changed after "
-                                     "preview; preview and confirm again"));
+                  ApplyKnownNoEffectErrorResponse(
+                      command, "confirmation_stale",
+                      "Deployment Apply impact changed after preview; preview "
+                      "and confirm again"));
               return false;
             }
             if (candidate_receipt.destructive_impact &&
                 command.accepted_impact_digest != candidate_receipt.impact_digest) {
               TrySendResponse(
                   client.get(),
-                  ApplyErrorResponse(command, "confirmation_required",
-                                     "Deployment Apply impact requires acknowledgment "
-                                     "of its exact preview digest"));
+                  ApplyKnownNoEffectErrorResponse(
+                      command, "confirmation_required",
+                      "Deployment Apply impact requires acknowledgment of its "
+                      "exact preview digest"));
               return false;
             }
             original_checked_observer = CaptureOriginalApplyPoseObserver(
@@ -6043,15 +6110,19 @@ private:
         } catch (const component_manager::ManagerNamedApplyBusyError &error) {
           TrySendResponse(
               client.get(),
-              ApplyErrorResponse(command, "apply_busy", error.what()));
+              ApplyErrorResponseFromJournalEvidence(command, "apply_busy",
+                                                    error.what()));
         } catch (const ManagerPackageGenerationRestartRequired &error) {
           PublishPackageRestartRequired();
+          // Publishing the package-generation fault is itself externally
+          // visible, even when this Apply was never accepted into its journal.
           TrySendResponse(client.get(),
                           ApplyDetailedErrorResponse(command, error.error()));
         } catch (const std::exception &error) {
           TrySendResponse(
               client.get(),
-              ApplyErrorResponse(command, "apply_rejected", error.what()));
+              ApplyErrorResponseFromJournalEvidence(
+                  command, "apply_rejected", error.what()));
         }
         return false;
       }

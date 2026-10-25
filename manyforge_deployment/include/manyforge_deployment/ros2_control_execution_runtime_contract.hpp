@@ -101,9 +101,6 @@ struct Configuration final {
 
   /// One row per hosted controllable component, sorted by component.
   std::vector<ControllerProfile> controller_profiles;
-  /// Q81: one deployment-authored logical world; machine facts stay at the
-  /// site.
-  std::optional<std::string> isaac_world;
   std::uint32_t planner_rng_seed{};
   std::vector<double> initial_joint_positions_rad;
   std::vector<
@@ -153,13 +150,11 @@ struct Configuration final {
 
 /// Q89: the same ROS cell host with no hosted components. Values retain the
 /// established empty-host planner seed and cadence; no component is fabricated.
-[[nodiscard]] CanonicalValue empty_host_configuration(
-    const std::optional<std::string> &isaac_world = std::nullopt);
+[[nodiscard]] CanonicalValue empty_host_configuration();
 
 [[nodiscard]] CanonicalValue empty_host_deployment(
     const core::CellId &cell_id, const CanonicalValue &runtime_profile_reference,
-    std::string_view deployment_id, std::string_view name,
-    const std::optional<std::string> &isaac_world = std::nullopt);
+    std::string_view deployment_id, std::string_view name);
 
 [[nodiscard]] Configuration
 require_configuration(const RetainedBundle &retained_bundle,

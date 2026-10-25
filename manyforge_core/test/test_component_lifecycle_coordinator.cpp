@@ -5896,7 +5896,12 @@ struct GroupedReadinessFixture final {
   std::shared_ptr<const ComponentLifecycleProductContext> context;
   std::unique_ptr<ComponentLifecycleCoordinator> coordinator;
 
-  GroupedReadinessFixture() {
+  explicit GroupedReadinessFixture(bool measured_state_required = false) {
+    std::vector<ConfiguredRobotMeasuredStateRequirement> measured_robots;
+    if (measured_state_required) {
+      measured_robots.push_back({ControllableComponentId("component.1"),
+                                 {ResourceId("joint.1")}, {}});
+    }
     context = std::make_shared<const ComponentLifecycleProductContext>(
         ComponentLifecycleProductContext{
             snapshots, catalogs, resolver, std::nullopt, nullptr,
@@ -5904,13 +5909,18 @@ struct GroupedReadinessFixture final {
                                                {ControllableComponentId("component.1")}},
             nullptr,
             std::make_shared<const ConfiguredRobotMeasuredStateInventory>(
-                std::vector<ConfiguredRobotMeasuredStateRequirement>{}),
-            [this](const ComponentLifecycleCurrentSnapshotDTO&) {
+                std::move(measured_robots)),
+            [this, measured_state_required](const ComponentLifecycleCurrentSnapshotDTO&) {
               if (!association_available)
                 return Result<ComponentLifecycleReadinessSourceView>::Err(
                     {"route_source_unavailable", "route source is unavailable", {}});
               return Result<ComponentLifecycleReadinessSourceView>::Ok(
-                  {std::nullopt, [this] {
+                  {measured_state_required
+                       ? std::optional<RobotMeasuredStateSourceView>(
+                             RobotMeasuredStateSourceView{
+                                 ControllableComponentId("component.1"), {}})
+                       : std::nullopt,
+                   [this] {
                     ++validations;
                     return association_current ? Result<void>::Ok()
                         : Result<void>::Err({"route_source_changed", "route source changed", {}});
@@ -5969,6 +5979,26 @@ TEST(ComponentLifecycleCoordinator, GroupedReadinessUsesExactPureHealthWithoutIn
   EXPECT_EQ(fixture.target_fact_reads, 4U);
   EXPECT_EQ(fixture.coordinator->request_owner_epoch(), owner);
   EXPECT_TRUE(fixture.journal.ReadQuiescentOwner(owner).ok());
+  fixture.ExpectNoExecutionEffects();
+}
+
+TEST(ComponentLifecycleCoordinator,
+     MissingMeasuredStateWarnsWithoutBlockingLifecycleReadiness) {
+  GroupedReadinessFixture fixture(true);
+  fixture.clock.set(123);
+  const auto read = fixture.Read();
+  ASSERT_TRUE(read.ok()) << read.error().message;
+  EXPECT_TRUE(read.value().readiness.ready);
+  EXPECT_FALSE(read.value().readiness.error);
+  EXPECT_EQ(read.value().readiness.next_intent,
+            ComponentLifecycleIntentKindDTO::kPrepare);
+  EXPECT_EQ(read.value().readiness.measured_state.required, true);
+  EXPECT_EQ(read.value().readiness.measured_state.available, false);
+  ASSERT_TRUE(read.value().readiness.measured_state.error);
+  EXPECT_EQ(read.value().readiness.measured_state.error->code,
+            "configured_robot_measured_state_unavailable");
+  EXPECT_EQ(read.value().readiness.measured_state.error->details.at("reason"),
+            "measured_geometry_coordinates_missing");
   fixture.ExpectNoExecutionEffects();
 }
 

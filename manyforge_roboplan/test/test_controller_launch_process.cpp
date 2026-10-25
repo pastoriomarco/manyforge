@@ -117,15 +117,6 @@ isaac_artifacts(const std::filesystem::path &directory,
                              {0.0, 0.0, 0.0, 0.0, 0.0, 0.0}};
 }
 
-[[nodiscard]] IsaacControllerLaunchInputs isaac_inputs() {
-  IsaacControllerLaunchInputs inputs;
-  inputs.world_uri = "file:/worlds/light.usda";
-  inputs.expected_world_name = "light";
-  inputs.scene_startup_timeout_s = "180.0";
-  inputs.scene_service_timeout_s = "120.0";
-  return inputs;
-}
-
 TEST(ControllerLaunchCommand, MockCommandIsTheTrack2LaunchWithTheArtifactArguments) {
   TemporaryRoot root;
   const auto artifacts = mock_artifacts(root.path());
@@ -180,11 +171,6 @@ TEST(ControllerLaunchCommand, MockCommandFailsClosed) {
   empty_value.launch_arguments.back() = "frame_prefix:=";
   EXPECT_THROW(static_cast<void>(mock_controller_launch_command(empty_value)),
                ControllerLaunchProcessError);
-  auto isaac_empty = isaac_inputs();
-  isaac_empty.additional_arguments = {"base_xyz:="};
-  EXPECT_THROW(static_cast<void>(isaac_controller_launch_command(
-                   isaac_artifacts(root.path()), isaac_lane(), isaac_empty)),
-               ControllerLaunchProcessError);
   auto unhashed = mock_artifacts(root.path());
   unhashed.controllers_sha256.clear();
   EXPECT_THROW(static_cast<void>(mock_controller_launch_command(unhashed)),
@@ -194,12 +180,7 @@ TEST(ControllerLaunchCommand, MockCommandFailsClosed) {
 TEST(ControllerLaunchCommand, IsaacCommandCarriesTheContractArguments) {
   TemporaryRoot root;
   const auto artifacts = isaac_artifacts(root.path(), "isaac_ur10e_light_robot/");
-  auto inputs = isaac_inputs();
-  inputs.manager_run_root = "/run/manager";
-  inputs.pose_observer_site_config = "/etc/observer.json";
-  inputs.additional_arguments = {"base_xyz:=0 0 0.1"};
-  const auto command =
-      isaac_controller_launch_command(artifacts, isaac_lane(), inputs);
+  const auto command = isaac_controller_launch_command(artifacts, isaac_lane());
   const std::vector<std::string> expected{
       "ros2", "launch", "manyforge_ros_bringup",
       "isaac_topic_based_control.launch.py",
@@ -211,14 +192,7 @@ TEST(ControllerLaunchCommand, IsaacCommandCarriesTheContractArguments) {
       "arm_controller_name:=isaac_arm_controller",
       "joint_commands_topic:=/isaac_joint_commands",
       "joint_states_topic:=/isaac_joint_states",
-      "frame_prefix:=isaac_ur10e_light_robot/",
-      "world_uri:=file:/worlds/light.usda",
-      "expected_world_name:=light",
-      "scene_startup_timeout_s:=180.0",
-      "scene_service_timeout_s:=120.0",
-      "manager_run_root:=/run/manager",
-      "pose_observer_site_config:=/etc/observer.json",
-      "base_xyz:=0 0 0.1"};
+      "frame_prefix:=isaac_ur10e_light_robot/"};
   EXPECT_EQ(command.argv, expected);
   EXPECT_EQ(command.controller_profile, artifacts.controller_profile);
   EXPECT_EQ(command.runtime_namespace, artifacts.runtime_namespace);
@@ -229,39 +203,20 @@ TEST(ControllerLaunchCommand, IsaacCommandCarriesTheContractArguments) {
   EXPECT_TRUE(command.keep_across_apply);
   // An empty retained deployment prefix passes no frame-prefix argument (Q82).
   const auto single = isaac_controller_launch_command(
-      isaac_artifacts(root.path()), isaac_lane(), isaac_inputs());
+      isaac_artifacts(root.path()), isaac_lane());
   for (const auto &argument : single.argv) {
     EXPECT_NE(argument.rfind("frame_prefix:=", 0), 0U) << argument;
   }
 }
 
-TEST(ControllerLaunchCommand, ManagedCellOwnershipIsExplicitAndPartOfIdentity) {
-  TemporaryRoot root;
-  auto inputs = isaac_inputs();
-  const auto standalone = isaac_controller_launch_command(
-      isaac_artifacts(root.path()), isaac_lane(), inputs);
-  inputs.manager_cell_world_owned = true;
-  const auto managed = isaac_controller_launch_command(
-      isaac_artifacts(root.path()), isaac_lane(), inputs);
-  EXPECT_EQ(std::count(managed.argv.begin(), managed.argv.end(),
-                       "manager_cell_world_owned:=true"), 1);
-  EXPECT_NE(standalone.identity, managed.identity);
-  EXPECT_EQ(standalone.argv.size() + 1U, managed.argv.size());
-  inputs.additional_arguments = {"manager_cell_world_owned:=false"};
-  EXPECT_THROW((void)isaac_controller_launch_command(
-                   isaac_artifacts(root.path()), isaac_lane(), inputs),
-               ControllerLaunchProcessError);
-}
-
 TEST(ControllerLaunchCommand,
-     IsaacIdentityKeepsOnlyTheSameWorldFilesAndLiteralPrefix) {
+     IsaacIdentityKeepsOnlyTheSameArtifactsAndLiteralPrefix) {
   TemporaryRoot first;
   TemporaryRoot second;
-  const auto inputs = isaac_inputs();
   const auto original = isaac_controller_launch_command(
-      isaac_artifacts(first.path(), "authored//custom"), isaac_lane(), inputs);
+      isaac_artifacts(first.path(), "authored//custom"), isaac_lane());
   const auto same = isaac_controller_launch_command(
-      isaac_artifacts(second.path(), "authored//custom"), isaac_lane(), inputs);
+      isaac_artifacts(second.path(), "authored//custom"), isaac_lane());
   EXPECT_NE(original.argv, same.argv);
   EXPECT_EQ(original.identity, same.identity);
   EXPECT_TRUE(same.keep_across_apply);
@@ -270,23 +225,15 @@ TEST(ControllerLaunchCommand,
           ControllerLaunchObservation{original.identity, true, true}, same),
       ControllerLaunchDecision::kKeep);
 
-  auto changed_world = inputs;
-  changed_world.world_uri = "file:/worlds/other.usda";
   auto changed_description = isaac_artifacts(second.path(), "authored//custom");
   changed_description.robot_description_sha256 = "sha256:new-description";
   auto changed_controllers = isaac_artifacts(second.path(), "authored//custom");
   changed_controllers.controllers_sha256 = "sha256:new-controllers";
   for (const auto &changed :
-       {isaac_controller_launch_command(
-            isaac_artifacts(second.path(), "authored//custom"), isaac_lane(),
-            changed_world),
-        isaac_controller_launch_command(changed_description, isaac_lane(),
-                                        inputs),
-        isaac_controller_launch_command(changed_controllers, isaac_lane(),
-                                        inputs),
+       {isaac_controller_launch_command(changed_description, isaac_lane()),
+        isaac_controller_launch_command(changed_controllers, isaac_lane()),
         isaac_controller_launch_command(
-            isaac_artifacts(second.path(), "authored/custom"), isaac_lane(),
-            inputs)}) {
+            isaac_artifacts(second.path(), "authored/custom"), isaac_lane())}) {
     EXPECT_NE(changed.identity, original.identity);
     EXPECT_EQ(decide_controller_launch(
                   ControllerLaunchObservation{original.identity, true, true},
@@ -295,41 +242,16 @@ TEST(ControllerLaunchCommand,
   }
 }
 
-TEST(ControllerLaunchCommand, IsaacCommandRequiresCallerInputsAndNeverOverridesTheHost) {
+TEST(ControllerLaunchCommand, IsaacCommandRequiresAttachLaneFacts) {
   TemporaryRoot root;
   const auto artifacts = isaac_artifacts(root.path());
-  for (auto missing : {&IsaacControllerLaunchInputs::world_uri,
-                       &IsaacControllerLaunchInputs::expected_world_name,
-                       &IsaacControllerLaunchInputs::scene_startup_timeout_s,
-                       &IsaacControllerLaunchInputs::scene_service_timeout_s}) {
-    auto inputs = isaac_inputs();
-    inputs.*missing = "";
-    EXPECT_THROW(static_cast<void>(isaac_controller_launch_command(
-                     artifacts, isaac_lane(), inputs)),
-                 ControllerLaunchProcessError);
-  }
-  auto unpaired = isaac_inputs();
-  unpaired.manager_run_root = "/run/manager";
-  EXPECT_THROW(static_cast<void>(isaac_controller_launch_command(
-                   artifacts, isaac_lane(), unpaired)),
-               ControllerLaunchProcessError);
-  for (const std::string override_argument :
-       {"joint_states_topic:=/elsewhere", "runtime_namespace:=/x",
-        "world_uri:=file:/again"}) {
-    auto inputs = isaac_inputs();
-    inputs.additional_arguments = {override_argument};
-    EXPECT_THROW(static_cast<void>(isaac_controller_launch_command(
-                     artifacts, isaac_lane(), inputs)),
-                 ControllerLaunchProcessError)
-        << override_argument;
-  }
   auto no_topics = isaac_lane();
   no_topics.joint_states_topic.clear();
   EXPECT_THROW(static_cast<void>(isaac_controller_launch_command(
-                   artifacts, no_topics, isaac_inputs())),
+                   artifacts, no_topics)),
                ControllerLaunchProcessError);
   EXPECT_THROW(static_cast<void>(isaac_controller_launch_command(
-                   mock_artifacts(root.path()), isaac_lane(), isaac_inputs())),
+                   mock_artifacts(root.path()), isaac_lane())),
                ControllerLaunchProcessError);
 }
 
@@ -351,7 +273,7 @@ TEST(ControllerLaunchDecision, StartKeepAndRestartRules) {
             ControllerLaunchDecision::kRestart);
   // DX224.3: unchanged Isaac identity keeps its launch across Apply.
   const auto isaac = isaac_controller_launch_command(
-      isaac_artifacts(root.path()), isaac_lane(), isaac_inputs());
+      isaac_artifacts(root.path()), isaac_lane());
   EXPECT_EQ(decide_controller_launch(
                 ControllerLaunchObservation{isaac.identity, true, true}, isaac),
             ControllerLaunchDecision::kKeep);
@@ -540,7 +462,7 @@ void check_parent_death(const std::string &role, const std::string &selector,
     int pid = -1;
     if (host_role == "cell") {
       const CellLaunchCommand command{
-          manyforge::core::CellId("q116_fixture"), CellLaunchRole::kSceneBarrier,
+          manyforge::core::CellId("q116_fixture"), CellLaunchRole::kPoseObserver,
           std::nullopt,
           {"ros2", "launch", "manyforge_ros_bringup", "mock_control.launch.py"},
           "q116_cell_fixture"};
@@ -557,7 +479,7 @@ void check_parent_death(const std::string &role, const std::string &selector,
       auto command =
           host_role == "isaac"
               ? isaac_controller_launch_command(isaac_artifacts(root),
-                                                 isaac_lane(), isaac_inputs())
+                                                 isaac_lane())
               : mock_controller_launch_command(mock_artifacts(root));
       if (host_role == "other")
         command.argv[3] = "other_control.launch.py";
@@ -849,12 +771,12 @@ TEST(ControllerLaunchSupervisor, UnchangedIsaacApplyKeepsTheExactProcess) {
   const auto log = fake.root() / "launch.artifacts";
   const auto first = supervisor.ensure(
       isaac_controller_launch_command(isaac_artifacts(fake.root() / "epoch-1"),
-                                      isaac_lane(), isaac_inputs()),
+                                      isaac_lane()),
       log);
   ASSERT_TRUE(fake.wait_for(fake.out(first.process->pid(), ".args")));
   const auto same = supervisor.ensure(
       isaac_controller_launch_command(isaac_artifacts(fake.root() / "epoch-2"),
-                                      isaac_lane(), isaac_inputs()),
+                                      isaac_lane()),
       log);
   EXPECT_EQ(same.decision, ControllerLaunchDecision::kKeep);
   EXPECT_EQ(same.process, first.process);
@@ -868,7 +790,7 @@ TEST(ControllerLaunchSupervisor, UnchangedIsaacApplyKeepsTheExactProcess) {
   const auto changed = supervisor.ensure(
       isaac_controller_launch_command(
           isaac_artifacts(fake.root() / "epoch-3", "authored/custom"),
-          isaac_lane(), isaac_inputs()),
+          isaac_lane()),
       log);
   EXPECT_EQ(changed.decision, ControllerLaunchDecision::kRestart);
   EXPECT_NE(changed.process, first.process);
@@ -1801,7 +1723,8 @@ TEST(ControllerLaunchSupervisor, HostShutdownSignalsAllGroupsAndOwnsCellLease) {
   const auto second = supervisor.ensure(b, fake.root() / "b-artifacts");
   auto cell = supervisor.start_cell_process(
       CellLaunchCommand{manyforge::core::CellId("cell.shutdown"),
-                        CellLaunchRole::kSceneBarrier, std::nullopt,
+                        CellLaunchRole::kPoseObserver,
+                        std::optional<std::string>("shutdown_pose_source"),
                         probe("cell"), "cell.shutdown.barrier"},
       fake.root() / "cell-artifacts");
   ASSERT_TRUE(fake.wait_for(fake.root() / "a.ready"));
@@ -1825,7 +1748,8 @@ TEST(ControllerLaunchSupervisor, HostShutdownSignalsAllGroupsAndOwnsCellLease) {
   EXPECT_THROW(
       static_cast<void>(supervisor.start_cell_process(
           CellLaunchCommand{manyforge::core::CellId("cell.shutdown"),
-                            CellLaunchRole::kSceneBarrier, std::nullopt,
+                            CellLaunchRole::kPoseObserver,
+                            std::optional<std::string>("shutdown_pose_source"),
                             probe("foreign"), "cell.shutdown.foreign"},
           fake.root() / "refused-cell-artifacts")),
       ControllerLaunchProcessError);
@@ -2452,7 +2376,7 @@ TEST(ControllerLaunchSupervisor,
 
 
 [[nodiscard]] CellLaunchCommand cell_command(
-    const CellLaunchRole role = CellLaunchRole::kSceneBarrier) {
+    const CellLaunchRole role = CellLaunchRole::kPoseObserver) {
   return {manyforge::core::CellId("cell_a"), role,
           role == CellLaunchRole::kPoseObserver
               ? std::optional<std::string>("configured_pose_source")
@@ -2512,8 +2436,8 @@ TEST(CellLaunchProcess, BarrierExitEvidenceDistinguishesSuccessAndFailure) {
     EXPECT_EQ(evidence->exit_status, status);
     EXPECT_FALSE(evidence->signal.has_value());
     EXPECT_EQ(evidence->command.cell_id.value(), "cell_a");
-    EXPECT_EQ(evidence->command.role, CellLaunchRole::kSceneBarrier);
-    EXPECT_FALSE(evidence->command.observer_source_id.has_value());
+    EXPECT_EQ(evidence->command.role, CellLaunchRole::kPoseObserver);
+    EXPECT_EQ(evidence->command.observer_source_id, "configured_pose_source");
     EXPECT_EQ(evidence->command.identity, "exact_cell_launch_identity");
     EXPECT_EQ(evidence->request_context, "Apply parent=actual_request");
     EXPECT_EQ(evidence->upstream_log_directory, root / "ros");
@@ -2610,9 +2534,6 @@ TEST(CellLaunchProcess, InvalidTypedInputsAndLogRootRefuseBeforeSpawn) {
   ControllerLaunchSupervisor supervisor(100ms);
   const auto root = fake.root() / "cell";
   auto invalid = cell_command();
-  invalid.observer_source_id = "forbidden_barrier_source";
-  EXPECT_THROW((void)supervisor.start_cell_process(invalid, root),
-               ControllerLaunchProcessError);
   invalid = cell_command(CellLaunchRole::kPoseObserver);
   invalid.observer_source_id.reset();
   EXPECT_THROW((void)supervisor.start_cell_process(invalid, root),

@@ -111,6 +111,11 @@ def test_check_config_returns_only_exact_metadata_without_ros_runtime(
         "cell_id": config.cell_id,
         "source_id": config.source_id,
         "bindings": [binding.to_value() for binding in config.observer_bindings],
+        "expected_joint_state": {
+            "object_id": config.joint_state.object_id,
+            "policy_id": config.joint_state.policy_id,
+            "topic": config.joint_state.topic,
+        },
     }
 
 
@@ -313,11 +318,24 @@ def test_simulation_capture_waits_for_attached_private_executor_spin(
     rclpy.init(context=context)
     dispatcher = _FakeDispatcher()
     captures = threading.Event()
+    client_cancelled = threading.Event()
+    client_closed = threading.Event()
 
     class _SimulationClient:
         def capture(self, **_kwargs: object) -> object:
             captures.set()
-            raise RuntimeError("bounded test capture")
+            assert client_cancelled.wait(timeout=2.0)
+            raise RuntimeError("bounded cancelled test capture")
+
+        def cancel(self) -> None:
+            client_cancelled.set()
+
+        def close(self) -> None:
+            assert captures.is_set()
+            assert client_cancelled.is_set()
+            client_closed.set()
+
+    simulation_client = _SimulationClient()
 
     publisher: pose_source_snapshot_publisher.PoseSourceSnapshotPublisher | None = (
         None
@@ -332,7 +350,7 @@ def test_simulation_capture_waits_for_attached_private_executor_spin(
             ),
             manager_run_root=tmp_path,
             dispatcher_factory=lambda _root, _config, _callback: dispatcher,
-            simulation_client_factory=lambda _node, _timeout_s: _SimulationClient(),
+            simulation_client_factory=lambda _node, _timeout_s: simulation_client,
             context=context,
         )
         executor.add_node(publisher)
@@ -347,6 +365,9 @@ def test_simulation_capture_waits_for_attached_private_executor_spin(
     finally:
         if publisher is not None:
             assert publisher.stop()
+            assert client_cancelled.is_set()
+            assert client_closed.is_set()
+            assert dispatcher.intents == []
             for auxiliary in publisher.auxiliary_nodes:
                 executor.remove_node(auxiliary)
                 auxiliary.destroy_node()
@@ -355,6 +376,135 @@ def test_simulation_capture_waits_for_attached_private_executor_spin(
         executor.shutdown(timeout_sec=2.0)
         if spin_thread is not None:
             spin_thread.join(timeout=2.0)
+        if context.ok():
+            rclpy.shutdown(context=context)
+
+
+def test_entrypoint_does_not_teardown_nodes_while_polling_worker_is_live(
+    monkeypatch,
+) -> None:
+    events: list[str] = []
+
+    class _Context:
+        def ok(self) -> bool:
+            return True
+
+    class _Auxiliary:
+        def destroy_node(self) -> None:
+            events.append("auxiliary:destroy")
+
+    auxiliary = _Auxiliary()
+
+    class _Publisher:
+        auxiliary_nodes = (auxiliary,)
+
+        def __init__(self, *, context: _Context) -> None:
+            del context
+
+        def start(self) -> None:
+            events.append("publisher:start")
+
+        def stop(self) -> bool:
+            events.append("publisher:stop-incomplete")
+            return False
+
+        def destroy_node(self) -> None:
+            events.append("publisher:destroy")
+
+    class _Executor:
+        def __init__(self, *, context: _Context) -> None:
+            del context
+
+        def add_node(self, _node: object) -> None:
+            pass
+
+        def remove_node(self, _node: object) -> None:
+            events.append("executor:remove")
+
+        def spin(self) -> None:
+            raise KeyboardInterrupt
+
+        def shutdown(self, *, timeout_sec: float) -> None:
+            del timeout_sec
+            events.append("executor:shutdown")
+
+    monkeypatch.setattr(pose_source_snapshot_publisher, "Context", _Context)
+    monkeypatch.setattr(
+        pose_source_snapshot_publisher, "PoseSourceSnapshotPublisher", _Publisher
+    )
+    monkeypatch.setattr(
+        pose_source_snapshot_publisher, "SingleThreadedExecutor", _Executor
+    )
+    monkeypatch.setattr(pose_source_snapshot_publisher.rclpy, "init", lambda **_: None)
+    monkeypatch.setattr(
+        pose_source_snapshot_publisher.rclpy,
+        "shutdown",
+        lambda **_: events.append("context:shutdown"),
+    )
+
+    assert pose_source_snapshot_publisher.main([]) == 1
+    assert events == ["publisher:start", "publisher:stop-incomplete"]
+
+
+def test_simulation_worker_future_completes_on_single_threaded_executor() -> None:
+    from std_srvs.srv import Trigger
+
+    from manyforge_ros.scene_mirror_probe import SimulationSceneMirrorClient
+
+    context = Context()
+    rclpy.init(context=context)
+    node = Node("pose_source_single_executor_service_test", context=context)
+    executor = SingleThreadedExecutor(context=context)
+    executor.add_node(node)
+    client = SimulationSceneMirrorClient(node, service_timeout_s=2.0)
+    service_name = "/pose_source_single_executor_service_test/read"
+    completed = threading.Event()
+    replies: list[object] = []
+    errors: list[Exception] = []
+
+    def respond(_request: object, response: object) -> object:
+        response.success = True
+        response.message = "completed on the attached executor"
+        return response
+
+    service = node.create_service(Trigger, service_name, respond)
+
+    def capture() -> None:
+        try:
+            replies.append(
+                client._call_service(service_name, Trigger, Trigger.Request())
+            )
+        except Exception as error:
+            errors.append(error)
+        finally:
+            completed.set()
+
+    spinner = threading.Thread(target=executor.spin, daemon=True)
+    worker = threading.Thread(target=capture, daemon=True)
+    try:
+        spinner.start()
+        deadline = time.monotonic() + 2.0
+        while not executor.is_spinning and time.monotonic() < deadline:
+            time.sleep(0.001)
+        assert executor.is_spinning
+        worker.start()
+        assert completed.wait(timeout=3.0)
+        worker.join(timeout=1.0)
+        assert not worker.is_alive()
+        assert errors == []
+        assert len(replies) == 1 and replies[0].success
+    finally:
+        client.cancel()
+        if worker.ident is not None:
+            worker.join(timeout=3.0)
+        assert not worker.is_alive()
+        client.close()
+        executor.shutdown(timeout_sec=2.0)
+        spinner.join(timeout=2.0)
+        assert not spinner.is_alive()
+        executor.remove_node(node)
+        node.destroy_service(service)
+        node.destroy_node()
         if context.ok():
             rclpy.shutdown(context=context)
 

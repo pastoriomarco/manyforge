@@ -98,11 +98,10 @@ struct MockControllerArtifactsInput final {
   core::GripperOutputMode gripper_output_mode{core::GripperOutputMode::kCommanded};
 };
 
-/// One Isaac lane component (Q47/Q73: fixed profile initial values).
+/// One Isaac lane component (amended Q41: backend-commanded initial pose).
 struct IsaacControllerArtifactsInput final {
   std::string isaac_profile;
-  /// The profile's controller description facts
-  /// (`retained_isaac_controller_lane(isaac_profile)`).
+  /// The profile's controller description facts and selected deployment pose.
   IsaacControllerLane lane;
 };
 

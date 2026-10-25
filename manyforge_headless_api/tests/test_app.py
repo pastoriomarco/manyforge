@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import asyncio
 import copy
 from functools import lru_cache
 import hashlib
@@ -10,6 +11,7 @@ import time
 from pathlib import Path
 from typing import Any, Sequence
 
+import httpx
 import pytest
 import rfc8785
 from fastapi.testclient import TestClient
@@ -2239,6 +2241,93 @@ def test_program_runner_surface_is_a_strict_thin_owner_projection() -> None:
         "resume_full_stop",
         "stop",
     ]
+
+
+def test_rest_command_owner_projection_does_not_block_asgi_event_loop() -> None:
+    projection_entered = threading.Event()
+    release_projection = threading.Event()
+
+    class BlockingProjectionRunner(FakeProgramRunner):
+        def __init__(self) -> None:
+            super().__init__()
+            self._first_projection_lock = threading.Lock()
+            self._blocked_first_projection = False
+
+        def cycle_status(self) -> dict[str, Any]:
+            with self._first_projection_lock:
+                block = not self._blocked_first_projection
+                self._blocked_first_projection = True
+            if block:
+                projection_entered.set()
+                if not release_projection.wait(timeout=5.0):
+                    raise RuntimeError("test projection release timed out")
+            return super().cycle_status()
+
+    core = FakeCore()
+    core.applied_program = _applied_for_program_run()
+    runner = BlockingProjectionRunner()
+    app = create_app(
+        service=_service(core, FakeManager(), program_runner=runner)
+    )
+    body = {
+        **_caller(),
+        "scenario_id": "cell-pick",
+        "source_document_digest": "sha256:" + "6" * 64,
+        "expected_applied_record_digest": "sha256:" + "5" * 64,
+        "draft_program_revision": core.applied_program["program_revision"],
+    }
+    probe_result: dict[str, Any] = {}
+
+    async def exercise() -> None:
+        async with app.router.lifespan_context(app):
+            async with httpx.AsyncClient(
+                transport=httpx.ASGITransport(app=app),
+                base_url="http://test",
+            ) as client:
+                loop = asyncio.get_running_loop()
+
+                def probe_event_loop() -> None:
+                    if not projection_entered.wait(timeout=3.0):
+                        probe_result["error"] = "owner projection did not start"
+                        release_projection.set()
+                        return
+                    request = asyncio.run_coroutine_threadsafe(
+                        client.get("/api/control/diagnostics"), loop
+                    )
+                    try:
+                        response = request.result(timeout=1.0)
+                        probe_result["status"] = response.status_code
+                        probe_result["completed_while_projection_waited"] = (
+                            not release_projection.is_set()
+                        )
+                    except TimeoutError:
+                        probe_result["error"] = "event loop was blocked by projection"
+                        request.cancel()
+                    finally:
+                        release_projection.set()
+
+                probe_thread = threading.Thread(
+                    target=probe_event_loop,
+                    name="rest-owner-projection-loop-probe",
+                    daemon=True,
+                )
+                probe_thread.start()
+                try:
+                    response = await asyncio.wait_for(
+                        client.post("/api/program/runs", json=body),
+                        timeout=5.0,
+                    )
+                    assert response.status_code == 200, response.text
+                finally:
+                    release_projection.set()
+                    probe_thread.join(timeout=2.0)
+                assert not probe_thread.is_alive()
+
+    asyncio.run(exercise())
+    assert probe_result == {
+        "status": 200,
+        "completed_while_projection_waited": True,
+    }
 
 
 def test_non_executable_program_refuses_execute_but_not_manual_control() -> None:

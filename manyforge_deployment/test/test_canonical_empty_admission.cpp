@@ -130,7 +130,6 @@ TEST(CanonicalEmptyAdmission, RosBootstrapOwnsInfrastructureWithoutAScenario) {
       admission.retained_bundle(), graph.runtime_units.front().runtime_unit_id);
   EXPECT_TRUE(configuration.controller_profiles.empty());
   EXPECT_TRUE(configuration.initial_joint_positions_rad.empty());
-  EXPECT_FALSE(configuration.isaac_world.has_value());
   const auto replay = detail::generate_ros_empty_package(root.path(), cell, profile);
   EXPECT_EQ(replay.canonical_bytes(), admission.canonical_bytes());
   ScopedTrustedRoot other_root("other-ros-infrastructure");

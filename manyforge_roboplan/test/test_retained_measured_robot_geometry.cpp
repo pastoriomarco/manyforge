@@ -41,7 +41,7 @@ public:
                         "resource", false, {}, {}, true, with_feedback_alias,
                         false, std::nullopt, false,
                         deployment::test::kLite6ArmTargetId, std::nullopt,
-                        std::nullopt, {}, {}, true, {},
+                        std::nullopt, {}, true, {},
                         "manyforge.provider.ros2_control", false, true))
                     .bundle),
         map_(load_map()) {

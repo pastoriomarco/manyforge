@@ -242,6 +242,61 @@ async function mountGripper(
 }
 
 describe('DeploymentFocusedEditor', () => {
+  it('offers a retained gripper contact endpoint when arm motion endpoints are also present', async () => {
+    const value = controller();
+    vi.mocked(value.mutate).mockResolvedValue(value.workspace);
+    const document = value.workspace!.draft.document as Record<string, JsonValue>;
+    const graph = document.graph as Record<string, JsonValue>;
+    const runtime = (graph.runtime_units as Array<Record<string, JsonValue>>)[0];
+    const configuration = runtime.configuration as Record<string, JsonValue>;
+    configuration.io_signals = [{
+      controllable_component_id: 'robot', command_target_id: 'io',
+      resource_role_id: 'contact', signal_name: 'contact', source_id: 'contact_geometry',
+      value_type: 'bool', direction: 'input', update_mode: 'sampled',
+      transition_capability: 'sampled_only',
+      freshness: { mode: 'sample_age', maximum_age_ns: 75_000_000 },
+      provider: {
+        profile: 'geometric_contact', ingress_depth: 64,
+        endpoint: {
+          controllable_component_id: 'robot', command_target_id: 'arm', frame_role_id: 'tcp',
+        },
+        target_scene_resource_id: 'workpiece',
+      },
+    }];
+    const descriptor = statusFixture().directControl!.targetDescriptor;
+    descriptor.controllableComponentId = 'robot';
+    descriptor.commandTargetId = 'arm';
+    const target = (targetId: string): SourceModelProjection['targets'][number] => ({
+      collision_bodies: [], component_id: 'robot', model_groups: [], target_id: targetId,
+      frames: [{ frame_kind: 'component_model_frame', frame_role_id: 'tcp',
+        model_instance_id: 'lite6', source_link_name: targetId === 'gripper' ? 'link_eef' : 'link6' }],
+    });
+    const sourceModel = {
+      targets: [target('arm'), target('gripper')], occurrences: [],
+    } as unknown as SourceModelProjection;
+    const { host, find } = mountedHost();
+    const { createRoot } = await import('react-dom/client');
+    const root = createRoot(host as unknown as Element);
+    try {
+      await act(() => root.render(<DeploymentFocusedEditor controller={value}
+        sourceModel={{ status: 'ready', data: sourceModel }} motionDescriptors={[descriptor]}
+        gripperDescriptors={[]} />));
+      const endpoint = find((props) => props['aria-label'] === 'contact Contact endpoint');
+      const gripperValue = JSON.stringify(['robot', 'gripper', 'tcp']);
+      expect(find((props) => props.value === gripperValue)).toBeDefined();
+      await act(() => endpoint.onChange?.({ target: { value: gripperValue } }));
+      await act(() => find((props) => props.children === 'Update I/O Draft').onClick?.());
+      expect(value.mutate).toHaveBeenCalledExactlyOnceWith(
+        ['graph', 'runtime_units', 0, 'configuration', 'io_signals'], 'set',
+        [expect.objectContaining({ provider: expect.objectContaining({ endpoint: {
+          controllable_component_id: 'robot', command_target_id: 'gripper', frame_role_id: 'tcp',
+        } }) })],
+      );
+    } finally {
+      await act(() => root.unmount());
+    }
+  });
+
   it.each(['commanded', 'none'] as const)(
     'preserves explicit pneumatic timeout through edits and %s output changes', async (mode) => {
       const mounted = await mountGripper('pneumatic', mode, 2.5);
@@ -508,7 +563,6 @@ describe('DeploymentFocusedEditor', () => {
       api_version: 'manyforge.deployment_intent.v2',
       deployment_artifact_id: 'cell-a',
       name: 'Cell A',
-      isaac_world: 'lite6_grf_ros2',
       components: [{
         component_id: 'robot',
         component_profile_id: 'robot_native_v1',
@@ -686,9 +740,9 @@ describe('DeploymentFocusedEditor', () => {
         { component_id: 'robot-b', model_instance_id: 'selected-arm',
           source_robot_name: 'Selected robot', source_model_name: 'Selected arm', model_revision: digest },
       ],
-      targets: [{ component_id: 'robot-b', target_id: 'arm',
+      targets: [{ component_id: 'robot-b', target_id: 'arm', frames: [],
         model_groups: [{ model_instance_id: 'selected-arm', source_group_name: 'Selected group' }] }],
-    } as SourceModelProjection;
+    } as unknown as SourceModelProjection;
     const markup = renderToStaticMarkup(<DeploymentFocusedEditor controller={value}
       sourceModel={{ status: 'ready', data: sourceModel }}
       motionDescriptors={[unrelatedDescriptor, descriptor]} gripperDescriptors={[]} />);

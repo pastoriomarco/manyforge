@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import errno
 import json
 from pathlib import Path
 import time
@@ -481,6 +482,57 @@ def test_dispatcher_is_latest_per_key_and_rejoins_with_exact_retry() -> None:
     assert events[0].scene_application_status is None
     assert events[1].scene_application_status == "not_requested"
     assert events[1].scene_runtime_source_generation == 2
+
+
+def test_dispatcher_retry_detail_reports_bounded_rpc_timing_and_cause() -> None:
+    clock = _Clock()
+
+    class TimedFailureClient(_FakeSceneRuntimeClient):
+        def observe(self, session, *, source_sequence, intent):
+            if not self.observations:
+                self.observations.append((source_sequence, intent))
+                self.clock.value = 170
+                try:
+                    raise TimeoutError(errno.ETIMEDOUT, "fixture timeout")
+                except TimeoutError as cause:
+                    raise SceneRuntimeManagerError(
+                        "manager_scene_runtime_unavailable", "provider unavailable"
+                    ) from cause
+            return super().observe(
+                session, source_sequence=source_sequence, intent=intent
+            )
+
+    client = TimedFailureClient(clock=clock)
+    events = []
+    dispatcher = ObservationDispatcher(
+        client=client,
+        expected_cell_id="cell.1",
+        source_id="isaac.observer",
+        allowed_keys=frozenset({("robot", "viewer.measured_robot")}),
+        event_callback=events.append,
+        clock_ns=clock,
+        source_epoch_factory=lambda: "source.epoch.1",
+        retry_initial_s=0.001,
+        retry_max_s=0.01,
+    )
+    intent = _intent(0.2, lifetime_ns=1_000)
+    clock.value = 100
+    dispatcher.submit(intent)
+    clock.value = 120
+    dispatcher.start()
+    _wait_for(lambda: dispatcher.snapshot().delivered == 1)
+    assert dispatcher.close()
+
+    assert [event.kind for event in events] == ["retry", "delivered"]
+    retry = events[0]
+    assert retry.code == "manager_scene_runtime_unavailable"
+    assert "enqueue_age_ns=20" in retry.detail
+    assert "observe_rpc_elapsed_ns=50" in retry.detail
+    assert "cause_type=TimeoutError" in retry.detail
+    assert f"cause_errno={errno.ETIMEDOUT}" in retry.detail
+    assert len(client.observations) == 2
+    assert [sequence for sequence, _ in client.observations] == [1, 1]
+    assert client.observations[0][1] == client.observations[1][1] == intent
 
 
 def test_dispatcher_registers_its_exact_bindings_before_any_sample() -> None:

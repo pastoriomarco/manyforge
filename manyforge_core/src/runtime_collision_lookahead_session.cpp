@@ -96,6 +96,9 @@ const char* runtime_collision_lookahead_termination_name(
 }
 
 const char* runtime_collision_lookahead_error_message(std::string_view reason) noexcept {
+  if (reason == "stale_dynamic_collision_body") {
+    return "Scene pose evidence is stale or invalid; the bounded future could not be collision-checked";
+  }
   if (reason == "runtime_lookahead_deadline_exceeded") {
     return "Runtime trajectory lookahead missed its cycle deadline";
   }

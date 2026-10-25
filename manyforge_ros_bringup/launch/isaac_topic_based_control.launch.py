@@ -1,11 +1,8 @@
-"""Bring up the retained Isaac ros2_control path behind an exact world barrier.
+"""Attach the retained ros2_control path to an already-open Isaac scene.
 
-The launch owns no motion or lifecycle policy. It first proves that Isaac's
-``simulation_interfaces`` owner loaded the selected world and left it stopped.
-The Manager-owned cell mode receives that preflight from the host and starts
-component infrastructure without another world barrier or cell pose observer.
-The standalone mode then exposes the retained JTC transport and the two thin mechanical
-adapters around the C++ execution backend's single command-admission fact.
+The launch owns no scene loading, simulation control, motion, or component
+lifecycle policy. It starts controller infrastructure inactive; the existing
+CCLC path activates it only after fresh backend readiness is observed.
 """
 
 from __future__ import annotations
@@ -18,10 +15,8 @@ from launch.actions import (
     DeclareLaunchArgument,
     EmitEvent,
     OpaqueFunction,
-    RegisterEventHandler,
     TimerAction,
 )
-from launch.event_handlers import OnProcessExit
 from launch.events import Shutdown
 from launch.substitutions import LaunchConfiguration
 from launch_ros.actions import Node
@@ -30,12 +25,6 @@ from launch_ros.substitutions import FindPackageShare
 from manyforge_ros_bringup.launch_signals import keep_sigint_out_of_tasks
 
 
-DEFAULT_WORLD_URI = (
-    "file:/home/tndlux/workspaces/isaac_ros-dev/src/"
-    "isaac_sim_custom_examples/Scenario/IsaacManipulator/UniversalRobots/"
-    "isaac_manipulator_scene_light.usda"
-)
-DEFAULT_WORLD_NAME = "isaac_manipulator_scene_light"
 DEFAULT_RUNTIME_NAMESPACE = "/manyforge/isaac_ur10e_light_robot"
 
 
@@ -54,28 +43,6 @@ def generate_launch_description() -> LaunchDescription:
                     "Exact /manyforge/<controllable_component_id> namespace "
                     "shared by this runtime and its mechanical adapters."
                 ),
-            ),
-            DeclareLaunchArgument(
-                "world_uri",
-                default_value=DEFAULT_WORLD_URI,
-                description="Exact local file URI resolved by the Isaac host.",
-            ),
-            DeclareLaunchArgument(
-                "expected_world_name",
-                default_value=DEFAULT_WORLD_NAME,
-                description="Exact GetCurrentWorld name required after LoadWorld.",
-            ),
-            DeclareLaunchArgument("scene_startup_timeout_s", default_value="180.0"),
-            DeclareLaunchArgument(
-                "require_existing_world",
-                default_value="false",
-                description="Require the exact already-loaded stopped world; never load another world.",
-            ),
-            DeclareLaunchArgument("scene_service_timeout_s", default_value="120.0"),
-            DeclareLaunchArgument(
-                "manager_cell_world_owned",
-                default_value="false",
-                description="The Manager host already owns the qualified cell world and pose observer.",
             ),
             DeclareLaunchArgument(
                 "pose_observer_site_config",
@@ -131,16 +98,6 @@ def generate_launch_description() -> LaunchDescription:
                 "pointcloud_demand_poll_period_s", default_value="0.5"
             ),
             DeclareLaunchArgument("pointcloud_http_timeout_s", default_value="1.0"),
-            DeclareLaunchArgument(
-                "additional_required_topics",
-                default_value="",
-                description=(
-                    "Comma-separated absolute topic names that must join the "
-                    "profile's simulator-owned Isaac graph before bringup "
-                    "continues. Topics owned by downstream providers must be "
-                    "validated after those providers start."
-                ),
-            ),
             DeclareLaunchArgument(
                 "robot_description_file",
                 description="Host-generated complete robot description file.",
@@ -204,10 +161,6 @@ def generate_launch_description() -> LaunchDescription:
 
 def _launch_setup(context, *_, **__) -> list[object]:
     keep_sigint_out_of_tasks(context)  # Q116: before any Node action exists.
-    manager_cell_world_owned = _parse_bool_launch_value(
-        LaunchConfiguration("manager_cell_world_owned").perform(context),
-        name="manager_cell_world_owned",
-    )
     package_share = Path(
         FindPackageShare("manyforge_ros_bringup").find("manyforge_ros_bringup")
     )
@@ -226,10 +179,6 @@ def _launch_setup(context, *_, **__) -> list[object]:
         LaunchConfiguration("joint_states_topic").perform(context),
         name="joint_states_topic",
     )
-    additional_topics = _parse_topic_csv(
-        LaunchConfiguration("additional_required_topics").perform(context),
-        name="additional_required_topics",
-    )
     pose_observer_site_config = _optional_absolute_path(
         LaunchConfiguration("pose_observer_site_config").perform(context),
         name="pose_observer_site_config",
@@ -243,16 +192,6 @@ def _launch_setup(context, *_, **__) -> list[object]:
             "pose_observer_site_config and manager_run_root must be "
             "configured together"
         )
-    required_topics = sorted(
-        {
-            "/clock",
-            joint_commands_topic,
-            joint_states_topic,
-            profile["raw_gripper_topic"],
-            *additional_topics,
-        }
-    )
-
     robot_description_path = Path(
         LaunchConfiguration("robot_description_file").perform(context)
     )
@@ -296,39 +235,6 @@ def _launch_setup(context, *_, **__) -> list[object]:
     if affinity:
         controller_manager_resources["cpu_affinity"] = affinity
 
-    scene_barrier = Node(
-        package="manyforge_ros_bringup",
-        executable="isaac_scene_load_barrier",
-        name="manyforge_isaac_scene_load_barrier",
-        namespace=runtime_namespace,
-        output="screen",
-        ros_arguments=["--disable-external-lib-logs"],
-        parameters=[
-            {
-                "world_uri": LaunchConfiguration("world_uri").perform(context),
-                "expected_world_name": LaunchConfiguration(
-                    "expected_world_name"
-                ).perform(context),
-                "require_existing_world": _parse_bool_launch_value(
-                    LaunchConfiguration("require_existing_world").perform(context),
-                    name="require_existing_world",
-                ),
-                "startup_timeout_s": _bounded_float(
-                    LaunchConfiguration("scene_startup_timeout_s").perform(context),
-                    name="scene_startup_timeout_s",
-                    minimum=0.1,
-                    maximum=600.0,
-                ),
-                "service_timeout_s": _bounded_float(
-                    LaunchConfiguration("scene_service_timeout_s").perform(context),
-                    name="scene_service_timeout_s",
-                    minimum=0.1,
-                    maximum=120.0,
-                ),
-                "required_topics": required_topics,
-            }
-        ],
-    )
     robot_state_publisher = Node(
         package="robot_state_publisher",
         executable="robot_state_publisher",
@@ -475,7 +381,6 @@ def _launch_setup(context, *_, **__) -> list[object]:
                 on_exit=_shutdown("Isaac gripper transport adapter exited"),
             )
         )
-    pose_observer_action = None
     if pose_observer_site_config:
         control_actions.append(
             Node(
@@ -518,7 +423,6 @@ def _launch_setup(context, *_, **__) -> list[object]:
                 on_exit=_shutdown("Isaac pose-observer adapter exited"),
             )
         )
-        pose_observer_action = control_actions[-1]
     pointcloud_topic_raw = LaunchConfiguration("pointcloud_topic").perform(
         context
     ).strip()
@@ -599,8 +503,8 @@ def _launch_setup(context, *_, **__) -> list[object]:
             )
         )
 
-    # Start the ROS stack after the scene barrier. The existing host/CCLC
-    # owner activates the configured JTC after observing real Isaac state.
+    # Start the ROS stack against the scene the user already opened. The
+    # existing host/CCLC owner activates JTC only after real Isaac readback.
     control_actions.extend(
         [
             TimerAction(period=0.5, actions=[controller_manager]),
@@ -608,28 +512,7 @@ def _launch_setup(context, *_, **__) -> list[object]:
             TimerAction(period=3.5, actions=[arm_controller]),
         ]
     )
-    if manager_cell_world_owned:
-        return [action for action in control_actions if action is not pose_observer_action]
-    return [
-        scene_barrier,
-        RegisterEventHandler(
-            OnProcessExit(
-                target_action=scene_barrier,
-                on_exit=lambda event, _context: _after_scene_barrier(
-                    event.returncode,
-                    control_actions,
-                ),
-            )
-        ),
-    ]
-
-
-def _after_scene_barrier(returncode: object, actions: list[object]) -> list[object]:
-    if type(returncode) is int and returncode == 0:
-        return actions
-    raise RuntimeError(
-        f"Isaac scene-load barrier failed with return code {returncode!r}"
-    )
+    return control_actions
 
 
 def _shutdown(reason: str) -> EmitEvent:
@@ -758,18 +641,6 @@ def _scoped_ros_name(
         runtime_namespace,
         _relative_ros_path(value, name=name),
     )
-
-
-def _parse_topic_csv(value: str, *, name: str) -> list[str]:
-    if not value.strip():
-        return []
-    raw_topics = value.split(",")
-    if len(raw_topics) > 64:
-        raise ValueError(f"{name} contains more than 64 topics")
-    topics = [_absolute_ros_name(topic, name=name) for topic in raw_topics]
-    if len(set(topics)) != len(topics):
-        raise ValueError(f"{name} contains duplicate topics")
-    return topics
 
 
 def _optional_absolute_path(value: str, *, name: str) -> str:

@@ -745,6 +745,21 @@ describe('Q114 closed readiness', () => {
     readiness.ready = true;
     expect(() => parseCCLCComponentSnapshot(snapshot)).toThrow();
   });
+  it('keeps lifecycle readiness separate from exact measured-state availability', () => {
+    const snapshot = componentSnapshot();
+    const readiness = snapshot.readiness as { ready: boolean; error: unknown;
+      domains: Array<{error: unknown; decision_kind: string | null}>; measured_state: unknown };
+    readiness.ready = true;
+    readiness.error = null;
+    readiness.domains[0].error = null;
+    readiness.domains[0].decision_kind = 'dispatch_primitive';
+    readiness.measured_state = { required: true, available: false,
+      error: { code: 'observation_stale', message: 'Required measured state is stale', details: {} } };
+    const parsed = parseCCLCComponentSnapshot(snapshot);
+    expect(parsed.readiness.ready).toBe(true);
+    expect(parsed.readiness.measuredState.available).toBe(false);
+    expect(parsed.readiness.measuredState.error?.code).toBe('observation_stale');
+  });
   it('rejects duplicate health occurrences and fact IDs', () => {
     const snapshot = componentSnapshot();
     const readiness = snapshot.readiness as { domains: Array<{health: {facts: unknown[]}}> };

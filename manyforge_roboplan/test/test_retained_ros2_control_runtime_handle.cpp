@@ -6,9 +6,6 @@
 
 #include <gtest/gtest.h>
 
-#include <builtin_interfaces/msg/time.hpp>
-#include <diagnostic_msgs/msg/diagnostic_status.hpp>
-#include <diagnostic_msgs/msg/key_value.hpp>
 #include <pal_statistics_msgs/msg/statistics.hpp>
 #include <sensor_msgs/msg/joint_state.hpp>
 
@@ -18,7 +15,6 @@
 #include <manyforge_core/time/manual_scheduler.hpp>
 #include <manyforge_core/types/lifecycle_cause.hpp>
 #include <manyforge_roboplan/native_runtime_support.hpp>
-#include <manyforge_roboplan/retained_isaac_arm_guard_binding.hpp>
 #include <manyforge_roboplan/retained_isaac_ros2_control_profile.hpp>
 #include <manyforge_roboplan/retained_ros2_control_runtime_handle.hpp>
 #include <manyforge_roboplan/retained_ros2_control_statistics_monitor.hpp>
@@ -440,6 +436,7 @@ struct GripperWorld final {
     auto gripper =
         std::make_unique<ros2_control_execution::Ros2GripperCommandBackend>(
             *resources, sink, clock, scheduler, true);
+    gripper_backend = gripper.get();
     ros2_control_execution::Ros2GripperActionConfig config;
     config.action_name = prefix + "/gripper_controller/gripper_cmd";
     config.group_id = "gripper";
@@ -523,6 +520,7 @@ struct GripperWorld final {
   std::string prefix;
   fake::FakeJtc jtc;
   GripperControllerManager manager;
+  ros2_control_execution::Ros2GripperCommandBackend *gripper_backend{};
   std::shared_ptr<RetainedRos2ControlRuntimeHandle> handle =
       RetainedRos2ControlRuntimeHandle::Create();
 };
@@ -2292,7 +2290,7 @@ TEST(RetainedRos2ControlRuntimeHandleTest, GripperActivationStepUsesExactSelecte
     const auto health = world.handle->ReadLifecycleHealth(
         core::ControlDomainId("domain.gripper"), world.clock.now());
     ASSERT_TRUE(health.ok()) << health.error().message;
-    EXPECT_EQ(health.value().has_activation_step, controller_manager_gripper);
+    EXPECT_TRUE(health.value().has_activation_step);
     EXPECT_EQ(RetainedRos2ControlRuntimeHandleTestAccess::Capture(*world.handle), before);
     const auto observed = world.Snapshot();
     EXPECT_EQ(observed.component_state, health.value().observed_state);
@@ -2303,6 +2301,37 @@ TEST(RetainedRos2ControlRuntimeHandleTest, GripperActivationStepUsesExactSelecte
     EXPECT_FALSE(arm.value().has_activation_step.has_value());
     EXPECT_TRUE(world.manager.Requests().empty());
   }
+}
+
+TEST(RetainedRos2ControlRuntimeHandleTest,
+     CommandBridgeLifecycleClosesAdmissionAndReactivatesWithoutControllerSwitch) {
+  GripperWorld world(true, {}, false);
+  world.handle->StartBackend();
+  ASSERT_TRUE(fake::WaitUntil([&] {
+    return world.handle->gripper_transport_readiness_snapshot()->ready;
+  }));
+  ASSERT_TRUE(world.WaitForState(State::kDeclared));
+  ASSERT_EQ(world.Dispatch("prepare").known,
+            core::LifecyclePrimitiveKnownResultDTO::kSucceeded);
+  ASSERT_TRUE(world.WaitForState(State::kPrepared));
+  core::GripperCommandRequestDTO command;
+  command.gripper_id = "gripper.target";
+  command.group_id = "gripper";
+  command.joint_name = "gripper_joint";
+  command.target_position = 0.02;
+  command.duration_s = 1.0;
+  EXPECT_FALSE(world.gripper_backend->command_gripper(command).accepted);
+  ASSERT_EQ(world.Dispatch("activate").known,
+            core::LifecyclePrimitiveKnownResultDTO::kSucceeded);
+  ASSERT_TRUE(world.WaitForState(State::kActive));
+  ASSERT_EQ(world.Dispatch("deactivate").known,
+            core::LifecyclePrimitiveKnownResultDTO::kSucceeded);
+  ASSERT_TRUE(world.WaitForState(State::kDisabled));
+  EXPECT_FALSE(world.gripper_backend->command_gripper(command).accepted);
+  ASSERT_EQ(world.Dispatch("activate").known,
+            core::LifecyclePrimitiveKnownResultDTO::kSucceeded);
+  ASSERT_TRUE(world.WaitForState(State::kActive));
+  EXPECT_TRUE(world.manager.Requests().empty());
 }
 
 TEST(RetainedRos2ControlRuntimeHandleTest, LaneGuardHooksGateActivationMotionAndRecover) {
@@ -2320,8 +2349,9 @@ TEST(RetainedRos2ControlRuntimeHandleTest, LaneGuardHooksGateActivationMotionAnd
       [&]() -> core::Result<void> {
         std::lock_guard lock(mutex);
         if (allow_activation) return core::Result<void>::Ok();
-        return core::Result<void>::Err({"execution_rejected", "no Isaac joint states",
-                                        {{"reason", "isaac_joint_states_not_received"}}});
+        return core::Result<void>::Err(
+            {"execution_rejected", "external mechanism guard is not ready",
+             {{"reason", "external_mechanism_guard_not_ready"}}});
       },
       [&] {
         std::lock_guard lock(mutex);
@@ -2348,7 +2378,8 @@ TEST(RetainedRos2ControlRuntimeHandleTest, LaneGuardHooksGateActivationMotionAnd
   const auto refused = world.handle->ActivateArmController({});
   EXPECT_EQ(refused.outcome, Outcome::kNotSent);
   ASSERT_TRUE(refused.error.has_value());
-  EXPECT_EQ(refused.error->details.at("reason"), "isaac_joint_states_not_received");
+  EXPECT_EQ(refused.error->details.at("reason"),
+            "external_mechanism_guard_not_ready");
   EXPECT_EQ(world.manager.switch_requests(), 0U);
   {
     std::lock_guard lock(mutex);
@@ -2360,7 +2391,7 @@ TEST(RetainedRos2ControlRuntimeHandleTest, LaneGuardHooksGateActivationMotionAnd
   const auto port = world.handle->current_port();
   ASSERT_TRUE(fake::WaitUntil([&] { return port->ReadReadiness().controller_bound; }));
 
-  // Q43: no motion command passes while the guard does not admit it.
+  // An installed external mechanism guard gates every motion path.
   core::TrajectoryDTO hold;
   hold.joint_names = {"joint_1"};
   hold.waypoints = {{0.0, {0.0}, {0.0}, {0.0}}, {1.0, {0.0}, {0.0}, {0.0}}};
@@ -2419,294 +2450,7 @@ TEST(RetainedRos2ControlRuntimeHandleTest, LaneGuardHooksGateActivationMotionAnd
   ASSERT_TRUE(world.WaitForState(State::kPrepared));
 }
 
-// --- Isaac guard binding
-// ------------------------------------------------------
-
-/// Scripted arm facts and a record of the binding's effects, in order.
-class FakeArmHost final : public IRetainedIsaacArmHost {
-public:
-  IsaacArmGuardFacts ReadFacts() override {
-    std::lock_guard lock(mutex_);
-    return facts_;
-  }
-  std::vector<std::string> ControllerJointNames() override { return {"joint1", "joint2"}; }
-  void ReportFault(core::ErrorDTO error) override {
-    std::lock_guard lock(mutex_);
-    effects_.push_back("fault:" + error.details.at("guard_reason"));
-  }
-  void DeactivateForFault(std::stop_token) override {
-    std::lock_guard lock(mutex_);
-    effects_.push_back("deactivate");
-  }
-
-  /// JTC active and holding on `epoch`, sample stamped `stamp`.
-  void Hold(std::uint64_t epoch, core::TimePoint stamp, bool executing = false) {
-    std::lock_guard lock(mutex_);
-    facts_.readiness = {true, true, true, core::ExecutionBindingEpoch(epoch)};
-    core::ExecutionControllerSampleDTO sample;
-    sample.binding_epoch = core::ExecutionBindingEpoch(epoch);
-    sample.source_stamp_ns = stamp;
-    sample.reference_velocities_rad_s = {0.0, executing ? 0.3 : 0.0};
-    facts_.sample = sample;
-    facts_.goal_executing = executing;
-  }
-
-  [[nodiscard]] std::vector<std::string> effects() const {
-    std::lock_guard lock(mutex_);
-    return effects_;
-  }
-
-private:
-  mutable std::mutex mutex_;
-  IsaacArmGuardFacts facts_;
-  std::vector<std::string> effects_;
-};
-
-/// The Isaac-side guard's ROS surface: status publisher (reliable,
-/// transient-local), authorization subscriber, joint states publisher.
-class FakeGuard final : public fake::PeerNode {
-public:
-  FakeGuard(const std::string &command_topic, const std::string &joint_states)
-      : PeerNode("manyforge_fake_isaac_guard") {
-    status_ = node()->create_publisher<diagnostic_msgs::msg::DiagnosticStatus>(
-        command_topic + "/guard_status", rclcpp::QoS(1).reliable().transient_local());
-    authorization_ = node()->create_subscription<builtin_interfaces::msg::Time>(
-        command_topic + "/authorization", rclcpp::QoS(1).reliable(),
-        [this](const builtin_interfaces::msg::Time::ConstSharedPtr message) {
-          std::lock_guard lock(mutex_);
-          authorizations_.push_back(static_cast<core::TimePoint>(message->sec) * 1'000'000'000 +
-                                    message->nanosec);
-        });
-    joint_states_ =
-        node()->create_publisher<sensor_msgs::msg::JointState>(joint_states, rclcpp::QoS(10));
-    Start();
-  }
-
-  void Publish(const std::string &state, std::optional<core::TimePoint> after,
-               const std::string &joint_names = R"(["joint1","joint2"])",
-               std::optional<std::string> reason = std::nullopt) {
-    diagnostic_msgs::msg::DiagnosticStatus message;
-    message.level = diagnostic_msgs::msg::DiagnosticStatus::ERROR;  // never decisive
-    const auto value = [&](std::string key, std::string text) {
-      diagnostic_msgs::msg::KeyValue row;
-      row.key = std::move(key);
-      row.value = std::move(text);
-      message.values.push_back(row);
-    };
-    value("state", state);
-    value("joint_names", joint_names);
-    if (after) {
-      value("authorized_after.sec", std::to_string(*after / 1'000'000'000));
-      value("authorized_after.nanosec", std::to_string(*after % 1'000'000'000));
-    }
-    if (reason) value("reason", *reason);
-    status_->publish(message);
-  }
-
-  void PublishJointState() { joint_states_->publish(sensor_msgs::msg::JointState{}); }
-
-  [[nodiscard]] std::vector<core::TimePoint> authorizations() const {
-    std::lock_guard lock(mutex_);
-    return authorizations_;
-  }
-
-private:
-  mutable std::mutex mutex_;
-  std::vector<core::TimePoint> authorizations_;
-  rclcpp::Publisher<diagnostic_msgs::msg::DiagnosticStatus>::SharedPtr status_;
-  rclcpp::Subscription<builtin_interfaces::msg::Time>::SharedPtr authorization_;
-  rclcpp::Publisher<sensor_msgs::msg::JointState>::SharedPtr joint_states_;
-};
-
-/// The binding on its own ROS node.
-struct GuardWorld final {
-  GuardWorld()
-      : command_topic("/manyforge_guard_test_" + fake::unique_suffix() + "/isaac_joint_commands"),
-        joint_states(command_topic + "_states"), node("manyforge_guard_binding_test") {
-    node.Start();
-    binding = RetainedIsaacArmGuardBinding::Create(
-        {command_topic, joint_states, 250'000'000, 5'000'000}, node.node(), host, clock);
-    hooks = binding->hooks();
-  }
-  ~GuardWorld() {
-    hooks = {};
-    binding.reset();
-    node.Stop();
-  }
-
-  [[nodiscard]] bool Admitted() const { return hooks.motion_admitted(); }
-
-  /// The guard's authorization subscription is matched (a volatile
-  /// authorization sent before that would be lost).
-  [[nodiscard]] bool GuardListening() const {
-    return fake::WaitUntil(
-        [&] { return node.node()->count_subscribers(command_topic + "/authorization") == 1U; });
-  }
-
-  std::string command_topic;
-  std::string joint_states;
-  WallClock clock;
-  std::shared_ptr<FakeArmHost> host = std::make_shared<FakeArmHost>();
-  fake::PeerNode node;
-  std::shared_ptr<RetainedIsaacArmGuardBinding> binding;
-  RetainedRos2ControlArmGuardHooks hooks;
-};
-
-TEST(RetainedIsaacArmGuardBindingTest, ParsesTheGuardStatusValuesOnly) {
-  diagnostic_msgs::msg::DiagnosticStatus message;
-  message.level = diagnostic_msgs::msg::DiagnosticStatus::OK;
-  const auto add = [&](std::string key, std::string value) {
-    diagnostic_msgs::msg::KeyValue row;
-    row.key = std::move(key);
-    row.value = std::move(value);
-    message.values.push_back(row);
-  };
-  add("state", "open");
-  add("joint_names", R"(["joint1","joint\"2"])");
-  add("authorized_after.sec", "12");
-  add("authorized_after.nanosec", "345");
-  auto parsed = RetainedIsaacArmGuardBinding::ParseStatus(message);
-  ASSERT_TRUE(parsed.status.has_value());
-  EXPECT_EQ(parsed.status->state, IsaacGuardState::kOpen);
-  EXPECT_EQ(parsed.status->authorized_after_ns, std::optional<core::TimePoint>(12'000'000'345));
-  ASSERT_TRUE(parsed.joint_names.has_value());
-  EXPECT_EQ(*parsed.joint_names, (std::vector<std::string>{"joint1", "joint\"2"}));
-
-  // Half an authorization stamp is malformed; an unknown state too.
-  message.values.pop_back();
-  EXPECT_FALSE(RetainedIsaacArmGuardBinding::ParseStatus(message).status.has_value());
-  message.values.front().value = "maybe";
-  EXPECT_FALSE(RetainedIsaacArmGuardBinding::ParseStatus(message).status.has_value());
-  // Joint names that are not one compact JSON string array are unparsable.
-  for (const char *bad : {"joint1,joint2", R"(["joint1",])", R"(["a"] )", R"(["\u0041"])"}) {
-    diagnostic_msgs::msg::DiagnosticStatus names;
-    diagnostic_msgs::msg::KeyValue row;
-    row.key = "joint_names";
-    row.value = bad;
-    names.values.push_back(row);
-    EXPECT_FALSE(RetainedIsaacArmGuardBinding::ParseStatus(names).joint_names.has_value()) << bad;
-  }
-}
-
-TEST(RetainedIsaacArmGuardBindingTest,
-     AuthorizesTheHoldAndAdmitsMotionOnlyOnTheExactConfirmationWithMatchingJoints) {
-  GuardWorld world;
-  FakeGuard guard(world.command_topic, world.joint_states);
-  ASSERT_TRUE(world.GuardListening());
-  world.host->Hold(1U, 1'000'000'000);
-  // No activation, authorization or motion before real Isaac joint states.
-  EXPECT_FALSE(world.hooks.before_activation().ok());
-  std::this_thread::sleep_for(50ms);
-  EXPECT_TRUE(guard.authorizations().empty());
-  ASSERT_TRUE(fake::WaitUntil([&] {
-    guard.PublishJointState();
-    return world.binding->status().activation_allowed;
-  }));
-  EXPECT_TRUE(world.hooks.before_activation().ok());
-  // The hold's own controller stamp is the authorization.
-  ASSERT_TRUE(fake::WaitUntil([&] { return !guard.authorizations().empty(); }));
-  EXPECT_EQ(guard.authorizations().front(), 1'000'000'000);
-  EXPECT_FALSE(world.Admitted());
-  // A stale confirmation does not admit; the exact one does.
-  guard.Publish("open", 999'000'000);
-  std::this_thread::sleep_for(50ms);
-  EXPECT_FALSE(world.Admitted());
-  guard.Publish("open", 1'000'000'000);
-  ASSERT_TRUE(fake::WaitUntil([&] { return world.Admitted(); }));
-  // Joint names in another order block motion until a matching status.
-  guard.Publish("open", 1'000'000'000, R"(["joint2","joint1"])");
-  ASSERT_TRUE(fake::WaitUntil([&] { return !world.Admitted(); }));
-  const auto status = world.binding->status();
-  EXPECT_TRUE(status.joint_names_mismatch);
-  EXPECT_EQ(status.last_diagnostic,
-            std::optional<std::string>("isaac_guard_joint_names_differ_from_controller_order"));
-  guard.Publish("open", 1'000'000'000, "not json");
-  std::this_thread::sleep_for(50ms);
-  EXPECT_FALSE(world.Admitted());
-  guard.Publish("open", 1'000'000'000);
-  ASSERT_TRUE(fake::WaitUntil([&] { return world.Admitted(); }));
-  EXPECT_EQ(guard.authorizations().size(), 1U);  // one outstanding authorization
-}
-
-TEST(RetainedIsaacArmGuardBindingTest, RestartedGuardIsReconnectedBeforeItsStatusIsTrusted) {
-  GuardWorld world;
-  world.host->Hold(1U, 1'000'000'000);
-  {
-    FakeGuard first(world.command_topic, world.joint_states);
-    ASSERT_TRUE(world.GuardListening());
-    ASSERT_TRUE(fake::WaitUntil([&] {
-      first.PublishJointState();
-      return !first.authorizations().empty();
-    }));
-    first.Publish("open", first.authorizations().front());
-    ASSERT_TRUE(fake::WaitUntil([&] { return world.Admitted(); }));
-  }
-  ASSERT_TRUE(fake::WaitUntil([&] {
-    return world.node.node()->count_subscribers(world.command_topic + "/authorization") == 0U;
-  }));
-  // A restarted guard (new publisher) replaying the old confirmation is not
-  // trusted: the reconnect handling requires a fresh, newer authorization.
-  FakeGuard restarted(world.command_topic, world.joint_states);
-  ASSERT_TRUE(world.GuardListening());
-  restarted.Publish("open", 1'000'000'000);
-  ASSERT_TRUE(fake::WaitUntil([&] { return world.binding->status().guard_reconnects == 1U; }));
-  EXPECT_FALSE(world.Admitted());
-  world.host->Hold(1U, 2'000'000'000);
-  ASSERT_TRUE(fake::WaitUntil([&] {
-    const auto values = restarted.authorizations();
-    return !values.empty() && values.back() == 2'000'000'000;
-  }));
-  EXPECT_FALSE(world.Admitted());
-  restarted.Publish("open", 2'000'000'000);
-  ASSERT_TRUE(fake::WaitUntil([&] { return world.Admitted(); }));
-}
-
-TEST(RetainedIsaacArmGuardBindingTest, TripReportsTheFaultThenSwitchesOffAndWaitsForRecover) {
-  GuardWorld world;
-  FakeGuard guard(world.command_topic, world.joint_states);
-  ASSERT_TRUE(world.GuardListening());
-  world.host->Hold(3U, 1'000'000'000);
-  ASSERT_TRUE(fake::WaitUntil([&] {
-    guard.PublishJointState();
-    return !guard.authorizations().empty();
-  }));
-  guard.Publish("open", 1'000'000'000);
-  ASSERT_TRUE(fake::WaitUntil([&] { return world.Admitted(); }));
-  world.host->Hold(3U, 1'100'000'000, true);  // a goal executes
-  std::this_thread::sleep_for(20ms);
-  guard.Publish("tripped", 1'000'000'000, R"(["joint1","joint2"])", "no fresh frame");
-  ASSERT_TRUE(fake::WaitUntil([&] { return world.host->effects().size() == 2U; }));
-  // Item 44 before Q41's switch-off.
-  EXPECT_EQ(world.host->effects(),
-            (std::vector<std::string>{"fault:no fresh frame", "deactivate"}));
-  EXPECT_FALSE(world.Admitted());
-  EXPECT_EQ(world.hooks.fault(), std::optional<std::string>("no fresh frame"));
-  EXPECT_FALSE(world.hooks.before_activation().ok());
-  // A late open status neither clears the incident nor admits motion.
-  guard.Publish("open", 1'000'000'000);
-  std::this_thread::sleep_for(50ms);
-  EXPECT_FALSE(world.Admitted());
-  EXPECT_TRUE(world.binding->status().tripped);
-
-  // The operator's Recover, then CCLC's reactivation on a new epoch: the
-  // hold of the old epoch is never authorized, the new epoch's is.
-  world.hooks.on_recover();
-  EXPECT_FALSE(world.hooks.fault().has_value());
-  EXPECT_TRUE(world.hooks.before_activation().ok());
-  world.host->Hold(3U, 1'200'000'000);  // still the tripped epoch
-  std::this_thread::sleep_for(50ms);
-  EXPECT_EQ(guard.authorizations().size(), 1U);
-  world.host->Hold(4U, 1'300'000'000);
-  ASSERT_TRUE(fake::WaitUntil([&] {
-    const auto values = guard.authorizations();
-    return values.size() == 2U && values.back() == 1'300'000'000;
-  }));
-  guard.Publish("open", 1'300'000'000);
-  ASSERT_TRUE(fake::WaitUntil([&] { return world.Admitted(); }));
-}
-
 // --- Q54: controller statistics monitor (observed statistics only)
-// -------------
 
 [[nodiscard]] pal_statistics_msgs::msg::Statistics
 Statistics(const std::vector<std::pair<std::string, double>> &values) {
@@ -3540,6 +3284,14 @@ TEST(RetainedRos2ControlRuntimeHandleTest,
   }
   EXPECT_EQ(RetainedRos2ControlRuntimeHandleTestAccess::Capture(*handle), before);
   EXPECT_FALSE(reader->current_state(query, clock->now()).ok());
+  // The lifecycle Observe checkpoint performs the required following stable
+  // endpoint capture. It settles unrelated graph churn without waiting for a
+  // measured sample and without issuing a controller effect.
+  const auto settled = handle->ReadLifecycleSnapshot(domain, clock->now());
+  ASSERT_TRUE(settled.ok()) << settled.error().message;
+  ASSERT_TRUE(handle->ReadLifecycleHealth(domain, clock->now()).ok());
+  EXPECT_EQ(manager.switch_requests(), 0U);
+  EXPECT_EQ(RetainedRos2ControlRuntimeHandleTestAccess::Capture(*handle), before);
   ASSERT_TRUE(fake::WaitUntil([&] {
     samples->publish(message);
     const auto sample = reader->current_state(query, clock->now());
@@ -3896,48 +3648,6 @@ TEST(RetainedRos2ControlRuntimeHandleTest,
   }
 }
 
-// Isaac lane (SX-3443): the guard worker, owned by this handle through its
-// hooks, polls the handle via its arm host every step. If the last external
-// owner releases while a poll holds its handle lease, that poll must not end
-// as the owner whose release destroys the guard binding on its own worker
-// (the binding's destructor joins that worker: std::system_error, abort).
-// No executor is started, so the guard worker is the only lease taker.
-TEST(RetainedRos2ControlRuntimeHandleTest,
-     LastExternalReleaseDuringGuardPollStopsTheGuardWorkerOffItsThread) {
-  std::weak_ptr<RetainedRos2ControlRuntimeHandle> external;
-  std::weak_ptr<RetainedRos2ControlRuntimeHandle> internal;
-  std::weak_ptr<RetainedIsaacArmGuardBinding> guard;
-  ArmWorld world;
-  const auto command_topic = world.prefix + "/isaac_joint_commands";
-  {
-    const auto binding = RetainedIsaacArmGuardBinding::Create(
-        {command_topic, command_topic + "_states", 250'000'000, 5'000'000},
-        world.handle->node(), make_retained_isaac_arm_host(world.handle),
-        world.clock);
-    world.handle->InstallGuardHooks(binding->hooks());
-    guard = binding;
-  }
-  external = world.handle;
-  internal = world.handle->weak_from_this();
-  std::jthread releaser;
-  bool poll_outlived_external = false;
-  {
-    // The next poll (ReadFacts -> current_port) blocks on this lock while
-    // holding its lease: one count above the external and internal owners.
-    auto state = RetainedRos2ControlRuntimeHandleTestAccess::LockState(*world.handle);
-    ASSERT_TRUE(fake::WaitUntil(
-        [&] { return external.use_count() + internal.use_count() == 3; }));
-    releaser = std::jthread(
-        [owner = std::move(world.handle)]() mutable { owner.reset(); });
-    // Bounded: with an external poll lease the owner never expires here.
-    poll_outlived_external =
-        !fake::WaitUntil([&] { return external.expired(); }, 1s);
-  }
-  releaser.join();
-  EXPECT_FALSE(poll_outlived_external);
-  EXPECT_TRUE(guard.expired());
-  EXPECT_TRUE(internal.expired());
-}
 
 } // namespace
 } // namespace manyforge::roboplan_backend

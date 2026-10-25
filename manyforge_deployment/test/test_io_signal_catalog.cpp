@@ -776,6 +776,126 @@ Object cyclic_input(std::string profile) {
   return row;
 }
 
+Object geometric_contact_input(std::string name = "contact",
+                               std::string source = "source.contact",
+                               double maximum_age_ns = 125.0) {
+  auto row = input_row(std::move(name), std::move(source));
+  row["update_mode"] = JsonValueDTO{std::string("sampled")};
+  row["freshness"] =
+      JsonValueDTO{Object{{"mode", JsonValueDTO{std::string("sample_age")}},
+                          {"maximum_age_ns",
+                           JsonValueDTO{maximum_age_ns}}}};
+  provider(row) = {
+      {"profile", JsonValueDTO{std::string("geometric_contact")}},
+      {"ingress_depth", JsonValueDTO{4.0}},
+      {"endpoint",
+       JsonValueDTO{Object{
+           {"controllable_component_id",
+            JsonValueDTO{std::string("robot.arm")}},
+           {"command_target_id", JsonValueDTO{std::string("arm")}},
+           {"frame_role_id", JsonValueDTO{std::string("tool")}}}}},
+      {"target_scene_resource_id",
+       JsonValueDTO{std::string("fixture.target")}}};
+  return row;
+}
+
+TEST(IoSignalCatalogTest,
+     GeometricContactUsesIndependentStandardAgeAndSourceScopedSelectors) {
+  auto first = geometric_contact_input();
+  auto second = geometric_contact_input("contact_copy");
+  auto result = ResolveRetainedIoSignalCatalog(
+      io_graph({JsonValueDTO{first}, JsonValueDTO{second}}));
+  ASSERT_TRUE(result.ok()) << result.error().message;
+  ASSERT_EQ(result.value().size(), 2U);
+  for (const auto &signal : result.value()) {
+    EXPECT_EQ(signal.descriptor.liveness, IoSignalLivenessMode::kPeriodic);
+    EXPECT_EQ(signal.descriptor.update_mode, IoSignalUpdateMode::kSampled);
+    EXPECT_EQ(signal.descriptor.freshness.mode,
+              IoFreshnessMode::kSampleAge);
+    EXPECT_EQ(signal.descriptor.freshness.maximum_age_ns, 125);
+    ASSERT_TRUE(signal.provider.endpoint);
+    EXPECT_EQ(signal.provider.endpoint->controllable_component_id,
+              ControllableComponentId("robot.arm"));
+    EXPECT_EQ(signal.provider.endpoint->command_target_id,
+              CommandTargetId("arm"));
+    EXPECT_EQ(signal.provider.endpoint->frame_role_id, FrameRoleId("tool"));
+    EXPECT_EQ(signal.provider.target_scene_resource_id,
+              SceneResourceId("fixture.target"));
+  }
+
+  first = geometric_contact_input("contact", "source.contact", 17.0);
+  second = geometric_contact_input("contact_copy", "source.contact", 42.0);
+  result = ResolveRetainedIoSignalCatalog(
+      io_graph({JsonValueDTO{first}, JsonValueDTO{second}}));
+  ASSERT_TRUE(result.ok()) << result.error().message;
+  ASSERT_EQ(result.value().size(), 2U);
+  EXPECT_EQ(result.value()[0].descriptor.freshness.maximum_age_ns, 17);
+  EXPECT_EQ(result.value()[1].descriptor.freshness.maximum_age_ns, 42);
+  const auto first_digest =
+      ComputeIoSignalDescriptorDigest(result.value()[0].descriptor);
+  const auto second_digest =
+      ComputeIoSignalDescriptorDigest(result.value()[1].descriptor);
+  ASSERT_TRUE(first_digest.ok());
+  ASSERT_TRUE(second_digest.ok());
+  EXPECT_NE(first_digest.value(), second_digest.value());
+
+  // Body roles are derived by the provider; the input contract has no body
+  // list or timing controls to configure.
+  for (const auto *field : {"body_ids", "body_role_ids", "sample_period_ns",
+                            "minimum_rate_hz", "timeout_ns"}) {
+    auto malformed = geometric_contact_input();
+    provider(malformed)[field] = JsonValueDTO{std::string("unapproved")};
+    EXPECT_FALSE(ResolveRetainedIoSignalCatalog(
+                     io_graph({JsonValueDTO{malformed}}))
+                     .ok())
+        << field;
+  }
+
+  auto malformed = geometric_contact_input();
+  provider(malformed).erase("endpoint");
+  EXPECT_FALSE(ResolveRetainedIoSignalCatalog(
+                   io_graph({JsonValueDTO{malformed}}))
+                   .ok());
+  malformed = geometric_contact_input();
+  provider(malformed)["target_scene_resource_id"] =
+      JsonValueDTO{std::string("")};
+  EXPECT_FALSE(ResolveRetainedIoSignalCatalog(
+                   io_graph({JsonValueDTO{malformed}}))
+                   .ok());
+  malformed = geometric_contact_input();
+  auto &endpoint = std::get<Object>(provider(malformed).at("endpoint").value);
+  endpoint["unrecognized"] = JsonValueDTO{true};
+  EXPECT_FALSE(ResolveRetainedIoSignalCatalog(
+                   io_graph({JsonValueDTO{malformed}}))
+                   .ok());
+
+  for (const double age : {0.0, -1.0}) {
+    malformed = geometric_contact_input("contact", "source.contact", age);
+    EXPECT_FALSE(ResolveRetainedIoSignalCatalog(
+                     io_graph({JsonValueDTO{malformed}}))
+                     .ok())
+        << age;
+  }
+
+  auto endpoint_conflict = geometric_contact_input("contact_copy");
+  auto &conflicting_endpoint =
+      std::get<Object>(provider(endpoint_conflict).at("endpoint").value);
+  conflicting_endpoint["frame_role_id"] =
+      JsonValueDTO{std::string("other_tool")};
+  EXPECT_FALSE(ResolveRetainedIoSignalCatalog(
+                   io_graph({JsonValueDTO{geometric_contact_input()},
+                             JsonValueDTO{endpoint_conflict}}))
+                   .ok());
+
+  auto target_conflict = geometric_contact_input("contact_copy");
+  provider(target_conflict)["target_scene_resource_id"] =
+      JsonValueDTO{std::string("other.fixture")};
+  EXPECT_FALSE(ResolveRetainedIoSignalCatalog(
+                   io_graph({JsonValueDTO{geometric_contact_input()},
+                             JsonValueDTO{target_conflict}}))
+                   .ok());
+}
+
 Object typed_output(std::string profile, std::string name = "lamp") {
   auto row = output_row(std::move(name));
   if (profile == "ur_set_io")
@@ -833,6 +953,36 @@ TEST(IoSignalCatalogTest,
       ComputeIoSignalDescriptorDigest(descriptor).value(),
       ComputeIoSignalDescriptorDigest(change_only.value().front().descriptor)
           .value());
+}
+
+TEST(IoSignalCatalogTest,
+     ExistingSourcesAllowSelectorAliasesButKeepProviderAndDepthCoherent) {
+  for (const auto *profile : {"ur_io_states", "ros2_control_gpio"}) {
+    auto first = cyclic_input(profile);
+    auto second = cyclic_input(profile);
+    second["resource_role_id"] = JsonValueDTO{std::string("other")};
+    second["signal_name"] = JsonValueDTO{std::string("other")};
+    second["source_id"] = JsonValueDTO{std::string("source.io")};
+    if (std::string_view(profile) == "ur_io_states") {
+      provider(second)["pin"] = JsonValueDTO{16.0};
+    } else {
+      provider(second)["group"] = JsonValueDTO{std::string("module/2")};
+      provider(second)["interface_name"] =
+          JsonValueDTO{std::string("digital.1/value")};
+    }
+    auto result = ResolveRetainedIoSignalCatalog(
+        io_graph({JsonValueDTO{first}, JsonValueDTO{second}}));
+    ASSERT_TRUE(result.ok()) << profile << ": " << result.error().message;
+    ASSERT_EQ(result.value().size(), 2U);
+    EXPECT_EQ(result.value()[0].descriptor.source_id,
+              result.value()[1].descriptor.source_id);
+
+    provider(second)["ingress_depth"] = JsonValueDTO{8.0};
+    EXPECT_FALSE(ResolveRetainedIoSignalCatalog(
+                     io_graph({JsonValueDTO{first}, JsonValueDTO{second}}))
+                     .ok())
+        << profile;
+  }
 }
 
 TEST(IoSignalCatalogTest,
@@ -965,7 +1115,16 @@ TEST(IoSignalCatalogTest,
      "resource_role_id":"lamp","signal_name":"lamp","source_id":"source.output",
      "value_type":"bool","direction":"output",
      "provider":{"profile":"ros2_control_gpio","topic":"/device/commands",
-                 "group":"module/1","interface_name":"digital.0/value"}}
+                 "group":"module/1","interface_name":"digital.0/value"}},
+    {"controllable_component_id":"device.io","command_target_id":"arm",
+     "resource_role_id":"contact","signal_name":"contact","source_id":"source.contact",
+     "value_type":"bool","direction":"input","update_mode":"sampled",
+     "transition_capability":"sampled_only",
+     "freshness":{"mode":"sample_age","maximum_age_ns":125},
+     "provider":{"profile":"geometric_contact","ingress_depth":4,
+       "endpoint":{"controllable_component_id":"robot.arm",
+                   "command_target_id":"arm","frame_role_id":"tool"},
+       "target_scene_resource_id":"fixture.target"}}
   ])")
                            .root();
   configuration.emplace_back("io_signals", signals);
@@ -974,7 +1133,18 @@ TEST(IoSignalCatalogTest,
   const auto &rows = normalized.normalized_value()
                          .find_object_member("io_signals")
                          ->as_array();
-  ASSERT_EQ(rows.size(), 2U);
+  ASSERT_EQ(rows.size(), 3U);
+  const auto find_profile_index = [](const auto &items,
+                                     std::string_view profile) {
+    for (std::size_t index = 0; index < items.size(); ++index) {
+      const auto *address = items[index].find_object_member("provider");
+      const auto *profile_value =
+          address == nullptr ? nullptr : address->find_object_member("profile");
+      if (profile_value != nullptr && profile_value->as_string() == profile)
+        return index;
+    }
+    return items.size();
+  };
   bool input_seen = false;
   for (const auto &row : rows) {
     const auto &address = *row.find_object_member("provider");
@@ -987,6 +1157,16 @@ TEST(IoSignalCatalogTest,
     }
   }
   EXPECT_TRUE(input_seen);
+  const auto geometric_index = find_profile_index(rows, "geometric_contact");
+  ASSERT_LT(geometric_index, rows.size());
+  const auto &geometric_provider =
+      *rows[geometric_index].find_object_member("provider");
+  EXPECT_EQ(geometric_provider.find_object_member("profile")->as_string(),
+            "geometric_contact");
+  EXPECT_EQ(geometric_provider.find_object_member("endpoint")
+                ->find_object_member("frame_role_id")
+                ->as_string(),
+            "tool");
   auto invalid_signals = signals.as_array();
   auto invalid = invalid_signals.front().as_object();
   for (auto &[key, field] : invalid) {
@@ -998,6 +1178,27 @@ TEST(IoSignalCatalogTest,
   }
   invalid_signals.front() = CanonicalValue(std::move(invalid));
   auto invalid_configuration = configuration;
+  for (auto &[key, field] : invalid_configuration)
+    if (key == "io_signals")
+      field = CanonicalValue(std::move(invalid_signals));
+  EXPECT_THROW((void)validate_and_normalize_build_qualified_value(
+                   *schema, CanonicalValue(invalid_configuration)),
+               std::exception);
+  invalid_signals = signals.as_array();
+  const auto invalid_geometric_index =
+      find_profile_index(invalid_signals, "geometric_contact");
+  ASSERT_LT(invalid_geometric_index, invalid_signals.size());
+  auto invalid_geometric = invalid_signals[invalid_geometric_index].as_object();
+  for (auto &[key, field] : invalid_geometric) {
+    if (key != "provider")
+      continue;
+    auto address = field.as_object();
+    address.emplace_back("body_ids", CanonicalValue(CanonicalValue::Array{}));
+    field = CanonicalValue(std::move(address));
+  }
+  invalid_signals[invalid_geometric_index] =
+      CanonicalValue(std::move(invalid_geometric));
+  invalid_configuration = configuration;
   for (auto &[key, field] : invalid_configuration)
     if (key == "io_signals")
       field = CanonicalValue(std::move(invalid_signals));

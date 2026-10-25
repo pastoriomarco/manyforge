@@ -726,7 +726,8 @@ ManagerLivenessObservationDTO LivenessObservation(const ManagerLivenessRequiredS
 
 KernelCellAdmissionOwner LivenessOwner(FixedClock& clock, AdmissionJournal& journal,
                                        const ManagerLivenessRequiredSetDTO& set,
-                                       CellAdmissionProgramResetStatusSource reset_status_source = {}) {
+                                       CellAdmissionProgramResetStatusSource reset_status_source = {},
+                                       CellAdmissionProgramNodeValidator program_node_validator = {}) {
   return KernelCellAdmissionOwner(
       RequestOwnerEpoch("kernel.1"), 16U, clock, journal, {}, AdmissionGeneration(0U),
       [](const auto&, const auto&) { return Result<void>::Ok(); },
@@ -735,7 +736,75 @@ KernelCellAdmissionOwner LivenessOwner(FixedClock& clock, AdmissionJournal& jour
         return Result<CellAdmissionReconcileValidationDTO>::Ok(
             {reconcile.current_owner_epochs, {}});
       },
-      {}, {}, set, CellAdmissionClaimGeneration(0U), {}, {}, std::move(reset_status_source));
+      {}, {}, set, CellAdmissionClaimGeneration(0U), std::move(program_node_validator), {},
+      std::move(reset_status_source));
+}
+
+TEST(KernelCellAdmissionOwner, ProgramNodeDependencyRefusalReportsCurrentReadinessFacts) {
+  FixedClock clock;
+  AdmissionJournal journal;
+  const auto set = LivenessSet();
+  auto owner = LivenessOwner(clock, journal, set, {}, [](const auto&) {
+    return Result<void>::Ok();
+  });
+  auto ready = Ready();
+  ready.program_cycle_status = ProgramCycleStatusDTO{
+      RequestOwnerEpoch("program.owner"), 1U, ProgramCycleStateDTO::kStarting,
+      ProgramRunId("run.1"), std::nullopt, std::nullopt};
+  ASSERT_TRUE(owner.UpdateCellAdmissionReadiness(ready).ok());
+  for (std::size_t receiver = 0; receiver < set.required_receivers.size(); ++receiver) {
+    ASSERT_TRUE(owner.Publish(LivenessObservation(set, receiver, 1U,
+                                                  ManagerLivenessStateDTO::kCurrent)).ok());
+  }
+
+  auto parent_intent = Intent(CellAdmissionClaimKindDTO::kProgramCycle,
+                              owner.GetAuthoringAdmission().admission_generation, "run.1");
+  parent_intent.owner_epoch = RequestOwnerEpoch("program.owner");
+  parent_intent.owner_transaction_id = "run.1";
+  const auto parent = owner.AcquireCellAdmissionClaim(parent_intent);
+  ASSERT_TRUE(parent.ok());
+
+  ready.program_cycle_status = ProgramCycleStatusDTO{
+      RequestOwnerEpoch("program.owner"), 2U, ProgramCycleStateDTO::kRunning,
+      ProgramRunId("run.1"), parent.value().claim_generation, std::nullopt};
+  ASSERT_TRUE(owner.UpdateCellAdmissionReadiness(ready).ok());
+  ASSERT_TRUE(owner.Publish(LivenessObservation(set, 0U, 2U,
+                                                ManagerLivenessStateDTO::kExpired, true)).ok());
+  ready.program_cycle_status = ProgramCycleStatusDTO{
+      RequestOwnerEpoch("program.owner"), 2U, ProgramCycleStateDTO::kRunning,
+      ProgramRunId("run.1"), parent.value().claim_generation, std::nullopt};
+  ready.deployment_status_current = false;
+  ready.deployment_converged = false;
+  ready.blocking_fault_count = 2U;
+  ready.unresolved_owner_count = 3U;
+  ready.unsettled_effect_count = 4U;
+  ASSERT_TRUE(owner.UpdateCellAdmissionReadiness(ready).ok());
+
+  auto child = Intent(CellAdmissionClaimKindDTO::kAuthoredScene,
+                      owner.GetAuthoringAdmission().admission_generation, "scene.child");
+  child.program_node_evidence = ProgramNodeAdmissionEvidenceDTO{
+      RequestOwnerEpoch("program.owner"), ProgramRunId("run.1"),
+      parent.value().claim_generation, "attach", "attach.attempt.1",
+      "scene.carried_attachment"};
+  const auto sequence_before = journal.sequence.load();
+  const auto refused = owner.AcquireCellAdmissionClaim(child);
+
+  ASSERT_FALSE(refused.ok());
+  EXPECT_EQ(refused.error().code, "authoring_not_ready");
+  EXPECT_EQ(refused.error().details.at("reason"), "program_node_dependencies_not_current");
+  EXPECT_EQ(refused.error().details.at("manager_liveness_required_set_present"), "true");
+  EXPECT_EQ(refused.error().details.at("manager_liveness_current_unfenced_count"), "1");
+  EXPECT_EQ(refused.error().details.at("manager_liveness_required_count"), "2");
+  EXPECT_EQ(refused.error().details.at("deployment_status_current"), "false");
+  EXPECT_EQ(refused.error().details.at("deployment_converged"), "false");
+  EXPECT_EQ(refused.error().details.at("blocking_fault_count"), "2");
+  EXPECT_EQ(refused.error().details.at("unresolved_owner_count"), "3");
+  EXPECT_EQ(refused.error().details.at("unsettled_effect_count"), "4");
+  EXPECT_NE(refused.error().message.find("manager_liveness_current_unfenced_count=1"),
+            std::string::npos);
+  EXPECT_NE(refused.error().message.find("unsettled_effect_count=4"), std::string::npos);
+  EXPECT_EQ(journal.sequence.load(), sequence_before);
+  EXPECT_FALSE(owner.GetAuthoringAdmission().authoring_allowed);
 }
 
 TEST(KernelCellAdmissionOwner, StartsFalseAndEveryReadinessInputFailsClosed) {

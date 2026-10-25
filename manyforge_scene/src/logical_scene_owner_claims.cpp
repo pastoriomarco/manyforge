@@ -28,9 +28,12 @@ namespace manyforge::scene::logical_scene_owner_detail {
   core::CellAdmissionClaimIntentDTO intent{
       core::CellAdmissionClaimKindDTO::kAuthoredScene,
       core::CellAdmissionOwnerRoleDTO::kAuthoredSceneOwner,
-      request.request_context.request_owner_epoch,
+      RequestOwnerEpoch(
+          request.expected_projection_revision.scene_revision.scene_id.value()),
       request.request_context.request_id.value(),
-      request.request_context.request_id,
+      // Scope replay to this exact request, including its rotating request
+      // epoch.
+      core::RequestId(request_digest.value()),
       request_digest,
       *request.expected_admission_generation,
       {},
@@ -81,9 +84,19 @@ void SettleAuthoredSceneClaimIfHeld(
        projection_status != SceneProjectionCommitStatusDTO::kNotAttempted)) {
     return;
   }
-  const auto intent = AuthoredSceneClaimIntent(request, request_digest);
-  const auto receipt = admission.GetCellAdmissionRecoveryReceipt(
+  auto intent = AuthoredSceneClaimIntent(request, request_digest);
+  auto receipt = admission.GetCellAdmissionRecoveryReceipt(
       {intent, std::nullopt, std::nullopt});
+  if (receipt.ok() &&
+      receipt.value().status ==
+          core::CellAdmissionRecoveryReceiptStatusDTO::kUnknown) {
+    // Pre-upgrade claims used the request epoch. Only recover that exact
+    // intent; new claims always use the stable Scene identity.
+    intent.owner_epoch = request.request_context.request_owner_epoch;
+    intent.request_id = request.request_context.request_id;
+    receipt = admission.GetCellAdmissionRecoveryReceipt(
+        {intent, std::nullopt, std::nullopt});
+  }
   if (!receipt.ok()) {
     ThrowCellAdmissionFailure("authored scene recovery lookup failed",
                               receipt.error());
@@ -222,9 +235,8 @@ core::Result<void> ValidateAuthoredSceneCellAdmissionSettlementReadOnly(
         "JOIN logical_scene_request_outcomes o "
         "ON o.request_owner_epoch=i.request_owner_epoch "
         "AND o.request_id=i.request_id "
-        "WHERE i.request_owner_epoch=? AND i.request_id=?");
-    row.Bind(1, claim.intent.owner_epoch.value());
-    row.Bind(2, claim.intent.request_id.value());
+        "WHERE i.request_digest=?");
+    row.Bind(1, claim.intent.request_payload_digest.value());
     if (!row.Step()) {
       throw LogicalSceneOwnerIntegrityError(
           "authored-scene terminal outcome is absent");
@@ -244,15 +256,14 @@ core::Result<void> ValidateAuthoredSceneCellAdmissionSettlementReadOnly(
     const auto expected_kind =
         success ? core::CellAdmissionSettlementKindDTO::kOwnerCommit
                 : core::CellAdmissionSettlementKindDTO::kProvenNoEffect;
+    const auto intent =
+        AuthoredSceneClaimIntent(request, ContentDigest(request_digest));
+    auto legacy_intent = intent;
+    legacy_intent.owner_epoch = request.request_context.request_owner_epoch;
+    legacy_intent.request_id = request.request_context.request_id;
     if ((!IsAuthoredSceneMutation(request) &&
          !request.program_node_evidence.has_value()) ||
-        request.program_node_evidence != claim.intent.program_node_evidence ||
-        request.expected_admission_generation !=
-            std::optional<core::AdmissionGeneration>{
-                claim.intent.expected_admission_generation} ||
-        request.request_context.request_owner_epoch !=
-            claim.intent.owner_epoch ||
-        request.request_context.request_id != claim.intent.request_id ||
+        (claim.intent != intent && claim.intent != legacy_intent) ||
         request_digest != claim.intent.request_payload_digest.value() ||
         release.settlement.evidence_digest.value() != request_digest ||
         release.settlement.settlement_kind != expected_kind ||

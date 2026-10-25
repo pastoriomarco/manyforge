@@ -368,10 +368,9 @@ TEST(RetainedRos2ControlBackendFactoryTest,
   ASSERT_TRUE(participant.tracking.has_value());
   EXPECT_DOUBLE_EQ(participant.tracking->tolerance_rad, 0.05);
   EXPECT_DOUBLE_EQ(participant.tracking->timeout_s, 0.0);
-  ASSERT_TRUE(selected.isaac_guard.has_value());
-  EXPECT_EQ(selected.isaac_guard->joint_commands_topic, "/isaac_joint_commands");
-  EXPECT_EQ(selected.isaac_guard->joint_states_topic, "/isaac_joint_states");
-  EXPECT_EQ(selected.isaac_guard->joint_state_max_age_ns, 250'000'000);
+  ASSERT_TRUE(selected.arm.measured_joint_state_lane.has_value());
+  EXPECT_EQ(selected.arm.measured_joint_state_lane->absolute_topic,
+            "/isaac_joint_states");
   ASSERT_TRUE(selected.gripper.has_value());
   EXPECT_EQ(selected.gripper->action_name,
             "/manyforge/robot_1/lite_gripper_controller/gripper_cmd");
@@ -408,12 +407,10 @@ TEST(RetainedRos2ControlBackendFactoryTest,
   for (std::size_t index = 0; index < first_endpoints.size(); ++index) {
     EXPECT_NE(first_endpoints[index], second_endpoints[index]);
   }
-  // Raw Isaac transport wires and the guard's command topic are lane values,
-  // not runtime-owned endpoints.
+  // Raw Isaac gripper transport wires are lane values, not runtime-owned
+  // endpoints.
   EXPECT_EQ(first.gripper->command_topic, second.gripper->command_topic);
   EXPECT_EQ(first.gripper->state_topic, second.gripper->state_topic);
-  EXPECT_EQ(first.isaac_guard->joint_commands_topic,
-            second.isaac_guard->joint_commands_topic);
 }
 
 TEST(RetainedRos2ControlBackendFactoryTest,
@@ -1636,32 +1633,35 @@ TEST(RetainedRos2ControlBackendFactoryTest,
 }
 
 TEST(RetainedRos2ControlBackendFactoryTest,
-     IsaacControllerDescriptionFactsAreTheLaunchDefaults) {
-  // Q69/Q47: the Isaac launch's argument defaults moved unchanged into the
-  // profile facts (component name, topics and fixed initial values).
-  const auto lite6 = retained_isaac_controller_lane("lite6");
+     IsaacControllerDescriptionUsesSelectedBackendCommandPose) {
+  // The maintained deployment defaults remain equivalent while the initial
+  // pose comes from the selected deployment rather than profile constants.
+  const std::vector<double> lite6_defaults{0.0, 0.0, 1.57, 0.0, 0.0, 0.0};
+  const auto lite6 = retained_isaac_controller_lane("lite6", lite6_defaults);
   EXPECT_EQ(lite6.hardware_component_name, "IsaacLite6TopicBasedSystem");
   EXPECT_EQ(lite6.joint_commands_topic, "/isaac_joint_commands");
   EXPECT_EQ(lite6.joint_states_topic, "/isaac_joint_states");
-  EXPECT_EQ(lite6.initial_joint_positions_rad,
-            (std::vector<double>{0.0, 0.0, 1.57, 0.0, 0.0, 0.0}));
-  const auto ur10e = retained_isaac_controller_lane("ur10e");
+  EXPECT_EQ(lite6.initial_joint_positions_rad, lite6_defaults);
+  const std::vector<double> ur10e_defaults{
+      2.63422544, -0.875980752, 1.551074106, -2.29231544, -1.560498884,
+      -2.038544566};
+  const auto ur10e = retained_isaac_controller_lane("ur10e", ur10e_defaults);
   EXPECT_EQ(ur10e.hardware_component_name, "IsaacUR10eTopicBasedSystem");
   EXPECT_EQ(ur10e.joint_commands_topic, "/isaac_joint_commands");
   EXPECT_EQ(ur10e.joint_states_topic, "/isaac_joint_states");
-  EXPECT_EQ(ur10e.initial_joint_positions_rad,
-            (std::vector<double>{2.63422544, -0.875980752, 1.551074106,
-                                 -2.29231544, -1.560498884, -2.038544566}));
-  EXPECT_THROW(static_cast<void>(retained_isaac_controller_lane("ur5e")),
-               std::invalid_argument);
+  EXPECT_EQ(ur10e.initial_joint_positions_rad, ur10e_defaults);
+  EXPECT_THROW(
+      static_cast<void>(retained_isaac_controller_lane("ur5e", lite6_defaults)),
+      std::invalid_argument);
 
-  // The facts generate the Isaac section from a model and binding joints.
+  // One non-default selected pose reaches both the backend-commanded authority
+  // and TopicBasedSystem's generated command/state-interface seed.
+  const std::vector<double> selected_pose{0.375};
+  const auto lane = retained_isaac_controller_lane("lite6", selected_pose);
   const std::string model =
       "<robot name=\"r\"><link name=\"a\"/><link name=\"b\"/>"
       "<joint name=\"joint1\" type=\"revolute\"><parent link=\"a\"/>"
       "<child link=\"b\"/></joint></robot>";
-  auto lane = lite6;
-  lane.initial_joint_positions_rad.resize(1U);
   const auto generated = generate_controller_robot_description(
       ControllerRobotDescriptionRequest{model, {"joint1"}, lane});
   EXPECT_NE(generated.find("<ros2_control name=\"IsaacLite6TopicBasedSystem\" "
@@ -1670,6 +1670,33 @@ TEST(RetainedRos2ControlBackendFactoryTest,
   EXPECT_NE(generated.find("<plugin>topic_based_ros2_control/TopicBasedSystem"
                            "</plugin>"),
             std::string::npos);
+  EXPECT_NE(generated.find("<param name=\"initial_value\">0.375</param>"),
+            std::string::npos);
+
+  core::FakeClock clock;
+  const auto binding = commanded_binding();
+  auto channel = test_projected_channel(
+      binding,
+      RetainedObservedStateChannelConfig{
+          core::ObservedStateSourceKind::kCommandedState, "commanded_state", 0,
+          1U},
+      clock);
+  ASSERT_TRUE(channel->publish_commanded_initialization_and_project(
+                         selected_pose, std::vector<double>{0.0}, 200)
+                  .applied());
+  const auto authoritative = channel->current_state(200);
+  ASSERT_TRUE(authoritative.ok()) << authoritative.error().message;
+  ASSERT_EQ(authoritative.value().positions.size(), 1U);
+  EXPECT_DOUBLE_EQ(
+      std::get<core::AngularPositionDTO>(authoritative.value().positions.front())
+          .value_rad,
+      selected_pose.front());
+
+  const std::vector<double> missing_pose;
+  const auto missing = retained_isaac_controller_lane("lite6", missing_pose);
+  EXPECT_THROW(static_cast<void>(generate_controller_robot_description(
+                   ControllerRobotDescriptionRequest{model, {"joint1"}, missing})),
+               ControllerRobotDescriptionError);
 }
 
 } // namespace
@@ -1760,9 +1787,8 @@ TEST(RetainedRos2ControlBackendFactoryTest,
   const auto isaac = make_retained_isaac_ros2_control_backend_config(
       isaac_runtime_configuration("lite6"), motion, tool);
   ASSERT_TRUE(isaac.arm.measured_joint_state_lane);
-  ASSERT_TRUE(isaac.isaac_guard);
   EXPECT_EQ(isaac.arm.measured_joint_state_lane->absolute_topic,
-            isaac.isaac_guard->joint_states_topic);
+            "/isaac_joint_states");
   EXPECT_EQ(isaac.arm.measured_joint_state_lane->freshness_budget_ns,
             isaac.participant.stop.controller_state_max_age_ns);
   EXPECT_GT(isaac.arm.measured_joint_state_lane->freshness_budget_ns, 0);
@@ -2037,7 +2063,6 @@ TEST(RetainedRos2ControlBackendFactoryTest,
   EXPECT_DOUBLE_EQ(participant.initial_speed_factor, 1.0);
   EXPECT_EQ(config.observed_state_authority_profile_id,
             "manyforge.commanded_simulation");
-  EXPECT_FALSE(config.isaac_guard.has_value());
   ASSERT_TRUE(config.arm.gripper_controller.has_value());
   EXPECT_EQ(*config.arm.gripper_controller,
             (RetainedRos2ControlArmController{

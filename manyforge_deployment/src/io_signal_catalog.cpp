@@ -153,10 +153,14 @@ ResolveRetainedIoSignalCatalog(
                         core::ResourceRoleId>>
         roles;
     std::map<core::InterruptSourceId,
-             std::tuple<core::RuntimeUnitId, std::string,
-                        std::optional<std::string>, std::size_t,
-                        std::optional<std::string>, std::optional<std::string>,
-                        std::optional<core::IoSignalLivenessMode>>>
+             std::tuple<core::RuntimeUnitId,
+                        std::string, std::optional<std::string>, std::size_t,
+                        std::optional<std::string>,
+                        std::optional<std::string>,
+                        std::optional<core::IoSignalLivenessMode>,
+                        std::optional<IoSignalProviderConfiguration::
+                                          GeometricContactEndpoint>,
+                        std::optional<core::SceneResourceId>>>
         sources;
     for (const auto &unit : graph.runtime_units) {
       if (runtime_unit_id && unit.runtime_unit_id != *runtime_unit_id)
@@ -243,7 +247,8 @@ ResolveRetainedIoSignalCatalog(
           const auto owner = std::tuple{
               unit.runtime_unit_id,  address.profile, address.topic,
               address.ingress_depth, address.service, address.channel,
-              descriptor.liveness};
+              descriptor.liveness,  address.endpoint,
+              address.target_scene_resource_id};
           const auto [source, inserted] =
               sources.emplace(descriptor.source_id, owner);
           if ((!inserted && source->second != owner) ||
@@ -331,6 +336,26 @@ ResolveRetainedIoSignalCatalog(
           address.interface_name =
               provider_selector(provider, "interface_name");
           descriptor.liveness = core::IoSignalLivenessMode::kPeriodic;
+        } else if (address.profile == "geometric_contact") {
+          fields(provider,
+                 {"profile", "ingress_depth", "endpoint",
+                  "target_scene_resource_id"});
+          const auto &endpoint = value<Object>(member(provider, "endpoint"));
+          fields(endpoint, {"controllable_component_id", "command_target_id",
+                            "frame_role_id"});
+          address.endpoint =
+              IoSignalProviderConfiguration::GeometricContactEndpoint{
+                  core::ControllableComponentId(provider_selector(
+                      endpoint, "controllable_component_id")),
+                  core::CommandTargetId(
+                      provider_selector(endpoint, "command_target_id")),
+                  core::FrameRoleId(
+                      provider_selector(endpoint, "frame_role_id"))};
+          address.target_scene_resource_id = core::SceneResourceId(
+              provider_selector(provider, "target_scene_resource_id"));
+          if (freshness_mode != "sample_age")
+            throw InvalidConfiguration("io_signal_provider_unsupported");
+          descriptor.liveness = core::IoSignalLivenessMode::kPeriodic;
         } else {
           throw InvalidConfiguration("io_signal_provider_unsupported");
         }
@@ -348,12 +373,18 @@ ResolveRetainedIoSignalCatalog(
              (address.profile != "ros_bool" &&
               descriptor.update_mode != core::IoSignalUpdateMode::kSampled)))
           throw InvalidConfiguration("io_signal_transition_unsupported");
+        if (address.profile == "geometric_contact" &&
+            (descriptor.freshness.mode !=
+                 core::IoFreshnessMode::kSampleAge ||
+             descriptor.update_mode != core::IoSignalUpdateMode::kSampled))
+          throw InvalidConfiguration("io_signal_provider_unsupported");
         if (!core::ComputeIoSignalDescriptorDigest(descriptor).ok())
           throw InvalidConfiguration("io_signal_liveness_freshness_mismatch");
-        const auto owner =
-            std::tuple{unit.runtime_unit_id,  address.profile, address.topic,
-                       address.ingress_depth, address.service, address.channel,
-                       descriptor.liveness};
+        const auto owner = std::tuple{
+            unit.runtime_unit_id,  address.profile, address.topic,
+            address.ingress_depth, address.service, address.channel,
+            descriptor.liveness,  address.endpoint,
+            address.target_scene_resource_id};
         const auto [source, inserted] =
             sources.emplace(descriptor.source_id, owner);
         if ((!inserted && source->second != owner) ||
@@ -399,6 +430,7 @@ core::Result<void> MaterializeRetainedIoProviderDevices(
           const auto &provider = value<Object>(member(row, "provider"));
           const auto profile = text(provider, "profile");
           if (profile != "mock" && profile != "ros_bool" &&
+              profile != "geometric_contact" &&
               profile != "mock_output" && profile != "ros_set_bool" &&
               profile != "ur_io_states" && profile != "ur_set_io" &&
               profile != "ros2_control_gpio")

@@ -157,14 +157,13 @@
             ],
             "stop_mode": "soft_on_path"
           },
-          "maximum_tcp_linear_speed_mps": 0.25
+          "maximum_tcp_linear_speed_mps": 0.5
         }
       }
     }
   ],
   "deployment_artifact_id": "isaac_manipulator_scene_light_ros2_control",
   "description": "Retained Isaac UR10e light-scene pick-and-place deployment using the separately retained ROS 2 control execution product, commanded state authority, and Robotiq bridge profile.",
-  "isaac_world": "isaac_manipulator_scene_light",
   "name": "isaac_manipulator_scene_light_ros2_control",
   "policies": {
     "interrupt_config": {

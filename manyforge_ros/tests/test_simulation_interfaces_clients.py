@@ -119,10 +119,14 @@ def test_control_and_scene_clients_share_the_typed_simulator_owner() -> None:
         assert terminal.state is OwnerTaskState.SUCCEEDED
         program_port.acknowledge(started.task_id, identity)
 
-        snapshot = SimulationSceneMirrorClient(
+        mirror = SimulationSceneMirrorClient(
             client_node,
             service_timeout_s=2.0,
-        ).capture(entity_names=["/World/soup_can"])
+        )
+        try:
+            snapshot = mirror.capture(entity_names=["/World/soup_can"])
+        finally:
+            mirror.close()
         assert snapshot.errors == ()
         assert len(snapshot.entities) == 1
         entity = snapshot.entities[0]

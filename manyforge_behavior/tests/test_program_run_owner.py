@@ -18,7 +18,10 @@ from manyforge_behavior.canonical_artifact import compute_content_identity
 from manyforge_behavior.executable_node_resolver import (
     build_executable_node_resolver,
 )
-from manyforge_behavior.kernel_client import KernelOperationAdmissionRejectedError
+from manyforge_behavior.kernel_client import (
+    KernelClient,
+    KernelOperationAdmissionRejectedError,
+)
 from manyforge_behavior.node_availability import (
     AvailabilityFact,
     NodeExecutionReadiness,
@@ -53,6 +56,7 @@ from manyforge_behavior.program_run_owner import (
     build_applied_program_run_admission,
     build_program_run_admission,
 )
+from manyforge_behavior.production_ports import NativeKernelProgramPort
 from manyforge_behavior.program_runtime import ProgramRunOwnerIdentity
 from manyforge_program_runner.runtime_controls import ProgramRuntimeControls
 
@@ -394,6 +398,7 @@ class _ScopePort:
     def __init__(self, events: list[str]) -> None:
         self._events = events
         self.state = ProgramRunScopeState.SETTLED
+        self.unknown_reason_code = "kernel_scope_unknown"
         self.stop_requests = 0
         self.release_requests = 0
         self.reset_requests = 0
@@ -401,6 +406,7 @@ class _ScopePort:
         self.selection_revision = 0
         self.held = False
         self.ready = False
+        self.selection_release_block_reason: str | None = None
         self.attention_refusal: ProgramSelectionReleaseRejectedError | None = None
         # Kernel stand-in for the per-node resource test: a node is refused
         # only while an alarm gates one of its own target resources.
@@ -442,6 +448,7 @@ class _ScopePort:
                 else []
             ),
             "faulted_node_indices": [],
+            "selection_release_block_reason": self.selection_release_block_reason,
         }
 
     def stop_selection(self, request):
@@ -510,7 +517,7 @@ class _ScopePort:
                 program_run_id,
                 self.state,
                 None,
-                "kernel_scope_unknown",
+                self.unknown_reason_code,
             )
         return ProgramRunScopeSnapshot(program_run_id, self.state, 1)
 
@@ -1162,6 +1169,335 @@ def test_terminal_reset_lost_reply_does_not_reuse_previous_settlement():
     with pytest.raises(ProgramRunOwnerOutcomeUnknownError):
         owner.reset_containment_settled(run_id)
     assert owner.read(run_id) == terminal and task.starts == 1
+
+
+def test_terminal_reset_partial_stop_accepts_only_current_zero_sample():
+    owner, admission, _task, scope, _events = _fixture(
+        initial_task_state=OwnerTaskState.FAILED
+    )
+    run_id = owner.start(admission).capture.program_run_id
+    terminal = owner.advance_once(run_id)
+    assert terminal.state is ProgramRunState.FAILED
+    assert terminal.active_operation_count == 0
+    scope.state = ProgramRunScopeState.UNKNOWN
+    scope.unknown_reason_code = "program_run_stop_partial"
+
+    owner.begin_reset_containment(run_id, stop_request_id="reset.partial")
+    assert (
+        owner._entry(run_id).reset_containment_pre_stop_active_operation_count == 0
+    )
+    assert owner.reset_containment_settled(run_id)
+    owner.begin_reset_containment(run_id, stop_request_id="reset.retry")
+    assert (
+        owner._entry(run_id).reset_containment_pre_stop_active_operation_count == 0
+    )
+    assert owner.reset_containment_settled(run_id)
+    assert scope.stop_requests == 2
+
+
+def test_program_run_owner_and_native_port_reset_partial_stop_with_intervention_operation():
+    class ResetTransport:
+        def __init__(self) -> None:
+            self.owner_epoch = "kernel.epoch.7"
+            self.runner_epoch = "program-runner.epoch.1"
+            self.operations: dict[str, dict[str, Any]] = {}
+            self.resident: dict[str, bool] = {}
+            self.stop_states: dict[str, str] = {}
+            self.stop_generations: dict[str, int] = {}
+            self.controls: list[tuple[str, str]] = []
+            self.released_fences: list[tuple[str, str, int]] = []
+
+        def identity(self):
+            return {
+                "ok": True,
+                "identity": {
+                    "owner_epoch": self.owner_epoch,
+                    "retained_bundle_id": _DIGEST_B,
+                    "graph_revision": _DIGEST_C,
+                    "scene_revision": {
+                        "scene_id": "scene.1",
+                        "revision_id": 1,
+                        "content_hash": _DIGEST_A,
+                    },
+                },
+            }
+
+        def submit(self, body):
+            operation_id = f"operation-{len(self.operations) + 1}"
+            self.operations[operation_id] = {
+                "operation_id": operation_id,
+                "operation_revision": 1,
+                "program_run_id": body["program_run_id"],
+                "state": "queued",
+                "active_stop_generation": None,
+                "participants": [],
+            }
+            self.resident[operation_id] = True
+            return {
+                "ok": True,
+                "accepted": {
+                    "operation_id": operation_id,
+                    "operation_revision": 1,
+                },
+            }
+
+        def read(self, operation_id):
+            return {
+                "ok": True,
+                "operation": deepcopy(self.operations[operation_id]),
+                "resident": self.resident[operation_id],
+                "owner_epoch": self.owner_epoch,
+                "control_pending": False,
+                "last_control": None,
+            }
+
+        def reset(self, operation_id, _body):
+            self.controls.append(("reset", operation_id))
+            self.operations[operation_id]["operation_revision"] += 1
+            self.resident[operation_id] = False
+            return {"ok": True, "accepted": {"operation_id": operation_id}}
+
+        def acknowledge_completed(self, _operation_id, _body):
+            return {"ok": True}
+
+        def stop(self, _body):
+            return {"ok": True}
+
+        def stop_program_run(self, body):
+            stop_id = f"scope-stop-{len(self.stop_states) + 1}"
+            generation = len(self.stop_generations) + 1
+            self.stop_states[stop_id] = "stopping"
+            self.stop_generations[stop_id] = generation
+            return {
+                "ok": True,
+                "accepted": {
+                    "request_id": body["request_context"]["request_id"],
+                    "stop_id": stop_id,
+                    "stop_generation": generation,
+                    "replay_status": "accepted_new",
+                },
+                "owner_epoch": self.owner_epoch,
+            }
+
+        def stop_status(self, stop_id):
+            return {
+                "ok": True,
+                "stop_status": {
+                    "stop_id": stop_id,
+                    "state": self.stop_states[stop_id],
+                    "stop_generation": self.stop_generations[stop_id],
+                },
+            }
+
+        def stop_fault(self):
+            return {
+                "ok": True,
+                "command": "get_stop_fault",
+                "stop_fault": None,
+            }
+
+        def read_program_execution_scope(self, program_run_id):
+            return {
+                "ok": True,
+                "scope": {
+                    "schema_version": "manyforge.program_execution_scope.v2",
+                    "program_run_id": program_run_id,
+                    "request_owner_epoch": self.owner_epoch,
+                    "program_runner_owner_epoch": self.runner_epoch,
+                    "claim_generation": 1,
+                    "selection_revision": 0,
+                    "held_node_indices": [],
+                    "ready_node_indices": [],
+                    "stopping_node_indices": [],
+                    "faulted_node_indices": [],
+                },
+            }
+
+        def release_program_run_stop_fence(self, program_run_id, stop_id, generation):
+            self.released_fences.append((program_run_id, stop_id, generation))
+            return {"ok": True}
+
+    transport = ResetTransport()
+    native = NativeKernelProgramPort(KernelClient(transport))
+    fixture_owner, admission, _task, _scope, _events = _fixture(
+        initial_task_state=OwnerTaskState.FAILED
+    )
+    binding = deepcopy(dict(admission.program_binding))
+    binding["target_role_bindings"] = [
+        {
+            "target_role_id": "arm",
+            "component_role_id": "robot",
+            "controllable_component_id": "robot.1",
+            "command_target_id": "arm.command",
+            "capability_bindings": [
+                {"capability_id": "execution.trajectory.execute", "command_schema": None},
+                {"capability_id": "model.kinematics.fk", "command_schema": None},
+                {"capability_id": "state.observed.current", "command_schema": None},
+            ],
+        }
+    ]
+    admission = replace(
+        admission,
+        program_binding=binding,
+        owner_identities=(
+            ProgramRunOwnerIdentity(
+                owner_role="kernel_operations",
+                owner_id="kernel.cell-a",
+                owner_epoch=transport.owner_epoch,
+            ),
+        ),
+    )
+    owner = ProgramRunOwner(
+        owner_id="program-runner.cell-a",
+        owner_epoch=transport.runner_epoch,
+        ports=replace(
+            fixture_owner._ports,
+            program_run_scope=native.scope,
+            program_run_context=native,
+        ),
+        run_id_factory=lambda: "program-run.1",
+    )
+
+    run_id = owner.start(admission).capture.program_run_id
+    native_task = native.operations.start(
+        "motion.move_to_pose",
+        NodeAttemptIdentity(run_id, "held-motion", "attempt.1"),
+        OwnerNodeInputs(
+            {
+                "target_role": "arm",
+                "base_frame_role": "base",
+                "tcp_endpoint": {"target_role": "arm", "frame_role": "tcp"},
+                "goal": {
+                    "position_m": [0.0, 0.0, 0.1],
+                    "orientation": {"rpy_deg": [180.0, 0.0, 0.0]},
+                },
+                "target_mode": "relative",
+                "target_reference": {
+                    "type": "scene_resource",
+                    "scene_resource_id": "graspable",
+                },
+                "offset_reference": {"type": "frame_role", "frame_role_id": "base"},
+                "planning_profile": "balanced",
+                "velocity_scale": 0.4,
+                "acceleration_scale": 0.4,
+                "max_tcp_linear_speed_mps": None,
+                "per_joint_dynamics_limits": {},
+                "joint_position_tol_rad": 0.05,
+                "translation_tol_m": 0.005,
+                "rotation_tol_rad": 0.05,
+                "planning_timeout_s": 2.0,
+                "execution_timeout_s": 10.0,
+                "cache_mode": "default",
+                "contact_policy_id": None,
+            }
+        ),
+    )
+    operation_id = native_task.metadata["operation_id"]
+    transport.operations[operation_id]["state"] = "intervention_required"
+    assert native.operations.observe(native_task.task_id).state is OwnerTaskState.FAILED
+
+    terminal = owner.advance_once(run_id)
+    assert terminal.state is ProgramRunState.FAILED
+    assert terminal.active_operation_count == 0
+
+    owner.begin_reset_containment(run_id, stop_request_id="reset.partial")
+    transport.stop_states["scope-stop-1"] = "partial"
+    owner._observe_reset_containment(run_id)
+    assert owner._entry(run_id).reset_containment.reason_code == "program_run_stop_partial"
+    assert owner.reset_containment_settled(run_id)
+
+    reset = owner.reset_effects(run_id)
+    assert reset.state is ProgramRunState.FAILED
+    assert transport.operations[operation_id]["state"] == "intervention_required"
+    assert transport.resident[operation_id] is False
+    assert transport.controls == [("reset", operation_id)]
+    assert native.scope.capture_stop(run_id) is None
+    assert transport.released_fences == []
+    owner.forget_reset_run(run_id)
+
+
+@pytest.mark.parametrize("pre_stop_count", [None, 1])
+def test_terminal_reset_partial_stop_rejects_missing_or_nonzero_sample(pre_stop_count):
+    owner, admission, _task, scope, _events = _fixture(
+        initial_task_state=OwnerTaskState.SUCCEEDED
+    )
+    run_id = owner.start(admission).capture.program_run_id
+    terminal = owner.advance_once(run_id)
+    assert terminal.state is ProgramRunState.SUCCEEDED
+    assert terminal.active_operation_count == 0
+    with owner._lock:
+        owner._entry(run_id).terminal_settlement_active_operation_count = pre_stop_count
+    scope.state = ProgramRunScopeState.UNKNOWN
+    scope.unknown_reason_code = "program_run_stop_partial"
+
+    owner.begin_reset_containment(run_id, stop_request_id="reset.partial")
+    with pytest.raises(ProgramRunOwnerOutcomeUnknownError):
+        owner.reset_containment_settled(run_id)
+
+
+@pytest.mark.parametrize(
+    ("scope_state", "reason_code"),
+    [
+        (ProgramRunScopeState.ACTIVE, None),
+        (ProgramRunScopeState.UNKNOWN, "program_run_stop_failed"),
+        (ProgramRunScopeState.UNKNOWN, "program_run_stop_uncontained"),
+        (ProgramRunScopeState.UNKNOWN, "program_run_stop_generation_mismatch"),
+    ],
+)
+def test_terminal_reset_does_not_treat_pending_or_other_unknown_as_partial(
+    scope_state, reason_code
+):
+    owner, admission, _task, scope, _events = _fixture(
+        initial_task_state=OwnerTaskState.SUCCEEDED
+    )
+    run_id = owner.start(admission).capture.program_run_id
+    owner.advance_once(run_id)
+    scope.state = scope_state
+    if reason_code is not None:
+        scope.unknown_reason_code = reason_code
+
+    owner.begin_reset_containment(run_id, stop_request_id="reset.unproven")
+    if scope_state is ProgramRunScopeState.ACTIVE:
+        assert owner.reset_containment_pending(run_id)
+        assert not owner.reset_containment_settled(run_id)
+    else:
+        with pytest.raises(ProgramRunOwnerOutcomeUnknownError):
+            owner.reset_containment_settled(run_id)
+
+
+def test_terminal_reset_partial_lost_reply_cannot_reuse_partial_proof():
+    owner, admission, _task, scope, _events = _fixture(
+        initial_task_state=OwnerTaskState.FAILED
+    )
+    run_id = owner.start(admission).capture.program_run_id
+    owner.advance_once(run_id)
+    scope.state = ProgramRunScopeState.UNKNOWN
+    scope.unknown_reason_code = "program_run_stop_partial"
+    owner.begin_reset_containment(run_id, stop_request_id="reset.partial")
+    assert owner.reset_containment_settled(run_id)
+
+    def lost_reply(*_args, **_kwargs):
+        raise RuntimeError("response lost")
+
+    scope.request_stop = lost_reply
+    with pytest.raises(ProgramRunOwnerOutcomeUnknownError):
+        owner.begin_reset_containment(run_id, stop_request_id="reset.retry")
+    with pytest.raises(ProgramRunOwnerOutcomeUnknownError):
+        owner.reset_containment_settled(run_id)
+
+
+def test_reset_containment_does_not_change_a_running_program():
+    owner, admission, _task, scope, _events = _fixture(
+        initial_task_state=OwnerTaskState.ACTIVE
+    )
+    started = owner.start(admission)
+
+    with pytest.raises(ProgramRunOwnerError, match="requires a terminal Run"):
+        owner.begin_reset_containment(
+            started.capture.program_run_id, stop_request_id="reset.running"
+        )
+
+    assert scope.stop_requests == 0
 
 
 def test_terminal_reset_waiter_uses_worker_notifications():
@@ -2353,6 +2689,163 @@ def test_initial_motion_run_releases_ready_scope_without_recovery():
     assert running["stop_allowed"]
 
 
+@pytest.mark.parametrize(
+    "blocker",
+    [
+        "cell_motion_admission_closed",
+        "cell_motion_admission_unreconciled",
+        "program_run_admission_pending",
+        "program_halt_active",
+    ],
+)
+def test_selection_controls_project_current_kernel_release_blocker_without_releasing(blocker):
+    owner, admission, _task, scope, events = _fixture(
+        initial_task_state=OwnerTaskState.SUCCEEDED
+    )
+    scope.ready = True
+    started = owner.start(admission)
+    run_id = started.capture.program_run_id
+    selection_revision = scope.selection_revision
+    initially_available = owner.execution_selection_controls(run_id)["groups"][0]
+    assert initially_available["start_allowed"] is True
+    assert initially_available["resume_allowed"] is True
+    scope.selection_release_block_reason = blocker
+
+    group = owner.execution_selection_controls(run_id)["groups"][0]
+
+    assert group["state"] == "ready"
+    assert group["start_allowed"] is False
+    assert group["resume_allowed"] is False
+    assert group["start_unavailable_reason"] == blocker
+    assert group["resume_unavailable_reason"] == blocker
+    assert group["stop_allowed"] is False
+    assert scope.selection_revision == selection_revision
+    assert scope.release_requests == 0
+    assert "scope_stop_release" not in events
+
+    # Admission can clear independently of selection revision. The existing
+    # owner projection must observe that change instead of caching the refusal.
+    scope.selection_release_block_reason = None
+    recovered = owner.execution_selection_controls(run_id)["groups"][0]
+    assert recovered["state"] == "ready"
+    assert recovered["start_allowed"] is True
+    assert recovered["resume_allowed"] is True
+    assert scope.selection_revision == selection_revision
+    assert scope.release_requests == 0
+    assert "scope_stop_release" not in events
+
+
+@pytest.mark.parametrize("blocker", ["unknown_release_blocker", 1, False, {}])
+def test_selection_controls_fail_closed_on_malformed_kernel_release_blocker(blocker):
+    owner, admission, _task, scope, _events = _fixture(
+        initial_task_state=OwnerTaskState.SUCCEEDED
+    )
+    scope.ready = True
+    started = owner.start(admission)
+    run_id = started.capture.program_run_id
+    baseline_snapshot, baseline = owner.read_selection_controls(run_id)
+    baseline_group = baseline["groups"][0]
+    revision = scope.selection_revision
+    scope.selection_release_block_reason = blocker
+
+    snapshot, controls = owner.read_selection_controls(run_id)
+    group = controls["groups"][0]
+
+    assert snapshot == baseline_snapshot
+    assert group["state"] == baseline_group["state"] == "ready"
+    assert group["start_allowed"] is False
+    assert group["resume_allowed"] is False
+    assert group["start_unavailable_reason"] == "program_selection_observation_unavailable"
+    assert group["resume_unavailable_reason"] == "program_selection_observation_unavailable"
+    assert group["stop_allowed"] == baseline_group["stop_allowed"]
+    assert controls["motion_held"] == baseline["motion_held"]
+    assert scope.selection_revision == revision
+    assert scope.release_requests == 0
+
+
+def test_unreadable_advisory_scope_blocks_release_only_for_retained_projection():
+    owner, admission, _task, scope, _events = _fixture(
+        initial_task_state=OwnerTaskState.SUCCEEDED
+    )
+    scope.ready = True
+    run_id = owner.start(admission).capture.program_run_id
+    baseline_snapshot, baseline = owner.read_selection_controls(run_id)
+    baseline_group = baseline["groups"][0]
+    assert baseline_group["state"] == "ready"
+    assert baseline_group["start_allowed"] is True
+    assert baseline["motion_held"] is True
+
+    def unreadable(_program_run_id):
+        raise RuntimeError("temporary Kernel scope read failure")
+
+    scope.execution_scope = unreadable
+    snapshot, controls = owner.read_selection_controls(run_id)
+    group = controls["groups"][0]
+
+    assert snapshot == baseline_snapshot
+    assert group["state"] == baseline_group["state"] == "ready"
+    assert group["stop_allowed"] == baseline_group["stop_allowed"]
+    assert group["start_allowed"] is False
+    assert group["resume_allowed"] is False
+    assert group["start_unavailable_reason"] == "program_selection_observation_unavailable"
+    assert group["resume_unavailable_reason"] == "program_selection_observation_unavailable"
+    assert controls["motion_held"] is True
+    assert scope.release_requests == 0
+
+
+def test_selection_scope_ipc_does_not_hold_program_transition_lock():
+    owner, admission, _task, scope, _events = _fixture(
+        initial_task_state=OwnerTaskState.ACTIVE
+    )
+    run_id = owner.start(admission).capture.program_run_id
+    transition_lock = owner._runs[run_id].transition_lock
+    read_scope = scope.execution_scope
+    entered, release = Event(), Event()
+
+    def blocked_scope_read(program_run_id):
+        entered.set()
+        if not release.wait(timeout=2):
+            raise RuntimeError("test scope read was not released")
+        return read_scope(program_run_id)
+
+    scope.execution_scope = blocked_scope_read
+    results = []
+    thread = Thread(
+        target=lambda: results.append(owner.read_selection_controls(run_id))
+    )
+    thread.start()
+    acquired = False
+    try:
+        assert entered.wait(timeout=1)
+        acquired = transition_lock.acquire(timeout=0.1)
+        if acquired:
+            transition_lock.release()
+    finally:
+        release.set()
+        thread.join(timeout=2)
+
+    assert not thread.is_alive()
+    assert acquired
+    assert len(results) == 1
+
+
+def test_selection_release_blocker_does_not_disable_stop_for_running_group():
+    owner, admission, _task, scope, _events = _fixture(
+        initial_task_state=OwnerTaskState.ACTIVE
+    )
+    run_id = owner.start(admission).capture.program_run_id
+    scope.selection_release_block_reason = "cell_motion_admission_closed"
+
+    group = owner.execution_selection_controls(run_id)["groups"][0]
+
+    assert group["state"] == "running"
+    assert group["start_allowed"] is False
+    assert group["resume_allowed"] is False
+    assert group["start_unavailable_reason"] == "selection_not_held"
+    assert group["stop_allowed"] is True
+    assert scope.release_requests == 0
+
+
 def test_motion_held_counts_only_effectful_nodes_and_settled_holds():
     """The owner fact a held-run Draft edit relies on: every effectful node is
     held by the Kernel (never released, or stopped and certified), whatever
@@ -2777,15 +3270,19 @@ def test_pending_selection_read_failure_does_not_fail_the_tree_or_poll_after_set
 
     scope.execution_scope = observe
     assert owner.advance_once(run_id).state is ProgramRunState.RUNNING
+    assert reads == 1
     assert (
         owner.execution_selection_controls(run_id)["groups"][0]["state"]
         == "unavailable"
     )
+    assert reads == 2  # The explicit controls read refreshes advisory eligibility.
     scope.state = ProgramRunScopeState.SETTLED
     settled = owner.advance_once(run_id)
+    assert reads == 3
     assert owner.execution_selection_controls(run_id)["groups"][0]["state"] == "held"
+    assert reads == 4
     assert owner.advance_once(run_id).run_revision == settled.run_revision
-    assert reads == 2 and scope.stop_requests == 1 and task.starts == 0
+    assert reads == 4 and scope.stop_requests == 1 and task.starts == 0
     assert "leaf_cancel" not in events
 
 

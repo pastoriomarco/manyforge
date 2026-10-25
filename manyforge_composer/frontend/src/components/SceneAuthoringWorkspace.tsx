@@ -2579,12 +2579,6 @@ export function SceneAuthoringWorkspace({
 
   const liveObjectPanel = objects.length === 0 ? undefined : (
     <div ref={ownerObjectPanel} className="viewer-object-owner-editor dpanel">
-      {!factsResult.available && (
-        <div className="panel-state error-state" role="alert">
-          <strong>Current scene is unavailable</strong>
-          <span>{factsResult.reason}</span>
-        </div>
-      )}
       {facts !== null && (
         <>
           <section className="dcard">
@@ -2792,6 +2786,13 @@ export function SceneAuthoringWorkspace({
           </label>
         </header>
 
+        {!factsResult.available && (
+          <div className="panel-state error-state" data-testid="scene-owner-facts-error" role="alert">
+            <strong>Current scene is unavailable</strong>
+            <span>{factsResult.reason}</span>
+          </div>
+        )}
+
         {activeSceneTool === 'sources' && sourceModel.status === 'error' && (
           <div className="panel-state error-state" role="alert">
             <strong>Source-model projection unavailable</strong>
@@ -2892,12 +2893,12 @@ export function SceneAuthoringWorkspace({
 
         {activeSceneTool === 'current' && (
           <div data-testid="current-scene-editor">
-            {liveObjectPanel ?? (
+            {liveObjectPanel ?? (factsResult.available ? (
               <div className="panel-state">
                 <strong>No current scene objects</strong>
                 <span>The logical-scene owner reports an empty object inventory.</span>
               </div>
-            )}
+            ) : null)}
           </div>
         )}
       </section>

@@ -25,7 +25,6 @@ struct ActivationDeploymentIntent final {
   std::string name;
   std::optional<std::string> description;
   std::optional<std::string> assistant_profile_id;
-  std::optional<std::string> isaac_world;
   CanonicalValue attachments;
   CanonicalValue policies;
   std::optional<CanonicalValue> compatibility;

@@ -1014,7 +1014,7 @@ TEST(ClosedSchema, IoComponentWrapperUsesSharedRowsAndMaterializesDeviceLimit) {
       core::SchemaId("manyforge.value_schema.runtime.io_provider_execution.v1"),
       core::SchemaRevision(
           "sha256:"
-          "c6518470d89236c3b91dfd88b77203ed30d3c6476f3358b2ec9f2514cd19f0a5"));
+          "94036272387dd8c604e9b2f54485fb87fb3ed904e1364024e10e526b37dd0776"));
   ASSERT_NE(schema, nullptr);
   const auto source = parse_strict_json_model_yaml(R"({
     "io_signals":[
@@ -1069,7 +1069,7 @@ TEST(ClosedSchema, IoComponentWrapperRefusesEmptySignalsMultipleDevicesAndMotion
       core::SchemaId("manyforge.value_schema.runtime.io_provider_execution.v1"),
       core::SchemaRevision(
           "sha256:"
-          "c6518470d89236c3b91dfd88b77203ed30d3c6476f3358b2ec9f2514cd19f0a5"));
+          "94036272387dd8c604e9b2f54485fb87fb3ed904e1364024e10e526b37dd0776"));
   ASSERT_NE(schema, nullptr);
   const std::string signal = R"({"controllable_component_id":"device.io",
     "command_target_id":"gpio","resource_role_id":"lamp","signal_name":"lamp",
@@ -1396,7 +1396,7 @@ TEST(ClosedSchema, EveryPackagedYamlResourcePassesStrictUniqueKeyIngress) {
         << relative_path;
     ++parsed_count;
   }
-  EXPECT_EQ(parsed_count, 19U);
+  EXPECT_EQ(parsed_count, 20U);
 }
 
 TEST(ClosedSchema,

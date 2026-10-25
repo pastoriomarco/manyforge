@@ -426,7 +426,7 @@ def _validate_component_readiness(
             or (measured["required"] is True and type(measured["available"]) is bool
                 and (measured["error"] is None) == measured["available"]))
         if readiness["ready"]:
-            require(readiness["error"] is None and measured["error"] is None
+            require(readiness["error"] is None
                 and all(row["health"] is not None and row["error"] is None for row in rows)
                 and (intent is not None or state == "active"))
     except (KeyError, TypeError, ValueError, UnicodeError) as exc:

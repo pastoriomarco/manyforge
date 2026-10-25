@@ -1750,7 +1750,6 @@ TEST(RetainedBundleMaterializer,
   EXPECT_EQ(configuration.controller_profiles.front().mock_profile,
             std::optional<std::string>("lite6_lite_gripper"));
   EXPECT_FALSE(configuration.controller_profiles.front().isaac_profile.has_value());
-  EXPECT_FALSE(configuration.isaac_world.has_value());
 }
 
 TEST(RetainedBundleMaterializer, ScalarPeerShapesRetainExactIndependentOwners) {
@@ -1802,7 +1801,6 @@ TEST(RetainedBundleMaterializer, ScalarPeerShapesRetainExactIndependentOwners) {
     ASSERT_EQ(configuration.gripper_target_configurations.size(), 2U);
     EXPECT_EQ(configuration.initial_joint_positions_rad.size(), arm_root ? 6U : 0U);
     EXPECT_EQ(configuration.motion_target_limits.size(), arm_root ? 1U : 0U);
-    EXPECT_FALSE(configuration.isaac_world.has_value());
     std::set<core::ControllableComponentId> profiled;
     std::set<std::string> namespaces;
     for (const auto &profile : configuration.controller_profiles) {
@@ -2802,7 +2800,7 @@ TEST(RetainedBundleMaterializer,
   const auto fixture = test::make_lite6_controllable_retention_fixture(
       false, true, 1U, false, true, {}, false, false, "resource", false,
       {}, {}, true, false, false, std::nullopt, false,
-      test::kLite6ArmTargetId, std::nullopt, std::nullopt, {}, {}, true,
+      test::kLite6ArmTargetId, std::nullopt, std::nullopt, {}, true,
       {}, "manyforge.provider.ros2_control", false, true);
   const test::Lite6ControllableCompilerInputArtifactSource input_source(
       fixture);
@@ -2892,7 +2890,7 @@ TEST(RetainedBundleMaterializer,
       false, true, 1U, true, true, "i6_lite6_arm_gripper_aggregate_cell",
       true, true, "resource", true, {}, {}, true, false, false,
       std::nullopt, false, test::kLite6ArmTargetId, std::nullopt,
-      std::nullopt, {}, {}, true, {}, "manyforge.provider.ros2_control",
+      std::nullopt, {}, true, {}, "manyforge.provider.ros2_control",
       false, true);
   const test::Lite6ControllableCompilerInputArtifactSource input_source(
       fixture);

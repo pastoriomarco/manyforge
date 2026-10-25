@@ -36,6 +36,7 @@ from manyforge_composer.backend.state import (
     _controllable_composition_change_kinds,
 )
 from manyforge_composer.backend.app import create_app
+from manyforge_headless_api.client import HeadlessClientError
 
 
 _DIGEST = "sha256:" + "1" * 64
@@ -2216,6 +2217,54 @@ def test_manager_apply_rejection_keeps_manager_code_and_message() -> None:
     with pytest.raises(AuthoringOperationError) as bare:
         state.apply_manager_deployment_candidate({"manager_apply": {"request_id": "r.2"}})
     assert str(bare.value) == "Manager rejected the exact Deployment candidate"
+
+
+def test_only_typed_preacceptance_rejection_becomes_definite_manager_refusal() -> None:
+    state = ComposerState()
+
+    class Headless:
+        effect: str | None = "none"
+
+        def manager_apply(self, _body):
+            message = "named Isaac world requires --isaac-site-settings"
+            details = {"effect": self.effect} if self.effect is not None else {}
+            raise HeadlessClientError(
+                "apply_rejected",
+                message,
+                status_code=400,
+                details=details,
+                response={
+                    "api_version": "manyforge.manager_command_response.v1",
+                    "ok": False,
+                    "error": {
+                        "code": "apply_rejected",
+                        "message": message,
+                        "details": details,
+                    },
+                },
+            )
+
+    headless = Headless()
+    state.headless_client = headless  # type: ignore[assignment]
+    with pytest.raises(AuthoringOperationError) as rejected:
+        state.apply_manager_deployment_candidate(
+            {"manager_apply": {"request_id": "isaac-load.1"}}
+        )
+    assert rejected.value.code == "manager_apply_rejected"
+    assert str(rejected.value) == (
+        "Manager rejected the exact Deployment candidate: "
+        "apply_rejected: "
+        "named Isaac world requires --isaac-site-settings"
+    )
+
+    # The generic Manager catch also covers failures during or after durable
+    # acceptance. Its identical-looking text is not no-effect evidence.
+    headless.effect = None
+    with pytest.raises(HeadlessClientError) as unknown:
+        state.apply_manager_deployment_candidate(
+            {"manager_apply": {"request_id": "isaac-load.2"}}
+        )
+    assert unknown.value.code == "apply_rejected"
 
 
 def test_focused_motion_target_limit_updates_one_exact_target_atomically(

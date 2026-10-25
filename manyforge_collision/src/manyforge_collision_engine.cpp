@@ -1592,6 +1592,13 @@ ManyForgeCollisionEngine::internal_last_query_mechanism_counters() const {
   return last_query_mechanism_counters_;
 }
 
+bool ManyForgeCollisionEngine::runtime_query_covers_full_configuration() const {
+  std::lock_guard<std::mutex> lock(scene_mutex_);
+  return runtime_query_prepared_ &&
+         static_cast<Eigen::Index>(runtime_joint_q_indices_.size()) ==
+             shared_model_->model.nq;
+}
+
 core::RuntimeCollisionQueryPrepareStatus
 ManyForgeCollisionEngine::prepare_runtime_query(
     std::span<const std::string> canonical_joint_names) noexcept {

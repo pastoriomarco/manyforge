@@ -95,6 +95,12 @@ public:
                            std::span<const core::RuntimeParticipantBinding>
                                current_representatives) const;
 
+  /// Apply the exact collision-body projection already derived from this
+  /// retained model map. Independent observation adapters use this instead of
+  /// reconstructing the semantic-to-physical alias authority.
+  [[nodiscard]] core::Result<core::RuntimeParticipantBinding>
+  BindCollisionBodyAliases(core::RuntimeParticipantBinding binding) const;
+
   [[nodiscard]] bool FrameObservationCovered(
       const core::ProgramFrameRoleBindingDTO &frame,
       const core::RuntimeParticipantBinding &observed_binding) const;

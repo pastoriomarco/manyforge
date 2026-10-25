@@ -490,9 +490,6 @@ struct ComponentProjection final {
          member(configuration, *selector, "runtime configuration")},
     });
   }
-  if (configuration.find_object_member("isaac_world") != nullptr) {
-    fail("isaac_world must be authored once at the Deployment cell level");
-  }
   const auto arm_resource_count =
       array(resource_bindings(component.component_id, "arm", profile),
             "arm resource bindings")
@@ -851,7 +848,7 @@ CanonicalValue compile_activation_deployment(
     }
     auto authored = ros2_control_execution_runtime_contract::empty_host_deployment(
         runtime_cell_id, catalog_value(runtime_ref), intent.deployment_artifact_id,
-        intent.name, intent.isaac_world).as_object();
+        intent.name).as_object();
     authored.emplace_back("compatibility", CanonicalValue(Object{
         {"lane", CanonicalValue("manyforge-only")},
         {"provides", CanonicalValue(Array{})},
@@ -945,7 +942,6 @@ CanonicalValue compile_activation_deployment(
   }
 
   Array controller_profiles;
-  bool uses_isaac = false;
   for (const auto &projection : projections) {
     const auto *rows = projection.runtime_configuration.find_object_member(
         "controller_profiles");
@@ -954,15 +950,6 @@ CanonicalValue compile_activation_deployment(
     controller_profiles.insert(controller_profiles.end(),
                                rows->as_array().begin(),
                                rows->as_array().end());
-    uses_isaac =
-        uses_isaac ||
-        std::any_of(rows->as_array().begin(), rows->as_array().end(),
-                    [](const auto &row) {
-                      return row.find_object_member("isaac_profile") != nullptr;
-                    });
-  }
-  if (uses_isaac && !intent.isaac_world.has_value()) {
-    fail("isaac_world is required when a component uses an Isaac profile");
   }
   require_no_exclusive_ros_controller_topic_collision(controller_profiles);
 
@@ -1034,11 +1021,6 @@ CanonicalValue compile_activation_deployment(
       runtime_configuration = object_with(runtime_configuration, std::string(name),
                                           CanonicalValue(std::move(combined)));
     }
-  }
-
-  if (ros2_control && intent.isaac_world.has_value()) {
-    runtime_configuration = object_with(runtime_configuration, "isaac_world",
-                                        CanonicalValue(*intent.isaac_world));
   }
 
   Array models;

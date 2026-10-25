@@ -446,7 +446,15 @@ struct RetainedNativeRuntime final
   core::PerJointDynamicsLimitsDTO direct_control_joint_limits;
 
   std::shared_ptr<core::ICollisionWorldSnapshotPublisher> collision_publisher;
+  collision::ManyForgeCollisionEngine::SharedModelPtr collision_shared_model;
+  collision::ManyForgeCollisionEngine::SharedSceneCachePtr
+      geometric_contact_scene_cache;
   std::shared_ptr<core::ICollisionQueryEngine> runtime_collision_engine;
+  /// Retained endpoint-runtime query policy reused by independent geometric
+  /// input adapters; it is construction policy, not a second timing owner.
+  core::Duration collision_monitor_period_ns{};
+  core::Duration runtime_collision_immediate_query_budget_ns{};
+  std::optional<core::Duration> runtime_dynamic_body_max_age_cap_ns{};
   std::vector<std::shared_ptr<core::ICollisionQueryEngine>>
       validation_collision_engines;
   std::vector<std::shared_ptr<core::ICollisionQueryEngine>>

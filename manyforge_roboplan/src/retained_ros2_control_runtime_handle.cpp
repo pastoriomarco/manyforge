@@ -2153,6 +2153,7 @@ RetainedRos2ControlRuntimeHandle::lifecycle_primitive_dispatcher() {
     const auto self = weak.lock();
     if (self) {
       bool gripper_domain = false;
+      bool command_bridge_domain = false;
       {
         std::lock_guard lock(self->mutex_);
         gripper_domain = ((self->arm_ && self->arm_->transport.gripper_controller) ||
@@ -2161,6 +2162,9 @@ RetainedRos2ControlRuntimeHandle::lifecycle_primitive_dispatcher() {
                            self->gripper_->gripper_actuation_kind(*self->gripper_id_) == core::GripperActuationKind::kPneumatic &&
                            self->gripper_->gripper_output_mode(*self->gripper_id_) == core::GripperOutputMode::kNone)) &&
                          self->gripper_domain_id_ == domain;
+        command_bridge_domain = self->gripper_ && self->gripper_id_ &&
+                                !gripper_domain &&
+                                self->gripper_domain_id_ == domain;
       }
       if (gripper_domain) {
         if (primitive.value() == "ros2_control.controller.prepare")
@@ -2174,6 +2178,44 @@ RetainedRos2ControlRuntimeHandle::lifecycle_primitive_dispatcher() {
         return primitive_outcome(
             not_sent("ros2_control_lifecycle_primitive_unknown",
                      "the gripper has no such controller primitive"));
+      }
+      if (command_bridge_domain) {
+        const auto bridge_result = [&]()
+            -> ros2_control_execution::Ros2GripperLifecycleResult {
+          if (primitive.value() == "ros2_control.controller.prepare")
+            return self->gripper_->prepare_lifecycle_gripper(*self->gripper_id_);
+          if (primitive.value() == "ros2_control.controller.activate") {
+            auto prepared =
+                self->gripper_->prepare_lifecycle_gripper(*self->gripper_id_);
+            if (!prepared.succeeded) return prepared;
+            return self->gripper_->authorize_lifecycle_gripper(
+                *self->gripper_id_);
+          }
+          if (primitive.value() == "ros2_control.controller.deactivate")
+            return self->gripper_->disable_lifecycle_gripper(
+                *self->gripper_id_, cancellation);
+          return ros2_control_execution::Ros2GripperLifecycleResult{
+              false, false, core::ErrorDTO{
+              "ros2_control_lifecycle_primitive_unknown",
+              "the gripper bridge has no such lifecycle primitive", {}}};
+        }();
+        if (!bridge_result.succeeded)
+          return primitive_outcome(RetainedRos2ControlSwitchResult{
+              bridge_result.effect_started
+                  ? RetainedRos2ControlSwitchOutcome::kUncertain
+                  : RetainedRos2ControlSwitchOutcome::kNotSent,
+              bridge_result.error});
+        {
+          std::lock_guard lock(self->mutex_);
+          self->gripper_requested_ =
+              primitive.value() == "ros2_control.controller.activate"
+                  ? core::ComponentLifecycleStateDTO::kActive
+              : primitive.value() == "ros2_control.controller.deactivate"
+                  ? core::ComponentLifecycleStateDTO::kDisabled
+                  : core::ComponentLifecycleStateDTO::kPrepared;
+        }
+        return primitive_outcome(RetainedRos2ControlSwitchResult{
+            RetainedRos2ControlSwitchOutcome::kSucceeded, std::nullopt});
       }
     }
     if (!self || self->motion_domain() != domain) {
@@ -2450,6 +2492,21 @@ RetainedRos2ControlRuntimeHandle::ComputeLifecycleHealth(
         state = gripper_requested;
       ready = owner_ready && state == State::kActive;
       signature += ":logical:" + std::string(core::to_string(gripper_requested));
+    } else if (!cm_gripper) {
+      // The action bridge has no controller-manager primitive. Its lifecycle
+      // owns command admission while transport readiness remains observed.
+      state = owner_ready ? gripper_requested
+                          : (fault_present ? State::kFaulted
+                                           : State::kDegraded);
+      ready = owner_ready && state == State::kActive;
+      if (inputs.gripper && gripper_id &&
+          inputs.gripper->lifecycle_disable_pending(*gripper_id)) {
+        state = State::kDegraded;
+        ready = false;
+        cause = Cause::kUnknown;
+      }
+      signature += ":bridge:" +
+                   std::string(core::to_string(gripper_requested));
     }
     if (cm_gripper) {
       transport_ready = gripper_activity.controller_manager_present &&
@@ -2528,7 +2585,11 @@ RetainedRos2ControlRuntimeHandle::ReadLifecycleHealth(
                       classification.transport_ready, reported),
       std::move(classification.diagnostic)};
   if (inputs.is_gripper && inputs.gripper_id)
-    result.has_activation_step = inputs.cm_gripper;
+    result.has_activation_step =
+        inputs.cm_gripper ||
+        (inputs.gripper_snapshot &&
+         inputs.gripper_snapshot->transport_kind == "ros_gripper_command" &&
+         inputs.gripper_snapshot->output_mode != core::GripperOutputMode::kNone);
   if (!result.locally_valid())
     return reject<core::LifecycleDomainHealthDTO>(
         "ros2_control_lifecycle_health_invalid",
@@ -2541,7 +2602,12 @@ RetainedRos2ControlRuntimeHandle::ReadLifecycleSnapshot(
     const core::ControlDomainId &domain, const core::TimePoint now_ns) {
   // Lifecycle Observe is already an NRT observation checkpoint. Refresh
   // endpoint facts here, while leaving its state/Disable/Recover semantics
-  // unchanged. Prepare/Enable Initialize consumes the separate pure health.
+  // unchanged. A newly established publisher identity deliberately needs a
+  // following stable capture; perform that bounded capture at this same NRT
+  // checkpoint so Prepare/Enable's immediately following pure-health read
+  // does not expose an intermediate cache state. Either capture still fails
+  // closed on missing, conflicting, or concurrently changing endpoints.
+  RefreshEndpointFacts();
   RefreshEndpointFacts();
   auto captured = CaptureLifecycleHealthInputs(domain, now_ns);
   if (!captured.ok())

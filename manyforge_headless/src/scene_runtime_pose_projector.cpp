@@ -298,6 +298,25 @@ ToString(const SceneRuntimePoseApplicationStatus status) noexcept {
   return {};
 }
 
+bool SceneRuntimePoseApplicationRetainsPlanningEvidence(
+    const SceneRuntimePoseApplicationStatus status,
+    const std::uint64_t retained_provider_source_sequence,
+    const std::uint64_t observation_source_sequence) noexcept {
+  switch (status) {
+  case SceneRuntimePoseApplicationStatus::kCommitted:
+  case SceneRuntimePoseApplicationStatus::kAlreadyApplied:
+    return retained_provider_source_sequence == observation_source_sequence;
+  case SceneRuntimePoseApplicationStatus::kFreshnessConfirmed:
+    return retained_provider_source_sequence < observation_source_sequence;
+  case SceneRuntimePoseApplicationStatus::kNotRequested:
+  case SceneRuntimePoseApplicationStatus::kDeferredBeforePlanning:
+  case SceneRuntimePoseApplicationStatus::kBuffered:
+  case SceneRuntimePoseApplicationStatus::kSkippedAttached:
+    return false;
+  }
+  return false;
+}
+
 bool SceneRuntimePoseApplicationResult::valid() const noexcept {
   switch (status) {
   case SceneRuntimePoseApplicationStatus::kNotRequested:

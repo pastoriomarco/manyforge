@@ -379,23 +379,6 @@ def test_existing_robot_prefix_edit_preserves_peers_and_add_boundary() -> None:
     assert "controllable_components" in _controllable_composition_change_kinds(before, changed)
 
 
-def test_isaac_world_is_one_optional_logical_cell_reference() -> None:
-    intent = _intent()
-    assert "isaac_world" not in validate_deployment_intent(intent, source="test")
-    intent["isaac_world"] = "isaac_manipulator_scene_light"
-    normalized = validate_deployment_intent(intent, source="test")
-    assert normalized["isaac_world"] == "isaac_manipulator_scene_light"
-    assert all("isaac_world" not in component for component in normalized["components"])
-
-
-@pytest.mark.parametrize("world", [None, "", 1, "/site/world.usda", "file:/world.usda", "World", "a" * 129])
-def test_isaac_world_refuses_machine_paths_and_invalid_ids(world: object) -> None:
-    intent = _intent()
-    intent["isaac_world"] = world
-    with pytest.raises(DeploymentIntentError, match="isaac_world must be a portable identifier"):
-        validate_deployment_intent(intent, source="test")
-
-
 def _io_device() -> dict:
     return {
         "component_id": "station_io",

@@ -53,7 +53,7 @@ ROS2_CONTROL_RUNTIME_CONFIGURATION_SCHEMA_ID: Final = (
     "manyforge.value_schema.runtime.ros2_control_execution.v1"
 )
 ROS2_CONTROL_RUNTIME_CONFIGURATION_SCHEMA_REVISION: Final = (
-    "sha256:775f7221ffc5433d18a7b794d3b26ab9993fa805ad5b83b6d1a3a0cb58bd1368"
+    "sha256:d60c4f1e7196f4eb6c4ebf4fd8d99980f4aa6b93f83de3e747f5253d7ea4795a"
 )
 EMPTY_PROVIDER_CONTRACT_SCHEMA_ID: Final = (
     "manyforge.value_schema.provider_contract.empty.v1"
@@ -2363,8 +2363,6 @@ def graph_and_applicability(
         "ros2_control_runtime" if ros2_control else "native_runtime"
     ])
     if ros2_control:
-        if "isaac_world" in deployment:
-            runtime_configuration["isaac_world"] = deployment["isaac_world"]
         # The source cap is explicit demo policy; bind it to this occurrence.
         for limit in runtime_configuration["motion_target_limits"]:
             limit["controllable_component_id"] = occurrence
@@ -3396,8 +3394,6 @@ def _deployment_intent(
         "assistant_profile_id": deployment["assistant_profile_id"],
         "compatibility": copy.deepcopy(deployment["compatibility"]),
     }
-    if "isaac_world" in deployment:
-        result["isaac_world"] = deployment["isaac_world"]
     return result
 
 

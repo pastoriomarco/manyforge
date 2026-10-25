@@ -16,6 +16,7 @@
 #include <limits>
 #include <manyforge_core/component_lifecycle_plan_catalog_codec.hpp>
 #include <manyforge_core/component_lifecycle_plan_evaluator.hpp>
+#include <manyforge_core/io_condition_evaluator.hpp>
 #include <manyforge_core/time/fake_clock.hpp>
 #include <manyforge_core/time/manual_scheduler.hpp>
 #include <manyforge_core/types/capability_definition.hpp>
@@ -44,6 +45,88 @@ public:
   }
   std::vector<core::IoSourceAcquisitionDTO> frames;
   std::vector<core::IoIngressLossNotificationDTO> losses;
+};
+
+const core::CollisionBodyId
+    kGeometricEndpoint("component/robot.arm/model/arm/body/tool/collision/0");
+const core::CollisionBodyId kGeometricTarget("scene/fixture/shape/0");
+
+class GeometricSnapshotPublisher final
+    : public core::ICollisionWorldSnapshotPublisher {
+public:
+  GeometricSnapshotPublisher() {
+    auto world = std::make_shared<core::CollisionWorldSnapshot>();
+    core::CollisionWorldBody endpoint{};
+    endpoint.body_id = kGeometricEndpoint;
+    core::CollisionWorldBody target{};
+    target.body_id = kGeometricTarget;
+    world->bodies = {std::move(endpoint), std::move(target)};
+    std::sort(world->bodies.begin(), world->bodies.end(),
+              [](const auto &left, const auto &right) {
+                return left.body_id < right.body_id;
+              });
+    bundle_ = std::make_shared<core::RuntimeCollisionQueryBundle>();
+    bundle_->world = std::move(world);
+    bundle_->lookup_order_valid = true;
+  }
+  core::CollisionWorldSnapshotPtr snapshot() const override {
+    return bundle_->world;
+  }
+  core::RuntimeCollisionQueryBundlePtr
+  published_runtime_collision_query_bundle() const override {
+    return bundle_;
+  }
+
+private:
+  std::shared_ptr<core::RuntimeCollisionQueryBundle> bundle_;
+};
+
+class AdvancingCollisionEngine final : public core::ICollisionQueryEngine {
+public:
+  explicit AdvancingCollisionEngine(core::FakeClock &clock) : clock_(clock) {
+    capability_.runtime_query_max_joints = 4;
+    capability_.runtime_query_max_world_bodies = 4;
+    capability_.runtime_query_max_collision_pairs = 4;
+  }
+  const core::CollisionEngineCapabilityDescriptor &capability() const override {
+    return capability_;
+  }
+  core::CollisionResult
+  check(const core::CollisionWorldSnapshot &, const core::CollisionQuery &,
+        const core::CollisionPolicySnapshot &,
+        const core::CollisionCancellationToken &) override {
+    return {};
+  }
+  core::RuntimeCollisionQueryPrepareStatus
+  prepare_runtime_query(std::span<const std::string>) noexcept override {
+    return core::RuntimeCollisionQueryPrepareStatus::kReady;
+  }
+  core::RuntimeCollisionQueryPrepareStatus prepare_runtime_snapshot(
+      const core::CollisionWorldSnapshot &) noexcept override {
+    return core::RuntimeCollisionQueryPrepareStatus::kReady;
+  }
+  core::RuntimeCollisionQueryResultView
+  check_runtime(const core::CollisionWorldSnapshot &,
+                const core::RuntimeCollisionQueryRequest &) noexcept override {
+    ++queries;
+    if (duration_ns > 0)
+      clock_.advance(duration_ns);
+    return {core::RuntimeCollisionQueryStatus::kClear,
+            core::RuntimeCollisionQueryFailureReason::kNone,
+            core::CollisionEngineStatus::kOk,
+            duration_ns,
+            {},
+            {}};
+  }
+  std::string engine_id() const override { return "lifecycle-test"; }
+  std::string engine_version() const override { return "1"; }
+
+  core::Duration duration_ns{};
+  std::size_t queries{};
+
+private:
+  core::FakeClock &clock_;
+  core::CollisionEngineCapabilityDescriptor capability_;
 };
 
 core::ProviderManifestDTO manifest() {
@@ -152,7 +235,8 @@ protected:
               core::ResourceRoleId("ready"), *descriptor, config}},
             {},
             ingress,
-            core::IoSourceIncarnation(std::move(incarnation))};
+            core::IoSourceIncarnation(std::move(incarnation)),
+            std::nullopt};
   }
 
   core::BrandLifecyclePrimitiveIntentDTO
@@ -267,7 +351,8 @@ TEST_F(IoProviderLifecycleProductTest,
   std::map<core::InterruptSourceId, HostIoSignalRuntime::SourceInput> sources;
   sources.emplace(kSource,
                   HostIoSignalRuntime::SourceInput{
-                      Input().rows, {}, driver->runtime_unit_epoch(), driver});
+                      Input().rows, {}, driver->runtime_unit_epoch(),
+                      std::nullopt, driver});
   auto runtime =
       HostIoSignalRuntime::Create(core::RequestOwnerEpoch("host"), 1U,
                                   std::move(sources), clock, scheduler);
@@ -944,7 +1029,8 @@ TEST_F(IoProviderLifecycleProductTest,
   std::map<core::InterruptSourceId, HostIoSignalRuntime::SourceInput> sources;
   sources.emplace(kSource,
                   HostIoSignalRuntime::SourceInput{
-                      Input().rows, {}, driver->runtime_unit_epoch(), driver});
+                      Input().rows, {}, driver->runtime_unit_epoch(),
+                      std::nullopt, driver});
   auto runtime =
       HostIoSignalRuntime::Create(core::RequestOwnerEpoch("host"), 1U,
                                   std::move(sources), clock, scheduler);
@@ -1007,6 +1093,178 @@ TEST_F(IoProviderLifecycleProductTest,
   EXPECT_EQ(runtime->ReadSignal(kSignal).value().availability,
             core::IoSignalAvailability::kFresh);
   EXPECT_EQ(transitions, (std::vector<bool>{false, true, false}));
+}
+
+TEST_F(IoProviderLifecycleProductTest,
+       GeometricEnableAcceptsNewerAndStaleBaselinesAndAbortsFailedTransition) {
+  Build();
+  descriptor->update_mode = core::IoSignalUpdateMode::kSampled;
+  descriptor->freshness = {core::IoFreshnessMode::kSampleAge, 25};
+  descriptor->liveness = core::IoSignalLivenessMode::kPeriodic;
+  auto input = Input();
+  input.rows.front().descriptor = *descriptor;
+  deployment::IoSignalProviderConfiguration config;
+  config.profile = "geometric_contact";
+  config.ingress_depth = 8;
+  config.endpoint =
+      deployment::IoSignalProviderConfiguration::GeometricContactEndpoint{
+          kSignal.controllable_component_id, core::CommandTargetId("arm"),
+          core::FrameRoleId("tool")};
+  config.target_scene_resource_id = core::SceneResourceId("fixture");
+  input.rows.front().provider = std::move(config);
+
+  const std::vector<std::string> names{"arm_joint"};
+  const std::vector<double> position{0.2};
+  const std::vector<double> velocity{0.0};
+  auto observed = std::make_shared<core::ObservedRobotStatePublication>(
+      names, std::vector<core::ObservedRobotStateSourceConfig>{
+                 {core::ObservedRobotStateSourceKind::kJointState, "motion",
+                  core::ObservedRobotStateAuthorityProfile::kMeasured, 1'000}});
+  ASSERT_TRUE(observed
+                  ->publish(core::ObservedRobotStateSourceKind::kJointState,
+                            names, position, velocity, 0, 0)
+                  .published);
+  auto scheduler = std::make_shared<core::ManualScheduler>();
+  auto publisher = std::make_shared<GeometricSnapshotPublisher>();
+  auto engine = std::make_shared<AdvancingCollisionEngine>(*clock);
+  const core::CollisionBodyRoleId body_role("tool");
+  const core::ModelInstanceId model("arm");
+  const core::ModelRevision model_revision("model.1");
+  core::RuntimeMotionEndpointBindingDTO endpoint{
+      core::TargetRoleId("motion"),
+      core::CommandTargetId("arm"),
+      {core::FrameRoleId("tool"),
+       model,
+       model_revision,
+       "tool_link",
+       {body_role}},
+      {{core::ComponentRoleId("robot"),
+        core::TargetRoleId("motion"),
+        kSignal.controllable_component_id,
+        core::CommandTargetId("arm"),
+        std::nullopt,
+        body_role,
+        model,
+        model_revision,
+        {kGeometricEndpoint}}}};
+  input.geometric_contact = GeometricContactInputBinding{
+      kSource,
+      core::IoSourceIncarnation("installation-owned"),
+      {*descriptor},
+      std::move(endpoint),
+      core::SceneResourceId("fixture"),
+      {observed},
+      publisher,
+      engine,
+      scheduler,
+      10,
+      5,
+      std::nullopt};
+
+  std::map<core::InterruptSourceId, HostIoSignalRuntime::SourceInput> sources;
+  sources.emplace(kSource,
+                  HostIoSignalRuntime::SourceInput{input.rows,
+                                                   {},
+                                                   driver->runtime_unit_epoch(),
+                                                   input.geometric_contact,
+                                                   driver});
+  auto runtime =
+      HostIoSignalRuntime::Create(core::RequestOwnerEpoch("host"), 1U,
+                                  std::move(sources), clock, scheduler);
+  auto acquisition = runtime->input_acquisition_hook(driver);
+  unsigned acquisition_calls{};
+  auto boundary = [&, acquisition = std::move(acquisition)](
+                      std::span<const IoProviderInputAcquisitionBaseline>
+                          baselines) mutable {
+    ++acquisition_calls;
+    if (acquisition_calls == 1U) {
+      clock->set(10);
+      scheduler->advance_to(10, core::SchedulerPriority::Monitoring);
+    }
+    auto acquired = acquisition(baselines);
+    if (acquisition_calls == 3U && acquired.ok())
+      return core::Result<void>::Err(
+          {"test_acquisition_failure",
+           "Test rejected an otherwise successful acquisition", {}});
+    return acquired;
+  };
+  {
+    auto delivery = driver->AcquireDelivery();
+    ASSERT_TRUE(driver
+                    ->InstallResourcesLocked(
+                        runtime->driver_input_installations().at(driver), {},
+                        runtime->cancellation_hook(driver),
+                        runtime->input_lifecycle_hook(driver),
+                        std::move(boundary))
+                    .ok());
+  }
+  runtime->Start();
+  ASSERT_EQ(Step("prepare").known,
+            core::LifecyclePrimitiveKnownResultDTO::kSucceeded);
+  ASSERT_EQ(Step("enable").known,
+            core::LifecyclePrimitiveKnownResultDTO::kSucceeded);
+  EXPECT_EQ(engine->queries, 2U);
+  const auto newer = runtime->ReadSignal(kSignal).value();
+  ASSERT_TRUE(newer.latest_sample);
+  EXPECT_EQ(newer.latest_sample->publication.source_sequence, 2U);
+  EXPECT_EQ(newer.availability, core::IoSignalAvailability::kFresh);
+
+  ASSERT_EQ(Step("disable").known,
+            core::LifecyclePrimitiveKnownResultDTO::kSucceeded);
+  ASSERT_EQ(Step("prepare").known,
+            core::LifecyclePrimitiveKnownResultDTO::kSucceeded);
+  engine->duration_ns = 30;
+  ASSERT_EQ(Step("enable").known,
+            core::LifecyclePrimitiveKnownResultDTO::kSucceeded);
+  EXPECT_EQ(driver->ReadLifecycleSnapshot(kDomain, clock->now())
+                .value()
+                .component_state,
+            core::ComponentLifecycleStateDTO::kActive);
+  EXPECT_EQ(engine->queries, 3U);
+  const auto stale = runtime->ReadSignal(kSignal).value();
+  ASSERT_TRUE(stale.latest_sample);
+  EXPECT_EQ(stale.latest_sample->publication.validity,
+            core::IoSampleValidity::kValid);
+  EXPECT_EQ(stale.availability, core::IoSignalAvailability::kStale);
+
+  core::IoConditionDefinitionDTO condition;
+  condition.inputs.push_back({kSignal, core::IoConditionValueKind::kBoolean});
+  condition.nodes.emplace_back(core::IoConditionCompareDTO{
+      core::IoConditionComparison::kEqual,
+      core::IoConditionInputReferenceDTO{0},
+      core::IoConditionValueDTO{true}});
+  auto checked =
+      core::CheckIoCondition(std::move(condition), {1, 1, 1, 1, 128, 128});
+  ASSERT_TRUE(checked.ok());
+  const auto armed = runtime->ArmRule(
+      {core::InterruptPolicyId("stale-geometric-contact"),
+       core::IoActivationRuleScopeDTO{core::RetainedBundleId("bundle"),
+                                      core::GraphRevision("graph")},
+       std::make_shared<const core::CheckedIoCondition>(
+           std::move(checked.value())),
+       core::MotionInterruptActivationMode::kRequireInactiveAtArm,
+       {kSource},
+       {}});
+  ASSERT_FALSE(armed.ok());
+  EXPECT_EQ(armed.error().code, core::kErrorMotionInterruptArmFailed);
+  EXPECT_EQ(armed.error().details.at("reason"),
+            "io_rule_baseline_unavailable");
+
+  ASSERT_EQ(Step("disable").known,
+            core::LifecyclePrimitiveKnownResultDTO::kSucceeded);
+  ASSERT_EQ(Step("prepare").known,
+            core::LifecyclePrimitiveKnownResultDTO::kSucceeded);
+  engine->duration_ns = 0;
+  const auto failed = Step("enable");
+  EXPECT_EQ(failed.known, core::LifecyclePrimitiveKnownResultDTO::kFailed);
+  EXPECT_EQ(driver->ReadLifecycleSnapshot(kDomain, clock->now())
+                .value()
+                .component_state,
+            core::ComponentLifecycleStateDTO::kFaulted);
+  EXPECT_EQ(engine->queries, 4U);
+  clock->set(100);
+  scheduler->advance_to(100, core::SchedulerPriority::Monitoring);
+  EXPECT_EQ(engine->queries, 4U);
 }
 
 TEST_F(IoProviderLifecycleProductTest,

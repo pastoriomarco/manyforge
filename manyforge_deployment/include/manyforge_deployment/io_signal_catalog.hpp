@@ -7,6 +7,13 @@
 namespace manyforge::deployment {
 
 struct IoSignalProviderConfiguration final {
+  struct GeometricContactEndpoint final {
+    core::ControllableComponentId controllable_component_id;
+    core::CommandTargetId command_target_id;
+    core::FrameRoleId frame_role_id;
+    friend bool operator==(const GeometricContactEndpoint &,
+                           const GeometricContactEndpoint &) = default;
+  };
   std::string profile;
   std::optional<std::string> topic;
   std::optional<std::size_t> input_bit;
@@ -20,6 +27,11 @@ struct IoSignalProviderConfiguration final {
   std::optional<std::size_t> pin{};
   std::optional<std::string> group{};
   std::optional<std::string> interface_name{};
+  /// Existing retained motion endpoint observed by the geometric-contact
+  /// provider. It is independent of the I/O signal's owning component/target;
+  /// contact bodies are derived from this exact endpoint definition.
+  std::optional<GeometricContactEndpoint> endpoint{};
+  std::optional<core::SceneResourceId> target_scene_resource_id{};
   friend bool operator==(const IoSignalProviderConfiguration &,
                          const IoSignalProviderConfiguration &) = default;
 };

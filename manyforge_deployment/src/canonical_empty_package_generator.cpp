@@ -193,15 +193,12 @@ derive_cell_scoped_canonical_empty_deployment_impl(
          "projection");
   }
   auto empty_runtime_fields = authored_runtime_units.front().as_object();
-  // Component-owned I/O declarations cannot survive removal of their owners.
-  // Keep every other execution-host setting exactly as authored.
+  // A canonical-empty graph has no component-owned controller, state, motion,
+  // fault, or I/O configuration.  Preserve the runtime unit's identity and
+  // dependency fields, but use the build-qualified empty-host configuration.
   for (auto &[name, value] : empty_runtime_fields) {
     if (name != "configuration") continue;
-    auto configuration = value.as_object();
-    for (auto &[field, setting] : configuration)
-      if (field == "io_signals" || field == "io_provider_devices")
-        setting = CanonicalValue(CanonicalValue::Array{});
-    value = CanonicalValue(std::move(configuration));
+    value = ros2_control_execution_runtime_contract::empty_host_configuration();
   }
   const CanonicalValue empty_runtime_unit(std::move(empty_runtime_fields));
 

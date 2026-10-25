@@ -264,7 +264,7 @@ make_robotiq_gripper_only_retention_fixture(std::string_view lifecycle_semantic_
       false, false, 1U, true, true, "i6_robotiq_gripper_only_cell", false, true,
       "resource", true, lifecycle_semantic_digest, lifecycle_semantic_digest,
       true, true, true, std::nullopt, false, kLite6ArmTargetId,
-      std::nullopt, std::nullopt, {}, {}, true, {},
+      std::nullopt, std::nullopt, {}, true, {},
       "manyforge.provider.ros2_control", true, true, &structural,
       map_robotiq_gripper_only_graph, false, false, "position_commanded", 1.0,
       "commanded", map_robotiq_gripper_only_component);

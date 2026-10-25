@@ -2240,6 +2240,16 @@ LogicalSceneOwner::Commit(const SceneTransactionRequestDTO &request) {
     }
     if (observed_transactions->resident_transaction_count >=
         kMaximumLogicalSceneTransactions) {
+      if (impl_->cell_admission_ != nullptr) {
+        // A durable Scene outcome can precede its admission release. Preserve
+        // that proof until exact settlement succeeds, before pruning it.
+        try {
+          SettleRecoveredAuthoredSceneClaims(database, *impl_->cell_admission_);
+        } catch (const CellAdmissionTemporarilyUnavailable &error) {
+          return reject(core::RequestReplayStatusDTO::kAcceptedNew,
+                        "kernel_owner_unavailable", error.what());
+        }
+      }
       Transaction compaction(database, "BEGIN IMMEDIATE");
       if (!impl_->SceneCommitStateStillCurrent(external_data_version)) {
         impl_->InvalidateSceneCommitState();

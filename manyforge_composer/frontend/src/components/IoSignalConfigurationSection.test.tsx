@@ -6,7 +6,10 @@ import type { JsonValue } from '../types/api';
 import { reactPropsHost, type MountedProps } from '../test/reactPropsHost';
 import { renderToStaticMarkup } from 'react-dom/server';
 
-import { IoSignalConfigurationSection } from './IoSignalConfigurationSection';
+import {
+  IoSignalConfigurationSection,
+  type GeometricContactEndpointOption,
+} from './IoSignalConfigurationSection';
 
 const existing = {
   controllable_component_id: 'station',
@@ -25,7 +28,11 @@ const output = { ...existing, resource_role_id: 'valve', signal_name: 'valve', d
 
 afterEach(() => vi.unstubAllGlobals());
 
-async function mount(rows: JsonValue[] | undefined, ioProvider = true) {
+async function mount(
+  rows: JsonValue[] | undefined,
+  ioProvider = true,
+  geometricContactEndpoints: GeometricContactEndpointOption[] = [],
+) {
   const configuration: Record<string, JsonValue> = { mode: 'commanded_sim', ...(rows === undefined ? {} : { io_signals: rows }) };
   const controller = {
     mutationAvailable: true,
@@ -40,7 +47,8 @@ async function mount(rows: JsonValue[] | undefined, ioProvider = true) {
   const { host, find, all } = reactPropsHost();
   const { createRoot } = await import('react-dom/client');
   const root = createRoot(host as unknown as Element);
-  await act(() => root.render(<IoSignalConfigurationSection controller={controller} runtimes={runtimes} />));
+  await act(() => root.render(<IoSignalConfigurationSection controller={controller} runtimes={runtimes}
+    geometricContactEndpoints={geometricContactEndpoints} />));
   const button = (text: string) => find((props) => props.type === 'button' && props.children === text);
   const texts = () => all(() => true).map((props) => (
     Array.isArray(props.children) ? props.children.filter((item) => typeof item === 'string').join('')
@@ -170,6 +178,37 @@ describe('IoSignalConfigurationSection', () => {
         ['graph', 'runtime_units', 0, 'configuration', 'io_signals'], 'set',
         [{ ...existing, update_mode: 'sampled', freshness: { mode: 'sample_age', maximum_age_ns: 50_000_000 },
           provider: { profile: 'ur_io_states', topic: '/io_and_status_controller/io_states', pin: 17 } }],
+      );
+    } finally { await mounted.unmount(); }
+  });
+
+  it('declares a read-only geometric contact input from structural endpoint metadata', async () => {
+    const endpoints: GeometricContactEndpointOption[] = [
+      { componentId: 'arm', targetId: 'tool', frameRoleId: 'camera' },
+      { componentId: 'arm', targetId: 'tool', frameRoleId: 'tcp' },
+    ];
+    const mounted = await mount([existing], true, endpoints);
+    try {
+      await mounted.type('part_present Source profile', 'geometric_contact');
+      expect(mounted.all((props) => props.value === JSON.stringify(['arm', 'tool', 'camera']))).toHaveLength(1);
+      expect(mounted.all((props) => props.value === JSON.stringify(['arm', 'tool', 'tcp']))).toHaveLength(1);
+      await mounted.type('part_present Contact endpoint', JSON.stringify(['arm', 'tool', 'tcp']));
+      await mounted.type('part_present Target Scene resource', 'workpiece');
+      await mounted.type('part_present Maximum sample age', '75');
+      expect(mounted.texts().some((text) => text.includes("selected endpoint's existing contact-body roles"))).toBe(true);
+      expect(mounted.texts().some((text) => text.includes('Manual and timed Mock writes do not apply'))).toBe(true);
+      await mounted.click('Update I/O Draft');
+      expect(mounted.controller.mutate).toHaveBeenCalledExactlyOnceWith(
+        ['graph', 'runtime_units', 0, 'configuration', 'io_signals'], 'set',
+        [{ ...existing, update_mode: 'sampled',
+          freshness: { mode: 'sample_age', maximum_age_ns: 75_000_000 }, provider: {
+          profile: 'geometric_contact',
+          ingress_depth: 64,
+          endpoint: {
+            controllable_component_id: 'arm', command_target_id: 'tool', frame_role_id: 'tcp',
+          },
+          target_scene_resource_id: 'workpiece',
+        } }],
       );
     } finally { await mounted.unmount(); }
   });

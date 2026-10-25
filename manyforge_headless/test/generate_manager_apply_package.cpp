@@ -698,7 +698,7 @@ int main(int argc, char **argv) {
             false, false, 1U, true, true, {}, false, true, "resource", true,
             semantic.value().value(), semantic.value().value(), true,
             true, true, std::nullopt, false, deployment::test::kLite6ArmTargetId,
-            std::nullopt, std::nullopt, {}, {}, true, {},
+            std::nullopt, std::nullopt, {}, true, {},
             "manyforge.provider.ros2_control", true, true, nullptr, nullptr,
             false, false, "pneumatic", arguments.pneumatic_dwell_s,
             arguments.pneumatic_no_output ? "none" : "commanded");
@@ -743,7 +743,7 @@ int main(int argc, char **argv) {
             for (auto &[key, entry] : unit) {
               if (key == "configuration") {
                 entry = deployment::ros2_control_execution_runtime_contract::
-                    empty_host_configuration(std::nullopt);
+                    empty_host_configuration();
               }
             }
             units.front() = deployment::CanonicalValue(std::move(unit));
@@ -831,7 +831,7 @@ int main(int argc, char **argv) {
           graph.controllable_components.size() != 1U || graph.control_domains.size() != 1U ||
           graph.control_bindings.size() != 2U || !graph.component_attachments.empty() ||
           !configuration.initial_joint_positions_rad.empty() ||
-          !configuration.motion_target_limits.empty() || configuration.isaac_world ||
+          !configuration.motion_target_limits.empty() ||
           configuration.controller_profiles.size() != 1U ||
           configuration.controller_profiles.front().mock_profile !=
               std::optional<std::string>("ur5e_robotiq_2f_85") ||

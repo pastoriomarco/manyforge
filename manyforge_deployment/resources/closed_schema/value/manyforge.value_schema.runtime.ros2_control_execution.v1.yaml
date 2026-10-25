@@ -1,6 +1,6 @@
 api_version: manyforge.closed_schema.v1
 schema_id: manyforge.value_schema.runtime.ros2_control_execution.v1
-schema_revision: sha256:775f7221ffc5433d18a7b794d3b26ab9993fa805ad5b83b6d1a3a0cb58bd1368
+schema_revision: sha256:d60c4f1e7196f4eb6c4ebf4fd8d99980f4aa6b93f83de3e747f5253d7ea4795a
 schema_purpose: value
 root_definition_id: ros2_control_execution_runtime_configuration
 definitions:
@@ -85,16 +85,6 @@ definitions:
                           - ur5e_robotiq_2f_85
                       - kind: string_format
                         value: portable_id
-        - field_id: isaac_world
-          presence: optional
-          default:
-            kind: absent
-          value_schema:
-            kind: scalar
-            scalar_type: string
-            constraints:
-              - kind: string_format
-                value: portable_id
         - field_id: planner_rng_seed
           presence: required
           default:
@@ -852,6 +842,81 @@ definitions:
                                 kind: "scalar"
                                 scalar_type: "boolean"
                                 constraints: []
+                      - tag_value: "geometric_contact"
+                        value_schema:
+                          kind: "object"
+                          fields:
+                            - field_id: "profile"
+                              presence: "required"
+                              default:
+                                kind: "absent"
+                              value_schema:
+                                kind: "scalar"
+                                scalar_type: "string"
+                                constraints:
+                                  - kind: "enum"
+                                    values:
+                                      - "geometric_contact"
+                            - field_id: "ingress_depth"
+                              presence: "optional"
+                              default:
+                                kind: "materialized"
+                                value: 64
+                              value_schema:
+                                kind: "scalar"
+                                scalar_type: "integer"
+                                constraints:
+                                  - kind: "minimum"
+                                    value: 1
+                                  - kind: "maximum"
+                                    value: 9007199254740991
+                            - field_id: "endpoint"
+                              presence: "required"
+                              default:
+                                kind: "absent"
+                              value_schema:
+                                kind: "object"
+                                fields:
+                                  - field_id: "controllable_component_id"
+                                    presence: "required"
+                                    default:
+                                      kind: "absent"
+                                    value_schema:
+                                      kind: "scalar"
+                                      scalar_type: "string"
+                                      constraints:
+                                        - kind: "string_format"
+                                          value: "portable_id"
+                                  - field_id: "command_target_id"
+                                    presence: "required"
+                                    default:
+                                      kind: "absent"
+                                    value_schema:
+                                      kind: "scalar"
+                                      scalar_type: "string"
+                                      constraints:
+                                        - kind: "string_format"
+                                          value: "portable_id"
+                                  - field_id: "frame_role_id"
+                                    presence: "required"
+                                    default:
+                                      kind: "absent"
+                                    value_schema:
+                                      kind: "scalar"
+                                      scalar_type: "string"
+                                      constraints:
+                                        - kind: "string_format"
+                                          value: "portable_id"
+                            - field_id: "target_scene_resource_id"
+                              presence: "required"
+                              default:
+                                kind: "absent"
+                              value_schema:
+                                kind: "scalar"
+                                scalar_type: "string"
+                                constraints:
+                                  - kind: "string_format"
+                                    value: "portable_id"
                       - tag_value: "ros_bool"
                         value_schema:
                           kind: "object"

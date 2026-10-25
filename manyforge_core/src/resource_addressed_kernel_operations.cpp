@@ -4173,13 +4173,30 @@ ProgramExecutionScopeStateDTO ResourceAddressedExecutionKernel::program_executio
   ProgramExecutionScopeStateDTO result{
       config_.request_owner_epoch, claim.program_runner_owner_epoch, claim.claim_generation,
       claim.program_run_id,        fence.selection_revision,         {},
-      fence.pending_effects};
+      fence.pending_effects, program_selection_release_block_reason_locked(fence)};
   for (std::size_t index = 0U; index < fence.node_states.size(); ++index) {
     if (fence.node_states[index] != ProgramNodeHoldStateDTO::kRunning) {
       result.held_nodes.push_back({static_cast<std::uint32_t>(index), fence.node_states[index]});
     }
   }
   return result;
+}
+
+std::optional<ProgramSelectionReleaseBlockReasonDTO>
+ResourceAddressedExecutionKernel::program_selection_release_block_reason_locked(
+    const ProgramRunStopFence& fence) const {
+  // Keep this order aligned with the atomic Run/Resume refusal below. The
+  // scope projection is advisory; release_program_selection re-evaluates this
+  // same predicate while holding the Kernel state lock before changing holds.
+  if (motion_admission_closed_)
+    return ProgramSelectionReleaseBlockReasonDTO::kCellMotionAdmissionClosed;
+  if (motion_admission_unreconciled_)
+    return ProgramSelectionReleaseBlockReasonDTO::kCellMotionAdmissionUnreconciled;
+  if (pending_program_run_admission_ == fence.program_run_id)
+    return ProgramSelectionReleaseBlockReasonDTO::kProgramRunAdmissionPending;
+  if (fence.stop_id.has_value())
+    return ProgramSelectionReleaseBlockReasonDTO::kProgramHaltActive;
+  return std::nullopt;
 }
 
 Result<ProgramExecutionScopeStateDTO> ResourceAddressedExecutionKernel::get_program_execution_scope(
@@ -4564,11 +4581,29 @@ Result<ProgramExecutionScopeStateDTO> ResourceAddressedExecutionKernel::release_
   }
   // A whole-run Stop (Program Halt) governs execution; only releasing it
   // (Execute) ends it. Resume releases motion holds and never ends a Halt.
-  if (motion_admission_closed_ || motion_admission_unreconciled_ ||
-      pending_program_run_admission_ == request.program_run_id || fence->stop_id.has_value()) {
-    return reject<ProgramExecutionScopeStateDTO>("Program admission or containment has not settled",
-                                                 "program_selection_not_releasable",
-                                                 ErrorCode::kInvalidStateTransition);
+  if (const auto blocker = program_selection_release_block_reason_locked(*fence);
+      blocker.has_value()) {
+    std::string message;
+    switch (*blocker) {
+      case ProgramSelectionReleaseBlockReasonDTO::kCellMotionAdmissionClosed:
+        message = "Cell motion admission is closed; Program Run or Resume remains blocked";
+        break;
+      case ProgramSelectionReleaseBlockReasonDTO::kCellMotionAdmissionUnreconciled:
+        message = "Cell motion admission is unreconciled; Program Run or Resume remains blocked";
+        break;
+      case ProgramSelectionReleaseBlockReasonDTO::kProgramRunAdmissionPending:
+        message = "A Program-run admission is pending; Program Run or Resume remains blocked";
+        break;
+      case ProgramSelectionReleaseBlockReasonDTO::kProgramHaltActive:
+        message = "Program Halt is still active; release its fence before Run or Resume";
+        break;
+    }
+    const auto error_code = std::string(to_string(ErrorCode::kInvalidStateTransition));
+    return Result<ProgramExecutionScopeStateDTO>::Err(ErrorDTO{
+        error_code, std::move(message),
+        {{"reason", "program_selection_not_releasable"},
+         {"selection_release_block_reason",
+          std::string(program_selection_release_block_reason_token(*blocker))}}});
   }
   // Resume releases only current holds. An overlapping selection can also
   // contain a branch already resumed and executing a fresh operation; that

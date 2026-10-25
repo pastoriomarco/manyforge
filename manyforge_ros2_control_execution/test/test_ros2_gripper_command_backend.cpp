@@ -741,6 +741,9 @@ public:
   std::size_t cancel_attempts = 0;
 };
 
+bool wait_for_gripper_fact(const std::function<bool()> &predicate);
+Ros2GripperActionConfig pneumatic_mock_config(const std::string &endpoint);
+
 TEST(Ros2GripperCommandBackendTest,
      SchedulerCancelFailurePreservesTheInvalidatedGenerationFence) {
   auto sink = std::make_shared<RecordingExecutionStateSink>();
@@ -906,13 +909,16 @@ public:
         [this](const rclcpp_action::GoalUUID &,
                std::shared_ptr<const Action::Goal>) {
           ++requests;
+          while (hold_goal_response.load() && !release_goal_response.load())
+            std::this_thread::sleep_for(1ms);
           return reject.load()
                      ? rclcpp_action::GoalResponse::REJECT
                      : rclcpp_action::GoalResponse::ACCEPT_AND_EXECUTE;
         },
         [this](std::shared_ptr<ServerGoal>) {
           ++cancels;
-          return rclcpp_action::CancelResponse::ACCEPT;
+          return accept_cancel.load() ? rclcpp_action::CancelResponse::ACCEPT
+                                      : rclcpp_action::CancelResponse::REJECT;
         },
         [this](std::shared_ptr<ServerGoal> goal) {
           std::lock_guard<std::mutex> lock(mutex_);
@@ -932,7 +938,9 @@ public:
     }
     auto result = std::make_shared<Action::Result>();
     // A pneumatic delivery never depends on finger position/reached_goal.
-    result->position = std::numeric_limits<double>::quiet_NaN();
+    result->position = finite_result.load()
+                           ? 0.0
+                           : std::numeric_limits<double>::quiet_NaN();
     result->reached_goal = false;
     if (succeeded)
       goal->succeed(result);
@@ -940,6 +948,10 @@ public:
       goal->abort(result);
   }
   std::atomic<bool> reject{false};
+  std::atomic<bool> accept_cancel{true};
+  std::atomic<bool> finite_result{false};
+  std::atomic<bool> hold_goal_response{false};
+  std::atomic<bool> release_goal_response{false};
   std::atomic<std::size_t> requests{0};
   std::atomic<std::size_t> cancels{0};
 
@@ -949,6 +961,161 @@ private:
   std::vector<std::shared_ptr<ServerGoal>> goals_;
   rclcpp_action::Server<Action>::SharedPtr server_;
 };
+
+TEST(Ros2GripperCommandBackendTest,
+     LifecycleDisableAndGenericInvalidationShareOneExactCancel) {
+  auto sink = std::make_shared<RecordingExecutionStateSink>();
+  sink->set_joint_position("gripper", "finger_joint", 0.7);
+  core::FakeClock clock;
+  core::ManualScheduler scheduler;
+  auto resources = test_transport_resources(sink, clock, "arm");
+  Ros2GripperCommandBackend backend(*resources, sink, clock, scheduler, false);
+  const auto endpoint = "/manyforge_lifecycle_cancel_" + unique_suffix();
+  ControlledPneumaticServer server(*resources, endpoint);
+  server.finite_result = true;
+  TestTransportLifetime lifetime(*resources, backend);
+  auto config = pneumatic_mock_config(endpoint);
+  config.actuation_kind = core::GripperActuationKind::kPositionCommanded;
+  config.completion_policy = "driver_result";
+  backend.configure_gripper_action("tool", config);
+  backend.complete_ros_configuration();
+  lifetime.start();
+  ASSERT_TRUE(wait_for_gripper_fact(
+      [&] { return backend.gripper_transport_readiness("tool").ready; }));
+  ASSERT_TRUE(backend.command_gripper(make_gripper_request(
+      0.0, 0.2, 1.0, "ros_gripper_command", "driver_result")).accepted);
+  ASSERT_TRUE(server.wait_for_goal());
+  std::stop_source stop;
+  auto disable = std::async(std::launch::async, [&] {
+    return backend.disable_lifecycle_gripper("tool", stop.get_token());
+  });
+  ASSERT_TRUE(wait_for_gripper_fact([&] { return server.cancels.load() == 1U; }));
+  EXPECT_EQ(disable.wait_for(20ms), std::future_status::timeout);
+  backend.invalidate_gripper_commands(core::GripperInvalidationReason::kReset);
+  std::this_thread::sleep_for(20ms);
+  EXPECT_EQ(server.cancels.load(), 1U);
+  server.result(0, true);
+  const auto interrupted = disable.get();
+  EXPECT_TRUE(interrupted.effect_started);
+  ASSERT_TRUE(wait_for_gripper_fact([&] {
+    return backend.disable_lifecycle_gripper("tool", {}).succeeded;
+  }));
+  EXPECT_FALSE(backend.command_gripper(make_gripper_request(
+      0.7, 0.2, 1.0, "ros_gripper_command", "driver_result")).accepted);
+  EXPECT_TRUE(backend.authorize_lifecycle_gripper("tool").succeeded);
+  EXPECT_FALSE(backend.get_gripper_status("tool").admission_closed);
+}
+
+TEST(Ros2GripperCommandBackendTest,
+     LifecycleDisableRetainsLateAcceptedGoalAfterWaiterCancellation) {
+  auto sink = std::make_shared<RecordingExecutionStateSink>();
+  sink->set_joint_position("gripper", "finger_joint", 0.7);
+  core::FakeClock clock;
+  core::ManualScheduler scheduler;
+  auto resources = test_transport_resources(sink, clock, "arm");
+  Ros2GripperCommandBackend backend(*resources, sink, clock, scheduler, false);
+  const auto endpoint = "/manyforge_lifecycle_late_" + unique_suffix();
+  ControlledPneumaticServer server(*resources, endpoint);
+  server.finite_result = true;
+  server.hold_goal_response = true;
+  TestTransportLifetime lifetime(*resources, backend);
+  auto config = pneumatic_mock_config(endpoint);
+  config.actuation_kind = core::GripperActuationKind::kPositionCommanded;
+  config.completion_policy = "driver_result";
+  backend.configure_gripper_action("tool", config);
+  backend.complete_ros_configuration();
+  lifetime.start();
+  ASSERT_TRUE(wait_for_gripper_fact(
+      [&] { return backend.gripper_transport_readiness("tool").ready; }));
+  ASSERT_TRUE(backend.command_gripper(make_gripper_request(
+      0.0, 0.2, 1.0, "ros_gripper_command", "driver_result")).accepted);
+  ASSERT_TRUE(wait_for_gripper_fact([&] { return server.requests.load() == 1U; }));
+  std::stop_source stop;
+  stop.request_stop();
+  const auto waiting = backend.disable_lifecycle_gripper("tool", stop.get_token());
+  EXPECT_FALSE(waiting.succeeded);
+  EXPECT_TRUE(waiting.effect_started);
+  server.release_goal_response = true;
+  ASSERT_TRUE(server.wait_for_goal());
+  ASSERT_TRUE(wait_for_gripper_fact([&] { return server.cancels.load() == 1U; }));
+  server.result(0, true);
+  ASSERT_TRUE(wait_for_gripper_fact([&] {
+    return backend.disable_lifecycle_gripper("tool", {}).succeeded;
+  }));
+}
+
+TEST(Ros2GripperCommandBackendTest,
+     ResetAuthorizationConsumesExactGenericInvalidationTerminal) {
+  auto sink = std::make_shared<RecordingExecutionStateSink>();
+  sink->set_joint_position("gripper", "finger_joint", 0.7);
+  core::FakeClock clock;
+  core::ManualScheduler scheduler;
+  auto resources = test_transport_resources(sink, clock, "arm");
+  Ros2GripperCommandBackend backend(*resources, sink, clock, scheduler, false);
+  const auto endpoint = "/manyforge_reset_cancel_" + unique_suffix();
+  ControlledPneumaticServer server(*resources, endpoint);
+  server.finite_result = true;
+  TestTransportLifetime lifetime(*resources, backend);
+  auto config = pneumatic_mock_config(endpoint);
+  config.actuation_kind = core::GripperActuationKind::kPositionCommanded;
+  config.completion_policy = "driver_result";
+  backend.configure_gripper_action("tool", config);
+  backend.complete_ros_configuration();
+  lifetime.start();
+  ASSERT_TRUE(wait_for_gripper_fact(
+      [&] { return backend.gripper_transport_readiness("tool").ready; }));
+  ASSERT_TRUE(backend.command_gripper(make_gripper_request(
+      0.0, 0.2, 1.0, "ros_gripper_command", "driver_result")).accepted);
+  ASSERT_TRUE(server.wait_for_goal());
+
+  backend.invalidate_gripper_commands(core::GripperInvalidationReason::kReset);
+  ASSERT_TRUE(wait_for_gripper_fact([&] { return server.cancels.load() == 1U; }));
+  const auto pending = backend.try_authorize_gripper_commands();
+  ASSERT_FALSE(pending.ok());
+  EXPECT_EQ(pending.error().code,
+            "ros2_control_gripper_bridge_disable_unsettled");
+  server.result(0, true);
+  ASSERT_TRUE(wait_for_gripper_fact([&] {
+    return backend.try_authorize_gripper_commands().ok();
+  }));
+  EXPECT_FALSE(backend.get_gripper_status("tool").admission_closed);
+  EXPECT_EQ(server.cancels.load(), 1U);
+}
+
+TEST(Ros2GripperCommandBackendTest,
+     LifecycleDisableCancelRejectionRemainsUnsettledUntilNaturalTerminal) {
+  auto sink = std::make_shared<RecordingExecutionStateSink>();
+  sink->set_joint_position("gripper", "finger_joint", 0.7);
+  core::FakeClock clock;
+  core::ManualScheduler scheduler;
+  auto resources = test_transport_resources(sink, clock, "arm");
+  Ros2GripperCommandBackend backend(*resources, sink, clock, scheduler, false);
+  const auto endpoint = "/manyforge_lifecycle_reject_" + unique_suffix();
+  ControlledPneumaticServer server(*resources, endpoint);
+  server.accept_cancel = false;
+  server.finite_result = true;
+  TestTransportLifetime lifetime(*resources, backend);
+  auto config = pneumatic_mock_config(endpoint);
+  config.actuation_kind = core::GripperActuationKind::kPositionCommanded;
+  config.completion_policy = "driver_result";
+  backend.configure_gripper_action("tool", config);
+  backend.complete_ros_configuration();
+  lifetime.start();
+  ASSERT_TRUE(wait_for_gripper_fact(
+      [&] { return backend.gripper_transport_readiness("tool").ready; }));
+  ASSERT_TRUE(backend.command_gripper(make_gripper_request(
+      0.0, 0.2, 1.0, "ros_gripper_command", "driver_result")).accepted);
+  ASSERT_TRUE(server.wait_for_goal());
+  const auto refused = backend.disable_lifecycle_gripper("tool", {});
+  EXPECT_FALSE(refused.succeeded);
+  EXPECT_TRUE(refused.effect_started);
+  EXPECT_FALSE(backend.prepare_lifecycle_gripper("tool").succeeded);
+  server.result(0, true);
+  ASSERT_TRUE(wait_for_gripper_fact([&] {
+    const auto retried = backend.disable_lifecycle_gripper("tool", {});
+    return retried.succeeded;
+  }));
+}
 
 bool wait_for_gripper_fact(const std::function<bool()> &predicate) {
   const auto deadline = std::chrono::steady_clock::now() + 2s;

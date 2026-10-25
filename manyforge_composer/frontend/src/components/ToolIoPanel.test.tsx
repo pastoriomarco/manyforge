@@ -152,6 +152,23 @@ describe('ToolIoPanelView', () => {
     expect(html).not.toContain('Liveness unproven');
   });
 
+  it('shows geometric contact as a periodic read-only input', () => {
+    const contact = signal({
+      resourceRoleId: 'part_contact', signalName: 'part_contact',
+      declared: {
+        profile: 'geometric_contact', sourceId: 'part_contact_geometry', topic: null,
+        liveness: 'periodic',
+      },
+    });
+    const html = view([contact], [reading({
+      signalName: 'part_contact', sourceId: 'part_contact_geometry', value: false,
+      liveness: { mode: 'periodic', warning: null },
+    })]);
+    expect(html).toContain('Geometric contact · part_contact_geometry');
+    expect(html).toContain('data-io-liveness="periodic"');
+    expect(html).toMatch(/disabled="" title="Only Mock inputs can be set; this is a real source."/);
+  });
+
   it('shows the owner-projected liveness and a change-only warning (SX-2194)', () => {
     const door = signal({
       resourceRoleId: 'door', signalName: 'door',

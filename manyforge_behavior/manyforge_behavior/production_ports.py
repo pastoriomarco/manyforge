@@ -4018,13 +4018,32 @@ class NativeKernelProgramPort:
                 self._kernel.stop_status(stop_id).get("stop_status"),
                 field="aggregate Stop status",
             )
-            if status.get("state") != "succeeded":
-                raise ProductionPortError("Program-run Stop cannot be released before settlement")
             if (
                 type(status.get("stop_generation")) is not int
                 or status["stop_generation"] != stop_generation
             ):
                 raise ProductionPortError("Program-run Stop settlement generation is stale")
+            stop_state = status.get("state")
+            if stop_state != "succeeded":
+                if not (not release_fence and stop_state == "partial"):
+                    raise ProductionPortError(
+                        "Program-run Stop cannot be released before settlement"
+                    )
+                try:
+                    fault = self._kernel.stop_fault()
+                except Exception as error:
+                    raise ProductionPortError(
+                        "Program-run Stop fault state is unavailable"
+                    ) from error
+                if (
+                    not isinstance(fault, Mapping)
+                    or fault.get("command") != "get_stop_fault"
+                    or "stop_fault" not in fault
+                    or fault["stop_fault"] is not None
+                ):
+                    raise ProductionPortError(
+                        "Program-run partial Stop has an active or unknown Stop fault"
+                    )
             if release_fence:
                 self._kernel.release_program_run_stop_fence(
                     program_run_id,

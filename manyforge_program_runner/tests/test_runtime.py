@@ -30,6 +30,7 @@ from manyforge_headless_api.models import (
     ProgramManualHandoverRequest,
     ProgramRunStopRequest,
     ProgramScenePreparationRequest,
+    ProgramSelectionResumeRequest,
     ProgramSelectionStartRequest,
     RuntimeBlackboardWriteRequest,
 )
@@ -469,6 +470,11 @@ class _Owner:
         return self.read(program_run_id), self.execution_selection_controls(
             program_run_id
         )
+
+    def execution_selection_motion_readiness_scope(
+        self, _program_run_id, _group_ids
+    ):
+        return (), _DIGEST_A, _DIGEST_B
 
     def execution_selection_controls(self, program_run_id: str) -> dict[str, Any]:
         running = self.rows[program_run_id].state == "running"
@@ -2152,6 +2158,141 @@ def test_scene_preparation_failure_blocks_run_until_idle_reset_converges(
     runtime.shutdown()
 
 
+def _terminal_cycle_reset_runtime(monkeypatch, tmp_path, owner_epoch):
+    """A public Run/Stop cycle with deterministic owner observations."""
+
+    monkeypatch.setattr(
+        "manyforge_program_runner.runtime.build_applied_program_run_admission",
+        lambda *_args, **_kwargs: _PreparedRunAdmission(),
+    )
+    _bypass_scene_preparation(monkeypatch)
+    _bypass_reset_scene_preparation(monkeypatch)
+    admission = _Admission()
+    runtime = ProgramRuntime(
+        ProgramRunnerConfig(
+            headless_url="http://headless.test", owner_epoch=owner_epoch
+        ),
+        headless_client=_Headless(),  # type: ignore[arg-type]
+        execution_transport=_Headless(),  # type: ignore[arg-type]
+        admission_client=admission,  # type: ignore[arg-type]
+        cycle_journal=ProgramCycleJournal(
+            tmp_path / "cycle.sqlite3", owner_epoch=owner_epoch
+        ),
+    )
+    runtime._host.shutdown()  # noqa: SLF001
+    owner = _ObservationOwner()
+    host = _Host(owner, owner_id=runtime.owner_id, owner_epoch=runtime.owner_epoch)
+    runtime._owner = owner  # type: ignore[assignment]  # noqa: SLF001
+    runtime._host = host  # type: ignore[assignment]  # noqa: SLF001
+    runtime.start()
+    runtime.start_run(_start_request())
+    stopped = runtime.stop_run(
+        "program-cycle.1",
+        ProgramRunStopRequest.model_validate(
+            {
+                "request_id": "request.stop.before-reset",
+                "request_owner_epoch": "composer.epoch.1",
+                "source_label": "operator_ui",
+                "correlation_id": None,
+                "program_run_id": "program-cycle.1",
+                "expected_owner_epoch": runtime.owner_epoch,
+                "reason": "operator stop before Reset",
+            }
+        ),
+    )
+    assert stopped["state"] == "stopped"
+    assert runtime.cycle_status()["state"] == "terminal_awaiting_reset"
+    return runtime, runtime._journal, admission, owner, host  # noqa: SLF001
+
+
+def test_program_runtime_reset_from_terminal_partial_stop_releases_cycle_claim(
+    monkeypatch: pytest.MonkeyPatch, tmp_path
+) -> None:
+    runtime, journal, admission, owner, host = _terminal_cycle_reset_runtime(
+        monkeypatch, tmp_path, "runner.partial-reset.terminal"
+    )
+    host.contain_reset_run = lambda program_run_id, **_kwargs: owner.rows[program_run_id]
+    try:
+        reset = _current_reset_request(runtime, journal, "reset.partial.terminal")
+        result = runtime.reset_cycle(reset)
+
+        assert result["idle_cycle_generation"] == 2
+        assert runtime.cycle_status()["state"] == "idle_after_reset"
+        assert journal.pending_commands() == ()
+        assert len(admission.releases) == 1
+        assert admission.releases[0]["settlement"]["settlement_kind"] == "explicit_reset"
+        assert host.reset_calls == ["program-cycle.1"]
+        assert host.forgotten_reset_runs == ["program-cycle.1"]
+        assert "program-cycle.1" not in owner.rows
+    finally:
+        runtime.shutdown()
+
+
+def test_program_runtime_reset_retry_from_recovery_required_retires_same_cycle(
+    monkeypatch: pytest.MonkeyPatch, tmp_path
+) -> None:
+    runtime, journal, admission, owner, host = _terminal_cycle_reset_runtime(
+        monkeypatch, tmp_path, "runner.partial-reset.retry"
+    )
+    containment_calls = 0
+
+    def contain_once_then_settle(program_run_id, **_kwargs):
+        nonlocal containment_calls
+        containment_calls += 1
+        if containment_calls == 1:
+            raise ProgramRunOwnerOutcomeUnknownError(
+                "program_run_stop_partial"
+            )
+        return owner.rows[program_run_id]
+
+    host.contain_reset_run = contain_once_then_settle
+    try:
+        first = _current_reset_request(runtime, journal, "reset.partial.first")
+        with pytest.raises(ProgramRunnerError) as pending:
+            runtime.reset_cycle(first)
+        assert pending.value.code == "program_cycle_recovery_required"
+        recovery = runtime.cycle_status()
+        assert recovery["state"] == "recovery_required"
+        assert recovery["reset_phase"] == "stopping"
+        assert not admission.releases
+        assert host.reset_calls == []
+        claim = journal.read().claim
+        assert claim is not None
+        admission.inventory = {
+            "status": "held_exact",
+            "kernel_owner_epoch": "execution.epoch.1",
+            "held_claims": [claim],
+            "current_owner_epochs": [
+                {
+                    "owner_role": "program_runner",
+                    "owner_epoch": runtime.owner_epoch,
+                }
+            ],
+            "matched_claim": claim,
+            "matched_release": None,
+            "matched_reconcile_settlement": None,
+        }
+
+        retry = _current_reset_request(runtime, journal, "reset.partial.retry")
+        result = runtime.reset_cycle(retry)
+
+        assert containment_calls == 2
+        assert result["idle_cycle_generation"] == 2
+        assert runtime.cycle_status()["state"] == "idle_after_reset"
+        assert journal.pending_commands() == ()
+        assert len(admission.releases) == 1
+        assert admission.releases[0]["settlement"]["settlement_kind"] == "explicit_reset"
+        assert host.stop_calls[-1] == (
+            "program-cycle.1",
+            "operator requested Program cycle Reset",
+        )
+        assert host.reset_calls == ["program-cycle.1"]
+        assert host.forgotten_reset_runs == ["program-cycle.1"]
+        assert "program-cycle.1" not in owner.rows
+    finally:
+        runtime.shutdown()
+
+
 def test_stop_overtakes_start_before_claim_without_launching_tree(
     monkeypatch: pytest.MonkeyPatch,
     tmp_path,
@@ -2710,6 +2851,27 @@ def test_repeated_run_is_state_rejected_and_keeps_one_active_product_run(
             "reason": "initial operator motion Run",
         }
     )
+    verify_feedback = runtime._verify_selected_motion_feedback  # noqa: SLF001
+    monkeypatch.setattr(
+        runtime,
+        "_verify_selected_motion_feedback",
+        lambda _run_id, _groups: (_ for _ in ()).throw(
+            ProgramRunnerError(
+                "program_motion_component_readiness_unavailable",
+                "Measured feed is stale",
+            )
+        ),
+    )
+    blocked_start = ProgramSelectionStartRequest.model_validate({
+        **motion_start.model_dump(mode="json"),
+        "request_id": "request.motion-start.blocked",
+    })
+    with pytest.raises(ProgramRunnerError) as blocked:
+        runtime.start_motion("program-cycle.1", blocked_start)
+    assert blocked.value.code == "program_motion_component_readiness_unavailable"
+    assert host.motion_start_calls == []
+    monkeypatch.setattr(runtime, "_verify_selected_motion_feedback", verify_feedback)
+
     motion_started = runtime.start_motion("program-cycle.1", motion_start)
     assert motion_started["state"] == "running"
     assert host.motion_start_calls == [
@@ -5943,8 +6105,6 @@ def _simulation_lane_fixture(*, lanes=("mock", "isaac"), simulation=None, admiss
                          "lite6_lite_gripper" if lane == "mock" else "lite6"}
                     for name, lane in zip(("lite6_arm", "robot.other"), lanes, strict=True)]}}]},
     }
-    if "isaac" in lanes:
-        graph["cell_graph"]["runtime_units"][0]["configuration"]["isaac_world"] = "lite6_grf_ros2"
     headless = _SimulationLaneHeadless(graph)
     runtime = ProgramRuntime(ProgramRunnerConfig(headless_url="http://headless.test", owner_epoch="program-runner.test"),
         headless_client=headless, execution_transport=headless,
@@ -6000,6 +6160,125 @@ def test_simulation_dependency_follows_only_actual_used_target_components(lanes,
         assert headless.graph_reads == 1
     finally:
         runtime.shutdown()
+
+
+def test_motion_feedback_preflight_is_selected_and_leaves_simulator_play_ungated():
+    runtime, headless, _binding = _simulation_lane_fixture()
+    original_owner = runtime._owner  # noqa: SLF001
+    runtime._owner = SimpleNamespace(  # type: ignore[assignment]
+        execution_selection_motion_readiness_scope=lambda run_id, groups: (
+            (),
+            _DIGEST_A,
+            _DIGEST_B,
+        )
+    )
+    headless.program_applied = lambda: pytest.fail(  # type: ignore[method-assign]
+        "non-motion selection must not read Applied"
+    )
+    headless.cclc_component = lambda component_id: pytest.fail(  # type: ignore[method-assign]
+        f"non-motion selection must not read CCLC {component_id}"
+    )
+    try:
+        # Play/Wait selections have no motion target, so feedback is not a
+        # prerequisite for the command that can establish it.
+        runtime._verify_selected_motion_feedback("run.1", ("play_and_wait",))  # noqa: SLF001
+    finally:
+        runtime._owner = original_owner  # type: ignore[assignment]
+        runtime.shutdown()
+
+
+def test_selected_motion_feedback_preflight_blocks_stale_and_recovers_without_effect():
+    runtime, headless, binding = _simulation_lane_fixture()
+    applied = headless.program_applied()
+    original_owner = runtime._owner  # noqa: SLF001
+    runtime._owner = SimpleNamespace(  # type: ignore[assignment]
+        execution_selection_motion_readiness_scope=lambda run_id, groups: (
+            ("lite6_arm",),
+            applied["retained_bundle_id"],
+            applied["graph_revision"],
+        )
+    )
+    available = False
+    reads: list[str] = []
+
+    def component(component_id: str):
+        reads.append(component_id)
+        return {
+            "controllable_component_id": component_id,
+            "retained_bundle_id": applied["retained_bundle_id"],
+            "graph_revision": applied["graph_revision"],
+            "readiness": {
+                "measured_state": {
+                    "required": True,
+                    "available": available,
+                    "error": None if available else {
+                        "message": "Measured feed is stale",
+                    },
+                },
+            },
+        }
+
+    headless.cclc_component = component  # type: ignore[method-assign]
+    with pytest.raises(ProgramRunnerError) as stale:
+        runtime._verify_selected_motion_feedback("run.1", ("all",))  # noqa: SLF001
+    assert stale.value.code == "program_motion_component_readiness_unavailable"
+    assert reads == ["lite6_arm"]
+    controls = {"groups": [{
+        "group_id": "all",
+        "start_allowed": True,
+        "resume_allowed": True,
+        "start_unavailable_reason": None,
+        "resume_unavailable_reason": None,
+    }]}
+    blocked = runtime._motion_feedback_controls("run.1", controls)  # noqa: SLF001
+    assert blocked["groups"][0]["start_allowed"] is False
+    assert blocked["groups"][0]["resume_unavailable_reason"] == (
+        "Measured feed is stale"
+    )
+
+    available = True
+    runtime._verify_selected_motion_feedback("run.1", ("all",))  # noqa: SLF001
+    released = runtime._motion_feedback_controls("run.1", controls)  # noqa: SLF001
+    assert released["groups"][0]["start_allowed"] is True
+    assert released["groups"][0]["resume_allowed"] is True
+    assert reads == ["lite6_arm"] * 4
+    runtime._owner = original_owner  # type: ignore[assignment]
+    runtime.shutdown()
+
+
+def test_resume_motion_rechecks_feedback_before_host_effect():
+    runtime = ProgramRuntime.__new__(ProgramRuntime)
+    runtime._control_effect = (  # type: ignore[method-assign]  # noqa: SLF001
+        lambda request, *, kind, effect: effect()
+    )
+    runtime._verify_selected_motion_feedback = (  # type: ignore[method-assign]  # noqa: SLF001
+        lambda _run_id, _groups: (_ for _ in ()).throw(
+            ProgramRunnerError(
+                "program_motion_component_readiness_unavailable",
+                "Measured feed is stale",
+            )
+        )
+    )
+    runtime._host = SimpleNamespace(  # noqa: SLF001
+        resume_motion=lambda *_args, **_kwargs: pytest.fail(
+            "feedback refusal must precede the host Resume effect"
+        )
+    )
+    request = ProgramSelectionResumeRequest.model_validate({
+        "request_id": "request.motion-resume.blocked",
+        "request_owner_epoch": "composer.epoch.1",
+        "source_label": "operator_ui",
+        "correlation_id": None,
+        "program_run_id": "run.1",
+        "expected_owner_epoch": "program-runner.test",
+        "expected_run_revision": 2,
+        "expected_selection_revision": 1,
+        "group_ids": ["arm"],
+        "reason": "operator Resume",
+    })
+    with pytest.raises(ProgramRunnerError) as blocked:
+        runtime.resume_motion("run.1", request)
+    assert blocked.value.code == "program_motion_component_readiness_unavailable"
 
 
 def test_used_native_runtime_does_not_become_a_mock_or_isaac_lane():
@@ -6208,7 +6487,6 @@ def test_one_runtime_rechecks_used_lane_after_each_current_graph_change():
         profile["isaac_profile"] = "lite6"
         applied["graph_revision"] = binding["graph_revision"] = "sha256:" + "c" * 64
         headless.graph["graph_revision"] = headless.graph["cell_graph"]["graph_revision"] = applied["graph_revision"]
-        headless.graph["cell_graph"]["runtime_units"][0]["configuration"]["isaac_world"] = "lite6_grf_ros2"
         assert runtime._simulation_context_requirement(program=applied["program"],
             program_binding=binding, retained_bundle_id=_DIGEST_A, graph_revision=applied["graph_revision"]) == (
                 True, AvailabilityFact(True))
@@ -6465,35 +6743,6 @@ def test_simulator_dependency_uses_exact_catalog_scope_capability_and_configured
         else:
             assert _simulation_lane_required(runtime, binding, program) is required
             assert headless.graph_reads == (0 if scope == "cell_global" and not required else 1)
-    finally:
-        runtime.shutdown()
-
-
-@pytest.mark.parametrize("program_kind", ["target", "simulator"])
-def test_positive_isaac_profile_requires_existing_sealed_world(program_kind):
-    runtime, headless, binding = _simulation_lane_fixture(lanes=("isaac", "mock"),
-                                                         simulation=_SimulationControl())
-    del headless.graph["cell_graph"]["runtime_units"][0]["configuration"]["isaac_world"]
-    program = (_simulation_lane_program("arm") if program_kind == "target" else
-               {"tree": {"node_id": "simulation.reset", "instance_id": "reset",
-                         "parameters": {}, "children": []}})
-    try:
-        with pytest.raises(ProgramRunOwnerError):
-            _simulation_lane_requirement(runtime, binding, program)
-        assert headless.graph_reads == 1
-    finally:
-        runtime.shutdown()
-
-
-def test_world_string_alone_does_not_supply_simulator_capability():
-    runtime, headless, binding = _simulation_lane_fixture(lanes=("mock", "mock"),
-                                                         simulation=_SimulationControl())
-    headless.graph["cell_graph"]["runtime_units"][0]["configuration"]["isaac_world"] = "lite6_grf_ros2"
-    program = {"tree": {"node_id": "simulation.reset", "instance_id": "reset",
-                        "parameters": {}, "children": []}}
-    try:
-        assert _simulation_lane_requirement(runtime, binding, program) == (
-            True, AvailabilityFact(False, ("program_runtime_owner_unavailable",)))
     finally:
         runtime.shutdown()
 

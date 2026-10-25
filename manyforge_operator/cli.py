@@ -11,7 +11,6 @@ from .contracts import LaunchOperation, LaunchProfile, OperatorCommandResult
 from .isaac import (
     DEFAULT_RUNTIME_HOST,
     DEFAULT_SIMULATOR_HOST,
-    DEFAULT_WORLD_NAME,
     IsaacLauncher,
     IsaacLauncherConfig,
     RemoteNativeConfig,
@@ -55,13 +54,8 @@ def _parser() -> argparse.ArgumentParser:
     start.add_argument("--poll-interval-s", type=float, default=0.25)
     start.add_argument("--reconciliation-period-ms", type=int, default=500)
     start.add_argument("--manager-timeout-s", type=float, default=60.0)
-    start.add_argument("--isaac-executable", type=Path)
-    start.add_argument("--world-path", type=Path)
-    start.add_argument("--guard-startup-config", type=Path,
-                       help="Explicit scene-owned Kit TOML merged at Isaac startup; no default")
     start.add_argument("--joint-commands-topic",
                        help="Arm command topic from the retained host profile; omission keeps the launch default")
-    start.add_argument("--expected-world-name", default=DEFAULT_WORLD_NAME)
     start.add_argument("--simulator-host", default=DEFAULT_SIMULATOR_HOST)
     start.add_argument("--control-host", default="")
     start.add_argument("--remote-target", default=DEFAULT_RUNTIME_HOST)
@@ -80,8 +74,6 @@ def _parser() -> argparse.ArgumentParser:
     start.add_argument("--remote-isaac-site-settings")
     start.add_argument("--remote-simulation-control-config")
     start.add_argument("--remote-bridge-state-root")
-    start.add_argument("--local-ros-setup-script", type=Path)
-    start.add_argument("--local-ros-environment-script", type=Path)
     start.add_argument("--remote-ros-setup-script")
     start.add_argument("--remote-ros-environment-script")
     start.add_argument("--remote-python-executable", default="python3")
@@ -153,8 +145,6 @@ def _config(args: argparse.Namespace) -> NativeLauncherConfig:
 
 def _isaac_config(args: argparse.Namespace) -> IsaacLauncherConfig:
     required = (
-        "isaac_executable",
-        "world_path",
         "remote_source_root",
         "remote_container_image_id",
         "remote_container_name",
@@ -175,10 +165,6 @@ def _isaac_config(args: argparse.Namespace) -> IsaacLauncherConfig:
     missing = [name.replace("_", "-") for name in required if getattr(args, name, None) is None]
     if missing:
         raise ValueError(f"isaac profile requires: {', '.join(missing)}")
-    local_environment = args.local_ros_environment_script
-    if local_environment is None:
-        local_environment = args.source_root / "config/ros/isaac_i9.env.sh"
-    local_setup = args.local_ros_setup_script or Path("/opt/ros/jazzy/setup.bash")
     remote = RemoteNativeConfig(
         target=args.remote_target,
         source_root=args.remote_source_root,
@@ -209,9 +195,6 @@ def _isaac_config(args: argparse.Namespace) -> IsaacLauncherConfig:
     peers = tuple(sorted(set(args.static_peers or ("192.168.1.132", "192.168.1.68"))))
     return IsaacLauncherConfig(
         source_root=args.source_root,
-        isaac_executable=args.isaac_executable,
-        world_path=args.world_path,
-        guard_startup_config=args.guard_startup_config,
         joint_commands_topic=args.joint_commands_topic,
         state_root=args.state_root,
         instance_id=args.instance_id,
@@ -219,9 +202,6 @@ def _isaac_config(args: argparse.Namespace) -> IsaacLauncherConfig:
         simulator_host=args.simulator_host,
         control_host=args.control_host,
         static_peers=peers,
-        local_ros_setup_script=local_setup,
-        local_ros_environment_script=local_environment,
-        expected_world_name=args.expected_world_name,
         expected_source_fingerprint=args.expected_source_fingerprint,
         expected_head_commit=args.expected_head_commit,
         expected_head_tree=args.expected_head_tree,

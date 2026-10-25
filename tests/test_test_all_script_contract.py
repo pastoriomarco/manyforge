@@ -843,7 +843,8 @@ def test_i9_isaac_launcher_enforces_the_recorded_topology_and_owner_split() -> N
         assert stale_override in topology_source
     assert "build-ros2-control-runtime.sh" in source
     assert "isaac_topic_based_control.launch.py" in source
-    assert "simulation_interfaces" in source
+    # Attach-only startup does not own or launch the user's Isaac process.
+    assert "simulation_interfaces" not in source
     assert "runtime_namespace:=${runtime_namespace}" in source
     assert "command_gate_owner_namespace" not in source
     assert "manager_run_root:=${MANYFORGE_MANAGER_RUN_ROOT}" in source
@@ -948,16 +949,11 @@ def test_ros_selector_builds_and_tests_the_q9_integration_graph() -> None:
     for suite in (
         "JtcExecutionPort",
         "RetainedRos2ControlRuntimeHandleTest",
-        "RetainedIsaacArmGuardBindingTest",
         "Ros2ControlKernelStopIntegrationTest",
     ):
         assert f'"{suite}"' in body
     assert "ROS_INTEGRATION_TOPIC_INSTALL=/opt/manyforge/topic_based_ros2_control/install" in source
     assert "ROS_INTEGRATION_DATA_OVERLAY=/opt/manyforge/xarm_description/install" in source
-    # Track 2's guard selection stays as delivered.
-    assert "        exts/manyforge.isaac.command_guard/tests/ \\\n" in source
-
-
 def test_bindings_selector_routes_to_the_real_i2_builder() -> None:
     source = _TEST_ALL.read_text(encoding="utf-8")
     body = source.split("run_pybind_tests() {", 1)[1].split("run_python_tests() {", 1)[0]

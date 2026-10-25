@@ -19,6 +19,7 @@ from manyforge_behavior.assistant_program_port import (
 from manyforge_behavior.kernel_client import (
     KernelOperationObservationUnavailableError,
     KernelClient,
+    KernelClientResponseError,
     KernelOperationAdmissionRejectedError,
 )
 from manyforge_behavior.orchestration_ports import OwnerTaskSettlementPendingError, OwnerTaskState
@@ -71,6 +72,7 @@ class _Transport:
         self.stop_status_reads = 0
         self.stop_states: dict[str, str] = {}
         self.stop_generations: dict[str, int] = {}
+        self.stop_fault_offer: Mapping[str, Any] | None = None
         self.released_scope_stops: list[tuple[str, str, int]] = []
         self.identity_reads = 0
         self.owner_epoch = "kernel.epoch.7"
@@ -187,6 +189,14 @@ class _Transport:
                 "state": self.stop_states[stop_id],
                 "stop_generation": self.stop_generations[stop_id],
             },
+        }
+
+    def stop_fault(self):
+        return {
+            "ok": True,
+            "command": "get_stop_fault",
+            "stop_fault": deepcopy(self.stop_fault_offer),
+            "global_rule_recovery_offers": [],
         }
 
 
@@ -1159,6 +1169,146 @@ def test_independent_lost_acceptance_reply_is_reconciled_by_reset() -> None:
     assert len(transport.submit_attempts) == 2
     assert len(transport.operations) == 1
     assert [control[0] for control in transport.controls].count("reset") == 1
+
+
+def test_partial_stop_reset_requires_resident_operations_to_be_reset_first() -> None:
+    transport = _Transport()
+    port = NativeKernelProgramPort(KernelClient(transport))
+    port.bind(_context())
+    started = port.operations.start(
+        "motion.move_to_pose", _identity("partial-reset"), _motion_inputs()
+    )
+    transport.operations[started.task_id]["state"] = "executing"
+    port.scope.request_stop("program-run.1", "stop.partial", "Reset containment")
+    transport.stop_states["scope-stop-1"] = "partial"
+
+    with pytest.raises(
+        ProductionPortError, match="cannot reset a Program run with active native operations"
+    ):
+        port.scope.reset("program-run.1")
+
+    assert transport.resident[started.task_id] is True
+    assert not [control for control in transport.controls if control[0] == "reset"]
+
+
+def test_partial_stop_reset_accepts_exact_generation_after_intervention_is_retired() -> None:
+    transport = _Transport()
+    port = NativeKernelProgramPort(KernelClient(transport))
+    port.bind(_context())
+    started = port.operations.start(
+        "motion.move_to_pose", _identity("partial-reset"), _motion_inputs()
+    )
+    transport.operations[started.task_id].update(
+        {"state": "intervention_required", "operation_revision": 4}
+    )
+    port.scope.request_stop("program-run.1", "stop.partial", "Reset containment")
+    transport.stop_states["scope-stop-1"] = "partial"
+
+    reset = port.scope.reset("program-run.1")
+
+    assert reset.state is ProgramRunScopeState.SETTLED
+    assert transport.resident[started.task_id] is False
+    assert [control[0] for control in transport.controls].count("reset") == 1
+    assert not transport.released_scope_stops
+
+
+def test_partial_stop_reset_keeps_intervention_task_and_fence_on_nonquiescent_refusal() -> None:
+    transport = _Transport()
+    refusal: dict[str, Any] = {}
+    port = NativeKernelProgramPort(KernelClient(transport))
+    port.bind(_context())
+    started = port.operations.start(
+        "motion.move_to_pose", _identity("partial-not-quiescent"), _motion_inputs()
+    )
+    transport.operations[started.task_id].update(
+        {"state": "intervention_required", "operation_revision": 4}
+    )
+    port.scope.request_stop("program-run.1", "stop.partial", "Reset containment")
+    transport.stop_states["scope-stop-1"] = "partial"
+
+    def refuse_nonquiescent(_operation_id, _body):
+        transport.controls.append(("reset", started.task_id, {}))
+        refusal.update({
+            "ok": False,
+            "error": {
+                "code": "execution_rejected",
+                "message": "prepared execution is not quiescent",
+                "details": {"reason": "prepared_execution_not_quiescent"},
+            },
+        })
+        return refusal
+
+    transport.reset = refuse_nonquiescent
+    with pytest.raises(
+        KernelClientResponseError, match="did not return a successful envelope"
+    ):
+        port.scope.reset("program-run.1")
+
+    assert refusal["error"]["details"]["reason"] == "prepared_execution_not_quiescent"
+    assert transport.resident[started.task_id] is True
+    assert port._task(started.task_id).task_id == started.task_id
+    assert port.scope.capture_stop("program-run.1") == ("scope-stop-1", 1)
+    assert not transport.released_scope_stops
+
+
+def test_partial_stop_reset_refuses_active_fault_and_unknown_fault_observation() -> None:
+    for fault_offer in ({"latch": {"latch_id": "stop-fault.1"}}, "missing-read"):
+        transport = _Transport()
+        port = NativeKernelProgramPort(KernelClient(transport))
+        port.bind(_context())
+        port.scope.request_stop("program-run.1", "stop.partial", "Reset containment")
+        transport.stop_states["scope-stop-1"] = "partial"
+        if fault_offer == "missing-read":
+            transport.stop_fault = lambda: {"ok": True, "command": "get_stop_fault"}
+        else:
+            transport.stop_fault_offer = fault_offer
+
+        with pytest.raises(ProductionPortError, match="Stop fault"):
+            port.scope.reset("program-run.1")
+
+
+def test_partial_stop_does_not_reconcile_unknown_admission() -> None:
+    transport = _LostAcceptanceReplyTransport()
+    port = NativeKernelProgramPort(KernelClient(transport))
+    port.bind(_context())
+    port.operations.start(
+        "motion.move_to_pose", _identity("partial-unknown"), _motion_inputs()
+    )
+    port.scope.request_stop("program-run.1", "stop.partial", "Reset containment")
+    transport.stop_states["scope-stop-1"] = "partial"
+
+    with pytest.raises(
+        ProductionPortError,
+        match="unknown operation admission requires settled Program Stop",
+    ):
+        port.scope.reset("program-run.1")
+
+    assert len(transport.submit_attempts) == 1
+    assert not [control for control in transport.controls if control[0] == "reset"]
+
+
+def test_partial_stop_cannot_release_resume_fence_or_accept_wrong_generation() -> None:
+    transport = _Transport()
+    port = NativeKernelProgramPort(KernelClient(transport))
+    port.bind(_context())
+    port.scope.request_stop("program-run.1", "stop.partial", "Reset containment")
+    transport.stop_states["scope-stop-1"] = "partial"
+
+    with pytest.raises(ProductionPortError, match="cannot be released before settlement"):
+        port.scope.release_stop("program-run.1")
+    assert not transport.released_scope_stops
+
+    transport.stop_states["scope-stop-1"] = "succeeded"
+    status = transport.stop_status
+
+    def wrong_generation(stop_id):
+        response = status(stop_id)
+        response["stop_status"]["stop_generation"] += 1
+        return response
+
+    transport.stop_status = wrong_generation
+    with pytest.raises(ProductionPortError, match="settlement generation is stale"):
+        port.scope.reset("program-run.1")
 
 
 def test_reset_does_not_turn_a_pre_acceptance_lost_reply_into_motion() -> None:

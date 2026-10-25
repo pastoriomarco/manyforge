@@ -166,7 +166,6 @@
   ],
   "deployment_artifact_id": "isaac_manipulator_scene_light_assistant",
   "description": "Retained Isaac UR10e light-scene deployment with the ROS 2 control execution product and the finite assistant scene-authoring overlay; simulator mutation remains operator-approved.",
-  "isaac_world": "isaac_manipulator_scene_light",
   "name": "isaac_manipulator_scene_light_assistant",
   "policies": {
     "interrupt_config": {

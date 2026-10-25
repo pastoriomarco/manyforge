@@ -226,7 +226,7 @@ ActivationDeploymentIntent parse_activation_deployment_intent(
       value,
       {"api_version", "attachments", "components", "deployment_artifact_id",
        "name", "policies"},
-      {"assistant_profile_id", "compatibility", "description", "isaac_world"},
+      {"assistant_profile_id", "compatibility", "description"},
       "root");
   if (text(member(value, "api_version", "root"), "api_version") !=
       kApiVersion) {
@@ -342,11 +342,6 @@ ActivationDeploymentIntent parse_activation_deployment_intent(
   const auto &name = text(member(value, "name", "root"), "name");
   if (name.size() > 256U) fail("name exceeds its byte bound");
 
-  std::optional<std::string> isaac_world;
-  if (const auto *world = value.find_object_member("isaac_world")) {
-    isaac_world = portable_identifier(*world, "isaac_world");
-  }
-
   return ActivationDeploymentIntent{
       deployment_id,
       name,
@@ -355,7 +350,6 @@ ActivationDeploymentIntent parse_activation_deployment_intent(
       optional_portable_identifier(
           value.find_object_member("assistant_profile_id"),
           "assistant_profile_id"),
-      std::move(isaac_world),
       member(value, "attachments", "root"),
       member(value, "policies", "root"),
       value.find_object_member("compatibility") == nullptr

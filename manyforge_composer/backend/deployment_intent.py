@@ -367,7 +367,7 @@ def validate_deployment_intent(value: Any, *, source: str) -> dict[str, Any]:
         "attachments",
         "policies",
     }
-    optional = {"description", "assistant_profile_id", "compatibility", "isaac_world"}
+    optional = {"description", "assistant_profile_id", "compatibility"}
     _require_exact_fields(
         intent, required=required, optional=optional, label=f"{source}: Deployment intent"
     )
@@ -384,9 +384,6 @@ def validate_deployment_intent(value: Any, *, source: str) -> dict[str, Any]:
         if type(intent["description"]) is not str or len(intent["description"].encode("utf-8")) > 4096:
             _fail(f"{source}: description is invalid")
         result["description"] = intent["description"]
-
-    if "isaac_world" in intent:
-        result["isaac_world"] = _require_id(intent["isaac_world"], f"{source}: isaac_world")
 
     components = intent["components"]
     if type(components) is not list or len(components) > _MAX_COMPONENTS:

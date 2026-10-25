@@ -35,6 +35,13 @@ export interface IoSignalRuntimeConfiguration {
   ioProvider?: boolean;
 }
 
+/** One exact retained motion endpoint offered to geometric-contact authoring. */
+export interface GeometricContactEndpointOption {
+  componentId: string;
+  targetId: string;
+  frameRoleId: string;
+}
+
 /**
  * Declare the boolean input and output signals of one runtime unit. The whole
  * `io_signals` array commits through the ordinary Deployment Draft mutation.
@@ -45,9 +52,12 @@ export interface IoSignalRuntimeConfiguration {
 export function IoSignalConfigurationSection({
   controller,
   runtimes,
+  geometricContactEndpoints = [],
 }: {
   controller: DeploymentWorkspaceController;
   runtimes: IoSignalRuntimeConfiguration[];
+  /** Exact retained motion endpoints used to select geometric-contact references. */
+  geometricContactEndpoints?: readonly GeometricContactEndpointOption[];
 }) {
   const [selected, setSelected] = useState(0);
   // Arms are listed only while they still declare rows (to review/remove them).
@@ -151,6 +161,7 @@ export function IoSignalConfigurationSection({
                   draft={row.draft}
                   disabled={disabled}
                   ioProvider={runtime.ioProvider === true}
+                  geometricContactEndpoints={geometricContactEndpoints}
                   onChange={(patch) => updateRow(index, patch)}
                   onDirection={(direction) => setDirection(index, direction)}
                   onRemove={() => setRows(rows.filter((_row, rowIndex) => rowIndex !== index))}
@@ -288,6 +299,7 @@ export function IoSignalInputFields({
   draft,
   disabled,
   ioProvider = false,
+  geometricContactEndpoints = [],
   onChange,
   onDirection,
   onRemove,
@@ -297,6 +309,8 @@ export function IoSignalInputFields({
   disabled: boolean;
   /** An I/O device row: component read-only. */
   ioProvider?: boolean;
+  /** Exact retained motion endpoints used to select geometric-contact references. */
+  geometricContactEndpoints?: readonly GeometricContactEndpointOption[];
   onChange: (patch: Partial<IoSignalInputDraft>) => void;
   onDirection: (direction: 'input' | 'output') => void;
   onRemove?: () => void;
@@ -304,6 +318,11 @@ export function IoSignalInputFields({
   const label = draft.signalName.trim() === '' ? `Signal ${index + 1}` : draft.signalName;
   const profiles = Object.keys(IO_SOURCE_PROFILE_LABELS) as IoSourceProfile[];
   const liveness = inputLivenessMode(draft);
+  const endpointOptions = [...geometricContactEndpoints]
+    .sort((left, right) => JSON.stringify(left).localeCompare(JSON.stringify(right)));
+  const endpointValue = JSON.stringify([
+    draft.endpointComponentId, draft.endpointTargetId, draft.endpointFrameRoleId,
+  ]);
   const text = (name: string, field: keyof IoSignalInputDraft, help?: string) => (
     <label className="deployment-focused-field" key={field}>
       <span>{name}</span>
@@ -341,7 +360,8 @@ export function IoSignalInputFields({
           </select>
         </label>
         {text('Source', 'sourceId', 'Signals sharing one source must agree on profile, topic, ingress depth and liveness.')}
-        {draft.profile !== 'mock' && text('Topic', 'topic', draft.profile === 'ros_bool' ? undefined
+        {draft.profile !== 'mock' && draft.profile !== 'geometric_contact'
+          && text('Topic', 'topic', draft.profile === 'ros_bool' ? undefined
           : 'Absolute, fully resolved topic, e.g. /io_and_status_controller/io_states.')}
         {draft.profile === 'ur_io_states' && number('Pin', 'pin', `0–${IO_UR_MAXIMUM_PIN}`, 'UR digital input pin.')}
         {draft.profile === 'ros2_control_gpio' && text('Group', 'group', 'The exact GPIO group name.')}
@@ -356,6 +376,41 @@ export function IoSignalInputFields({
               <option value="change_only">Change only (liveness unproven)</option>
             </select>
           </label>
+        )}
+        {draft.profile === 'geometric_contact' && (
+          <>
+            {endpointOptions.length > 0 ? (
+              <label className="deployment-focused-field">
+                <span>Contact endpoint</span>
+                <select aria-label={`${label} Contact endpoint`} value={endpointValue}
+                  disabled={disabled}
+                  onChange={(event) => {
+                    const [endpointComponentId, endpointTargetId, endpointFrameRoleId] = JSON.parse(event.target.value) as string[];
+                    onChange({ endpointComponentId, endpointTargetId, endpointFrameRoleId });
+                  }}>
+                  <option value={JSON.stringify(['', '', ''])}>Select a motion endpoint</option>
+                  {!endpointOptions.some((option) => JSON.stringify([
+                    option.componentId, option.targetId, option.frameRoleId,
+                  ]) === endpointValue) && draft.endpointFrameRoleId !== ''
+                    && <option value={endpointValue}>{draft.endpointComponentId} / {draft.endpointTargetId} / {draft.endpointFrameRoleId} (not in current model)</option>}
+                  {endpointOptions.map((option) => {
+                    const value = JSON.stringify([option.componentId, option.targetId, option.frameRoleId]);
+                    return <option key={value} value={value}>
+                      {option.componentId} / {option.targetId} / {option.frameRoleId}
+                    </option>;
+                  })}
+                </select>
+              </label>
+            ) : (
+              <>
+                {text('Endpoint component', 'endpointComponentId')}
+                {text('Endpoint target', 'endpointTargetId')}
+                {text('Endpoint frame role', 'endpointFrameRoleId')}
+              </>
+            )}
+            {text('Target Scene resource', 'targetSceneResourceId',
+              'Exact logical Scene resource id whose current collision shapes are queried.')}
+          </>
         )}
         {draft.profile === 'mock' ? (
           <label className="deployment-focused-field">
@@ -378,6 +433,14 @@ export function IoSignalInputFields({
             : 'provider validity only; no sample age applies.'}
         {' '}Transitions are sampled only.
       </p>
+      {draft.profile === 'geometric_contact' && (
+        <p className="field-help" data-geometric-contact-note>
+          Derived read-only input. Runtime resolves the selected endpoint&apos;s existing contact-body roles and the
+          Scene resource; neither is copied into the Program. Missing, stale, busy or inconclusive geometry is
+          unavailable, never false. A maximum age below runtime production latency can make the input stale.
+          Manual and timed Mock writes do not apply.
+        </p>
+      )}
       {liveness === 'change_only' && (
         <p className="inline-message severity-warning" data-io-liveness-warning>{IO_LIVENESS_UNPROVEN_WARNING}</p>
       )}

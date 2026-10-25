@@ -4,6 +4,8 @@
 #include <manyforge_core/types/program_contract.hpp>
 #include <manyforge_core/types/stop_control.hpp>
 
+#include <string_view>
+
 namespace manyforge::core {
 
 /// Internal owner request. Public adapters cannot supply captured membership.
@@ -60,6 +62,28 @@ struct ProgramNodeStopEffectDTO final {
   StopGeneration stop_generation;
 };
 
+enum class ProgramSelectionReleaseBlockReasonDTO : std::uint8_t {
+  kCellMotionAdmissionClosed,
+  kCellMotionAdmissionUnreconciled,
+  kProgramRunAdmissionPending,
+  kProgramHaltActive
+};
+
+[[nodiscard]] inline constexpr std::string_view program_selection_release_block_reason_token(
+    const ProgramSelectionReleaseBlockReasonDTO reason) noexcept {
+  switch (reason) {
+    case ProgramSelectionReleaseBlockReasonDTO::kCellMotionAdmissionClosed:
+      return "cell_motion_admission_closed";
+    case ProgramSelectionReleaseBlockReasonDTO::kCellMotionAdmissionUnreconciled:
+      return "cell_motion_admission_unreconciled";
+    case ProgramSelectionReleaseBlockReasonDTO::kProgramRunAdmissionPending:
+      return "program_run_admission_pending";
+    case ProgramSelectionReleaseBlockReasonDTO::kProgramHaltActive:
+      return "program_halt_active";
+  }
+  return "selection_release_unavailable";
+}
+
 struct ProgramExecutionScopeStateDTO final {
   RequestOwnerEpoch request_owner_epoch;
   RequestOwnerEpoch program_runner_owner_epoch;
@@ -69,6 +93,7 @@ struct ProgramExecutionScopeStateDTO final {
   // Sparse, node-index ordered; omitted nodes are not held.
   std::vector<ProgramNodeHoldDTO> held_nodes;
   std::vector<ProgramNodeStopEffectDTO> pending_effects;
+  std::optional<ProgramSelectionReleaseBlockReasonDTO> selection_release_block_reason{};
 };
 
 struct ProgramExecutionSelectionAcceptedDTO final {

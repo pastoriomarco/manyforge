@@ -105,6 +105,7 @@ class ProgramRunOwnerRecoveryIncompleteError(ProgramRunOwnerError):
 
 
 PROGRAM_RESET_STOP_REASON = "operator requested Program cycle Reset"
+PROGRAM_RUN_STOP_PARTIAL_REASON_CODE: Final = "program_run_stop_partial"
 
 
 class ProgramRunState(Enum):
@@ -476,6 +477,11 @@ class _RunEntry:
     state_after_finalize_origin: Mapping[str, Any] | None = None
     resources_released: bool = False
     reset_containment: ProgramRunScopeSnapshot | None = None
+    # Preserve the exact terminal scope sample; the public terminal snapshot
+    # normalizes its count to zero after settlement.
+    terminal_settlement_active_operation_count: int | None = None
+    # Bound to each Reset-owned Stop occurrence before its Stop is requested.
+    reset_containment_pre_stop_active_operation_count: int | None = None
     transition_lock: RLock = field(default_factory=RLock, repr=False)
     motion_stop_lock: RLock = field(default_factory=RLock, repr=False)
 
@@ -852,6 +858,51 @@ class ProgramRunOwner:
 
         with self._lock:
             return self._snapshot(self._entry(program_run_id))
+
+    def execution_selection_motion_readiness_scope(
+        self, program_run_id: str, group_ids: Sequence[str]
+    ) -> tuple[tuple[str, ...], str, str]:
+        """Components and identity captured for selected motion targets."""
+
+        with self._lock:
+            entry = self._entry(program_run_id)
+            run = entry.run
+            roles: set[str] = set()
+            try:
+                for group_id in group_ids:
+                    roles.update(run.execution_selection_motion_target_roles(group_id))
+            except ProgramRuntimeError as error:
+                raise ProgramRunOwnerError(str(error)) from error
+            if not roles:
+                return (), run.capture.retained_bundle_id, run.capture.graph_revision
+            bindings: dict[str, str] = {}
+            for row in entry.program_binding.get("target_role_bindings", ()):
+                target = row.get("target_role_id") if isinstance(row, Mapping) else None
+                component = (
+                    row.get("controllable_component_id")
+                    if isinstance(row, Mapping)
+                    else None
+                )
+                if (
+                    not isinstance(target, str)
+                    or not target
+                    or not isinstance(component, str)
+                    or not component
+                    or target in bindings
+                ):
+                    raise ProgramRunOwnerError(
+                        "captured Program target bindings are not exact"
+                    )
+                bindings[target] = component
+            if not roles <= bindings.keys():
+                raise ProgramRunOwnerError(
+                    "selected motion target has no captured component binding"
+                )
+            return (
+                tuple(sorted({bindings[role] for role in roles})),
+                run.capture.retained_bundle_id,
+                run.capture.graph_revision,
+            )
 
     def value_store(self, program_run_id: str) -> ProgramValueStore:
         """The run's value store, for its BB publication subscription."""
@@ -1409,6 +1460,11 @@ class ProgramRunOwner:
                     else:
                         self._restore_after_stop(entry)
                     if settled:
+                        entry.terminal_settlement_active_operation_count = (
+                            active_count
+                            if active_count == 0 and scope_reason is None
+                            else None
+                        )
                         self._mark_finalizing_after_stop(entry)
                         finalize = True
                 snapshot = self._snapshot(entry)
@@ -1582,11 +1638,37 @@ class ProgramRunOwner:
     ) -> tuple[ProgramRunSnapshot, dict[str, Any]]:
         """Atomically derive one Run/control projection from retained facts."""
         with self._lock:
-            transition_lock = self._entry(program_run_id).transition_lock
+            entry = self._entry(program_run_id)
+            run = entry.run
+            transition_lock = entry.transition_lock
+            observed_eligible = entry.state in {
+                ProgramRunState.RUNNING,
+                ProgramRunState.INTERVENTION_REQUIRED,
+            }
+
+        # This fresh Kernel read is advisory and must not hold the transition
+        # lock: Program Halt uses that lock. Read it on every eligible
+        # projection (admission can change without a selection revision), then
+        # verify below that the retained owner entry is still the same run.
+        selection_release_block_reason = None
+        selection_release_observation_error = False
+        if observed_eligible:
+            try:
+                selection_scope = run.read_operator_stop_scope()
+                selection_release_block_reason = selection_scope.get(
+                    "selection_release_block_reason"
+                )
+            except Exception:
+                selection_release_observation_error = True
+
         with transition_lock:
             with self._lock:
-                entry = self._entry(program_run_id)
-                run = entry.run
+                current = self._entry(program_run_id)
+                if current is not entry or current.run is not run:
+                    raise ProgramRunOwnerError(
+                        "Program run changed during controls projection"
+                    )
+                entry = current
                 live = self._snapshot(entry)
                 eligible = entry.state in {
                     ProgramRunState.RUNNING,
@@ -1594,6 +1676,11 @@ class ProgramRunOwner:
                 }
                 snapshot = run.operator_stop_scope()
                 program_binding = entry.program_binding
+            # If eligibility began after the pre-lock read, fail closed for
+            # release in this projection; the next snapshot performs a fresh
+            # read. Never reuse a blocker based only on selection revision.
+            if eligible and not observed_eligible:
+                selection_release_observation_error = True
             unavailable = (
                 run.stop_observation_error if eligible else "program_run_not_running"
             )
@@ -1665,6 +1752,13 @@ class ProgramRunOwner:
                     and reason is None
                     and state in {"ready", "held", "mixed"}
                 )
+                if release_allowed:
+                    if selection_release_observation_error:
+                        release_allowed = False
+                        reason = "program_selection_observation_unavailable"
+                    elif selection_release_block_reason is not None:
+                        release_allowed = False
+                        reason = selection_release_block_reason
                 release_reason = (
                     None if release_allowed else reason or "selection_not_releasable"
                 )
@@ -2604,6 +2698,9 @@ class ProgramRunOwner:
                         "Reset containment requires a terminal Run"
                     )
                 entry.reset_containment = None
+                entry.reset_containment_pre_stop_active_operation_count = (
+                    entry.terminal_settlement_active_operation_count
+                )
             try:
                 scope = self._scope.request_stop(
                     program_run_id, stop_request_id, PROGRAM_RESET_STOP_REASON
@@ -2633,10 +2730,19 @@ class ProgramRunOwner:
 
     def reset_containment_settled(self, program_run_id: str) -> bool:
         with self._lock:
-            scope = self._entry(program_run_id).reset_containment
+            entry = self._entry(program_run_id)
+            scope = entry.reset_containment
+            pre_stop_active_count = (
+                entry.reset_containment_pre_stop_active_operation_count
+            )
         if scope is None:
             raise ProgramRunOwnerError("Reset containment has not been requested")
         if scope.state is ProgramRunScopeState.UNKNOWN:
+            if (
+                scope.reason_code == PROGRAM_RUN_STOP_PARTIAL_REASON_CODE
+                and pre_stop_active_count == 0
+            ):
+                return True
             raise ProgramRunOwnerOutcomeUnknownError(
                 scope.reason_code or "Reset containment outcome is unknown"
             )
@@ -2760,6 +2866,11 @@ class ProgramRunOwner:
                 else:
                     self._restore_after_stop(entry)
                 if entry.state is ProgramRunState.STOPPING and settled:
+                    entry.terminal_settlement_active_operation_count = (
+                        active_count
+                        if active_count == 0 and scope_reason is None
+                        else None
+                    )
                     self._mark_finalizing_after_stop(entry)
                     finalize = True
                 snapshot = self._snapshot(entry)
@@ -3077,7 +3188,7 @@ class ProgramRunOwner:
             )
             try:
                 scope_snapshot = self._scope.observe(program_run_id)
-                _active_count, scope_settled, _scope_reason = self._scope_fields(
+                active_count, scope_settled, scope_reason = self._scope_fields(
                     scope_snapshot,
                     program_run_id,
                 )
@@ -3103,6 +3214,11 @@ class ProgramRunOwner:
             with self._lock:
                 entry = self._entry(program_run_id)
                 if entry.state is ProgramRunState.RUNNING:
+                    entry.terminal_settlement_active_operation_count = (
+                        active_count
+                        if active_count == 0 and scope_reason is None
+                        else None
+                    )
                     terminal = (
                         {
                             "reason_code": None,

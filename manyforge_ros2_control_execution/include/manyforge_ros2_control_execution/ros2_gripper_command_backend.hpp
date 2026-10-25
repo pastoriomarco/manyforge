@@ -16,6 +16,7 @@
 
 #include <atomic>
 #include <chrono>
+#include <condition_variable>
 #include <control_msgs/action/gripper_command.hpp>
 #include <cstdint>
 #include <functional>
@@ -31,6 +32,7 @@
 #include <rclcpp_action/rclcpp_action.hpp>
 #include <sensor_msgs/msg/joint_state.hpp>
 #include <string>
+#include <stop_token>
 #include <unordered_map>
 #include <vector>
 
@@ -71,6 +73,12 @@ struct Ros2GripperActionConfig {
   /// publication.
   std::function<core::Result<void>(double)> publish_display_position;
   core::GripperOutputMode output_mode{core::GripperOutputMode::kCommanded};
+};
+
+struct Ros2GripperLifecycleResult {
+  bool succeeded{};
+  bool effect_started{};
+  std::optional<core::ErrorDTO> error;
 };
 
 /// One bounded, non-blocking readiness read for a configured gripper
@@ -135,6 +143,15 @@ public:
   void invalidate_gripper_commands(
       core::GripperInvalidationReason reason) noexcept override;
   void authorize_gripper_commands() noexcept override;
+  core::Result<void> try_authorize_gripper_commands() noexcept override;
+  [[nodiscard]] Ros2GripperLifecycleResult authorize_lifecycle_gripper(
+      const std::string &gripper_id);
+  [[nodiscard]] bool lifecycle_disable_pending(
+      const std::string &gripper_id) const;
+  [[nodiscard]] Ros2GripperLifecycleResult prepare_lifecycle_gripper(
+      const std::string &gripper_id);
+  [[nodiscard]] Ros2GripperLifecycleResult disable_lifecycle_gripper(
+      const std::string &gripper_id, std::stop_token cancellation);
 
 private:
   using GripperCommand = control_msgs::action::GripperCommand;
@@ -146,11 +163,18 @@ private:
     rclcpp::Subscription<sensor_msgs::msg::JointState>::SharedPtr
         joint_state_sub;
     mutable std::mutex mutex;
+    std::condition_variable_any lifecycle_condition;
     GoalHandleGripper::SharedPtr active_goal_handle;
     std::string state = "idle";
     bool executing = false;
     bool goal_accepted = false;
     bool cancel_pending = false;
+    bool lifecycle_disable_pending = false;
+    bool lifecycle_disable_terminal = false;
+    bool lifecycle_disable_failed = false;
+    bool lifecycle_cancel_dispatched = false;
+    std::uint64_t lifecycle_disable_command_id = 0;
+    std::uint64_t lifecycle_disable_generation = 0;
     std::uint64_t command_id = 0;
     std::optional<core::AddressedGripperCommandIdentityDTO> addressed_identity;
     std::uint64_t generation = 0;

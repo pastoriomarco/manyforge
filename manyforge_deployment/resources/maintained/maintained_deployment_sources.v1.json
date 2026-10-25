@@ -1006,7 +1006,6 @@
     },
     {
       "deployment_source": "examples/isaac_lite6_lite_gripper_pick_and_place.deployment.yaml",
-      "isaac_world": "lite6_grf_ros2",
       "deployment_artifact_id": "isaac_lite6_lite_gripper_pick_and_place",
       "cell_id": "isaac_lite6_pick_place_cell",
       "name": "isaac_lite6_lite_gripper_pick_and_place",
@@ -1059,7 +1058,6 @@
     },
     {
       "deployment_source": "examples/isaac_manipulator_scene_light_assistant.deployment.yaml",
-      "isaac_world": "isaac_manipulator_scene_light",
       "deployment_artifact_id": "isaac_manipulator_scene_light_assistant",
       "cell_id": "isaac_ur10e_assistant_cell",
       "name": "isaac_manipulator_scene_light_assistant",
@@ -1114,7 +1112,6 @@
     },
     {
       "deployment_source": "examples/isaac_manipulator_scene_light_ros2_control.deployment.yaml",
-      "isaac_world": "isaac_manipulator_scene_light",
       "deployment_artifact_id": "isaac_manipulator_scene_light_ros2_control",
       "cell_id": "isaac_ur10e_light_cell",
       "name": "isaac_manipulator_scene_light_ros2_control",
@@ -1167,7 +1164,6 @@
     },
     {
       "deployment_source": "examples/isaac_manipulator_scene_light_ros2_control_collision.deployment.yaml",
-      "isaac_world": "isaac_manipulator_scene_light",
       "deployment_artifact_id": "isaac_manipulator_scene_light_ros2_control_collision",
       "cell_id": "isaac_ur10e_collision_cell",
       "name": "isaac_manipulator_scene_light_ros2_control_collision",
@@ -1363,7 +1359,6 @@
     },
     {
       "deployment_source": "examples/trocar_lite6_foundationpose_pick.deployment.yaml",
-      "isaac_world": "test_scene_realsense_foundationpose_trocar",
       "deployment_artifact_id": "trocar_lite6_foundationpose_pick",
       "cell_id": "isaac_lite6_trocar_cell",
       "name": "trocar_lite6_foundationpose_pick",

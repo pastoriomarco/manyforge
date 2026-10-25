@@ -973,7 +973,7 @@ TEST(ResolvedStopBasePlanResolverTest, ModelBackedCommandedGripperWithoutRowReta
     const auto fixture = test::make_lite6_controllable_retention_fixture(
         false, false, 1U, true, true, {}, false, true, "resource", true,
         {}, {}, true, false, false, std::nullopt, false,
-        test::kLite6ArmTargetId, std::nullopt, std::nullopt, {}, {}, true, {},
+        test::kLite6ArmTargetId, std::nullopt, std::nullopt, {}, true, {},
         "manyforge.provider.ros2_control", true, true, nullptr, without_row,
         false, false, "position_commanded", 0.2, "commanded");
     (void)test::materialize_lite6_retained_consumer_fixture_from(root.path(), fixture);

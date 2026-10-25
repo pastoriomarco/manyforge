@@ -58,6 +58,152 @@ driver_for(const Composition &root,
           "I/O signal has no actual lifecycle driver adapter");
   return result;
 }
+
+Composition &endpoint_view(Composition &root,
+                           const deployment::IoSignalProviderConfiguration::
+                               GeometricContactEndpoint &endpoint) {
+  Composition *result = nullptr;
+  const auto include = [&](Composition &view) {
+    if (view.controllable_component_id != endpoint.controllable_component_id)
+      return;
+    require(result == nullptr,
+            "geometric contact endpoint component is repeated");
+    result = &view;
+  };
+  include(root);
+  for (const auto &part : root.participant_compositions) {
+    require(part != nullptr, "geometric contact endpoint view is absent");
+    include(*part);
+  }
+  require(result != nullptr,
+          "geometric contact endpoint component is unavailable");
+  return *result;
+}
+
+GeometricContactInputBinding geometric_contact_binding(
+    Composition &root,
+    const deployment::RetainedIoSignalConfiguration &row,
+    const std::shared_ptr<core::IScheduler> &scheduler) {
+  require(row.provider.endpoint && row.provider.target_scene_resource_id,
+          "geometric contact selector is incomplete");
+  auto &view = endpoint_view(root, *row.provider.endpoint);
+  const auto &selector = *row.provider.endpoint;
+  const core::RuntimeParticipantBinding *selected_participant = nullptr;
+  const auto select_participant = [&](const auto &binding) {
+    if (!binding ||
+        binding->value().controllable_component_id !=
+            selector.controllable_component_id ||
+        binding->value().command_target_id != selector.command_target_id)
+      return;
+    require(selected_participant == nullptr,
+            "geometric contact endpoint target is repeated");
+    selected_participant = &*binding;
+  };
+  select_participant(view.direct_control_motion_binding);
+  select_participant(view.direct_control_gripper_binding);
+  const auto collision_model = view.candidate_collision_model
+                                   ? view.candidate_collision_model
+                                   : view.runtime
+                                         ? view.runtime->collision_shared_model
+                                         : nullptr;
+  require(view.runtime && selected_participant != nullptr &&
+              view.runtime->motion_state_channel &&
+              collision_model && scheduler,
+          "geometric contact endpoint has no current runtime observation");
+  const auto &participant = selected_participant->value();
+  const auto frame = std::find_if(
+      participant.frame_bindings.begin(), participant.frame_bindings.end(),
+      [&](const auto &candidate) {
+        return candidate.frame_role_id == selector.frame_role_id;
+      });
+  require(frame != participant.frame_bindings.end() &&
+              !frame->contact_body_role_ids.empty(),
+          "geometric contact endpoint has no declared contact bodies");
+  core::RuntimeMotionEndpointBindingDTO endpoint{
+      participant.target_role_id, participant.command_target_id, *frame, {}};
+  for (const auto &role : frame->contact_body_role_ids) {
+    const auto body = std::find_if(
+        participant.collision_body_bindings.begin(),
+        participant.collision_body_bindings.end(), [&](const auto &candidate) {
+          return candidate.collision_body_role_id == role &&
+                 candidate.model_instance_id == frame->model_instance_id &&
+                 candidate.model_revision == frame->model_revision;
+        });
+    require(body != participant.collision_body_bindings.end() &&
+                !body->compiled_collision_body_names.empty(),
+            "geometric contact endpoint body is unresolved");
+    std::vector<std::string> ids;
+    ids.reserve(body->compiled_collision_body_names.size());
+    for (std::size_t index = 0;
+         index < body->compiled_collision_body_names.size(); ++index)
+      ids.push_back(core::make_component_collision_body_id(
+          participant.controllable_component_id, frame->model_instance_id,
+          role, index));
+    endpoint.contact_body_bindings.push_back(
+        {participant.component_role_id, participant.target_role_id,
+         participant.controllable_component_id, participant.command_target_id,
+         std::nullopt, role, frame->model_instance_id, frame->model_revision,
+         std::move(ids)});
+  }
+  auto endpoint_value = participant;
+  endpoint_value.motion_endpoint = std::move(endpoint);
+  auto verified_endpoint =
+      core::verify_runtime_participant_binding(std::move(endpoint_value));
+  require(verified_endpoint.ok() && view.target_resolver != nullptr,
+          "geometric contact endpoint binding is invalid");
+  auto projected_endpoint = view.target_resolver->BindCollisionBodyAliases(
+      std::move(verified_endpoint.value()));
+  require(projected_endpoint.ok() &&
+              projected_endpoint.value().value().motion_endpoint.has_value(),
+          "geometric contact endpoint body projection is unresolved");
+  endpoint = *projected_endpoint.value().value().motion_endpoint;
+  std::vector<std::shared_ptr<const core::ObservedRobotStatePublication>>
+      observed_states;
+  const auto include_observed = [&](const auto &channel) {
+    if (channel)
+      observed_states.emplace_back(
+          channel,
+          &channel->addressed_publication()->numeric_publication());
+  };
+  include_observed(view.runtime->motion_state_channel);
+  include_observed(view.runtime->gripper_state_channel);
+  auto publisher = view.candidate_collision_publisher
+                       ? view.candidate_collision_publisher
+                       : view.runtime->collision_publisher;
+  require(publisher != nullptr,
+          "geometric contact endpoint has no collision publication");
+  auto scene_cache = view.candidate_geometric_contact_scene_cache
+                         ? view.candidate_geometric_contact_scene_cache
+                         : view.runtime->geometric_contact_scene_cache;
+  require(scene_cache != nullptr,
+          "geometric contact endpoint has no shared scene cache");
+  auto engine = std::make_shared<collision::ManyForgeCollisionEngine>(
+      collision_model, std::move(scene_cache));
+  std::vector<std::string> query_joint_names;
+  std::set<std::string, std::less<>> unique_joint_names;
+  for (const auto &publication : observed_states)
+    for (const auto &name : publication->canonical_joint_names()) {
+      require(unique_joint_names.insert(name).second,
+              "geometric contact observed coordinate is repeated");
+      query_joint_names.push_back(name);
+    }
+  require(engine->prepare_runtime_query(query_joint_names) ==
+                  core::RuntimeCollisionQueryPrepareStatus::kReady &&
+              engine->runtime_query_covers_full_configuration(),
+          "geometric contact endpoint lacks current articulated coordinates");
+  return {row.descriptor.source_id,
+          core::IoSourceIncarnation("installation-owned"),
+          std::vector<core::IoSignalDescriptorDTO>{},
+          std::move(endpoint),
+          *row.provider.target_scene_resource_id,
+          std::move(observed_states),
+          std::move(publisher),
+          std::move(engine),
+          scheduler,
+          view.runtime->collision_monitor_period_ns,
+          view.runtime->runtime_collision_immediate_query_budget_ns,
+          view.runtime->runtime_dynamic_body_max_age_cap_ns};
+}
 bool same_aliases(const std::vector<IoOutputAliasIdentity> &left,
                   const std::vector<IoOutputAliasIdentity> &right) {
   if (left.size() != right.size())
@@ -224,6 +370,18 @@ core::Result<void> PrepareCompositionIoProviderResources(
         source.installation_occurrence = driver->runtime_unit_epoch();
         source.node = generic_node;
         source.rows.push_back(row);
+        if (row.provider.profile == "geometric_contact") {
+          if (!source.geometric_contact)
+            source.geometric_contact =
+                geometric_contact_binding(candidate, row, cell.scheduler());
+          else
+            require(source.geometric_contact->endpoint.frame.frame_role_id ==
+                            row.provider.endpoint->frame_role_id &&
+                        source.geometric_contact->target_scene_resource_id ==
+                            *row.provider.target_scene_resource_id,
+                    "geometric contact source changes its selector");
+          source.geometric_contact->signals.push_back(row.descriptor);
+        }
       } else {
         require(row.descriptor.output_resource.has_value(),
                 "output has no canonical resource");
@@ -385,13 +543,17 @@ core::Result<void> PrepareCompositionIoProviderResources(
                             : std::function<void()>{[] {}};
       auto lifecycle = runtime ? runtime->input_lifecycle_hook(driver)
                                : IoProviderDriverRecord::InputLifecycleHook{};
+      auto acquisition =
+          runtime ? runtime->input_acquisition_hook(driver)
+                  : IoProviderDriverRecord::InputAcquisitionHook{};
       const auto prepared =
           installed
               ? driver->RebindInputsLocked(std::move(inputs), std::move(cancel),
-                                           std::move(lifecycle))
+                                           std::move(lifecycle),
+                                           std::move(acquisition))
               : driver->InstallResourcesLocked(
                     std::move(inputs), std::move(outputs), std::move(cancel),
-                    std::move(lifecycle));
+                    std::move(lifecycle), std::move(acquisition));
       if (!prepared.ok())
         return Reply::Err(prepared.error());
     }

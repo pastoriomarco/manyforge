@@ -1132,11 +1132,11 @@
         "schema_revision": "sha256:b242431032bf183f81718ae1b7b8501ee5f705e52d455732e0052215565bf4cc"
       },
       {
-        "content_addressed_store_key": "catalog/maintained/runtime_profile/manyforge.ros2_control_execution_runtime/b08fa170fe4df131f2cd7d85e1302e178d74ea46d31b03dd877cba5dc74e96c1",
-        "content_digest": "sha256:5874d7126a55d4d429a901a41af28bca2b06bfa6a57ebadc1b398f03f11d52eb",
+        "content_addressed_store_key": "catalog/maintained/runtime_profile/manyforge.ros2_control_execution_runtime/802d8cb56c078b62da66e3177df128b2e5d0479018efaadbed0fe476ba3343b2",
+        "content_digest": "sha256:a9b9016a2a1264f3922a136ac2f92b3aa73a7c791964f32438fa3599175f6f0f",
         "record_id": "manyforge.ros2_control_execution_runtime",
         "record_kind": "runtime_profile",
-        "record_revision": "sha256:b08fa170fe4df131f2cd7d85e1302e178d74ea46d31b03dd877cba5dc74e96c1",
+        "record_revision": "sha256:802d8cb56c078b62da66e3177df128b2e5d0479018efaadbed0fe476ba3343b2",
         "schema_id": "manyforge.runtime_profile.v1",
         "schema_revision": "sha256:c254afa8c2bfcc803f12a7af63b1f09a8ee804b1ffa2a65b7361ad9309b87ae7"
       },
@@ -1163,7 +1163,7 @@
     ]
   },
   "deployment_artifact_id": "ur5_roboplan_local_vision_guided_pose_pick",
-  "deployment_revision": "sha256:dda83d7a80094bfe16fe9c580d217f125e7818f810a9e5d3aba0511a06aef0f9",
+  "deployment_revision": "sha256:6c19a5cf29d99661b6655f971edf871d0ce8332324b73dc27150d056018fde85",
   "description": "Local deployment for the vision-guided pose-pick example. It requires one connected native viewer snapshot source so assistant.query_model can attach a live scene snapshot.",
   "desired_control_configurations": [
     {
@@ -1872,7 +1872,7 @@
         },
         "dependency_runtime_unit_ids": [],
         "runtime_profile_id": "manyforge.ros2_control_execution_runtime",
-        "runtime_profile_revision": "sha256:b08fa170fe4df131f2cd7d85e1302e178d74ea46d31b03dd877cba5dc74e96c1",
+        "runtime_profile_revision": "sha256:802d8cb56c078b62da66e3177df128b2e5d0479018efaadbed0fe476ba3343b2",
         "runtime_unit_id": "robot_cell.ros2_control_execution"
       }
     ]

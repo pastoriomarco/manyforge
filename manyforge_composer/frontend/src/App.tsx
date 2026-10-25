@@ -32,6 +32,7 @@ import { useAuthoringWorkspace } from './hooks/useAuthoringWorkspace';
 import { useDeploymentWorkspace } from './hooks/useDeploymentWorkspace';
 import { useManagerApplyStatus } from './hooks/useManagerApplyStatus';
 import { activationFailureNotice } from './state/activationNotices';
+import { isaacJointStreamNotices } from './state/isaacJointStreamNotices';
 import { isMotionWaitRefusal } from './state/motionWaitRefusal';
 import { useProgramRuntime } from './hooks/useProgramRuntime';
 import { useProgramWorkspace, type ScenarioReplacementIdentity } from './hooks/useProgramWorkspace';
@@ -695,6 +696,7 @@ export default function App() {
     const notices: WorkbenchNotice[] = [
       ...requiredComponentFaultNotices(headlessSnapshot),
       ...authoringContainmentNotices(headlessSnapshot),
+      ...isaacJointStreamNotices(headlessSnapshot?.runtime.sections.sceneRuntime ?? null),
     ];
     const label = pendingProgramAction === null
       ? undefined

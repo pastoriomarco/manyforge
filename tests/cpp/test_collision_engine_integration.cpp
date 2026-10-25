@@ -215,6 +215,7 @@ TEST(CollisionEngineSelfCoverage, MasterOnlyGroupIncludesItsCrossBranchMimic) {
                                        std::max(follower_id, obstacle.body_id)};
   const std::vector<std::string> names{"a_source"};
   ASSERT_EQ(engine.prepare_runtime_query(names), core::RuntimeCollisionQueryPrepareStatus::kReady);
+  EXPECT_TRUE(engine.runtime_query_covers_full_configuration());
   ASSERT_EQ(engine.prepare_runtime_snapshot(snapshot),
             core::RuntimeCollisionQueryPrepareStatus::kReady);
   for (const double position : {.1, .4}) {
@@ -319,6 +320,16 @@ TEST(CollisionEngineSelfCoverage, NamedStateMapsByNameEvenWhenItsCountEqualsTheM
   ASSERT_EQ(canonical.engine_status, CollisionEngineStatus::kOk);
   EXPECT_FALSE(canonical.in_collision);
 
+  const std::vector<std::string> reordered_runtime_names{
+      "b_far", "c_idle", "a_near"};
+  ASSERT_EQ(engine.prepare_runtime_query(reordered_runtime_names),
+            core::RuntimeCollisionQueryPrepareStatus::kReady);
+  EXPECT_TRUE(engine.runtime_query_covers_full_configuration());
+  const std::vector<std::string> partial_runtime_names{"a_near", "b_far"};
+  ASSERT_EQ(engine.prepare_runtime_query(partial_runtime_names),
+            core::RuntimeCollisionQueryPrepareStatus::kReady);
+  EXPECT_FALSE(engine.runtime_query_covers_full_configuration());
+
   const auto refused = [&](CollisionQuery refused_query, const std::string& reason) {
     const auto result = check(engine, snapshot, std::move(refused_query));
     EXPECT_EQ(result.engine_status, CollisionEngineStatus::kDiagnosticIncomplete) << reason;
@@ -380,6 +391,8 @@ TEST(CollisionEngineSelfCoverage, RetainsEverySrdfEnabledSelfPairAndMatchesIndep
                                        "elbow_joint",        "wrist_1_joint",
                                        "wrist_2_joint",      "wrist_3_joint"};
   ASSERT_EQ(engine.prepare_runtime_query(names), core::RuntimeCollisionQueryPrepareStatus::kReady);
+  // The integrated Robotiq coordinates are outside this arm-only view.
+  EXPECT_FALSE(engine.runtime_query_covers_full_configuration());
   ASSERT_EQ(engine.prepare_runtime_snapshot(snapshot),
             core::RuntimeCollisionQueryPrepareStatus::kReady);
   pinocchio::Data data(model);

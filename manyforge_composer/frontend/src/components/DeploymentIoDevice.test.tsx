@@ -93,7 +93,7 @@ describe('Deployment I/O devices', () => {
       expect(mounted.control('Signal 1 Component').readOnly).toBe(true);
       const profiles = (mounted.control('Signal 1 Source profile').children as Array<{ props: { value: string } }>)
         .map((option) => option.props.value);
-      expect(profiles).toEqual(['mock', 'ros_bool', 'ur_io_states', 'ros2_control_gpio']);
+      expect(profiles).toEqual(['mock', 'ros_bool', 'ur_io_states', 'ros2_control_gpio', 'geometric_contact']);
       await mounted.click('Create I/O device');
       expect(mounted.controller.mutate).not.toHaveBeenCalled();
       expect(alerts(mounted.all).join()).toContain('signal name');

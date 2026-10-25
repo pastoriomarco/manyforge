@@ -1,0 +1,73 @@
+# syntax=docker/dockerfile:1.7
+#
+# Real UFactory (xArm family) lane on ROS 2 Lyrical, R7 direction 2026-10-24/25.
+#
+# Unmodified vendor driver from the maintainer's fork branch `lyrical-no-gazebo`:
+# fork `jazzy`, plus upstream effort limits `63b7f20`, SDK `f367943` and the
+# `jazzy_no_gazebo` Gazebo removal. Same ros2_control/JTC pair as the live Mock lane:
+# apt ros2_control 6.9.0 plus source JTC 6.10.0 with realtime_tools 5.4.0 and
+# ros2_control_cmake 1.0.0. Every source is pinned by commit.
+
+ARG MANYFORGE_ROS_FULL_BASE_IMAGE=manyforge-ros-lyrical-full:eval-20261011-final-recipe
+FROM ${MANYFORGE_ROS_FULL_BASE_IMAGE}
+
+USER root
+SHELL ["/bin/bash", "-c"]
+
+RUN apt-get update && apt-get install -y --no-install-recommends \
+        git \
+        ros-${ROS_DISTRO}-control-msgs \
+        ros-${ROS_DISTRO}-launch-param-builder \
+        ros-${ROS_DISTRO}-robot-state-publisher \
+        ros-${ROS_DISTRO}-urdf \
+        ros-${ROS_DISTRO}-xacro \
+    && rm -rf /var/lib/apt/lists/*
+
+# Stock JTC 6.10.0 overlay, identical to the live Mock lane's controller build.
+ARG ROS2_CONTROL_CMAKE_COMMIT=10b9df0d804c2880e7dc50927f8fd82c7198bda4
+ARG REALTIME_TOOLS_COMMIT=f2f8ee08580659e0ee673a8cdbd1a83b274e9d4a
+ARG ROS2_CONTROLLERS_COMMIT=0c702e0e938f94a9cc04c45e014ffdc4667f940e
+RUN set -euo pipefail; \
+    ws=/tmp/control_overlay_ws; mkdir -p "${ws}/src"; \
+    fetch() { \
+      git init -q "${ws}/src/$1"; \
+      git -C "${ws}/src/$1" fetch -q --depth 1 "https://github.com/ros-controls/$1" "$2"; \
+      git -C "${ws}/src/$1" checkout -q FETCH_HEAD; \
+      test "$(git -C "${ws}/src/$1" rev-parse HEAD)" = "$2"; \
+    }; \
+    fetch ros2_control_cmake "${ROS2_CONTROL_CMAKE_COMMIT}"; \
+    fetch realtime_tools "${REALTIME_TOOLS_COMMIT}"; \
+    fetch ros2_controllers "${ROS2_CONTROLLERS_COMMIT}"; \
+    set +u; source /opt/ros/${ROS_DISTRO}/setup.bash; set -u; \
+    cd "${ws}"; \
+    colcon build --install-base /opt/manyforge/control_overlay \
+        --packages-select ros2_control_cmake realtime_tools joint_trajectory_controller \
+        --cmake-args -DCMAKE_BUILD_TYPE=Release -DBUILD_TESTING=OFF; \
+    printf 'ros2_control_cmake %s\nrealtime_tools %s\nros2_controllers %s\n' \
+        "${ROS2_CONTROL_CMAKE_COMMIT}" "${REALTIME_TOOLS_COMMIT}" "${ROS2_CONTROLLERS_COMMIT}" \
+        > /opt/manyforge/control_overlay/UPSTREAM_COMMITS; \
+    rm -rf "${ws}"
+
+# Vendor driver, unmodified, pinned by commit (SDK submodule pinned by the branch).
+ARG XARM_SOURCE_REPOSITORY=https://github.com/pastoriomarco/xarm_ros2
+ARG XARM_SOURCE_COMMIT=ef7351f90e451a37ef73de69c643b7e85040401a
+ARG XARM_SDK_COMMIT=f36794320a285c0b4bf1cd8ef181cbff6e3b794a
+RUN set -euo pipefail; \
+    ws=/opt/manyforge/xarm_ws; mkdir -p "${ws}/src"; \
+    git clone -q "${XARM_SOURCE_REPOSITORY}" "${ws}/src/xarm_ros2"; \
+    cd "${ws}/src/xarm_ros2"; \
+    git checkout -q "${XARM_SOURCE_COMMIT}"; \
+    git submodule update --init --recursive -q; \
+    test "$(git -C xarm_sdk/cxx rev-parse HEAD)" = "${XARM_SDK_COMMIT}"; \
+    printf 'xarm_ros2 %s\nxarm_sdk %s\n' "$(git rev-parse HEAD)" "${XARM_SDK_COMMIT}" > "${ws}/UPSTREAM_COMMITS"; \
+    rm -rf .git xarm_sdk/cxx/.git; \
+    set +u; source /opt/ros/${ROS_DISTRO}/setup.bash; \
+    source /opt/manyforge/control_overlay/setup.bash; set -u; \
+    cd "${ws}"; \
+    colcon build --packages-up-to xarm_controller xarm_api uf_ros_lib \
+        --cmake-args -DCMAKE_BUILD_TYPE=Release -DBUILD_TESTING=OFF; \
+    rm -rf build log
+
+USER ubuntu
+ENTRYPOINT ["/bin/bash", "-c", "set +u; source /opt/ros/${ROS_DISTRO}/setup.bash; source /opt/manyforge/control_overlay/setup.bash; source /opt/manyforge/xarm_ws/install/setup.bash; exec \"$@\"", "--"]
+CMD ["bash"]

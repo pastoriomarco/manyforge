@@ -108,10 +108,10 @@ public:
   /// Capture the supplied observer file once and execute only the configured
   /// existing observer entrypoint with --check-config. Inherits this Manager's
   /// container ROS overlay; no shell, host ROS, runtime child protocol or world
-  /// effects. Caller supplies the existing scene startup budget.
+  /// effects. Caller supplies a bounded observer-configuration budget.
   [[nodiscard]] IsaacPoseObserverCheckedConfiguration
   CheckIsaacPoseObserverConfiguration(const std::filesystem::path &config_path,
-                                      double scene_startup_timeout_s);
+                                      double observer_configuration_timeout_s);
 
   /// Supply checked cell inputs before initial managed child creation. This
   /// does not launch/restart a child; Apply facts use the accepted request.

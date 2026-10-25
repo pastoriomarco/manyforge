@@ -1967,7 +1967,6 @@ TEST(RetainedNativeRuntimeUnitAdapter,
       *fixture.bundle, graph.runtime_units.front().runtime_unit_id);
   EXPECT_TRUE(configuration.initial_joint_positions_rad.empty());
   EXPECT_TRUE(configuration.motion_target_limits.empty());
-  EXPECT_FALSE(configuration.isaac_world.has_value());
   ASSERT_EQ(configuration.controller_profiles.size(), 1U);
   EXPECT_EQ(configuration.controller_profiles.front().controllable_component_id,
             command_binding.controllable_component_id);
@@ -4461,9 +4460,9 @@ TEST(RetainedNativeRuntimeUnitAdapter,
   const auto executable = InstallSelectedPacketTestTargets(targets.path());
   const auto arguments_path = fixture.execution_run_root.path() / "site.arguments";
   std::string document =
-      "schema: manyforge.isaac_site.v1\n"
-      "scene_startup_timeout_s: 60\nscene_service_timeout_s: 60\n"
-      "worlds: {}\npose_observers_by_cell: {}\n"
+      "schema: manyforge.isaac_attach_site.v1\n"
+      "observer_configuration_timeout_s: 60\n"
+      "pose_observers_by_cell: {}\n"
       "# shell-looking text stays data: ; $(not_a_command) 'quoted'\n";
   // Accepted site documents can exceed Linux's single exec argument limit.
   document.append(256U * 1024U, ' ');

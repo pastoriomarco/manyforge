@@ -3255,15 +3255,17 @@ TEST(ManagerDaemonProcess,
       WaitForAuthoringAdmission(directory).admission_generation;
   // The runtime-only candidate has none of the fixture Program's components:
   // the Program becomes non-executable, a destructive impact (H1a).
+  std::string last_request;
   const auto submit = [&](const std::string_view request_id,
                           const std::string_view accepted) {
-    const auto request =
+    last_request =
         ApplyRequest(directory, before->source_owner_epoch, admission,
-                     fixture.deployment_artifact_id, fixture.deployment_revision,
+                     fixture.deployment_artifact_id,
+                     fixture.deployment_revision,
                      fixture.predecessor_graph_revision,
                      fixture.predecessor_retained_bundle_id, request_id, {},
                      false, accepted);
-    const auto response = SendCommand(directory.socket_path(), request);
+    const auto response = SendCommand(directory.socket_path(), last_request);
     return response;
   };
 
@@ -3271,10 +3273,16 @@ TEST(ManagerDaemonProcess,
   EXPECT_NE(unaccepted.find("\"code\":\"confirmation_required\""),
             std::string::npos)
       << unaccepted;
+  EXPECT_NE(unaccepted.find("\"details\":{\"effect\":\"none\"}"),
+            std::string::npos)
+      << unaccepted;
   const auto wrong = submit(
       "impact-wrong",
       "sha256:0000000000000000000000000000000000000000000000000000000000000000");
   EXPECT_NE(wrong.find("\"code\":\"confirmation_required\""),
+            std::string::npos)
+      << wrong;
+  EXPECT_NE(wrong.find("\"details\":{\"effect\":\"none\"}"),
             std::string::npos)
       << wrong;
   // Neither refusal recorded an operation or changed the active selection.
@@ -3290,6 +3298,28 @@ TEST(ManagerDaemonProcess,
             std::string::npos)
       << accepted;
   EXPECT_NE(accepted.find("\"ok\":true"), std::string::npos) << accepted;
+
+  // Once that exact request is durable, a conflicting replay is not a
+  // pre-acceptance no-op even though the conflict is found synchronously.
+  auto changed_replay =
+      deployment::parse_strict_json_model_yaml(last_request).root().as_object();
+  for (auto &[name, value] : changed_replay) {
+    if (name == "source_label") {
+      value = content_identity::CanonicalValue("changed-replay-source");
+    }
+  }
+  const auto replay = deployment::parse_strict_json_model_yaml(SendCommand(
+                          directory.socket_path(),
+                          content_identity::canonical_json(
+                              content_identity::CanonicalValue(
+                                  std::move(changed_replay)))))
+                          .root();
+  ASSERT_EQ(RequiredMember(replay, "ok"),
+            content_identity::CanonicalValue(false));
+  const auto &replay_error = RequiredMember(replay, "error");
+  EXPECT_EQ(RequiredText(replay_error, "code"), "apply_rejected");
+  EXPECT_EQ(replay_error.find_object_member("details"), nullptr)
+      << content_identity::canonical_json(replay);
 }
 
 TEST(ManagerDaemonProcess,

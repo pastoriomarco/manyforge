@@ -821,7 +821,11 @@ class ComponentLifecycleCoordinator::Impl final {
             "the source view does not belong to the qualified robot inventory", "measured_membership_mismatch");
       }
     }
-    if (readiness.measured_state.error) block(*readiness.measured_state.error);
+    // Measured state is command readiness, not a lifecycle transition
+    // prerequisite.  Keep its exact warning in the component view; motion
+    // admission consumes that verdict separately.  In particular, a
+    // configured commanded-state simulator can Prepare/Enable from its
+    // authored hardware state while playback is stopped.
     if (sources) {
       auto checked = sources->validate_current();
       if (!checked.ok()) return ReadResult::Err(checked.error());

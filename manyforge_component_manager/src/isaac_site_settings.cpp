@@ -56,29 +56,13 @@ double Number(const CanonicalValue &value, const std::string &label) {
 } // namespace
 
 IsaacSiteSettings::IsaacSiteSettings(
-    double startup_timeout, double service_timeout,
-    std::map<std::string, IsaacSiteWorld, std::less<>> worlds,
+    double observer_configuration_timeout,
     std::map<std::string, IsaacSitePoseObserver, std::less<>> pose_observers)
-    : scene_startup_timeout_s_(startup_timeout),
-      scene_service_timeout_s_(service_timeout), worlds_(std::move(worlds)),
+    : observer_configuration_timeout_s_(observer_configuration_timeout),
       pose_observers_(std::move(pose_observers)) {}
 
-double IsaacSiteSettings::scene_startup_timeout_s() const noexcept {
-  return scene_startup_timeout_s_;
-}
-
-double IsaacSiteSettings::scene_service_timeout_s() const noexcept {
-  return scene_service_timeout_s_;
-}
-
-const IsaacSiteWorld &
-IsaacSiteSettings::ResolveWorld(std::string_view logical_world) const {
-  const auto found = worlds_.find(logical_world);
-  if (found == worlds_.end()) {
-    Fail("unknown Isaac world '" + std::string(logical_world) +
-         "' in site settings");
-  }
-  return found->second;
+double IsaacSiteSettings::observer_configuration_timeout_s() const noexcept {
+  return observer_configuration_timeout_s_;
 }
 
 const IsaacSitePoseObserver *
@@ -95,49 +79,25 @@ IsaacSiteSettings ParseIsaacSiteSettings(std::string_view bytes) {
     Fail("cannot decode Isaac site settings: " + std::string(error.what()));
   }
   RequireFields(root, "Isaac site settings",
-                {"schema", "scene_startup_timeout_s", "scene_service_timeout_s",
-                 "worlds", "pose_observers_by_cell"});
+                {"schema", "observer_configuration_timeout_s",
+                 "pose_observers_by_cell"});
   if (Text(Member(root, "schema"), "Isaac site settings schema") !=
-      "manyforge.isaac_site.v1") {
-    Fail("Isaac site settings schema must be manyforge.isaac_site.v1");
+      "manyforge.isaac_attach_site.v1") {
+    Fail("Isaac site settings schema must be manyforge.isaac_attach_site.v1");
   }
-  const double startup = Number(Member(root, "scene_startup_timeout_s"),
-                                "scene_startup_timeout_s");
-  const double service = Number(Member(root, "scene_service_timeout_s"),
-                                "scene_service_timeout_s");
-  const std::string worlds_label = "Isaac site worlds";
-  std::map<std::string, IsaacSiteWorld, std::less<>> worlds;
-  for (const auto &[id, value] :
-       RequireObject(Member(root, "worlds"), worlds_label)) {
-    const std::string label = "Isaac site worlds." + id;
-    RequireFields(value, label, {"world_uri", "expected_world_name"});
-    worlds.emplace(id, IsaacSiteWorld{Text(Member(value, "world_uri"),
-                                           label + ".world_uri"),
-                                      Text(Member(value, "expected_world_name"),
-                                           label + ".expected_world_name")});
-  }
+  const double timeout = Number(Member(root, "observer_configuration_timeout_s"),
+                                "observer_configuration_timeout_s");
   const std::string observers_label = "Isaac site observers";
   std::map<std::string, IsaacSitePoseObserver, std::less<>> observers;
   for (const auto &[id, value] : RequireObject(
            Member(root, "pose_observers_by_cell"), observers_label)) {
     const std::string label = "Isaac site pose_observers_by_cell." + id;
-    RequireFields(value, label, {"site_config", "additional_required_topics"});
-    const auto &topics = Member(value, "additional_required_topics");
-    if (!topics.is_array()) {
-      Fail(label + ".additional_required_topics must be an array");
-    }
-    std::vector<std::string> required_topics;
-    for (const auto &topic : topics.as_array()) {
-      required_topics.push_back(
-          Text(topic, label + ".additional_required_topics"));
-    }
+    RequireFields(value, label, {"site_config"});
     observers.emplace(id,
                       IsaacSitePoseObserver{Text(Member(value, "site_config"),
-                                                 label + ".site_config"),
-                                            std::move(required_topics)});
+                                                 label + ".site_config")});
   }
-  return IsaacSiteSettings(startup, service, std::move(worlds),
-                           std::move(observers));
+  return IsaacSiteSettings(timeout, std::move(observers));
 }
 
 } // namespace manyforge::component_manager

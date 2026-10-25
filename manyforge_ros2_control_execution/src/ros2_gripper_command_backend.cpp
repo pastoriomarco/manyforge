@@ -14,6 +14,7 @@
 
 #include "scene_projection_worker.hpp"
 #include "transport_helpers.hpp"
+#include <action_msgs/srv/cancel_goal.hpp>
 #include <algorithm>
 #include <cmath>
 #include <limits>
@@ -539,8 +540,36 @@ void Ros2GripperCommandBackend::configure_gripper_action(
     }
     if (action_client && goal_handle) {
       try {
-        (void)action_client->async_cancel_goal(goal_handle);
+        const auto command_id = runtime->lifecycle_disable_command_id;
+        const auto generation = runtime->lifecycle_disable_generation;
+        const auto goal_id = goal_handle->get_goal_id();
+        (void)action_client->async_cancel_goal(
+            goal_handle,
+            [runtime, command_id, generation, goal_id](const auto response) {
+              std::lock_guard lock(runtime->mutex);
+              if (!runtime->lifecycle_disable_pending ||
+                  runtime->lifecycle_disable_command_id != command_id ||
+                  runtime->lifecycle_disable_generation != generation)
+                return;
+              const bool accepted = response &&
+                  response->return_code ==
+                      action_msgs::srv::CancelGoal::Response::ERROR_NONE &&
+                  std::any_of(response->goals_canceling.begin(),
+                              response->goals_canceling.end(),
+                              [&](const auto &row) {
+                                return row.goal_id.uuid == goal_id;
+                              });
+              if (!accepted && !runtime->lifecycle_disable_terminal)
+                runtime->lifecycle_disable_failed = true;
+              runtime->lifecycle_condition.notify_all();
+            });
       } catch (const std::exception &exc) {
+        {
+          std::lock_guard lock(runtime->mutex);
+          if (runtime->lifecycle_disable_pending)
+            runtime->lifecycle_disable_failed = true;
+          runtime->lifecycle_condition.notify_all();
+        }
         RCLCPP_WARN(node_->get_logger(),
                     "Failed to cancel replaced gripper action goal: %s",
                     exc.what());
@@ -764,6 +793,16 @@ void Ros2GripperCommandBackend::on_gripper_result(
     std::lock_guard<std::mutex> lock(runtime->mutex);
     if (runtime->command_id != command_id ||
         runtime->generation != generation) {
+      if (runtime->lifecycle_disable_pending &&
+          runtime->lifecycle_disable_command_id == command_id &&
+          runtime->lifecycle_disable_generation == generation) {
+        runtime->lifecycle_disable_terminal = true;
+        runtime->lifecycle_disable_failed =
+            result.code == rclcpp_action::ResultCode::ABORTED ||
+            result.code == rclcpp_action::ResultCode::UNKNOWN;
+        runtime->cancel_pending = false;
+        runtime->lifecycle_condition.notify_all();
+      }
       return;
     }
     if (runtime->externally_failed) {
@@ -827,8 +866,17 @@ void Ros2GripperCommandBackend::on_gripper_result(
         break;
       }
     }
+    if (runtime->lifecycle_disable_pending &&
+        runtime->lifecycle_disable_command_id == command_id &&
+        runtime->lifecycle_disable_generation == generation) {
+      runtime->lifecycle_disable_terminal = true;
+      runtime->lifecycle_disable_failed =
+          result.code == rclcpp_action::ResultCode::ABORTED ||
+          result.code == rclcpp_action::ResultCode::UNKNOWN;
+    }
     ++runtime->revision;
   }
+  runtime->lifecycle_condition.notify_all();
   if (lifecycle_handle.has_value()) {
     try {
       scheduler_.cancel(*lifecycle_handle);
@@ -887,6 +935,22 @@ void Ros2GripperCommandBackend::invalidate_gripper_commands(
         continue;
       }
       goal_handle = runtime->active_goal_handle;
+      const bool command_unsettled = runtime->executing || goal_handle;
+      if (command_unsettled && !runtime->lifecycle_disable_pending) {
+        runtime->lifecycle_disable_pending = true;
+        runtime->lifecycle_disable_terminal = false;
+        runtime->lifecycle_disable_failed = false;
+        runtime->lifecycle_cancel_dispatched = false;
+        runtime->lifecycle_disable_command_id = runtime->command_id;
+        runtime->lifecycle_disable_generation = runtime->generation;
+      }
+      if (goal_handle && runtime->lifecycle_disable_pending) {
+        if (runtime->lifecycle_cancel_dispatched) {
+          goal_handle.reset();
+        } else {
+          runtime->lifecycle_cancel_dispatched = true;
+        }
+      }
       action_client = runtime->action_client;
       lifecycle_handle = runtime->lifecycle_handle;
       runtime->lifecycle_handle.reset();
@@ -895,7 +959,7 @@ void Ros2GripperCommandBackend::invalidate_gripper_commands(
           next_gripper_generation_.fetch_add(1, std::memory_order_relaxed);
       runtime->executing = false;
       runtime->goal_accepted = false;
-      runtime->cancel_pending = true;
+      runtime->cancel_pending = command_unsettled;
       runtime->active_goal_handle.reset();
       runtime->state = "idle";
       runtime->progress = 0.0;
@@ -908,6 +972,7 @@ void Ros2GripperCommandBackend::invalidate_gripper_commands(
       runtime->projection_reason.clear();
       ++runtime->revision;
     }
+    runtime->lifecycle_condition.notify_all();
     if (lifecycle_handle.has_value()) {
       try {
         scheduler_.cancel(*lifecycle_handle);
@@ -928,13 +993,243 @@ void Ros2GripperCommandBackend::invalidate_gripper_commands(
 }
 
 void Ros2GripperCommandBackend::authorize_gripper_commands() noexcept {
+  (void)try_authorize_gripper_commands();
+}
+
+core::Result<void>
+Ros2GripperCommandBackend::try_authorize_gripper_commands() noexcept {
   std::lock_guard<std::mutex> lock(gripper_authority_mutex_);
+  {
+    std::lock_guard map_lock(gripper_map_mutex_);
+    for (const auto &row : grippers_) {
+      std::lock_guard runtime_lock(row.second->mutex);
+      if (!row.second->lifecycle_disable_pending) continue;
+      if (row.second->lifecycle_disable_terminal &&
+          !row.second->lifecycle_disable_failed) {
+        row.second->lifecycle_disable_pending = false;
+        continue;
+      }
+      return core::Result<void>::Err(core::ErrorDTO{
+          "ros2_control_gripper_bridge_disable_unsettled",
+          "The prior gripper cancellation remains unsettled", {}});
+    }
+  }
   if (!gripper_admission_blocked_ && !gripper_motion_admission_blocked_) {
-    return;
+    return core::Result<void>::Ok();
   }
   ++gripper_authority_generation_;
   gripper_admission_blocked_ = false;
   gripper_motion_admission_blocked_ = false;
+  return core::Result<void>::Ok();
+}
+
+Ros2GripperLifecycleResult
+Ros2GripperCommandBackend::authorize_lifecycle_gripper(
+    const std::string &gripper_id) {
+  std::lock_guard authority_lock(gripper_authority_mutex_);
+  std::lock_guard map_lock(gripper_map_mutex_);
+  const auto found = grippers_.find(gripper_id);
+  if (found == grippers_.end())
+    return {false, false, core::ErrorDTO{
+        "ros2_control_gripper_bridge_not_configured",
+        "The exact gripper command bridge is not configured", {}}};
+  std::lock_guard runtime_lock(found->second->mutex);
+  if (found->second->lifecycle_disable_pending)
+    return {false, false, core::ErrorDTO{
+        "ros2_control_gripper_bridge_disable_unsettled",
+        "The prior gripper cancellation remains unsettled", {}}};
+  ++gripper_authority_generation_;
+  gripper_admission_blocked_ = false;
+  gripper_motion_admission_blocked_ = false;
+  return {true, true, std::nullopt};
+}
+
+bool Ros2GripperCommandBackend::lifecycle_disable_pending(
+    const std::string &gripper_id) const {
+  std::lock_guard map_lock(gripper_map_mutex_);
+  const auto found = grippers_.find(gripper_id);
+  if (found == grippers_.end()) return true;
+  std::lock_guard runtime_lock(found->second->mutex);
+  return found->second->lifecycle_disable_pending;
+}
+
+Ros2GripperLifecycleResult Ros2GripperCommandBackend::prepare_lifecycle_gripper(
+    const std::string &gripper_id) {
+  const auto readiness = gripper_transport_readiness(gripper_id);
+  if (!readiness.configured || !readiness.ready ||
+      readiness.transport_kind != "ros_gripper_command")
+    return {false, false, core::ErrorDTO{
+        "ros2_control_gripper_bridge_not_ready",
+        "The exact ROS action gripper command bridge is not ready", {}}};
+  std::lock_guard authority_lock(gripper_authority_mutex_);
+  std::lock_guard map_lock(gripper_map_mutex_);
+  const auto found = grippers_.find(gripper_id);
+  if (found == grippers_.end())
+    return {false, false, core::ErrorDTO{
+        "ros2_control_gripper_bridge_not_configured",
+        "The exact gripper command bridge is not configured", {}}};
+  std::lock_guard runtime_lock(found->second->mutex);
+  if (found->second->executing || found->second->goal_accepted ||
+      found->second->active_goal_handle ||
+      found->second->cancel_pending ||
+      found->second->lifecycle_disable_pending)
+    return {false, false, core::ErrorDTO{
+        "ros2_control_gripper_bridge_busy",
+        "The gripper command bridge is not idle for lifecycle preparation",
+        {}}};
+  gripper_admission_blocked_ = true;
+  gripper_motion_admission_blocked_ = true;
+  ++gripper_authority_generation_;
+  ++gripper_lifecycle_generation_;
+  return {true, true, std::nullopt};
+}
+
+Ros2GripperLifecycleResult Ros2GripperCommandBackend::disable_lifecycle_gripper(
+    const std::string &gripper_id, const std::stop_token cancellation) {
+  std::shared_ptr<GripperRuntime> runtime;
+  GoalHandleGripper::SharedPtr goal;
+  rclcpp_action::Client<GripperCommand>::SharedPtr client;
+  std::uint64_t command_id = 0;
+  std::uint64_t generation = 0;
+  {
+    std::lock_guard authority_lock(gripper_authority_mutex_);
+    std::lock_guard map_lock(gripper_map_mutex_);
+    const auto found = grippers_.find(gripper_id);
+    if (found == grippers_.end())
+      return {false, false, core::ErrorDTO{
+          "ros2_control_gripper_bridge_not_configured",
+          "The exact gripper command bridge is not configured", {}}};
+    runtime = found->second;
+    std::lock_guard runtime_lock(runtime->mutex);
+    if (runtime->config.transport_kind != "ros_gripper_command")
+      return {false, false, core::ErrorDTO{
+          "ros2_control_gripper_bridge_transport_unsupported",
+          "Lifecycle disable requires the exact ROS action gripper bridge",
+          {}}};
+    if (runtime->lifecycle_disable_pending) {
+      if (runtime->lifecycle_disable_terminal) {
+        const bool success = !runtime->lifecycle_disable_failed;
+        runtime->lifecycle_disable_pending = false;
+        return {success, true,
+                success ? std::optional<core::ErrorDTO>{}
+                        : std::optional<core::ErrorDTO>{core::ErrorDTO{
+                              "ros2_control_gripper_bridge_disable_unsettled",
+                              "The retained gripper cancellation did not settle successfully",
+                              {}}}};
+      }
+      command_id = runtime->lifecycle_disable_command_id;
+      generation = runtime->lifecycle_disable_generation;
+      goal = runtime->active_goal_handle;
+      client = runtime->action_client;
+    } else {
+    gripper_admission_blocked_ = true;
+    gripper_motion_admission_blocked_ = true;
+    ++gripper_authority_generation_;
+    ++gripper_lifecycle_generation_;
+    if (!runtime->executing && !runtime->goal_accepted &&
+        !runtime->active_goal_handle)
+      return {true, true, std::nullopt};
+    runtime->lifecycle_disable_pending = true;
+    runtime->lifecycle_disable_terminal = false;
+    runtime->lifecycle_disable_failed = false;
+    runtime->lifecycle_cancel_dispatched = false;
+    runtime->cancel_pending = true;
+    command_id = runtime->command_id;
+    generation = runtime->generation;
+    runtime->lifecycle_disable_command_id = command_id;
+    runtime->lifecycle_disable_generation = generation;
+    goal = runtime->active_goal_handle;
+    client = runtime->action_client;
+    }
+  }
+
+  std::unique_lock runtime_lock(runtime->mutex);
+  if (!goal) {
+    runtime->lifecycle_condition.wait(runtime_lock, cancellation, [&] {
+      return shutdown_started_.load() ||
+             runtime->lifecycle_disable_terminal ||
+             runtime->lifecycle_disable_failed ||
+             runtime->command_id != command_id ||
+             runtime->generation != generation || runtime->active_goal_handle;
+    });
+    goal = runtime->active_goal_handle;
+    client = runtime->action_client;
+  }
+  if (runtime->lifecycle_disable_terminal &&
+      !runtime->lifecycle_disable_failed) {
+    runtime->lifecycle_disable_pending = false;
+    return {true, true, std::nullopt};
+  }
+  if (shutdown_started_.load() ||
+      runtime->command_id != command_id || runtime->generation != generation ||
+      runtime->lifecycle_disable_failed || !goal || !client) {
+    return {false, true, core::ErrorDTO{
+        "ros2_control_gripper_bridge_disable_unsettled",
+        "The exact gripper command did not establish a terminal cancellation outcome",
+        {}}};
+  }
+  if (runtime->lifecycle_cancel_dispatched) {
+    runtime->lifecycle_condition.wait(runtime_lock, cancellation, [&] {
+      return runtime->lifecycle_disable_terminal ||
+             runtime->lifecycle_disable_failed;
+    });
+    if (runtime->lifecycle_disable_terminal &&
+        !runtime->lifecycle_disable_failed) {
+      runtime->lifecycle_disable_pending = false;
+      return {true, true, std::nullopt};
+    }
+    return {false, true, core::ErrorDTO{
+        "ros2_control_gripper_bridge_disable_unsettled",
+        "The exact gripper cancellation remains unsettled", {}}};
+  }
+  runtime->lifecycle_cancel_dispatched = true;
+  runtime_lock.unlock();
+  try {
+    const auto goal_id = goal->get_goal_id();
+    (void)client->async_cancel_goal(
+        goal, [runtime, command_id, generation, goal_id](const auto response) {
+          std::lock_guard lock(runtime->mutex);
+          if (!runtime->lifecycle_disable_pending ||
+              runtime->command_id != command_id ||
+              runtime->generation != generation)
+            return;
+          const bool accepted = response &&
+              response->return_code ==
+                  action_msgs::srv::CancelGoal::Response::ERROR_NONE &&
+              std::any_of(response->goals_canceling.begin(),
+                          response->goals_canceling.end(), [&](const auto &row) {
+                            return row.goal_id.uuid == goal_id;
+                          });
+          if (!accepted) runtime->lifecycle_disable_failed = true;
+          runtime->lifecycle_condition.notify_all();
+        });
+  } catch (...) {
+    runtime_lock.lock();
+    runtime->lifecycle_disable_failed = true;
+    return {false, true, core::ErrorDTO{
+        "ros2_control_gripper_bridge_cancel_failed",
+        "The gripper cancellation request could not be dispatched", {}}};
+  }
+  runtime_lock.lock();
+  runtime->lifecycle_condition.wait(runtime_lock, cancellation, [&] {
+    return shutdown_started_.load() ||
+           runtime->lifecycle_disable_terminal ||
+           runtime->lifecycle_disable_failed ||
+           runtime->command_id != command_id ||
+           runtime->generation != generation;
+  });
+  const bool settled = runtime->lifecycle_disable_terminal &&
+                       !runtime->lifecycle_disable_failed &&
+                       runtime->command_id == command_id &&
+                       runtime->generation == generation;
+  if (settled) {
+    runtime->lifecycle_disable_pending = false;
+    return {true, true, std::nullopt};
+  }
+  return {false, true, core::ErrorDTO{
+      "ros2_control_gripper_bridge_disable_unsettled",
+      "The exact gripper command did not establish a terminal cancellation outcome",
+      {}}};
 }
 
 Ros2GripperTransportReadinessSnapshot
@@ -1570,13 +1865,28 @@ core::GripperCommandResultDTO Ros2GripperCommandBackend::command_gripper(
           runtime->reason_code = ros2_control_fault_reason::kGripperGoalRejected;
           runtime->projection_state = core::GripperProjectionState::kNotRequired;
           runtime->projection_reason.clear();
+          if (runtime->lifecycle_disable_pending) {
+            runtime->lifecycle_disable_failed = true;
+            runtime->lifecycle_disable_terminal = true;
+          }
           ++runtime->revision;
         }
+        runtime->lifecycle_condition.notify_all();
       } else if (runtime->config.actuation_kind ==
                      core::GripperActuationKind::kPneumatic &&
                  !runtime->executing) {
         // A late acceptance is diagnostic only after a final pneumatic result.
         return;
+      } else if (runtime->lifecycle_disable_pending) {
+        runtime->goal_accepted = true;
+        runtime->active_goal_handle = goal_handle;
+        if (!runtime->lifecycle_cancel_dispatched) {
+          runtime->lifecycle_cancel_dispatched = true;
+          handle_to_cancel = goal_handle;
+          action_client = runtime->action_client;
+        }
+        runtime->lifecycle_condition.notify_all();
+        ++runtime->revision;
       } else if (runtime->cancel_pending || !runtime->executing) {
         lifecycle_handle = runtime->lifecycle_handle;
         runtime->lifecycle_handle.reset();
@@ -1608,11 +1918,33 @@ core::GripperCommandResultDTO Ros2GripperCommandBackend::command_gripper(
     }
     if (action_client && handle_to_cancel) {
       try {
-        (void)action_client->async_cancel_goal(handle_to_cancel);
+        const auto goal_id = handle_to_cancel->get_goal_id();
+        (void)action_client->async_cancel_goal(
+            handle_to_cancel,
+            [runtime, command_id, generation, goal_id](const auto response) {
+              std::lock_guard lock(runtime->mutex);
+              if (!runtime->lifecycle_disable_pending ||
+                  runtime->lifecycle_disable_command_id != command_id ||
+                  runtime->lifecycle_disable_generation != generation)
+                return;
+              const bool accepted = response &&
+                  response->return_code ==
+                      action_msgs::srv::CancelGoal::Response::ERROR_NONE &&
+                  std::any_of(response->goals_canceling.begin(),
+                              response->goals_canceling.end(),
+                              [&](const auto &row) {
+                                return row.goal_id.uuid == goal_id;
+                              });
+              if (!accepted && !runtime->lifecycle_disable_terminal)
+                runtime->lifecycle_disable_failed = true;
+              runtime->lifecycle_condition.notify_all();
+            });
       } catch (const std::exception&) {
-        // Reset/stop remains best-effort if the remote goal disappears
-        // during negotiation; the next status/result callback will
-        // reconcile state.
+        std::lock_guard lock(runtime->mutex);
+        if (runtime->lifecycle_disable_pending) {
+          runtime->lifecycle_disable_failed = true;
+          runtime->lifecycle_condition.notify_all();
+        }
       }
     }
   };

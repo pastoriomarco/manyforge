@@ -10,13 +10,14 @@ import type { JsonValue } from '../types/api';
  * kept verbatim.
  */
 
-export type IoSourceProfile = 'mock' | 'ros_bool' | 'ur_io_states' | 'ros2_control_gpio';
+export type IoSourceProfile = 'mock' | 'ros_bool' | 'ur_io_states' | 'ros2_control_gpio' | 'geometric_contact';
 
 export const IO_SOURCE_PROFILE_LABELS: Record<IoSourceProfile, string> = {
   mock: 'Mock',
   ros_bool: 'ROS Bool topic',
   ur_io_states: 'Universal Robots I/O states',
   ros2_control_gpio: 'ros2_control GPIO',
+  geometric_contact: 'Geometric contact',
 };
 
 /**
@@ -106,6 +107,12 @@ export interface IoSignalInputDraft {
   /** ros2_control GPIO group and interface name (exact, no trim). */
   group: string;
   interfaceName: string;
+  /** Geometric contact: an existing motion endpoint, independent of this I/O row. */
+  endpointComponentId: string;
+  endpointTargetId: string;
+  endpointFrameRoleId: string;
+  /** Geometric contact: an existing logical Scene resource. */
+  targetSceneResourceId: string;
   /** Periodic sample-age freshness bound, in ms. */
   maximumAgeMs: string;
   ingressDepth: string;
@@ -150,7 +157,9 @@ function integerText(text: string): number | null {
   return value <= MAXIMUM_SAFE ? Number(value) : null;
 }
 
-const INPUT_PROFILES: readonly IoSourceProfile[] = ['mock', 'ros_bool', 'ur_io_states', 'ros2_control_gpio'];
+const INPUT_PROFILES: readonly IoSourceProfile[] = [
+  'mock', 'ros_bool', 'ur_io_states', 'ros2_control_gpio', 'geometric_contact',
+];
 const OUTPUT_PROFILES: readonly IoOutputProfile[] = ['ros_set_bool', 'mock_output', 'ur_set_io', 'ros2_control_gpio'];
 
 const PROVIDER_KEYS: Record<IoSourceProfile, string[]> = {
@@ -158,6 +167,9 @@ const PROVIDER_KEYS: Record<IoSourceProfile, string[]> = {
   ros_bool: ['profile', 'ingress_depth', 'topic', 'liveness'],
   ur_io_states: ['profile', 'ingress_depth', 'topic', 'pin'],
   ros2_control_gpio: ['profile', 'ingress_depth', 'topic', 'group', 'interface_name'],
+  geometric_contact: [
+    'profile', 'ingress_depth', 'endpoint', 'target_scene_resource_id',
+  ],
 };
 const OUTPUT_PROVIDER_KEYS: Record<IoOutputProfile, string[]> = {
   ros_set_bool: ['profile', 'service'],
@@ -198,8 +210,10 @@ function inputDraft(row: Record<string, JsonValue>): IoSignalInputDraft | null {
     row.signal_name, row.source_id];
   if (ids.some((value) => typeof value !== 'string')) return null;
   const liveness = profile === 'ros_bool' ? rosBoolLiveness(provider) : null;
+  const geometricEndpoint = profile === 'geometric_contact' ? object(provider.endpoint) : null;
   if (profile === 'ros_bool' && liveness === null) return null;
-  // Mock and change-only ROS Bool: provider validity, no age; periodic: sample age.
+  // Mock and change-only ROS Bool: provider validity, no age; periodic sources
+  // including geometric contact: sample age.
   const providerValidity = profile === 'mock' || liveness === 'change_only';
   const sampleAgeOk = freshness.mode === 'sample_age' && Object.keys(freshness).length === 2
     && (safeInteger(freshness.maximum_age_ns) ?? 0) > 0;
@@ -209,10 +223,18 @@ function inputDraft(row: Record<string, JsonValue>): IoSignalInputDraft | null {
     : profile === 'ros_bool' ? row.update_mode === (liveness === 'periodic' ? 'sampled' : 'change_only')
       : row.update_mode === 'sampled';
   if (!expectedUpdate) return null;
-  if ((profile !== 'mock' && typeof provider.topic !== 'string')
+  if ((profile !== 'mock' && profile !== 'geometric_contact' && typeof provider.topic !== 'string')
     || (profile === 'ur_io_states' && safeInteger(provider.pin) === null)
     || (profile === 'ros2_control_gpio'
       && (typeof provider.group !== 'string' || typeof provider.interface_name !== 'string'))
+    || (profile === 'geometric_contact' && (
+      geometricEndpoint === null
+      || !exactKeys(geometricEndpoint, ['controllable_component_id', 'command_target_id', 'frame_role_id'])
+      || typeof geometricEndpoint.controllable_component_id !== 'string'
+      || typeof geometricEndpoint.command_target_id !== 'string'
+      || typeof geometricEndpoint.frame_role_id !== 'string'
+      || typeof provider.target_scene_resource_id !== 'string'
+    ))
   ) return null;
   const depth = provider.ingress_depth;
   if ((depth !== undefined && safeInteger(depth) === null)
@@ -234,6 +256,14 @@ function inputDraft(row: Record<string, JsonValue>): IoSignalInputDraft | null {
     pin: safeInteger(provider.pin)?.toString() ?? '0',
     group: typeof provider.group === 'string' ? provider.group : '',
     interfaceName: typeof provider.interface_name === 'string' ? provider.interface_name : '',
+    endpointComponentId: typeof geometricEndpoint?.controllable_component_id === 'string'
+      ? geometricEndpoint.controllable_component_id : '',
+    endpointTargetId: typeof geometricEndpoint?.command_target_id === 'string'
+      ? geometricEndpoint.command_target_id : '',
+    endpointFrameRoleId: typeof geometricEndpoint?.frame_role_id === 'string'
+      ? geometricEndpoint.frame_role_id : '',
+    targetSceneResourceId: typeof provider.target_scene_resource_id === 'string'
+      ? provider.target_scene_resource_id : '',
     maximumAgeMs: sampleAgeOk ? nsToMsText(freshness.maximum_age_ns as number) : '',
     ingressDepth: String(safeInteger(depth) ?? IO_DEFAULT_INGRESS_DEPTH),
     initialValue: provider.initial_value === true,
@@ -357,6 +387,10 @@ export function newIoSignalInput(componentId = ''): IoSignalInputDraft {
     pin: '0',
     group: '',
     interfaceName: '',
+    endpointComponentId: '',
+    endpointTargetId: '',
+    endpointFrameRoleId: '',
+    targetSceneResourceId: '',
     maximumAgeMs: '',
     ingressDepth: String(IO_DEFAULT_INGRESS_DEPTH),
     initialValue: false,
@@ -382,7 +416,8 @@ export function withIoDirection(
 
 /** The liveness an input's source kind declares (contract 81). */
 export function inputLivenessMode(draft: Pick<IoSignalInputDraft, 'profile' | 'liveness'>): IoLivenessMode {
-  return draft.profile === 'mock' ? 'in_process' : draft.profile === 'ros_bool' ? draft.liveness : 'periodic';
+  return draft.profile === 'mock' ? 'in_process'
+    : draft.profile === 'ros_bool' ? draft.liveness : 'periodic';
 }
 
 /** Whether an input uses the periodic sample-age freshness budget. */
@@ -396,7 +431,7 @@ export function rowInputLiveness(row: Record<string, JsonValue> | null): IoLiven
   const provider = object(row.provider);
   const profile = provider?.profile;
   if (profile === 'mock') return 'in_process';
-  if (profile === 'ur_io_states' || profile === 'ros2_control_gpio') return 'periodic';
+  if (profile === 'ur_io_states' || profile === 'ros2_control_gpio' || profile === 'geometric_contact') return 'periodic';
   return profile === 'ros_bool' && provider !== null ? rosBoolLiveness(provider) : null;
 }
 
@@ -441,6 +476,21 @@ export function validateIoSignalInput(draft: IoSignalInputDraft, index = 0): str
     return `${label}: ingress depth must be a whole number of samples from 1 to ${Number.MAX_SAFE_INTEGER}.`;
   }
   if (draft.profile === 'mock') return null;
+  if (draft.profile === 'geometric_contact') {
+    if (!PORTABLE_ID.test(draft.endpointComponentId)
+      || !PORTABLE_ID.test(draft.endpointTargetId)
+      || !PORTABLE_ID.test(draft.endpointFrameRoleId)) {
+      return `${label}: select a motion endpoint.`;
+    }
+    if (!PORTABLE_ID.test(draft.targetSceneResourceId)) {
+      return `${label}: enter a target Scene resource id.`;
+    }
+    const maximumAge = msTextToNs(draft.maximumAgeMs);
+    if (maximumAge === null || maximumAge < 1) {
+      return `${label}: the maximum sample age must be above 0 ms, with at most 6 decimals.`;
+    }
+    return null;
+  }
   const address = draft.profile === 'ros_bool'
     ? (draft.topic.trim() === '' ? 'enter the source topic.' : null)
     : draft.profile === 'ur_io_states'
@@ -497,6 +547,11 @@ function sourceFacts(row: Extract<IoSignalRow, { kind: 'input' | 'output' }>): s
         : draft.profile === 'ros2_control_gpio' ? draft.topic : null]);
   }
   const { draft } = row;
+  if (draft.profile === 'geometric_contact') {
+    return JSON.stringify(['input', draft.profile, integerText(draft.ingressDepth),
+      draft.endpointComponentId, draft.endpointTargetId, draft.endpointFrameRoleId,
+      draft.targetSceneResourceId, inputLivenessMode(draft)]);
+  }
   return JSON.stringify(['input', draft.profile,
     draft.profile === 'mock' ? null : draft.profile === 'ros_bool' ? draft.topic.trim() : draft.topic,
     integerText(draft.ingressDepth), inputLivenessMode(draft)]);
@@ -577,6 +632,23 @@ export function ioSignalInputValue(draft: IoSignalInputDraft): Record<string, Js
         profile: 'mock',
         ...optional('ingress_depth', depth, IO_DEFAULT_INGRESS_DEPTH),
         ...optional('initial_value', draft.initialValue, false),
+      },
+    };
+  }
+  if (draft.profile === 'geometric_contact') {
+    return {
+      ...base,
+      update_mode: 'sampled',
+      freshness: { mode: 'sample_age', maximum_age_ns: msTextToNs(draft.maximumAgeMs)! },
+      provider: {
+        profile: draft.profile,
+        ...optional('ingress_depth', depth, IO_DEFAULT_INGRESS_DEPTH),
+        endpoint: {
+          controllable_component_id: draft.endpointComponentId,
+          command_target_id: draft.endpointTargetId,
+          frame_role_id: draft.endpointFrameRoleId,
+        },
+        target_scene_resource_id: draft.targetSceneResourceId,
       },
     };
   }
@@ -687,7 +759,7 @@ export function declaredIoSources(
     result.set(ioSourceKey(draft.componentId, draft.targetId, draft.resourceRoleId), {
       profile: draft.profile,
       sourceId: draft.sourceId,
-      topic: draft.profile === 'mock' ? null : draft.topic,
+      topic: draft.profile === 'mock' || draft.profile === 'geometric_contact' ? null : draft.topic,
       liveness: inputLivenessMode(draft),
     });
   }

@@ -2020,9 +2020,6 @@ struct CompositionBuildInput final {
   // model and the candidate worker. Absent: relative scene meshes fail closed.
   std::optional<int> scene_asset_root_fd{};
   std::string controller_request_context{};
-  // Captured by the stable cell owner only after the strict observer check
-  // and cell barrier complete. Component construction performs no world work.
-  std::optional<IsaacControllerLaunchInputs> managed_isaac_launch_inputs{};
   std::vector<std::shared_ptr<RetainedPlannerSceneProjection>> required_projection_pins{};
   std::optional<core::NamedApplyPublicationTransactionDTO> origin_named_apply{};
   // Root cell selection only. Physical component construction keeps its
@@ -2881,6 +2878,9 @@ BuildRetainedProductComposition(CompositionBuildInput input) {
       std::move(resolver_factory);
   composition->candidate_collision_publisher = input.collision_publisher;
   composition->candidate_collision_model = input.collision_shared_model;
+  composition->candidate_geometric_contact_scene_cache =
+      collision::ManyForgeCollisionEngine::make_shared_scene_cache(
+          input.collision_shared_model);
   composition->candidate_runtime_collision_engine =
       std::make_shared<collision::ManyForgeCollisionEngine>(
           input.collision_shared_model,
@@ -3589,7 +3589,8 @@ BuildSingleProductComposition(CompositionBuildInput input) {
     artifact_input.mock_profile = selected_profile->mock_profile;
     if (selected_profile->isaac_profile.has_value()) {
       artifact_input.isaac_lane =
-          retained_isaac_controller_lane(*selected_profile->isaac_profile);
+          retained_isaac_controller_lane(*selected_profile->isaac_profile,
+                                         selected_initial_joint_positions);
     } else {
       artifact_input.initial_joint_positions_rad =
           selected_initial_joint_positions;
@@ -3682,14 +3683,11 @@ BuildSingleProductComposition(CompositionBuildInput input) {
                               ? "started"
                               : "restarted")
                 << " pid=" << ensured.process->pid() << std::endl;
-    } else if (input.managed_isaac_launch_inputs) {
-      const auto &cell_inputs = *input.managed_isaac_launch_inputs;
-      Require(cell_inputs.manager_cell_world_owned,
-              "managed Isaac component requires completed cell-world preflight");
+    } else {
       Require(artifact_input.isaac_lane.has_value(),
               "managed Isaac component has no retained controller lane");
       const auto command = isaac_controller_launch_command(
-          written, *artifact_input.isaac_lane, cell_inputs);
+          written, *artifact_input.isaac_lane);
       const auto ensured = host_controller_launch_supervisor().ensure(
           command, written.directory,
           input.controller_request_context.empty()
@@ -3708,14 +3706,6 @@ BuildSingleProductComposition(CompositionBuildInput input) {
                               ? "started"
                               : "restarted")
                 << " pid=" << ensured.process->pid() << std::endl;
-    } else {
-      // Unmanaged developer launch remains external. Managed construction
-      // receives the cell owner's qualified inputs rather than recreating
-      // its barrier/observer inside each robot launch.
-      std::cerr << "manyforge controller launch: component="
-                << written.controllable_component_id
-                << " Isaac launch requires qualified cell-world inputs"
-                << std::endl;
     }
   }
   auto ros2_control_runtime_handle =
@@ -3935,6 +3925,10 @@ BuildSingleProductComposition(CompositionBuildInput input) {
                                     input.shared_scheduler != nullptr
                                 ? input.shared_scheduler
                                 : std::make_shared<SimpleScheduler>(runtime_config.scheduler);
+  const auto runtime_collision_immediate_query_budget_ns =
+      runtime_config.kernel.runtime_collision_immediate_query_budget_ns;
+  const auto runtime_dynamic_body_max_age_cap_ns =
+      runtime_config.kernel.runtime_dynamic_body_max_age_cap_ns;
   auto runtime = input.attach_addressed_owner
                      ? create_retained_native_runtime(
                            std::move(runtime_input), std::move(runtime_config),
@@ -3942,6 +3936,14 @@ BuildSingleProductComposition(CompositionBuildInput input) {
                      : create_retained_native_runtime_participants(
                            std::move(runtime_input), std::move(runtime_config),
                            measured_receiver_clock, std::move(receiver_scheduler));
+  runtime->collision_monitor_period_ns = collision_monitor_period_ns;
+  runtime->runtime_collision_immediate_query_budget_ns =
+      runtime_collision_immediate_query_budget_ns;
+  runtime->runtime_dynamic_body_max_age_cap_ns =
+      runtime_dynamic_body_max_age_cap_ns > 0
+          ? std::optional<core::Duration>(
+                runtime_dynamic_body_max_age_cap_ns)
+          : std::nullopt;
   auto direct_scene_frame_resolver =
       std::dynamic_pointer_cast<RetainedSceneFrameResolver>(
           runtime->reference_resolver);
@@ -4728,6 +4730,9 @@ void RefreshRetainedNativeCandidateCollision(
                     *candidate_policy,
             "retained native collision readback differs from the candidate");
     runtime.collision_publisher = view.candidate_collision_publisher;
+    runtime.collision_shared_model = view.candidate_collision_model;
+    runtime.geometric_contact_scene_cache =
+        view.candidate_geometric_contact_scene_cache;
     runtime.runtime_collision_engine =
         view.candidate_runtime_collision_engine;
     runtime.validation_collision_engines =
@@ -8372,116 +8377,46 @@ public:
     return process ? process->exit_evidence() : std::nullopt;
   }
 
-  [[nodiscard]] std::optional<IsaacControllerLaunchInputs>
-  prepare(const deployment::RetainedBundle &bundle,
-          const std::optional<Facts> &facts, const std::string &context,
-          const bool qualify_existing_world = false) {
+  void prepare(const deployment::RetainedBundle &bundle,
+               const std::optional<Facts> &facts,
+               const std::string &context) {
     std::lock_guard transition_lock(transition_mutex_);
-    std::optional<std::string> world;
-    std::set<std::string> topics{"/clock"};
+    bool uses_isaac = false;
     for (const auto &unit : bundle.value().cell_graph.runtime_units) {
       if (unit.runtime_unit_id.value() != config_.runtime_unit_id ||
           unit.runtime_profile_id.value() !=
               deployment::ros2_control_execution_runtime_contract::kRuntimeProfileId) continue;
-      // World-free infrastructure needs no robot membership decode. The
-      // existing world-free branch below still rejects supplied observer facts.
-      if (!unit.configuration.contains("isaac_world")) continue;
       const auto value = deployment::ros2_control_execution_runtime_contract::require_configuration(
           bundle, unit.runtime_unit_id);
-      world = value.isaac_world;
       for (const auto &profile : value.controller_profiles) {
-        if (!profile.isaac_profile) continue;
-        const auto required = retained_isaac_scene_required_topics(*profile.isaac_profile);
-        topics.insert(required.begin(), required.end());
+        uses_isaac = uses_isaac || profile.isaac_profile.has_value();
       }
     }
-    std::optional<IsaacControllerLaunchInputs> inputs;
-    std::filesystem::path parameters;
-    std::optional<component_manager::IsaacSiteWorld> site_world;
-    double startup = 0.0;
-    double service = 0.0;
-    if (world) {
-      Require(config_.isaac_site_settings && config_.isaac_pose_observer_executable &&
-                  facts && facts->valid(),
-              "named cell world requires supplied site settings and checked observer facts");
-      const auto &site = *config_.isaac_site_settings;
-      const auto &mapping = site.ResolveWorld(*world);
-      site_world = mapping;
-      const auto *observer = site.FindPoseObserver(bundle.value().cell_graph.cell_id.value());
-      Require(observer != nullptr, "named cell world has no pose observer site mapping");
-      startup = site.scene_startup_timeout_s();
-      service = site.scene_service_timeout_s();
-      Require(std::isfinite(startup) && startup >= 0.1 && startup <= 600.0 &&
-                  std::isfinite(service) && service >= 0.1 && service <= 120.0,
-              "cell barrier timeouts violate existing barrier ranges");
-      Require(!mapping.expected_world_name.empty() && mapping.expected_world_name.size() <= 1024U,
-              "cell barrier world name violates its existing byte bound");
-      topics.insert(observer->additional_required_topics.begin(),
-                    observer->additional_required_topics.end());
-      Require(topics.size() <= 64U && std::all_of(topics.begin(), topics.end(),
-          [](const auto &topic) { return !topic.empty() && topic.front() == '/' && topic.size() <= 1024U; }),
-          "cell barrier required topics violate existing barrier limits");
-      const auto barrier = config_.isaac_pose_observer_executable->parent_path() /
-                           "isaac_scene_load_barrier";
-      Require(::access(barrier.c_str(), X_OK) == 0,
-              "installed sibling Isaac scene barrier is not executable");
-      inputs = IsaacControllerLaunchInputs{
-          mapping.world_uri, mapping.expected_world_name,
-          number_text(startup), number_text(service), config_.manager_run_root,
-          std::filesystem::path(facts->retained_snapshot_path), {}, true};
-    } else {
-      Require(!facts, "a world-free cell cannot carry observer launch facts");
-    }
-    std::optional<std::string> old_world;
+    Require(!facts || (uses_isaac && facts->valid() &&
+                       config_.isaac_pose_observer_executable.has_value()),
+            "Isaac pose observer facts require a configured Isaac component and executable");
     std::optional<Facts> old_facts;
     std::shared_ptr<CellLaunchProcess> old_observer;
-    std::optional<IsaacControllerLaunchInputs> old_inputs;
-    std::set<std::string> old_topics;
     bool initialized = false;
     {
       std::lock_guard lock(state_mutex_);
       initialized = initialized_;
-      old_world = world_;
       old_facts = facts_;
       old_observer = observer_;
-      old_inputs = inputs_;
-      old_topics = qualified_topics_;
-      if (initialized && old_world == world && old_facts == facts) {
-        Require(!world || old_observer || observer_start_pending_,
+      if (initialized && old_facts == facts) {
+        Require(!facts || old_observer || observer_start_pending_,
                 "cell pose observer is absent; explicit intervention requires a fresh occurrence");
         Require(!old_observer || !old_observer->exit_evidence(),
                 "cell pose observer exited; explicit intervention requires a fresh occurrence");
       }
     }
-    const bool unchanged_observer = initialized && old_world == world && old_facts == facts;
+    const bool unchanged_observer = initialized && old_facts == facts;
     if (initialized && old_facts && facts && !unchanged_observer)
       Require(old_facts->source_epoch_base != facts->source_epoch_base,
               "replacement cell observer requires a fresh Manager source epoch base");
-    // Cell-only observer metadata is not robot launch identity. Preserve the
-    // original robot inputs while the logical world remains unchanged (Q94).
-    if (initialized && world && old_world == world) inputs = old_inputs;
-    // The caller derives physical Add/Replace/recovery from its immutable
-    // plan. Cached topic evidence cannot certify a fresh robot occurrence.
-    const bool passive_join = initialized && world && old_world == world &&
-        (qualify_existing_world ||
-         !std::includes(old_topics.begin(), old_topics.end(), topics.begin(), topics.end()));
-    if (passive_join) {
-      parameters = barrier_parameters(*facts, *site_world, topics, startup, service, true);
-      run_barrier(parameters, *world, *facts, context, startup, service, true);
-    }
     if (unchanged_observer) {
-      // Keep the current membership's closure, not historical topic evidence:
-      // removing then adding the last Isaac robot qualifies its topics again.
-      std::lock_guard lock(state_mutex_);
-      qualified_topics_ = world ? topics : std::set<std::string>{};
-      return old_inputs;
+      return;
     }
-    if (world && old_world != world)
-      parameters = barrier_parameters(*facts, *site_world, topics, startup, service, false);
-    // Required mappings, checked observer facts and the parameter shape above
-    // are validated before retirement. The existing barrier validates its URI.
-    // A changed source is started only by finish(), after Manager clears its
-    // old source state and activates the already-checked new expectation.
     if (old_observer) {
       old_observer->update_request_context(context);
       Require(host_controller_launch_supervisor().retire_cell_process(old_observer),
@@ -8490,20 +8425,14 @@ public:
       retired_observer_ = old_observer;
       observer_.reset();
     }
-    if (world && old_world != world)
-      run_barrier(parameters, *world, *facts, context, startup, service, false);
     {
       std::lock_guard lock(state_mutex_);
       initialized_ = true;
-      world_ = std::move(world);
       facts_ = facts;
-      inputs_ = inputs;
       observer_.reset();
       observer_start_pending_ = facts.has_value();
       observer_start_failure_.reset();
-      qualified_topics_ = world ? topics : std::set<std::string>{};
     }
-    return inputs;
   }
 
   void finish(const std::optional<Facts> &facts, const std::string &context) {
@@ -8547,120 +8476,16 @@ public:
   BeginHostShutdown() {
     std::lock_guard lock(state_mutex_);
     return host_controller_launch_supervisor().BeginHostShutdown(
-        {observer_, retired_observer_, observer_incident_process_, barrier_});
+        {observer_, retired_observer_, observer_incident_process_});
   }
 
 private:
-  static std::string number_text(const double value) {
-    std::ostringstream out;
-    out.precision(std::numeric_limits<double>::max_digits10);
-    out << value;
-    auto text = out.str();
-    if (text.find_first_of(".eE") == std::string::npos) text += ".0";
-    return text;
-  }
-  void run_barrier(const std::filesystem::path &parameters, const std::string &world,
-                   const Facts &facts, const std::string &context,
-                   const double startup, const double service, const bool passive) const {
-    const auto barrier = config_.isaac_pose_observer_executable->parent_path() /
-                         "isaac_scene_load_barrier";
-    const CellLaunchCommand command{core::CellId(config_.cell_id),
-        CellLaunchRole::kSceneBarrier, std::nullopt,
-        {barrier.string(), "--ros-args", "--params-file", parameters.string(),
-         "--disable-external-lib-logs"},
-        std::string(passive ? "cell-passive-join:" : "cell-world:") + world + ":" +
-            facts.source_epoch_base};
-    // The normal barrier gives its stopped cleanup two separate calls using
-    // the supplied service budget after startup expires. Do not interrupt that
-    // existing cleanup with the startup-only bound used by passive joining.
-    const auto deadline = std::chrono::steady_clock::now() +
-        std::chrono::duration_cast<std::chrono::steady_clock::duration>(
-            std::chrono::duration<double>(startup + (passive ? 0.0 : 2.0 * service)));
-    std::shared_ptr<CellLaunchProcess> process;
-    {
-      // Publish the genuine barrier lease before a shutdown cut can complete.
-      // No separate cell registry: this is the original in-flight owner.
-      std::lock_guard lock(state_mutex_);
-      process = host_controller_launch_supervisor().start_cell_process(
-          command, config_.execution_run_root, context);
-      barrier_ = process;
-    }
-    while (!process->exit_evidence() && std::chrono::steady_clock::now() < deadline &&
-           g_stop_requested == 0)
-      std::this_thread::sleep_for(std::chrono::milliseconds(20));
-    const auto exit = process->exit_evidence();
-    const bool reaped = host_controller_launch_supervisor().retire_cell_process(process);
-    {
-      std::lock_guard lock(state_mutex_);
-      if (barrier_ == process)
-        barrier_.reset();
-    }
-    Require(exit && exit->exit_status == 0 && !exit->signal && reaped,
-            "cell world barrier did not complete with actual exit zero: " +
-                (exit ? exit->description : std::string("startup budget elapsed")));
-  }
-  std::filesystem::path barrier_parameters(
-      const Facts &facts, const component_manager::IsaacSiteWorld &world,
-      const std::set<std::string> &topics, const double startup, const double service,
-      const bool passive) const {
-    const auto scalar = [](const std::string &value) {
-      return content_identity::canonical_json(CanonicalValue(value));
-    };
-    CanonicalValue::Array array;
-    for (const auto &topic : topics) array.emplace_back(topic);
-    const std::string bytes = "manyforge_isaac_scene_load_barrier:\n  ros__parameters:\n"
-        "    world_uri: " + scalar(world.world_uri) + "\n    expected_world_name: " +
-        scalar(world.expected_world_name) + "\n    passive_join: " + (passive ? "true" : "false") +
-        "\n    startup_timeout_s: " + number_text(startup) +
-        "\n    service_timeout_s: " + number_text(service) + "\n    required_topics: " +
-        content_identity::canonical_json(CanonicalValue(std::move(array))) + "\n";
-    // One bounded parameter artifact per checked-input attempt/world config;
-    // exact replay reuses these bytes. No polling writer, overwrite or cleanup.
-    const auto path = std::filesystem::path(facts.retained_snapshot_path).parent_path() /
-        (std::filesystem::path(facts.retained_snapshot_path).filename().string() +
-         ".world-" + content_identity::sha256_digest(bytes).substr(7U) + ".yaml");
-    FileDescriptor file(::open(path.c_str(), O_WRONLY | O_CREAT | O_EXCL | O_NOFOLLOW | O_CLOEXEC, 0600));
-    if (file.get() < 0 && errno == EEXIST) {
-      FileDescriptor existing(::open(path.c_str(), O_RDONLY | O_NOFOLLOW | O_CLOEXEC));
-      if (existing.get() < 0) FailErrno("open retained cell barrier parameters");
-      struct stat status {};
-      Require(::fstat(existing.get(), &status) == 0 && S_ISREG(status.st_mode) &&
-                  status.st_uid == ::geteuid() && (status.st_mode & 0777) == 0600 &&
-                  status.st_size >= 0 && static_cast<std::uint64_t>(status.st_size) == bytes.size(),
-              "retained cell barrier parameter file differs on exact replay");
-      std::string captured(bytes.size(), '\0');
-      std::size_t read_offset = 0U;
-      while (read_offset < captured.size()) {
-        const auto count = ::read(existing.get(), captured.data() + read_offset,
-                                  captured.size() - read_offset);
-        if (count < 0 && errno == EINTR) continue;
-        Require(count > 0, "retained cell barrier parameters are incomplete");
-        read_offset += static_cast<std::size_t>(count);
-      }
-      Require(captured == bytes, "retained cell barrier parameters differ on exact replay");
-      return path;
-    }
-    if (file.get() < 0) FailErrno("create retained cell barrier parameters");
-    std::size_t offset = 0U;
-    while (offset < bytes.size()) {
-      const auto written = ::write(file.get(), bytes.data() + offset, bytes.size() - offset);
-      if (written < 0 && errno == EINTR) continue;
-      if (written <= 0) FailErrno("write retained cell barrier parameters");
-      offset += static_cast<std::size_t>(written);
-    }
-    std::cerr << "manyforge cell barrier parameters: path=" << path
-              << " bytes=" << bytes.size() << " snapshot=" << facts.retained_snapshot_path << '\n';
-    return path;
-  }
   const ManagedRuntimeChildConfig &config_;
   std::mutex transition_mutex_;
   mutable std::mutex state_mutex_;
   bool initialized_{false};
-  std::optional<std::string> world_;
   std::optional<Facts> facts_;
-  std::optional<IsaacControllerLaunchInputs> inputs_;
   std::shared_ptr<CellLaunchProcess> observer_;
-  mutable std::shared_ptr<CellLaunchProcess> barrier_;
   std::shared_ptr<CellLaunchProcess> retired_observer_;
   std::shared_ptr<CellLaunchProcess> observer_incident_process_;
   std::optional<core::CellObserverIncidentRecordDTO> observer_incident_record_;
@@ -8669,7 +8494,6 @@ private:
   bool observer_incident_slot_qualified_{false};
   bool observer_start_pending_{false};
   std::optional<std::string> observer_start_failure_;
-  std::set<std::string> qualified_topics_;
 };
 
 [[nodiscard]] int
@@ -8760,10 +8584,10 @@ RunManagedRuntimeChild(const ManagedRuntimeChildConfig &config) {
   NativeShutdownOwnerPhase cell_destructor_phase{
       shutdown_projection, ShutdownPhase::kCellProcessesDestruction,
       managed_isaac_cell};
-  const auto prepare_managed_cell_world = [&](const deployment::RetainedBundle &bundle,
+  const auto prepare_managed_cell_observer = [&](const deployment::RetainedBundle &bundle,
       const std::optional<component_manager::ManagerIsaacPoseObserverLaunchFactsDTO> &facts,
-      const std::string &context, const bool qualify_existing_world = false) {
-    return managed_isaac_cell.prepare(bundle, facts, context, qualify_existing_world);
+      const std::string &context) {
+    managed_isaac_cell.prepare(bundle, facts, context);
   };
   const auto finish_managed_cell_observer = [&](const auto &facts, const std::string &context) {
     managed_isaac_cell.finish(facts, context);
@@ -8917,10 +8741,10 @@ RunManagedRuntimeChild(const ManagedRuntimeChildConfig &config) {
       config, bootstrap_retained_bundle_id, bootstrap_graph_revision);
   const auto bootstrap_cell = LoadManagedBundleAtPinnedRoot(config, bootstrap_retained_bundle_id);
   Require(bootstrap_cell && bootstrap_cell->bundle,
-          "cell-world bootstrap has no verified retained bundle");
+          "Isaac attach bootstrap has no verified retained bundle");
   const std::string cell_bootstrap_context = "Bootstrap runtime=" + config.runtime_unit_id +
                                            " epoch=" + config.runtime_epoch;
-  const auto bootstrap_isaac_inputs = prepare_managed_cell_world(
+  prepare_managed_cell_observer(
       *bootstrap_cell->bundle, config.isaac_pose_observer_launch_facts, cell_bootstrap_context);
   finish_managed_cell_observer(config.isaac_pose_observer_launch_facts, cell_bootstrap_context);
   const bool bootstrap_requires_physical_composition =
@@ -9435,7 +9259,6 @@ RunManagedRuntimeChild(const ManagedRuntimeChildConfig &config) {
       input->motion_trace = host_motion_trace;
       input->shared_scheduler = detached_owner_scheduler;
       input->observation_wake = stable_observation_wake;
-      input->managed_isaac_launch_inputs = bootstrap_isaac_inputs;
       current_predecessor_composition_pending = false;
       current_composition_builder_started = true;
       Require(stable_kernel_owner->SetRouteRecoveryPending(true).ok(),
@@ -10904,6 +10727,12 @@ RunManagedRuntimeChild(const ManagedRuntimeChildConfig &config) {
     Require(
         actual_candidate && actual_candidate->bundle,
         "actual_installed_state_unknown: candidate product is not verified");
+    const std::string observer_request_context =
+        "Apply=" + request.apply_id.value() + " generation=" +
+        std::to_string(request.apply_generation.value());
+    prepare_managed_cell_observer(
+        *actual_candidate->bundle, request.isaac_pose_observer_launch_facts,
+        observer_request_context);
     {
       std::lock_guard lock(managed_composition_mutex);
       if (managed_composition_failure != nullptr) {
@@ -11966,6 +11795,8 @@ RunManagedRuntimeChild(const ManagedRuntimeChildConfig &config) {
       }
       throw;
     }
+    finish_managed_cell_observer(request.isaac_pose_observer_launch_facts,
+                                 observer_request_context);
     require_installed_candidate_configuration();
     if (request.phase == component_manager::
                              ManagerSelectedRuntimeCompositionPhase::kPrepare) {

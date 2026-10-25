@@ -598,7 +598,6 @@ run_python_tests() {
         tests/test_public_contract_entrypoint_reconciliation.py \
         tests/test_qualification_wrapper_entrypoints.py \
         tests/test_ros_qualification_helpers.py \
-        exts/manyforge.isaac.command_guard/tests/ \
         tests/test_grouped_gtest_runner.py \
         tests/test_release_golden_workflow.py \
         tests/test_test_all_script_contract.py \
@@ -797,7 +796,6 @@ run_ros_tests() {
                "JtcExecutionPort" "Ros2GripperCommandBackendTest" \
                "RetainedRos2ControlBackendFactoryTest" \
                "RetainedRos2ControlRuntimeHandleTest" \
-               "RetainedIsaacArmGuardBindingTest" \
                "Ros2ControlKernelStopIntegrationTest" ); then
         FAIL=$((FAIL + 1))
     elif ( source_ros_integration_environment

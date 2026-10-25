@@ -31,7 +31,7 @@
     interpolation_method: splines
     interpolate_from_desired_state: true
     allow_trajectory_replacement: false
-    set_last_command_interface_value_as_state_on_activation: false
+    set_last_command_interface_value_as_state_on_activation: true
     constraints:
       decelerate_on_cancel: true
       stopped_velocity_tolerance: 0.2

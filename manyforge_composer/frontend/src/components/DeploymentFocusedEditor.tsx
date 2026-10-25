@@ -5,6 +5,7 @@ import {
   IoSignalConfigurationSection,
   IoSignalInputFields,
   IoSignalOutputFields,
+  type GeometricContactEndpointOption,
 } from './IoSignalConfigurationSection';
 import {
   IO_DEVICE_MAXIMUM_LIFECYCLE_TIMEOUT_S,
@@ -568,32 +569,6 @@ function FramePrefixDraft({ value, disabled, onCommit }: {
         {formatInvalid
           ? "Frame prefix must be empty or use only ASCII letters, digits, '_' and '/', without a leading '/' and with a trailing '/'."
           : 'Value was rejected.'}
-      </small>}
-    </label>
-  );
-}
-
-function IsaacWorldDraft({ controller }: { controller: DeploymentWorkspaceController }) {
-  const document = controller.workspace?.draft.document;
-  const value = typeof document?.isaac_world === 'string' ? document.isaac_world : '';
-  const [draft, setDraft] = useState(value);
-  useEffect(() => { setDraft(value); }, [value]);
-  const invalid = draft !== '' && !/^[a-z][a-z0-9._-]{0,127}$/.test(draft);
-  if (document?.api_version !== 'manyforge.deployment_intent.v2') return null;
-  return (
-    <label className="deployment-focused-field">
-      <span>Isaac world</span>
-      <input value={draft} disabled={!controller.mutationAvailable || controller.busy}
-        aria-invalid={invalid}
-        onChange={(event) => setDraft(event.target.value)}
-        onBlur={() => {
-          if (!invalid && draft !== value) {
-            void controller.mutate(['isaac_world'], draft === '' ? 'remove' : 'set', draft);
-          }
-        }} />
-      <small>Logical world name from the Manager site settings. Required for Isaac robots.</small>
-      {invalid && <small className="deployment-field-error inline-message severity-error">
-        World must be a portable identifier.
       </small>}
     </label>
   );
@@ -1764,6 +1739,26 @@ export function DeploymentFocusedEditor({
   executionGroupIds = null,
 }: DeploymentFocusedEditorProps) {
   const document = controller.workspace?.draft.document ?? null;
+  const geometricContactEndpoints = useMemo(() => {
+    const motionEndpoints = motionDescriptors.flatMap((descriptor) => descriptor.frames.map(
+      (frame): GeometricContactEndpointOption => ({
+        componentId: descriptor.controllableComponentId,
+        targetId: descriptor.commandTargetId,
+        frameRoleId: frame.frameRoleId,
+      }),
+    ));
+    const retainedEndpoints = sourceModel.status === 'ready'
+      ? sourceModel.data.targets.flatMap((target) => target.frames.map(
+        (frame): GeometricContactEndpointOption => ({
+          componentId: target.component_id,
+          targetId: target.target_id,
+          frameRoleId: frame.frame_role_id,
+        }),
+      )) : [];
+    return [...new Map([...motionEndpoints, ...retainedEndpoints].map((endpoint) => [
+      JSON.stringify([endpoint.componentId, endpoint.targetId, endpoint.frameRoleId]), endpoint,
+    ])).values()];
+  }, [motionDescriptors, sourceModel]);
   const runtimes = useMemo(() => runtimeConfigurations(document), [document]);
   // I/O devices have no model, motion, gripper, frame or Stop inputs.
   const motionRuntimes = useMemo(() => runtimes.filter((runtime) => !runtime.ioProvider), [runtimes]);
@@ -1788,7 +1783,6 @@ export function DeploymentFocusedEditor({
           <h3 id="deployment-focused-title">Robot and runtime configuration</h3>
         </div>
       </header>
-      <IsaacWorldDraft controller={controller} />
       <ModelAndTargetSection
         controller={controller}
         sourceModel={sourceModel}
@@ -1800,9 +1794,11 @@ export function DeploymentFocusedEditor({
       <ControlledStopSection controller={controller} targets={controlledStop} />
       <GripperSection controller={controller} descriptors={gripperDescriptors} runtimes={motionRuntimes} />
       {document.api_version === 'manyforge.deployment_intent.v2' && (
-        <IoDeviceSection controller={controller} document={document} />
+        <IoDeviceSection controller={controller} document={document}
+          geometricContactEndpoints={geometricContactEndpoints} />
       )}
-      <IoSignalConfigurationSection controller={controller} runtimes={ioRuntimes} />
+      <IoSignalConfigurationSection controller={controller} runtimes={ioRuntimes}
+        geometricContactEndpoints={geometricContactEndpoints} />
       {document.api_version === 'manyforge.deployment_intent.v2' && (
         <MotionTakeoverSection controller={controller} document={document} />
       )}
@@ -1892,9 +1888,10 @@ interface IoDeviceRow {
  * limit, or remove it. Its signals are edited in the I/O signals section. An
  * I/O device is not drawn in the 3D scene.
  */
-function IoDeviceSection({ controller, document }: {
+function IoDeviceSection({ controller, document, geometricContactEndpoints }: {
   controller: DeploymentWorkspaceController;
   document: Record<string, JsonValue>;
+  geometricContactEndpoints: readonly GeometricContactEndpointOption[];
 }) {
   const components = Array.isArray(document.components) ? document.components : [];
   const componentIds = components.flatMap((value) => {
@@ -1969,6 +1966,7 @@ function IoDeviceSection({ controller, document }: {
             <p className="field-help">First signal (an I/O device needs at least one). Leave Resource role blank to use the signal name, and Source blank to use {draft.componentId}_source.</p>
             {signal?.kind === 'input' ? (
               <IoSignalInputFields index={0} draft={signal.draft} disabled={disabled} ioProvider
+                geometricContactEndpoints={geometricContactEndpoints}
                 onChange={(patch: Partial<IoSignalInputDraft>) => update({ ...draft, signal: { kind: 'input', draft: { ...signal.draft, ...patch } } })}
                 onDirection={(direction) => update({ ...draft, signal: withIoDirection(signal, direction) as IoDeviceDraft['signal'] })} />
             ) : signal?.kind === 'output' ? (

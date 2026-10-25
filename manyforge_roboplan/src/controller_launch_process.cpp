@@ -184,8 +184,7 @@ resolve_executable(const std::string &name) {
 
 [[nodiscard]] std::string cell_launch_fields(const CellLaunchCommand &command) {
   return " cell=" + log_field(command.cell_id.value()) +
-         " role=" + (command.role == CellLaunchRole::kSceneBarrier
-                           ? "scene_barrier" : "pose_observer") +
+         " role=pose_observer" +
          (command.observer_source_id.has_value()
               ? " source=" + log_field(*command.observer_source_id)
               : std::string());
@@ -460,21 +459,10 @@ mock_controller_launch_command(const ControllerLaunchArtifacts &artifacts) {
 
 ControllerLaunchCommand
 isaac_controller_launch_command(const ControllerLaunchArtifacts &artifacts,
-                                const IsaacControllerLane &lane,
-                                const IsaacControllerLaunchInputs &inputs) {
+                                const IsaacControllerLane &lane) {
   require_artifacts(artifacts, ControllerLaunchLane::kIsaac);
-  const auto required = [](const std::string &value, const char *name) {
-    if (value.empty()) {
-      fail(std::string("Isaac launch input '") + name + "' is required");
-    }
-    return value;
-  };
   if (lane.joint_commands_topic.empty() || lane.joint_states_topic.empty()) {
     fail("Isaac lane facts have no joint topics");
-  }
-  if (inputs.manager_run_root.has_value() !=
-      inputs.pose_observer_site_config.has_value()) {
-    fail("manager_run_root and pose_observer_site_config are supplied together");
   }
   std::vector<std::string> host_owned{
       "robot_description_file:=" + artifacts.robot_description_file.string(),
@@ -491,45 +479,19 @@ isaac_controller_launch_command(const ControllerLaunchArtifacts &artifacts,
   if (!artifacts.frame_prefix.empty()) {
     host_owned.push_back("frame_prefix:=" + artifacts.frame_prefix);
   }
-  std::vector<std::string> caller{
-      "world_uri:=" + required(inputs.world_uri, "world_uri"),
-      "expected_world_name:=" +
-          required(inputs.expected_world_name, "expected_world_name"),
-      "scene_startup_timeout_s:=" +
-          required(inputs.scene_startup_timeout_s, "scene_startup_timeout_s"),
-      "scene_service_timeout_s:=" +
-          required(inputs.scene_service_timeout_s, "scene_service_timeout_s"),
-  };
-  if (inputs.manager_run_root.has_value()) {
-    caller.push_back("manager_run_root:=" + inputs.manager_run_root->string());
-    caller.push_back("pose_observer_site_config:=" +
-                     inputs.pose_observer_site_config->string());
-  }
-  if (inputs.manager_cell_world_owned) {
-    caller.push_back("manager_cell_world_owned:=true");
-  }
-  for (const auto &argument : inputs.additional_arguments) {
-    if (argument_name(argument) == "manager_cell_world_owned") {
-      fail("Isaac cell launch ownership is a host-owned input");
-    }
-    caller.push_back(argument);
-  }
   ControllerLaunchCommand command;
   command.controllable_component_id = artifacts.controllable_component_id;
   command.lane = ControllerLaunchLane::kIsaac;
   command.argv = {std::string(kRos2), "launch", std::string(kBringupPackage),
                   std::string(kIsaacLaunchFile)};
   std::set<std::string> names;
-  for (const auto *group : {&host_owned, &caller}) {
-    for (const auto &argument : *group) {
-      if (!names.insert(argument_name(argument)).second) {
-        fail("Isaac launch argument repeated or overrides a host-owned "
-             "argument: " + argument);
-      }
-      command.argv.push_back(argument);
+  for (const auto &argument : host_owned) {
+    if (!names.insert(argument_name(argument)).second) {
+      fail("Isaac launch argument repeated: " + argument);
     }
+    command.argv.push_back(argument);
   }
-  command.identity = identity_of(artifacts, caller);
+  command.identity = identity_of(artifacts, {});
   command.robot_description_sha256 = artifacts.robot_description_sha256;
   command.controllers_sha256 = artifacts.controllers_sha256;
   command.controller_profile = artifacts.controller_profile;
@@ -538,8 +500,8 @@ isaac_controller_launch_command(const ControllerLaunchArtifacts &artifacts,
   command.gripper_controller_name = artifacts.gripper_controller_name;
   command.frame_prefix = artifacts.frame_prefix;
   command.controllers_yaml = artifacts.controllers_yaml;
-  // DX224.3: unchanged Isaac identity keeps the launch and avoids an
-  // unintended world reload on Apply.
+  // The inactive controller infrastructure stays attached across Apply when
+  // its exact generated configuration is unchanged.
   command.keep_across_apply = true;
   return command;
 }
@@ -1472,19 +1434,10 @@ std::shared_ptr<CellLaunchProcess> ControllerLaunchSupervisor::start_cell_proces
     const std::filesystem::path &artifacts_root, std::string context) {
   if (command.cell_id.empty() || command.identity.empty() || command.argv.empty())
     fail("cell launch requires an exact cell, launch identity and argv");
-  switch (command.role) {
-  case CellLaunchRole::kSceneBarrier:
-    if (command.observer_source_id.has_value())
-      fail("cell scene barrier must not name an observer source");
-    break;
-  case CellLaunchRole::kPoseObserver:
-    if (!command.observer_source_id.has_value() ||
-        command.observer_source_id->empty())
-      fail("cell pose observer requires its exact configured source identity");
-    break;
-  default:
-    fail("cell launch role is unknown");
-  }
+  if (command.role != CellLaunchRole::kPoseObserver ||
+      !command.observer_source_id.has_value() ||
+      command.observer_source_id->empty())
+    fail("cell pose observer requires its exact configured source identity");
   prepare_upstream_log_directory(artifacts_root);
   std::lock_guard submission_lock(mutex_);
   if (host_shutdown_started_)

@@ -164,7 +164,6 @@
   ],
   "deployment_artifact_id": "isaac_manipulator_scene_light_ros2_control_collision",
   "description": "Retained Isaac UR10e light-scene collision scenario using commanded ROS 2 control execution, the authoritative runtime collision projection, and Kernel-owned Stop evidence.",
-  "isaac_world": "isaac_manipulator_scene_light",
   "name": "isaac_manipulator_scene_light_ros2_control_collision",
   "policies": {
     "interrupt_config": {

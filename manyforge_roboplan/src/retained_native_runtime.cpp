@@ -1644,6 +1644,10 @@ create_retained_native_runtime_participants(
       shared_model,
       collision::ManyForgeCollisionEngine::make_shared_scene_cache(
           shared_model));
+  runtime->collision_shared_model = shared_model;
+  runtime->geometric_contact_scene_cache =
+      collision::ManyForgeCollisionEngine::make_shared_scene_cache(
+          shared_model);
   const auto validation_cache =
       collision::ManyForgeCollisionEngine::make_shared_scene_cache(
           shared_model);

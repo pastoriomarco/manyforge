@@ -11,6 +11,10 @@ import type {
   LogicalScenePose,
   LogicalSceneProjection,
   LogicalSceneShape,
+  SceneRuntimeCellObserver,
+  SceneRuntimeCellObserverExit,
+  SceneRuntimeCellObserverIncidentPersistence,
+  SceneRuntimeConfiguredPoseSource,
   SceneRuntimeProjection,
   SceneRuntimeGoodObservationPayload,
   SceneRuntimeObservationPose,
@@ -963,29 +967,46 @@ export function parseLogicalSceneProjection(value: unknown): LogicalSceneProject
 
 export function parseSceneRuntimeProjection(value: unknown): SceneRuntimeProjection {
   const record = objectAt(value, 'sceneRuntime');
-  exactKeysAt(record, ['api_version', 'cell_id', 'state'], 'sceneRuntime');
+  const hasCellObserver = Object.prototype.hasOwnProperty.call(record, 'cell_observer');
+  exactKeysAt(
+    record,
+    hasCellObserver
+      ? ['api_version', 'cell_id', 'cell_observer', 'state']
+      : ['api_version', 'cell_id', 'state'],
+    'sceneRuntime',
+  );
   const apiVersion = stringAt(record.api_version, 'sceneRuntime.api_version');
   if (apiVersion !== 'manyforge.scene_runtime_source.v1') {
     return fail('sceneRuntime.api_version', 'manyforge.scene_runtime_source.v1');
   }
+  const cellId = stringAt(record.cell_id, 'sceneRuntime.cell_id');
+  const cellObserver = hasCellObserver
+    ? parseSceneRuntimeCellObserver(record.cell_observer, 'sceneRuntime.cell_observer', cellId)
+    : undefined;
   const state = objectAt(record.state, 'sceneRuntime.state');
+  const hasConfiguredPoseSource = Object.prototype.hasOwnProperty.call(
+    state,
+    'configured_pose_source',
+  );
+  const stateKeys = [
+    'active_replay_id',
+    'api_version',
+    'counters',
+    'deferred',
+    'error',
+    'initialization_generation',
+    'initialization_token',
+    'pose_sources',
+    'reason',
+    'runtime_identity',
+    'started_at_ns',
+    'state',
+    'updated_at_ns',
+  ];
+  if (hasConfiguredPoseSource) stateKeys.push('configured_pose_source');
   exactKeysAt(
     state,
-    [
-      'active_replay_id',
-      'api_version',
-      'counters',
-      'deferred',
-      'error',
-      'initialization_generation',
-      'initialization_token',
-      'pose_sources',
-      'reason',
-      'runtime_identity',
-      'started_at_ns',
-      'state',
-      'updated_at_ns',
-    ],
+    stateKeys,
     'sceneRuntime.state',
   );
   const stateApiVersion = stringAt(state.api_version, 'sceneRuntime.state.api_version');
@@ -1019,6 +1040,12 @@ export function parseSceneRuntimeProjection(value: unknown): SceneRuntimeProject
   if (!stateNames.includes(stateName as typeof stateNames[number])) {
     return fail('sceneRuntime.state.state', 'a supported scene-runtime state');
   }
+  const configuredPoseSource = hasConfiguredPoseSource
+    ? parseSceneRuntimeConfiguredPoseSource(
+      state.configured_pose_source,
+      'sceneRuntime.state.configured_pose_source',
+    )
+    : undefined;
   let runtimeIdentity: SceneRuntimeProjection['state']['runtime_identity'] = null;
   if (state.runtime_identity !== null) {
     const identity = objectAt(state.runtime_identity, 'sceneRuntime.state.runtime_identity');
@@ -1037,12 +1064,16 @@ export function parseSceneRuntimeProjection(value: unknown): SceneRuntimeProject
   }
   return {
     api_version: apiVersion,
-    cell_id: stringAt(record.cell_id, 'sceneRuntime.cell_id'),
+    cell_id: cellId,
+    ...(cellObserver === undefined ? {} : { cell_observer: cellObserver }),
     state: {
       api_version: stateApiVersion,
       active_replay_id: state.active_replay_id === null
         ? null
         : positiveIntegerAt(state.active_replay_id, 'sceneRuntime.state.active_replay_id'),
+      ...(configuredPoseSource === undefined
+        ? {}
+        : { configured_pose_source: configuredPoseSource }),
       counters: parsedCounters,
       deferred: booleanAt(state.deferred, 'sceneRuntime.state.deferred'),
       error: nullableStringAt(state.error, 'sceneRuntime.state.error'),
@@ -1068,6 +1099,195 @@ export function parseSceneRuntimeProjection(value: unknown): SceneRuntimeProject
       state: stateName as SceneRuntimeProjection['state']['state'],
       updated_at_ns: monotonicNanosecondsAt(state.updated_at_ns, 'sceneRuntime.state.updated_at_ns'),
     },
+  };
+}
+
+function utf8ByteLength(value: string): number {
+  return new TextEncoder().encode(value).byteLength;
+}
+
+function parseSceneRuntimeConfiguredPoseSource(
+  value: unknown,
+  path: string,
+): SceneRuntimeConfiguredPoseSource {
+  const record = objectAt(value, path);
+  exactKeysAt(record, ['freshness_open', 'source_epoch_base', 'source_id'], path);
+  const sourceId = nonEmptyStringAt(record.source_id, `${path}.source_id`);
+  if (utf8ByteLength(sourceId) > 256 || sourceId.normalize('NFC') !== sourceId) {
+    return fail(`${path}.source_id`, 'a bounded NFC source ID');
+  }
+  const sourceEpochBase = nonEmptyStringAt(
+    record.source_epoch_base,
+    `${path}.source_epoch_base`,
+  );
+  if (
+    sourceEpochBase.includes('\0')
+    || utf8ByteLength(sourceEpochBase) > 256 - '.9007199254740991'.length
+    || sourceEpochBase.normalize('NFC') !== sourceEpochBase
+  ) {
+    return fail(`${path}.source_epoch_base`, 'a bounded NFC epoch base without NUL');
+  }
+  return {
+    freshness_open: booleanAt(record.freshness_open, `${path}.freshness_open`),
+    source_epoch_base: sourceEpochBase,
+    source_id: sourceId,
+  };
+}
+
+function parseSceneRuntimeCellObserverExit(
+  value: unknown,
+  path: string,
+): SceneRuntimeCellObserverExit {
+  const record = objectAt(value, path);
+  exactKeysAt(
+    record,
+    ['core_dumped', 'detected_at_ns', 'exit_status', 'observed_utc', 'pid', 'signal'],
+    path,
+  );
+  const pid = positiveIntegerAt(record.pid, `${path}.pid`);
+  if (pid > 2_147_483_647) {
+    return fail(`${path}.pid`, 'a positive signed 32-bit integer');
+  }
+  const nullableByte = (field: 'exit_status' | 'signal'): number | null => {
+    const item = record[field];
+    if (item === null) return null;
+    const byte = integerAt(item, `${path}.${field}`);
+    if (byte > 255) return fail(`${path}.${field}`, 'a byte or null');
+    return byte;
+  };
+  const exitStatus = nullableByte('exit_status');
+  const signal = nullableByte('signal');
+  if ((exitStatus === null) === (signal === null)) {
+    return fail(path, 'exactly one of exit_status and signal to be present');
+  }
+  const observedUtc = stringAt(record.observed_utc, `${path}.observed_utc`);
+  if (utf8ByteLength(observedUtc) > 128) {
+    return fail(`${path}.observed_utc`, 'a string of at most 128 UTF-8 bytes');
+  }
+  return {
+    core_dumped: booleanAt(record.core_dumped, `${path}.core_dumped`),
+    detected_at_ns: monotonicNanosecondsAt(record.detected_at_ns, `${path}.detected_at_ns`),
+    exit_status: exitStatus,
+    observed_utc: observedUtc,
+    pid,
+    signal,
+  };
+}
+
+function parseSceneRuntimeCellObserver(
+  value: unknown,
+  path: string,
+  expectedCellId: string,
+): SceneRuntimeCellObserver {
+  const record = objectAt(value, path);
+  const hasExpectedJointState = Object.prototype.hasOwnProperty.call(
+    record,
+    'expected_joint_state',
+  );
+  exactKeysAt(
+    record,
+    [
+      'availability',
+      'cell_id',
+      'exit',
+      'incident_id',
+      'incident_persistence',
+      'observation_current',
+      'process_presence',
+      'source_epoch_base',
+      'source_id',
+      ...(hasExpectedJointState ? ['expected_joint_state'] : []),
+    ],
+    path,
+  );
+  const cellId = stringAt(record.cell_id, `${path}.cell_id`);
+  if (cellId !== expectedCellId) {
+    return fail(`${path}.cell_id`, 'the scene runtime cell_id');
+  }
+  const sourceId = stringAt(record.source_id, `${path}.source_id`);
+  if (utf8ByteLength(sourceId) > 256) {
+    return fail(`${path}.source_id`, 'a string of at most 256 UTF-8 bytes');
+  }
+  const sourceEpochBase = stringAt(record.source_epoch_base, `${path}.source_epoch_base`);
+  if (
+    sourceEpochBase.includes('\0')
+    || utf8ByteLength(sourceEpochBase) > 256 - '.9007199254740991'.length
+  ) {
+    return fail(`${path}.source_epoch_base`, 'a bounded source epoch base without NUL');
+  }
+  const availability = stringAt(record.availability, `${path}.availability`);
+  if (!['available', 'pending', 'unavailable', 'unknown'].includes(availability)) {
+    return fail(`${path}.availability`, 'a supported cell-observer availability');
+  }
+  const processPresence = stringAt(record.process_presence, `${path}.process_presence`);
+  if (!['present', 'absent', 'unknown'].includes(processPresence)) {
+    return fail(`${path}.process_presence`, 'a supported process-presence state');
+  }
+  const exit = record.exit === null
+    ? null
+    : parseSceneRuntimeCellObserverExit(record.exit, `${path}.exit`);
+  const incidentId = record.incident_id === null
+    ? null
+    : nonEmptyStringAt(record.incident_id, `${path}.incident_id`);
+  if (incidentId !== null && utf8ByteLength(incidentId) > 128) {
+    return fail(`${path}.incident_id`, 'a non-empty string of at most 128 UTF-8 bytes or null');
+  }
+  const incidentPersistenceValue = integerAt(
+    record.incident_persistence,
+    `${path}.incident_persistence`,
+  );
+  if (incidentPersistenceValue > 4) {
+    return fail(`${path}.incident_persistence`, 'an incident-persistence enum from 0 through 4');
+  }
+  const incidentPersistence = incidentPersistenceValue as SceneRuntimeCellObserverIncidentPersistence;
+  if (
+    (exit === null && (incidentId !== null || incidentPersistence !== 0))
+    || (exit !== null && incidentId === null && incidentPersistence !== 4)
+    || (exit !== null && incidentId !== null && incidentPersistence === 0)
+  ) {
+    return fail(path, 'a consistent exit, incident_id, and incident_persistence combination');
+  }
+  let expectedJointState: SceneRuntimeCellObserver['expected_joint_state'];
+  if (hasExpectedJointState) {
+    if (record.expected_joint_state === null) {
+      expectedJointState = null;
+    } else {
+      const expected = objectAt(record.expected_joint_state, `${path}.expected_joint_state`);
+      exactKeysAt(expected, ['object_id', 'policy_id', 'topic'], `${path}.expected_joint_state`);
+      const expectedObjectId = nonEmptyStringAt(
+        expected.object_id,
+        `${path}.expected_joint_state.object_id`,
+      );
+      const expectedPolicyId = nonEmptyStringAt(
+        expected.policy_id,
+        `${path}.expected_joint_state.policy_id`,
+      );
+      const expectedTopic = nonEmptyStringAt(
+        expected.topic,
+        `${path}.expected_joint_state.topic`,
+      );
+      if ([expectedObjectId, expectedPolicyId, expectedTopic]
+        .some((field) => utf8ByteLength(field) > 256)) {
+        return fail(`${path}.expected_joint_state`, 'bounded source identifiers and topic');
+      }
+      expectedJointState = {
+        object_id: expectedObjectId,
+        policy_id: expectedPolicyId,
+        topic: expectedTopic,
+      };
+    }
+  }
+  return {
+    availability: availability as SceneRuntimeCellObserver['availability'],
+    cell_id: cellId,
+    exit,
+    incident_id: incidentId,
+    incident_persistence: incidentPersistence,
+    observation_current: booleanAt(record.observation_current, `${path}.observation_current`),
+    process_presence: processPresence as SceneRuntimeCellObserver['process_presence'],
+    source_epoch_base: sourceEpochBase,
+    source_id: sourceId,
+    ...(hasExpectedJointState ? { expected_joint_state: expectedJointState } : {}),
   };
 }
 

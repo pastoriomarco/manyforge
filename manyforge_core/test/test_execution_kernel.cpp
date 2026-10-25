@@ -9877,9 +9877,8 @@ TEST_F(PortParticipantKernelTest, LateControlCycleBeyondTheMarginIsTheItem17Path
 }
 
 TEST_F(PortParticipantKernelTest, HostReportedMechanismFaultIsTheItem17Path) {
-  // Item 44 / Q41: the host reports the Isaac guard trip before switching the
-  // controller off; the in-flight motion ends InterventionRequired through
-  // the Kernel's hard stop, not as a controller-binding loss.
+  // A host-reported mechanism fault ends in-flight motion through the Kernel's
+  // hard stop, not as a controller-binding loss.
   Build(Config(StateAuthorityClass::kCommanded));
   std::atomic<int> step{0};
   tick = [&] {
@@ -9891,7 +9890,8 @@ TEST_F(PortParticipantKernelTest, HostReportedMechanismFaultIsTheItem17Path) {
     Sample(0.01 * step, 0.005 * step, 0.5);
     if (step == 3) {
       participant->ReportCriticalFault(ErrorDTO{
-          "internal_error", "Isaac command guard tripped", {{"reason", "isaac_guard_tripped"}}});
+          "internal_error", "Controller mechanism fault",
+          {{"reason", "controller_mechanism_fault"}}});
       // The controller deactivation the host requests next is observed later.
       ExecutionReadinessDTO inactive;
       inactive.binding_epoch = ExecutionBindingEpoch(1U);
@@ -9902,14 +9902,15 @@ TEST_F(PortParticipantKernelTest, HostReportedMechanismFaultIsTheItem17Path) {
   ASSERT_TRUE(wait_for_ended(*pkernel, "failed_effect_uncertain")) << ended_as(*pkernel);
   const auto status = pkernel->get_status();
   ASSERT_TRUE(status.fact.has_value() && status.fact->error.has_value());
-  EXPECT_EQ(status.fact->error->details.at("reason"), "isaac_guard_tripped");
+  EXPECT_EQ(status.fact->error->details.at("reason"),
+            "controller_mechanism_fault");
   EXPECT_EQ(participant->get_execution_snapshot().state, ExecutionState::kInterventionRequired);
   EXPECT_FALSE(participant->GoalInFlight() &&
                participant->get_execution_snapshot().state == ExecutionState::kExecuting);
   // Without motion in flight a report changes nothing.
   participant->ReportCriticalFault(ErrorDTO{"internal_error", "late", {}});
   EXPECT_EQ(participant->get_execution_snapshot().error->details.at("reason"),
-            "isaac_guard_tripped");
+            "controller_mechanism_fault");
 }
 
 TEST_F(PortParticipantKernelTest, SoftStopUnderTheAddressedFenceEndsTheExecutionStopped) {

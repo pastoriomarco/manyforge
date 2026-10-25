@@ -1209,8 +1209,7 @@ decode_fault_stop_profile(const core::JsonValueDTO &encoded) {
 
 } // namespace
 
-CanonicalValue empty_host_configuration(
-    const std::optional<std::string> &isaac_world) {
+CanonicalValue empty_host_configuration() {
   CanonicalValue::Object configuration{
       {"mode", CanonicalValue("commanded_sim")},
       {"planner_rng_seed", CanonicalValue(12345.0)},
@@ -1220,16 +1219,12 @@ CanonicalValue empty_host_configuration(
       {"motion_target_limits", CanonicalValue(CanonicalValue::Array{})},
       {"controller_profiles", CanonicalValue(CanonicalValue::Array{})},
   };
-  if (isaac_world.has_value()) {
-    configuration.emplace_back("isaac_world", CanonicalValue(*isaac_world));
-  }
   return CanonicalValue(std::move(configuration));
 }
 
 CanonicalValue empty_host_deployment(
     const core::CellId &cell_id, const CanonicalValue &runtime_profile_reference,
-    std::string_view deployment_id, std::string_view name,
-    const std::optional<std::string> &isaac_world) {
+    std::string_view deployment_id, std::string_view name) {
   using Object = CanonicalValue::Object;
   using Array = CanonicalValue::Array;
   const auto *profile = runtime_profile_reference.find_object_member("record_id");
@@ -1251,7 +1246,7 @@ CanonicalValue empty_host_deployment(
               {"runtime_profile_id", *profile},
               {"runtime_profile_revision", *revision},
               {"dependency_runtime_unit_ids", CanonicalValue(Array{})},
-              {"configuration", empty_host_configuration(isaac_world)},
+              {"configuration", empty_host_configuration()},
           })})},
           {"model_instances", CanonicalValue(Array{})},
           {"controllable_components", CanonicalValue(Array{})},
@@ -1366,15 +1361,6 @@ require_configuration(const RetainedBundle &retained_bundle,
       canonical_configuration.find_object_member("controller_profiles")
           ->as_array());
   Configuration result;
-  if (const auto found = unit.configuration.find("isaac_world");
-      found != unit.configuration.end()) {
-    const auto *world = std::get_if<std::string>(&found->second.value);
-    if (world == nullptr || world->empty()) {
-      throw RetainedBundleError(
-          "ros2_control isaac_world must be a portable identifier");
-    }
-    result.isaac_world = *world;
-  }
   // Q68: one controller profile per hosted component, exactly one lane each.
   for (const auto &row : *profiles) {
     const auto *object = std::get_if<core::JsonObjectDTO>(&row.value);
@@ -1416,14 +1402,6 @@ require_configuration(const RetainedBundle &retained_bundle,
     result.controller_profiles.push_back(Configuration::ControllerProfile{
         core::ControllableComponentId(*component), std::move(isaac),
         std::move(mock), std::move(frame_prefix)});
-  }
-  if (!result.isaac_world.has_value() &&
-      std::any_of(result.controller_profiles.begin(),
-                  result.controller_profiles.end(), [](const auto &profile) {
-                    return profile.isaac_profile.has_value();
-                  })) {
-    throw RetainedBundleError(
-        "isaac_world is required when a component uses an Isaac profile");
   }
   std::sort(result.controller_profiles.begin(), result.controller_profiles.end(),
             [](const auto &left, const auto &right) {
@@ -1617,12 +1595,6 @@ Configuration require_component_configuration(
   };
   std::erase_if(result.controller_profiles, unrelated);
   std::erase_if(result.default_fault_stop_profiles, unrelated);
-  if (std::none_of(result.controller_profiles.begin(),
-                   result.controller_profiles.end(), [](const auto &profile) {
-                     return profile.isaac_profile.has_value();
-                   })) {
-    result.isaac_world.reset();
-  }
   return result;
 }
 
@@ -1643,10 +1615,6 @@ CanonicalValue component_configuration_projection(
       throw RetainedBundleError("ROS component configuration lacks its verified settings");
     }
     auto result = configuration->as_object();
-    if (!selected.isaac_world.has_value()) {
-      std::erase_if(result,
-                    [](const auto &row) { return row.first == "isaac_world"; });
-    }
     for (auto &[name, value] : result) {
       if (name == "initial_joint_positions_rad") {
         CanonicalValue::Array positions;

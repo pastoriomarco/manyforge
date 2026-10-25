@@ -148,7 +148,6 @@
   ],
   "deployment_artifact_id": "isaac_lite6_lite_gripper_pick_and_place",
   "description": "Retained Isaac commanded-simulation pick-and-place deployment for UFACTORY Lite6 with the articulated lite pneumatic gripper and the source-matched ROS 2 control execution product.",
-  "isaac_world": "lite6_grf_ros2",
   "name": "isaac_lite6_lite_gripper_pick_and_place",
   "policies": {
     "interrupt_config": {

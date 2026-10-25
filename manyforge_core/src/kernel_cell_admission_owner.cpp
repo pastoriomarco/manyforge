@@ -1205,8 +1205,35 @@ Result<CellAdmissionClaimDTO> KernelCellAdmissionOwner::AcquireClaim(
         !readiness_.deployment_status_current || !readiness_.deployment_converged ||
         readiness_.blocking_fault_count != 0U || readiness_.unresolved_owner_count != 0U ||
         readiness_.unsettled_effect_count != 0U) {
-      return AuthoringNotReady<CellAdmissionClaimDTO>(generation_,
-                                                      "program_node_dependencies_not_current");
+      auto rejected = AuthoringNotReady<CellAdmissionClaimDTO>(
+          generation_, "program_node_dependencies_not_current");
+      auto error = rejected.error();
+      error.details.emplace("manager_liveness_required_set_present",
+                            manager_liveness_required_set_.has_value() ? "true" : "false");
+      error.details.emplace("manager_liveness_current_unfenced_count",
+                            std::to_string(manager_liveness_current_unfenced_count_));
+      error.details.emplace("manager_liveness_required_count",
+                            std::to_string(manager_liveness_rows_.size()));
+      error.details.emplace("deployment_status_current",
+                            readiness_.deployment_status_current ? "true" : "false");
+      error.details.emplace("deployment_converged",
+                            readiness_.deployment_converged ? "true" : "false");
+      error.details.emplace("blocking_fault_count",
+                            std::to_string(readiness_.blocking_fault_count));
+      error.details.emplace("unresolved_owner_count",
+                            std::to_string(readiness_.unresolved_owner_count));
+      error.details.emplace("unsettled_effect_count",
+                            std::to_string(readiness_.unsettled_effect_count));
+      // Program failure projections retain the bounded message, while their
+      // registered detail keys intentionally omit private admission facts.
+      for (const auto* key : {"manager_liveness_required_set_present",
+                              "manager_liveness_current_unfenced_count",
+                              "manager_liveness_required_count", "deployment_status_current",
+                              "deployment_converged", "blocking_fault_count",
+                              "unresolved_owner_count", "unsettled_effect_count"}) {
+        error.message.append("; ").append(key).append("=").append(error.details.at(key));
+      }
+      return Result<CellAdmissionClaimDTO>::Err(std::move(error));
     }
     // Concurrent children of this parent retain their owners' existing narrow
     // reservations. No authoring/manual/recovery claim inherits this exception.

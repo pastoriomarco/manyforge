@@ -53,6 +53,7 @@ def _arguments() -> argparse.Namespace:
     parser.add_argument("--no-program", action="store_true")
     parser.add_argument("--ros2-control", action="store_true")
     parser.add_argument("--manager-ros-apply-fixture-root", type=Path)
+    parser.add_argument("--manager-isaac-apply-fixture-root", type=Path)
     return parser.parse_args()
 
 
@@ -810,17 +811,11 @@ def _check_ros_preparation(
     document: dict[str, object],
     root: Path,
 ) -> None:
-    missing_world = copy.deepcopy(request)
-    missing_world["deployment"].pop("isaac_world")
-    _rehash_request(missing_world)
-    _run(args, missing_world, root / "ros-missing-world",
-         expect_error="isaac_world is required when a component uses an Isaac profile")
-    for index, world in enumerate(("/site/world.usda", "file:/world.usda", "", None)):
-        bad_world = copy.deepcopy(request)
-        bad_world["deployment"]["isaac_world"] = world
-        _rehash_request(bad_world)
-        _run(args, bad_world, root / f"ros-invalid-world-{index}",
-             expect_error="isaac_world")
+    legacy_world = copy.deepcopy(request)
+    legacy_world["deployment"]["isaac_world"] = "lite6_grf_ros2"
+    _rehash_request(legacy_world)
+    _run(args, legacy_world, root / "ros-legacy-world-selector",
+         expect_error="isaac_world")
     prepared = _run(args, request, root / "ros-valid")
     assert prepared is not None
     bundle = prepared["activation_payload"]["retained_bundle"]
@@ -854,7 +849,6 @@ def _check_ros_preparation(
     }]
     # Q68: the authored selector becomes the component's controller profile
     # row inside the one ROS runtime unit.
-    expected_configuration["isaac_world"] = request["deployment"]["isaac_world"]
     expected_configuration["controller_profiles"] = [{
         "controllable_component_id": component_id,
         "isaac_profile": expected_configuration.pop("isaac_profile"),
@@ -1203,25 +1197,36 @@ def _check_ros_preparation(
 
 
 def _write_manager_ros_apply_fixture(
-    args: argparse.Namespace, request: dict[str, object]
+    args: argparse.Namespace, request: dict[str, object], *, isaac: bool = False
 ) -> None:
-    """Materialize the existing one-Mock Scenario through the production tool."""
+    """Materialize one real ROS Scenario through the production tool."""
     components = request["deployment"]["components"]
     if len(components) != 1:
         raise AssertionError("Manager ROS fixture requires exactly one component")
     configuration = components[0]["configuration"]
-    if (
-        configuration["runtime_kind"] != "ros2_control"
-        or "mock_profile" not in configuration["runtime_configuration"]
-        or request["deployment"].get("isaac_world") is not None
-    ):
-        raise AssertionError("Manager ROS fixture must use Mock ROS without a world")
+    runtime_configuration = configuration["runtime_configuration"]
+    if configuration["runtime_kind"] != "ros2_control":
+        raise AssertionError("Manager ROS fixture must use the ROS runtime")
+    if isaac:
+        if "isaac_profile" not in runtime_configuration:
+            raise AssertionError("Manager Isaac fixture must use an Isaac profile")
+    elif "mock_profile" not in runtime_configuration:
+        raise AssertionError("Manager ROS fixture must use Mock ROS")
     # This is the real runtime cell requested by the test, not a retained ID,
     # catalog seal, generation, owner epoch, or readiness observation.
-    request["runtime_cell_id"] = "manager_ros_apply_fixture"
-    requested_root = args.manager_ros_apply_fixture_root
+    request["runtime_cell_id"] = (
+        "c1_build_authority_cell" if isaac else "manager_ros_apply_fixture"
+    )
+    requested_root = (
+        args.manager_isaac_apply_fixture_root
+        if isaac
+        else args.manager_ros_apply_fixture_root
+    )
+    required_root_name = (
+        "manager-isaac-apply-fixture" if isaac else "manager-ros-apply-fixture"
+    )
     if (
-        requested_root.name != "manager-ros-apply-fixture"
+        requested_root.name != required_root_name
         or requested_root.is_symlink()
     ):
         raise AssertionError(
@@ -1425,8 +1430,21 @@ def main() -> int:
     args = _arguments()
     workspace = args.workspace.resolve()
     scenario_path, document, request = _scenario_request(workspace, args.scenario)
-    if args.manager_ros_apply_fixture_root is not None:
-        _write_manager_ros_apply_fixture(args, request)
+    fixture_count = sum(
+        selected is not None
+        for selected in (
+            args.manager_ros_apply_fixture_root,
+            args.manager_isaac_apply_fixture_root,
+        )
+    )
+    if fixture_count > 1:
+        raise AssertionError("select only one Manager ROS fixture output")
+    if fixture_count == 1:
+        _write_manager_ros_apply_fixture(
+            args,
+            request,
+            isaac=args.manager_isaac_apply_fixture_root is not None,
+        )
         return 0
     with tempfile.TemporaryDirectory(prefix="manyforge-prepare-test-") as raw:
         temporary = Path(raw)

@@ -19,6 +19,12 @@ First publishable release. This section accumulates all work intended for the
 initial `v0.1.0` tag, including the publication-readiness baseline and later
 hardening done before the first tag was granted.
 
+### Fixed
+
+- Scene admission identity survives bounded history cleanup, so later attachment
+  requests retain the same owner. Unsettled claim releases keep their durable
+  proof until exact reconciliation succeeds.
+
 ### Added
 
 - Program node groups can be selected with multiple checkboxes, inherited from

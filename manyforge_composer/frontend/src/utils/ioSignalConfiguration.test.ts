@@ -196,6 +196,69 @@ describe('io_signals configuration', () => {
       .toBe('preserved');
   });
 
+  it('round-trips a geometric contact input through an existing endpoint reference', () => {
+    const geometric = {
+      ...mockRow,
+      resource_role_id: 'part_contact',
+      signal_name: 'part_contact',
+      source_id: 'part_contact_geometry',
+      update_mode: 'sampled',
+      freshness: { mode: 'sample_age', maximum_age_ns: 75_000_000 },
+      provider: {
+        profile: 'geometric_contact',
+        ingress_depth: 64,
+        endpoint: {
+          controllable_component_id: 'arm',
+          command_target_id: 'tool',
+          frame_role_id: 'tcp',
+        },
+        target_scene_resource_id: 'workpiece',
+      },
+    };
+    const rows = ioSignalRows({ io_signals: [geometric] as JsonValue[] });
+    expect(rows[0]).toMatchObject({
+      kind: 'input',
+      draft: {
+        profile: 'geometric_contact',
+        endpointComponentId: 'arm',
+        endpointTargetId: 'tool',
+        endpointFrameRoleId: 'tcp',
+        targetSceneResourceId: 'workpiece',
+        maximumAgeMs: '75',
+        ingressDepth: '64',
+      },
+    });
+    expect(rows[0].kind === 'input' ? inputLivenessMode(rows[0].draft) : null).toBe('periodic');
+    expect(validateIoSignalRows(rows)).toBeNull();
+    expect(ioSignalRowsValue(rows)).toEqual([geometric]);
+
+    const omittedDepth = { ...geometric, provider: {
+      profile: 'geometric_contact', endpoint: geometric.provider.endpoint,
+      target_scene_resource_id: 'workpiece',
+    } };
+    const omittedRows = ioSignalRows({ io_signals: [omittedDepth] as JsonValue[] });
+    expect(omittedRows[0]).toMatchObject({ kind: 'input', draft: { ingressDepth: '64' } });
+    expect(ioSignalRowsValue(omittedRows)).toEqual([omittedDepth]);
+    const nondefaultDepth = { ...geometric, provider: { ...geometric.provider, ingress_depth: 32 } };
+    expect(ioSignalRowsValue(ioSignalRows({ io_signals: [nondefaultDepth] as JsonValue[] })))
+      .toEqual([nondefaultDepth]);
+
+    for (const provider of [
+      { ...geometric.provider, contact_body_role_ids: ['finger'] },
+      { ...geometric.provider, endpoint: { controllable_component_id: 'arm', command_target_id: 'tool' } },
+    ]) {
+      expect(ioSignalRows({ io_signals: [{ ...geometric, provider }] as JsonValue[] })[0].kind)
+        .toBe('preserved');
+    }
+    for (const freshness of [
+      { mode: 'provider_validity' },
+      { mode: 'sample_age', maximum_age_ns: 0 },
+    ]) {
+      expect(ioSignalRows({ io_signals: [{ ...geometric, freshness }] as JsonValue[] })[0].kind)
+        .toBe('preserved');
+    }
+  });
+
   it('round-trips UR io_states and ros2_control GPIO inputs (periodic, exact addresses)', () => {
     const ur = { ...rosRow, resource_role_id: 'di3', signal_name: 'di3', source_id: 'ur_io',
       provider: { profile: 'ur_io_states', topic: '/io_and_status_controller/io_states', pin: 17 } };
@@ -274,6 +337,20 @@ describe('io_signals configuration', () => {
       input({ profile: 'ros_bool', topic: '/a', maximumAgeMs: '1', sourceId: 'bus' }),
       input({ profile: 'ros_bool', topic: '/a', liveness: 'change_only', sourceId: 'bus', resourceRoleId: 'b', signalName: 'b' }),
     ])).toContain('liveness');
+  });
+
+  it('validates geometric freshness independently and excludes it from shared-source identity', () => {
+    const geometric = {
+      profile: 'geometric_contact' as const,
+      endpointComponentId: 'arm', endpointTargetId: 'tool', endpointFrameRoleId: 'tcp',
+      targetSceneResourceId: 'workpiece', sourceId: 'contact_geometry',
+    };
+    expect(validateIoSignalRows([input({ ...geometric, maximumAgeMs: '' })]))
+      .toContain('maximum sample age must be above 0 ms');
+    expect(validateIoSignalRows([
+      input({ ...geometric, maximumAgeMs: '25' }),
+      input({ ...geometric, maximumAgeMs: '100', resourceRoleId: 'contact_b', signalName: 'contact_b' }),
+    ])).toBeNull();
   });
 
   it('refuses duplicate keys, duplicate names and a disagreeing shared source', () => {

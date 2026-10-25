@@ -1986,7 +1986,6 @@ def validate(source: Path, root: Path) -> None:
                     "historical_program_blob",
                     "i9_behavior_obligations",
                     "root_pose_in_cell",
-                    "isaac_world",
                 }
             )
         row = _exact(
@@ -1994,8 +1993,6 @@ def validate(source: Path, root: Path) -> None:
             required=frozenset(deployment_fields),
             path=path,
         )
-        if is_i9:
-            _identifier(row["isaac_world"], path=f"{path}.isaac_world")
         deployment_source = _source_path(
             row["deployment_source"], root=root, path=f"{path}.deployment_source"
         )

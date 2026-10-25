@@ -313,7 +313,7 @@ function componentReadinessAt(
       && (measured.available ? measuredError === null : measuredError !== null))) {
     fail(`${path}.measured_state`, 'an exact qualified measured-state verdict');
   }
-  if (ready && (error !== null || measuredError !== null || occurrences.some((domain) => (
+  if (ready && (error !== null || occurrences.some((domain) => (
     domain.health === null || domain.error !== null
   )) || (nextIntent === null && state !== 'active'))) fail(path, 'a consistent positive readiness verdict');
   return { requestOwnerEpoch: readinessTextAt(row.request_owner_epoch, `${path}.request_owner_epoch`, 256),

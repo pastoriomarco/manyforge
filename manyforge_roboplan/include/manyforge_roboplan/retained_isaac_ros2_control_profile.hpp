@@ -3,6 +3,7 @@
 #include <functional>
 #include <map>
 #include <optional>
+#include <span>
 #include <string>
 #include <string_view>
 #include <vector>
@@ -33,16 +34,13 @@ make_retained_ros2_control_measured_state_descriptor(
     const core::RuntimeParticipantBinding &binding);
 
 /// The Isaac lane's controller robot_description facts of one closed retained
-/// profile (Q69): hardware component name, topics and the profile's fixed
-/// initial values. Generation from the model URDF and the binding's arm joints
-/// is generate_controller_robot_description().
+/// profile (Q69): hardware component name and topics, plus the selected
+/// deployment's backend-commanded initial pose. Generation from the model URDF
+/// and the binding's arm joints is generate_controller_robot_description().
 [[nodiscard]] IsaacControllerLane
-retained_isaac_controller_lane(std::string_view isaac_profile);
-
-/// The exact simulator topics the existing standalone scene barrier checks,
-/// from the same retained profile facts (no second profile table).
-[[nodiscard]] std::vector<std::string>
-retained_isaac_scene_required_topics(std::string_view isaac_profile);
+retained_isaac_controller_lane(
+    std::string_view isaac_profile,
+    std::span<const double> initial_joint_positions_rad);
 
 /// Expand one closed retained Isaac profile into the exact ROS execution
 /// configuration used by the installed execution host.

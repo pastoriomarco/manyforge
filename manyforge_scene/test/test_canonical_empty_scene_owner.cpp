@@ -14,7 +14,10 @@
 #include <functional>
 #include <future>
 #include <initializer_list>
+#include <manyforge_content_identity/content_identity.hpp>
+#include <manyforge_core/kernel_cell_admission_owner.hpp>
 #include <manyforge_core/logical_scene_identity.hpp>
+#include <manyforge_core/ports/ioperation_journal.hpp>
 #include <manyforge_core/types/native_projection_capability.hpp>
 #include <manyforge_deployment/canonical_empty_admission.hpp>
 #include <manyforge_deployment/verified_retained_bundle.hpp>
@@ -22,6 +25,7 @@
 #include <mutex>
 #include <optional>
 #include <set>
+#include <span>
 #include <sstream>
 #include <stdexcept>
 #include <string>
@@ -74,6 +78,107 @@ using core::ProjectionNativeRuntimeBindingDTO;
 using core::ProjectionRevisionDTO;
 using core::RequestOwnerEpoch;
 using core::Result;
+
+class SceneAdmissionClock final : public core::IClock {
+public:
+  core::TimePoint now() const override { return 42; }
+};
+
+class SceneAdmissionJournal final : public core::IOperationJournal {
+public:
+  Result<core::OperationJournalRecoveryDTO>
+  BeginOwnerEpoch(const RequestOwnerEpoch &, std::int64_t, std::size_t,
+                  const std::vector<core::ResourceId> &) override {
+    return Result<core::OperationJournalRecoveryDTO>::Ok({});
+  }
+  Result<std::uint64_t> RecordOperationAccepted(
+      const RequestOwnerEpoch &, const core::OperationIntentDTO &,
+      const core::OperationAcceptedDTO &, const core::OperationStateDTO &,
+      std::span<const core::OperationId>) override {
+    return Result<std::uint64_t>::Err(core::ErrorCode::kInternalError);
+  }
+  Result<std::uint64_t>
+  RecordControlAccepted(const RequestOwnerEpoch &,
+                        const core::OperationControlRequestDTO &,
+                        const core::OperationControlAcceptedDTO &,
+                        const core::OperationStateDTO &) override {
+    return Result<std::uint64_t>::Err(core::ErrorCode::kInternalError);
+  }
+  core::EmergencyStopAcceptanceProjectionResultDTO RecordStopAccepted(
+      const RequestOwnerEpoch &, const core::EmergencyStopAcceptanceRecordDTO &,
+      const core::EmergencyStopProjectedIntentDTO &,
+      const core::StopAcceptedDTO &,
+      const core::EmergencyStopAffectedStateSnapshotDTO &) noexcept override {
+    return {};
+  }
+  core::StopForensicProjectionResultDTO RecordStopTerminal(
+      const RequestOwnerEpoch &, const core::StopStatusDTO &,
+      const core::StopCertificateDTO &,
+      const std::optional<core::StopFaultLatchDTO> &) noexcept override {
+    return {};
+  }
+  core::StopForensicProjectionResultDTO RecordStopSurveillanceCheckpoint(
+      const RequestOwnerEpoch &, const core::StopPostTerminalSurveillanceDTO &,
+      const core::StopFaultLatchDTO &, std::int64_t) noexcept override {
+    return {};
+  }
+  Result<std::uint64_t> RecordStopFaultCleared(
+      const RequestOwnerEpoch &, const core::StopFaultRecoveryIntentDTO &,
+      const core::StopFaultRecoveryResultDTO &, const core::StopFaultLatchDTO &,
+      const core::StopStatusDTO &) override {
+    return Result<std::uint64_t>::Err(core::ErrorCode::kInternalError);
+  }
+  Result<std::uint64_t> CloseOwnerEpoch(const RequestOwnerEpoch &,
+                                        std::int64_t) override {
+    return Result<std::uint64_t>::Ok(++sequence_);
+  }
+  Result<std::uint64_t> RecordRuntimeScaleAccepted(
+      const RequestOwnerEpoch &, const core::RuntimeScaleRequestDTO &,
+      const core::RuntimeScaleAcceptedDTO &, const core::OperationStateDTO &,
+      const core::RuntimeScaleStatusDTO &) override {
+    return Result<std::uint64_t>::Err(core::ErrorCode::kInternalError);
+  }
+  Result<std::uint64_t> RecordOperationState(
+      const RequestOwnerEpoch &, const core::OperationStateDTO &,
+      const core::RuntimeScaleStatusDTO *, const char *,
+      std::span<const core::PreparedMotionDiagnosticsDTO>) override {
+    return Result<std::uint64_t>::Err(core::ErrorCode::kInternalError);
+  }
+  Result<std::uint64_t> RecordCellAdmissionClaimAcquired(
+      const RequestOwnerEpoch &, const core::CellAdmissionClaimDTO &) override {
+    return Result<std::uint64_t>::Ok(++sequence_);
+  }
+  Result<std::uint64_t>
+  RecordCellAdmissionClaimReleased(const RequestOwnerEpoch &,
+                                   const core::CellAdmissionClaimDTO &,
+                                   const core::CellAdmissionClaimReleaseDTO &,
+                                   core::AdmissionGeneration) override {
+    if (fail_next_claim_release_) {
+      fail_next_claim_release_ = false;
+      return Result<std::uint64_t>::Err(
+          {"kernel_owner_unavailable", "injected release reply loss", {}});
+    }
+    return Result<std::uint64_t>::Ok(++sequence_);
+  }
+  Result<std::uint64_t> RecordCellAdmissionClaimsReconciled(
+      const RequestOwnerEpoch &, const core::CellAdmissionReconcileDTO &,
+      const core::CellAdmissionReconcileValidationDTO &,
+      core::AdmissionGeneration) override {
+    return Result<std::uint64_t>::Ok(++sequence_);
+  }
+  Result<std::uint64_t>
+  RecordCellAdmissionGenerationAdvanced(const RequestOwnerEpoch &,
+                                        core::AdmissionGeneration,
+                                        core::AdmissionGeneration) override {
+    return Result<std::uint64_t>::Ok(++sequence_);
+  }
+
+  void FailNextClaimRelease() { fail_next_claim_release_ = true; }
+
+private:
+  bool fail_next_claim_release_{};
+  std::uint64_t sequence_{};
+};
 
 constexpr std::string_view kExpectedSceneId =
     "sha256:b6edf7957c79f97cabefc2c61056f0bb09e00d1cac1ff3080ed540b650346dad";
@@ -2937,14 +3042,13 @@ deployment::test::DurableLite6RetainedConsumerFixture AdoptionProduct(
     const std::filesystem::path &package_root, const CellId &cell_id,
     const char lifecycle_digest_digit) {
   return deployment::test::materialize_lite6_retained_consumer_fixture_from(
-      package_root, deployment::test::make_lite6_controllable_retention_fixture(
-                        false, false, 1U, false, true, cell_id.value(),
-                        false, true, "resource", true,
-                        Digest(lifecycle_digest_digit).value(), {}, true, false,
-                        false, std::nullopt, false,
-                        deployment::test::kLite6ArmTargetId, std::nullopt,
-                        std::nullopt, {}, {}, true, {},
-                        "manyforge.provider.ros2_control", false, true));
+      package_root,
+      deployment::test::make_lite6_controllable_retention_fixture(
+          false, false, 1U, false, true, cell_id.value(), false, true,
+          "resource", true, Digest(lifecycle_digest_digit).value(), {}, true,
+          false, false, std::nullopt, false,
+          deployment::test::kLite6ArmTargetId, std::nullopt, std::nullopt, {},
+          true, {}, "manyforge.provider.ros2_control", false, true));
 }
 
 struct SceneProductAdoptionFixture final {
@@ -6365,6 +6469,475 @@ TEST(CanonicalEmptySceneOwnerProviderFreshness,
   const auto next = owner.ConfirmProviderFreshness(scene.Confirmation(11U, 2100));
   ASSERT_TRUE(next.ok()) << next.error().code << ": " << next.error().message;
   EXPECT_EQ(next.value(), revision);
+}
+
+TEST(CanonicalEmptySceneOwner,
+     ProgramSceneCompactionKeepsStableAdmissionAndSettlesBeforePruning) {
+  TemporaryDirectory directory("scene-program-compaction");
+  const auto package_root = directory.path() / "packages";
+  CopyCanonicalEmptyPackage(package_root);
+  const auto admission = LoadAdmission(package_root);
+  const auto candidate = deployment::test::
+      materialize_lite6_ros2_control_motion_retained_consumer_fixture_for_cell(
+          package_root, admission.cell_id().value());
+  const auto bindings = NativeRuntimeBindings(
+      candidate.bundle->value(), "runtime-epoch-program-compaction");
+  auto projections = MakeFakeProjections(bindings);
+  FakePlannerSceneProjectionResolver resolver(ProjectionClients(projections));
+  ControlledPublicationReader publication_reader;
+  deployment::FilesystemVerifiedRetainedBundleSource bundle_source(
+      package_root);
+  const auto database_path = directory.path() / "logical-scene.sqlite3";
+
+  SceneAdmissionClock clock;
+  SceneAdmissionJournal journal;
+  core::ManagerLivenessRequiredSetDTO liveness{
+      admission.cell_id(),
+      core::RetainedBundleId(Digest('a').value()),
+      Digest('b'),
+      core::RuntimeUnitId("manager"),
+      core::RuntimeEpoch("manager.epoch.1"),
+      RequestOwnerEpoch("manager.owner.1"),
+      {}};
+  liveness.required_runtime_set_digest =
+      core::ComputeRequiredRuntimeSetDigest(liveness.required_receivers);
+  const RequestOwnerEpoch runner_epoch("runner.2");
+  const core::ProgramRunId run_id("program.2");
+  std::optional<core::CellAdmissionClaimGeneration> parent_generation;
+  core::KernelCellAdmissionOwner cell_admission(
+      RequestOwnerEpoch("kernel.scene-compaction"), 512U, clock, journal, {},
+      core::AdmissionGeneration(0U),
+      [](const auto &, const auto &) { return Result<void>::Ok(); },
+      [&](const auto &claim, const auto &release) {
+        if (claim.intent.claim_kind ==
+            core::CellAdmissionClaimKindDTO::kAuthoredScene) {
+          return ValidateAuthoredSceneCellAdmissionSettlementReadOnly(
+              database_path, admission.cell_id(), claim, release);
+        }
+        return Result<void>::Ok();
+      },
+      [](const auto &, const auto &, const auto &reconcile) {
+        return Result<core::CellAdmissionReconcileValidationDTO>::Ok(
+            {reconcile.current_owner_epochs, {}});
+      },
+      {}, {}, liveness, core::CellAdmissionClaimGeneration(0U),
+      [&](const core::ProgramNodeAdmissionEvidenceDTO &evidence) {
+        if (!parent_generation.has_value() ||
+            evidence.program_runner_owner_epoch != runner_epoch ||
+            evidence.program_run_id != run_id ||
+            evidence.parent_program_cycle_claim_generation !=
+                *parent_generation) {
+          return Result<void>::Err({"program_node_parent_not_current",
+                                    "scene test node evidence is not exact",
+                                    {}});
+        }
+        return Result<void>::Ok();
+      });
+
+  auto readiness = core::CellAdmissionReadinessSnapshotDTO{
+      true,
+      core::ProgramCycleStatusDTO{runner_epoch, 1U,
+                                  core::ProgramCycleStateDTO::kIdleAfterReset,
+                                  std::nullopt, std::nullopt, std::nullopt},
+      true,
+      2U,
+      2U,
+      true,
+      true,
+      0U,
+      0U,
+      0U};
+  ASSERT_TRUE(cell_admission.UpdateCellAdmissionReadiness(readiness).ok());
+
+  std::optional<ProjectionRevisionDTO> final_revision;
+  std::optional<core::LogicalSceneSnapshotDTO> final_snapshot;
+  std::optional<core::SceneTransactionRequestDTO>
+      request_to_settle_after_restart;
+  std::optional<core::CellAdmissionClaimDTO> parent_claim;
+  core::CellAdmissionClaimIntentDTO parent_intent{
+      core::CellAdmissionClaimKindDTO::kProgramCycle,
+      core::CellAdmissionOwnerRoleDTO::kProgramRunner,
+      runner_epoch,
+      run_id.value(),
+      core::RequestId("program-cycle-claim"),
+      Digest('c'),
+      core::AdmissionGeneration(0U),
+      {},
+      core::ProgramCycleAdmissionEvidenceDTO{
+          core::ProgramRevision("program.rev"),
+          core::ProgramRevision("program.rev")},
+      std::nullopt,
+      std::nullopt};
+
+  const auto node_evidence = [&](const std::string &node_id,
+                                 const std::string &attempt_id,
+                                 const std::string &owner_api) {
+    return core::ProgramNodeAdmissionEvidenceDTO{runner_epoch,       run_id,
+                                                 *parent_generation, node_id,
+                                                 attempt_id,         owner_api};
+  };
+  const auto make_pose_update = [&](LogicalSceneOwner &owner,
+                                    const std::string &request_id,
+                                    const std::string &attempt_id) {
+    auto pose = owner.GetObjectPose(core::SceneResourceId("scene-box"));
+    if (!pose.ok())
+      throw std::runtime_error(pose.error().message);
+    pose.value().position_m.x_m += 0.001;
+    core::SceneTransactionRequestDTO request{
+        core::PublicRequestContextDTO{core::RequestId(request_id),
+                                      owner.CurrentRequestOwnerEpoch(),
+                                      "scene-owner-test", std::nullopt},
+        {},
+        owner.CurrentProjectionRevision(),
+        core::UpdateObjectPoseRequestDTO{
+            core::SceneResourceId("scene-box"), pose.value(),
+            core::CellSceneFrameRefDTO{admission.cell_id()}, std::nullopt,
+            false},
+        std::nullopt};
+    request.expected_admission_generation =
+        cell_admission.GetAuthoringAdmission().admission_generation;
+    request.program_node_evidence =
+        node_evidence("pose", attempt_id, "scene.transaction");
+    return request;
+  };
+  const auto scene_claim_intent =
+      [&](const core::SceneTransactionRequestDTO &request) {
+        const auto digest =
+            ContentDigest(manyforge::content_identity::sha256_digest(
+                logical_scene_codec_internal::EncodeRequestDigestInput(
+                    request)));
+        return core::CellAdmissionClaimIntentDTO{
+            core::CellAdmissionClaimKindDTO::kAuthoredScene,
+            core::CellAdmissionOwnerRoleDTO::kAuthoredSceneOwner,
+            RequestOwnerEpoch(request.expected_projection_revision
+                                  .scene_revision.scene_id.value()),
+            request.request_context.request_id.value(),
+            core::RequestId(digest.value()),
+            digest,
+            *request.expected_admission_generation,
+            {},
+            std::nullopt,
+            std::nullopt,
+            request.program_node_evidence};
+      };
+  std::optional<core::SceneTransactionRequestDTO> reused_external_request;
+
+  {
+    LogicalSceneOwner owner(database_path, admission, publication_reader,
+                            bundle_source, resolver, cell_admission);
+    auto active = FinalizeNativeCandidate(owner, publication_reader, admission,
+                                          *candidate.bundle, bindings,
+                                          "apply-program-scene-compaction");
+    ResetProjections(projections, active,
+                     FakePlannerSceneProjection::Mode::kCommit);
+
+    auto add = AddBoxRequest(active, admission.cell_id(),
+                             "scene-program-compaction-add");
+    add.expected_admission_generation =
+        cell_admission.GetAuthoringAdmission().admission_generation;
+    const auto added = owner.Commit(add);
+    ASSERT_TRUE(added.success)
+        << (added.error.has_value() ? added.error->message : "missing error");
+
+    readiness.program_cycle_status = core::ProgramCycleStatusDTO{
+        runner_epoch, 2U,           core::ProgramCycleStateDTO::kStarting,
+        run_id,       std::nullopt, std::nullopt};
+    ASSERT_TRUE(cell_admission.UpdateCellAdmissionReadiness(readiness).ok());
+    parent_intent.expected_admission_generation =
+        cell_admission.GetAuthoringAdmission().admission_generation;
+    const auto acquired_parent =
+        cell_admission.AcquireCellAdmissionClaim(parent_intent);
+    ASSERT_TRUE(acquired_parent.ok()) << acquired_parent.error().message;
+    parent_claim = acquired_parent.value();
+    parent_generation = parent_claim->claim_generation;
+    readiness.program_cycle_status =
+        core::ProgramCycleStatusDTO{runner_epoch,
+                                    3U,
+                                    core::ProgramCycleStateDTO::kRunning,
+                                    run_id,
+                                    parent_claim->claim_generation,
+                                    std::nullopt};
+    ASSERT_TRUE(cell_admission.UpdateCellAdmissionReadiness(readiness).ok());
+
+    const auto initial_count = static_cast<std::size_t>(
+        owner.VerifyIntegrity().transaction_intent_count);
+    ASSERT_LT(initial_count, kMaximumLogicalSceneTransactions - 1U);
+    for (std::size_t index = initial_count;
+         index < kMaximumLogicalSceneTransactions - 1U; ++index) {
+      const auto request = make_pose_update(
+          owner, "scene-program-compaction-pose-" + std::to_string(index),
+          "pose:attempt." + std::to_string(index));
+      const auto moved = owner.Commit(request);
+      ASSERT_TRUE(moved.success)
+          << index << " "
+          << (moved.error.has_value() ? moved.error->message : "missing error");
+      if (index == initial_count)
+        reused_external_request = request;
+    }
+    ASSERT_EQ(owner.VerifyIntegrity().transaction_intent_count,
+              static_cast<std::int64_t>(kMaximumLogicalSceneTransactions - 1U));
+
+    auto unknown_release =
+        make_pose_update(owner, "scene-program-compaction-release-unknown",
+                         "pose:attempt.release-unknown");
+    journal.FailNextClaimRelease();
+    EXPECT_THROW(owner.Commit(unknown_release), std::runtime_error);
+    ASSERT_EQ(owner.VerifyIntegrity().transaction_intent_count,
+              static_cast<std::int64_t>(kMaximumLogicalSceneTransactions));
+    const auto unresolved = cell_admission.GetCellAdmissionRecoveryReceipt(
+        {scene_claim_intent(unknown_release), std::nullopt, std::nullopt});
+    ASSERT_TRUE(unresolved.ok());
+    ASSERT_EQ(unresolved.value().status,
+              core::CellAdmissionRecoveryReceiptStatusDTO::kHeldExact);
+
+    auto compaction_probe =
+        make_pose_update(owner, "scene-program-compaction-retry",
+                         "pose:attempt.compaction-retry");
+    const auto old_request_epoch = owner.CurrentRequestOwnerEpoch();
+    const auto before_blocked_compaction = owner.VerifyIntegrity();
+    journal.FailNextClaimRelease();
+    const auto blocked = owner.Commit(compaction_probe);
+    ASSERT_FALSE(blocked.success);
+    ASSERT_TRUE(blocked.error.has_value());
+    EXPECT_EQ(blocked.error->code, "kernel_owner_unavailable");
+    EXPECT_EQ(owner.CurrentRequestOwnerEpoch(), old_request_epoch);
+    const auto after_blocked_compaction = owner.VerifyIntegrity();
+    EXPECT_EQ(after_blocked_compaction.transaction_intent_count,
+              before_blocked_compaction.transaction_intent_count);
+    EXPECT_EQ(after_blocked_compaction.request_outcome_count,
+              before_blocked_compaction.request_outcome_count);
+    const auto still_held = cell_admission.GetCellAdmissionRecoveryReceipt(
+        {scene_claim_intent(unknown_release), std::nullopt, std::nullopt});
+    ASSERT_TRUE(still_held.ok());
+    EXPECT_EQ(still_held.value().status,
+              core::CellAdmissionRecoveryReceiptStatusDTO::kHeldExact);
+
+    const auto cleanup_started = std::chrono::steady_clock::now();
+    const auto rotated = owner.Commit(compaction_probe);
+    const auto cleanup_elapsed =
+        std::chrono::steady_clock::now() - cleanup_started;
+    RecordProperty(
+        "scene_compaction_settlement_us",
+        std::chrono::duration_cast<std::chrono::microseconds>(cleanup_elapsed)
+            .count());
+    ASSERT_FALSE(rotated.success);
+    ASSERT_TRUE(rotated.error.has_value());
+    EXPECT_EQ(rotated.error->code, "stale_request_owner_epoch");
+    EXPECT_NE(owner.CurrentRequestOwnerEpoch(), old_request_epoch);
+    const auto released_before_prune =
+        cell_admission.GetCellAdmissionRecoveryReceipt(
+            {scene_claim_intent(unknown_release), std::nullopt, std::nullopt});
+    ASSERT_TRUE(released_before_prune.ok());
+    EXPECT_EQ(released_before_prune.value().status,
+              core::CellAdmissionRecoveryReceiptStatusDTO::kReleasedExact);
+    const auto stale_replay = owner.Commit(compaction_probe);
+    ASSERT_FALSE(stale_replay.success);
+    ASSERT_TRUE(stale_replay.error.has_value());
+    EXPECT_EQ(stale_replay.error->code, "stale_request_owner_epoch");
+
+    compaction_probe.request_context.request_owner_epoch =
+        owner.CurrentRequestOwnerEpoch();
+    compaction_probe.expected_projection_revision =
+        owner.CurrentProjectionRevision();
+    compaction_probe.expected_admission_generation =
+        cell_admission.GetAuthoringAdmission().admission_generation;
+    const auto retried = owner.Commit(compaction_probe);
+    ASSERT_TRUE(retried.success)
+        << (retried.error.has_value() ? retried.error->message
+                                      : "missing error");
+
+    ASSERT_TRUE(reused_external_request.has_value());
+    auto reused_id = make_pose_update(
+        owner, reused_external_request->request_context.request_id.value(),
+        "pose:attempt.cross-epoch-id-reuse");
+    EXPECT_EQ(reused_id.request_context.request_id,
+              reused_external_request->request_context.request_id);
+    EXPECT_NE(reused_id.request_context.request_owner_epoch,
+              reused_external_request->request_context.request_owner_epoch);
+    const auto reused = owner.Commit(reused_id);
+    ASSERT_TRUE(reused.success)
+        << (reused.error.has_value() ? reused.error->message : "missing error");
+    const auto reused_claim = cell_admission.GetCellAdmissionRecoveryReceipt(
+        {scene_claim_intent(reused_id), std::nullopt, std::nullopt});
+    ASSERT_TRUE(reused_claim.ok());
+    EXPECT_EQ(reused_claim.value().status,
+              core::CellAdmissionRecoveryReceiptStatusDTO::kReleasedExact);
+
+    const core::ComponentAttachmentRevision structural_revision(
+        "program-compaction-attachment-revision");
+    for (auto &participant : projections) {
+      participant->SetFrameResolution(
+          core::Pose3DTO{{1.0, 2.0, 3.0}, {0.0, 0.0, 0.0, 1.0}},
+          {structural_revision});
+      participant->SetResolvedFrameRoleOverride(
+          core::FrameRoleId("asset_tool_frame"));
+    }
+    active = owner.CurrentProjectionRevision();
+    core::SceneTransactionRequestDTO attach{
+        core::PublicRequestContextDTO{
+            core::RequestId("scene-program-compaction-attach"),
+            owner.CurrentRequestOwnerEpoch(), "scene-owner-test", std::nullopt},
+        {},
+        active,
+        core::AttachCarriedObjectRequestDTO{
+            core::CarriedObjectAttachmentId("attachment.compaction"),
+            core::SceneResourceId("scene-box"),
+            core::ControllableComponentId("component.1"),
+            core::CommandTargetId("arm"),
+            core::FrameRoleId("tool_frame"),
+            {core::CollisionBodyRoleId("finger")},
+            {structural_revision}},
+        std::nullopt};
+    attach.expected_admission_generation =
+        cell_admission.GetAuthoringAdmission().admission_generation;
+    attach.program_node_evidence = node_evidence(
+        "attach", "attach:attempt.compaction", "scene.carried_attachment");
+    const auto attached = owner.Commit(attach);
+    ASSERT_TRUE(attached.success)
+        << (attached.error.has_value() ? attached.error->message
+                                       : "missing error");
+    ASSERT_TRUE(attached.committed_projection_revision.has_value());
+    const auto after_attach = owner.LogicalSnapshot();
+    ASSERT_EQ(after_attach->carried_object_attachments.size(), 1U);
+    const auto attachment = after_attach->carried_object_attachments.front();
+
+    core::SceneTransactionRequestDTO detach{
+        core::PublicRequestContextDTO{
+            core::RequestId("scene-program-compaction-detach"),
+            owner.CurrentRequestOwnerEpoch(), "scene-owner-test", std::nullopt},
+        {},
+        *attached.committed_projection_revision,
+        core::DetachCarriedObjectAtCurrentPoseRequestDTO{
+            attachment.carried_object_attachment_id,
+            attachment.carried_object_attachment_revision,
+            attachment.scene_resource_id, attachment.controllable_component_id,
+            attachment.command_target_id},
+        std::nullopt};
+    detach.expected_admission_generation =
+        cell_admission.GetAuthoringAdmission().admission_generation;
+    detach.program_node_evidence = node_evidence(
+        "detach", "detach:attempt.compaction", "scene.carried_attachment");
+    const auto detached = owner.Commit(detach);
+    ASSERT_TRUE(detached.success)
+        << (detached.error.has_value() ? detached.error->message
+                                       : "missing error");
+
+    auto restart_release_unknown = make_pose_update(
+        owner, "scene-program-compaction-restart-release-unknown",
+        "pose:attempt.restart-release-unknown");
+    request_to_settle_after_restart = restart_release_unknown;
+    journal.FailNextClaimRelease();
+    EXPECT_THROW(owner.Commit(restart_release_unknown), std::runtime_error);
+    const auto held_across_restart =
+        cell_admission.GetCellAdmissionRecoveryReceipt(
+            {scene_claim_intent(restart_release_unknown), std::nullopt,
+             std::nullopt});
+    ASSERT_TRUE(held_across_restart.ok());
+    ASSERT_EQ(held_across_restart.value().status,
+              core::CellAdmissionRecoveryReceiptStatusDTO::kHeldExact);
+
+    final_revision = owner.CurrentProjectionRevision();
+    final_snapshot = *owner.LogicalSnapshot();
+    EXPECT_TRUE(final_snapshot->carried_object_attachments.empty());
+    EXPECT_EQ(final_snapshot->revision, final_revision->scene_revision);
+
+    const auto parent_receipt = cell_admission.GetCellAdmissionRecoveryReceipt(
+        {parent_intent, *parent_claim, std::nullopt});
+    ASSERT_TRUE(parent_receipt.ok());
+    EXPECT_EQ(parent_receipt.value().status,
+              core::CellAdmissionRecoveryReceiptStatusDTO::kHeldExact);
+    EXPECT_EQ(cell_admission.GetAuthoringAdmission().authoring_allowed, false);
+  }
+
+  LogicalSceneOwner reopened(database_path, admission, publication_reader,
+                             bundle_source, resolver, cell_admission);
+  const auto reconciliation_started = std::chrono::steady_clock::now();
+  const auto reconciled = reopened.ReconcileAuthoredSceneAdmissionClaims();
+  const auto reconciliation_elapsed =
+      std::chrono::steady_clock::now() - reconciliation_started;
+  RecordProperty("scene_restart_admission_settlement_us",
+                 std::chrono::duration_cast<std::chrono::microseconds>(
+                     reconciliation_elapsed)
+                     .count());
+  ASSERT_TRUE(reconciled.ok()) << reconciled.error().message;
+  ASSERT_TRUE(final_revision.has_value());
+  ASSERT_TRUE(final_snapshot.has_value());
+  EXPECT_EQ(reopened.CurrentProjectionRevision(), *final_revision);
+  const auto reopened_snapshot = reopened.LogicalSnapshot();
+  ASSERT_NE(reopened_snapshot, nullptr);
+  EXPECT_EQ(*reopened_snapshot, *final_snapshot);
+  EXPECT_TRUE(reopened_snapshot->carried_object_attachments.empty());
+  ASSERT_TRUE(request_to_settle_after_restart.has_value());
+  const auto settled_after_restart =
+      cell_admission.GetCellAdmissionRecoveryReceipt(
+          {scene_claim_intent(*request_to_settle_after_restart), std::nullopt,
+           std::nullopt});
+  ASSERT_TRUE(settled_after_restart.ok());
+  EXPECT_EQ(settled_after_restart.value().status,
+            core::CellAdmissionRecoveryReceiptStatusDTO::kReleasedExact);
+  const auto parent_receipt = cell_admission.GetCellAdmissionRecoveryReceipt(
+      {parent_intent, *parent_claim, std::nullopt});
+  ASSERT_TRUE(parent_receipt.ok());
+  EXPECT_EQ(parent_receipt.value().status,
+            core::CellAdmissionRecoveryReceiptStatusDTO::kHeldExact);
+
+  // A pre-upgrade Scene claim used the transaction's rotating request epoch
+  // and external request ID. Reconstruct that exact old identity from a
+  // committed row and prove both the read-only settlement validator and the
+  // real Scene recovery scan still accept it.
+  reopened.Close();
+  ASSERT_TRUE(request_to_settle_after_restart.has_value());
+  const auto &legacy_request = *request_to_settle_after_restart;
+  auto legacy_intent = scene_claim_intent(legacy_request);
+  legacy_intent.owner_epoch =
+      legacy_request.request_context.request_owner_epoch;
+  legacy_intent.request_id = legacy_request.request_context.request_id;
+  ASSERT_TRUE(core::ValidateCellAdmissionClaimIntent(legacy_intent).ok());
+  const core::CellAdmissionClaimDTO legacy_claim{
+      legacy_intent, core::CellAdmissionClaimGeneration(1U),
+      *legacy_request.expected_admission_generation, 43};
+  const core::CellAdmissionClaimReleaseDTO legacy_release{
+      legacy_intent.owner_role,
+      legacy_intent.owner_epoch,
+      legacy_intent.owner_transaction_id,
+      legacy_intent.request_id,
+      legacy_intent.request_payload_digest,
+      legacy_claim.acquired_admission_generation,
+      legacy_claim.claim_generation,
+      {core::CellAdmissionSettlementKindDTO::kOwnerCommit,
+       legacy_intent.request_payload_digest}};
+  const auto legacy_validation =
+      ValidateAuthoredSceneCellAdmissionSettlementReadOnly(
+          database_path, admission.cell_id(), legacy_claim, legacy_release);
+  ASSERT_TRUE(legacy_validation.ok()) << legacy_validation.error().code << ": "
+                                      << legacy_validation.error().message;
+
+  SceneAdmissionClock legacy_clock;
+  SceneAdmissionJournal legacy_journal;
+  core::KernelCellAdmissionOwner legacy_admission(
+      RequestOwnerEpoch("kernel.scene-compaction-legacy"), 8U, legacy_clock,
+      legacy_journal, {{legacy_claim, std::nullopt, std::nullopt}},
+      legacy_claim.acquired_admission_generation, {},
+      [&](const auto &claim, const auto &release) {
+        return ValidateAuthoredSceneCellAdmissionSettlementReadOnly(
+            database_path, admission.cell_id(), claim, release);
+      });
+  const auto legacy_held = legacy_admission.GetCellAdmissionRecoveryReceipt(
+      {legacy_intent, std::nullopt, std::nullopt});
+  ASSERT_TRUE(legacy_held.ok());
+  ASSERT_EQ(legacy_held.value().status,
+            core::CellAdmissionRecoveryReceiptStatusDTO::kHeldExact);
+  LogicalSceneOwner legacy_reopened(database_path, admission,
+                                    publication_reader, bundle_source, resolver,
+                                    legacy_admission);
+  const auto legacy_reconciled =
+      legacy_reopened.ReconcileAuthoredSceneAdmissionClaims();
+  ASSERT_TRUE(legacy_reconciled.ok()) << legacy_reconciled.error().message;
+  const auto legacy_released = legacy_admission.GetCellAdmissionRecoveryReceipt(
+      {legacy_intent, std::nullopt, std::nullopt});
+  ASSERT_TRUE(legacy_released.ok());
+  EXPECT_EQ(legacy_released.value().status,
+            core::CellAdmissionRecoveryReceiptStatusDTO::kReleasedExact);
 }
 
 TEST(CanonicalEmptySceneOwnerProviderFreshness,

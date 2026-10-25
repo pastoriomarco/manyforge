@@ -156,6 +156,24 @@ class IoSourceIngressSender final {
     return true;
   }
 
+  /// Roll back one failed owner-issued Resume without minting another driver
+  /// generation. This is not a lifecycle command: only the exact current
+  /// generation may close its own accepting gate.
+  bool AbortResume(std::uint64_t generation) {
+    std::lock_guard lock(mutex_);
+    if (retired_ || generation == 0U ||
+        generation != driver_generation_.load())
+      return false;
+    if (!enabled_)
+      return true;
+    const bool was_accepting = accepting_;
+    accepting_ = false;
+    enabled_ = false;
+    if (was_accepting)
+      Lose(IoIngressLossReason::kDisconnected, clock_.now());
+    return true;
+  }
+
   void Shutdown() {
     std::lock_guard lock(mutex_);
     retired_ = true;

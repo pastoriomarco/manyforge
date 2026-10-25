@@ -235,8 +235,7 @@ Result<void> GripperParticipantEngine::reset_gripper(const std::string& id,
                                       "Gripper changed before scoped Reset",
                                       {{"reason", "stale_gripper_state"}}});
   backend_.invalidate_gripper_commands(GripperInvalidationReason::kReset);
-  backend_.authorize_gripper_commands();
-  return Result<void>::Ok();
+  return backend_.try_authorize_gripper_commands();
 }
 AddressedParticipantStopFenceDisposition GripperParticipantEngine::fence_addressed_participant_stop(
     const std::uint64_t execution_id) noexcept {

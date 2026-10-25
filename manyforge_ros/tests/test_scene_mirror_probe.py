@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from types import SimpleNamespace
+import threading
 
 from geometry_msgs.msg import Vector3
 import pytest
@@ -139,10 +140,11 @@ def test_scene_mirror_captures_info_pose_bounds_and_per_entity_failure() -> None
             "/get_entity_bounds": bounds,
         }
     )
-    snapshot = scene_mirror_probe.SimulationSceneMirrorClient(
+    with scene_mirror_probe.SimulationSceneMirrorClient(
         node,
         service_timeout_s=0.5,
-    ).capture(entity_filter="/World/.*")
+    ) as client:
+        snapshot = client.capture(entity_filter="/World/.*")
 
     assert observed_filters == ["/World/.*"]
     assert snapshot.errors == ()
@@ -168,7 +170,7 @@ def test_scene_mirror_captures_info_pose_bounds_and_per_entity_failure() -> None
     assert second.pose is not None and second.pose.position_xyz[0] == 2.0
     assert second.bounds is None
     assert second.errors == ("GetEntityBounds failed: 4: bounds unavailable",)
-    assert node.destroyed == len(node.created) == 8
+    assert node.destroyed == len(node.created) == 5
     assert not hasattr(node, "create_publisher")
 
 
@@ -185,16 +187,17 @@ def test_explicit_entities_do_not_require_get_entities_service() -> None:
             "/get_entity_bounds": lambda _r: _ok_response(GetEntityBounds),
         }
     )
-    snapshot = scene_mirror_probe.SimulationSceneMirrorClient(
+    with scene_mirror_probe.SimulationSceneMirrorClient(
         node,
         service_names=configured,
-    ).capture(
-        entity_names=["/World/a"],
-        entity_limit=0,
-        include_info=False,
-        include_state=False,
-        include_bounds=False,
-    )
+    ) as client:
+        snapshot = client.capture(
+            entity_names=["/World/a"],
+            entity_limit=0,
+            include_info=False,
+            include_state=False,
+            include_bounds=False,
+        )
 
     assert snapshot.entities == ()
     assert "/get_entities" not in node.created
@@ -214,21 +217,230 @@ def test_configured_service_name_requires_the_exact_graph_type() -> None:
         ("/wrong_type", ["simulation_interfaces/srv/GetEntities"]),
     ]
 
-    snapshot = scene_mirror_probe.SimulationSceneMirrorClient(
+    with scene_mirror_probe.SimulationSceneMirrorClient(
         node,
         service_names=configured,
         service_timeout_s=0.05,
-    ).capture(
-        entity_names=[],
-        include_info=False,
-        include_state=False,
-        include_bounds=False,
-    )
+    ) as client:
+        snapshot = client.capture(
+            entity_names=[],
+            include_info=False,
+            include_state=False,
+            include_bounds=False,
+        )
 
     assert snapshot.service_names["get_simulator_features"] == (
         "/get_simulator_features"
     )
     assert "/wrong_type" not in node.created
+
+
+def test_scene_mirror_reuses_exact_typed_clients_until_explicit_close() -> None:
+    calls = {"features": 0, "state": 0}
+
+    def features(_request):
+        calls["features"] += 1
+        return GetSimulatorFeatures.Response()
+
+    def state(_request):
+        calls["state"] += 1
+        response = _ok_response(GetEntityState)
+        response.state.header.frame_id = "world"
+        response.state.pose.orientation.w = 1.0
+        return response
+
+    node = _Node(
+        {
+            "/get_simulator_features": features,
+            "/get_entity_state": state,
+        }
+    )
+    client = scene_mirror_probe.SimulationSceneMirrorClient(node)
+
+    for _ in range(2):
+        snapshot = client.capture(
+            entity_names=["/World/a"],
+            include_info=False,
+            include_state=True,
+            include_bounds=False,
+        )
+        assert snapshot.entities[0].errors == ()
+
+    assert calls == {"features": 2, "state": 2}
+    assert node.created == ["/get_simulator_features", "/get_entity_state"]
+    assert node.destroyed == 0
+    client.close()
+    client.close()
+    assert node.destroyed == 2
+    with pytest.raises(RuntimeError, match="client is closed"):
+        client.capture(entity_names=[])
+
+
+def test_scene_mirror_evicts_only_failed_client_and_recreates_it() -> None:
+    state_calls = 0
+
+    def state(_request):
+        nonlocal state_calls
+        state_calls += 1
+        if state_calls == 2:
+            raise RuntimeError("fixture transport loss")
+        response = _ok_response(GetEntityState)
+        response.state.header.frame_id = "world"
+        response.state.pose.orientation.w = 1.0
+        return response
+
+    node = _Node(
+        {
+            "/get_simulator_features": lambda _r: GetSimulatorFeatures.Response(),
+            "/get_entity_state": state,
+        }
+    )
+    client = scene_mirror_probe.SimulationSceneMirrorClient(node)
+    arguments = {
+        "entity_names": ["/World/a"],
+        "include_info": False,
+        "include_state": True,
+        "include_bounds": False,
+    }
+
+    assert client.capture(**arguments).entities[0].errors == ()
+    failed = client.capture(**arguments)
+    assert failed.entities[0].errors == (
+        "GetEntityState failed: fixture transport loss",
+    )
+    assert client.capture(**arguments).entities[0].errors == ()
+
+    assert node.created == [
+        "/get_simulator_features",
+        "/get_entity_state",
+        "/get_entity_state",
+    ]
+    assert node.destroyed == 1
+    client.close()
+    assert node.destroyed == 3
+
+
+def test_scene_mirror_prunes_client_when_discovered_exact_name_changes() -> None:
+    node = _Node(
+        {
+            "/get_simulator_features": lambda _r: GetSimulatorFeatures.Response(),
+            "/get_entity_state": lambda _r: _ok_response(GetEntityState),
+            "/vendor/get_entity_state": lambda _r: _ok_response(GetEntityState),
+        }
+    )
+    original_graph = node.get_service_names_and_types
+    client = scene_mirror_probe.SimulationSceneMirrorClient(node)
+    arguments = {
+        "entity_names": ["/World/a"],
+        "include_info": False,
+        "include_state": True,
+        "include_bounds": False,
+    }
+    client.capture(**arguments)
+    node.get_service_names_and_types = lambda: [
+        row for row in original_graph() if row[0] != "/get_entity_state"
+    ] + [
+        (
+            "/vendor/get_entity_state",
+            ["simulation_interfaces/srv/GetEntityState"],
+        )
+    ]
+
+    client.capture(**arguments)
+
+    assert node.created == [
+        "/get_simulator_features",
+        "/get_entity_state",
+        "/vendor/get_entity_state",
+    ]
+    assert node.destroyed == 1
+    client.close()
+    assert node.destroyed == 3
+
+
+def test_scene_mirror_cancel_interrupts_pending_response_and_evicts_client() -> None:
+    state_called = threading.Event()
+
+    class _PendingFuture:
+        def done(self) -> bool:
+            return False
+
+    class _PendingClient(_Client):
+        def call_async(self, _request: object) -> _PendingFuture:
+            state_called.set()
+            return _PendingFuture()
+
+    class _PendingNode(_Node):
+        def create_client(self, service_type: type, service_name: str) -> _Client:
+            self.created.append(service_name)
+            if service_type is GetEntityState:
+                return _PendingClient(lambda _request: None)
+            return _Client(self.handlers[service_name])
+
+    node = _PendingNode(
+        {
+            "/get_simulator_features": lambda _r: GetSimulatorFeatures.Response(),
+            "/get_entity_state": lambda _r: _ok_response(GetEntityState),
+        }
+    )
+    client = scene_mirror_probe.SimulationSceneMirrorClient(node)
+    result: list[BaseException] = []
+
+    def capture() -> None:
+        try:
+            client.capture(
+                entity_names=["/World/a"],
+                include_info=False,
+                include_state=True,
+                include_bounds=False,
+            )
+        except BaseException as error:
+            result.append(error)
+
+    worker = threading.Thread(target=capture)
+    worker.start()
+    assert state_called.wait(timeout=1.0)
+    client.cancel()
+    worker.join(timeout=1.0)
+
+    assert not worker.is_alive()
+    assert len(result) == 1
+    assert str(result[0]) == "simulation scene-mirror capture was cancelled"
+    assert node.destroyed == 1
+    client.close()
+    assert node.destroyed == 2
+
+
+def test_scene_mirror_cancel_interrupts_service_graph_retry_wait() -> None:
+    node = _Node({})
+    node.get_service_names_and_types = lambda: []
+    client = scene_mirror_probe.SimulationSceneMirrorClient(
+        node,
+        service_timeout_s=1.0,
+    )
+    result: list[BaseException] = []
+
+    def capture() -> None:
+        try:
+            client.capture(
+                entity_names=[],
+                include_info=False,
+                include_state=False,
+                include_bounds=False,
+            )
+        except BaseException as error:
+            result.append(error)
+
+    worker = threading.Thread(target=capture)
+    worker.start()
+    threading.Event().wait(0.05)
+    client.cancel()
+    worker.join(timeout=1.0)
+
+    assert not worker.is_alive()
+    assert len(result) == 1
+    assert str(result[0]) == "simulation scene-mirror capture was cancelled"
+    assert node.created == []
 
 
 def test_scene_snapshot_records_and_service_merge_remain_owner_neutral() -> None:

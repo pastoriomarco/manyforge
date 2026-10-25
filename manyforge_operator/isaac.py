@@ -4,7 +4,7 @@ The profile is an outer lifecycle owner only. It starts Isaac Sim on the
 laptop, starts the source-matched ManyForge/ROS composition on the configured
 runtime host through an explicit SSH command, and records exact process
 identities from both hosts. Manager, Headless, Program runner, Composer, and
-the Isaac scene barrier retain semantic ownership of their respective state.
+the Isaac ROS adapters retain semantic ownership of their respective state.
 
 The remote helpers are deliberately small and identity-scoped. They never
 search by process name, kill by port, or adopt an unrecorded process.
@@ -19,7 +19,6 @@ import json
 import os
 from pathlib import Path
 import shlex
-import signal
 import socket
 import subprocess
 import time
@@ -60,16 +59,12 @@ from .orchestrator import (
     LauncherError,
     _StateStore,
     _boot_id,
-    _command_line,
-    _proc_observation,
     _safe_unix_timestamp,
     _status,
     _source_identity,
-    _journal_command,
 )
 
 
-DEFAULT_WORLD_NAME = "isaac_manipulator_scene_light"
 DEFAULT_RUNTIME_NAMESPACE = "/manyforge/isaac_ur10e_light_robot"
 DEFAULT_SIMULATOR_HOST = "192.168.1.132"
 DEFAULT_RUNTIME_HOST = "tndlux@192.168.1.68"
@@ -107,10 +102,6 @@ def _last_json_object(text: str) -> dict[str, Any]:
         if isinstance(value, dict):
             return value
     raise ValueError("remote operator returned no JSON object")
-
-
-def _world_uri(path: Path) -> str:
-    return "file:" + path.absolute().as_posix()
 
 
 def _as_namespace(value: Any) -> Any:
@@ -216,8 +207,6 @@ class IsaacLauncherConfig:
     """Laptop outer-lifecycle configuration for the split Isaac profile."""
 
     source_root: Path
-    isaac_executable: Path
-    world_path: Path
     remote: RemoteNativeConfig
     state_root: Path = DEFAULT_STATE_ROOT
     instance_id: str = "isaac"
@@ -227,9 +216,6 @@ class IsaacLauncherConfig:
     ros_domain: int = DEFAULT_ROS_DOMAIN
     rmw: str = DEFAULT_RMW
     discovery_range: str = DEFAULT_DISCOVERY_RANGE
-    local_ros_setup_script: Path = Path("/opt/ros/jazzy/setup.bash")
-    local_ros_environment_script: Path | None = None
-    expected_world_name: str = DEFAULT_WORLD_NAME
     runtime_namespace: str = DEFAULT_RUNTIME_NAMESPACE
     expected_source_fingerprint: str | None = None
     expected_head_commit: str | None = None
@@ -239,16 +225,12 @@ class IsaacLauncherConfig:
     manager_timeout_seconds: float = 60.0
     ssh_executable: Path = Path("/usr/bin/ssh")
     ssh_timeout_seconds: float = 15.0
-    guard_startup_config: Path | None = None
     joint_commands_topic: str | None = None
 
     def __post_init__(self) -> None:
         for name in (
             "source_root",
-            "isaac_executable",
-            "world_path",
             "state_root",
-            "local_ros_setup_script",
             "ssh_executable",
         ):
             value = Path(getattr(self, name))
@@ -257,34 +239,10 @@ class IsaacLauncherConfig:
             object.__setattr__(self, name, value)
         if not self.source_root.is_dir():
             raise ValueError(f"source_root does not exist: {self.source_root}")
-        if not self.isaac_executable.is_file() or not os.access(self.isaac_executable, os.X_OK):
-            raise ValueError("isaac_executable must be an executable file")
-        isaac_ros_setup = self.isaac_executable.parent / "setup_ros_env.sh"
-        if not isaac_ros_setup.is_file():
-            raise ValueError("Isaac install must provide setup_ros_env.sh")
-        if not self.world_path.is_file():
-            raise ValueError("world_path must be an existing USD file")
-        if self.guard_startup_config is not None:
-            startup_config = Path(self.guard_startup_config)
-            if not startup_config.is_absolute() or not startup_config.is_file():
-                raise ValueError("guard_startup_config must be an existing absolute scene config")
-            guard_extension = self.source_root / "exts/manyforge.isaac.command_guard/config/extension.toml"
-            if not guard_extension.is_file():
-                raise ValueError("selected guard extension must exist in source_root/exts")
-            object.__setattr__(self, "guard_startup_config", startup_config)
         if not self.ssh_executable.is_file() or not os.access(self.ssh_executable, os.X_OK):
             raise ValueError("ssh_executable must be executable")
-        environment_script = self.local_ros_environment_script
-        if environment_script is None:
-            environment_script = self.source_root / "config/ros/isaac_i9.env.sh"
-        environment_script = Path(environment_script)
-        if not environment_script.is_absolute() or not environment_script.is_file():
-            raise ValueError("local_ros_environment_script must be an existing absolute file")
-        object.__setattr__(self, "local_ros_environment_script", environment_script)
         if not self.instance_id or "/" in self.instance_id or "\\" in self.instance_id:
             raise ValueError("instance_id must be one path-safe identifier")
-        if not self.expected_world_name or "/" in self.expected_world_name:
-            raise ValueError("expected_world_name must be one bounded world name")
         if not self.runtime_namespace.startswith("/") or " " in self.runtime_namespace:
             raise ValueError("runtime_namespace must be one absolute ROS namespace")
         if type(self.ros_domain) is not int or not 0 <= self.ros_domain <= 232:
@@ -328,18 +286,12 @@ class IsaacLauncherConfig:
             raise ValueError("expected_head_tree must be a lowercase Git tree SHA")
 
     @property
-    def world_uri(self) -> str:
-        return _world_uri(self.world_path)
-
-    @property
     def instance_root(self) -> Path:
         return self.state_root / self.instance_id
 
     def input_digest(self) -> str:
         inputs = {
             "instance_id": self.instance_id,
-            "world_uri": self.world_uri,
-            "world_name": self.expected_world_name,
             "runtime_namespace": self.runtime_namespace,
             "simulator_host": self.simulator_host,
             "remote_target": self.remote.target,
@@ -355,9 +307,6 @@ class IsaacLauncherConfig:
                  "install_root", "canonical_empty_admission_filename", "composer_static_dir",
                  "simulation_control_config", "isaac_site_settings", "node_catalog_path", "alarm_catalog_path", "package_aggregate_sha256",
                  "compiler_build_manifest_sha256", "node_environment_sha256")}
-        if self.guard_startup_config is not None:
-            inputs["guard_startup_config"] = str(self.guard_startup_config)
-            inputs["guard_startup_config_sha256"] = _sha256_file(self.guard_startup_config)
         if self.joint_commands_topic is not None:
             inputs["joint_commands_topic"] = self.joint_commands_topic
         return _sha256_json(inputs)
@@ -365,13 +314,7 @@ class IsaacLauncherConfig:
     def record(self) -> dict[str, Any]:
         value = asdict(self)
         value["source_root"] = str(self.source_root)
-        value["isaac_executable"] = str(self.isaac_executable)
-        value["world_path"] = str(self.world_path)
-        value["guard_startup_config"] = (str(self.guard_startup_config)
-                                         if self.guard_startup_config is not None else None)
         value["state_root"] = str(self.state_root)
-        value["local_ros_setup_script"] = str(self.local_ros_setup_script)
-        value["local_ros_environment_script"] = str(self.local_ros_environment_script)
         value["ssh_executable"] = str(self.ssh_executable)
         value["remote"] = asdict(self.remote)
         value["static_peers"] = list(self.static_peers)
@@ -470,21 +413,6 @@ time.sleep(.05)
 print(json.dumps({"clean":not auth(),"present":auth()},sort_keys=True,separators=(",",":")))
 '''
 
-_REMOTE_SIM_STOP = r'''
-import json
-import rclpy
-from manyforge_ros.simulation_control import SimulationControlClient
-rclpy.init(args=None)
-node=rclpy.create_node("manyforge_operator_isaac_stop")
-try:
-    result=SimulationControlClient(node,service_timeout_s=5.0).set_simulation_state(state="stopped")
-    print(json.dumps(result.to_dict(),sort_keys=True,separators=(",",":")))
-finally:
-    node.destroy_node()
-    if rclpy.ok(): rclpy.shutdown()
-'''
-
-
 class IsaacLauncher:
     """Persistent split-profile controller with bounded remote operations."""
 
@@ -497,7 +425,6 @@ class IsaacLauncher:
         self._processes: dict[str, dict[str, Any]] = {}
         self._persisted_launch_input_digest: str | None = None
         self._unrecorded_bridge_meta_path: str | None = None
-        self._sim_stop_unverified = False
 
     @staticmethod
     def _make_store(config: IsaacLauncherConfig) -> _StateStore:
@@ -523,11 +450,31 @@ class IsaacLauncher:
         launcher._processes = {}
         launcher._persisted_launch_input_digest = None
         launcher._unrecorded_bridge_meta_path = None
-        launcher._sim_stop_unverified = False
         if store.record_path.exists():
             try:
                 envelope = json.loads(store.record_path.read_text(encoding="utf-8"))
                 mechanical = envelope.get("mechanical", {})
+                stored_config = mechanical.get("config", {})
+                stored_processes = mechanical.get("processes", {})
+                retired_keys = {
+                    "isaac_executable",
+                    "local_ros_setup_script",
+                    "local_ros_environment_script",
+                    "guard_startup_config",
+                }
+                if (
+                    isinstance(stored_config, dict)
+                    and retired_keys.intersection(stored_config)
+                ) or (
+                    isinstance(stored_processes, dict)
+                    and "isaac_simulator" in stored_processes
+                ):
+                    raise LauncherError(
+                        "status_record_invalid",
+                        "prepublication operator record uses removed simulator ownership; "
+                        "recreate the operator instance after reconciling the existing remote runtime",
+                        exit_code=70,
+                    )
                 launcher.config = _as_namespace(mechanical.get("config", {}))
                 launcher._remote_status = mechanical.get("native_status")
                 launcher._processes = dict(mechanical.get("processes", {}))
@@ -535,6 +482,8 @@ class IsaacLauncher:
                 launcher._persisted_launch_input_digest = digest if isinstance(digest, str) else None
                 orphan_meta_path = mechanical.get("unrecorded_bridge_meta_path")
                 launcher._unrecorded_bridge_meta_path = orphan_meta_path if isinstance(orphan_meta_path, str) else None
+            except LauncherError:
+                raise
             except (OSError, ValueError, TypeError, json.JSONDecodeError) as error:
                 raise LauncherError("status_record_invalid", str(error), exit_code=70) from error
         return launcher
@@ -679,9 +628,6 @@ class IsaacLauncher:
             HostIdentity("runtime", HostRole.RUNTIME, remote.advertised_host, runtime_boot_id),
             HostIdentity("simulator", HostRole.SIMULATOR, config.simulator_host, _boot_id()),
         ]
-        simulator_script = _sha256_file(Path(config.isaac_executable))
-        world_digest = _sha256_file(Path(config.world_path))
-        env_digest = _sha256_file(Path(config.local_ros_environment_script))
         artifacts = [
             RuntimeArtifactIdentity(
                 host_id="runtime", kind=ArtifactKind.MOUNTED_INSTALL,
@@ -690,14 +636,6 @@ class IsaacLauncher:
                 compiler_build_manifest_sha256=remote.compiler_build_manifest_sha256,
                 node_environment_sha256=remote.node_environment_sha256,
                 install_root=remote.install_root,
-            ),
-            RuntimeArtifactIdentity(
-                host_id="simulator", kind=ArtifactKind.MOUNTED_INSTALL,
-                source_fingerprint=source.fingerprint_sha256,
-                package_aggregate_sha256=world_digest,
-                compiler_build_manifest_sha256=simulator_script,
-                node_environment_sha256=env_digest,
-                install_root=str(Path(config.isaac_executable).parent),
             ),
         ]
         if getattr(remote, "container_image_id", ""):
@@ -736,84 +674,6 @@ class IsaacLauncher:
             source=source, hosts=hosts, artifacts=artifacts, endpoints=endpoints,
             ros_topology=topology, configuration_digest=configuration_digest(payload),
         )
-
-    @staticmethod
-    def _local_process_authenticated(meta: Mapping[str, Any]) -> bool:
-        try:
-            pid = int(meta["pid"])
-            observation = _proc_observation(pid)
-            if observation is None or observation[0] != int(meta["start_ticks"]):
-                return False
-            if observation[1] in {"Z", "X"} or _boot_id() != meta["boot_id"]:
-                return False
-            if os.getpgid(pid) != int(meta["process_group_id"]):
-                return False
-            observed = _command_line(pid)
-            expected = tuple(str(item) for item in meta["argv"])
-            return observed is not None and observed[: len(expected)] == expected
-        except (KeyError, TypeError, ValueError, ProcessLookupError, PermissionError, OSError):
-            return False
-
-    def _spawn_local_simulator(self) -> dict[str, Any]:
-        config = self._require_config()
-        command = (
-            f"source {shlex.quote(str(config.isaac_executable.parent / 'setup_ros_env.sh'))} && "
-            f"source {shlex.quote(str(config.local_ros_environment_script))} && "
-            f"{shlex.quote(str(config.isaac_executable))} --no-ros-env --no-window "
-            "--enable_extension isaacsim.ros2.bridge "
-            "--enable_extension isaacsim.ros2.sim_control"
-        )
-        guard_startup_config = getattr(config, "guard_startup_config", None)
-        if guard_startup_config is not None:
-            command += (
-                f" --merge-config={shlex.quote(str(guard_startup_config))}"
-                f" --ext-folder {shlex.quote(str(config.source_root / 'exts'))}"
-                " --enable_extension manyforge.isaac.command_guard"
-            )
-        argv, log_reference = _journal_command(
-            config.instance_id, "isaac_simulator", ["bash", "-lc", command]
-        )
-        process = subprocess.Popen(
-            argv, cwd=str(Path(config.isaac_executable).parent),
-            env=os.environ.copy(), stdin=subprocess.DEVNULL,
-            stdout=subprocess.DEVNULL, stderr=subprocess.STDOUT, start_new_session=True,
-        )
-        deadline = time.monotonic() + 5.0
-        actual_argv = None
-        while time.monotonic() < deadline:
-            observation = _proc_observation(process.pid)
-            actual_argv = _command_line(process.pid)
-            # systemd-cat execs the child in the same PID. Record the child,
-            # never the wrapper command that will immediately disappear.
-            if observation is not None and actual_argv and actual_argv[0] != argv[0]:
-                break
-            time.sleep(0.01)
-        observation = _proc_observation(process.pid)
-        if observation is None:
-            self._terminate_local({"pid": process.pid, "process_group_id": process.pid, "argv": argv})
-            raise LauncherError("simulator_identity_unavailable", "Isaac PID identity could not be recorded", exit_code=73)
-        if not actual_argv or actual_argv[0] == argv[0]:
-            self._terminate_local(
-                {
-                    "pid": process.pid,
-                    "process_group_id": process.pid,
-                    "argv": argv,
-                    "start_ticks": observation[0],
-                    "boot_id": _boot_id(),
-                }
-            )
-            raise LauncherError(
-                "simulator_identity_unavailable",
-                "Isaac command line could not be recorded",
-                exit_code=73,
-            )
-        return {
-            "resource_id": "isaac_simulator", "component_id": "isaac_simulator",
-            "kind": ResourceKind.PROCESS.value, "host_id": "simulator",
-            "pid": process.pid, "start_ticks": observation[0], "boot_id": _boot_id(),
-            "process_group_id": os.getpgid(process.pid), "argv": actual_argv,
-            "log_reference": log_reference,
-        }
 
     def _remote_probe(self, meta: Mapping[str, Any]) -> bool | None:
         try:
@@ -1036,33 +896,7 @@ class IsaacLauncher:
         status = result.get("status")
         return status if isinstance(status, dict) else None
 
-    def _remote_stop_simulation(self) -> bool | None:
-        config = self._require_config()
-        remote = config.remote
-        if getattr(remote, "container_image_id", ""):
-            resources = (self._remote_status or {}).get("owned_resources", [])
-            containers = [row for row in resources if row.get("kind") == ResourceKind.CONTAINER.value]
-            if len(containers) != 1:
-                return None
-            # First authenticate actual current ownership through the same status guard.
-            current = self._remote_native_status()
-            if current is None or current.get("container_running") is not True:
-                return None
-            code = "source /runner/build/isaac/ros-overlay/install/setup.bash && " + shlex.join(["python3", "-c", _REMOTE_SIM_STOP])
-            source = shlex.join(["docker", "exec", containers[0]["container_id"],
-                "/usr/local/bin/docker-entrypoint.ros-jazzy-full.sh", "bash", "-c", code])
-        else:
-            # A legacy host record cannot authorize host ROS or a new helper container.
-            return None
-        try:
-            result = self._ssh_json(f"bash -lc {shlex.quote(source)}", timeout=20)
-        except LauncherError as error:
-            if error.code == "runtime_host_unavailable":
-                return None
-            raise
-        return result.get("success") is True
-
-    def _resource_observations(self, resources: Sequence[Mapping[str, Any]], remote_status: Mapping[str, Any] | None, bridge: Mapping[str, Any] | None, simulator: Mapping[str, Any] | None) -> list[ResourceObservation]:
+    def _resource_observations(self, resources: Sequence[Mapping[str, Any]], remote_status: Mapping[str, Any] | None, bridge: Mapping[str, Any] | None) -> list[ResourceObservation]:
         remote_observations = {
             str(row["resource_id"]): ResourceObservation.model_validate_json(json.dumps(row))
             for row in (remote_status or {}).get("resource_observations", [])
@@ -1074,9 +908,7 @@ class IsaacLauncher:
             if resource_id in remote_observations:
                 values.append(remote_observations[resource_id])
                 continue
-            if resource_id == "isaac_simulator" and simulator is not None:
-                presence = ResourcePresence.PRESENT if self._local_process_authenticated(simulator) else ResourcePresence.ABSENT
-            elif resource_id == "isaac_bridge" and bridge is not None:
+            if resource_id == "isaac_bridge" and bridge is not None:
                 probed = self._remote_probe(bridge)
                 presence = ResourcePresence.PRESENT if probed is True else ResourcePresence.ABSENT if probed is False else ResourcePresence.UNKNOWN
             else:
@@ -1084,17 +916,8 @@ class IsaacLauncher:
             values.append(ResourceObservation(resource_id=resource_id, presence=presence, observed_at_unix_ns=_safe_unix_timestamp()))
         return sorted(values, key=lambda row: row.resource_id)
 
-    def _readiness_rows(self, remote_status: Mapping[str, Any] | None, simulator: Mapping[str, Any] | None) -> list[ReadinessObservation]:
+    def _readiness_rows(self, remote_status: Mapping[str, Any] | None) -> list[ReadinessObservation]:
         rows = [ReadinessObservation.model_validate_json(json.dumps(row)) for row in (remote_status or {}).get("readiness_observations", []) if isinstance(row, dict)]
-        now = _safe_unix_timestamp()
-        sim_present = simulator is not None and self._local_process_authenticated(simulator)
-        rows.append(ReadinessObservation(
-            component_id="isaac_simulator", authority=ReadinessAuthority.EXTERNAL_OBSERVATION,
-            state=ReadinessState.READY if sim_present else ReadinessState.UNAVAILABLE,
-            source_schema="manyforge.isaac_simulator_process.v1", owner_id="isaac-sim",
-            payload_sha256=_sha256_json({"present": sim_present}), observed_at_unix_ns=now,
-            reason_code=None if sim_present else "sim_stop_unverified" if self._sim_stop_unverified else "simulator_unavailable",
-        ))
         return sorted(rows, key=lambda row: (row.component_id, row.authority, row.source_schema))
 
     def _snapshot(self, configuration: LaunchConfiguration, old_status: LaunchInstanceStatus | None, mechanical: Mapping[str, Any], *, remote_status: Mapping[str, Any] | None, state_override: LaunchInstanceState | None = None, failure: FailureRecord | None = None) -> LaunchInstanceStatus:
@@ -1106,9 +929,8 @@ class IsaacLauncher:
         resources_by_id = {str(item["resource_id"]): item for item in native_resources + local_resources}
         resources = [resources_by_id[key] for key in sorted(resources_by_id)]
         bridge = resources_by_id.get("isaac_bridge")
-        simulator = resources_by_id.get("isaac_simulator")
-        observations = self._resource_observations(resources, remote_status, bridge, simulator)
-        readiness = self._readiness_rows(remote_status, simulator)
+        observations = self._resource_observations(resources, remote_status, bridge)
+        readiness = self._readiness_rows(remote_status)
         native_ready = remote_status is not None and remote_status.get("state") == LaunchInstanceState.READY.value
         all_present = bool(resources) and all(row.presence is ResourcePresence.PRESENT for row in observations)
         all_ready = bool(readiness) and all(row.state is ReadinessState.READY for row in readiness)
@@ -1157,7 +979,6 @@ class IsaacLauncher:
     def _cleanup(self, mechanical: Mapping[str, Any]) -> bool:
         processes = mechanical.get("processes", {})
         bridge = processes.get("isaac_bridge") if isinstance(processes, dict) else None
-        simulator = processes.get("isaac_simulator") if isinstance(processes, dict) else None
         orphan_bridge_meta_path = mechanical.get("unrecorded_bridge_meta_path")
         if not isinstance(orphan_bridge_meta_path, str):
             orphan_bridge_meta_path = self._unrecorded_bridge_meta_path
@@ -1180,23 +1001,7 @@ class IsaacLauncher:
                 LaunchInstanceState.STOPPING.value,
             }
         )
-        self._sim_stop_unverified = False
         clean = not remote_unknown
-        simulator_present = simulator is not None and self._local_process_authenticated(simulator)
-        # The startup record owns this Sim; Manager cell retirement has no
-        # simulation Stop effect, and an unowned/attached Sim is untouched.
-        if simulator is not None:
-            if simulator_present:
-                try:
-                    simulation_stopped = self._remote_stop_simulation() if not remote_unknown else None
-                except LauncherError:
-                    simulation_stopped = None
-            else:
-                self._sim_stop_unverified = True
-                simulation_stopped = True
-            if simulation_stopped is not True:
-                self._sim_stop_unverified = True
-                clean = False
         if bridge is not None:
             remote_clean = self._remote_stop_process(bridge)
             if remote_clean is not True:
@@ -1218,9 +1023,6 @@ class IsaacLauncher:
                 clean = False
             else:
                 self._remote_status = remote_native
-        self._terminate_local(simulator)
-        if simulator is not None and self._local_process_authenticated(simulator):
-            clean = False
         return clean
 
     def _assert_stopped_record_absent(
@@ -1241,15 +1043,6 @@ class IsaacLauncher:
         self._processes = dict(processes)
         if getattr(self._require_config().remote, "container_image_id", ""):
             self._remote_status = mechanical.get("native_status")
-        for resource_id in ("isaac_simulator",):
-            process = self._processes.get(resource_id)
-            if process is not None and self._local_process_authenticated(process):
-                raise LauncherError(
-                    "stale_launch_record",
-                    f"stopped Isaac launch still owns {resource_id}",
-                    exit_code=70,
-                    status=old_status,
-                )
         bridge = self._processes.get("isaac_bridge")
         if bridge is not None:
             present = self._remote_probe(bridge)
@@ -1388,9 +1181,6 @@ class IsaacLauncher:
             starting = self._snapshot(configuration, None, self._mechanical(), remote_status=None, state_override=LaunchInstanceState.STARTING)
             self._write(starting, self._mechanical())
             try:
-                simulator = self._spawn_local_simulator()
-                self._processes["isaac_simulator"] = simulator
-                self._write(self._snapshot(configuration, starting, self._mechanical(), remote_status=None, state_override=LaunchInstanceState.STARTING), self._mechanical())
                 self._remote_status = self._remote_native_start()
                 self._verify_remote_source(configuration.source)
                 final = self._snapshot(configuration, starting, self._mechanical(), remote_status=self._remote_status)
@@ -1479,26 +1269,4 @@ class IsaacLauncher:
                 return final
             raise LauncherError("cleanup_deadline_exceeded", "Isaac stop did not prove every owned resource absent", exit_code=74, status=final)
 
-    def _terminate_local(self, meta: Mapping[str, Any] | None) -> None:
-        if not meta:
-            return
-        try:
-            if not self._local_process_authenticated(meta):
-                return
-            pgid = int(meta["process_group_id"])
-            if pgid <= 1 or pgid == os.getpgrp():
-                return
-            os.killpg(pgid, signal.SIGINT)
-            deadline = time.monotonic() + 8.0
-            while time.monotonic() < deadline and self._local_process_authenticated(meta):
-                time.sleep(0.05)
-            if self._local_process_authenticated(meta):
-                os.killpg(pgid, signal.SIGTERM)
-                time.sleep(0.2)
-            if self._local_process_authenticated(meta):
-                os.killpg(pgid, signal.SIGKILL)
-        except (KeyError, TypeError, ValueError, ProcessLookupError, PermissionError, OSError):
-            return
-
-
-__all__ = ["DEFAULT_WORLD_NAME", "IsaacLauncher", "IsaacLauncherConfig", "RemoteNativeConfig"]
+__all__ = ["IsaacLauncher", "IsaacLauncherConfig", "RemoteNativeConfig"]

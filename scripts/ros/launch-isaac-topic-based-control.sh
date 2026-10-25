@@ -1,11 +1,11 @@
 #!/usr/bin/env bash
 # Developer tool: standalone I9 Isaac/Jazzy ros2_control qualification.
-# This is separate from the Manager-owned component/world launch.
+# This is separate from the Manager-owned component launch.
 #
 # Isaac Sim is a separately owned laptop process.  This launcher runs in the
 # source-matched Orin container, incrementally builds the retained ROS product,
-# proves the exact world through simulation_interfaces, and only then exposes
-# the JTC and gripper adapters.  It never starts Composer, loads a Program,
+# attaches the inactive controller infrastructure to the scene already opened
+# by the user. It never starts Composer, loads a world or Program,
 # or restores DemoSupervisor command ownership.
 
 set -euo pipefail
@@ -112,10 +112,6 @@ launch_arguments=(
     "controllers_file:=${MANYFORGE_CONTROLLERS_FILE}"
     "isaac_profile:=${isaac_profile}"
     "runtime_namespace:=${runtime_namespace}"
-    "world_uri:=${ISAAC_WORLD_URI:-file:/home/tndlux/workspaces/isaac_ros-dev/src/isaac_sim_custom_examples/Scenario/IsaacManipulator/UniversalRobots/isaac_manipulator_scene_light.usda}"
-    "expected_world_name:=${ISAAC_EXPECTED_WORLD_NAME:-isaac_manipulator_scene_light}"
-    "scene_startup_timeout_s:=${ISAAC_SCENE_STARTUP_TIMEOUT_S:-180.0}"
-    "scene_service_timeout_s:=${ISAAC_SCENE_SERVICE_TIMEOUT_S:-30.0}"
     "controller_manager_lock_memory:=${MANYFORGE_CONTROLLER_MANAGER_LOCK_MEMORY:-false}"
     "controller_manager_thread_priority:=${MANYFORGE_CONTROLLER_MANAGER_THREAD_PRIORITY:-50}"
 )
@@ -128,11 +124,6 @@ fi
 if [[ -n "${MANYFORGE_CONTROLLER_MANAGER_CPU_AFFINITY:-}" ]]; then
     launch_arguments+=(
         "controller_manager_cpu_affinity:=${MANYFORGE_CONTROLLER_MANAGER_CPU_AFFINITY}"
-    )
-fi
-if [[ -n "${ISAAC_ADDITIONAL_REQUIRED_TOPICS:-}" ]]; then
-    launch_arguments+=(
-        "additional_required_topics:=${ISAAC_ADDITIONAL_REQUIRED_TOPICS}"
     )
 fi
 if [[ -n "${MANYFORGE_MANAGER_RUN_ROOT:-}" || \

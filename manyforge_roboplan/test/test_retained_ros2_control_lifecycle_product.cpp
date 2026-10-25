@@ -233,7 +233,8 @@ TEST(RetainedRos2ControlLifecycleProductTest,
                         {{rows.value(),
                           {},
                           ingress,
-                          core::IoSourceIncarnation("actual.apply")}},
+                          core::IoSourceIncarnation("actual.apply"),
+                          std::nullopt}},
                         {}, {})
                     .ok());
   }

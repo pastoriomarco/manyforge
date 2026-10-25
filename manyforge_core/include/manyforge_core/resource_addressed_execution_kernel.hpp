@@ -1334,6 +1334,8 @@ class ResourceAddressedExecutionKernel final : public IAddressedOperationOwner,
       bool allow_node_release = false) const;
   [[nodiscard]] ProgramExecutionScopeStateDTO program_execution_scope_locked(
       const ProgramRunStopFence& fence) const;
+  [[nodiscard]] std::optional<ProgramSelectionReleaseBlockReasonDTO>
+  program_selection_release_block_reason_locked(const ProgramRunStopFence& fence) const;
   // Whether a captured node can have physical effects. Unknown capture or
   // index is treated as effectful, so containment is never skipped.
   [[nodiscard]] bool program_node_effectful_locked(const ProgramRunId& program_run_id,

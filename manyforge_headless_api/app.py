@@ -624,7 +624,13 @@ def create_app(
             owner_epoch = request_context.request_owner_epoch
             control_revision = 1
         else:
-            owner_epoch, control_revision = control_dispatch.owner_projection()
+            # This synchronous Program Runner read can itself make a REST
+            # request. Keep it off the ASGI event loop and within the existing
+            # bounded ordinary-control lane. Recognized Stop retains its
+            # projection-free reserved path above.
+            owner_epoch, control_revision = await control_call(
+                control_dispatch.owner_projection
+            )
         freshness = control_ingress.freshness_for(owner_epoch, control_revision)
         correlation_id = request_context.correlation_id or request_context.request_id
         command_payload = dict(payload)

@@ -78,7 +78,8 @@ struct IoProviderDriverRecord::State final {
     IoProviderInputSourceInstallation installation;
     std::variant<std::unique_ptr<MockBooleanInputProvider>,
                  std::unique_ptr<RosBooleanInputProvider>,
-                 std::unique_ptr<RosMappedBooleanInputProvider>>
+                 std::unique_ptr<RosMappedBooleanInputProvider>,
+                 std::unique_ptr<GeometricContactInputProvider>>
         leaf;
   };
   core::ResolvedLifecycleControlDomainScopeDTO domain;
@@ -92,6 +93,7 @@ struct IoProviderDriverRecord::State final {
   std::vector<IoProviderOutputChannelInstallation> outputs;
   std::function<void()> cancel_pending;
   InputLifecycleHook input_lifecycle;
+  InputAcquisitionHook input_acquisition;
   core::ComponentLifecycleStateDTO state{
       core::ComponentLifecycleStateDTO::kDeclared};
   std::uint64_t generation{1U};
@@ -373,7 +375,8 @@ core::Result<void> IoProviderDriverRecord::InstallResourcesLocked(
     std::vector<IoProviderInputSourceInstallation> inputs,
     std::vector<IoProviderOutputChannelInstallation> outputs,
     std::function<void()> cancel_pending_answers,
-    InputLifecycleHook input_lifecycle) {
+    InputLifecycleHook input_lifecycle,
+    InputAcquisitionHook input_acquisition) {
   using Reply = core::Result<void>;
   if (state_->installed || state_->retired ||
       (inputs.empty() && outputs.empty()))
@@ -454,6 +457,21 @@ core::Result<void> IoProviderDriverRecord::InstallResourcesLocked(
       if (!leaf.ok())
         return Reply::Err(leaf.error());
       prepared_inputs.push_back({std::move(input), std::move(leaf.value())});
+    } else if (first.provider.profile == "geometric_contact") {
+      if (!input.geometric_contact || !input.geometric_contact->scheduler)
+        return Reply::Err(error("driver_geometric_contact_binding_invalid"));
+      auto binding = *input.geometric_contact;
+      binding.incarnation = input.incarnation;
+      binding.signals.clear();
+      for (const auto &row : input.rows)
+        binding.signals.push_back(row.descriptor);
+      const auto scheduler = binding.scheduler;
+      auto leaf = GeometricContactInputProvider::Create(
+          input.ingress, *state_->clock, *scheduler, std::move(binding),
+          state_->generation);
+      if (!leaf.ok())
+        return Reply::Err(leaf.error());
+      prepared_inputs.push_back({std::move(input), std::move(leaf.value())});
     } else if (first.provider.profile == "ur_io_states" ||
                first.provider.profile == "ros2_control_gpio") {
       if (!input.node || !first.provider.topic)
@@ -494,6 +512,7 @@ core::Result<void> IoProviderDriverRecord::InstallResourcesLocked(
   state_->outputs = std::move(outputs);
   state_->cancel_pending = std::move(cancel_pending_answers);
   state_->input_lifecycle = std::move(input_lifecycle);
+  state_->input_acquisition = std::move(input_acquisition);
   state_->installed = true;
   state_->CommitFacts();
   return Reply::Ok();
@@ -517,7 +536,8 @@ IoProviderDriverRecord::SetMockValueLocked(const core::IoSignalId &signal,
 core::Result<void> IoProviderDriverRecord::RebindInputsLocked(
     std::vector<IoProviderInputSourceInstallation> inputs,
     std::function<void()> cancel_pending_answers,
-    InputLifecycleHook input_lifecycle) {
+    InputLifecycleHook input_lifecycle,
+    InputAcquisitionHook input_acquisition) {
   using Reply = core::Result<void>;
   if (state_->retired || !state_->installed || state_->fault ||
       inputs.size() != state_->inputs.size())
@@ -547,8 +567,29 @@ core::Result<void> IoProviderDriverRecord::RebindInputsLocked(
   for (std::size_t i = 0; i < inputs.size(); ++i) {
     auto rebound = std::visit(
         [&](auto &leaf) -> core::Result<void> {
-          auto result = leaf->RebindIngress(
-              inputs[i].ingress, inputs[i].incarnation, state_->generation);
+          core::Result<void> result = [&]() -> core::Result<void> {
+            if constexpr (std::is_same_v<
+                              std::decay_t<decltype(leaf)>,
+                              std::unique_ptr<GeometricContactInputProvider>>) {
+              if (!inputs[i].geometric_contact)
+                return Reply::Err(
+                    error("driver_geometric_contact_binding_invalid"));
+              auto binding = *inputs[i].geometric_contact;
+              binding.incarnation = inputs[i].incarnation;
+              binding.signals.clear();
+              for (const auto &row : inputs[i].rows)
+                binding.signals.push_back(row.descriptor);
+              return leaf->RebindIngress(inputs[i].ingress,
+                                         std::move(binding),
+                                         state_->generation);
+            } else {
+              const auto result = leaf->RebindIngress(
+                  inputs[i].ingress, inputs[i].incarnation,
+                  state_->generation);
+              return result.ok() ? Reply::Ok()
+                                 : Reply::Err(result.error());
+            }
+          }();
           if (!result.ok())
             return Reply::Err(result.error());
           return Reply::Ok();
@@ -565,6 +606,7 @@ core::Result<void> IoProviderDriverRecord::RebindInputsLocked(
   }
   state_->cancel_pending = std::move(cancel_pending_answers);
   state_->input_lifecycle = std::move(input_lifecycle);
+  state_->input_acquisition = std::move(input_acquisition);
   return Reply::Ok();
 }
 
@@ -663,6 +705,7 @@ RetainedExternallyManagedPrimitiveOutcome IoProviderDriverRecord::Dispatch(
   if (state_->cancel_pending)
     state_->cancel_pending();
   std::optional<core::ErrorDTO> failure;
+  std::vector<IoProviderInputAcquisitionBaseline> acquisition_baselines;
   for (auto &input : state_->inputs) {
     const bool accepted = std::visit(
         [&](auto &leaf) {
@@ -676,12 +719,32 @@ RetainedExternallyManagedPrimitiveOutcome IoProviderDriverRecord::Dispatch(
             // A refused Mock baseline remains unavailable through shared
             // ingress.
             return resumed.ok() || leaf->status().accepting;
+          } else if constexpr (std::is_same_v<
+                                   std::decay_t<decltype(leaf)>,
+                                   std::unique_ptr<
+                                       GeometricContactInputProvider>>) {
+            const auto resumed = leaf->Resume(state_->generation);
+            if (!resumed.ok())
+              return false;
+            std::vector<core::IoSignalId> signals;
+            signals.reserve(input.installation.rows.size());
+            for (const auto &row : input.installation.rows)
+              signals.push_back(row.descriptor.signal_id);
+            acquisition_baselines.push_back(
+                {resumed.value().incarnation,
+                 resumed.value().source_sequence, std::move(signals)});
+            return true;
           } else
             return leaf->Resume(state_->generation);
         },
         input.leaf);
     if (!accepted)
       failure = error("driver_input_gate_failed");
+  }
+  if (enable && !failure && state_->input_acquisition) {
+    const auto acquired = state_->input_acquisition(acquisition_baselines);
+    if (!acquired.ok())
+      failure = acquired.error();
   }
   for (auto &output : state_->outputs) {
     const auto result = std::visit(
@@ -695,6 +758,17 @@ RetainedExternallyManagedPrimitiveOutcome IoProviderDriverRecord::Dispatch(
     if (!result.ok())
       failure = result.error();
   }
+  if (enable && failure)
+    for (auto &input : state_->inputs)
+      std::visit(
+          [&](auto &leaf) {
+            if constexpr (std::is_same_v<
+                              std::decay_t<decltype(leaf)>,
+                              std::unique_ptr<
+                                  GeometricContactInputProvider>>)
+              static_cast<void>(leaf->AbortResume(state_->generation));
+          },
+          input.leaf);
   if (failure) {
     state_->fault = failure;
     state_->state = Lifecycle::kFaulted;

@@ -3401,6 +3401,7 @@ TEST(ResourceAddressedExecutionKernelTest,
 
   const auto initial = kernel.get_program_execution_scope(ProgramRunId("run.1"));
   ASSERT_TRUE(initial.ok()) << initial.error().message;
+  EXPECT_FALSE(initial.value().selection_release_block_reason.has_value());
   ASSERT_EQ(initial.value().held_nodes.size(), 1U);
   EXPECT_EQ(initial.value().held_nodes.front().node_index, 0U);
   EXPECT_EQ(initial.value().held_nodes.front().state, ProgramNodeHoldStateDTO::kReady);
@@ -3416,9 +3417,75 @@ TEST(ResourceAddressedExecutionKernelTest,
       program_selection_request("resume.as.initial.run", "arm"),
       initial.value().selection_revision);
   ASSERT_TRUE(started.ok()) << started.error().message;
+  EXPECT_FALSE(started.value().selection_release_block_reason.has_value());
   EXPECT_TRUE(started.value().held_nodes.empty());
   const auto admitted = kernel.execute(scoped_motion_operation("after.initial.run"));
   ASSERT_TRUE(admitted.ok()) << admitted.error().message;
+}
+
+TEST(ResourceAddressedExecutionKernelTest,
+     PendingProgramMotionAdmissionIsProjectedAndAtomicallyBlocksOtherReadySelection) {
+  FakeClock clock;
+  ManualScheduler scheduler;
+  FakeParticipantEngine engine;
+  ResourceAddressedExecutionKernelConfig config{RequestOwnerEpoch("kernel.epoch.1"),
+                                                CellId("cell.test"), 8U};
+  config.manager_liveness_required_set = EmptyManagerLivenessSet();
+  ResourceAddressedExecutionKernel kernel(
+      {registration(
+          make_binding("arm", "arm", "execution.trajectory.execute", CoordinateKind::kAngular),
+          engine)},
+      clock, scheduler, default_journal, std::move(config));
+  ASSERT_TRUE(claim_program_execution(kernel).ok());
+  auto capture = program_execution_capture();
+  auto table = std::make_shared<ProgramExecutionTableDTO>(*capture.table);
+  table->nodes.insert(
+      table->nodes.begin() + 1,
+      {ProgramNodeInstanceId("move.second"),
+       "kernel.operation",
+       {{TargetRoleId("arm"), CapabilityId("execution.trajectory.execute"), true}}});
+  table->named_selections = {{"arm", {0U}}, {"arm.second", {1U}}, {"supervision", {2U}}};
+  capture.table = table;
+  ASSERT_TRUE(kernel.register_program_run_capture(std::move(capture)).ok());
+  start_program_motion(kernel, "arm");
+
+  HeldSettlementCall dispatch;
+  engine.execute_return_hook = dispatch.Blocker();
+  auto execution = std::async(std::launch::async, [&] {
+    return kernel.execute(scoped_motion_operation("pending.program.motion"));
+  });
+  const bool entered = dispatch.Entered();
+  if (!entered) dispatch.Release();
+  ASSERT_TRUE(entered);
+
+  const auto pending = kernel.get_program_execution_scope(ProgramRunId("run.1"));
+  std::optional<Result<ProgramExecutionScopeStateDTO>> blocked;
+  std::optional<Result<ProgramExecutionScopeStateDTO>> unchanged;
+  if (pending.ok()) {
+    blocked.emplace(kernel.release_program_selection(
+        program_selection_request("resume.second.while.pending", "arm.second"),
+        pending.value().selection_revision));
+    unchanged.emplace(kernel.get_program_execution_scope(ProgramRunId("run.1")));
+  }
+
+  dispatch.Release();
+  const auto executed = execution.get();
+  ASSERT_TRUE(executed.ok()) << executed.error().message;
+  ASSERT_TRUE(pending.ok()) << pending.error().message;
+  ASSERT_TRUE(pending.value().selection_release_block_reason.has_value());
+  EXPECT_EQ(*pending.value().selection_release_block_reason,
+            ProgramSelectionReleaseBlockReasonDTO::kProgramRunAdmissionPending);
+  ASSERT_TRUE(blocked.has_value());
+  ASSERT_FALSE(blocked->ok());
+  EXPECT_EQ(blocked->error().details.at("reason"), "program_selection_not_releasable");
+  EXPECT_EQ(blocked->error().details.at("selection_release_block_reason"),
+            "program_run_admission_pending");
+  ASSERT_TRUE(unchanged.has_value());
+  ASSERT_TRUE(unchanged->ok()) << unchanged->error().message;
+  EXPECT_EQ(unchanged->value().selection_revision, pending.value().selection_revision);
+  const auto settled = kernel.get_program_execution_scope(ProgramRunId("run.1"));
+  ASSERT_TRUE(settled.ok()) << settled.error().message;
+  EXPECT_FALSE(settled.value().selection_release_block_reason.has_value());
 }
 
 [[nodiscard]] RuntimeScaleControlSelectorDTO runtime_scale_control_selector(
@@ -8119,12 +8186,21 @@ TEST(ResourceAddressedExecutionKernelTest, ProgramHaltKeepsReadyWorkReadyAfterRe
   ASSERT_TRUE(during.ok()) << during.error().message;
   ASSERT_EQ(during.value().held_nodes.size(), 1U);
   EXPECT_EQ(during.value().held_nodes.front().state, ProgramNodeHoldStateDTO::kReady);
+  ASSERT_TRUE(during.value().selection_release_block_reason.has_value());
+  EXPECT_EQ(*during.value().selection_release_block_reason,
+            ProgramSelectionReleaseBlockReasonDTO::kCellMotionAdmissionClosed);
 
   // Neither Run nor Resume ends the Halt; only its release does.
   const auto resume_while_halted = kernel.release_program_selection(
       program_selection_request("resume.while.halted", "arm"), during.value().selection_revision);
   ASSERT_FALSE(resume_while_halted.ok());
   EXPECT_EQ(resume_while_halted.error().details.at("reason"), "program_selection_not_releasable");
+  EXPECT_EQ(resume_while_halted.error().details.at("selection_release_block_reason"),
+            "cell_motion_admission_closed");
+  EXPECT_NE(resume_while_halted.error().message.find("Cell motion admission is closed"),
+            std::string::npos);
+  EXPECT_EQ(kernel.get_program_execution_scope(ProgramRunId("run.1")).value().selection_revision,
+            during.value().selection_revision);
 
   ASSERT_TRUE(kernel
                   .release_program_run_stop_fence(ProgramRunId("run.1"), halted.value().stop_id,
@@ -8132,6 +8208,7 @@ TEST(ResourceAddressedExecutionKernelTest, ProgramHaltKeepsReadyWorkReadyAfterRe
                   .ok());
   const auto after = kernel.get_program_execution_scope(ProgramRunId("run.1"));
   ASSERT_TRUE(after.ok()) << after.error().message;
+  EXPECT_FALSE(after.value().selection_release_block_reason.has_value());
   ASSERT_EQ(after.value().held_nodes.size(), 1U);
   EXPECT_EQ(after.value().held_nodes.front().state, ProgramNodeHoldStateDTO::kReady);
   const auto before_run = kernel.execute(scoped_motion_operation("halt.ready.before.run"));
@@ -11893,6 +11970,7 @@ class FinalPneumaticTestBackend final : public IGripperCommandBackend {
   std::atomic<int> closes{};
   std::atomic<int> opens{};
   std::atomic<bool> actual_owner_proof{};
+  std::atomic<bool> authorization_unsettled{};
   bool reject_delivery{};
   std::atomic_bool refuse_validation{};
   Result<void> validate_gripper_command(const GripperCommandRequestDTO&) const override {
@@ -11959,7 +12037,40 @@ class FinalPneumaticTestBackend final : public IGripperCommandBackend {
     ++opens;
     status.admission_closed = false;
   }
+  Result<void> try_authorize_gripper_commands() noexcept override {
+    if (authorization_unsettled)
+      return Result<void>::Err(ErrorDTO{
+          "gripper_cancellation_unsettled",
+          "The prior gripper cancellation remains unsettled", {}});
+    authorize_gripper_commands();
+    return Result<void>::Ok();
+  }
 };
+
+TEST(ResourceAddressedExecutionKernelTest,
+     GripperResetReportsUnsettledAuthorizationAndRecoversAfterSettlement) {
+  FinalPneumaticTestBackend backend;
+  FakeClock clock;
+  GripperParticipantEngine gripper(backend, clock);
+  {
+    std::lock_guard lock(backend.mutex);
+    backend.status.gripper_id = "gripper.target";
+    backend.status.command_id = 19U;
+    backend.status.generation = 7U;
+    backend.status.state = GripperCommandState::kIdle;
+  }
+  backend.authorization_unsettled = true;
+  const auto refused = gripper.reset_gripper("gripper.target", 19U, 7U);
+  ASSERT_FALSE(refused.ok());
+  EXPECT_EQ(refused.error().code, "gripper_cancellation_unsettled");
+  EXPECT_EQ(backend.opens, 0);
+
+  backend.authorization_unsettled = false;
+  const auto settled = backend.get_gripper_status("gripper.target");
+  EXPECT_TRUE(gripper.reset_gripper(
+      "gripper.target", settled.command_id, settled.generation).ok());
+  EXPECT_EQ(backend.opens, 1);
+}
 
 
 class PreparedGripperForwarder final : public IResolvedPreparedParticipantExecutionEngine {

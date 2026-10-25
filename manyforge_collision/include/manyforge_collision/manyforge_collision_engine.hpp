@@ -269,6 +269,9 @@ class ManyForgeCollisionEngine final : public core::ICollisionQueryEngine {
   const void* internal_prepared_scene_identity() const;
   std::uint64_t internal_prepared_scene_build_count() const;
   QueryMechanismCounters internal_last_query_mechanism_counters() const;
+  /// Cold-path admission proof for consumers that must never let unspecified
+  /// articulated coordinates fall back to the neutral model configuration.
+  [[nodiscard]] bool runtime_query_covers_full_configuration() const;
 
  private:
   struct PreparedScene;

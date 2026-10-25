@@ -1852,11 +1852,11 @@ target: 0.5
         ),
         (
             "manyforge.value_schema.runtime.ros2_control_execution.v1",
-            "sha256:775f7221ffc5433d18a7b794d3b26ab9993fa805ad5b83b6d1a3a0cb58bd1368",
+            "sha256:d60c4f1e7196f4eb6c4ebf4fd8d99980f4aa6b93f83de3e747f5253d7ea4795a",
         ),
         (
             "manyforge.value_schema.runtime.io_provider_execution.v1",
-            "sha256:c6518470d89236c3b91dfd88b77203ed30d3c6476f3358b2ec9f2514cd19f0a5",
+            "sha256:94036272387dd8c604e9b2f54485fb87fb3ed904e1364024e10e526b37dd0776",
         ),
     }
     assert (

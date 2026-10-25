@@ -431,6 +431,63 @@ esac
     assert "ROS_STATIC_PEERS=orin;laptop" not in command
 
 
+def test_developer_start_forwards_explicit_isaac_site_settings(tmp_path: Path) -> None:
+    launcher = _copy_writable_launcher(tmp_path)
+    site = tmp_path / "site-inputs" / "isaac-site.json"
+    site.parent.mkdir()
+    site.write_text(
+        '{"schema":"manyforge.isaac_attach_site.v1",'
+        '"observer_configuration_timeout_s":60,'
+        '"pose_observers_by_cell":{}}\n',
+        encoding="utf-8",
+    )
+    environment = _fake_docker_environment(
+        tmp_path,
+        FAKE_WORKSPACE=str(launcher.parents[1]),
+        FAKE_CONTAINER_PRESENT="false",
+        MANYFORGE_DEV_IMAGE="sha256:test",
+        MANYFORGE_DEV_ISAAC_SITE_SETTINGS=str(site),
+    )
+    completed = subprocess.run(
+        ["/bin/bash", str(launcher), "start"],
+        cwd=launcher.parents[1],
+        env=environment,
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+
+    assert completed.returncode == 0, completed.stderr
+    command = next(
+        call
+        for call in Path(environment["FAKE_DOCKER_CALLS"]).read_text().splitlines()
+        if call.startswith("run ")
+    )
+    assert f"-v {site.parent}:{site.parent}:ro" in command
+    assert command.endswith(
+        "sha256:test python3 scripts/dev-workbench.py serve "
+        f"--isaac-site-settings {site}"
+    )
+
+
+@pytest.mark.parametrize("setting", ["relative/site.json", "/missing/isaac-site.json"])
+def test_developer_start_refuses_unavailable_isaac_site_settings(
+    tmp_path: Path, setting: str
+) -> None:
+    completed, environment = _run_launcher(
+        tmp_path,
+        "start",
+        FAKE_CONTAINER_PRESENT="false",
+        MANYFORGE_DEV_IMAGE="sha256:test",
+        MANYFORGE_DEV_ISAAC_SITE_SETTINGS=setting,
+    )
+
+    assert completed.returncode == 64
+    assert "Isaac site settings" in completed.stderr
+    calls = Path(environment["FAKE_DOCKER_CALLS"]).read_text().splitlines()
+    assert not any(call.startswith("run ") for call in calls)
+
+
 @pytest.mark.parametrize("same_root", [False, True])
 def test_start_refuses_shared_live_state_but_allows_another_root(tmp_path: Path, same_root: bool) -> None:
     launcher = LAUNCHER if same_root else _copy_writable_launcher(tmp_path)
@@ -660,18 +717,9 @@ def test_g_exited_status_crosses_real_ssh_boundary_as_authenticated_facts(tmp_pa
         compiler_build_manifest_sha256="b" * 64, node_environment_sha256="c" * 64,
         container_image_id=environment["MANYFORGE_DEV_IMAGE"], container_name=environment["MANYFORGE_DEV_CONTAINER_NAME"],
         cache_root=str(tmp_path / "cache"), runtime_root="/srv/runtime", evidence_root=str(tmp_path / "evidence"))
-    simulator = tmp_path / "isaac-sim.sh"
-    simulator.write_text("#!/bin/bash\n")
-    simulator.chmod(0o755)
-    (tmp_path / "setup_ros_env.sh").write_text("# fixture\n")
-    world = tmp_path / "world.usda"
-    world.write_text("#usda 1.0\n")
-    topology = tmp_path / "topology.sh"
-    topology.write_text("# fixture\n")
-    config = IsaacLauncherConfig(source_root=workspace, isaac_executable=simulator,
-        world_path=world, remote=remote, state_root=tmp_path / "outer-state",
-        instance_id="isaac-fixture", ssh_executable=ssh,
-        local_ros_environment_script=topology)
+    config = IsaacLauncherConfig(source_root=workspace,
+        remote=remote, state_root=tmp_path / "outer-state",
+        instance_id="isaac-fixture", ssh_executable=ssh)
     # Docker returns the exact digest forwarded by the production shell.
     outer = IsaacLauncher(config)
     status = outer._remote_container_operation("status")

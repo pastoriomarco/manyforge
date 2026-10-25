@@ -421,7 +421,7 @@ int main(int argc, char **argv) {
             false, false, 1U, false, true, "ur5_arm_only_ros_cell", false,
             true, "resource", true, digest.value().value(), {}, true,
             false, false, std::nullopt, false, deployment::test::kLite6ArmTargetId,
-            std::nullopt, std::nullopt, {}, {}, true, {},
+            std::nullopt, std::nullopt, {}, true, {},
             "manyforge.provider.ros2_control", true, true,
             &structural, map_ur5_arm_only_graph);
         return deployment::test::materialize_lite6_retained_consumer_fixture_from(
@@ -490,7 +490,7 @@ int main(int argc, char **argv) {
           bundle, graph.runtime_units.front().runtime_unit_id);
       if (config.gripper_target_configurations.size() != 1U ||
           !config.initial_joint_positions_rad.empty() || !config.motion_target_limits.empty() ||
-          config.isaac_world.has_value() || config.controller_profiles.size() != 1U ||
+          config.controller_profiles.size() != 1U ||
           config.controller_profiles.front().mock_profile != std::optional<std::string>(
               robotiq_position ? "ur5e_robotiq_2f_85" : "lite6_lite_gripper")) {
         throw std::logic_error("gripper-only producer lost its exact no-motion Mock configuration");

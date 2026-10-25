@@ -81,8 +81,8 @@ auto logical_arm(const std::filesystem::path &root, const V &config) {
       root, d::test::make_lite6_controllable_retention_fixture(
                 false, false, 1U, false, true, {}, false, true, "resource",
                 true, {}, {}, true, false, false, std::nullopt, false,
-                d::test::kLite6ArmTargetId, std::nullopt, std::nullopt, {}, {},
-                true, {}, "manyforge.provider.ros2_control", false, true,
+                d::test::kLite6ArmTargetId, std::nullopt, std::nullopt, {}, true,
+                {}, "manyforge.provider.ros2_control", false, true,
                 nullptr, nullptr, true, false, "pneumatic", std::nullopt,
                 "commanded", nullptr, &config));
 }

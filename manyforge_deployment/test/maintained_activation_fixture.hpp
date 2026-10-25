@@ -69,7 +69,8 @@ MaterializeMaintainedInterruptDeployment(
     const std::filesystem::path &package_root,
     const CanonicalValue &configuration,
     const std::filesystem::path &scenario_relative_path =
-        "examples/lite6_pick_and_place.scenario") {
+        "examples/lite6_pick_and_place.scenario",
+    void (*authored_mapper)(CanonicalValue::Object &) = nullptr) {
   using namespace maintained_activation_fixture_detail;
   const std::filesystem::path workspace(MANYFORGE_WORKSPACE_ROOT);
   const auto scenario = workspace / scenario_relative_path;
@@ -81,6 +82,11 @@ MaterializeMaintainedInterruptDeployment(
   for (const auto &[name, value] : configuration.as_object())
     policies = With(std::move(policies), name, value);
   authored = With(std::move(authored), "policies", std::move(policies));
+  if (authored_mapper != nullptr) {
+    auto members = authored.as_object();
+    authored_mapper(members);
+    authored = CanonicalValue(std::move(members));
+  }
   const auto &components = Member(authored, "components").as_array();
   const auto model_component =
       std::find_if(components.begin(), components.end(), [](const auto &row) {

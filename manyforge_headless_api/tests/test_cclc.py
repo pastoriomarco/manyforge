@@ -1383,6 +1383,19 @@ def test_q114_preserves_blockers_and_exact_health_values() -> None:
         _validate_component_readiness(snapshot)
 
 
+def test_lifecycle_ready_accepts_exact_unavailable_measured_state_warning() -> None:
+    snapshot = _target_snapshot()
+    readiness = snapshot["readiness"]
+    readiness["ready"] = True
+    readiness["error"] = None
+    readiness["domains"][0]["error"] = None
+    readiness["domains"][0]["decision_kind"] = "dispatch_primitive"
+    error = {"code": "observation_stale", "message": "Required measured state is stale",
+        "details": {}}
+    readiness["measured_state"] = {"required": True, "available": False, "error": error}
+    _validate_component_readiness(snapshot)
+
+
 def test_q114_retains_general_error_and_normalized_health_bounds() -> None:
     snapshot = _target_snapshot()
     error = {"code": "measured_source_unavailable", "message": "m" * 1024,

@@ -194,7 +194,7 @@ TEST(
       const auto fixture = test::make_lite6_controllable_retention_fixture(
           false, false, 1U, true, true, {}, false, true, "resource", true, {},
           {}, true, true, true, std::nullopt, false, test::kLite6ArmTargetId,
-          std::nullopt, std::nullopt, {}, {}, true, {},
+          std::nullopt, std::nullopt, {}, true, {},
           "manyforge.provider.ros2_control", true, true, nullptr, nullptr,
           false, false, kind, 0.25, mode);
       const auto retained =

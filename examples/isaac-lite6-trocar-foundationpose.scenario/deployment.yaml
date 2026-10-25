@@ -150,7 +150,6 @@
   ],
   "deployment_artifact_id": "trocar_lite6_foundationpose_pick",
   "description": "Retained Isaac Lite6 trocar pick deployment using the commanded ROS 2 control runtime and the qualified FoundationPose Detection3D pose-source client.",
-  "isaac_world": "test_scene_realsense_foundationpose_trocar",
   "name": "trocar_lite6_foundationpose_pick",
   "policies": {
     "interrupt_config": {

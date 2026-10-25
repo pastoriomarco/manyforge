@@ -270,8 +270,7 @@ TEST(ApplyComponentDelta,
   const auto fixture = test::make_lite6_controllable_retention_fixture(
       false, false, 2U, false, true, kFixtureCellId, false, false, "resource",
       false, {}, {}, true, false, false, std::nullopt, false,
-      test::kLite6ArmTargetId, std::nullopt, std::nullopt, "", "lite6_grf_ros2",
-      false);
+      test::kLite6ArmTargetId, std::nullopt, std::nullopt, "", false);
   const auto bundle = Materialize(fixture);
   const auto &unit = bundle->value().cell_graph.runtime_units.front();
   try {
@@ -287,59 +286,52 @@ TEST(ApplyComponentDelta,
   }
 }
 
-TEST(ApplyComponentDelta, EmptyRosHostAcceptsWorldAndNoWorldWithoutFakeComponents) {
-  for (const std::string_view world : {"", "lite6_grf_ros2"}) {
-    const auto catalog = test::lite6_controllable_fixture_detail::qualify_control_catalog(
-        false, true, false, "resource", false, {}, true);
-    const auto &profile = *catalog.ros2_control_execution_runtime_profile;
-    detail::ActivationDeploymentIntent intent{};
-    intent.deployment_artifact_id = "empty_ros_compiler_regression";
-    intent.name = "Empty ROS compiler regression";
-    intent.isaac_world = world.empty() ? std::nullopt
-                                     : std::optional<std::string>(world);
-    intent.attachments = CanonicalValue(CanonicalValue::Array{});
-    intent.policies = CanonicalValue(CanonicalValue::Object{});
-    const auto authored = detail::compile_activation_deployment(
-        intent, core::CellId(std::string(kFixtureCellId)), {}, {},
-        {profile.reference()}, {profile});
-    const auto *authored_graph = authored.find_object_member("graph");
-    ASSERT_NE(authored_graph, nullptr);
-    const auto *units = authored_graph->find_object_member("runtime_units");
-    ASSERT_NE(units, nullptr);
-    ASSERT_EQ(units->as_array().size(), 1U);
-    const auto &host = units->as_array().front();
-    EXPECT_EQ(host.find_object_member("runtime_profile_id")->as_string(),
-              ros2_control_execution_runtime_contract::kRuntimeProfileId);
-    EXPECT_EQ(canonical_json(*host.find_object_member("configuration")),
-              canonical_json(
-                  ros2_control_execution_runtime_contract::empty_host_configuration(
-                      intent.isaac_world)));
-    const auto fixture = test::make_lite6_controllable_retention_fixture(
-        false, false, 0U, false, true, kFixtureCellId, false, false, "resource",
-        false, {}, {}, true, false, false, std::nullopt, false,
-        test::kLite6ArmTargetId, std::nullopt, std::nullopt, "", world);
-    ASSERT_TRUE(fixture.structural_preparations().empty());
-    ASSERT_TRUE(fixture.qualified.compiler_ir().applicability().composition()
-                    .model_assets().empty());
-    const auto bundle = Materialize(fixture);
-    const auto &graph = bundle->value().cell_graph;
-    ASSERT_EQ(graph.runtime_units.size(), 1U);
-    EXPECT_TRUE(graph.controllable_components.empty());
-    EXPECT_TRUE(graph.model_instances.empty());
-    EXPECT_TRUE(graph.control_domains.empty());
-    EXPECT_TRUE(graph.control_bindings.empty());
-    const auto configuration =
-        ros2_control_execution_runtime_contract::require_configuration(
-            *bundle, graph.runtime_units.front().runtime_unit_id);
-    EXPECT_TRUE(configuration.controller_profiles.empty());
-    EXPECT_TRUE(configuration.initial_joint_positions_rad.empty());
-    EXPECT_TRUE(configuration.motion_target_limits.empty());
-    EXPECT_EQ(configuration.planner_rng_seed, 12345U);
-    EXPECT_EQ(configuration.execution_tick_hz, 100U);
-    EXPECT_EQ(configuration.collision_monitor_period_ms, 50.0);
-    EXPECT_EQ(configuration.isaac_world,
-              world.empty() ? std::nullopt : std::optional<std::string>(world));
-  }
+TEST(ApplyComponentDelta, EmptyRosHostHasNoFakeComponents) {
+  const auto catalog = test::lite6_controllable_fixture_detail::qualify_control_catalog(
+      false, true, false, "resource", false, {}, true);
+  const auto &profile = *catalog.ros2_control_execution_runtime_profile;
+  detail::ActivationDeploymentIntent intent{};
+  intent.deployment_artifact_id = "empty_ros_compiler_regression";
+  intent.name = "Empty ROS compiler regression";
+  intent.attachments = CanonicalValue(CanonicalValue::Array{});
+  intent.policies = CanonicalValue(CanonicalValue::Object{});
+  const auto authored = detail::compile_activation_deployment(
+      intent, core::CellId(std::string(kFixtureCellId)), {}, {},
+      {profile.reference()}, {profile});
+  const auto *authored_graph = authored.find_object_member("graph");
+  ASSERT_NE(authored_graph, nullptr);
+  const auto *units = authored_graph->find_object_member("runtime_units");
+  ASSERT_NE(units, nullptr);
+  ASSERT_EQ(units->as_array().size(), 1U);
+  const auto &host = units->as_array().front();
+  EXPECT_EQ(host.find_object_member("runtime_profile_id")->as_string(),
+            ros2_control_execution_runtime_contract::kRuntimeProfileId);
+  EXPECT_EQ(canonical_json(*host.find_object_member("configuration")),
+            canonical_json(
+                ros2_control_execution_runtime_contract::empty_host_configuration()));
+  const auto fixture = test::make_lite6_controllable_retention_fixture(
+      false, false, 0U, false, true, kFixtureCellId, false, false, "resource",
+      false, {}, {}, true, false, false, std::nullopt, false,
+      test::kLite6ArmTargetId);
+  ASSERT_TRUE(fixture.structural_preparations().empty());
+  ASSERT_TRUE(fixture.qualified.compiler_ir().applicability().composition()
+                  .model_assets().empty());
+  const auto bundle = Materialize(fixture);
+  const auto &graph = bundle->value().cell_graph;
+  ASSERT_EQ(graph.runtime_units.size(), 1U);
+  EXPECT_TRUE(graph.controllable_components.empty());
+  EXPECT_TRUE(graph.model_instances.empty());
+  EXPECT_TRUE(graph.control_domains.empty());
+  EXPECT_TRUE(graph.control_bindings.empty());
+  const auto configuration =
+      ros2_control_execution_runtime_contract::require_configuration(
+          *bundle, graph.runtime_units.front().runtime_unit_id);
+  EXPECT_TRUE(configuration.controller_profiles.empty());
+  EXPECT_TRUE(configuration.initial_joint_positions_rad.empty());
+  EXPECT_TRUE(configuration.motion_target_limits.empty());
+  EXPECT_EQ(configuration.planner_rng_seed, 12345U);
+  EXPECT_EQ(configuration.execution_tick_hz, 100U);
+  EXPECT_EQ(configuration.collision_monitor_period_ms, 50.0);
 }
 
 TEST(ApplyComponentDelta, NonemptyRosHostStillRefusesEmptyRequiredRows) {
@@ -356,8 +348,7 @@ TEST(ApplyComponentDelta, NonemptyRosHostStillRefusesEmptyRequiredRows) {
         static_cast<void>(test::make_lite6_controllable_retention_fixture(
             false, false, 1U, false, true, kFixtureCellId, false, false, "resource",
             false, {}, {}, true, false, false, std::nullopt, false,
-            test::kLite6ArmTargetId, std::nullopt, std::nullopt, "", "lite6_grf_ros2",
-            true, field)),
+            test::kLite6ArmTargetId, std::nullopt, std::nullopt, "", true, field)),
         CellGraphCodecError);
     auto unit = graph.runtime_units.front();
     unit.configuration.at(std::string(field)).value = core::JsonValueDTO::Array{};
@@ -366,32 +357,6 @@ TEST(ApplyComponentDelta, NonemptyRosHostStillRefusesEmptyRequiredRows) {
             graph, unit)),
         RetainedBundleError);
   }
-}
-
-TEST(ApplyComponentDelta, CellWorldChangeReplacesIsaacAndRetainsMockPeer) {
-  const auto materialize = [](std::string_view world) {
-    return Materialize(test::make_lite6_controllable_retention_fixture(
-        false, false, 2U, false, true, kFixtureCellId, false, false, "resource",
-        false, {}, {}, true, false, false, std::nullopt, false,
-        test::kLite6ArmTargetId, std::nullopt, std::nullopt, "", world, true));
-  };
-  const auto first = materialize("lite6_grf_ros2");
-  const auto next = materialize("test_scene_realsense_foundationpose_trocar");
-  const auto delta = derive_apply_component_delta(*first, *next);
-  EXPECT_EQ(Row(delta, FirstArm()).disposition,
-            ApplyComponentDisposition::kReplace);
-  EXPECT_EQ(Row(delta, SecondArm()).disposition,
-            ApplyComponentDisposition::kRetain);
-  const auto &unit = next->value().cell_graph.runtime_units.front();
-  EXPECT_EQ(
-      ros2_control_execution_runtime_contract::require_component_configuration(
-          *next, unit.runtime_unit_id, FirstArm())
-          .isaac_world,
-      "test_scene_realsense_foundationpose_trocar");
-  EXPECT_FALSE(
-      ros2_control_execution_runtime_contract::require_component_configuration(
-          *next, unit.runtime_unit_id, SecondArm())
-          .isaac_world.has_value());
 }
 
 TEST(ApplyComponentDelta, AddedAndRemovedComponentsAreClassifiedAndFenced) {

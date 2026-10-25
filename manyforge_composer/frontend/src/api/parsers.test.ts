@@ -1,6 +1,9 @@
 import { describe, expect, it } from 'vitest';
 import actualHeldRun from '../testFixtures/programRunHeld64.fixture.json';
+import isaacSceneOwnerSections from '../testFixtures/isaacSceneOwnerSections.fixture.json';
 import nativeBindingFixture from '../../../../manyforge_deployment/resources/program_binding_lite6_native.fixture.json';
+import { sceneOwnerFacts } from '../state/sceneAuthoring';
+import type { NodeEnvironmentResponse } from '../types/api';
 import {
   StructuralContractError,
   parsePreparedActivationInput,
@@ -676,6 +679,21 @@ function sceneRuntimeFixture(): Record<string, unknown> {
       state: 'open',
       updated_at_ns: 2,
     },
+  };
+}
+
+function sceneCellObserverFixture(overrides: Record<string, unknown> = {}): Record<string, unknown> {
+  return {
+    availability: 'available',
+    cell_id: 'cell-a',
+    exit: null,
+    incident_id: null,
+    incident_persistence: 0,
+    observation_current: true,
+    process_presence: 'present',
+    source_epoch_base: 'observer-epoch',
+    source_id: 'isaac-observer',
+    ...overrides,
   };
 }
 
@@ -2279,12 +2297,6 @@ describe('Deployment workspace parser', () => {
     const parsed = parseDeploymentWorkspaceResponse(fixture);
     expect(parsed.draft.document?.api_version).toBe('manyforge.deployment_intent.v2');
     expect(parsed.draft.graphRevision).toBeNull();
-    const authored = (fixture.draft as Record<string, unknown>).document as Record<string, unknown>;
-    authored.isaac_world = 'lite6_grf_ros2';
-    expect(parseDeploymentWorkspaceResponse(fixture).draft.document?.isaac_world).toBe('lite6_grf_ros2');
-    authored.isaac_world = 'file:/machine/world.usda';
-    expect(() => parseDeploymentWorkspaceResponse(fixture)).toThrow('portable identifier');
-    delete authored.isaac_world;
     expect(parsed.saved.path).toBe('/workspace/deployment.yaml');
     expect(parsed.saved.deploymentRevision).toBeNull();
     const intent = (fixture.draft as Record<string, unknown>).document as Record<string, unknown>;
@@ -2888,6 +2900,167 @@ describe('headless projection parsers', () => {
     expect(parseLogicalSceneProjection(logicalSceneFixture()).snapshot?.objects[0]
       ?.scene_resource_id).toBe('part');
     expect(parseSceneRuntimeProjection(sceneRuntimeFixture()).state.state).toBe('open');
+  });
+
+  it('accepts the closed cell_observer runtime extension and keeps the legacy shape valid', () => {
+    const fixture = sceneRuntimeFixture();
+    fixture.cell_observer = sceneCellObserverFixture({
+      expected_joint_state: {
+        object_id: 'robot-1',
+        policy_id: 'viewer.measured_robot',
+        topic: '/isaac_joint_states',
+      },
+    });
+
+    expect(parseSceneRuntimeProjection(fixture).cell_observer).toEqual({
+      availability: 'available',
+      cell_id: 'cell-a',
+      exit: null,
+      expected_joint_state: {
+        object_id: 'robot-1',
+        policy_id: 'viewer.measured_robot',
+        topic: '/isaac_joint_states',
+      },
+      incident_id: null,
+      incident_persistence: 0,
+      observation_current: true,
+      process_presence: 'present',
+      source_epoch_base: 'observer-epoch',
+      source_id: 'isaac-observer',
+    });
+    const noJointState = sceneRuntimeFixture();
+    noJointState.cell_observer = sceneCellObserverFixture({ expected_joint_state: null });
+    expect(parseSceneRuntimeProjection(noJointState).cell_observer?.expected_joint_state).toBeNull();
+    expect(parseSceneRuntimeProjection(sceneRuntimeFixture()).cell_observer).toBeUndefined();
+  });
+
+  it('rejects malformed cell_observer DTOs and inconsistent exit incidents', () => {
+    const extraField = sceneRuntimeFixture();
+    extraField.cell_observer = sceneCellObserverFixture({ unexpected: true });
+    expect(() => parseSceneRuntimeProjection(extraField)).toThrow(/exactly/);
+
+    const extraExpectedField = sceneRuntimeFixture();
+    extraExpectedField.cell_observer = sceneCellObserverFixture({
+      expected_joint_state: {
+        object_id: 'robot-1',
+        policy_id: 'viewer.measured_robot',
+        topic: '/isaac_joint_states',
+        unexpected: true,
+      },
+    });
+    expect(() => parseSceneRuntimeProjection(extraExpectedField)).toThrow(/exactly/);
+
+    const emptyExpectedTopic = sceneRuntimeFixture();
+    emptyExpectedTopic.cell_observer = sceneCellObserverFixture({
+      expected_joint_state: {
+        object_id: 'robot-1', policy_id: 'viewer.measured_robot', topic: '',
+      },
+    });
+    expect(() => parseSceneRuntimeProjection(emptyExpectedTopic)).toThrow(
+      'must be a non-empty string',
+    );
+
+    const wrongCell = sceneRuntimeFixture();
+    wrongCell.cell_observer = sceneCellObserverFixture({ cell_id: 'cell-b' });
+    expect(() => parseSceneRuntimeProjection(wrongCell)).toThrow('the scene runtime cell_id');
+
+    const invalidAvailability = sceneRuntimeFixture();
+    invalidAvailability.cell_observer = sceneCellObserverFixture({ availability: 'running' });
+    expect(() => parseSceneRuntimeProjection(invalidAvailability)).toThrow(
+      'a supported cell-observer availability',
+    );
+
+    const inconsistentIncident = sceneRuntimeFixture();
+    inconsistentIncident.cell_observer = sceneCellObserverFixture({ incident_id: 'incident-1' });
+    expect(() => parseSceneRuntimeProjection(inconsistentIncident)).toThrow(
+      'a consistent exit, incident_id, and incident_persistence combination',
+    );
+
+    const invalidExit = sceneRuntimeFixture();
+    invalidExit.cell_observer = sceneCellObserverFixture({
+      exit: {
+        core_dumped: false,
+        detected_at_ns: 10,
+        exit_status: null,
+        observed_utc: '2026-10-24T12:00:00Z',
+        pid: 123,
+        signal: null,
+      },
+      incident_id: 'incident-1',
+      incident_persistence: 2,
+    });
+    expect(() => parseSceneRuntimeProjection(invalidExit)).toThrow(
+      'exactly one of exit_status and signal to be present',
+    );
+  });
+
+  it('accepts the complete captured live owner sections and all five current objects', () => {
+    const captured = structuredClone(isaacSceneOwnerSections) as Record<string, unknown>;
+    const runtimeWire = runtimeSnapshotFixture();
+    runtimeWire.projection_generation = captured.projection_generation;
+    runtimeWire.projection_owner_epoch = captured.projection_owner_epoch;
+    runtimeWire.projection_owner_id = captured.projection_owner_id;
+    const runtimeSections = runtimeWire.sections as Record<string, unknown>;
+    const capturedSections = captured.sections as Record<string, unknown>;
+    runtimeSections.logical_scene = capturedSections.logical_scene;
+    runtimeSections.scene_runtime = capturedSections.scene_runtime;
+
+    const logicalSection = capturedSections.logical_scene as Record<string, unknown>;
+    const logicalPayload = logicalSection.payload as Record<string, unknown>;
+    const activeProjection = (logicalPayload.access as Record<string, unknown>)
+      .active_projection as Record<string, string>;
+    const sourceModel = sourceModelFixture();
+    sourceModel.cell_id = (logicalPayload.snapshot as Record<string, unknown>).cell_id;
+    sourceModel.retained_bundle_id = activeProjection.retained_bundle_id;
+    sourceModel.graph_revision = activeProjection.graph_revision;
+    const environment = {
+      active: {
+        retainedBundleId: activeProjection.retained_bundle_id,
+        graphRevision: activeProjection.graph_revision,
+      },
+    } as NodeEnvironmentResponse;
+    const facts = sceneOwnerFacts(
+      parseHeadlessRuntimeSnapshot(runtimeWire),
+      parseSourceModelProjection(sourceModel),
+      environment,
+    );
+
+    expect(facts.available, facts.available ? undefined : facts.reason).toBe(true);
+    if (facts.available) {
+      expect(facts.facts.logicalScene.snapshot?.objects.map((object) => object.scene_resource_id))
+        .toEqual([
+          'isaac_cheese_box',
+          'isaac_small_klt',
+          'isaac_small_klt_01',
+          'isaac_soup_can',
+          'isaac_table_low_327',
+        ]);
+      expect(facts.facts.sceneRuntime.cell_observer?.source_id).toBe('isaac_scene_objects');
+      expect(facts.facts.sceneRuntime.state.configured_pose_source).toEqual({
+        freshness_open: true,
+        source_epoch_base: 'isaac-source-995486bda18407d1177567122de2f4df',
+        source_id: 'isaac_scene_objects',
+      });
+    }
+
+    const malformedRuntime = structuredClone(runtimeWire);
+    const malformedSections = malformedRuntime.sections as Record<string, Record<string, unknown>>;
+    const sceneRuntimeSection = malformedSections.scene_runtime;
+    const sceneRuntimePayload = sceneRuntimeSection.payload as Record<string, unknown>;
+    const state = sceneRuntimePayload.state as Record<string, unknown>;
+    const configuredPoseSource = state.configured_pose_source as Record<string, unknown>;
+    configuredPoseSource.unexpected = true;
+    const malformed = sceneOwnerFacts(
+      parseHeadlessRuntimeSnapshot(malformedRuntime),
+      parseSourceModelProjection(sourceModel),
+      environment,
+    );
+    expect(malformed.available).toBe(false);
+    if (!malformed.available) {
+      expect(malformed.reason).toContain(
+        'sceneRuntime.state.configured_pose_source must be an object with exactly',
+      );
+    }
   });
 
   it('strictly parses carried-object attachment hierarchy metadata', () => {

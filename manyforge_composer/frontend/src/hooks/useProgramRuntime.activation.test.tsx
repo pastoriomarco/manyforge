@@ -1,6 +1,10 @@
 import { StrictMode, act } from 'react';
 import { afterEach, expect, it, vi } from 'vitest';
-import type { AppliedProgramSelection, ProgramWorkspaceResponse } from '../types/api';
+import type {
+  AppliedProgramSelection,
+  ProgramRuntimeControlProjection,
+  ProgramWorkspaceResponse,
+} from '../types/api';
 import type { ComposerHeadlessState } from '../types/headless';
 import type { CCLCComponentSnapshot, CCLCLifecycleRequestBody } from '../types/cclc';
 import { heldRun } from '../testFixtures/heldRun';
@@ -171,6 +175,76 @@ it('all-Active sends one ordinary Execute, and an authoritative refusal does not
   expect(apiMock.cclc.submitLifecycle).not.toHaveBeenCalled();
   expect(test.runtime.activationOffer).toBeNull();
   expect(test.runtime.state.error).toContain('Simulator unavailable');
+});
+
+it('keeps an exact selection refusal visible and projects the next owner snapshot without resending', async () => {
+  const test = await mount();
+  const run = heldRun();
+  const makeControls = (
+    allowed: boolean,
+    reason: string | null,
+  ): ProgramRuntimeControlProjection => ({
+    schemaVersion: 'manyforge.program_runtime_control_projection.v9',
+    ownerId: 'program-runner.development-workbench',
+    ownerEpoch: run.ownerEpoch,
+    programRunId: run.capture.programRunId,
+    runRevision: run.runRevision,
+    runtimeControls: { runtimeControlRevision: 1 } as never,
+    recoveryOffer: null,
+    recoveryHolds: [],
+    executionSelections: {
+      selectionRevision: 7,
+      motionHeld: true,
+      groups: [{
+        groupId: 'all', nodeCount: 1, heldNodeCount: 1, state: 'held',
+        stopAllowed: true,
+        startAllowed: allowed, startUnavailableReason: reason,
+        resumeAllowed: allowed, resumeUnavailableReason: reason,
+        runtimeScaleSelector: null, runtimeScaleUnavailableReason: null,
+        resourceIds: [],
+      }],
+    },
+  } as unknown as ProgramRuntimeControlProjection);
+  const runningControls = makeControls(true, null);
+  await test.observe(({ snapshot }) => {
+    snapshot.programCycle = {
+      ...snapshot.programCycle,
+      state: 'running',
+      programRunId: run.capture.programRunId,
+      cycleClaimGeneration: 4,
+      runRevision: run.runRevision,
+      nodeStatusRevision: 1,
+      runtimeControlRevision: 1,
+      run,
+      runtimeControls: runningControls,
+    };
+  });
+  const currentScenarioReads = apiMock.programs.currentScenario.mock.calls.length;
+  const appliedReads = apiMock.programs.applied.mock.calls.length;
+  const refusal = 'Cell motion admission is unreconciled; Program Run or Resume remains blocked';
+  test.send.mockRejectedValueOnce(new Error(refusal));
+
+  await act(async () => {
+    expect(await test.runtime.resumeMotion('all')).toBe(false);
+  });
+
+  expect(test.send).toHaveBeenCalledTimes(1);
+  expect(apiMock.programs.currentScenario).toHaveBeenCalledTimes(currentScenarioReads);
+  expect(apiMock.programs.applied).toHaveBeenCalledTimes(appliedReads);
+  expect(test.runtime.state.error).toContain(refusal);
+  expect(apiMock.cclc.submitLifecycle).not.toHaveBeenCalled();
+
+  const blockedControls = makeControls(false, 'cell_motion_admission_unreconciled');
+  await test.observe(({ snapshot }) => {
+    snapshot.programCycle = {
+      ...snapshot.programCycle,
+      runtimeControls: blockedControls,
+    };
+  });
+  const group = test.runtime.state.controls?.executionSelections.groups[0];
+  expect(group?.resumeAllowed).toBe(false);
+  expect(group?.resumeUnavailableReason).toBe('cell_motion_admission_unreconciled');
+  expect(test.send).toHaveBeenCalledTimes(1);
 });
 
 it('confirms all configured components in Applied priority, then waits for fresh permission and Executes once', async () => {

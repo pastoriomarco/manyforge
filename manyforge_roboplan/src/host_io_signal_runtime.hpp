@@ -37,6 +37,7 @@ public:
     std::vector<deployment::RetainedIoSignalConfiguration> rows;
     rclcpp::Node::SharedPtr node;
     std::optional<core::RuntimeUnitEpochBindingDTO> installation_occurrence;
+    std::optional<GeometricContactInputBinding> geometric_contact;
     // Sole actual leaf/lifecycle owner for every qualified input. Empty
     // source inventory remains valid for a real BB-only service.
     std::shared_ptr<IoProviderDriverRecord> driver{};
@@ -133,7 +134,8 @@ public:
               "I/O source does not name its actual driver occurrence");
       auto [entry, inserted] = result->driver_inputs_.try_emplace(input.driver);
       if (inserted) result->drivers_.push_back(input.driver);
-      entry->second.push_back({input.rows, input.node, wake, incarnation});
+      entry->second.push_back({input.rows, input.node, wake, incarnation,
+                               input.geometric_contact});
       for (const auto &row : input.rows) {
         const auto signal = row.descriptor.signal_id;
         Require(result->input_profiles_.emplace(signal, row.provider.profile)
@@ -222,6 +224,71 @@ public:
       // A staged, not-yet-Applied service has no armed Kernel catalog.
       return processor ? processor(self, sources, transaction, disabled)
                        : core::Result<void>::Ok();
+    };
+  }
+  IoProviderDriverRecord::InputAcquisitionHook
+  input_acquisition_hook(
+      const std::shared_ptr<IoProviderDriverRecord> &driver) {
+    std::vector<core::IoSignalId> expected_signals;
+    if (const auto found = driver_inputs_.find(driver);
+        found != driver_inputs_.end())
+      for (const auto &input : found->second)
+        if (input.geometric_contact)
+          for (const auto &row : input.rows)
+            expected_signals.push_back(row.descriptor.signal_id);
+    std::sort(expected_signals.begin(), expected_signals.end());
+    return [weak = weak_from_this(),
+            expected_signals = std::move(expected_signals)](
+               std::span<const IoProviderInputAcquisitionBaseline> baselines)
+               -> core::Result<void> {
+      if (expected_signals.empty())
+        return core::Result<void>::Ok();
+      std::vector<core::IoSignalId> actual_signals;
+      for (const auto &baseline : baselines)
+        actual_signals.insert(actual_signals.end(), baseline.signals.begin(),
+                              baseline.signals.end());
+      std::sort(actual_signals.begin(), actual_signals.end());
+      if (actual_signals != expected_signals)
+        return core::Result<void>::Err(
+            {"io_source_unavailable",
+             "Geometric contact source has no initial acquisition", {}});
+      const auto self = weak.lock();
+      if (!self)
+        return core::Result<void>::Err(
+            {"invalid_state_transition", "I/O acquisition owner expired", {}});
+      const auto drained = self->DrainPending();
+      if (!drained.ok())
+        return core::Result<void>::Err(drained.error());
+      if (drained.value().blocked_error)
+        return core::Result<void>::Err(*drained.value().blocked_error);
+      for (const auto &baseline : baselines)
+        for (const auto &signal : baseline.signals) {
+          const auto observed = self->signals_->ReadSignal(signal);
+          const bool matches =
+              observed.ok() && observed.value().latest_sample &&
+              observed.value().latest_sample->publication.incarnation ==
+                  baseline.incarnation &&
+              observed.value().latest_sample->publication.source_sequence >=
+                  baseline.source_sequence;
+          const bool current =
+              matches &&
+              ((observed.value().latest_sample->publication.validity ==
+                    core::IoSampleValidity::kValid &&
+                (observed.value().availability ==
+                     core::IoSignalAvailability::kFresh ||
+                 observed.value().availability ==
+                     core::IoSignalAvailability::kStale)) ||
+               (observed.value().latest_sample->publication.validity ==
+                    core::IoSampleValidity::kUnavailable &&
+                observed.value().availability ==
+                    core::IoSignalAvailability::kUnavailable));
+          if (!current)
+            return core::Result<void>::Err(
+                {"io_source_unavailable",
+                 "Geometric contact source has no initial acquisition",
+                 {{"signal_name", signal.name}}});
+        }
+      return core::Result<void>::Ok();
     };
   }
   core::Result<core::IoIngressDrainResultDTO> DrainPending() {

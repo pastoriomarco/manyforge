@@ -4,14 +4,10 @@ import importlib.util
 import math
 from pathlib import Path
 import sys
-from types import SimpleNamespace
 
 from launch import LaunchContext
-from launch.actions import (
-    DeclareLaunchArgument, EmitEvent, OpaqueFunction, RegisterEventHandler, TimerAction,
-)
+from launch.actions import DeclareLaunchArgument, OpaqueFunction
 from launch.utilities import perform_substitutions
-from launch_ros.actions import Node
 from launch_ros.utilities import evaluate_parameters
 import pytest
 from rclpy.parameter import parameter_dict_from_yaml_file
@@ -77,7 +73,7 @@ def _node_namespace(action: object, context: LaunchContext) -> str:
     )
 
 
-def test_launch_declares_exact_world_and_has_no_retired_semantic_owner() -> None:
+def test_launch_declares_runtime_inputs_and_has_no_retired_semantic_owner() -> None:
     module = _load_launch_module()
     description = module.generate_launch_description()
     declarations = [
@@ -86,12 +82,6 @@ def test_launch_declares_exact_world_and_has_no_retired_semantic_owner() -> None
         if isinstance(action, DeclareLaunchArgument)
     ]
 
-    assert module.DEFAULT_WORLD_URI == (
-        "file:/home/tndlux/workspaces/isaac_ros-dev/src/"
-        "isaac_sim_custom_examples/Scenario/IsaacManipulator/UniversalRobots/"
-        "isaac_manipulator_scene_light.usda"
-    )
-    assert module.DEFAULT_WORLD_NAME == "isaac_manipulator_scene_light"
     assert (
         module.DEFAULT_RUNTIME_NAMESPACE
         == "/manyforge/isaac_ur10e_light_robot"
@@ -101,10 +91,6 @@ def test_launch_declares_exact_world_and_has_no_retired_semantic_owner() -> None
         "robot_description_file",
         "controllers_file",
         "runtime_namespace",
-        "world_uri",
-        "expected_world_name",
-        "require_existing_world",
-        "additional_required_topics",
         "manager_run_root",
         "pose_observer_site_config",
         "pointcloud_topic",
@@ -151,7 +137,7 @@ def test_artifact_paths_accept_readable_relative_files(
     monkeypatch.chdir(parent)
     for name, path in _SUPPLIED_ARTIFACTS.items():
         context.launch_configurations[name] = Path(path).name
-    assert len(module._launch_setup(context)) == 2
+    assert len(module._launch_setup(context)) == 6
 
 
 @pytest.mark.parametrize(
@@ -182,7 +168,7 @@ def test_profile_selection_preserves_distinct_gripper_transports(
             )
 
 
-def test_launch_builds_barrier_first_and_releases_ur_stack_only_on_success(
+def test_launch_attaches_controller_stack_with_inactive_arm_spawner(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     module = _load_launch_module()
@@ -194,31 +180,19 @@ def test_launch_builds_barrier_first_and_releases_ur_stack_only_on_success(
     context = _launch_context(module, profile="ur10e")
     actions = module._launch_setup(context)
 
-    assert len(actions) == 2
-    barrier, registration = actions
-    assert isinstance(barrier, Node)
-    assert _node_executable(barrier) == "isaac_scene_load_barrier"
-    assert _node_namespace(barrier, context) == module.DEFAULT_RUNTIME_NAMESPACE
-    event_handler = getattr(
-        registration, "_RegisterEventHandler__event_handler"
-    )
-    assert getattr(event_handler, "_OnActionEventBase__action_matcher") is barrier
-    callback = getattr(event_handler, "_OnActionEventBase__on_event")
-
-    released = callback(SimpleNamespace(returncode=0), LaunchContext())
-    assert [_node_executable(action) for action in released[:3]] == [
+    assert len(actions) == 6
+    assert [_node_executable(action) for action in actions[:3]] == [
         "robot_state_publisher",
         "static_transform_publisher",
         "isaac_gripper_action_bridge",
     ]
-    assert len(released) == 6
     assert all(
         _node_namespace(action, context) == module.DEFAULT_RUNTIME_NAMESPACE
-        for action in released[:3]
+        for action in actions[:3]
     )
     timed_nodes = [
         getattr(action, "_TimerAction__actions")[0]
-        for action in released[3:]
+        for action in actions[3:]
     ]
     assert all(
         _node_namespace(action, context) == module.DEFAULT_RUNTIME_NAMESPACE
@@ -233,8 +207,10 @@ def test_launch_builds_barrier_first_and_releases_ur_stack_only_on_success(
     assert arm_arguments[arm_arguments.index("--param-file") + 1] == (
         _SUPPLIED_ARTIFACTS["controllers_file"]
     )
-    expected_description = Path(_SUPPLIED_ARTIFACTS["robot_description_file"]).read_text(encoding="utf-8")
-    assert evaluate_parameters(context, released[0]._Node__parameters)[0] == {
+    expected_description = Path(
+        _SUPPLIED_ARTIFACTS["robot_description_file"]
+    ).read_text(encoding="utf-8")
+    assert evaluate_parameters(context, actions[0]._Node__parameters)[0] == {
         "robot_description": expected_description, "frame_prefix": "",
     }
     assert evaluate_parameters(context, timed_nodes[0]._Node__parameters)[0] == {
@@ -246,10 +222,6 @@ def test_launch_builds_barrier_first_and_releases_ur_stack_only_on_success(
         assert arguments[arguments.index("--controller-manager") + 1] == (
             expected_manager
         )
-
-    with pytest.raises(RuntimeError, match="return code 2"):
-        callback(SimpleNamespace(returncode=2), LaunchContext())
-
 
 @pytest.mark.parametrize("profile", ["ur10e", "lite6"])
 @pytest.mark.parametrize("prefix", ["", "authored_component/"])
@@ -267,10 +239,7 @@ def test_explicit_prefix_changes_rsp_and_static_child_only(
         base_child_frame="authored_model_root",
     )
     actions = module._launch_setup(context)
-    handler = actions[1]._RegisterEventHandler__event_handler
-    callback = handler._OnActionEventBase__on_event
-    released = callback(SimpleNamespace(returncode=0), LaunchContext())
-    rsp, static = released[:2]
+    rsp, static = actions[:2]
     description = Path(_SUPPLIED_ARTIFACTS["robot_description_file"]).read_text()
     assert evaluate_parameters(context, rsp._Node__parameters)[0] == {
         "robot_description": description, "frame_prefix": prefix,
@@ -284,7 +253,7 @@ def test_explicit_prefix_changes_rsp_and_static_child_only(
         prefix + "authored_model_root"
     )
     manager = next(
-        action._TimerAction__actions[0] for action in released
+        action._TimerAction__actions[0] for action in actions
         if hasattr(action, "_TimerAction__actions")
         and _node_executable(action._TimerAction__actions[0]) == "ros2_control_node"
     )
@@ -307,43 +276,14 @@ def test_launch_lite6_stack_omits_python_gripper_action_adapter(
         lambda _self, _name: str(_PACKAGE_ROOT),
     )
     actions = module._launch_setup(_launch_context(module, profile="lite6"))
-    registration = actions[1]
-    event_handler = getattr(
-        registration, "_RegisterEventHandler__event_handler"
-    )
-    callback = getattr(event_handler, "_OnActionEventBase__on_event")
-    released = callback(SimpleNamespace(returncode=0), LaunchContext())
 
     assert "isaac_gripper_action_bridge" not in {
-        _node_executable(action) for action in released
+        _node_executable(action) for action in actions
     }
-    assert len(released) == 5
+    assert len(actions) == 5
 
 
-@pytest.mark.parametrize("require_existing_world", ["false", "true"])
-def test_existing_world_selection_reaches_only_the_scene_barrier(
-    monkeypatch: pytest.MonkeyPatch, require_existing_world: str
-) -> None:
-    module = _load_launch_module()
-    monkeypatch.setattr(
-        module.FindPackageShare, "find", lambda _self, _name: str(_PACKAGE_ROOT)
-    )
-    context = _launch_context(module)
-    assert context.launch_configurations["require_existing_world"] == "false"
-    context.launch_configurations["require_existing_world"] = require_existing_world
-    barrier = module._launch_setup(context)[0]
-    parameters = getattr(barrier, "_Node__parameters")[0]
-    selected = next(
-        value for key, value in parameters.items()
-        if perform_substitutions(context, key) == "require_existing_world"
-    )
-    assert selected is (require_existing_world == "true")
-    context.launch_configurations["require_existing_world"] = "invalid"
-    with pytest.raises(ValueError, match="require_existing_world"):
-        module._launch_setup(context)
-
-
-def test_launch_releases_exact_pose_observer_only_after_scene_barrier(
+def test_launch_includes_exact_pose_observer_with_controller_stack(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     module = _load_launch_module()
@@ -358,19 +298,13 @@ def test_launch_releases_exact_pose_observer_only_after_scene_barrier(
     )
     context.launch_configurations["manager_run_root"] = "/run/manyforge"
     actions = module._launch_setup(context)
-    registration = actions[1]
-    event_handler = getattr(
-        registration, "_RegisterEventHandler__event_handler"
-    )
-    callback = getattr(event_handler, "_OnActionEventBase__on_event")
-    released = callback(SimpleNamespace(returncode=0), LaunchContext())
 
-    assert [_node_executable(action) for action in released].count(
+    assert [_node_executable(action) for action in actions].count(
         "pose_source_snapshot_publisher"
     ) == 1
     observer = next(
         action
-        for action in released
+        for action in actions
         if _node_executable(action) == "pose_source_snapshot_publisher"
     )
     assert getattr(observer, "_ExecuteLocal__on_exit") is not None
@@ -394,16 +328,11 @@ def test_launch_adds_demand_pointcloud_bridge_only_with_exact_cell_inputs(
     context = _launch_context(module, profile="ur10e")
     context.launch_configurations["pointcloud_topic"] = "/isaac_cell_cloud"
     context.launch_configurations["pointcloud_cell_id"] = "isaac.cell.1"
-    registration = module._launch_setup(context)[1]
-    event_handler = getattr(
-        registration, "_RegisterEventHandler__event_handler"
-    )
-    callback = getattr(event_handler, "_OnActionEventBase__on_event")
-    released = callback(SimpleNamespace(returncode=0), LaunchContext())
+    actions = module._launch_setup(context)
 
     bridge = next(
         action
-        for action in released
+        for action in actions
         if _node_executable(action) == "isaac_pointcloud_observer_bridge"
     )
     assert _node_namespace(bridge, context) == module.DEFAULT_RUNTIME_NAMESPACE
@@ -413,16 +342,6 @@ def test_launch_adds_demand_pointcloud_bridge_only_with_exact_cell_inputs(
     invalid.launch_configurations["pointcloud_topic"] = "/isaac_cell_cloud"
     with pytest.raises(ValueError, match="pointcloud_cell_id"):
         module._launch_setup(invalid)
-
-
-def test_scene_barrier_return_code_is_exact_and_fail_closed() -> None:
-    module = _load_launch_module()
-    sentinel = object()
-
-    assert module._after_scene_barrier(0, [sentinel]) == [sentinel]
-    for returncode in (False, None, "0", 2, -9):
-        with pytest.raises(RuntimeError, match="scene-load barrier failed"):
-            module._after_scene_barrier(returncode, [sentinel])
 
 
 def test_launch_name_topic_and_vector_parsers_are_bounded() -> None:
@@ -446,10 +365,6 @@ def test_launch_name_topic_and_vector_parsers_are_bounded() -> None:
         )
         == "/manyforge/robot_a/controller/action"
     )
-    assert module._parse_topic_csv("/clock, /tf", name="topics") == [
-        "/clock",
-        "/tf",
-    ]
     assert module._parse_vector3("0 -1.25 3e-2", name="xyz") == [
         "0",
         "-1.25",
@@ -484,9 +399,6 @@ def test_launch_name_topic_and_vector_parsers_are_bounded() -> None:
                 runtime_namespace="/manyforge/robot_a",
                 name="topic",
             )
-    for invalid in ("/clock,/clock", "/clock,relative", "/clock,"):
-        with pytest.raises(ValueError):
-            module._parse_topic_csv(invalid, name="topics")
     assert module._optional_absolute_path("", name="path") == ""
     assert module._optional_absolute_path(" /run/manyforge ", name="path") == (
         "/run/manyforge"
@@ -562,7 +474,7 @@ def test_controller_parameters_follow_each_runtime_namespace(profile: str) -> No
     assert len(controller["joints"].value.string_array_value) == 6
     assert controller["constraints.decelerate_on_cancel"].value.bool_value
     assert controller["interpolate_from_desired_state"].value.bool_value is True
-    assert controller["set_last_command_interface_value_as_state_on_activation"].value.bool_value is False
+    assert controller["set_last_command_interface_value_as_state_on_activation"].value.bool_value is True
     assert "update_rate" not in controller
 
 
@@ -607,46 +519,3 @@ def test_owned_nodes_disable_external_library_log_files():
     for node in nodes:
         arguments = next(keyword.value for keyword in node.keywords if keyword.arg == "ros_arguments")
         assert ast.literal_eval(arguments) == ["--disable-external-lib-logs"]
-
-
-@pytest.mark.parametrize("profile", ["ur10e", "lite6"])
-def test_manager_cell_owned_launch_omits_only_world_barrier_and_pose_observer(
-    monkeypatch: pytest.MonkeyPatch, profile: str,
-) -> None:
-    module = _load_launch_module()
-    monkeypatch.setattr(module.FindPackageShare, "find", lambda _self, _name: str(_PACKAGE_ROOT))
-    context = _launch_context(module, profile=profile)
-    context.launch_configurations.update({
-        "pose_observer_site_config": "/opt/manyforge/pose-observer.json",
-        "manager_run_root": "/run/manyforge",
-    })
-    assert context.launch_configurations["manager_cell_world_owned"] == "false"
-    _, registration = module._launch_setup(context)
-    handler = getattr(registration, "_RegisterEventHandler__event_handler")
-    callback = getattr(handler, "_OnActionEventBase__on_event")
-    standalone = callback(SimpleNamespace(returncode=0), LaunchContext())
-    context.launch_configurations["manager_cell_world_owned"] = "true"
-    managed = module._launch_setup(context)
-    expected = [a for a in standalone if _node_executable(a) != "pose_source_snapshot_publisher"]
-    assert len(managed) == len(expected)
-    assert [_node_executable(a) for a in managed] == [_node_executable(a) for a in expected]
-    assert not any(isinstance(a, RegisterEventHandler) for a in managed)
-    assert not any(_node_executable(a) in ("isaac_scene_load_barrier", "pose_source_snapshot_publisher") for a in managed)
-    assert sum(isinstance(a, TimerAction) for a in managed) == 3
-
-
-@pytest.mark.parametrize("key,value", [
-    ("manager_cell_world_owned", "invalid"),
-    ("scene_startup_timeout_s", "601"),
-    ("scene_service_timeout_s", "121"),
-])
-def test_manager_cell_mode_preserves_existing_launch_input_validation(
-    monkeypatch: pytest.MonkeyPatch, key: str, value: str,
-) -> None:
-    module = _load_launch_module()
-    monkeypatch.setattr(module.FindPackageShare, "find", lambda _self, _name: str(_PACKAGE_ROOT))
-    context = _launch_context(module)
-    context.launch_configurations["manager_cell_world_owned"] = "true"
-    context.launch_configurations[key] = value
-    with pytest.raises(ValueError, match=key):
-        module._launch_setup(context)

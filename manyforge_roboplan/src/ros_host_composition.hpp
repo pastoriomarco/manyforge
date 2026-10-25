@@ -156,6 +156,8 @@ struct Composition final : ExecutionProduct {
       candidate_collision_publisher;
   collision::ManyForgeCollisionEngine::SharedModelPtr
       candidate_collision_model;
+  collision::ManyForgeCollisionEngine::SharedSceneCachePtr
+      candidate_geometric_contact_scene_cache;
   std::shared_ptr<core::ICollisionQueryEngine>
       candidate_runtime_collision_engine;
   std::vector<std::shared_ptr<core::ICollisionQueryEngine>>

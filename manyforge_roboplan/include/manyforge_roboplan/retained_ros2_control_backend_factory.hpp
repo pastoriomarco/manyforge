@@ -6,7 +6,6 @@
 #include <vector>
 
 #include <manyforge_core/execution_port_participant.hpp>
-#include <manyforge_roboplan/retained_isaac_arm_guard_binding.hpp>
 #include <manyforge_roboplan/retained_native_runtime.hpp>
 #include <manyforge_roboplan/retained_ros2_control_runtime_handle.hpp>
 #include <manyforge_ros2_control_execution/ros2_gripper_command_backend.hpp>
@@ -33,8 +32,6 @@ struct RetainedRos2ControlBackendConfig final {
   /// State-authority profile id of the arm's addressed commanded state.
   std::string observed_state_authority_profile_id;
   std::optional<ros2_control_execution::Ros2GripperActionConfig> gripper;
-  /// The Isaac lane's command-age guard sequencing (absent: no guard).
-  std::optional<RetainedIsaacArmGuardBindingConfig> isaac_guard;
   /// Managed first installation starts the executor only after fenced
   /// ownership.
   bool defer_ros_start{false};
