@@ -12,17 +12,6 @@
 
 namespace manyforge::core {
 
-enum class ObservedSceneObjectRole {
-  kStaticObstacle,
-  kSnapshotObstacle,
-  kObservedTarget,
-  kObservedDynamicObstacle,
-  kAttachedObject,
-  kSupportContact,
-  kVisualizationOnly,
-  kRobotRuntimeState,
-};
-
 enum class SceneSnapshotLeaseRejection {
   kNone,
   kSceneSnapshotLeaseMissing,
@@ -30,38 +19,20 @@ enum class SceneSnapshotLeaseRejection {
   kSceneSnapshotLeaseExpired,
   kObservedSceneSourceStale,
   kProjectionStructureChangedAfterValidation,
-  kSceneTopologyChangedAfterValidation,
-  kCollisionPolicyChangedAfterValidation,
-  kTargetMovedAfterValidation,
-  kObstacleMovedAfterValidation,
-  kRuntimeDynamicSceneNotQualified,
+  kSceneSnapshotStructureInvalid,
 };
 
-const char* to_string(ObservedSceneObjectRole role);
 const char* to_reason_code(SceneSnapshotLeaseRejection rejection);
 
+// Validation-time object identity. Dispatch accepts a newer scene for every
+// object; these fields are evidence only, compared solely for the optional
+// per-object divergence detail.
 struct SceneSnapshotLeaseObject {
   std::string object_id;
-  ObservedSceneObjectRole role = ObservedSceneObjectRole::kStaticObstacle;
   std::vector<CollisionBodyId> collision_body_ids;
-
-  // Non-pose collision identity: shape, body inventory, touch-link, support
-  // contact, attachment, and other semantic object content that must not drift
-  // silently after validation. Pose-bearing observed objects still use the
-  // explicit pose drift checks below for their world-pose divergence.
   std::optional<std::string> object_revision_token;
   std::map<CollisionBodyId, std::string> body_content_hashes;
-
   std::optional<Pose3DTO> pose;
-  std::optional<std::string> source_id;
-  std::optional<std::int64_t> source_timestamp_ns;
-  std::optional<std::int64_t> source_freshness_budget_ns;
-
-  std::optional<double> target_drift_tolerance_m;
-  std::optional<double> target_angular_tolerance_rad;
-  std::optional<double> obstacle_drift_tolerance_m;
-  std::optional<double> obstacle_angular_tolerance_rad;
-  bool runtime_dynamic_obstacle_allowed = false;
 };
 
 struct SceneSnapshotLease {
@@ -79,7 +50,6 @@ struct SceneSnapshotLease {
 
 struct SceneSnapshotLiveObject {
   std::string object_id;
-  std::optional<ObservedSceneObjectRole> declared_role;
   std::vector<CollisionBodyId> collision_body_ids;
   std::optional<std::string> object_revision_token;
   std::map<CollisionBodyId, std::string> body_content_hashes;
@@ -88,19 +58,6 @@ struct SceneSnapshotLiveObject {
   std::optional<std::int64_t> source_timestamp_ns;
   std::optional<std::int64_t> source_freshness_budget_ns;
   std::optional<std::int64_t> lease_max_age_ns;
-  std::optional<double> target_drift_tolerance_m;
-  std::optional<double> target_angular_tolerance_rad;
-  std::optional<double> obstacle_drift_tolerance_m;
-  std::optional<double> obstacle_angular_tolerance_rad;
-  bool runtime_dynamic_obstacle_allowed = false;
-};
-
-struct RuntimeDynamicSceneCoverage {
-  bool configured = false;
-  bool armed = false;
-  bool fresh = false;
-  bool qualified = false;
-  std::string coverage_id;
 };
 
 struct SceneSnapshotLeaseValidationContext {
@@ -112,7 +69,9 @@ struct SceneSnapshotLeaseValidationContext {
   std::uint64_t topology_epoch = 0;
   std::uint64_t policy_epoch = 0;
   std::vector<SceneSnapshotLiveObject> live_objects;
-  RuntimeDynamicSceneCoverage runtime_dynamic_scene_coverage;
+  // Debug only: compare lease and live objects and record what changed per
+  // object (bounded). Off, no per-object comparison runs.
+  bool record_object_divergence = false;
 };
 
 struct SceneSnapshotLeaseValidationResult {
@@ -130,10 +89,6 @@ struct SceneSnapshotLeaseValidationResult {
   std::optional<std::string> source_id;
   std::optional<std::int64_t> lease_age_ns;
   std::optional<std::int64_t> source_age_ns;
-  std::optional<double> target_drift_m;
-  std::optional<double> target_angular_drift_rad;
-  std::optional<double> obstacle_drift_m;
-  std::optional<double> obstacle_angular_drift_rad;
   std::map<std::string, std::string> details;
 };
 

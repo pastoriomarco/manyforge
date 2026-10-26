@@ -1,4 +1,5 @@
 #include "logical_scene_owner_impl.hpp"
+#include <manyforge_scene/scene_candidate_preview.hpp>
 
 namespace manyforge::scene::logical_scene_owner_detail {
 namespace {
@@ -47,6 +48,26 @@ namespace manyforge::scene::logical_scene_owner_detail {
 ErrorDTO SceneError(const std::string_view code, const std::string_view message,
                     std::map<std::string, std::string> details) {
   return {std::string(code), std::string(message), std::move(details)};
+}
+
+bool ExpectedProjectionAdmitsActive(const SceneTransactionRequestDTO &request,
+                                    const ProjectionRevisionDTO &active) {
+  if (request.expected_projection_revision == active) {
+    return true;
+  }
+  const bool identity_checked =
+      std::holds_alternative<core::AttachCarriedObjectRequestDTO>(
+          request.operation) ||
+      std::holds_alternative<core::DetachCarriedObjectRequestDTO>(
+          request.operation) ||
+      std::holds_alternative<core::DetachCarriedObjectAtCurrentPoseRequestDTO>(
+          request.operation) ||
+      std::holds_alternative<core::RemoveObjectRequestDTO>(request.operation) ||
+      std::holds_alternative<core::UpdateObjectPoseRequestDTO>(
+          request.operation);
+  return identity_checked &&
+         core::ProjectionIsSameOrForwardInLineage(
+             active, request.expected_projection_revision);
 }
 
 SceneCommitResultDTO
@@ -662,10 +683,13 @@ ResolveSceneCandidate(const SceneTransactionRequestDTO &request,
                                             core::UpdateObjectPoseRequestDTO>) {
           ValidateBoundedIdentity(operation.scene_resource_id.value(),
                                   "scene_resource_id");
-          const auto normalized =
-              NormalizeScenePose(operation.frame_ref, operation.pose, current,
-                                 request.expected_projection_revision,
-                                 request_digest, frame_resolution);
+          const auto normalized = NormalizeScenePose(
+              operation.frame_ref, operation.pose, current,
+              request.expected_projection_revision, request_digest,
+              std::holds_alternative<core::CellSceneFrameRefDTO>(
+                  operation.frame_ref)
+                  ? std::nullopt
+                  : frame_resolution);
           auto found = std::lower_bound(candidate.snapshot.objects.begin(),
                                         candidate.snapshot.objects.end(),
                                         operation.scene_resource_id,
@@ -694,14 +718,6 @@ ResolveSceneCandidate(const SceneTransactionRequestDTO &request,
                  {"current_attached", attached ? "true" : "false"},
                  {"current_frame_id", CurrentFrameId(current, *found)}});
           }
-          if (attached) {
-            throw SceneRequestRejectionError(
-                "scene_object_state_conflict",
-                "a carried object pose is derived from its attachment",
-                {{"reason", "scene_object_is_attached"},
-                 {"scene_resource_id", operation.scene_resource_id.value()},
-                 {"current_frame_id", CurrentFrameId(current, *found)}});
-          }
           if (operation.provider_evidence.has_value() &&
               found->provider_evidence.has_value()) {
             const auto &next = *operation.provider_evidence;
@@ -725,6 +741,76 @@ ResolveSceneCandidate(const SceneTransactionRequestDTO &request,
                    {"received_provider_source_sequence",
                     std::to_string(next.provider_source_sequence)}});
             }
+          }
+          if (attached) {
+            if (!operation.provider_evidence)
+              throw SceneRequestRejectionError(
+                  "scene_object_state_conflict",
+                  "a carried object pose is updated only by its runtime "
+                  "provider",
+                  {{"reason", "scene_object_is_attached"}});
+            const auto &placement =
+                std::get<core::CarriedSceneObjectPlacementDTO>(
+                    found->placement);
+            auto attachment = std::lower_bound(
+                candidate.snapshot.carried_object_attachments.begin(),
+                candidate.snapshot.carried_object_attachments.end(),
+                placement.carried_object_attachment_id,
+                [](const auto &entry, const auto &id) {
+                  return entry.carried_object_attachment_id < id;
+                });
+            if (attachment ==
+                    candidate.snapshot.carried_object_attachments.end() ||
+                attachment->carried_object_attachment_id !=
+                    placement.carried_object_attachment_id ||
+                attachment->carried_object_attachment_revision !=
+                    placement.carried_object_attachment_revision)
+              throw LogicalSceneOwnerIntegrityError(
+                  "attached pose update has no exact attachment");
+            // A pose in the attachment's own carrier frame is the carried
+            // offset itself; a cell-frame pose is expressed on the carrier.
+            const bool carrier_frame_pose =
+                operation.frame_ref ==
+                core::ToSceneTransactionFrameRef(attachment->carrier_frame_ref);
+            if ((!carrier_frame_pose &&
+                 !std::holds_alternative<core::CellSceneFrameRefDTO>(
+                     operation.frame_ref)) ||
+                !frame_resolution || !frame_resolution->valid())
+              throw SceneRequestRejectionError(
+                  "missing_reference",
+                  "attached pose update requires a cell-frame or carrier-frame "
+                  "pose and exact carrier resolution");
+            const auto next_pose =
+                carrier_frame_pose
+                    ? operation.pose
+                    : core::multiply_poses(
+                          core::inverse_pose(
+                              frame_resolution->frame_pose_in_cell),
+                          normalized.pose_in_cell);
+            const bool pose_changed =
+                !SamePose(attachment->pose_in_carrier_frame, next_pose);
+            const bool evidence_changed = !SameProviderEvidence(
+                found->provider_evidence, operation.provider_evidence);
+            attachment->pose_in_carrier_frame = next_pose;
+            attachment->carried_object_attachment_revision =
+                core::logical_scene_identity::
+                    ComputeCarriedObjectAttachmentRevision(*attachment);
+            found->placement = core::CarriedSceneObjectPlacementDTO{
+                attachment->carried_object_attachment_id,
+                attachment->carried_object_attachment_revision};
+            found->provider_evidence = operation.provider_evidence;
+            candidate.operation =
+                core::ResolvedUpsertSceneObjectDTO{*found, *attachment};
+            candidate.resolution_evidence_digest =
+                frame_resolution->resolution_evidence_digest;
+            if (!pose_changed) {
+              topology_changed = false;
+              candidate.update_status =
+                  evidence_changed ? SceneUpdateStatusDTO::kFreshnessOnly
+                                   : SceneUpdateStatusDTO::kNoOp;
+              content_expected_to_change = evidence_changed;
+            }
+            return;
           }
           const auto previous_pose =
               std::get<core::CellFixedSceneObjectPlacementDTO>(found->placement)
@@ -878,12 +964,13 @@ ResolveSceneCandidate(const SceneTransactionRequestDTO &request,
                  const core::CarriedObjectAttachmentId &id) {
                 return entry.carried_object_attachment_id < id;
               });
+          // As for detach at the current pose: the attachment id identifies
+          // the attachment; its revision may have advanced with the carried
+          // offset since the caller read it.
           if (attachment ==
                   candidate.snapshot.carried_object_attachments.end() ||
               attachment->carried_object_attachment_id !=
-                  operation.carried_object_attachment_id ||
-              attachment->carried_object_attachment_revision !=
-                  operation.expected_carried_object_attachment_revision) {
+                  operation.carried_object_attachment_id) {
             throw LogicalSceneOwnerConflictError(
                 "carried-object attachment precondition failed");
           }
@@ -931,12 +1018,14 @@ ResolveSceneCandidate(const SceneTransactionRequestDTO &request,
                  const core::CarriedObjectAttachmentId &id) {
                 return entry.carried_object_attachment_id < id;
               });
+          // The attachment is identified by its id, object and carrier. Its
+          // revision also covers the carried offset, which a continuous pose
+          // source may advance between the caller's read and this commit, so
+          // the detach applies to the latest offset rather than refusing.
           if (attachment ==
                   candidate.snapshot.carried_object_attachments.end() ||
               attachment->carried_object_attachment_id !=
                   operation.carried_object_attachment_id ||
-              attachment->carried_object_attachment_revision !=
-                  operation.expected_carried_object_attachment_revision ||
               attachment->scene_resource_id !=
                   operation.expected_scene_resource_id ||
               attachment->controllable_component_id !=
@@ -1539,6 +1628,31 @@ FrameSelectorForRequest(const SceneTransactionRequestDTO &request,
                       std::is_same_v<T, core::UpsertObjectRequestDTO> ||
                       std::is_same_v<T, core::UpdateObjectPoseRequestDTO> ||
                       std::is_same_v<T, core::DetachCarriedObjectRequestDTO>) {
+          if constexpr (std::is_same_v<T, core::UpdateObjectPoseRequestDTO>) {
+            const auto object = std::find_if(
+                current.objects.begin(), current.objects.end(),
+                [&](const auto &entry) {
+                  return entry.scene_resource_id == operation.scene_resource_id;
+                });
+            if (object != current.objects.end())
+              if (const auto *carried =
+                      std::get_if<core::CarriedSceneObjectPlacementDTO>(
+                          &object->placement)) {
+                const auto attachment =
+                    std::find_if(current.carried_object_attachments.begin(),
+                                 current.carried_object_attachments.end(),
+                                 [&](const auto &entry) {
+                                   return entry.carried_object_attachment_id ==
+                                          carried->carried_object_attachment_id;
+                                 });
+                if (attachment == current.carried_object_attachments.end())
+                  throw LogicalSceneOwnerIntegrityError(
+                      "carried pose update has no attachment");
+                return core::SceneFrameResolutionSelectorDTO{
+                    std::in_place_type<core::SceneFrameRefDTO>,
+                    attachment->carrier_frame_ref};
+              }
+          }
           return std::visit(
               [&current](const auto &frame)
                   -> std::optional<core::SceneFrameResolutionSelectorDTO> {
@@ -1900,8 +2014,12 @@ NormalizeProjectionResult(const core::SceneTransactionDTO &transaction,
 namespace manyforge::scene {
 
 core::Result<core::SceneCandidatePreviewDTO>
-LogicalSceneOwner::PreviewResolvedSceneCandidate(
-    const core::ResolvedSceneCandidatePreviewRequestDTO &preview) const {
+BuildResolvedSceneCandidatePreview(
+    const core::ResolvedSceneCandidatePreviewRequestDTO &preview,
+    const core::ProjectionRevisionDTO &predecessor,
+    std::shared_ptr<const core::LogicalSceneSnapshotDTO> snapshot,
+    const std::uint64_t transaction_sequence,
+    const CandidatePolicyProjector &project_policy) {
   const auto reject = [](std::string code, std::string message,
                          std::map<std::string, std::string> details = {}) {
     return core::Result<core::SceneCandidatePreviewDTO>::Err(
@@ -1918,6 +2036,13 @@ LogicalSceneOwner::PreviewResolvedSceneCandidate(
                   {{"reason", "scene_candidate_operation_unsupported"}});
   }
   try {
+  if (!snapshot || !snapshot->locally_valid() || !predecessor.valid() ||
+      snapshot->revision != predecessor.scene_revision ||
+      request.expected_projection_revision != predecessor ||
+      snapshot->revision.content_hash !=
+          core::logical_scene_identity::ComputeLogicalSceneContentHash(*snapshot)) {
+    return reject("invalid_request", "Candidate snapshot does not match its planning projection");
+  }
     ValidateBoundedIdentity(request.request_context.request_id.value(),
                             "request_id");
     ValidateBoundedIdentity(request.request_context.request_owner_epoch.value(),
@@ -1954,6 +2079,59 @@ LogicalSceneOwner::PreviewResolvedSceneCandidate(
                   {{"reason", "scene_candidate_request_not_canonical"}});
   }
 
+  try {
+    auto candidate =
+        ResolveSceneCandidate(request, *snapshot, transaction_sequence,
+                              request_digest, preview.frame_resolution);
+    auto effective_policy = project_policy(candidate.snapshot);
+    if (!effective_policy.ok()) {
+      return core::Result<core::SceneCandidatePreviewDTO>::Err(effective_policy.error());
+    }
+    const core::ProjectionRevisionDTO proposed{
+        predecessor.retained_bundle_id,
+        predecessor.graph_revision,
+        candidate.snapshot.revision};
+    auto result = core::SceneCandidatePreviewDTO{
+        request_digest,
+        predecessor,
+        proposed,
+        std::make_shared<const LogicalSceneSnapshotDTO>(
+            std::move(candidate.snapshot)),
+        std::move(candidate.operation),
+        std::move(effective_policy.value()),
+        candidate.update_status,
+        candidate.resolution_evidence_digest};
+    if (!result.valid()) {
+      return reject("invariant_violation",
+                    "Scene candidate reducer produced an invalid successor",
+                    {{"reason", "scene_candidate_result_invalid"}});
+    }
+    return core::Result<core::SceneCandidatePreviewDTO>::Ok(std::move(result));
+  } catch (const SceneRequestRejectionError &error) {
+    return reject(error.code(), error.what(), error.details());
+  } catch (const LogicalSceneOwnerConflictError &error) {
+    return reject("scene_object_state_conflict", error.what());
+  } catch (const LogicalSceneOwnerLimitError &error) {
+    return reject("request_ledger_full", error.what());
+  } catch (const std::invalid_argument &error) {
+    return reject("invalid_request", error.what());
+  } catch (const std::exception &error) {
+    return reject("live_scene_snapshot_unavailable", error.what());
+  } catch (...) {
+    return reject("live_scene_snapshot_unavailable",
+                  "Scene candidate preview raised a non-standard exception");
+  }
+}
+
+core::Result<core::SceneCandidatePreviewDTO>
+LogicalSceneOwner::PreviewResolvedSceneCandidate(
+    const core::ResolvedSceneCandidatePreviewRequestDTO &preview) const {
+  const auto reject = [](std::string code, std::string message,
+                         std::map<std::string, std::string> details = {}) {
+    return core::Result<core::SceneCandidatePreviewDTO>::Err(
+        SceneError(code, message, std::move(details)));
+  };
+  const auto &request = preview.request;
   DurableState observed_state;
   std::optional<SceneTransactionStoreState> observed_transactions;
   {
@@ -2019,47 +2197,14 @@ LogicalSceneOwner::PreviewResolvedSceneCandidate(
     }
   }
 
-  try {
-    auto candidate =
-        ResolveSceneCandidate(request, *observed_state.active_scene_snapshot,
-                              observed_transactions->next_transaction_sequence,
-                              request_digest, preview.frame_resolution);
-    auto effective_policy =
-        ProjectEffectivePolicy(candidate.snapshot, projections);
-    const core::ProjectionRevisionDTO proposed{
-        observed_state.active_projection->retained_bundle_id,
-        observed_state.active_projection->graph_revision,
-        candidate.snapshot.revision};
-    auto result = core::SceneCandidatePreviewDTO{
-        request_digest,
-        *observed_state.active_projection,
-        proposed,
-        std::make_shared<const LogicalSceneSnapshotDTO>(
-            std::move(candidate.snapshot)),
-        std::move(candidate.operation),
-        std::move(effective_policy),
-        candidate.update_status,
-        candidate.resolution_evidence_digest};
-    if (!result.valid()) {
-      return reject("invariant_violation",
-                    "Scene candidate reducer produced an invalid successor",
-                    {{"reason", "scene_candidate_result_invalid"}});
-    }
-    return core::Result<core::SceneCandidatePreviewDTO>::Ok(std::move(result));
-  } catch (const SceneRequestRejectionError &error) {
-    return reject(error.code(), error.what(), error.details());
-  } catch (const LogicalSceneOwnerConflictError &error) {
-    return reject("scene_object_state_conflict", error.what());
-  } catch (const LogicalSceneOwnerLimitError &error) {
-    return reject("request_ledger_full", error.what());
-  } catch (const std::invalid_argument &error) {
-    return reject("invalid_request", error.what());
-  } catch (const std::exception &error) {
-    return reject("live_scene_snapshot_unavailable", error.what());
-  } catch (...) {
-    return reject("live_scene_snapshot_unavailable",
-                  "Scene candidate preview raised a non-standard exception");
-  }
+  return BuildResolvedSceneCandidatePreview(
+      preview, *observed_state.active_projection,
+      std::make_shared<const LogicalSceneSnapshotDTO>(*observed_state.active_scene_snapshot),
+      observed_transactions->next_transaction_sequence,
+      [&](const LogicalSceneSnapshotDTO &candidate) {
+        return core::Result<core::CollisionPolicySnapshot>::Ok(
+            ProjectEffectivePolicy(candidate, projections));
+      });
 }
 
 SceneCommitResultDTO
@@ -2232,8 +2377,8 @@ LogicalSceneOwner::Commit(const SceneTransactionRequestDTO &request) {
                     "logical-scene projection is unavailable or "
                     "desynchronized");
     }
-    if (request.expected_projection_revision !=
-        *observed_state.active_projection) {
+    if (!ExpectedProjectionAdmitsActive(request,
+                                        *observed_state.active_projection)) {
       return reject(
           core::RequestReplayStatusDTO::kAcceptedNew, "stale_revision",
           "expected composite projection revision is no longer active");
@@ -2271,7 +2416,9 @@ LogicalSceneOwner::Commit(const SceneTransactionRequestDTO &request) {
           "stale_request_owner_epoch",
           "logical-scene request owner epoch rotated after bounded history "
           "compaction",
-          {{"expected_request_owner_epoch", next_epoch.value()}});
+          {{"reason", "scene_history_compaction_no_effect"},
+           {"previous_request_owner_epoch", request.request_context.request_owner_epoch.value()},
+           {"expected_request_owner_epoch", next_epoch.value()}});
     }
   }
 
@@ -2305,12 +2452,17 @@ LogicalSceneOwner::Commit(const SceneTransactionRequestDTO &request) {
   }
 
   try {
+    // An identity-checked request may name an older revision of this Scene;
+    // its frames and candidate always resolve against the active revision.
+    auto active_request = request;
+    active_request.expected_projection_revision =
+        *observed_state.active_projection;
     const auto frame_resolution = ResolveFrameForRequest(
-        request, *observed_state.active_scene_snapshot, projections);
-    candidate =
-        ResolveSceneCandidate(request, *observed_state.active_scene_snapshot,
-                              observed_transactions->next_transaction_sequence,
-                              request_digest, frame_resolution);
+        active_request, *observed_state.active_scene_snapshot, projections);
+    candidate = ResolveSceneCandidate(
+        active_request, *observed_state.active_scene_snapshot,
+        observed_transactions->next_transaction_sequence, request_digest,
+        frame_resolution);
     auto effective_policy =
         ProjectEffectivePolicy(candidate->snapshot, projections);
     if (auto *policy = std::get_if<core::ResolvedCollisionPolicyDTO>(

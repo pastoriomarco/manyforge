@@ -1782,7 +1782,7 @@ def test_mixed_apply_preserves_survivor_and_observations_during_publication() ->
             ) -> set[tuple[str, str, str]]:
                 assert response.get("ok") is True, response
                 observation = response["observation"]
-                assert observation["schema_version"] == "manyforge.execution_observation.v3"
+                assert observation["schema_version"] == "manyforge.execution_observation.v4"
                 assert observation["owner_epoch"] == host_epoch
                 assert observation["source_epoch"] == wake_epoch
                 rows = keyed_observations(observation["targets"])

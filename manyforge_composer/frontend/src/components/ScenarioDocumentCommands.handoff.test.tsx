@@ -611,7 +611,7 @@ it('removes three supported fixed Scene objects in dependency order with fresh r
   expect(new Set(apiMock.scene.commit.mock.calls.map(([request]) => request.request_context.request_id)).size).toBe(3);
 });
 
-it.each(['stale', 'scene_owner', 'manager_owner', 'workspace', 'fault', 'revision', 'inventory'])('stops further Scene effects after intervening %s', async (change) => {
+it.each(['stale', 'scene_owner', 'manager_owner', 'workspace', 'fault', 'scene', 'inventory'])('stops further Scene effects after intervening %s', async (change) => {
   const test = await mount(false);
   const objects = supportedObjects();
   await test.openClose();
@@ -628,7 +628,11 @@ it.each(['stale', 'scene_owner', 'manager_owner', 'workspace', 'fault', 'revisio
   if (change === 'fault') {
     next.componentOverview.readiness = 'fault'; next.componentOverview.userMessage = 'Actual owner fault';
   }
-  if (change === 'revision') next.runtime.sections.logicalScene.payload = { ...logicalScene(test.closed, remaining, 5) };
+  if (change === 'scene') {
+    const other = logicalScene(test.closed, remaining, 5);
+    other.access.active_projection!.scene_revision.scene_id = 'scene.other';
+    next.runtime.sections.logicalScene.payload = { ...other };
+  }
   if (change === 'inventory') next.runtime.sections.logicalScene.payload = { ...logicalScene(test.closed, [fixedObject('unexpected')], 4) };
   await test.observe(next);
   expect(apiMock.scene.commit).toHaveBeenCalledTimes(1);
@@ -639,6 +643,25 @@ it.each(['stale', 'scene_owner', 'manager_owner', 'workspace', 'fault', 'revisio
     { scene: logicalScene(test.closed, remaining, 4), admissionGeneration: 9 }));
   expect(apiMock.scene.commit).toHaveBeenCalledTimes(1);
   expect(apiMock.programWorkspace.clearClosedScenario).not.toHaveBeenCalled();
+});
+
+it('continues Scene removal on a later revision of the same Scene, naming that latest revision', async () => {
+  const test = await mount(false);
+  const objects = supportedObjects();
+  await test.openClose();
+  await act(async () => { test.close.resolve(test.closed); });
+  // A pose update already advanced the Scene past the Close publication.
+  await test.observe(snapshot(test.closed, test.published, false, { scene: logicalScene(test.closed, objects, 4) }));
+  expect(apiMock.scene.commit).toHaveBeenCalledTimes(1);
+  expect(apiMock.scene.commit.mock.calls[0][0]).toMatchObject({ expected_projection_revision: sceneRevision(test.closed, 4) });
+  const remaining = objects.filter((object) => object.scene_resource_id !== 'graspable');
+  // The removal committed revision 5; pose updates since then reached revision 9.
+  await test.observe(snapshot(test.closed, test.published, false,
+    { scene: logicalScene(test.closed, remaining, 9), admissionGeneration: 9 }));
+  expect(apiMock.scene.commit).toHaveBeenCalledTimes(2);
+  expect(apiMock.scene.commit.mock.calls[1][0]).toMatchObject({
+    expected_projection_revision: sceneRevision(test.closed, 9), operation: { kind: 'remove_object', scene_resource_id: 'wall' } });
+  expect(test.all().some((p) => p.className === 'inline-message severity-error')).toBe(false);
 });
 
 it('a failed second Scene removal reports the confirmed partial outcome and never clears or resends', async () => {

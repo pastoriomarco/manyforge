@@ -559,6 +559,54 @@ def test_control_shell_publishes_the_held_run_draft_edit_rule(paired) -> None:
     assert idle["held_run_draft_edit_allowed"] is False
 
 
+@pytest.mark.parametrize("control_scene_id", ["scene.1", "scene.2"])
+def test_control_shell_pairs_reads_across_a_scene_revision_of_the_same_scene(
+    control_scene_id,
+) -> None:
+    held = {
+        **_cycle(),
+        "state": "running",
+        "program_run_id": "run.1",
+        "run": {"state": "running", "capture": {"program_run_id": "run.1"}},
+        "recovery_offer": None,
+        "runtime_controls": {"execution_selections": {"motion_held": True}},
+    }
+
+    def identity(scene_id: str, revision_id: int) -> dict[str, Any]:
+        return {
+            "owner_epoch": "kernel.1",
+            "scene_revision": {
+                "scene_id": scene_id,
+                "revision_id": revision_id,
+                "content_hash": f"sha256:{revision_id:064x}",
+            },
+        }
+
+    targets = {"ok": True, "identity": identity("scene.1", 7)}
+    # A pose-source commit lands between the targets and control reads.
+    control = {
+        "ok": True,
+        "identity": identity(control_scene_id, 8),
+        "control_state": {"manual_operations": []},
+    }
+    facts = replace(
+        _facts_for_cycle(held),
+        execution_targets_response=targets,
+        execution_control_response=control,
+    )
+    shell = HeadlessControlStateSource._shell_from_facts(facts)
+
+    same_scene = control_scene_id == "scene.1"
+    assert shell["held_run_draft_edit_allowed"] is same_scene
+    assert shell["execution_control_state"] == (control if same_scene else None)
+    # The browser receives one identity-bound pair under the later read.
+    assert shell["execution_targets"] == (
+        {**targets, "identity": control["identity"]} if same_scene else None
+    )
+    assert facts.execution_targets_response is targets
+    assert targets["identity"] == identity("scene.1", 7)
+
+
 @pytest.mark.parametrize(
     "targets_ok,control_ok", [(False, False), (False, True), (True, False)]
 )

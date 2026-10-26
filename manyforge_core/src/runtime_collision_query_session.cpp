@@ -470,17 +470,34 @@ bool RuntimeCollisionQuerySession::bind_policy(
   // Commit the new binding only after every candidate check passes. A malformed
   // publication cannot partially erase the previous generation's contact
   // history before the monitor faults closed.
+  //
+  // A rule change during execution keeps the observed history of every
+  // support-contact pair whose rule is unchanged; new or changed pairs start
+  // fresh and removed pairs drop out. The previous entries point into the
+  // previous bundle, which stays pinned until the copy completes. The
+  // start-of-motion contact baseline is not re-counted.
+  const auto previous_bundle = std::move(bound_bundle_);
+  const auto previous_states = release_states_;
+  const auto previous_states_end = previous_states.begin() + release_state_count_;
   bound_bundle_ = bundle;
   bound_policy_ = bound_bundle_->policy.get();
   bound_policy_index_ = bound_bundle_->policy_index.get();
   active_contact_policy_ = candidate_active_contact_policy;
   release_state_count_ = 0;
-  initial_contact_pair_count_ = 0;
-  initial_contact_pair_count_initialized_ = false;
   for (const auto& [pair, policy] : bundle->policy_index->support_contact_index) {
-    const auto state_index = release_state_count_;
-    release_states_[state_index] = ContactReleaseState{&pair, &policy, {}, false, std::nullopt};
-    ++release_state_count_;
+    auto& state = release_states_[release_state_count_++];
+    state = ContactReleaseState{&pair, &policy, {}, false, std::nullopt};
+    const auto previous =
+        std::lower_bound(previous_states.begin(), previous_states_end, pair,
+                         [](const ContactReleaseState& entry, const CollisionPairId& key) {
+                           return *entry.pair < key;
+                         });
+    if (previous != previous_states_end && *previous->pair == pair &&
+        *previous->policy == policy) {
+      state.transition_state = previous->transition_state;
+      state.observed_in_contact = previous->observed_in_contact;
+      state.observed_clearance_m = previous->observed_clearance_m;
+    }
   }
   policy_binding_valid_ = true;
   policy_binding_error_ = RuntimeCollisionTickReason::kNone;
@@ -860,8 +877,7 @@ RuntimeCollisionTickOutcome RuntimeCollisionQuerySession::tick(
       return out;
     }
   }
-  const bool pin_admission_policy = admission_projection_revision_.has_value() && bound_bundle_;
-  if (!pin_admission_policy && !bind_policy(bundle)) {
+  if (!bind_policy(bundle)) {
     RuntimeCollisionTickOutcome out;
     out.reason = policy_binding_error_;
     return out;
@@ -875,17 +891,11 @@ RuntimeCollisionTickOutcome RuntimeCollisionQuerySession::tick(
   }
   CollisionDistanceRequestMode distance_request_mode = CollisionDistanceRequestMode::kNone;
   std::span<const CollisionPairId> selected_distance_pairs;
-  const auto& policy_bundle = pin_admission_policy ? bound_bundle_ : bundle;
-  if (!policy_bundle) {
-    RuntimeCollisionTickOutcome out;
-    out.reason = RuntimeCollisionTickReason::kPolicyUnavailable;
-    return out;
-  }
-  const std::vector<CollisionPairId>* prepared_selection = &policy_bundle->selected_distance_pairs;
+  const std::vector<CollisionPairId>* prepared_selection = &bundle->selected_distance_pairs;
   if (!active_contact_policy_id_.empty()) {
     const auto grasp =
-        policy_bundle->contact_grasp_selected_distance_pairs.find(active_contact_policy_id_);
-    if (grasp == policy_bundle->contact_grasp_selected_distance_pairs.end()) {
+        bundle->contact_grasp_selected_distance_pairs.find(active_contact_policy_id_);
+    if (grasp == bundle->contact_grasp_selected_distance_pairs.end()) {
       RuntimeCollisionTickOutcome out;
       out.reason = RuntimeCollisionTickReason::kPolicyIndexMismatch;
       return out;

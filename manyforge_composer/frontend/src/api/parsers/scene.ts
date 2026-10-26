@@ -1329,6 +1329,48 @@ function parseSceneRuntimeObservationPose(
   };
 }
 
+type ObservationReference = Extract<
+  SceneRuntimeGoodObservationPayload,
+  { kind: 'simulation_entity_pose_with_reference.v1' }
+>['reference'];
+
+function parseSceneRuntimeObservationReference(
+  value: unknown,
+  path: string,
+): ObservationReference {
+  const record = objectAt(value, path);
+  exactKeysAt(
+    record,
+    ['coherent', 'entity', 'link', 'pose_in_reference'],
+    path,
+  );
+  let relative: ObservationReference['pose_in_reference'] = null;
+  if (record.pose_in_reference !== null) {
+    const pose = objectAt(record.pose_in_reference, `${path}.pose_in_reference`);
+    exactKeysAt(
+      pose,
+      ['orientation_xyzw', 'position_m'],
+      `${path}.pose_in_reference`,
+    );
+    relative = {
+      orientation_xyzw: quaternionAt(
+        pose.orientation_xyzw,
+        `${path}.pose_in_reference.orientation_xyzw`,
+      ),
+      position_m: vector3At(
+        pose.position_m,
+        `${path}.pose_in_reference.position_m`,
+      ),
+    };
+  }
+  return {
+    coherent: booleanAt(record.coherent, `${path}.coherent`),
+    entity: nonEmptyStringAt(record.entity, `${path}.entity`),
+    link: nonEmptyStringAt(record.link, `${path}.link`),
+    pose_in_reference: relative,
+  };
+}
+
 function parseSceneRuntimeGoodPayload(
   value: unknown,
   path: string,
@@ -1381,21 +1423,45 @@ function parseSceneRuntimeGoodPayload(
       topic,
     };
   }
-  if (kind !== 'simulation_entity_pose' && kind !== 'detection3d_pose') {
+  const referenced = kind === 'simulation_entity_pose_with_reference.v1';
+  if (
+    kind !== 'simulation_entity_pose'
+    && kind !== 'detection3d_pose'
+    && !referenced
+  ) {
     return fail(`${path}.kind`, 'a supported ROS pose-observation kind');
   }
-  exactKeysAt(record, ['api_version', 'kind', 'pose', 'source'], path);
+  exactKeysAt(
+    record,
+    referenced
+      ? ['api_version', 'kind', 'pose', 'reference', 'source']
+      : ['api_version', 'kind', 'pose', 'source'],
+    path,
+  );
   const pose = parseSceneRuntimeObservationPose(record.pose, `${path}.pose`);
   const source = objectAt(record.source, `${path}.source`);
-  if (kind === 'simulation_entity_pose') {
+  if (kind === 'simulation_entity_pose' || referenced) {
     exactKeysAt(source, ['entity'], `${path}.source`);
+    const entitySource = {
+      entity: nonEmptyStringAt(source.entity, `${path}.source.entity`),
+    };
+    if (referenced) {
+      return {
+        api_version: 'manyforge.ros_pose_observation.v2',
+        kind,
+        pose,
+        reference: parseSceneRuntimeObservationReference(
+          record.reference,
+          `${path}.reference`,
+        ),
+        source: entitySource,
+      };
+    }
     return {
       api_version: 'manyforge.ros_pose_observation.v2',
       kind,
       pose,
-      source: {
-        entity: nonEmptyStringAt(source.entity, `${path}.source.entity`),
-      },
+      source: entitySource,
     };
   }
   exactKeysAt(
@@ -1447,6 +1513,7 @@ function parseSceneRuntimeUnknownPayload(
   if (![
     'joint_state',
     'simulation_entity_pose',
+    'simulation_entity_pose_with_reference.v1',
     'detection3d_pose',
   ].includes(kind)) {
     return fail(`${path}.kind`, 'a supported ROS pose-observation kind');

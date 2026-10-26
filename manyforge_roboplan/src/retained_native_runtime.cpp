@@ -3464,6 +3464,23 @@ RetainedNativeRuntime::PrepareCurrentMeasuredSources() {
   }
 }
 
+std::optional<core::RequiredRobotMeasuredStateSource>
+RetainedNativeRuntime::TryReadMotionMeasuredSource() const {
+  const auto *root = cell_runtime_root != nullptr ? cell_runtime_root : this;
+  std::unique_lock lock(root->route_publication_mutex_, std::try_to_lock);
+  if (!lock.owns_lock() || !prepared_measured_sources_)
+    return std::nullopt;
+  const auto &motion = motion_binding.value();
+  for (const auto &source : prepared_measured_sources_->source_view.sources) {
+    const auto &query = source.descriptor.publication.query_context;
+    if (source.reader &&
+        query.controllable_component_id == motion.controllable_component_id &&
+        query.command_target_id == motion.command_target_id)
+      return source;
+  }
+  return std::nullopt;
+}
+
 core::Result<core::ComponentLifecycleReadinessSourceView>
 RetainedNativeRuntime::CaptureReadinessSources(
     const core::ComponentLifecycleCurrentSnapshotDTO &snapshot,

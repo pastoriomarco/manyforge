@@ -1,16 +1,19 @@
 import { readFileSync } from 'node:fs';
 
+import type { ReactElement } from 'react';
 import { renderToStaticMarkup } from 'react-dom/server';
 import * as THREE from 'three';
 import { describe, expect, it, vi } from 'vitest';
 
 import {
-  DEFAULT_COMPARISON_GHOST_VISIBLE,
+  DEFAULT_MEASURED_STATE_GHOSTS_VISIBLE,
   DEFAULT_WIREFRAME_VISIBLE,
   VIEWER_CLICK_MAX_DURATION_MS,
   VIEWER_CONTEXT_DRAG_THRESHOLD_PX,
   clonePreviewMesh,
   candidateGhostColor,
+  MeasuredStateGhostLayers,
+  MeasuredStateGhostToggle,
   frameableContentBounds,
   framedCameraPresentation,
   sceneObjectMaterial,
@@ -20,8 +23,13 @@ import {
   AttachedLogicalSceneObject,
   ViewerFailureBoundary,
 } from './StructuralViewer';
-import type { LogicalSceneObject } from '../types/api';
-import type { AttachedObjectPresentation } from '../state/runtimeScenePresentation';
+import type { LogicalSceneObject, SceneRuntimeObservationPose, SceneUrdfManifest } from '../types/api';
+import type {
+  AttachedObjectPresentation,
+  MeasuredPosePresentation,
+  MeasuredRobotPresentation,
+  RuntimeScenePresentation,
+} from '../state/runtimeScenePresentation';
 import { readStyleSource } from '../styles/readStyleSource';
 
 function sceneObject(
@@ -96,7 +104,7 @@ describe('viewer failure isolation', () => {
     );
 
     expect(DEFAULT_WIREFRAME_VISIBLE).toBe(false);
-    expect(DEFAULT_COMPARISON_GHOST_VISIBLE).toBe(false);
+    expect(DEFAULT_MEASURED_STATE_GHOSTS_VISIBLE).toBe(false);
     expect(source).toContain('<span>Wireframe overlays</span>');
     expect(source).toContain('wireframe={wireframe}');
     expect(source).toContain('depthWrite={!material.transparent && !wireframe}');
@@ -120,8 +128,8 @@ describe('viewer failure isolation', () => {
     expect(new Set([authoritative.color, draft.color, comparison.color]).size).toBe(3);
     expect(source).toContain("appearance={programDraftPreview ? 'draft' : 'authoritative'}");
     expect(source).toContain("data-scene-presentation={programDraftPreview ? 'program-draft' : 'owner'}");
-    expect(source).toContain("(object) => !observedSceneResourceIds.has(object.scene_resource_id)");
-    expect(source).toContain('<ObservedLogicalSceneObjects');
+    expect(source).toContain('objects={sceneObjects}');
+    expect(source).not.toContain('<ObservedLogicalSceneObjects');
     expect(source).toContain('viewer-source-swatch candidate');
     // The preview-layer dot moved from the Tools button to the viewer gear.
     const transport = readFileSync(new URL('./ProgramRuntimePanel.tsx', import.meta.url), 'utf8');
@@ -129,7 +137,7 @@ describe('viewer failure isolation', () => {
     expect(transport).toContain('A Draft scene or target preview is visible. Open the viewer settings for layer details.');
     expect(source).toContain('previewLayerActive: auxiliaryViewerSourcesActive,');
     expect(source).not.toContain('viewer-source-active');
-    expect(source).not.toContain('Measured state');
+    expect(source).toContain('Measured state ghosts');
     expect(source).not.toContain('Non-live viewer overlays');
   });
 
@@ -161,8 +169,9 @@ describe('viewer failure isolation', () => {
     expect(source).toContain("['Other objects', 'session', presentedObjectAxesRows.filter((row) => !row.persistent)],");
     expect(source).not.toContain('Program Draft setting');
     expect(source).toContain('<summary>Control panels</summary>');
-    expect(source).toContain('Comparison ghost');
-    expect(source).toContain('disabled={!comparisonGhostAvailable}');
+    expect(source).toContain('MeasuredStateGhostToggle');
+    expect(source).toContain('checked={enabled}');
+    expect(source).toContain('measuredStateGhostsEnabled');
     expect(source).toContain('Model and source facts');
     expect(source).toContain('{manifest.data.links.length} links · {manifest.data.joints.length} joints');
     expect(source).not.toContain('className="viewer-legend"');
@@ -316,7 +325,7 @@ describe('viewer failure isolation', () => {
     );
 
     expect(source.match(/onSelect={selectStructure}/g)).toHaveLength(2);
-    expect(source.match(/onSelect={selectSceneResource}/g)).toHaveLength(2);
+    expect(source.match(/onSelect={selectSceneResource}/g)).toHaveLength(1);
   });
 
   it('drives the measured robot once and nests each Attached object under its carrier', () => {
@@ -420,6 +429,187 @@ describe('viewer failure isolation', () => {
     expect(markup).toContain('quaternion="0,0,0,1"');
     expect(markup).toContain('color="#5fa84a"');
     expect(markup).toContain('opacity="0.85"');
+  });
+
+  it('renders exact measured robot, TCP, and object facts as diagnostic overlays without changing the primary objects', () => {
+    const manifest: SceneUrdfManifest = {
+      cell_id: 'cell-1',
+      graph_revision: 'graph-1',
+      retained_bundle_id: 'bundle-1',
+      viewer_model_revision: 'viewer-1',
+      model_key: 'model-1',
+      root_link: 'base',
+      projection: {
+        kind: 'retained_neutral',
+        source: 'active_retained_viewer_model',
+        root_frame: 'base',
+        position_unit: 'm',
+        angle_unit: 'rad',
+        quaternion_order: 'xyzw',
+        joint_coordinate_policy: 'zero_independent_with_retained_mimic',
+        operational_validity: 'not_asserted',
+        runtime_state_used: false,
+      },
+      links: [{
+        name: 'base',
+        neutral_transform: {
+          relative_to: 'base',
+          position_m: [0, 0, 0],
+          orientation_xyzw: [0, 0, 0, 1],
+        },
+        visuals: [{
+          index: 0,
+          mesh_url: null,
+          primitive: { type: 'box', size_m: [0.2, 0.3, 0.4] },
+          visual_origin: {
+            position_m: [0.1, 0, 0],
+            orientation_rpy_rad: [0, 0, 0],
+            orientation_xyzw: [0, 0, 0, 1],
+          },
+        }],
+        collisions: [],
+      }],
+      joints: [],
+    };
+    const robotPresentation: MeasuredRobotPresentation = {
+      objectId: 'robot-1',
+      sourceId: 'scene-runtime:robot',
+      sourceEpoch: 'scene-epoch-4',
+      sourceSequence: 9,
+      observedAtNs: '1000' as MeasuredRobotPresentation['observedAtNs'],
+      linkTransforms: {
+        base: { position_m: [1, 2, 3], orientation_xyzw: [0, 0, 0, 1] },
+      },
+    };
+    const observedPose: SceneRuntimeObservationPose = {
+      frame_id: 'cell',
+      frame_kind: 'cell_frame',
+      position_m: [4, 5, 6],
+      orientation_xyzw: [0, 0, 0, 1],
+      source_stamp_ns: '900' as SceneRuntimeObservationPose['source_stamp_ns'],
+    };
+    const measuredPose = (
+      objectId: string,
+      policyId: string,
+      sourceId: string,
+    ): MeasuredPosePresentation => ({
+      objectId,
+      policyId,
+      sourceId,
+      sourceEpoch: 'scene-epoch-4',
+      sourceSequence: 10,
+      observedAtNs: '1000' as MeasuredPosePresentation['observedAtNs'],
+      pose: observedPose,
+    });
+    const presentation: RuntimeScenePresentation = {
+      measuredRobot: robotPresentation,
+      measuredTcp: measuredPose('tcp-1', 'viewer.measured_tcp', 'scene-runtime:tcp'),
+      measuredObjects: [measuredPose('part', 'continuous_unattached', 'scene-runtime:part')],
+      attachedObjects: [],
+      attachmentDiagnostics: [],
+      status: { total: 3, freshGood: 3, staleGood: 0, unknown: 0, buffered: 0, warnings: [] },
+    };
+    const consoleError = vi.spyOn(console, 'error').mockImplementation(() => undefined);
+    let markup = '';
+    try {
+      markup = renderToStaticMarkup(
+        <MeasuredStateGhostLayers
+          enabled
+          presentation={presentation}
+          manifest={manifest}
+          objects={[sceneObject({ type: 'box', dimensions_m: { x: 1, y: 2, z: 3 } })]}
+          ownerIdentity={{ ownerEpoch: 'owner-1', generation: 4 }}
+          onAssetError={() => undefined}
+        >
+          <span data-measured-tcp-marker="tcp-1" />
+        </MeasuredStateGhostLayers>,
+      );
+    } finally {
+      consoleError.mockRestore();
+    }
+
+    expect(markup).toContain('name="measured-state-ghost-layers"');
+    // The comparison robot follows the viewer stream's measured rows
+    // (MeasuredRobotStateGhost.test.tsx), never the scene-runtime copy.
+    expect(markup).not.toContain('measured-state-robot');
+    expect(markup).toContain('data-measured-tcp-marker="tcp-1"');
+    expect(markup).toContain('name="measured-state-object:part:scene-runtime:part"');
+    expect(markup).toContain('color="#43d7ec"');
+    expect(markup).toContain('opacity="0.45"');
+    expect(markup).toContain('<boxGeometry args="1,2,3"></boxGeometry>');
+    // A carried object keeps its measured world-pose ghost during the carry.
+    const carried = {
+      ...sceneObject({ type: 'box', dimensions_m: { x: 1, y: 2, z: 3 } }),
+      placement: {
+        kind: 'carried',
+        carried_object_attachment_id: 'attachment.part',
+        carried_object_attachment_revision: 'attachment-revision-1',
+      },
+    } as unknown as LogicalSceneObject;
+    expect(renderToStaticMarkup(
+      <MeasuredStateGhostLayers
+        enabled
+        presentation={{ ...presentation, measuredTcp: null }}
+        manifest={manifest}
+        objects={[carried]}
+        ownerIdentity={{ ownerEpoch: 'owner-1', generation: 4 }}
+        onAssetError={() => undefined}
+      />,
+    )).toContain('name="measured-state-object:part:scene-runtime:part"');
+    expect(renderToStaticMarkup(
+      <MeasuredStateGhostLayers
+        enabled={false}
+        presentation={presentation}
+        manifest={manifest}
+        objects={[sceneObject({ type: 'box', dimensions_m: { x: 1, y: 2, z: 3 } })]}
+        ownerIdentity={{ ownerEpoch: 'owner-1', generation: 4 }}
+        onAssetError={() => undefined}
+      />,
+    )).toBe('');
+  });
+
+  it('keeps the local ghost preference selectable at rest when feeds are missing or stale', () => {
+    const onChange = vi.fn();
+    const toggle = MeasuredStateGhostToggle({ enabled: false, onChange });
+    const input = (toggle.props.children as ReactElement[])[0] as ReactElement<{
+      checked: boolean;
+      disabled?: boolean;
+      onChange: (event: { target: { checked: boolean } }) => void;
+    }>;
+    const empty: RuntimeScenePresentation = {
+      measuredRobot: null,
+      measuredTcp: null,
+      measuredObjects: [],
+      attachedObjects: [],
+      attachmentDiagnostics: [],
+      status: { total: 2, freshGood: 0, staleGood: 2, unknown: 0, buffered: 0, warnings: [] },
+    };
+
+    expect(DEFAULT_MEASURED_STATE_GHOSTS_VISIBLE).toBe(false);
+    expect(input.props.disabled).toBeUndefined();
+    expect(renderToStaticMarkup(toggle)).not.toContain('disabled');
+    expect(renderToStaticMarkup(
+      <MeasuredStateGhostLayers
+        enabled
+        presentation={empty}
+        manifest={null}
+        objects={[]}
+        ownerIdentity={undefined}
+        onAssetError={() => undefined}
+      />,
+    )).toBe('');
+    input.props.onChange({ target: { checked: true } });
+    expect(onChange).toHaveBeenCalledWith(true);
+    expect(renderToStaticMarkup(
+      <MeasuredStateGhostLayers
+        enabled={false}
+        presentation={undefined}
+        manifest={null}
+        objects={[]}
+        ownerIdentity={undefined}
+        onAssetError={() => undefined}
+      />,
+    )).toBe('');
   });
 
   it('uses Attached and Detached as operator terms while retaining carried as an internal kind', () => {
@@ -558,10 +748,7 @@ describe('viewer failure isolation', () => {
     const reloadKeys = [...source.matchAll(
       /<(?:LogicalSceneObjects|ObservedLogicalSceneObjects)\s+key=(.+)/g,
     )].map((match) => match[1]);
-    expect(reloadKeys).toHaveLength(2);
-    // Both layers are siblings: a shared reload counter must not give them
-    // the same React identity, or reconciliation can duplicate/remove meshes.
-    expect(new Set(reloadKeys).size).toBe(2);
+    expect(reloadKeys).toHaveLength(1);
     expect(reloadKeys.every((key) => key.includes('retryGeneration'))).toBe(true);
   });
 

@@ -45,6 +45,9 @@ from manyforge_behavior.json_scalars import nonnegative_int64_value
 
 SITE_CONFIG_VERSION = "manyforge.isaac_pose_observer_site.v1"
 OBSERVATION_PAYLOAD_VERSION = "manyforge.ros_pose_observation.v2"
+# A simulation entity pose that also carries the object pose relative to a
+# gripper reference entity read in the same source snapshot.
+REFERENCED_SIMULATION_POSE_KIND = "simulation_entity_pose_with_reference.v1"
 MAX_SITE_CONFIG_BYTES = 256 * 1024
 MAX_CONFIGURED_OBSERVATIONS = 128
 
@@ -78,6 +81,14 @@ class JointStateBinding:
 
 
 @dataclass(frozen=True)
+class SimulationEntityReference:
+    """Gripper reference entity and the source-local model link it shows."""
+
+    request: SimulationEntityPoseRequest
+    link: str
+
+
+@dataclass(frozen=True)
 class SimulationEntityBinding:
     request: SimulationEntityPoseRequest
     frame_kind: str
@@ -85,6 +96,7 @@ class SimulationEntityBinding:
     policy_id: str
     lifetime_ns: int
     eligible: bool
+    reference: SimulationEntityReference | None = None
 
     @property
     def key(self) -> tuple[str, str]:
@@ -323,6 +335,14 @@ def load_isaac_pose_observer_site_config(
         raise IsaacPoseObserverConfigError(
             "site config observation object/policy keys must be unique"
         )
+    references: dict[str, SimulationEntityPoseRequest] = {}
+    for binding in simulations:
+        if binding.reference is not None and references.setdefault(
+            binding.reference.request.entity, binding.reference.request
+        ) != binding.reference.request:
+            raise IsaacPoseObserverConfigError(
+                "relative_reference entities must be read identically"
+            )
     return IsaacPoseObserverSiteConfig(
         cell_id=cell_id,
         source_id=source_id,
@@ -370,17 +390,42 @@ def joint_state_observation_intent(
 def simulation_entity_observation_intent(
     binding: SimulationEntityBinding,
     observation: SimulationEntityPoseObservation,
+    *,
+    pose_in_reference: PoseSnapshot | None = None,
+    coherent: bool = False,
 ) -> PoseObservationIntent:
+    """``pose_in_reference`` is the object in the binding's reference entity;
+    ``coherent`` states that both came from one source instant."""
     if observation.entity != binding.request.entity:
         raise ObservationNormalizationError(
             "simulation_entity_mismatch",
             "simulator observation has a different configured entity",
         )
+    if binding.reference is None:
+        return _pose_intent(
+            binding=binding,
+            kind="simulation_entity_pose",
+            pose=observation.pose,
+            source={"entity": observation.entity},
+        )
     return _pose_intent(
         binding=binding,
-        kind="simulation_entity_pose",
+        kind=REFERENCED_SIMULATION_POSE_KIND,
         pose=observation.pose,
         source={"entity": observation.entity},
+        reference={
+            "coherent": coherent and pose_in_reference is not None,
+            "entity": binding.reference.request.entity,
+            "link": binding.reference.link,
+            "pose_in_reference": (
+                None
+                if pose_in_reference is None
+                else {
+                    "orientation_xyzw": list(pose_in_reference.orientation_xyzw),
+                    "position_m": list(pose_in_reference.position_xyz),
+                }
+            ),
+        },
     )
 
 
@@ -414,6 +459,8 @@ def unknown_observation_intent(
         SimulationEntityBinding: "simulation_entity_pose",
         Detection3dBinding: "detection3d_pose",
     }[type(binding)]
+    if isinstance(binding, SimulationEntityBinding) and binding.reference:
+        kind = REFERENCED_SIMULATION_POSE_KIND
     return PoseObservationIntent(
         object_id=binding.object_id,
         policy_id=binding.policy_id,
@@ -819,6 +866,7 @@ def _pose_intent(
     kind: str,
     pose: PoseSnapshot,
     source: dict[str, Any],
+    reference: dict[str, Any] | None = None,
 ) -> PoseObservationIntent:
     target_frame_id = (
         binding.request.target_frame_id
@@ -830,25 +878,28 @@ def _pose_intent(
             "pose_frame_mismatch",
             "normalized pose does not use the configured cell frame",
         )
+    payload: dict[str, Any] = {
+        "api_version": OBSERVATION_PAYLOAD_VERSION,
+        "kind": kind,
+        "pose": {
+            "frame_kind": binding.frame_kind,
+            "frame_id": pose.frame_id,
+            "orientation_xyzw": list(pose.orientation_xyzw),
+            "position_m": list(pose.position_xyz),
+            "source_stamp_ns": (None if pose.stamp_ns is None
+                                else nonnegative_int64_value(pose.stamp_ns)),
+        },
+        "source": source,
+    }
+    if reference is not None:
+        payload["reference"] = reference
     return PoseObservationIntent(
         object_id=binding.object_id,
         policy_id=binding.policy_id,
         lifetime_ns=binding.lifetime_ns,
         quality="good",
         eligible=binding.eligible,
-        payload={
-            "api_version": OBSERVATION_PAYLOAD_VERSION,
-            "kind": kind,
-            "pose": {
-                "frame_kind": binding.frame_kind,
-                "frame_id": pose.frame_id,
-                "orientation_xyzw": list(pose.orientation_xyzw),
-                "position_m": list(pose.position_xyz),
-                "source_stamp_ns": (None if pose.stamp_ns is None
-                                    else nonnegative_int64_value(pose.stamp_ns)),
-            },
-            "source": source,
-        },
+        payload=payload,
     )
 
 
@@ -890,23 +941,23 @@ def _joint_binding(value: object) -> JointStateBinding | None:
 
 def _simulation_binding(value: object) -> SimulationEntityBinding:
     record = _object(value, label="simulation entity")
-    _require_fields(
-        record,
-        {
-            "eligible",
-            "entity",
-            "frame_kind",
-            "lifetime_ns",
-            "local_orientation_xyzw",
-            "local_position_xyz",
-            "object_id",
-            "policy_id",
-            "source_coordinate_frame_id",
-            "source_header_frame_id",
-            "target_frame_id",
-        },
-        label="simulation entity",
-    )
+    fields = {
+        "eligible",
+        "entity",
+        "frame_kind",
+        "lifetime_ns",
+        "local_orientation_xyzw",
+        "local_position_xyz",
+        "object_id",
+        "policy_id",
+        "source_coordinate_frame_id",
+        "source_header_frame_id",
+        "target_frame_id",
+    }
+    # Optional: the gripper reference for continuous_relative_to_attached.
+    if "relative_reference" in record:
+        fields.add("relative_reference")
+    _require_fields(record, fields, label="simulation entity")
     target_frame_id = _text(
         record["target_frame_id"], label="simulation target_frame_id"
     )
@@ -930,6 +981,42 @@ def _simulation_binding(value: object) -> SimulationEntityBinding:
         policy_id=_text(record["policy_id"], label="simulation policy_id", maximum=256),
         lifetime_ns=_lifetime(record["lifetime_ns"]),
         eligible=_bool(record["eligible"], label="simulation eligible"),
+        reference=(
+            _simulation_reference(record["relative_reference"], request)
+            if "relative_reference" in record
+            else None
+        ),
+    )
+
+
+def _simulation_reference(
+    value: object,
+    request: SimulationEntityPoseRequest,
+) -> SimulationEntityReference:
+    """The reference is read raw in the object's own coordinate frames."""
+    record = _object(value, label="relative_reference")
+    _require_fields(
+        record,
+        {"entity", "link", "source_header_frame_id"},
+        label="relative_reference",
+    )
+    try:
+        reference = SimulationEntityPoseRequest(
+            entity=record["entity"],
+            target_frame_id=request.target_frame_id,
+            source_header_frame_id=_text(
+                record["source_header_frame_id"],
+                label="relative_reference source_header_frame_id",
+            ),
+            source_coordinate_frame_id=request.source_coordinate_frame_id,
+        )
+    except (TypeError, ValueError) as exc:
+        raise IsaacPoseObserverConfigError(
+            f"relative_reference request is invalid: {exc}"
+        ) from exc
+    return SimulationEntityReference(
+        request=reference,
+        link=_text(record["link"], label="relative_reference link", maximum=256),
     )
 
 

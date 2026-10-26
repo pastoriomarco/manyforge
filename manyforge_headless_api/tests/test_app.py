@@ -917,7 +917,7 @@ class FakeExecution:
             "api_version": "manyforge.execution_command_response.v1",
             "ok": True,
             "command": "observation",
-            "observation": {"schema_version": "manyforge.execution_observation.v3"},
+            "observation": {"schema_version": "manyforge.execution_observation.v4"},
         }
 
     def submit(
@@ -3783,7 +3783,7 @@ def test_execution_observation_websocket_proxies_one_persistent_credited_session
                 "api_version": "manyforge.execution_command_response.v1",
                 "command": "observation",
                 "observation": {
-                    "schema_version": "manyforge.execution_observation.v3",
+                    "schema_version": "manyforge.execution_observation.v4",
                     "source_sequence": len(self.cursors),
                 },
                 "ok": True,

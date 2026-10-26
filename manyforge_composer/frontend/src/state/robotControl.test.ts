@@ -188,8 +188,14 @@ describe('addressed Robot Control state', () => {
       pose: { ...dragging.draftPose, position_m: { ...dragging.draftPose.position_m, x_m: 0.41 } } });
     expect(released.phase).toBe('planning');
     expect(released.preview).toBeNull();
-    const changed = robotControlReducer(dragging, { type: 'status_refreshed', status: {
+    // A newer revision of the same Scene never cancels the drag.
+    const advanced = robotControlReducer(dragging, { type: 'status_refreshed', status: {
       ...dragging.status!, sceneRevision: { ...dragging.status!.sceneRevision, revision_id: 99 },
+    } });
+    expect(advanced.poseDragging).toBe(true);
+    expect(advanced.generation).toBe(dragging.generation);
+    const changed = robotControlReducer(dragging, { type: 'status_refreshed', status: {
+      ...dragging.status!, sceneRevision: { ...dragging.status!.sceneRevision, scene_id: 'sha256:' + 'f'.repeat(64) },
     } });
     expect(changed.poseDragging).toBe(false);
     expect(changed.preview).toBeNull();
@@ -819,8 +825,19 @@ describe('addressed Robot Control state', () => {
     const stillReady = robotControlReducer(ready, { type: 'status_refreshed', status: fresh });
     expect(stillReady.phase).toBe('ready');
     expect(stillReady.generation).toBe(ready.generation);
+    // Pose updates advance the revision of the same Scene: the preview stays
+    // ready and approvable without another planning request.
+    const advanced = structuredClone(fresh);
+    advanced.sceneRevision.revision_id += 1;
+    advanced.sceneRevision.content_hash = 'sha256:' + 'b'.repeat(64);
+    const kept = robotControlReducer(stillReady, { type: 'status_refreshed', status: advanced });
+    expect(kept.phase).toBe('ready');
+    expect(kept.preview).toBe(ready.preview);
+    expect(kept.generation).toBe(ready.generation);
+    expect(kept.status).toBe(advanced);
+    expect(robotControlPreviewApprovable(kept)).toBe(true);
     const replacement = structuredClone(fresh);
-    replacement.sceneRevision.revision_id += 1;
+    replacement.sceneRevision.scene_id = 'sha256:' + 'f'.repeat(64);
     const changed = robotControlReducer(stillReady, { type: 'status_refreshed', status: replacement });
     expect(changed.preview).toBeNull();
     expect(changed.phase).toBe('planning');
@@ -855,15 +872,14 @@ describe('addressed Robot Control state', () => {
       return { state, status, receipt, latched };
     };
 
-    it('is not approvable until status shows the receipt revision, which does not invalidate it', () => {
+    it('is approvable on any revision of the same Scene; only another Scene re-previews', () => {
       const { state: planning, status, receipt, latched } = planningMotion();
       const ready = robotControlReducer(planning, {
         type: 'preview_resolved', generation: planning.generation, receipt,
       });
       expect(ready.phase).toBe('ready');
       expect(ready.preview).toBe(receipt);
-      expect(robotControlPreviewApprovable(ready)).toBe(false);
-      expect(robotControlReducer(ready, { type: 'approve_started' })).toBe(ready);
+      expect(robotControlPreviewApprovable(ready)).toBe(true);
 
       const caughtUp = robotControlReducer(ready, {
         type: 'status_refreshed', status: { ...structuredClone(status), sceneRevision: { ...latched } },
@@ -877,11 +893,22 @@ describe('addressed Robot Control state', () => {
 
       const moved = robotControlReducer(caughtUp, {
         type: 'status_refreshed',
-        status: { ...structuredClone(status), sceneRevision: { ...latched, revision_id: latched.revision_id + 1 } },
+        status: { ...structuredClone(status), sceneRevision: { ...latched, revision_id: latched.revision_id + 5 } },
       });
-      expect(moved.phase).toBe('planning');
-      expect(moved.preview).toBeNull();
-      expect(moved.generation).toBeGreaterThan(caughtUp.generation);
+      expect(moved.phase).toBe('ready');
+      expect(moved.preview).toBe(receipt);
+      expect(moved.generation).toBe(caughtUp.generation);
+      expect(robotControlPreviewApprovable(moved)).toBe(true);
+      expect(robotControlReducer(moved, { type: 'approve_started' }).phase).toBe('approving');
+
+      const otherScene = robotControlReducer(moved, {
+        type: 'status_refreshed',
+        status: { ...structuredClone(status), sceneRevision: { ...latched, scene_id: 'sha256:' + 'f'.repeat(64) } },
+      });
+      expect(otherScene.phase).toBe('planning');
+      expect(otherScene.preview).toBeNull();
+      expect(otherScene.generation).toBeGreaterThan(moved.generation);
+      expect(robotControlPreviewApprovable(otherScene)).toBe(false);
     });
 
     it('keeps a ready receipt while status advances toward its revision', () => {
@@ -900,7 +927,7 @@ describe('addressed Robot Control state', () => {
       expect(toward.phase).toBe('ready');
       expect(toward.preview).toBe(receipt);
       expect(toward.generation).toBe(ready.generation);
-      expect(robotControlPreviewApprovable(toward)).toBe(false);
+      expect(robotControlPreviewApprovable(toward)).toBe(true);
       const reached = robotControlReducer(toward, {
         type: 'status_refreshed', status: { ...structuredClone(status), sceneRevision: { ...ahead } },
       });
@@ -909,11 +936,12 @@ describe('addressed Robot Control state', () => {
         type: 'status_refreshed',
         status: { ...structuredClone(status), sceneRevision: { ...ahead, revision_id: ahead.revision_id + 1 } },
       });
-      expect(passed.phase).toBe('planning');
-      expect(passed.preview).toBeNull();
+      expect(passed.phase).toBe('ready');
+      expect(passed.preview).toBe(receipt);
+      expect(robotControlPreviewApprovable(passed)).toBe(true);
     });
 
-    it('keeps an in-flight preview across the latch and re-previews only older evidence', () => {
+    it('keeps an in-flight preview across the latch and accepts evidence older than status', () => {
       const { state: planning, status, receipt, latched } = planningMotion();
       const latchedStatus = { ...structuredClone(status), sceneRevision: { ...latched } };
       const awaiting = robotControlReducer(planning, { type: 'status_refreshed', status: latchedStatus });
@@ -927,14 +955,15 @@ describe('addressed Robot Control state', () => {
       expect(ready.phase).toBe('ready');
       expect(robotControlPreviewApprovable(ready)).toBe(true);
 
+      // Planning outlasted several pose updates: the older evidence of the
+      // same Scene is still approvable and is not re-planned.
       const older = robotControlReducer(awaiting, {
         type: 'preview_resolved', generation: awaiting.generation,
         receipt: receiptFixture(status, 'latched-1', [0.25, 0.5]),
       });
-      expect(older.phase).toBe('planning');
-      expect(older.preview).toBeNull();
-      expect(older.intent).toBeNull();
-      expect(older.generation).toBeGreaterThan(awaiting.generation);
+      expect(older.phase).toBe('ready');
+      expect(older.generation).toBe(awaiting.generation);
+      expect(robotControlPreviewApprovable(older)).toBe(true);
     });
 
     it('rejects a receipt older than the intent or for another Scene', () => {

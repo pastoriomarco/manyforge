@@ -74,6 +74,12 @@ update the attachment-relative offset from the observation. Keep it only for
 deployments that intentionally want that behavior. Do not use bare `continuous`
 for graspable parts as a default.
 
+`continuous_relative_to_attached` is `continuous_unattached` while detached.
+While attached, it updates the attachment offset only from a source pose
+relative to a gripper reference measured at the same source instant, composed
+with the fixed retained-model transform to the carrier frame. Observations
+without such a coherent relative pose are refused.
+
 Pose sources update poses only. They must not delete, recreate, or reset objects
 unless a future authority is explicitly designed, documented, and tested.
 

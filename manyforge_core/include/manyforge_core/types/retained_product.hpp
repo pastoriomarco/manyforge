@@ -7,6 +7,7 @@
 #include <manyforge_core/types/deployment_applicability.hpp>
 #include <manyforge_core/types/retained_artifact.hpp>
 #include <manyforge_core/types/runtime_contract_manifest.hpp>
+#include <manyforge_core/types/scene_pose_source_policy.hpp>
 #include <manyforge_core/types/strong_id.hpp>
 #include <optional>
 #include <string>
@@ -259,6 +260,7 @@ struct RetainedBundleDTO final {
   std::optional<double> motion_takeover_preparation_budget_s{};
   /// Optional suffix-planning cap within the whole preparation/handoff budget.
   std::optional<double> motion_takeover_planning_budget_s{};
+  std::vector<ScenePoseSourcePolicyDTO> scene_pose_sources{};
 
   friend bool operator==(const RetainedBundleDTO&, const RetainedBundleDTO&) = default;
 };

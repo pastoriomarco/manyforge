@@ -10,6 +10,7 @@ import pytest
 from simulation_interfaces.msg import Bounds, EntityCategory, SimulatorFeatures
 from simulation_interfaces.srv import (
     GetEntities,
+    GetEntitiesStates,
     GetEntityBounds,
     GetEntityInfo,
     GetEntityState,
@@ -172,6 +173,53 @@ def test_scene_mirror_captures_info_pose_bounds_and_per_entity_failure() -> None
     assert second.errors == ("GetEntityBounds failed: 4: bounds unavailable",)
     assert node.destroyed == len(node.created) == 5
     assert not hasattr(node, "create_publisher")
+
+
+class _BatchNode(_Node):
+    def get_service_names_and_types(self):
+        return super().get_service_names_and_types() + [
+            ("/get_entities_states", ["simulation_interfaces/srv/GetEntitiesStates"])
+        ]
+
+
+def test_entity_states_batch_is_one_call_for_exactly_the_named_entities() -> None:
+    assert (
+        scene_mirror_probe.SimulationSceneMirrorClient(_Node({}))
+        .capture_entity_states(entity_names=["/World/a"])
+        is None
+    )
+    filters: list[str] = []
+
+    def states(request):
+        filters.append(request.filters.filter)
+        response = _ok_response(GetEntitiesStates)
+        response.entities = ["/World/a.b", "/World/c", "/World/missing_frame"]
+        rows = []
+        for index, name in enumerate(response.entities):
+            row = GetEntityState.Response().state
+            row.header.frame_id = "" if name.endswith("frame") else "world"
+            row.pose.position.x = float(index)
+            row.pose.orientation.w = 1.0
+            rows.append(row)
+        response.states = rows
+        return response
+
+    node = _BatchNode({"/get_entities_states": states})
+    with scene_mirror_probe.SimulationSceneMirrorClient(node) as client:
+        snapshot = client.capture_entity_states(
+            entity_names=["/World/a.b", "/World/missing_frame"]
+        )
+
+    assert filters == [r"^(/World/a\.b|/World/missing_frame)$"]
+    assert node.created == ["/get_entities_states"]
+    assert snapshot is not None
+    assert [entity.name for entity in snapshot.entities] == [
+        "/World/a.b",
+        "/World/missing_frame",
+    ]
+    assert snapshot.entities[0].pose is not None
+    assert snapshot.entities[0].pose.position_xyz == (0.0, 0.0, 0.0)
+    assert snapshot.entities[1].pose is None and snapshot.entities[1].errors
 
 
 def test_explicit_entities_do_not_require_get_entities_service() -> None:

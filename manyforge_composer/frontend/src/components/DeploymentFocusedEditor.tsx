@@ -1,4 +1,5 @@
 import { useEffect, useMemo, useState } from 'react';
+import { ScenePoseSourcePolicySection } from './ScenePoseSourcePolicySection';
 
 import type { DeploymentWorkspaceController } from '../hooks/useDeploymentWorkspace';
 import {
@@ -51,6 +52,7 @@ import type {
   DeploymentControlledStopProfile,
   JsonValue,
   SourceModelProjection,
+  SceneRuntimePoseSource,
 } from '../types/api';
 import type {
   ManualControlGripperDescriptor,
@@ -68,6 +70,7 @@ interface DeploymentFocusedEditorProps {
   stopChains?: readonly TargetStopChain[];
   /** The Applied Program's execution group ids; null when no Program is applied (contract 73). */
   executionGroupIds?: readonly string[] | null;
+  poseSources?: readonly SceneRuntimePoseSource[];
 }
 
 const NO_PROGRAM_KEYS: readonly BlackboardKeyDeclaration[] = [];
@@ -1737,6 +1740,7 @@ export function DeploymentFocusedEditor({
   programKeys = NO_PROGRAM_KEYS,
   stopChains = NO_STOP_CHAINS,
   executionGroupIds = null,
+  poseSources = [],
 }: DeploymentFocusedEditorProps) {
   const document = controller.workspace?.draft.document ?? null;
   const geometricContactEndpoints = useMemo(() => {
@@ -1791,6 +1795,7 @@ export function DeploymentFocusedEditor({
         runtimes={motionRuntimes}
       />
       <NativeRuntimeSection controller={controller} runtimes={motionRuntimes} />
+      <ScenePoseSourcePolicySection controller={controller} sources={poseSources} />
       <ControlledStopSection controller={controller} targets={controlledStop} />
       <GripperSection controller={controller} descriptors={gripperDescriptors} runtimes={motionRuntimes} />
       {document.api_version === 'manyforge.deployment_intent.v2' && (

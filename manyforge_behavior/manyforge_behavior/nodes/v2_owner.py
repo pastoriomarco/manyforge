@@ -31,6 +31,7 @@ from manyforge_behavior.orchestration_ports import (
     OwnerTaskSettlementPendingError,
     OwnerTaskSnapshot,
     OwnerTaskState,
+    PoseSourceLatchError,
     ProgramInterventionPort,
     is_ordinary_operator_stop,
     request_identity,
@@ -620,6 +621,14 @@ class OwnerTaskAdapter(_OwnerAdapter):
     def _close_request_id(self, identity: NodeAttemptIdentity) -> str:
         return request_identity("program-close", identity.program_run_id, identity.node_attempt_id)
 
+    def _record_pose_source_latch_failure(self, error: PoseSourceLatchError) -> None:
+        self._phase = _TaskPhase.DONE
+        self._record_owner_failure(
+            error.reason_code,
+            describe_owner_failure(str(error), error.details),
+            error.details,
+        )
+
     def _await_settled_assessment(
         self, task: OwnerTaskSnapshot
     ) -> tuple[py_trees.common.Status | None, OwnerTaskSnapshot]:
@@ -980,6 +989,9 @@ class OwnerTaskAdapter(_OwnerAdapter):
             self._task = None
             self._phase = _TaskPhase.DONE
             return self._on_priority_refusal(error)
+        except PoseSourceLatchError as error:
+            self._record_pose_source_latch_failure(error)
+            return py_trees.common.Status.FAILURE
         except Exception as exc:
             self._record_owner_error("owner_request_failed", exc)
             return py_trees.common.Status.FAILURE
@@ -1014,6 +1026,8 @@ class OwnerTaskAdapter(_OwnerAdapter):
             self._task = None
             self._phase = _TaskPhase.SUBMIT
             self._hold_before_admission(error)
+        except PoseSourceLatchError as error:
+            self._record_pose_source_latch_failure(error)
         except Exception as exc:
             self._record_owner_error("owner_request_failed", exc)
 

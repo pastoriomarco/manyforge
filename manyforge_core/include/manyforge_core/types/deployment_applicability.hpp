@@ -5,6 +5,7 @@
 #include <manyforge_core/types/capability_definition.hpp>
 #include <manyforge_core/types/catalog.hpp>
 #include <manyforge_core/types/cell_graph.hpp>
+#include <manyforge_core/types/scene_pose_source_policy.hpp>
 #include <manyforge_core/types/stop_control.hpp>
 #include <manyforge_core/types/strong_id.hpp>
 #include <optional>
@@ -285,6 +286,7 @@ struct DeploymentApplicabilityInputsDTO final {
   std::optional<double> motion_takeover_preparation_budget_s{};
   /// Optional suffix-planning cap within the whole preparation/handoff budget.
   std::optional<double> motion_takeover_planning_budget_s{};
+  std::vector<ScenePoseSourcePolicyDTO> scene_pose_sources{};
 
   friend bool operator==(const DeploymentApplicabilityInputsDTO&,
                          const DeploymentApplicabilityInputsDTO&) = default;

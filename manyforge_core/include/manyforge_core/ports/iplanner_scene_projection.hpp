@@ -27,6 +27,18 @@ public:
   RetainProjection(const ProjectionRevisionDTO &projection_revision,
                    ProjectionLeaseId projection_lease_id) = 0;
 
+  /// Select and retain the current planning projection in one operation.
+  /// Native implementations make selection and retention atomic.
+  [[nodiscard]] virtual Result<CollisionWorldLeaseInventory>
+  RetainCurrentProjection(ProjectionLeaseId projection_lease_id) {
+    const auto health = ProjectionHealth();
+    if (!health.active_projection_revision) {
+      return Result<CollisionWorldLeaseInventory>::Err(
+          {"live_scene_snapshot_unavailable", "Current planning projection is unavailable", {}});
+    }
+    return RetainProjection(*health.active_projection_revision, std::move(projection_lease_id));
+  }
+
   /// Retain the exact native projection for an owner-side resolution and
   /// return only its binding receipt. Local implementations reuse the full
   /// inventory operation; process proxies keep the inventory native and do

@@ -4,6 +4,7 @@
 #include "execution_host_responses.hpp"
 #include <manyforge_scene/logical_scene_value_codec.hpp>
 #include <manyforge_scene/scene_transaction_codec.hpp>
+#include <manyforge_scene/scene_candidate_preview.hpp>
 #include <algorithm>
 #include <cmath>
 #include <thread>
@@ -13,8 +14,10 @@ namespace manyforge::roboplan_backend::host_detail {
 
 namespace scene = manyforge::scene;
 
-ManagerSceneAuthorityProxy::ManagerSceneAuthorityProxy(std::filesystem::path manager_run_root)
-      : manager_run_root_(std::move(manager_run_root)) {}
+ManagerSceneAuthorityProxy::ManagerSceneAuthorityProxy(
+    std::filesystem::path manager_run_root,
+    std::shared_ptr<core::IPlannerSceneProjection> projection)
+    : manager_run_root_(std::move(manager_run_root)), projection_(std::move(projection)) {}
 
 [[nodiscard]] core::SceneCommitResultDTO
   ManagerSceneAuthorityProxy::Commit(const core::SceneTransactionRequestDTO &request) {
@@ -85,33 +88,20 @@ ManagerSceneAuthorityProxy::ManagerSceneAuthorityProxy(std::filesystem::path man
   }
 
 [[nodiscard]] core::Result<core::SceneCandidatePreviewDTO>
-  ManagerSceneAuthorityProxy::PreviewResolvedSceneCandidate(
-      const core::ResolvedSceneCandidatePreviewRequestDTO &request)
-      const {
-    const auto encoded =
-        scene::EncodeResolvedSceneCandidatePreviewRequest(request);
-    const auto response = ExchangeManagerCommand(
-        manager_run_root_,
-        CanonicalValue(CanonicalValue::Object{
-            {"api_version",
-             CanonicalValue(std::string(kManagerCommandApiVersion))},
-            {"candidate_request",
-             CanonicalCodecValue(encoded, "scene candidate request")},
-            {"command", CanonicalValue("scene_candidate_preview")},
-        }));
-    if (!Boolean(response, "ok")) {
-      return core::Result<core::SceneCandidatePreviewDTO>::Err(
-          DecodeManagerError(Member(response, "error")));
-    }
-    RequireExactObjectSize(response, 3U, "Manager scene candidate response");
-    auto preview =
-        scene::DecodeSceneCandidatePreview(content_identity::canonical_json(
-            Member(response, "candidate_preview")));
-    Require(preview.prior_projection_revision ==
-                request.request.expected_projection_revision,
-            "Manager scene candidate changed predecessor projection");
-    return core::Result<core::SceneCandidatePreviewDTO>::Ok(std::move(preview));
+ManagerSceneAuthorityProxy::PreviewResolvedSceneCandidate(
+    const core::ResolvedSceneCandidatePreviewRequestDTO &request,
+    const core::CollisionWorldLeaseInventory &predecessor) const {
+  if (!projection_ || !predecessor.logical_scene) {
+    return core::Result<core::SceneCandidatePreviewDTO>::Err(
+        {"live_scene_snapshot_unavailable", "Candidate planning projection is unavailable", {}});
   }
+  return scene::BuildResolvedSceneCandidatePreview(
+      request, predecessor.projection_binding.projection_revision,
+      predecessor.logical_scene, predecessor.logical_scene->transaction_sequence + 1U,
+      [&](const core::LogicalSceneSnapshotDTO &candidate) {
+        return projection_->ProjectEffectiveCollisionPolicy(candidate, candidate.revision.revision_id);
+      });
+}
 
 [[nodiscard]] core::RequestOwnerEpoch
   ManagerSceneAuthorityProxy::CurrentRequestOwnerEpoch() const {
@@ -186,8 +176,9 @@ ManagerSceneAuthorityProxy::ManagerSceneAuthorityProxy(std::filesystem::path man
           DecodeManagerError(Member(response, "error")));
     }
     RequireExactObjectSize(response, 4U, "Manager scene pose response");
-    Require(DecodeProjectionRevision(Member(response, "projection_revision")) ==
-                current.projection_revision,
+    Require(core::ProjectionIsSameOrForwardInLineage(
+                DecodeProjectionRevision(Member(response, "projection_revision")),
+                current.projection_revision),
             "Manager scene pose response changed projection identity");
     const auto &poses = Array(response, "poses");
     Require(poses.size() == 1U, "Manager scene pose response is incomplete");
@@ -268,22 +259,6 @@ ManagerPlanningSceneSynchronizer::ManagerPlanningSceneSynchronizer(
 [[nodiscard]] core::Result<core::ProjectionRevisionDTO>
   ManagerPlanningSceneSynchronizer::SynchronizeBeforePlanning() {
     try {
-      for (std::size_t attempt = 0U;
-           attempt < kPlanningSceneSynchronizationAttempts; ++attempt) {
-        const auto current =
-            collision_publisher_->current_scene_snapshot_lease_inventory();
-        if (!current.has_value() ||
-            !current->projection_binding.projection_revision.valid() ||
-            current->projection_binding.projection_revision
-                    .retained_bundle_id != retained_bundle_id_ ||
-            current->projection_binding.projection_revision.graph_revision !=
-                graph_revision_) {
-          return Failure(
-              "planning_scene_projection_unavailable",
-              "local native predecessor projection is unavailable or stale");
-        }
-        const auto predecessor =
-            current->projection_binding.projection_revision;
         const auto response = ExchangeManagerCommand(
             manager_run_root_,
             CanonicalValue(CanonicalValue::Object{
@@ -291,18 +266,10 @@ ManagerPlanningSceneSynchronizer::ManagerPlanningSceneSynchronizer(
                  CanonicalValue(std::string(kManagerCommandApiVersion))},
                 {"command",
                  CanonicalValue("scene_runtime_latch_before_planning")},
-                {"expected_projection_revision",
-                 ProjectionRevisionValue(predecessor)},
                 {"expected_runtime_identity", RuntimeIdentityValue()},
             }));
         if (!Boolean(response, "ok")) {
           auto error = DecodeManagerError(Member(response, "error"));
-          if (error.code == "scene_runtime_pose_projection_changed" &&
-              attempt + 1U < kPlanningSceneSynchronizationAttempts) {
-            std::this_thread::sleep_for(
-                kPlanningSceneSynchronizationRetryDelay);
-            continue;
-          }
           return core::Result<core::ProjectionRevisionDTO>::Err(
               std::move(error));
         }
@@ -322,11 +289,9 @@ ManagerPlanningSceneSynchronizer::ManagerPlanningSceneSynchronizer(
             Counter(response, "skipped_attached_observation_count", 0U);
         static_cast<void>(
             Counter(response, "scene_runtime_source_generation", 1U));
-        Require(initial == predecessor && projection.valid() &&
+        Require(core::ProjectionIsSameOrForwardInLineage(projection, initial) &&
                     projection.retained_bundle_id == retained_bundle_id_ &&
                     projection.graph_revision == graph_revision_ &&
-                    projection.scene_revision.scene_id ==
-                        predecessor.scene_revision.scene_id &&
                     latched == committed + already_applied + skipped_attached,
                 "Manager before-planning latch response crossed its request");
         for (std::size_t convergence_attempt = 0U;
@@ -335,7 +300,8 @@ ManagerPlanningSceneSynchronizer::ManagerPlanningSceneSynchronizer(
           const auto converged =
               collision_publisher_->current_scene_snapshot_lease_inventory();
           if (converged.has_value() &&
-              converged->projection_binding.projection_revision == projection) {
+              core::ProjectionIsSameOrForwardInLineage(
+                  converged->projection_binding.projection_revision, projection)) {
             return core::Result<core::ProjectionRevisionDTO>::Ok(projection);
           }
           if (convergence_attempt + 1U <
@@ -347,9 +313,6 @@ ManagerPlanningSceneSynchronizer::ManagerPlanningSceneSynchronizer(
         return Failure(
             "planning_scene_projection_not_converged",
             "local native projection did not converge to the Manager latch");
-      }
-      return Failure("planning_scene_projection_changed",
-                     "logical scene kept changing before Manager pose latch");
     } catch (const std::exception &error) {
       return Failure("planning_scene_synchronization_failed", error.what());
     } catch (...) {

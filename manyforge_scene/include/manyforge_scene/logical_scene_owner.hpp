@@ -170,8 +170,7 @@ using QualifiedSceneConfigurationAdoptionRequest =
 class LogicalSceneOwner final
     : public manyforge::core::IManagerSceneProjectionBootstrapPort,
       public manyforge::core::IManagerSceneProjectionMaintenancePort,
-      public manyforge::core::ISceneAuthority,
-      public manyforge::core::ISceneCandidatePreview {
+      public manyforge::core::ISceneAuthority {
 public:
   LogicalSceneOwner(
       std::filesystem::path database_path,
@@ -351,8 +350,7 @@ public:
   ReadCommitResult(const manyforge::core::SceneTransactionRequestDTO& request) const;
   [[nodiscard]] manyforge::core::Result<manyforge::core::SceneCandidatePreviewDTO>
   PreviewResolvedSceneCandidate(
-      const manyforge::core::ResolvedSceneCandidatePreviewRequestDTO &request)
-      const override;
+      const manyforge::core::ResolvedSceneCandidatePreviewRequestDTO &request) const;
   [[nodiscard]] manyforge::core::RequestOwnerEpoch
   CurrentRequestOwnerEpoch() const override;
   [[nodiscard]] manyforge::core::ProjectionRevisionDTO

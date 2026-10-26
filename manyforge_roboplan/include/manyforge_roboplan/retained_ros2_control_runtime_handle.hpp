@@ -292,19 +292,23 @@ public:
   /// Never replaces or retires predecessor sources on a shared handle.
   /// Successful null means subscription construction is operationally
   /// unavailable; the actual exception is logged. Invalid association is Err.
+  /// An optional render wake is the cell viewer wake: it advances only when a
+  /// source's visible coordinates (or their completeness) change.
   [[nodiscard]] core::Result<std::shared_ptr<PreparedMeasuredStateSources>>
   StageMeasuredStateSources(
       std::vector<core::MeasuredStateSourceDescriptor> descriptors,
       std::shared_ptr<core::IClock> receiver_clock,
       const core::RuntimeParticipantBinding &candidate_motion,
-      const std::optional<core::RuntimeParticipantBinding> &candidate_gripper);
+      const std::optional<core::RuntimeParticipantBinding> &candidate_gripper,
+      std::shared_ptr<RetainedObservationWake> render_wake = {});
 
   [[nodiscard]] core::Result<std::shared_ptr<PreparedMeasuredStateSources>>
   StageMeasuredStateSources(
       std::vector<core::MeasuredStateSourceDescriptor> descriptors,
       std::shared_ptr<core::IClock> receiver_clock,
       const std::optional<core::RuntimeParticipantBinding>& candidate_motion,
-      const std::optional<core::RuntimeParticipantBinding>& candidate_gripper);
+      const std::optional<core::RuntimeParticipantBinding>& candidate_gripper,
+      std::shared_ptr<RetainedObservationWake> render_wake = {});
 
   /// Installs the lane guard's hooks; only before `StartBackend`.
   void InstallGuardHooks(RetainedRos2ControlArmGuardHooks hooks);

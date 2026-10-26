@@ -8182,6 +8182,42 @@ TEST(RetainedProductCrossConsumer,
   EXPECT_NE(carried_body->frame_id,
             collision_projector.model_map().compiled_cell_frame_name);
 
+  // A `continuous` pose source keeps provider evidence on a carried object:
+  // it projects exactly like the carried object, never as a fresh obstacle.
+  core::LogicalSceneSnapshotDTO observed_carried_scene = carried_scene;
+  observed_carried_scene.objects.front().provider_evidence =
+      core::SceneObjectProviderEvidenceDTO{
+          core::ProviderInstanceId("isaac.pose.observer"),
+          core::ProviderManifestId("manyforge.provider.logical_scene"),
+          core::ProviderManifestRevision("sha256:" + std::string(64U, 'b')),
+          "sha256:" + std::string(64U, 'a'),
+          7U,
+          1'000,
+          std::nullopt,
+          10'000'000'000};
+  observed_carried_scene.revision.content_hash =
+      core::logical_scene_identity::ComputeLogicalSceneContentHash(
+          observed_carried_scene);
+  auto observed_carried_world = collision_projector.project(
+      observed_carried_scene, 3U, 0, "retained-lite6-cross-consumer");
+  ASSERT_TRUE(observed_carried_world.ok())
+      << observed_carried_world.error().message;
+  const auto observed_body = std::find_if(
+      observed_carried_world.value().bodies.begin(),
+      observed_carried_world.value().bodies.end(),
+      [](const core::CollisionWorldBody &body) {
+        return body.body_id == "scene/carried-part/shape/0";
+      });
+  ASSERT_NE(observed_body, observed_carried_world.value().bodies.end());
+  EXPECT_EQ(observed_body->parent_body_id, carried_body->parent_body_id);
+  EXPECT_EQ(observed_body->pose, carried_body->pose);
+  EXPECT_FALSE(observed_body->source_freshness_budget_ns.has_value());
+  const auto observed_live = collision_projector.project_live_objects(
+      observed_carried_scene, observed_carried_world.value());
+  ASSERT_EQ(observed_live.size(), carried_scene.objects.size());
+  EXPECT_FALSE(observed_live.front().source_freshness_budget_ns.has_value());
+  EXPECT_FALSE(observed_live.front().source_timestamp_ns.has_value());
+
   auto carried_policy_result =
       collision_projector.project_effective_policy(carried_scene, 2U);
   ASSERT_TRUE(carried_policy_result.ok())
@@ -8557,6 +8593,16 @@ TEST(RetainedProductCrossConsumer,
       committed.resulting_health.healthy_for_target(candidate_revision));
   ASSERT_NE(projection->logical_snapshot(), nullptr);
   EXPECT_EQ(*projection->logical_snapshot(), candidate_scene);
+  const auto after_live_update = projection->ProjectSceneCandidate(
+      candidate_preview, retained_predecessor.value().projection_binding,
+      core::ProjectionLeaseId("pick-candidate.after-live-update"));
+  ASSERT_TRUE(after_live_update.ok()) << after_live_update.error().message;
+  EXPECT_EQ(after_live_update.value().logical_scene, candidate_preview.logical_scene);
+  const auto current_planning = projection->RetainCurrentProjection(
+      core::ProjectionLeaseId("current-planning.after-live-update"));
+  ASSERT_TRUE(current_planning.ok()) << current_planning.error().message;
+  EXPECT_EQ(current_planning.value().projection_binding.projection_revision, candidate_revision);
+  projection->ReleaseProjection(current_planning.value().projection_binding.projection_lease_id);
   const auto current_world = projection->snapshot();
   ASSERT_NE(current_world, nullptr);
   EXPECT_NE(current_world, predecessor_world);

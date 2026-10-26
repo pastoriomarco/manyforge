@@ -1342,7 +1342,7 @@ def test_arm_only_native_process_publishes_component_based_status(
         ) == target_key
         assert control_row["observed"]["kind"] == "joint_positions"
 
-        assert observation["schema_version"] == "manyforge.execution_observation.v3"
+        assert observation["schema_version"] == "manyforge.execution_observation.v4"
         observation_rows = observation["targets"]
         assert len(observation_rows) == 1
         observation_row = observation_rows[0]
@@ -1704,7 +1704,7 @@ def test_reconciliation_gate_does_not_block_ordinary_accept_or_exact_read(
         assert observation["ok"] is True, observation
         assert observation["command"] == "observation"
         assert observation["observation"]["schema_version"] == (
-            "manyforge.execution_observation.v3"
+            "manyforge.execution_observation.v4"
         )
         observation_targets = observation["observation"]["targets"]
         observation_target_keys = [
@@ -3978,7 +3978,7 @@ def test_gripper_only_motion_updates_the_shared_native_observation_stream(
             with client.open_observation_session() as observation_session:
                 first = observation_session.next(None, cancelled)["observation"]
                 assert first["schema_version"] == (
-                    "manyforge.execution_observation.v3"
+                    "manyforge.execution_observation.v4"
                 )
                 assert sorted(
                     (

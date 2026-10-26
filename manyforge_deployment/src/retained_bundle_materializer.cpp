@@ -1,4 +1,5 @@
 #include "manyforge_deployment/retained_bundle.hpp"
+#include "manyforge_deployment/scene_pose_source_policy_codec.hpp"
 #include <manyforge_deployment/io_provider_domain.hpp>
 
 #include <algorithm>
@@ -461,6 +462,7 @@ catalogs_projection(std::span<const core::CatalogRecordRefDTO> records,
       deployment.applicability_inputs()
           .value()
           .motion_takeover_planning_budget_s,
+      deployment.applicability_inputs().value().scene_pose_sources,
   };
 }
 
@@ -588,6 +590,10 @@ catalogs_projection(std::span<const core::CatalogRecordRefDTO> records,
     root.emplace_back("motion_takeover_planning_budget_s",
                       CanonicalValue(*budget));
   }
+  if (const auto &sources =
+          deployment.applicability_inputs().value().scene_pose_sources;
+      !sources.empty())
+    root.emplace_back("scene_pose_sources", EncodeScenePoseSources(sources));
   return CanonicalValue(std::move(root));
 }
 

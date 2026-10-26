@@ -194,9 +194,10 @@ things:
 ## 7. Optional: stream object poses from Isaac
 
 Static OBJ files define object shape. Object pose can also be observed
-from Isaac at runtime through deployment `pose_sources`. In Composer,
-open **Deployment > Object Pose Sources** to edit the source, entity
-binding, and apply policy. The Isaac demo source uses
+from Isaac at runtime through the configured observer adapter. In Composer,
+**Deployment > Object pose sources** selects the application policy for each
+configured source/object binding through normal Draft, Save and Apply. The source
+and entity acquisition bindings remain adapter configuration. The Isaac demo source uses
 `kind: simulation_interfaces`, `service_prefix: auto`, `frame_id: universe`, and a bounded `max_update_hz` such as `4.0`.
 
 For camera/perception scenes such as the Lite6 trocar FoundationPose workflow,
@@ -216,28 +217,42 @@ Pick the apply policy per object:
 
 - `observe_only` shows freshness and observed pose without changing
   ManyForge's planning scene.
-- `when_idle` updates only while no cycle or direct-control session is
-  active.
-- `before_planning` latches the latest fresh pose just before planning
-  an object-relative motion.
-- `between_nodes` applies only at behavior-tree safe points.
+- `before_planning` latches fresh configured detached poses at the planning
+  boundary. Missing required observations block planning.
+- `between_nodes` latches objects referenced by the next motion or pick;
+  reset readiness latches the full configured set. It may also revise an
+  attached object's offset. These captures require fresh observations and
+  then retain a planning snapshot without continuous source expiry.
 - `continuous` applies fresh observations immediately at the configured
-  source rate. If the object is attached, Composer updates the object's
+  source rate. If the object is attached, the Scene owner updates the object's
   offset in the attachment frame instead of detaching it with a
   world-frame overwrite.
 - `continuous_unattached` applies fresh observations at the configured
   source rate only while the object is detached. Once attached, the
   planning-scene object stays at the canonical attachment offset while
   the external observation remains available for ghost/drift diagnostics.
+- `continuous_relative_to_attached` behaves like `continuous_unattached`
+  while the object is detached. While it is attached, the source must also
+  report the object relative to a gripper reference measured at the same
+  source instant (`relative_reference` on the observer's simulation entity:
+  the reference `entity`, its `source_header_frame_id`, and the model `link`
+  it shows). The Scene owner sets the attachment offset from that relative
+  pose and the fixed model transform from the link to the carrier frame; no
+  commanded or measured robot pose is used. The Isaac observer reads both
+  through one `GetEntitiesStates` call; an observation that is not from one
+  instant, or a link that is not joined to the carrier frame by fixed joints
+  only, is refused and does not update the offset.
 
 For industrial cells, keep `observe_only` as the default while
 commissioning a source, then move individual objects to `before_planning`,
-`between_nodes`, `continuous`, or `continuous_unattached` only when that
+`between_nodes`, `continuous`, `continuous_unattached`, or
+`continuous_relative_to_attached` only when that
 source is part of the cell authority model and its stale-data behavior is
 understood.
 
-For diagnostics, open **Tools > Sources** in the native viewer and enable
-**Measured-state ghosts**. It renders fresh external object observations as
+The primary viewer always uses the authoritative Scene, including while
+objects are detached. For diagnostics, use the viewer's **Tool & I/O** source
+panel and enable **Measured-state ghosts** in viewer settings. It renders fresh external object observations as
 a cyan translucent overlay so you can compare Isaac/perception state with
 Composer's backend-authoritative planning scene. Enable **Robot collision
 meshes** in the same panel to overlay the URDF collision geometry used by

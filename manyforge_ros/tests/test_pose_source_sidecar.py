@@ -46,6 +46,8 @@ from manyforge_ros.pose_source_sidecar import (
     normalize_joint_state_message,
     normalize_pose_array_message,
     normalize_pose_stamped_message,
+    read_simulation_entity_states,
+    relative_pose,
     transform_pose_snapshot,
 )
 from manyforge_ros.scene_mirror_probe import PoseSnapshot
@@ -377,6 +379,70 @@ def test_simulation_capture_is_stateless_and_reports_each_entity() -> None:
     ]
     assert not hasattr(batch, "status")
     assert not hasattr(batch, "snapshot")
+
+
+def test_coherent_read_is_one_batch_and_falls_back_as_non_coherent() -> None:
+    snapshot = _namespace(entities=(), errors=())
+
+    class _BatchClient(_FakeSimulationClient):
+        def __init__(self, batch: object) -> None:
+            super().__init__(snapshot)
+            self.batch = batch
+
+        def capture_entity_states(self, **kwargs: object) -> object:
+            self.calls.append({"batch": kwargs})
+            return self.batch
+
+    batch_snapshot = _namespace(
+        entities=(
+            _namespace(
+                name="/obj",
+                pose=PoseSnapshot("world", None, (1.0, 1.0, 0.0), (0.0, 0.0, 0.0, 1.0)),
+                errors=(),
+            ),
+        ),
+        errors=(),
+    )
+    client = _BatchClient(batch_snapshot)
+    read, coherent = read_simulation_entity_states(
+        client, ("/obj", "/ref"), coherent=True
+    )
+    assert coherent and read is batch_snapshot
+    batch = capture_simulation_entity_poses(
+        client, [SimulationEntityPoseRequest(entity="/obj")], snapshot=read
+    )
+    assert [item.entity for item in batch.observations] == ["/obj"]
+    assert client.calls == [{"batch": {"entity_names": ("/obj", "/ref")}}]
+
+    capture_kwargs = {
+        "entity_names": ("/obj",),
+        "include_info": False,
+        "include_state": True,
+        "include_bounds": False,
+    }
+    for fallback in (_BatchClient(None), _FakeSimulationClient(snapshot)):
+        read, coherent = read_simulation_entity_states(
+            fallback, ("/obj",), coherent=True
+        )
+        assert not coherent and read is snapshot
+        assert fallback.calls[-1] == capture_kwargs
+    unrequested = _BatchClient(batch_snapshot)
+    assert read_simulation_entity_states(unrequested, ("/obj",), coherent=False)[1] is False
+    assert unrequested.calls == [capture_kwargs]
+
+
+def test_relative_pose_expresses_source_in_reference_frame() -> None:
+    quarter = (0.0, 0.0, 2.0**-0.5, 2.0**-0.5)
+    reference = PoseSnapshot("world", 7, (1.0, 0.0, 0.0), quarter)
+    source = PoseSnapshot("world", 9, (1.0, 1.0, 0.5), quarter)
+    relative = relative_pose(reference, source)
+    assert relative.stamp_ns == 9
+    assert relative.position_xyz == pytest.approx((1.0, 0.0, 0.5))
+    assert relative.orientation_xyzw == pytest.approx((0.0, 0.0, 0.0, 1.0))
+    with pytest.raises(ObservationNormalizationError):
+        relative_pose(
+            PoseSnapshot("other", 7, (0.0, 0.0, 0.0), quarter), source
+        )
 
 
 def test_simulation_request_values_are_bounded_finite_and_normalized() -> None:

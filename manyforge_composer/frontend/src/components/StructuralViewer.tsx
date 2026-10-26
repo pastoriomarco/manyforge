@@ -162,6 +162,12 @@ interface StructuralViewerProps {
   correctionRobot?: CandidateRobotPresentation | null;
   correctionStale?: boolean;
   runtimePresentation?: RuntimeScenePresentation;
+  /** Exact, fresh scene-runtime sources for the optional diagnostic overlays. */
+  measuredStateGhostPresentation?: RuntimeScenePresentation;
+  /** Measured comparison robot from the viewer stream's measured rows. */
+  measuredStateGhostRobot?: MeasuredRobotPresentationReader;
+  /** Applied logical objects matched by measured scene-runtime poses. */
+  measuredStateGhostObjects?: readonly LogicalSceneObject[];
   executionObservationPresentation?: MeasuredRobotPresentationReader;
   sceneOwnerIdentity?: {
     ownerEpoch: string;
@@ -245,7 +251,7 @@ interface ViewerFailureBoundaryState {
 }
 
 export const DEFAULT_WIREFRAME_VISIBLE = DEFAULT_COMPOSER_SETTINGS.viewer.wireframeOverlays;
-export const DEFAULT_COMPARISON_GHOST_VISIBLE = false;
+export const DEFAULT_MEASURED_STATE_GHOSTS_VISIBLE = false;
 
 export type SceneObjectAppearance =
   | 'authoritative'
@@ -1428,7 +1434,9 @@ function MeasuredRuntimeLink({
         )}
         {attachedObjects.map((object) => (
           <AttachedLogicalSceneObject
-            key={`${object.attachmentId}:${object.attachmentRevision}`}
+            // A carried pose update advances the attachment revision; keep the
+            // mounted object (and its mesh) and update its pose in place.
+            key={object.attachmentId}
             presentation={object}
             selected={selectedSceneResourceId === object.object.scene_resource_id}
             axesVisible={objectAxesVisibleIds.has(object.object.scene_resource_id)}
@@ -1508,6 +1516,243 @@ function CandidateRobotGhost({
         );
       })}
     </group>
+  );
+}
+
+/**
+ * The measured comparison robot follows the viewer stream's measured rows
+ * through the same frame driver as the solid robot: links move through refs,
+ * never a React render per frame. It mounts on the first measured
+ * presentation and is hidden while the latest frame has none.
+ */
+function MeasuredRobotStateGhost({
+  manifest,
+  reader,
+  latestFrameAppliers,
+  interpolationDurationMs,
+  onAssetError,
+}: {
+  manifest: SceneUrdfManifest;
+  reader: MeasuredRobotPresentationReader;
+  latestFrameAppliers: Set<() => void>;
+  interpolationDurationMs: number;
+  onAssetError: (error: Error) => void;
+}) {
+  const [initial, setInitial] = useState(() => reader.readMeasuredRobotPresentation());
+  const root = useRef<THREE.Group | null>(null);
+  const invalidate = useThree((state) => state.invalidate);
+  const linkGroups = useMemo(() => new Map(
+    manifest.links.map((link) => [link.name, { current: null as THREE.Group | null }]),
+  ), [manifest]);
+  useLayoutEffect(() => {
+    const update = () => {
+      const current = reader.readMeasuredRobotPresentation();
+      if (initial === null) {
+        // One React render for the first measured pose only.
+        if (current !== null) setInitial(current);
+        return;
+      }
+      const group = root.current;
+      if (group !== null && group.visible !== (current !== null)) {
+        group.visible = current !== null;
+        invalidate();
+      }
+    };
+    update();
+    return reader.subscribeMeasuredRobotPresentation(update);
+  }, [initial, invalidate, reader]);
+  // A comparison robot is one coherent retained-model pose. Hide it entirely
+  // if a projection ever supplies only a subset of the model links.
+  if (initial === null
+    || !manifest.links.every((link) => initial.linkTransforms[link.name] !== undefined)) {
+    return null;
+  }
+  const color = VIEWPORT_COLORS.objectComparison;
+  const opacity = 0.35;
+  return (
+    <group ref={root} name={`measured-state-robot:${initial.objectId}:${initial.sourceId}`}>
+      <MeasuredRobotFrameDriver
+        manifestModelKey={manifest.model_key}
+        linkGroups={linkGroups}
+        presentation={initial}
+        livePresentation={reader}
+        latestFrameAppliers={latestFrameAppliers}
+        interpolationDurationMs={interpolationDurationMs}
+        minimumCreditIntervalMs={0}
+      />
+      {manifest.links.map((link) => {
+        const transform = initial.linkTransforms[link.name];
+        if (transform === undefined) return null;
+        return (
+          <group
+            key={`comparison:${manifest.model_key}:${link.name}`}
+            ref={linkGroups.get(link.name)!}
+            name={`measured-state-link:${link.name}`}
+            position={transform.position_m}
+            quaternion={normalizeQuaternion(transform.orientation_xyzw)}
+            raycast={ignoreViewerRaycast}
+          >
+            {link.visuals.map((visual) => {
+              const origin = visual.visual_origin;
+              return (
+                <group
+                  key={`comparison-visual:${link.name}:${visual.index}`}
+                  position={origin.position_m}
+                  quaternion={normalizeQuaternion(origin.orientation_xyzw)}
+                  raycast={ignoreViewerRaycast}
+                >
+                  {visual.mesh_url !== null && (
+                    <AssetErrorBoundary resetKey={visual.mesh_url} onError={onAssetError}>
+                      <Suspense fallback={null}>
+                        <OverlayVisualMesh
+                          url={visual.mesh_url}
+                          color={color}
+                          opacity={opacity}
+                        />
+                      </Suspense>
+                    </AssetErrorBoundary>
+                  )}
+                  {visual.mesh_url === null && visual.primitive !== null && (
+                    <PrimitiveOverlay
+                      primitive={visual.primitive}
+                      color={color}
+                      opacity={opacity}
+                    />
+                  )}
+                </group>
+              );
+            })}
+          </group>
+        );
+      })}
+    </group>
+  );
+}
+
+function MeasuredObjectStateGhost({
+  object,
+  presentation,
+  ownerIdentity,
+}: {
+  object: LogicalSceneObject;
+  presentation: NonNullable<RuntimeScenePresentation['measuredObjects'][number]>;
+  ownerIdentity: StructuralViewerProps['sceneOwnerIdentity'];
+}) {
+  const { position_m: position, orientation_xyzw: orientation } = presentation.pose;
+  return (
+    <group
+      name={`measured-state-object:${object.scene_resource_id}:${presentation.sourceId}`}
+      position={position}
+      quaternion={normalizeQuaternion(orientation)}
+      raycast={ignoreViewerRaycast}
+    >
+      {object.collision_shapes.map((shape, index) => shape.type === 'mesh'
+        ? ownerIdentity === undefined ? null : (
+            <SceneObjectMesh
+              key={`measured-state:${object.scene_resource_id}:${index}`}
+              shape={shape}
+              ownerIdentity={ownerIdentity}
+              appearance="comparison"
+              selected={false}
+              wireframe={false}
+            />
+          )
+        : (
+            <SceneObjectPrimitive
+              key={`measured-state:${object.scene_resource_id}:${index}`}
+              shape={shape}
+              appearance="comparison"
+              selected={false}
+              wireframe={false}
+            />
+          ))}
+    </group>
+  );
+}
+
+export function MeasuredStateGhostLayers({
+  enabled,
+  presentation,
+  measuredRobot,
+  latestFrameAppliers,
+  interpolationDurationMs = 0,
+  manifest,
+  objects,
+  ownerIdentity,
+  onAssetError,
+  children,
+}: {
+  enabled: boolean;
+  presentation: RuntimeScenePresentation | undefined;
+  /** Measured comparison robot read from the viewer stream frames. */
+  measuredRobot?: MeasuredRobotPresentationReader;
+  latestFrameAppliers?: Set<() => void>;
+  interpolationDurationMs?: number;
+  manifest: SceneUrdfManifest | null;
+  objects: readonly LogicalSceneObject[];
+  ownerIdentity: StructuralViewerProps['sceneOwnerIdentity'];
+  onAssetError: (error: Error) => void;
+  children?: ReactNode;
+}) {
+  if (!enabled || presentation === undefined) return null;
+  const objectById = new Map(objects.map((object) => [object.scene_resource_id, object]));
+  const robot = manifest !== null && manifest.links.length > 0
+    && latestFrameAppliers !== undefined ? measuredRobot ?? null : null;
+  const measuredObjects = presentation.measuredObjects.flatMap((measurement) => {
+    const object = objectById.get(measurement.objectId);
+    // The measured world pose is shown whether the object is fixed or carried,
+    // so it can be compared with the attached pose during a carry.
+    return object !== undefined
+      && object.collision_shapes.some((shape) => shape.type !== 'mesh' || ownerIdentity !== undefined)
+      ? [{ measurement, object }]
+      : [];
+  });
+  const measuredTcp = presentation.measuredTcp === null ? null : children ?? null;
+  if (robot === null && measuredTcp === null && measuredObjects.length === 0) return null;
+  return (
+    <group name="measured-state-ghost-layers" renderOrder={20} raycast={ignoreViewerRaycast}>
+      {manifest !== null && robot !== null && latestFrameAppliers !== undefined && (
+        <MeasuredRobotStateGhost
+          key={manifest.model_key}
+          manifest={manifest}
+          reader={robot}
+          latestFrameAppliers={latestFrameAppliers}
+          interpolationDurationMs={interpolationDurationMs}
+          onAssetError={onAssetError}
+        />
+      )}
+      {measuredTcp}
+      {measuredObjects.map(({ measurement, object }) => {
+        return (
+          <MeasuredObjectStateGhost
+            key={`${measurement.objectId}:${measurement.policyId}:${measurement.sourceEpoch}:${measurement.sourceId}`}
+            object={object}
+            presentation={measurement}
+            ownerIdentity={ownerIdentity}
+          />
+        );
+      })}
+    </group>
+  );
+}
+
+export function MeasuredStateGhostToggle({
+  enabled,
+  onChange,
+}: {
+  enabled: boolean;
+  onChange: (enabled: boolean) => void;
+}) {
+  return (
+    <label className="toggle-control">
+      <input
+        type="checkbox"
+        aria-label="Measured state ghosts"
+        checked={enabled}
+        onChange={(event) => onChange(event.target.checked)}
+      />
+      <span>Measured state ghosts</span>
+    </label>
   );
 }
 
@@ -1776,86 +2021,6 @@ function LogicalSceneObjects({
   );
 }
 
-function ObservedLogicalSceneObjects({
-  objects,
-  presentation,
-  wireframe,
-  ownerIdentity,
-  latestFrameAppliers,
-  selectedSceneResourceId,
-  objectAxesVisibleIds,
-  axesSizeM,
-  onSelect,
-}: {
-  objects: readonly LogicalSceneObject[];
-  presentation: RuntimeScenePresentation;
-  wireframe: boolean;
-  ownerIdentity: StructuralViewerProps['sceneOwnerIdentity'];
-  latestFrameAppliers: Set<() => void>;
-  selectedSceneResourceId: string | null;
-  objectAxesVisibleIds: ReadonlySet<string>;
-  axesSizeM: number;
-  onSelect: (event: ThreeEvent<MouseEvent>, sceneResourceId: string) => void;
-}) {
-  const objectById = new Map(
-    objects.map((object) => [object.scene_resource_id, object]),
-  );
-  return (
-    <group name="owner-observed-scene">
-      {presentation.measuredObjects.map((measurement) => {
-        const object = objectById.get(measurement.objectId);
-        if (object === undefined || object.placement.kind !== 'cell_fixed') return null;
-        const selected = selectedSceneResourceId === measurement.objectId;
-        return (
-          <AuthoritativeTransformGroup
-            key={`observed-scene:${measurement.objectId}`}
-            name={`observed-scene:${measurement.objectId}`}
-            streamIdentity={authoritativeStreamIdentity(
-              ownerIdentity,
-              'scene-object',
-              measurement.objectId,
-              measurement.policyId,
-              measurement.sourceId,
-              measurement.sourceEpoch,
-            )}
-            sourceSequence={measurement.sourceSequence}
-            observedAtNs={measurement.observedAtNs}
-            positionM={measurement.pose.position_m}
-            orientationXyzw={measurement.pose.orientation_xyzw}
-            latestFrameAppliers={latestFrameAppliers}
-            onClick={(event) => onSelect(event, measurement.objectId)}
-          >
-            <group>
-              {object.collision_shapes.map((shape, index) => shape.type === 'mesh'
-                ? ownerIdentity === undefined ? null : (
-                    <SceneObjectMesh
-                      key={`observed-scene:${measurement.objectId}:${index}`}
-                      shape={shape}
-                      ownerIdentity={ownerIdentity}
-                      appearance="authoritative"
-                      selected={selected}
-                      wireframe={wireframe}
-                    />
-                  )
-                : (
-                    <SceneObjectPrimitive
-                      key={`observed-scene:${measurement.objectId}:${index}`}
-                      shape={shape}
-                      appearance="authoritative"
-                      selected={selected}
-                      wireframe={wireframe}
-                    />
-                  ))}
-              {(selected || objectAxesVisibleIds.has(measurement.objectId)) && (
-                <axesHelper args={[axesSizeM]} raycast={ignoreViewerRaycast} />
-              )}
-            </group>
-          </AuthoritativeTransformGroup>
-        );
-      })}
-    </group>
-  );
-}
 
 function CandidateTcpGhost({
   pose,
@@ -2492,6 +2657,10 @@ const ViewerCanvas = memo(function ViewerCanvas({
   correctionRobot,
   correctionStale,
   runtimePresentation,
+  measuredStateGhostPresentation,
+  measuredStateGhostRobot,
+  measuredStateGhostObjects,
+  measuredStateGhostsEnabled,
   executionObservationPresentation,
   sceneOwnerIdentity,
   programDraftIdentity,
@@ -2550,6 +2719,10 @@ const ViewerCanvas = memo(function ViewerCanvas({
   correctionRobot: CandidateRobotPresentation | null;
   correctionStale: boolean;
   runtimePresentation: RuntimeScenePresentation | undefined;
+  measuredStateGhostPresentation: RuntimeScenePresentation | undefined;
+  measuredStateGhostRobot: MeasuredRobotPresentationReader | undefined;
+  measuredStateGhostObjects: readonly LogicalSceneObject[];
+  measuredStateGhostsEnabled: boolean;
   executionObservationPresentation: MeasuredRobotPresentationReader | undefined;
   sceneOwnerIdentity: StructuralViewerProps['sceneOwnerIdentity'];
   programDraftIdentity: StructuralViewerProps['programDraftIdentity'];
@@ -2592,12 +2765,6 @@ const ViewerCanvas = memo(function ViewerCanvas({
     if (inspection.renderer !== null) setViewerQualificationRenderer(renderer);
   }, [inspection.renderer, renderer]);
   const retainedCameraPresentation = cameraPresentation.read();
-  const observedSceneResourceIds = useMemo(
-    () => new Set(
-      runtimePresentation?.measuredObjects.map((item) => item.objectId) ?? [],
-    ),
-    [runtimePresentation?.measuredObjects],
-  );
   const selectedCamera = retainedCameraPresentation.camera;
   const captureCameraPresentation = useCallback((
     presentation: RetainedCameraPresentation,
@@ -2872,9 +3039,7 @@ const ViewerCanvas = memo(function ViewerCanvas({
         )}
         <LogicalSceneObjects
           key={`logical-scene:${retryGeneration}`}
-          objects={sceneObjects.filter(
-            (object) => !observedSceneResourceIds.has(object.scene_resource_id),
-          )}
+          objects={sceneObjects}
           appearance={programDraftPreview ? 'draft' : 'authoritative'}
           selectedSceneResourceId={selectedSceneResourceId}
           onSelect={selectSceneResource}
@@ -2890,29 +3055,29 @@ const ViewerCanvas = memo(function ViewerCanvas({
           onTransformDraggingChange={setTransformDragging}
           onContextPointerDown={registerContextPointer}
         />
-        {runtimePresentation !== undefined && (
-          <ObservedLogicalSceneObjects
-            key={`observed-scene:${retryGeneration}`}
-            objects={sceneObjects}
-            presentation={runtimePresentation}
-            wireframe={wireframeVisible}
-            ownerIdentity={sceneOwnerIdentity}
-            latestFrameAppliers={latestFrameAppliers}
-            selectedSceneResourceId={selectedSceneResourceId}
-            objectAxesVisibleIds={objectAxesVisibleIds}
-            axesSizeM={viewer?.object_axes_gizmo_size_m ?? 0.1}
-            onSelect={selectSceneResource}
-          />
-        )}
-        {runtimePresentation?.measuredTcp !== null
-          && runtimePresentation?.measuredTcp !== undefined && (
-          <MeasuredTcpMarker
-            presentation={runtimePresentation.measuredTcp}
-            axesSizeM={viewer?.frame_gizmo_size_m ?? 0.1}
-            ownerIdentity={sceneOwnerIdentity}
-            latestFrameAppliers={latestFrameAppliers}
-          />
-        )}
+
+        <MeasuredStateGhostLayers
+          enabled={measuredStateGhostsEnabled}
+          presentation={measuredStateGhostPresentation}
+          measuredRobot={measuredStateGhostRobot}
+          latestFrameAppliers={latestFrameAppliers}
+          interpolationDurationMs={graphicsProfile.motionSmoothing
+            ? MAX_AUTHORITATIVE_INTERPOLATION_MS : 0}
+          manifest={manifest}
+          objects={measuredStateGhostObjects}
+          ownerIdentity={sceneOwnerIdentity}
+          onAssetError={onPreviewAssetError}
+        >
+          {measuredStateGhostPresentation?.measuredTcp !== null
+            && measuredStateGhostPresentation?.measuredTcp !== undefined && (
+            <MeasuredTcpMarker
+              presentation={measuredStateGhostPresentation.measuredTcp}
+              axesSizeM={viewer?.frame_gizmo_size_m ?? 0.1}
+              ownerIdentity={sceneOwnerIdentity}
+              latestFrameAppliers={latestFrameAppliers}
+            />
+          )}
+        </MeasuredStateGhostLayers>
         {candidateTcpPose !== null && robotEditorActive && (
           <CandidateTcpGhost
             pose={candidateTcpPose}
@@ -2999,6 +3164,9 @@ function StructuralViewerContent({
   correctionRobot = null,
   correctionStale = false,
   runtimePresentation,
+  measuredStateGhostPresentation,
+  measuredStateGhostRobot,
+  measuredStateGhostObjects = [],
   executionObservationPresentation,
   sceneOwnerIdentity,
   viewerFrameIdentity,
@@ -3025,9 +3193,12 @@ function StructuralViewerContent({
   onInspectorMaximize,
   onInspectorPanelChange,
 }: StructuralViewerProps) {
-  // Display toggles are installation settings (UA7W.11): they say what to
-  // show when the data exists, never that it exists.
+  // The diagnostic ghost preference is local and independent of motion state
+  // or sample availability. Current presentations decide only what can draw.
   const composerSettings = useComposerSettings();
+  const [measuredStateGhostsEnabled, setMeasuredStateGhostsEnabled] = useState(
+    DEFAULT_MEASURED_STATE_GHOSTS_VISIBLE,
+  );
   const [rendererKind, setRendererKind] = useState<ViewerRendererKind | null>(null);
   const {
     collisionGeometry: collisionsVisible,
@@ -3200,9 +3371,8 @@ function StructuralViewerContent({
   // One outline per component: every robot link (not only those with axes
   // shown) resolves to its model instance.
   const outlineComponents = useOutlineComponents(frameAxes);
-  // Runtime measured state is the primary robot pose, not an optional ghost.
-  // The current projection has no second passive comparison-pose contract.
-  const comparisonGhostAvailable = false;
+  // Runtime measured state is the primary robot pose. Only the independent,
+  // unmerged scene-runtime fact may be rendered as its optional comparison.
   const auxiliaryViewerSourcesActive = programDraftPreview
     || candidateTcpPose !== null
     || candidateRobot !== null;
@@ -3595,6 +3765,10 @@ function StructuralViewerContent({
               correctionRobot={correctionRobot}
               correctionStale={correctionStale}
               runtimePresentation={presentedRuntime}
+              measuredStateGhostPresentation={measuredStateGhostPresentation}
+              measuredStateGhostRobot={measuredStateGhostRobot}
+              measuredStateGhostObjects={measuredStateGhostObjects}
+              measuredStateGhostsEnabled={measuredStateGhostsEnabled}
               executionObservationPresentation={executionObservationPresentation}
               sceneOwnerIdentity={sceneOwnerIdentity}
               programDraftIdentity={programDraftIdentity}
@@ -3855,16 +4029,10 @@ function StructuralViewerContent({
                     />
                     <span>Point cloud</span>
                   </label>
-                  <label className="toggle-control">
-                    <input
-                      type="checkbox"
-                      checked={DEFAULT_COMPARISON_GHOST_VISIBLE}
-                      disabled={!comparisonGhostAvailable}
-                      readOnly
-                      title="No independent comparison pose is available."
-                    />
-                    <span>Comparison ghost</span>
-                  </label>
+                  <MeasuredStateGhostToggle
+                    enabled={measuredStateGhostsEnabled}
+                    onChange={setMeasuredStateGhostsEnabled}
+                  />
                   </section>
                   <ViewerGraphicsSettings rendererKind={rendererKind} />
                   <details className="dcard" open>

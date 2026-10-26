@@ -64,6 +64,22 @@ struct ProjectionRevisionDTO final {
                          const ProjectionRevisionDTO&) = default;
 };
 
+/// Test a minimum revision within one owner-minted Scene lineage. This only
+/// selects a snapshot; planning and collision remain bound to its exact revision.
+[[nodiscard]] inline bool ProjectionIsSameOrForwardInLineage(
+    const ProjectionRevisionDTO& candidate,
+    const ProjectionRevisionDTO& floor) noexcept {
+  if (!candidate.valid() || !floor.valid() ||
+      candidate.retained_bundle_id != floor.retained_bundle_id ||
+      candidate.graph_revision != floor.graph_revision ||
+      candidate.scene_revision.scene_id != floor.scene_revision.scene_id ||
+      candidate.scene_revision.revision_id < floor.scene_revision.revision_id) {
+    return false;
+  }
+  return candidate.scene_revision.revision_id != floor.scene_revision.revision_id ||
+         candidate.scene_revision.content_hash == floor.scene_revision.content_hash;
+}
+
 /// Whether two projection revisions name the same active Deployment.
 ///
 /// A planned reconfiguration's predecessor is the active Deployment (retained

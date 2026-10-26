@@ -110,18 +110,16 @@ struct ExecutionKernelConfig {
   Duration validation_collision_wall_timeout_ns = 5'000'000'000;  // 5 s
 
   // Maximum age of the observed-scene snapshot lease captured at execute
-  // admission. The lease bounds how long validation may tolerate live
-  // pose-source revisions diverging from the immutable world+policy bundle
-  // actually used for planning/validation; structural and policy divergence
-  // still fail closed immediately.
+  // admission. Dispatch accepts a newer scene for every object; the lease
+  // bounds how old the validation may be. Structural divergence (a re-Apply)
+  // and stale sources still fail closed.
   Duration scene_snapshot_lease_max_age_ns = 5'000'000'000;  // 5 s
 
-  // Default bounded drift tolerated for request-target observed objects during
-  // one lease window. Composer/deployment metadata can refine roles; the
-  // kernel default is deliberately small and applies only to target pose drift,
-  // never to topology, shape, attachment, support-contact, or policy changes.
-  double scene_snapshot_default_observed_drift_tolerance_m = 0.02;
-  double scene_snapshot_default_observed_angular_tolerance_rad = 0.17453292519943295;  // 10 deg
+  // When true, an accepted dispatch on a newer scene also records bounded
+  // per-object divergence detail (`object_divergence.*`). Default OFF: only
+  // the revision-level `accepted_live_*` evidence is kept and no per-object
+  // comparison runs. Hosts set it from MANYFORGE_DEBUG_SCENE_DIVERGENCE=1.
+  bool record_scene_divergence_detail = false;
 
   // When true, a collision-validation rejection re-runs the failing waypoint
   // through the dedicated non-authoritative diagnostic comparator and appends
@@ -583,8 +581,14 @@ class ExecutionKernel : public IResolvedParticipantExecutionEngine,
 
   /// Publish an observer-safe execution snapshot.
   void publish_execution_snapshot(ExecutionSnapshot snapshot);
-  std::uint64_t start_collision_monitoring(std::string reason,
-                                           const CollisionWorldLeaseInventory* admission_inventory);
+  struct CollisionMonitoringStart {
+    std::uint64_t generation = 0;
+    std::optional<ErrorDTO> prepare_error;
+  };
+  /// A prepare failure leaves the generation active but unarmed; the caller
+  /// must stop it fail-closed and must not dispatch.
+  CollisionMonitoringStart start_collision_monitoring(
+      std::string reason, const CollisionWorldLeaseInventory* admission_inventory);
   void stop_collision_monitoring(RuntimeCollisionMonitorRelease release,
                                  std::optional<std::uint64_t> expected_generation = std::nullopt,
                                  bool drain_callbacks = false);
@@ -616,8 +620,7 @@ class ExecutionKernel : public IResolvedParticipantExecutionEngine,
       std::uint64_t exec_id, const std::string& move_id);
   Result<std::optional<ProjectionRevisionDTO>> synchronize_scene_before_planning();
   std::optional<SceneSnapshotLease> build_scene_snapshot_lease(
-      const CollisionWorldLeaseInventory& inventory, const ExecuteRequestDTO& request,
-      std::uint64_t exec_id) const;
+      const CollisionWorldLeaseInventory& inventory, std::uint64_t exec_id) const;
   std::optional<SceneSnapshotLeaseValidationContext>
   current_scene_snapshot_lease_validation_context() const;
   std::shared_ptr<CollisionCancellationToken> install_validation_cancel_token();
@@ -853,8 +856,6 @@ class ExecutionKernel : public IResolvedParticipantExecutionEngine,
   std::atomic<std::shared_ptr<RuntimeCollisionQuerySession>> runtime_collision_query_session_;
   std::atomic<std::shared_ptr<RuntimeCollisionLookaheadSession>>
       runtime_collision_lookahead_session_;
-  mutable std::mutex runtime_collision_query_prepare_error_mutex_;
-  std::optional<ErrorDTO> runtime_collision_query_prepare_error_;
   mutable std::mutex validation_cancel_mutex_;
   std::weak_ptr<CollisionCancellationToken> active_validation_cancel_token_;
 

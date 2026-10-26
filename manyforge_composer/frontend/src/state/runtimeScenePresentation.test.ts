@@ -23,6 +23,7 @@ import {
   candidateToolPresentation,
   candidateObservationEpoch,
   createExecutionRobotPresentationReader,
+  createMeasuredComparisonPresentationReader,
   executionObservationRobotPresentation,
   executionRobotPresentation,
   measuredLinkTransforms,
@@ -144,7 +145,6 @@ function sourceModel(): SourceModelProjection {
       model_revision: 'model-revision-1',
       coordinates: [
         { source_joint_name: 'source-joint', viewer_joint_name: 'joint-1', coordinate_kind: 'angular', unit: 'radians' },
-        { source_joint_name: 'joint-1' },
       ],
     }],
     targets: [
@@ -445,7 +445,7 @@ describe('runtime scene presentation', () => {
 
   it('projects and caches compact owner observations once per frame', () => {
     let frame: ExecutionObservationFrame | null = {
-      schemaVersion: 'manyforge.execution_observation_frame.v3',
+      schemaVersion: 'manyforge.execution_observation_frame.v4',
       ownerEpoch: 'owner-1',
       cellId: 'cell-1',
       retainedBundleId: 'bundle-1',
@@ -459,6 +459,7 @@ describe('runtime scene presentation', () => {
         sourceJointNames: ['source-joint'], compiledJointNames: ['joint-1'],
         coordinateKinds: ['angular'], positionsSi: [Math.PI / 2],
       }],
+      measuredTargets: [],
     };
     const projected = executionObservationRobotPresentation(
       frame, sourceModel(), manifest(), motionDescriptor(), 2_000_000,
@@ -517,6 +518,48 @@ describe('runtime scene presentation', () => {
     expect(rejected).toEqual([rejected[0], frame]);
   });
 
+  it('projects measured rows through the solid robot path without crediting frames', () => {
+    const commanded = {
+      controllableComponentId: 'robot-1', commandTargetId: 'arm', operationCapabilityId: 'execution.trajectory.execute',
+      sourceEpoch: 'native-1', sourceSequence: 5,
+      sourceJointNames: ['source-joint'], compiledJointNames: ['joint-1'],
+      coordinateKinds: ['angular' as const], positionsSi: [0],
+    };
+    let frame: ExecutionObservationFrame | null = {
+      schemaVersion: 'manyforge.execution_observation_frame.v4',
+      ownerEpoch: 'owner-1', cellId: 'cell-1', retainedBundleId: 'bundle-1', graphRevision: 'graph-1',
+      sourceEpoch: 'native-1', sourceSequence: 5, receivedAtMonotonicUs: 123,
+      targets: [commanded],
+      measuredTargets: [{ ...commanded, sourceEpoch: 'measured-1', sourceSequence: 40, positionsSi: [Math.PI / 2] }],
+    };
+    const credits: unknown[] = [];
+    const reader = createMeasuredComparisonPresentationReader({
+      getLatestExecutionObservation: () => frame,
+      subscribeExecutionObservation: () => () => undefined,
+      markExecutionObservationApplied: (value) => { credits.push(value); },
+      rejectExecutionObservation: (value) => { credits.push(value); },
+    }, sourceModel(), manifest());
+    const measured = reader.readMeasuredRobotPresentation();
+    expect(measured).toMatchObject({
+      objectId: 'robot-1', sourceId: 'measured:arm', sourceSequence: 5, observedAtNs: '123000',
+    });
+    expect(reader.readMeasuredRobotPresentation()).toBe(measured);
+    // Same retained-model projection as the solid robot at that coordinate.
+    expect(measured?.linkTransforms).toEqual(executionObservationRobotPresentation(
+      { ...frame, targets: frame.measuredTargets, measuredTargets: [] },
+      sourceModel(), manifest(), null, '123000',
+    )?.linkTransforms);
+    expect(measured?.linkTransforms.tip.position_m[1]).toBeCloseTo(1);
+    reader.markMeasuredRobotPresentationApplied(measured!);
+    expect(credits).toEqual([]);
+
+    frame = { ...frame, sourceSequence: 6, measuredTargets: [] };
+    expect(reader.readMeasuredRobotPresentation()).toBeNull();
+    frame = { ...frame, sourceSequence: 7, measuredTargets: [{ ...commanded, commandTargetId: 'other' }] };
+    expect(reader.readMeasuredRobotPresentation()).toBeNull();
+    expect(credits).toEqual([]);
+  });
+
   it('moves model-backed gripper master and mimic fingers without an arm update', () => {
     const model = sourceModel();
     const geometry = manifest();
@@ -536,7 +579,7 @@ describe('runtime scene presentation', () => {
     model.targets[1].model_groups = [{ ...model.targets[0].model_groups[0],
       model_instance_id: 'gripper-model', commandable_source_joint_names: ['finger'] }];
     const frame: ExecutionObservationFrame = {
-      schemaVersion: 'manyforge.execution_observation_frame.v3', ownerEpoch: 'owner-1',
+      schemaVersion: 'manyforge.execution_observation_frame.v4', ownerEpoch: 'owner-1',
       cellId: 'cell-1', retainedBundleId: 'bundle-1', graphRevision: 'graph-1',
       sourceEpoch: 'render-1', sourceSequence: 10, receivedAtMonotonicUs: 123,
       targets: [
@@ -545,6 +588,7 @@ describe('runtime scene presentation', () => {
         { controllableComponentId: 'robot-1', commandTargetId: 'gripper', operationCapabilityId: 'tool.gripper.command', sourceEpoch: 'gripper-1', sourceSequence: 8,
           sourceJointNames: ['finger'], compiledJointNames: ['finger-master'], coordinateKinds: ['linear'], positionsSi: [0.025] },
       ],
+      measuredTargets: [],
     };
     const open = executionObservationRobotPresentation(frame, model, geometry, motionDescriptor(), null);
     const authoringStatus = executionStatus();
@@ -574,7 +618,7 @@ describe('runtime scene presentation', () => {
   it('computes retained-model FK and exact measured object/TCP overlays', () => {
     const jointSource = baseSource({
       api_version: 'manyforge.ros_pose_observation.v2',
-      joint_names: ['joint-1'],
+      joint_names: ['source-joint'],
       kind: 'joint_state',
       positions: [Math.PI / 2],
       source_stamp_ns: 11000000000,
@@ -647,7 +691,44 @@ describe('runtime scene presentation', () => {
     });
   });
 
-  it('joins a gripper-carried object to the exact shared model frame and excludes a duplicate pose overlay', () => {
+  it('withholds every measured overlay when its good scene-runtime samples are stale', () => {
+    const jointSource = baseSource({
+      api_version: 'manyforge.ros_pose_observation.v2',
+      joint_names: ['source-joint'],
+      kind: 'joint_state',
+      positions: [Math.PI / 2],
+      source_stamp_ns: 11000000000,
+      topic: '/isaac_joint_states',
+    }, { fresh: false });
+    const tcp = baseSource(posePayload('simulation_entity_pose'), {
+      fresh: false,
+      policy_id: 'viewer.measured_tcp',
+      source_sequence: 2,
+    });
+    const object = baseSource(posePayload('simulation_entity_pose'), {
+      eligible: true,
+      fresh: false,
+      object_id: 'part',
+      policy_id: 'continuous_unattached',
+      source_sequence: 3,
+    });
+
+    const presentation = runtimeScenePresentation(
+      runtime([jointSource, tcp, object]),
+      logicalScene(),
+      sourceModel(),
+      manifest(),
+    );
+
+    expect(presentation).toMatchObject({
+      measuredRobot: null,
+      measuredTcp: null,
+      measuredObjects: [],
+      status: { total: 3, freshGood: 0, staleGood: 3 },
+    });
+  });
+
+  it('joins the exact carrier while retaining independent measured drift evidence', () => {
     const scene = attachedLogicalScene();
     const joined = attachedScenePresentation(
       scene,
@@ -681,7 +762,8 @@ describe('runtime scene presentation', () => {
       motionDescriptor(),
     );
     expect(presentation.attachedObjects).toHaveLength(1);
-    expect(presentation.measuredObjects).toEqual([]);
+    expect(presentation.measuredObjects).toHaveLength(1);
+    expect(presentation.measuredObjects[0].objectId).toBe('part');
     expect(presentation.attachmentDiagnostics).toEqual([]);
   });
 
@@ -697,7 +779,7 @@ describe('runtime scene presentation', () => {
 
     const cellPose = (positionRad: number) => {
       const frame: ExecutionObservationFrame = {
-        schemaVersion: 'manyforge.execution_observation_frame.v3',
+        schemaVersion: 'manyforge.execution_observation_frame.v4',
         ownerEpoch: 'owner-1',
         cellId: 'cell-1',
         retainedBundleId: 'bundle-1',
@@ -711,6 +793,7 @@ describe('runtime scene presentation', () => {
           sourceJointNames: ['source-joint'], compiledJointNames: ['joint-1'],
           coordinateKinds: ['angular'], positionsSi: [positionRad],
         }],
+        measuredTargets: [],
       };
       const robot = executionObservationRobotPresentation(
         frame, sourceModel(), manifest(), motionDescriptor(), 2_000_000,
@@ -808,7 +891,7 @@ describe('runtime scene presentation', () => {
     const presentation = runtimeScenePresentation(
       runtime([baseSource({
         api_version: 'manyforge.ros_pose_observation.v2',
-        joint_names: ['joint-1'],
+        joint_names: ['source-joint'],
         kind: 'joint_state',
         positions: [0.5],
         source_stamp_ns: null,
@@ -823,7 +906,7 @@ describe('runtime scene presentation', () => {
     expect(presentation.status.warnings[0]).toContain('occurrence-keyed');
   });
 
-  it('fails closed on identity drift and excludes ineligible object poses', () => {
+  it('fails closed on identity drift while retaining observation-only ghost poses', () => {
     const object = baseSource(posePayload('simulation_entity_pose'), {
       eligible: false,
       object_id: 'part',
@@ -835,7 +918,8 @@ describe('runtime scene presentation', () => {
       sourceModel(),
       manifest(),
     );
-    expect(withoutEligibleObject.measuredObjects).toEqual([]);
+    expect(withoutEligibleObject.measuredObjects).toHaveLength(1);
+    expect(withoutEligibleObject.measuredObjects[0].objectId).toBe('part');
 
     const staleModel = sourceModel();
     staleModel.graph_revision = 'graph-stale';

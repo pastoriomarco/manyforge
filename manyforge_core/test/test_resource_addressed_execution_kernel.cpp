@@ -234,30 +234,58 @@ class FakeParticipantEngine final : public IResolvedParticipantExecutionEngine,
       return Result<AddressedParticipantStopSettlementDTO>::Err(ErrorDTO{
           "addressed_motion_stop_execution_mismatch", "fake addressed Stop identity is stale", {}});
     }
+    std::optional<ParticipantExecutionFact> terminal_fact;
     {
       std::lock_guard lock(status_mutex_);
-      if (!scripted_ending(status.state)) ended_phase = status.state;
-      status.state = ExecutionState::kStopped;
-      status.execution_id = request.execution_id;
+      terminal_fact = participant_status(status, ended_phase, ended_error).fact;
+      if (settle_contained_failure_as_ack) {
+        if (!terminal_fact || terminal_fact->kind != ParticipantExecutionFactKind::kLocalFailure ||
+            terminal_fact->effect != ParticipantEffectKnowledge::kEffectSettled ||
+            !terminal_fact->error) {
+          return Result<AddressedParticipantStopSettlementDTO>::Err(ErrorDTO{
+              "addressed_motion_stop_state_invalid",
+              "fake contained-failure ACK requires the original settled failure", {}});
+        }
+        status.execution_id = request.execution_id;
+      } else {
+        if (!scripted_ending(status.state)) ended_phase = status.state;
+        status.state = ExecutionState::kStopped;
+        status.execution_id = request.execution_id;
+        terminal_fact.reset();
+      }
     }
     recovery_assessment.assessment_revision += 1U;
     recovery_assessment.control_command_epoch += 1U;
     recovery_assessment.execution_id = request.execution_id;
-    recovery_assessment.execution_state = ExecutionState::kStopped;
-    recovery_assessment.recovery_class = RecoveryClass::kOrdinaryOperatorStop;
-    recovery_assessment.status = RecoveryAssessmentStatus::kRetryReady;
-    recovery_assessment.retry_admissible = true;
+    recovery_assessment.execution_state = settle_contained_failure_as_ack
+                                              ? ExecutionState::kFailed
+                                              : ExecutionState::kStopped;
+    recovery_assessment.recovery_class = settle_contained_failure_as_ack
+                                             ? RecoveryClass::kUnknownFault
+                                             : RecoveryClass::kOrdinaryOperatorStop;
+    recovery_assessment.status = settle_contained_failure_as_ack
+                                     ? RecoveryAssessmentStatus::kActionRequired
+                                     : RecoveryAssessmentStatus::kRetryReady;
+    recovery_assessment.retry_admissible = !settle_contained_failure_as_ack;
+    if (settle_contained_failure_as_ack) recovery_assessment.eligible_close = true;
     recovery_assessment.stop_certificate_id = certificate.stop_certificate_id.value();
     recovery_assessment.stop_certificate_revision = certificate.stop_certificate_revision.value();
     recovery_assessment.stop_owner_generation = certificate.stop_generation.value();
     recovery_assessment.backend_stop_confirmed = true;
-    recovery_assessment.allowed_actions = {RecoveryAction::kReplanFromStoppedState,
-                                           RecoveryAction::kResetCycle};
+    recovery_assessment.allowed_actions = settle_contained_failure_as_ack
+                                              ? std::vector<RecoveryAction>{RecoveryAction::kResetCycle,
+                                                                           RecoveryAction::kCloseOperation}
+                                              : std::vector<RecoveryAction>{
+                                                    RecoveryAction::kReplanFromStoppedState,
+                                                    RecoveryAction::kResetCycle};
     auto settlement = AddressedParticipantStopSettlementDTO{
         request.execution_id,     certificate,
         stage.operation_id,       stage.participant_id,
         stage.controller_goal_id, stage.controller_goal_generation,
-        recovery_assessment};
+        recovery_assessment,
+        settle_contained_failure_as_ack && addressed_stop_terminal_fact_override
+            ? addressed_stop_terminal_fact_override
+            : std::move(terminal_fact)};
     if (return_mismatched_participant_stop_settlement) {
       settlement.controller_goal_generation =
           ControllerGoalGeneration(stage.controller_goal_generation.value() + 1U);
@@ -1432,6 +1460,8 @@ class FakeParticipantEngine final : public IResolvedParticipantExecutionEngine,
   std::optional<ErrorDTO> prepared_dispatch_event_error;
   std::optional<ErrorDTO> participant_stop_settlement_error;
   bool return_mismatched_participant_stop_settlement{};
+  bool settle_contained_failure_as_ack{};
+  std::optional<ParticipantExecutionFact> addressed_stop_terminal_fact_override;
   std::function<void()> acknowledge_effect_hook;
   std::function<void()> execute_return_hook;
   std::function<void()> reset_effect_hook;
@@ -4735,6 +4765,77 @@ TEST(ResourceAddressedExecutionKernelTest,
             "injected_preparation_failure");
   ASSERT_EQ(kernel.resource_snapshot().size(), 1U);
   EXPECT_EQ(kernel.resource_snapshot().front().state, ResourceSlotState::kTerminal);
+}
+
+TEST(ResourceAddressedExecutionKernelTest,
+     RuntimeMonitorPrepareFailureHoldsMotionUntilResetWithoutStopLatch) {
+  FakeClock clock;
+  ManualScheduler scheduler;
+  FakeParticipantEngine engine;
+  ResourceAddressedExecutionKernel kernel(
+      {registration(
+          make_binding("arm", "arm", "execution.trajectory.execute", CoordinateKind::kAngular),
+          engine)},
+      clock, scheduler, default_journal,
+      ResourceAddressedExecutionKernelConfig{RequestOwnerEpoch("kernel.epoch.1"),
+                                             CellId("cell.test"), 8U});
+
+  const auto accepted = kernel.execute(motion_operation("request.monitor-prepare.fail"));
+  ASSERT_TRUE(accepted.ok()) << accepted.error().message;
+  ASSERT_TRUE(wait_until([&] { return engine.execute_calls.load() == 1; }));
+  // The participant refuses before sending anything: a critical fault with no
+  // effect, as ExecutionKernel settles a failed runtime-monitor preparation.
+  const ErrorDTO failure{kErrorRuntimeCollisionMonitorPrepareFailed,
+                         "Runtime collision monitor preparation failed",
+                         {{"reason", "runtime_collision_query_prepare_failed"},
+                          {"reason_code", kErrorRuntimeCollisionMonitorPrepareFailed}}};
+  const ParticipantExecutionFact fact{ParticipantExecutionFactKind::kLocalFailure,
+                                      ParticipantEffectKnowledge::kNoEffect, failure};
+  {
+    std::lock_guard lock(engine.status_mutex_);
+    engine.status.state = ExecutionState::kExecuting;
+    engine.status.fact = fact;
+    engine.status.execution_id = engine.next_execution_id;
+  }
+  KernelEvent settled{KernelEventType::kParticipantSettled,
+                      engine.next_execution_id,
+                      0,
+                      ExecutionState::kExecuting,
+                      ExecutionState::kExecuting,
+                      failure,
+                      {{"reason", "execution_critical_fault"}}};
+  settled.participant_fact = fact;
+  engine.deliver_event(settled);
+
+  ASSERT_TRUE(wait_until([&] {
+    const auto state = kernel.get_operation_state(accepted.value().operation_id);
+    return state.ok() && state.value().state == OperationStateKind::kInterventionRequired;
+  }));
+  const auto failed = kernel.get_operation_state(accepted.value().operation_id);
+  ASSERT_TRUE(failed.ok()) << failed.error().message;
+  EXPECT_FALSE(failed.value().active_stop_id.has_value());
+  ASSERT_TRUE(failed.value().participants.front().terminal_error.has_value());
+  EXPECT_EQ(failed.value().participants.front().terminal_error->code,
+            kErrorRuntimeCollisionMonitorPrepareFailed);
+  ASSERT_EQ(kernel.resource_snapshot().size(), 1U);
+  EXPECT_EQ(kernel.resource_snapshot().front().state, ResourceSlotState::kTerminal);
+  const auto blocked = kernel.execute(motion_operation("request.monitor-prepare.blocked"));
+  ASSERT_FALSE(blocked.ok());
+  EXPECT_EQ(blocked.error().details.at("reason"), "participant_engine_busy");
+
+  const auto reset =
+      kernel.reset(control_request("request.reset.monitor-prepare", accepted.value(),
+                                   failed.value().operation_revision.value()));
+  ASSERT_TRUE(reset.ok()) << reset.error().message;
+  ASSERT_TRUE(wait_until([&] {
+    return engine.certified_reset_calls.load() == 1 &&
+           kernel.resource_snapshot().front().state == ResourceSlotState::kFree;
+  }));
+  engine.next_execution_id = 42U;
+  engine.next_execute_result = Result<std::uint64_t>::Ok(42U);
+  const auto next = kernel.execute(motion_operation("request.after-monitor-prepare-reset"));
+  ASSERT_TRUE(next.ok()) << next.error().message;
+  EXPECT_TRUE(wait_until([&] { return engine.execute_calls.load() == 2; }));
 }
 
 TEST(ResourceAddressedExecutionKernelTest,
@@ -10774,6 +10875,182 @@ TEST(ResourceAddressedExecutionKernelTest,
             "stop-certificate." + stopped.value().stop_id.value());
   EXPECT_EQ(engine.stop_calls, 1);
   EXPECT_EQ(engine.participant_stop_settlement_calls, 1);
+}
+
+TEST(ResourceAddressedExecutionKernelTest,
+     ContainedSettledFailureAcknowledgementPreservesFailureAndAllowsExactClose) {
+  FakeClock clock;
+  ManualScheduler scheduler;
+  FakeParticipantEngine engine;
+  engine.settle_contained_failure_as_ack = true;
+  ResourceAddressedExecutionKernel kernel(
+      {registration(
+          make_binding("arm", "arm", "execution.trajectory.execute", CoordinateKind::kAngular),
+          engine)},
+      clock, scheduler, default_journal,
+      {RequestOwnerEpoch("kernel.epoch.1"), CellId("cell.test"), 8U});
+
+  const auto accepted = kernel.execute(motion_operation("request.stop.failed-ack"));
+  ASSERT_TRUE(accepted.ok()) << accepted.error().message;
+  engine.emit_transition(ExecutionState::kPlanning, ExecutionState::kExecuting);
+  const ErrorDTO original_error{"execution_aborted", "controller goal aborted",
+                                {{"reason", "aborted_path_tolerance"}}};
+  engine.emit_transition(ExecutionState::kExecuting, ExecutionState::kFailed, original_error);
+  const auto failed = kernel.get_operation_state(accepted.value().operation_id);
+  ASSERT_TRUE(failed.ok()) << failed.error().message;
+  ASSERT_EQ(failed.value().participants.size(), 1U);
+  ASSERT_TRUE(failed.value().participants.front().terminal_fact.has_value());
+  const auto original_fact = *failed.value().participants.front().terminal_fact;
+  ASSERT_EQ(original_fact.kind, ParticipantExecutionFactKind::kLocalFailure);
+  ASSERT_EQ(original_fact.effect, ParticipantEffectKnowledge::kEffectSettled);
+  ASSERT_EQ(original_fact.error, std::optional(original_error));
+
+  const auto stopped = kernel.stop(stop_request(
+      "request.stop.failed-ack.stop", accepted.value(),
+      failed.value().operation_revision.value()));
+  ASSERT_TRUE(stopped.ok()) << stopped.error().message;
+  ASSERT_TRUE(wait_until([&] {
+    const auto status = kernel.get_stop_status(stopped.value().stop_id);
+    return status.ok() && (status.value().state == StopStatusStateDTO::kSucceeded ||
+                           status.value().state == StopStatusStateDTO::kPartial ||
+                           status.value().state == StopStatusStateDTO::kFailed);
+  }));
+  const auto stop_status = kernel.get_stop_status(stopped.value().stop_id);
+  ASSERT_TRUE(stop_status.ok()) << stop_status.error().message;
+  EXPECT_EQ(stop_status.value().state, StopStatusStateDTO::kSucceeded);
+  ASSERT_TRUE(stop_status.value().stop_certificate.has_value());
+  const auto certificate =
+      kernel.get_stop_certificate(stop_status.value().stop_certificate->stop_certificate_id);
+  ASSERT_TRUE(certificate.ok()) << certificate.error().message;
+  EXPECT_EQ(certificate.value().result, StopCertificateResultDTO::kSucceededNominal);
+  EXPECT_FALSE(kernel.get_stop_fault_latch().has_value());
+
+  const auto after_stop = kernel.get_operation_state(accepted.value().operation_id);
+  ASSERT_TRUE(after_stop.ok()) << after_stop.error().message;
+  EXPECT_EQ(after_stop.value().state, OperationStateKind::kInterventionRequired);
+  ASSERT_EQ(after_stop.value().participants.size(), 1U);
+  EXPECT_EQ(after_stop.value().participants.front().terminal_fact,
+            std::optional(original_fact));
+  EXPECT_EQ(after_stop.value().participants.front().terminal_error,
+            std::optional(original_error));
+
+  const auto recovery = kernel.get_operation_recovery_assessment(accepted.value().operation_id);
+  ASSERT_TRUE(recovery.ok()) << recovery.error().message;
+  EXPECT_EQ(recovery.value().assessment.execution_state, ExecutionState::kFailed);
+  EXPECT_FALSE(recovery.value().assessment.retry_admissible);
+  EXPECT_FALSE(recovery.value().assessment.retry_eligibility.eligible);
+  EXPECT_TRUE(recovery.value().assessment.eligible_close);
+  EXPECT_TRUE(std::find(recovery.value().assessment.allowed_actions.begin(),
+                        recovery.value().assessment.allowed_actions.end(),
+                        RecoveryAction::kCloseOperation) !=
+              recovery.value().assessment.allowed_actions.end());
+  EXPECT_EQ(engine.execute_calls, 1);
+
+  const auto& assessment = recovery.value().assessment;
+  const KernelRecoveryActionRequestDTO close_request{
+      "request.stop.failed-ack.close",
+      RecoveryAction::kCloseOperation,
+      "program_runner",
+      assessment.assessment_revision,
+      assessment.control_command_epoch,
+      assessment.execution_id,
+      assessment.latch_id,
+      assessment.stop_certificate_id,
+      assessment.stop_owner_generation,
+      "retire contained failed operation",
+      false};
+  engine.next_recovery_result = KernelRecoveryActionResultDTO{
+      close_request.request_id, close_request.action, true, assessment, std::nullopt};
+  const auto closed = kernel.apply_operation_recovery_action(
+      accepted.value().operation_id, recovery.value().operation_revision, close_request);
+  ASSERT_TRUE(closed.ok()) << closed.error().message;
+  ASSERT_TRUE(closed.value().accepted);
+  EXPECT_EQ(closed.value().action, RecoveryAction::kCloseOperation);
+  EXPECT_EQ(engine.recovery_action_calls, 1);
+  ASSERT_TRUE(engine.last_recovery_request);
+  EXPECT_EQ(engine.last_recovery_request->action, RecoveryAction::kCloseOperation);
+  EXPECT_EQ(engine.certified_reset_calls, 0);
+
+  const auto history = kernel.get_operation_projection(accepted.value().operation_id);
+  ASSERT_TRUE(history.ok()) << history.error().message;
+  EXPECT_FALSE(history.value().resident);
+  EXPECT_EQ(history.value().operation.state, OperationStateKind::kInterventionRequired);
+  ASSERT_EQ(history.value().operation.participants.size(), 1U);
+  EXPECT_EQ(history.value().operation.participants.front().terminal_fact,
+            std::optional(original_fact));
+  EXPECT_EQ(history.value().operation.participants.front().terminal_error,
+            std::optional(original_error));
+
+  // Closing the exact failed operation releases its ownership without
+  // clearing or bypassing a cell-wide admission fault. A fresh command is
+  // accepted only because this contained receipt did not create that fault.
+  const auto fresh = kernel.execute(motion_operation("request.stop.failed-ack.fresh"));
+  ASSERT_TRUE(fresh.ok()) << fresh.error().message;
+}
+
+TEST(ResourceAddressedExecutionKernelTest,
+     UnsettledOrInternalFailureAcknowledgementCannotCompleteAggregateSettlement) {
+  const ErrorDTO original_error{"execution_aborted", "controller goal aborted",
+                                {{"reason", "aborted_path_tolerance"}}};
+  const std::vector<std::pair<std::string, ParticipantExecutionFact>> invalid_facts{
+      {"uncertain-effect",
+       {ParticipantExecutionFactKind::kLocalFailure,
+        ParticipantEffectKnowledge::kEffectUncertain, original_error}},
+      {"internal-error",
+       {ParticipantExecutionFactKind::kLocalFailure,
+        ParticipantEffectKnowledge::kEffectSettled,
+        ErrorDTO{std::string(kErrorInternalError), "participant invariant unavailable", {}}}},
+      {"invariant-error",
+       {ParticipantExecutionFactKind::kLocalFailure,
+        ParticipantEffectKnowledge::kEffectSettled,
+        ErrorDTO{std::string(kErrorInvariantViolation), "participant invariant failed", {}}}}};
+
+  for (const auto& [label, invalid_fact] : invalid_facts) {
+    SCOPED_TRACE(label);
+    const auto request_prefix = "request.stop.invalid-ack." + label;
+    FakeClock clock;
+    ManualScheduler scheduler;
+    FakeParticipantEngine engine;
+    engine.settle_contained_failure_as_ack = true;
+    engine.addressed_stop_terminal_fact_override = invalid_fact;
+    ResourceAddressedExecutionKernel kernel(
+        {registration(
+            make_binding("arm", "arm", "execution.trajectory.execute", CoordinateKind::kAngular),
+            engine)},
+        clock, scheduler, default_journal,
+        {RequestOwnerEpoch("kernel.epoch.1"), CellId("cell.test"), 8U});
+
+    const auto accepted = kernel.execute(motion_operation(request_prefix + ".execute"));
+    ASSERT_TRUE(accepted.ok()) << accepted.error().message;
+    engine.emit_transition(ExecutionState::kPlanning, ExecutionState::kExecuting);
+    engine.emit_transition(ExecutionState::kExecuting, ExecutionState::kFailed, original_error);
+    const auto failed = kernel.get_operation_state(accepted.value().operation_id);
+    ASSERT_TRUE(failed.ok()) << failed.error().message;
+    ASSERT_TRUE(failed.value().participants.front().terminal_fact.has_value());
+
+    const auto stopped = kernel.stop(stop_request(
+        request_prefix + ".stop", accepted.value(),
+        failed.value().operation_revision.value()));
+    ASSERT_TRUE(stopped.ok()) << stopped.error().message;
+    ASSERT_TRUE(wait_until([&] {
+      const auto status = kernel.get_stop_status(stopped.value().stop_id);
+      return status.ok() && (status.value().state == StopStatusStateDTO::kSucceeded ||
+                             status.value().state == StopStatusStateDTO::kPartial ||
+                             status.value().state == StopStatusStateDTO::kFailed);
+    }));
+    const auto status = kernel.get_stop_status(stopped.value().stop_id);
+    ASSERT_TRUE(status.ok()) << status.error().message;
+    EXPECT_EQ(status.value().state, StopStatusStateDTO::kPartial);
+    ASSERT_TRUE(status.value().stop_certificate.has_value());
+    const auto certificate =
+        kernel.get_stop_certificate(status.value().stop_certificate->stop_certificate_id);
+    ASSERT_TRUE(certificate.ok()) << certificate.error().message;
+    EXPECT_EQ(certificate.value().result, StopCertificateResultDTO::kPartial);
+    ASSERT_TRUE(certificate.value().terminal_error.has_value());
+    EXPECT_EQ(certificate.value().terminal_error->details.at("reason"),
+              "participant_stop_settlement_mismatch");
+    EXPECT_EQ(engine.participant_stop_settlement_calls, 1);
+  }
 }
 
 TEST(ResourceAddressedExecutionKernelTest,

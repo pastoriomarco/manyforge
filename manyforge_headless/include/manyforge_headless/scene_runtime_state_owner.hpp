@@ -217,7 +217,8 @@ public:
   void Retire(std::string_view token, std::string reason);
 
   [[nodiscard]] PoseObservationAcceptance
-  ObservePose(PoseSourceObservation observation);
+  ObservePose(PoseSourceObservation observation,
+              std::string_view apply_policy = {});
 
   [[nodiscard]] SceneRuntimeStateSnapshot Snapshot() const;
 

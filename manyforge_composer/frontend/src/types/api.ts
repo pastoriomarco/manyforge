@@ -1426,6 +1426,22 @@ export type SceneRuntimeGoodObservationPayload =
     }
   | {
       api_version: 'manyforge.ros_pose_observation.v2';
+      kind: 'simulation_entity_pose_with_reference.v1';
+      pose: SceneRuntimeObservationPose;
+      /** Object pose relative to a gripper reference read at one source instant. */
+      reference: {
+        coherent: boolean;
+        entity: string;
+        link: string;
+        pose_in_reference: {
+          orientation_xyzw: QuaternionXyzwTuple;
+          position_m: Vector3Tuple;
+        } | null;
+      };
+      source: { entity: string };
+    }
+  | {
+      api_version: 'manyforge.ros_pose_observation.v2';
       kind: 'detection3d_pose';
       pose: SceneRuntimeObservationPose;
       source: {
@@ -1439,7 +1455,11 @@ export type SceneRuntimeGoodObservationPayload =
 
 export interface SceneRuntimeUnknownObservationPayload {
   api_version: 'manyforge.ros_pose_observation.v2';
-  kind: 'joint_state' | 'simulation_entity_pose' | 'detection3d_pose';
+  kind:
+    | 'joint_state'
+    | 'simulation_entity_pose'
+    | 'simulation_entity_pose_with_reference.v1'
+    | 'detection3d_pose';
   source_error: {
     code: string;
     detail: string;

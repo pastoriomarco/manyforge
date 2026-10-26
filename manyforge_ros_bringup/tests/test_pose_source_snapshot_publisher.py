@@ -380,6 +380,112 @@ def test_simulation_capture_waits_for_attached_private_executor_spin(
             rclpy.shutdown(context=context)
 
 
+def test_relative_reference_is_read_with_its_object_in_one_batch(
+    tmp_path: Path,
+) -> None:
+    from types import SimpleNamespace
+
+    from manyforge_ros.scene_mirror_probe import PoseSnapshot
+
+    gripper = (
+        "/World/ur10e_robotiq2f_140_ROS/ur10e_robotiq2f_140/"
+        "ee_link/robotiq_arg2f_base_link"
+    )
+    quarter = (0.0, 0.0, 2.0**-0.5, 2.0**-0.5)
+    batches: list[tuple[str, ...]] = []
+
+    class _BatchClient:
+        def capture_entity_states(self, *, entity_names):
+            batches.append(tuple(entity_names))
+            return SimpleNamespace(
+                errors=(),
+                entities=(
+                    SimpleNamespace(
+                        name=gripper,
+                        pose=PoseSnapshot(
+                            "robotiq_arg2f_base_link", None, (1.0, 0.0, 0.5), quarter
+                        ),
+                        errors=(),
+                    ),
+                    SimpleNamespace(
+                        name="/mac_n_cheese_centered",
+                        pose=PoseSnapshot(
+                            "mac_n_cheese_centered",
+                            None,
+                            (1.0, 0.02, 0.25),
+                            (0.0, 0.0, 0.0, 1.0),
+                        ),
+                        errors=(),
+                    ),
+                ),
+            )
+
+        def capture(self, **_kwargs: object) -> object:
+            raise AssertionError("a referenced poll must use the batch read")
+
+    context = Context()
+    rclpy.init(context=context)
+    dispatcher = _FakeDispatcher()
+    executor = SingleThreadedExecutor(context=context)
+    publisher = pose_source_snapshot_publisher.PoseSourceSnapshotPublisher(
+        site_config_path=(
+            _REPOSITORY_ROOT
+            / "manyforge_ros_bringup/config/isaac_ur10e_light.pose_observer.json"
+        ),
+        manager_run_root=tmp_path,
+        dispatcher_factory=lambda _root, _config, _callback: dispatcher,
+        simulation_client_factory=lambda _node, _timeout_s: _BatchClient(),
+        context=context,
+    )
+    spin_thread = threading.Thread(target=executor.spin, daemon=True)
+    try:
+        executor.add_node(publisher)
+        for auxiliary in publisher.auxiliary_nodes:
+            executor.add_node(auxiliary)
+        publisher.start()
+        spin_thread.start()
+        deadline = time.monotonic() + 2.0
+        while time.monotonic() < deadline and not any(
+            intent.object_id == "isaac_cheese_box" for intent in dispatcher.intents
+        ):
+            time.sleep(0.01)
+    finally:
+        assert publisher.stop()
+        for auxiliary in publisher.auxiliary_nodes:
+            executor.remove_node(auxiliary)
+            auxiliary.destroy_node()
+        executor.remove_node(publisher)
+        publisher.destroy_node()
+        executor.shutdown(timeout_sec=2.0)
+        spin_thread.join(timeout=2.0)
+        if context.ok():
+            rclpy.shutdown(context=context)
+
+    assert batches and batches[0] == (gripper, "/mac_n_cheese_centered")
+    cheese = next(
+        intent.payload_value()
+        for intent in dispatcher.intents
+        if intent.object_id == "isaac_cheese_box"
+    )
+    assert cheese["kind"] == "simulation_entity_pose_with_reference.v1"
+    assert cheese["pose"]["position_m"] == [1.0, 0.02, 0.25]
+    reference = cheese["reference"]
+    assert reference["coherent"] is True
+    assert reference["link"] == "robotiq_base_link"
+    assert reference["pose_in_reference"]["position_m"] == pytest.approx(
+        [0.02, 0.0, -0.25]
+    )
+    assert reference["pose_in_reference"]["orientation_xyzw"] == pytest.approx(
+        [0.0, 0.0, -(2.0**-0.5), 2.0**-0.5]
+    )
+    tcp = next(
+        intent.payload_value()
+        for intent in dispatcher.intents
+        if intent.policy_id == "viewer.measured_tcp"
+    )
+    assert tcp["kind"] == "simulation_entity_pose"
+
+
 def test_entrypoint_does_not_teardown_nodes_while_polling_worker_is_live(
     monkeypatch,
 ) -> None:
@@ -648,6 +754,14 @@ def test_retained_site_configs_preserve_historical_pose_source_contracts() -> No
             ("robotiq_arg2f_base_link", "universe", "universe"),
             ("mac_n_cheese_centered", "universe", "universe"),
         ]
+
+        cheese_reference = ur_config.simulation_entities[1].reference
+        if config_name == "isaac_ur10e_light.pose_observer.json":
+            assert cheese_reference is not None
+            assert cheese_reference.request.entity == rigid_gripper
+            assert cheese_reference.link == "robotiq_base_link"
+        else:
+            assert cheese_reference is None
 
     foundation = load_isaac_pose_observer_site_config(
         config_root / "isaac_lite6_trocar_foundationpose.pose_observer.json"

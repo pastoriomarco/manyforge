@@ -22,7 +22,11 @@ from manyforge_behavior.kernel_client import (
     KernelClientResponseError,
     KernelOperationAdmissionRejectedError,
 )
-from manyforge_behavior.orchestration_ports import OwnerTaskSettlementPendingError, OwnerTaskState
+from manyforge_behavior.orchestration_ports import (
+    OwnerTaskSettlementPendingError,
+    OwnerTaskState,
+    PoseSourceLatchError,
+)
 from manyforge_behavior.nodes.stop_policy import (
     OperatorMotionStopPolicy,
     OperatorMotionStopSnapshot,
@@ -49,6 +53,7 @@ from manyforge_behavior.production_ports import (
     NativeKernelProgramPort,
     ProductionPortError,
     ProgramMotionPreviewUnavailableError,
+    SimulationResetPoseSourceTaskPort,
     _owner_failure_message,
     program_motion_participant,
 )
@@ -3607,6 +3612,210 @@ def _scene_port(transport):
     return HeadlessSceneProgramPort(transport, program_node_evidence=captured_node)
 
 
+def _pose_latch_owner_response() -> dict[str, Any]:
+    return {
+        "api_version": "manyforge.manager_command_response.v1",
+        "cell_id": "cell-a",
+        "initialization_generation": 1,
+        "initialization_state": "ready",
+        "ok": True,
+        "runtime_identity": {
+            "retained_bundle_id": _DIGEST_B,
+            "graph_revision": _DIGEST_C,
+            "deployment_generation": 1,
+            "program_generation": 1,
+            "runtime_generation": 1,
+        },
+        "scene_runtime_owner_epoch": "scene-runtime.epoch.1",
+    }
+
+
+def _pose_latch_success_response(request: Mapping[str, Any]) -> dict[str, Any]:
+    projection = deepcopy(_SceneTransport().revision)
+    committed_projection = deepcopy(projection)
+    committed_projection["scene_revision"]["revision_id"] += 1
+    committed_projection["scene_revision"]["content_hash"] = _DIGEST_F
+    return {
+        "already_applied_observation_count": 0,
+        "api_version": "manyforge.manager_command_response.v1",
+        "committed_observation_count": 1,
+        "initial_projection_revision": projection,
+        "latched_observation_count": 1,
+        "ok": True,
+        "projection_revision": committed_projection,
+        "runtime_identity": deepcopy(request["expected_runtime_identity"]),
+        "scene_runtime_source_generation": 2,
+        "skipped_attached_observation_count": 0,
+    }
+
+
+def test_between_nodes_latch_sends_sorted_scope_and_accepts_authoritative_commit() -> None:
+    transport = _SceneTransport()
+    requests: list[dict[str, Any]] = []
+
+    def manager_command(request: dict[str, Any]) -> dict[str, Any]:
+        requests.append(deepcopy(request))
+        if request["command"] == "scene_runtime_owner_read":
+            return _pose_latch_owner_response()
+        assert request["command"] == "scene_runtime_latch_between_nodes"
+        return _pose_latch_success_response(request)
+
+    scene = HeadlessSceneProgramPort(transport, manager_command=manager_command)
+    scene.bind(_scene_context())
+
+    scene.latch_between_nodes(
+        _identity("latch"), scene_resource_ids=("alpha", "zeta")
+    )
+
+    assert requests[1] == {
+        "api_version": "manyforge.manager_command.v1",
+        "command": "scene_runtime_latch_between_nodes",
+        "expected_runtime_identity": _pose_latch_owner_response()["runtime_identity"],
+        "scene_resource_ids": ["alpha", "zeta"],
+    }
+
+
+def test_between_nodes_capture_uses_manager_scene_without_a_stale_pre_read() -> None:
+    class NoScenePreRead(_SceneTransport):
+        def scene(self):
+            raise AssertionError("between-nodes capture must not pre-read Scene")
+
+    def manager_command(request):
+        if request["command"] == "scene_runtime_owner_read":
+            return _pose_latch_owner_response()
+        assert "expected_projection_revision" not in request
+        result = _pose_latch_success_response(request)
+        result["initial_projection_revision"]["scene_revision"]["revision_id"] = 20
+        result["projection_revision"]["scene_revision"]["revision_id"] = 21
+        return result
+
+    scene = HeadlessSceneProgramPort(NoScenePreRead(), manager_command=manager_command)
+    scene.bind(_scene_context())
+    scene.latch_between_nodes(_identity("latch"), scene_resource_ids=("part",))
+
+
+@pytest.mark.parametrize("crossed", ["bundle", "scene", "revision"])
+def test_between_nodes_capture_retains_deployment_and_scene_fences(crossed) -> None:
+    def manager_command(request):
+        if request["command"] == "scene_runtime_owner_read":
+            return _pose_latch_owner_response()
+        result = _pose_latch_success_response(request)
+        if crossed == "bundle":
+            result["initial_projection_revision"]["retained_bundle_id"] = _DIGEST_A
+        elif crossed == "scene":
+            result["projection_revision"]["scene_revision"]["scene_id"] = _DIGEST_A
+        else:
+            result["initial_projection_revision"]["scene_revision"]["revision_id"] = 3
+        return result
+
+    scene = HeadlessSceneProgramPort(_SceneTransport(), manager_command=manager_command)
+    scene.bind(_scene_context())
+    with pytest.raises(PoseSourceLatchError):
+        scene.latch_between_nodes(_identity("latch"), scene_resource_ids=("part",))
+
+
+@pytest.mark.parametrize(
+    "latch_response,expected_reason",
+    [
+        ({"api_version": "manyforge.manager_command_response.v1", "ok": True},
+         "scene_runtime_latch_failed"),
+        (
+            {
+                "api_version": "manyforge.manager_command_response.v1",
+                "ok": False,
+                "error": {"code": "stale_scene_projection", "message": "stale"},
+            },
+            "stale_scene_projection",
+        ),
+    ],
+)
+def test_between_nodes_latch_malformed_or_refused_response_fails_before_motion_dispatch(
+    latch_response: Mapping[str, Any], expected_reason: str
+) -> None:
+    scene_transport = _SceneTransport()
+    latch_requests: list[dict[str, Any]] = []
+
+    def manager_command(request: dict[str, Any]) -> dict[str, Any]:
+        if request["command"] == "scene_runtime_owner_read":
+            return _pose_latch_owner_response()
+        latch_requests.append(deepcopy(request))
+        return deepcopy(dict(latch_response))
+
+    scene = HeadlessSceneProgramPort(
+        scene_transport, manager_command=manager_command
+    )
+    scene.bind(_scene_context())
+    kernel_transport = _Transport()
+    native = NativeKernelProgramPort(
+        KernelClient(kernel_transport),
+        scene_pose_source_latch=scene.latch_between_nodes,
+    )
+    native.bind(_context())
+    parameters = dict(_motion_inputs().parameters)
+    parameters["target_reference"] = {
+        "type": "scene_resource",
+        "scene_resource_id": "zeta",
+    }
+    parameters["offset_reference"] = {
+        "type": "scene_resource",
+        "scene_resource_id": "alpha",
+    }
+
+    with pytest.raises(PoseSourceLatchError) as error:
+        native.operations.start(
+            "motion.move_to_pose",
+            _identity("refused-motion"),
+            OwnerNodeInputs(parameters=parameters),
+        )
+
+    assert error.value.reason_code == "pose_source_apply_failed"
+    assert error.value.details == {"reason": expected_reason}
+    assert latch_requests[0]["scene_resource_ids"] == ["alpha", "zeta"]
+    assert kernel_transport.submissions == []
+
+
+def test_simulation_reset_latches_once_after_successful_terminal_observation() -> None:
+    class ResetTaskPort:
+        def __init__(self) -> None:
+            self.observed = OwnerTaskSnapshot(
+                task_id="reset-task.1", state=OwnerTaskState.SUCCEEDED
+            )
+
+        def start(self, _node_id, _identity, _inputs):
+            return OwnerTaskSnapshot(
+                task_id="reset-task.1", state=OwnerTaskState.ACTIVE
+            )
+
+        def observe(self, _task_id):
+            return self.observed
+
+        def cancel(self, _task_id, _identity):
+            pass
+
+        def acknowledge(self, _task_id, _identity):
+            pass
+
+    calls: list[tuple[NodeAttemptIdentity, Sequence[str] | None]] = []
+    scene = SimpleNamespace(
+        latch_between_nodes=lambda identity, *, scene_resource_ids: calls.append(
+            (identity, scene_resource_ids)
+        )
+    )
+    identity = _identity("reset")
+    reset = SimulationResetPoseSourceTaskPort(ResetTaskPort(), scene)
+
+    started = reset.start(
+        "simulation.reset", identity, OwnerNodeInputs(parameters={})
+    )
+    assert started.state is OwnerTaskState.ACTIVE
+    assert calls == []
+
+    terminal = reset.observe(started.task_id)
+
+    assert terminal.state is OwnerTaskState.SUCCEEDED
+    assert calls == [(identity, None)]
+
+
 def _scene_rejection(body, code, message):
     from manyforge_behavior.scene_client import SceneTransactionRejectedError
 
@@ -3625,6 +3834,35 @@ def _scene_rejection(body, code, message):
             "update_status": None,
         }
     )
+
+
+def _scene_compaction_no_effect_rejection(body, expected_owner_epoch):
+    error = _scene_rejection(
+        body,
+        "stale_request_owner_epoch",
+        "Scene request owner epoch changed during history compaction",
+    )
+    error.response["error"]["details"] = {
+        "reason": "scene_history_compaction_no_effect",
+        "previous_request_owner_epoch": body["request_context"]["request_owner_epoch"],
+        "expected_request_owner_epoch": expected_owner_epoch,
+    }
+    error.response["replay_status"] = "stale_request_owner_epoch"
+    return error
+
+
+def _scene_stale_owner_epoch_rejection(body, expected_owner_epoch):
+    """The owner's plain rejection when another writer compacted history."""
+    error = _scene_rejection(
+        body,
+        "stale_request_owner_epoch",
+        "scene request names a stale logical-owner epoch",
+    )
+    error.response["error"]["details"] = {
+        "expected_request_owner_epoch": expected_owner_epoch,
+    }
+    error.response["replay_status"] = "stale_request_owner_epoch"
+    return error
 
 
 def _authored_scene() -> list[dict[str, Any]]:
@@ -3788,6 +4026,77 @@ def test_scene_initialization_retries_no_effect_admission_race_with_new_identity
     assert rejected["request_context"]["request_id"] != committed["request_context"]["request_id"]
 
 
+def test_scene_initialization_retries_proven_compaction_epoch_rotation_once() -> None:
+    class _CompactionTransport(_SceneTransport):
+        def __init__(self) -> None:
+            super().__init__()
+            self.rejected_requests: list[dict[str, Any]] = []
+
+        def commit_scene_transaction(self, body: Mapping[str, Any]) -> dict[str, Any]:
+            if not self.rejected_requests:
+                request = deepcopy(dict(body))
+                self.rejected_requests.append(request)
+                expected_epoch = "scene-owner.epoch.compacted"
+                self.owner_epoch = expected_epoch
+                raise _scene_compaction_no_effect_rejection(body, expected_epoch)
+            assert body["request_context"]["request_owner_epoch"] == self.owner_epoch
+            return super().commit_scene_transaction(body)
+
+    transport = _CompactionTransport()
+    port = _scene_port(transport)
+
+    proof = port.prepare_initial_scene(_scene_context(), [_authored_scene()[0]])
+
+    assert len(transport.rejected_requests) == 1
+    assert len(transport.submissions) == 1
+    rejected = transport.rejected_requests[0]
+    committed = transport.submissions[0]
+    assert rejected["request_context"]["request_id"] != committed["request_context"]["request_id"]
+    assert rejected["request_context"]["request_owner_epoch"] == "scene-owner.epoch.1"
+    assert committed["request_context"]["request_owner_epoch"] == "scene-owner.epoch.compacted"
+    assert rejected["expected_projection_revision"] == committed["expected_projection_revision"]
+    # The proof names the prepared scene, not the owner epoch compaction rotates.
+    assert "scene_owner_epoch" not in proof
+
+
+@pytest.mark.parametrize("rejection", ["stale_request_owner_epoch", "stale_revision"])
+def test_scene_initialization_follows_observer_compaction_of_the_same_scene(rejection) -> None:
+    """Reset/run-start preparation continues across another writer's rotation."""
+
+    class _ObserverTransport(_SceneTransport):
+        def __init__(self) -> None:
+            super().__init__()
+            self.rejected_requests: list[dict[str, Any]] = []
+
+        def commit_scene_transaction(self, body: Mapping[str, Any]) -> dict[str, Any]:
+            if not self.rejected_requests:
+                self.rejected_requests.append(deepcopy(dict(body)))
+                # Pose-source commits advanced the revision and compacted.
+                self.owner_epoch = "scene-owner.epoch.compacted"
+                revision_id = self.revision["scene_revision"]["revision_id"] + 2
+                self.revision["scene_revision"] = {
+                    **self.revision["scene_revision"],
+                    "revision_id": revision_id,
+                    "content_hash": "sha256:" + f"{revision_id:064x}"[-64:],
+                }
+                if rejection == "stale_revision":
+                    raise _scene_rejection(body, "stale_revision", "revision advanced")
+                raise _scene_stale_owner_epoch_rejection(body, self.owner_epoch)
+            assert body["request_context"]["request_owner_epoch"] == self.owner_epoch
+            return super().commit_scene_transaction(body)
+
+    transport = _ObserverTransport()
+    port = _scene_port(transport)
+
+    proof = port.prepare_initial_scene(_scene_context(), [_authored_scene()[0]])
+
+    assert len(transport.rejected_requests) == 1
+    assert len(transport.submissions) == 1
+    committed = transport.submissions[0]
+    assert committed["request_context"]["request_owner_epoch"] == "scene-owner.epoch.compacted"
+    assert proof["scene_identity"]["scene_id"] == transport.revision["scene_revision"]["scene_id"]
+
+
 def test_scene_initialization_upserts_only_the_changed_authored_object() -> None:
     transport = _SceneTransport()
     scene = [_authored_scene()[0]]
@@ -3849,19 +4158,27 @@ def test_exact_cell_frame_initial_scene_is_a_read_only_fast_path(
     replacement.verify_initial_scene(_scene_context(), scene, proof)
 
 
-def test_prepared_scene_verification_rejects_an_intervening_owner_revision() -> None:
+def test_prepared_scene_verification_accepts_a_newer_revision_of_the_same_scene() -> None:
     transport = _SceneTransport()
     port = _scene_port(transport)
     context = _scene_context()
     scene = [_authored_scene()[0]]
     proof = port.prepare_initial_scene(context, scene)
+    # A continuous pose source advances the revision of the prepared scene.
     revision_id = transport.revision["scene_revision"]["revision_id"] + 1
+    scene_id = transport.revision["scene_revision"]["scene_id"]
     transport.revision["scene_revision"] = {
-        "scene_id": _DIGEST_D,
+        "scene_id": scene_id,
         "revision_id": revision_id,
         "content_hash": "sha256:" + f"{revision_id:064x}"[-64:],
     }
+    port.verify_initial_scene(context, scene, proof)
 
+    # A different scene is not the prepared one.
+    transport.revision["scene_revision"] = {
+        **transport.revision["scene_revision"],
+        "scene_id": _DIGEST_A if scene_id != _DIGEST_A else _DIGEST_B,
+    }
     with pytest.raises(ProductionPortError, match="changed before Program capture"):
         port.verify_initial_scene(context, scene, proof)
 
@@ -4270,6 +4587,175 @@ def test_scene_node_retries_a_concurrent_revision_with_one_correlation(
     )
 
 
+def test_scene_node_retries_one_proven_compaction_epoch_rotation() -> None:
+    class _CompactionTransport(_SceneTransport):
+        def __init__(self) -> None:
+            super().__init__()
+            self.reject_next_node = False
+            self.rejected_requests: list[dict[str, Any]] = []
+
+        def commit_scene_transaction(self, body: Mapping[str, Any]) -> dict[str, Any]:
+            if self.reject_next_node:
+                self.reject_next_node = False
+                self.rejected_requests.append(deepcopy(dict(body)))
+                expected_epoch = "scene-owner.epoch.compacted"
+                self.owner_epoch = expected_epoch
+                raise _scene_compaction_no_effect_rejection(body, expected_epoch)
+            assert body["request_context"]["request_owner_epoch"] == self.owner_epoch
+            return super().commit_scene_transaction(body)
+
+    transport = _CompactionTransport()
+    port = _scene_port(transport)
+    port.prepare_initial_scene(_scene_context(), _authored_scene())
+    transport.submissions.clear()
+    transport.reject_next_node = True
+
+    result = port.invoke(
+        "scene.attach_carried_object",
+        _identity("attach-after-compaction"),
+        OwnerNodeInputs(
+            parameters={
+                "scene_resource_id": "graspable",
+                "target_role": "arm",
+                "carrier_frame_role": "tcp",
+                "touch_body_roles": ["tool_collision"],
+            }
+        ),
+    )
+
+    assert result.succeeded is True
+    assert result.metadata["stale_revision_retry_count"] == 0
+    assert len(transport.rejected_requests) == 1
+    assert len(transport.submissions) == 1
+    rejected = transport.rejected_requests[0]
+    committed = transport.submissions[0]
+    assert rejected["request_context"]["request_id"] != committed["request_context"]["request_id"]
+    assert rejected["request_context"]["correlation_id"] == committed["request_context"]["correlation_id"]
+    assert rejected["request_context"]["request_owner_epoch"] == "scene-owner.epoch.1"
+    assert committed["request_context"]["request_owner_epoch"] == "scene-owner.epoch.compacted"
+    assert rejected["expected_projection_revision"] == committed["expected_projection_revision"]
+
+
+@pytest.mark.parametrize("receipt", ["observer_compaction", "foreign_epoch_detail"])
+def test_scene_node_retries_once_after_compaction_by_another_writer(receipt) -> None:
+    """A pose source's commit compacted history; this request had no effect."""
+
+    class _CompactionTransport(_SceneTransport):
+        def __init__(self) -> None:
+            super().__init__()
+            self.reject_next_node = False
+            self.rejected_requests: list[dict[str, Any]] = []
+
+        def commit_scene_transaction(self, body: Mapping[str, Any]) -> dict[str, Any]:
+            if self.reject_next_node:
+                self.reject_next_node = False
+                self.rejected_requests.append(deepcopy(dict(body)))
+                self.owner_epoch = "scene-owner.epoch.compacted"
+                # The observer's commits also advanced the revision.
+                revision_id = self.revision["scene_revision"]["revision_id"] + 3
+                self.revision["scene_revision"] = {
+                    **self.revision["scene_revision"],
+                    "revision_id": revision_id,
+                    "content_hash": "sha256:" + f"{revision_id:064x}"[-64:],
+                }
+                if receipt == "observer_compaction":
+                    raise _scene_stale_owner_epoch_rejection(body, self.owner_epoch)
+                # Details are not trusted; the re-read view names the epoch.
+                raise _scene_compaction_no_effect_rejection(body, "scene-owner.epoch.other")
+            assert body["request_context"]["request_owner_epoch"] == self.owner_epoch
+            return super().commit_scene_transaction(body)
+
+    transport = _CompactionTransport()
+    port = _scene_port(transport)
+    port.prepare_initial_scene(_scene_context(), _authored_scene())
+    transport.submissions.clear()
+    transport.reject_next_node = True
+
+    result = port.invoke(
+        "scene.attach_carried_object",
+        _identity(f"attach-after-{receipt}"),
+        OwnerNodeInputs(
+            parameters={
+                "scene_resource_id": "graspable",
+                "target_role": "arm",
+                "carrier_frame_role": "tcp",
+                "touch_body_roles": ["tool_collision"],
+            }
+        ),
+    )
+
+    assert result.succeeded is True
+    assert len(transport.rejected_requests) == 1
+    assert len(transport.submissions) == 1
+    rejected = transport.rejected_requests[0]
+    committed = transport.submissions[0]
+    assert rejected["request_context"]["request_id"] != committed["request_context"]["request_id"]
+    assert committed["request_context"]["request_owner_epoch"] == "scene-owner.epoch.compacted"
+    # The retry names the re-read (newer) revision of the same Scene.
+    assert (
+        committed["expected_projection_revision"]["scene_revision"]["revision_id"]
+        == rejected["expected_projection_revision"]["scene_revision"]["revision_id"] + 3
+    )
+
+
+@pytest.mark.parametrize("fault", ["effect_unproven", "scene_changed", "second_rotation"])
+def test_scene_node_blocks_unproven_or_repeated_compaction_epoch_rotation(fault) -> None:
+    class _CompactionTransport(_SceneTransport):
+        def __init__(self) -> None:
+            super().__init__()
+            self.rejected_requests: list[dict[str, Any]] = []
+            self.reject_compaction = False
+
+        def commit_scene_transaction(self, body: Mapping[str, Any]) -> dict[str, Any]:
+            if not self.reject_compaction:
+                return super().commit_scene_transaction(body)
+            request = deepcopy(dict(body))
+            self.rejected_requests.append(request)
+            old_epoch = self.owner_epoch
+            expected_epoch = f"scene-owner.epoch.compacted.{len(self.rejected_requests)}"
+            self.owner_epoch = expected_epoch
+            if fault == "scene_changed" and len(self.rejected_requests) == 1:
+                self.revision["scene_revision"] = {
+                    **self.revision["scene_revision"],
+                    "scene_id": _DIGEST_E,
+                }
+            error = _scene_stale_owner_epoch_rejection(body, expected_epoch)
+            if fault == "effect_unproven":
+                error.response["projection_status"] = "rejected_rollback_proven"
+            raise error
+
+    transport = _CompactionTransport()
+    port = _scene_port(transport)
+    port.prepare_initial_scene(_scene_context(), _authored_scene())
+    transport.submissions.clear()
+    transport.reject_compaction = True
+
+    result = port.invoke(
+        "scene.attach_carried_object",
+        _identity(f"attach-compaction-{fault}"),
+        OwnerNodeInputs(
+            parameters={
+                "scene_resource_id": "graspable",
+                "target_role": "arm",
+                "carrier_frame_role": "tcp",
+                "touch_body_roles": ["tool_collision"],
+            }
+        ),
+    )
+
+    assert result.succeeded is False
+    assert result.reason_code == "stale_request_owner_epoch"
+    assert not transport.submissions
+    if fault == "second_rotation":
+        assert len(transport.rejected_requests) == 2
+        assert (
+            transport.rejected_requests[0]["request_context"]["request_id"]
+            != transport.rejected_requests[1]["request_context"]["request_id"]
+        )
+    else:
+        assert len(transport.rejected_requests) == 1
+
+
 def test_scene_resource_relative_pose_is_forwarded_to_the_scene_owner() -> None:
     transport = _SceneTransport()
     port = _scene_port(transport)
@@ -4330,6 +4816,7 @@ def test_scene_object_pose_is_a_read_of_owner_truth_never_a_transaction() -> Non
         def __init__(self) -> None:
             super().__init__(populated=True)
             self.queries: list[dict[str, Any]] = []
+            self.response_revision: dict[str, Any] | None = None
 
         def scene(self) -> dict[str, Any]:
             projection = super().scene()
@@ -4341,7 +4828,7 @@ def test_scene_object_pose_is_a_read_of_owner_truth_never_a_transaction() -> Non
             self.queries.append(deepcopy(dict(body)))
             return {
                 "api_version": "manyforge.scene_resource_pose_response.v1",
-                "projection_revision": deepcopy(self.revision),
+                "projection_revision": deepcopy(self.response_revision or self.revision),
                 "poses": [
                     {
                         "scene_resource_id": body["scene_resource_ids"][0],
@@ -4385,6 +4872,30 @@ def test_scene_object_pose_is_a_read_of_owner_truth_never_a_transaction() -> Non
             "scene_resource_ids": ["old-part"],
         }
     ]
+    # A pose-source commit between the read and the query: the owner answers
+    # from a newer revision of the same Scene, which is the latest truth.
+    scene_revision = transport.revision["scene_revision"]
+    transport.response_revision = {
+        **transport.revision,
+        "scene_revision": {
+            **scene_revision,
+            "revision_id": scene_revision["revision_id"] + 1,
+            "content_hash": _DIGEST_F,
+        },
+    }
+    assert read("old-part").succeeded is True
+    for foreign in (
+        {**transport.revision, "graph_revision": _DIGEST_F},
+        {
+            **transport.revision,
+            "scene_revision": {**scene_revision, "content_hash": _DIGEST_F},
+        },
+    ):
+        transport.response_revision = foreign
+        changed = read("old-part")
+        assert changed.succeeded is False
+        assert "changed owner revision" in changed.message
+    transport.response_revision = None
     absent = read("missing")
     assert absent.succeeded is False
     assert "absent from the logical scene" in absent.message

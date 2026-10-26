@@ -631,7 +631,7 @@ function receiveControlSnapshot(
 
 function wireObservation(sequence: number): Record<string, unknown> {
   return {
-    schema_version: 'manyforge.execution_observation_frame.v3',
+    schema_version: 'manyforge.execution_observation_frame.v4',
     owner_epoch: 'execution-owner.1',
     cell_id: 'cell-1',
     retained_bundle_id: 'bundle-1',
@@ -646,6 +646,7 @@ function wireObservation(sequence: number): Record<string, unknown> {
       source_joint_names: ['joint1'], compiled_joint_names: ['robot__joint1'],
       coordinate_kinds: ['angular'], positions_si: [sequence / 100],
     }],
+    measured_targets: [],
   };
 }
 
@@ -1122,6 +1123,17 @@ describe('HeadlessStateSource delivery scheduling', () => {
     expect(parseExecutionObservationFrame(empty).targets).toEqual([]);
     expect(parseExecutionObservationFrame(wireObservation(5)).targets[0].operationCapabilityId)
       .toBe('execution.trajectory.execute');
+    // Measured comparison rows use the target shape and validation.
+    const measured = wireObservation(6);
+    const row = { ...(measured.targets as Record<string, unknown>[])[0], positions_si: [0.5] };
+    measured.measured_targets = [row];
+    expect(parseExecutionObservationFrame(measured).measuredTargets).toMatchObject([
+      { commandTargetId: 'arm', positionsSi: [0.5] },
+    ]);
+    measured.measured_targets = [row, row];
+    expect(() => parseExecutionObservationFrame(measured)).toThrow(/overlap/);
+    delete measured.measured_targets;
+    expect(() => parseExecutionObservationFrame(measured)).toThrow(/shape/);
   });
 
   it('uses the same UTF-8 identity byte bounds as the owner and proxy', () => {

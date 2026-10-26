@@ -274,6 +274,25 @@ def control_shell_fact_key(shell: dict[str, Any], name: str) -> Any:
     return shell.get(name)
 
 
+def _execution_pair_identity(response: dict[str, Any]) -> Any:
+    """The execution identity that binds a targets/control pair.
+
+    The same owner, publication and product at any revision of the same
+    Scene: continuous pose sources advance the Scene revision between the
+    two sequential reads without changing what either describes.
+    """
+    identity = response.get("identity")
+    if not isinstance(identity, dict):
+        return identity
+    scene = identity.get("scene_revision")
+    return {
+        **identity,
+        "scene_revision": (
+            scene.get("scene_id") if isinstance(scene, dict) else scene
+        ),
+    }
+
+
 def _shell_key(shell: dict[str, Any]) -> tuple[Any, ...]:
     return (
         control_shell_fact_key(shell, "runtime"),
@@ -1370,9 +1389,14 @@ class HeadlessControlStateSource:
             or control is None
             or targets.get("ok") is not True
             or control.get("ok") is not True
-            or targets.get("identity") != control.get("identity")
+            or _execution_pair_identity(targets) != _execution_pair_identity(control)
         ):
             targets = control = None
+        elif targets.get("identity") != control.get("identity"):
+            # Only the Scene revision differs: a pose-source commit landed
+            # between the two reads. Targets do not depend on it, so publish
+            # the pair under the later (control) read's identity.
+            targets = {**targets, "identity": control["identity"]}
         return {
             "runtime": dict(facts.runtime),
             "alarms": dict(facts.alarms),

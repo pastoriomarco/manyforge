@@ -620,7 +620,7 @@ Result<PickCandidateSearchOutcomeDTO> AddressedPickCandidatePlanner::Search(
     }
     auto candidate_request = request.attach_preview_request;
     candidate_request.frame_resolution = std::move(frame.value());
-    auto attached = scene_.PreviewResolvedSceneCandidate(candidate_request);
+    auto attached = scene_.PreviewResolvedSceneCandidate(candidate_request, predecessor);
     if (!attached.ok()) {
       report.stages.push_back(
           failed_stage(PickCandidateStageDTO::kCandidateAttach, attached.error()));
@@ -803,7 +803,7 @@ Result<PlacePlanningOutcomeDTO> AddressedPlacePlanner::Plan(PlacePlanningRequest
   candidate_detach->pose = attachment->pose_in_carrier_frame;
   candidate_detach->frame_ref =
       ToSceneTransactionFrameRef(attachment->carrier_frame_ref);
-  auto detached = scene_.PreviewResolvedSceneCandidate(candidate_request);
+  auto detached = scene_.PreviewResolvedSceneCandidate(candidate_request, predecessor);
   if (!detached.ok()) {
     report.stages.push_back(
         failed_stage(PickCandidateStageDTO::kCandidateDetach, detached.error()));

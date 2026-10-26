@@ -45,6 +45,8 @@ from manyforge_ros.pose_source_sidecar import (
     capture_simulation_entity_poses,
     normalize_detection3d_array_message,
     normalize_joint_state_message,
+    read_simulation_entity_states,
+    relative_pose,
 )
 from manyforge_ros.scene_mirror_probe import SimulationSceneMirrorClient
 
@@ -363,10 +365,28 @@ class PoseSourceSnapshotPublisher(Node):
         self,
         binding: SimulationEntityBinding,
         observation: Any,
+        *,
+        reference_poses: dict[str, Any] | None = None,
+        coherent: bool = False,
     ) -> None:
         try:
+            pose_in_reference = None
+            if binding.reference is not None and reference_poses:
+                reference = reference_poses.get(binding.reference.request.entity)
+                if reference is not None:
+                    try:
+                        pose_in_reference = relative_pose(
+                            reference, observation.pose
+                        )
+                    except ValueError:
+                        pose_in_reference = None
             self._dispatcher.submit(
-                simulation_entity_observation_intent(binding, observation)
+                simulation_entity_observation_intent(
+                    binding,
+                    observation,
+                    pose_in_reference=pose_in_reference,
+                    coherent=coherent,
+                )
             )
         except ObservationNormalizationError as error:
             self._submit_unknown(
@@ -405,6 +425,20 @@ class PoseSourceSnapshotPublisher(Node):
         requests = tuple(
             binding.request for binding in self._config.simulation_entities
         )
+        # Gripper references are read in the same coherent batch as the
+        # objects, so each relative pose is from one simulator instant.
+        reference_requests = tuple(
+            {
+                binding.reference.request.entity: binding.reference.request
+                for binding in self._config.simulation_entities
+                if binding.reference is not None
+            }.values()
+        )
+        read_entities = tuple(
+            dict.fromkeys(
+                request.entity for request in requests + reference_requests
+            )
+        )
         while not self._stop_event.is_set():
             # ``start()`` runs immediately before the entrypoint begins
             # spinning its already-attached executor.  Do not let the
@@ -423,11 +457,33 @@ class PoseSourceSnapshotPublisher(Node):
                 continue
             started = time.monotonic()
             try:
+                lookup_time = Time()
+                snapshot = None
+                coherent = False
+                reference_poses: dict[str, Any] = {}
+                if reference_requests:
+                    snapshot, coherent = read_simulation_entity_states(
+                        self._simulation_client, read_entities, coherent=True
+                    )
+                    reference_batch = capture_simulation_entity_poses(
+                        self._simulation_client,
+                        reference_requests,
+                        tf_buffer=self._tf_buffer,
+                        lookup_time=lookup_time,
+                        snapshot=snapshot,
+                    )
+                    reference_poses = {
+                        observation.entity: observation.pose
+                        for observation in reference_batch.observations
+                    }
+                    for failure in reference_batch.failures:
+                        self._log_source_failure(failure)
                 batch = capture_simulation_entity_poses(
                     self._simulation_client,
                     requests,
                     tf_buffer=self._tf_buffer,
-                    lookup_time=Time(),
+                    lookup_time=lookup_time,
+                    snapshot=snapshot,
                 )
                 if self._stop_event.is_set():
                     break
@@ -437,7 +493,12 @@ class PoseSourceSnapshotPublisher(Node):
                     observed_entities.add(observation.entity)
                     binding = bindings_by_entity.get(observation.entity)
                     if binding is not None:
-                        self._submit_simulation(binding, observation)
+                        self._submit_simulation(
+                            binding,
+                            observation,
+                            reference_poses=reference_poses,
+                            coherent=coherent,
+                        )
                 for failure in batch.failures:
                     binding = bindings_by_entity.get(failure.source_key)
                     if binding is None:

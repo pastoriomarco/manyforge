@@ -601,10 +601,10 @@ RetainedCollisionWorldProjector::project(
         return projection_error(
             "carried scene resource has no exact attachment row");
       }
-      if (object.provider_evidence.has_value()) {
-        return projection_error(
-            "carried scene resource retains provider pose authority");
-      }
+      // A `continuous` pose source may keep updating a carried object's
+      // carrier-relative pose; its evidence is provenance only here. The
+      // carried pose is the attachment's, and it never becomes a freshness-
+      // checked snapshot obstacle (see below and project_live_objects).
       const auto* target =
           find_target(model_map_, attachment->controllable_component_id,
                       attachment->command_target_id);
@@ -657,7 +657,8 @@ RetainedCollisionWorldProjector::project(
         body.frame_id = model_map_.compiled_cell_frame_name;
         body.pose = fixed->pose_in_cell;
       }
-      if (!carried_parent.has_value() && object.provider_evidence.has_value()) {
+      if (!carried_parent.has_value() && object.provider_evidence.has_value() &&
+          object.provider_evidence->source_freshness_budget_ns.has_value()) {
         body.source_id = object.provider_evidence->provider_instance_id.value();
         body.source_timestamp_ns = object.provider_evidence->received_at_ns;
         body.source_freshness_budget_ns =
@@ -709,15 +710,14 @@ RetainedCollisionWorldProjector::project_live_objects(
         core::logical_scene_identity::ComputeSceneObjectCollisionIdentity(
             object, logical_scene.cell_id)
             .value();
-    if (const auto* fixed =
-            std::get_if<core::CellFixedSceneObjectPlacementDTO>(
-                &object.placement)) {
+    const auto* fixed =
+        std::get_if<core::CellFixedSceneObjectPlacementDTO>(&object.placement);
+    if (fixed != nullptr) {
       live.pose = fixed->pose_in_cell;
-      live.declared_role = core::ObservedSceneObjectRole::kStaticObstacle;
-    } else {
-      live.declared_role = core::ObservedSceneObjectRole::kAttachedObject;
     }
-    if (object.provider_evidence.has_value()) {
+    // A carried object's provider evidence is provenance only; it carries no
+    // freshness fields.
+    if (object.provider_evidence.has_value() && fixed != nullptr) {
       const auto& evidence = *object.provider_evidence;
       live.source_id = evidence.provider_instance_id.value() + "@" +
                        evidence.provider_source_epoch;
@@ -728,10 +728,6 @@ RetainedCollisionWorldProjector::project_live_objects(
       live.source_timestamp_ns = evidence.received_at_ns;
       live.source_freshness_budget_ns =
           evidence.source_freshness_budget_ns;
-      // The operation may identify this exact object as its observed target;
-      // otherwise the Kernel treats it as a snapshot obstacle and enforces
-      // freshness. Do not hard-code either role here.
-      live.declared_role.reset();
     }
     result.push_back(std::move(live));
   }

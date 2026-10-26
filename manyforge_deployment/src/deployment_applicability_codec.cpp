@@ -1,4 +1,5 @@
 #include "manyforge_deployment/deployment_applicability_codec.hpp"
+#include "manyforge_deployment/scene_pose_source_policy_codec.hpp"
 
 #include <algorithm>
 #include <array>
@@ -1459,7 +1460,9 @@ encode_external_resources(const std::vector<ExternalResourceDTO> &values) {
     const CanonicalValue &interrupt_config,
     const std::optional<double> motion_takeover_preparation_budget_s,
     const std::optional<double> motion_takeover_planning_budget_s,
-    const CanonicalValue *interrupt_rules = nullptr) {
+    const CanonicalValue *interrupt_rules = nullptr,
+    const std::vector<core::ScenePoseSourcePolicyDTO> &scene_pose_sources =
+        {}) {
   CanonicalValue::Object result{
       {"retained_policy_records",
        encode_retained_policy_records(retained_policy_records)},
@@ -1482,6 +1485,9 @@ encode_external_resources(const std::vector<ExternalResourceDTO> &values) {
     result.emplace_back("motion_takeover_planning_budget_s",
                         CanonicalValue(*motion_takeover_planning_budget_s));
   }
+  if (!scene_pose_sources.empty())
+    result.emplace_back("scene_pose_sources",
+                        EncodeScenePoseSources(scene_pose_sources));
   return CanonicalValue(std::move(result));
 }
 
@@ -2656,6 +2662,7 @@ decode_deployment_applicability_inputs_candidate(
   std::vector<core::CatalogRecordRefDTO> retained_policy_records;
   std::optional<double> motion_takeover_preparation_budget_s;
   std::optional<double> motion_takeover_planning_budget_s;
+  std::vector<core::ScenePoseSourcePolicyDTO> scene_pose_sources;
   std::optional<CanonicalValue> normalized_policies;
   const CanonicalValue *policies_value = find_member(root, "policies");
   if (policies_value != nullptr) {
@@ -2666,8 +2673,10 @@ decode_deployment_applicability_inputs_candidate(
                            "interrupt_policies", "interrupt_config"},
                           {"motion_takeover_preparation_budget_s",
                            "motion_takeover_planning_budget_s",
-                           "interrupt_rules"},
+                           "interrupt_rules", "scene_pose_sources"},
                           "$.policies");
+    if (const auto *sources = find_member(policies, "scene_pose_sources"))
+      scene_pose_sources = DecodeScenePoseSources(*sources);
     if (const auto *budget =
             find_member(policies, "motion_takeover_preparation_budget_s")) {
       constexpr auto path = "$.policies.motion_takeover_preparation_budget_s";
@@ -2735,7 +2744,7 @@ decode_deployment_applicability_inputs_candidate(
         retained_policy_records, normalized_interrupt_sources,
         normalized_interrupt_policies, interrupt_config,
         motion_takeover_preparation_budget_s, motion_takeover_planning_budget_s,
-        &normalized_interrupt_rules);
+        &normalized_interrupt_rules, scene_pose_sources);
   }
 
   std::optional<SiteOverlayRefDTO> site_overlay_ref;
@@ -2767,6 +2776,7 @@ decode_deployment_applicability_inputs_candidate(
       std::move(retained_policy_records),
       motion_takeover_preparation_budget_s,
       motion_takeover_planning_budget_s,
+      std::move(scene_pose_sources),
   };
   CanonicalValue normalized_desired =
       encode_desired_configurations(value.desired_control_configurations);
@@ -2829,7 +2839,8 @@ compute_capability_provider_binding_revisions(
         require_normalized_policy_member("interrupt_config"),
         value.motion_takeover_preparation_budget_s,
         value.motion_takeover_planning_budget_s,
-        candidate.normalized_policies()->find_object_member("interrupt_rules"));
+        candidate.normalized_policies()->find_object_member("interrupt_rules"),
+        value.scene_pose_sources);
   }
 
   return RevisionVerifiedDeploymentApplicabilityInputs(

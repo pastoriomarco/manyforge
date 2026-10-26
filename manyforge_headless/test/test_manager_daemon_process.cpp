@@ -1630,6 +1630,37 @@ std::string ScenePoseRequest(const SourceSnapshot &scene_source,
   }));
 }
 
+// The active projection with its Scene revision advanced by one: a request
+// naming a revision the owner has not reached.
+std::string ScenePoseRequestAheadOfOwner(const SourceSnapshot &scene_source,
+                                         const std::string_view scene_resource_id) {
+  using content_identity::CanonicalValue;
+  const auto &projection = RequiredMember(
+      RequiredMember(scene_source.payload, "access"), "active_projection");
+  const auto &scene = RequiredMember(projection, "scene_revision");
+  return content_identity::canonical_json(CanonicalValue(CanonicalValue::Object{
+      {"api_version", CanonicalValue("manyforge.manager_command.v1")},
+      {"command", CanonicalValue("scene_pose_query")},
+      {"expected_projection_revision",
+       CanonicalValue(CanonicalValue::Object{
+           {"graph_revision", RequiredMember(projection, "graph_revision")},
+           {"retained_bundle_id",
+            RequiredMember(projection, "retained_bundle_id")},
+           {"scene_revision",
+            CanonicalValue(CanonicalValue::Object{
+                {"content_hash", RequiredMember(scene, "content_hash")},
+                {"revision_id",
+                 CanonicalValue(
+                     RequiredMember(scene, "revision_id").as_number() + 1.0)},
+                {"scene_id", RequiredMember(scene, "scene_id")},
+            })},
+       })},
+      {"scene_resource_ids", CanonicalValue(CanonicalValue::Array{
+                                 CanonicalValue(std::string(scene_resource_id)),
+                             })},
+  }));
+}
+
 std::string
 ScenePreviewRequest(const SourceSnapshot &scene_source,
                     const std::string_view request_id,
@@ -1781,14 +1812,11 @@ std::string SceneRuntimePoseObserveRequest(
 
 std::string SceneRuntimeBeforePlanningLatchRequest(
     const SourceSnapshot &scene_runtime_source,
-    const SourceSnapshot &scene_source) {
+    const SourceSnapshot &) {
   using content_identity::CanonicalValue;
-  const auto &projection = RequiredMember(
-      RequiredMember(scene_source.payload, "access"), "active_projection");
   return content_identity::canonical_json(CanonicalValue(CanonicalValue::Object{
       {"api_version", CanonicalValue("manyforge.manager_command.v1")},
       {"command", CanonicalValue("scene_runtime_latch_before_planning")},
-      {"expected_projection_revision", projection},
       {"expected_runtime_identity",
        SceneRuntimeIdentityValue(scene_runtime_source)},
   }));
@@ -2254,6 +2282,51 @@ TEST(ManagerDaemonProcess,
     EXPECT_NE(owner_read.find("\"runtime_identity\":"), std::string::npos);
     EXPECT_EQ(owner_read.find("\"pose_sources\":"), std::string::npos);
 
+    auto between_request =
+        deployment::parse_strict_json_model_yaml(
+            SceneRuntimeBeforePlanningLatchRequest(*initial, *initial_scene))
+            .root();
+    auto between_fields = between_request.as_object();
+    for (auto &[name, value] : between_fields)
+      if (name == "command")
+        value = content_identity::CanonicalValue(
+            "scene_runtime_latch_between_nodes");
+    std::erase_if(between_fields, [](const auto &entry) {
+      return entry.first == "expected_projection_revision";
+    });
+    const auto between =
+        SendCommand(directory.socket_path(),
+                    content_identity::canonical_json(
+                        content_identity::CanonicalValue(between_fields)));
+    EXPECT_NE(between.find("\"ok\":true"), std::string::npos) << between;
+    EXPECT_NE(between.find("\"latched_observation_count\":0"),
+              std::string::npos)
+        << between;
+    between_fields.emplace_back(
+        "scene_resource_ids",
+        content_identity::CanonicalValue(
+            content_identity::CanonicalValue::Array{
+                content_identity::CanonicalValue("scene_object")}));
+    const auto scoped =
+        SendCommand(directory.socket_path(),
+                    content_identity::canonical_json(
+                        content_identity::CanonicalValue(between_fields)));
+    EXPECT_NE(scoped.find("\"ok\":true"), std::string::npos) << scoped;
+    EXPECT_NE(scoped.find("\"latched_observation_count\":0"), std::string::npos)
+        << scoped;
+
+    auto crossed_between = between_fields;
+    for (auto &[name, value] : crossed_between)
+      if (name == "expected_runtime_identity")
+        value = DifferentSceneRuntimeIdentityValue(*initial);
+    const auto crossed_latch =
+        SendCommand(directory.socket_path(),
+                    content_identity::canonical_json(
+                        content_identity::CanonicalValue(crossed_between)));
+    EXPECT_NE(crossed_latch.find("scene_runtime_identity_changed"),
+              std::string::npos)
+        << crossed_latch;
+
     const auto opened_first = SendCommand(
         directory.socket_path(),
         SceneRuntimeObserverOpenRequest(*initial, "observer-epoch-1"));
@@ -2359,6 +2432,12 @@ TEST(ManagerDaemonProcess,
                         "scene-process-box", "before_planning", true));
     EXPECT_NE(before_planning_open.find("\"ok\":true"), std::string::npos)
         << before_planning_open;
+    const auto never_seen_latch = SendCommand(
+        directory.socket_path(),
+        SceneRuntimeBeforePlanningLatchRequest(*initial, *initial_scene));
+    EXPECT_NE(never_seen_latch.find("scene_runtime_pose_observation_missing"),
+              std::string::npos)
+        << never_seen_latch;
     const auto added_object = SendCommand(
         directory.socket_path(),
         SceneAddRequest(*initial_scene, "scene-runtime-planning-object.1", 1U));
@@ -2653,6 +2732,14 @@ TEST(ManagerDaemonProcess,
                   "\"details\":{\"scene_resource_id\":\"scene-process-box\"}"),
               std::string::npos)
         << stale_pose;
+    // The owner resolves against its current projection, a same or newer
+    // revision of the expected Scene; one it has not reached is refused.
+    const auto ahead_pose = SendCommand(
+        directory.socket_path(),
+        ScenePoseRequestAheadOfOwner(*published, "scene-process-box"));
+    EXPECT_NE(ahead_pose.find("\"scene_projection_changed\""),
+              std::string::npos)
+        << ahead_pose;
     const auto absent_pose = SendCommand(
         directory.socket_path(), ScenePoseRequest(*published, "absent-object"));
     EXPECT_NE(absent_pose.find("\"object_not_found\""), std::string::npos);

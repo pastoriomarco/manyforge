@@ -58,6 +58,7 @@ from manyforge_behavior.production_ports import (
     NativeKernelProgramPort,
     ProductionPortError,
     ProgramMotionPreviewUnavailableError,
+    SimulationResetPoseSourceTaskPort,
 )
 from manyforge_behavior.program_run_owner import (
     PROGRAM_RESET_STOP_REASON,
@@ -97,6 +98,7 @@ from manyforge_headless_api.cell_admission import (
     CellAdmissionError,
     cell_admission_owner_epoch_reconciliation_evidence_digest,
 )
+from manyforge_headless_api.manager import ManagerCommandClient
 from .cycle_journal import (
     ProgramCycleJournal,
     ProgramCycleJournalVersionError,
@@ -471,6 +473,17 @@ class ProgramRuntime:
             config.headless_url,
             timeout_seconds=config.headless_timeout_seconds,
         )
+        # Production launchers place the Runner liveness socket beside
+        # Manager's command socket in the explicitly supplied manager-run root.
+        # Reuse that proven root; never infer a Manager endpoint from cwd.
+        self._manager_commands = (
+            None
+            if config.manager_liveness_socket is None
+            else ManagerCommandClient(
+                config.manager_liveness_socket.parent,
+                timeout_seconds=min(config.headless_timeout_seconds, 5.0),
+            )
+        )
         if execution_transport is None:
             if config.execution_run_root is None:
                 raise ValueError(
@@ -482,6 +495,13 @@ class ProgramRuntime:
             )
         self._kernel = KernelClient(execution_transport)
         self._execution_transport = execution_transport
+        self._scene = HeadlessSceneProgramPort(
+            self._headless,
+            manager_command=(
+                None if self._manager_commands is None else self._manager_commands._exchange
+            ),
+            program_node_evidence=self._program_node_admission_evidence,
+        )
         read_rule_states = getattr(execution_transport, "read_interrupt_rule_state_events", None)
         if callable(read_rule_states):
             self._interrupt_state_mirror = InterruptRuleStateMirror(
@@ -520,10 +540,17 @@ class ProgramRuntime:
                 if self._interrupt_state_mirror is None
                 else self._interrupt_state_mirror.stop_terminal
             ),
+            scene_pose_source_latch=(
+                None
+                if self._manager_commands is None
+                else self._scene.latch_between_nodes
+            ),
         )
-        self._scene = HeadlessSceneProgramPort(
-            self._headless, program_node_evidence=self._program_node_admission_evidence
-        )
+        simulator_control_port = self._simulation_control
+        if self._manager_commands is not None and simulator_control_port is not None:
+            simulator_control_port = SimulationResetPoseSourceTaskPort(
+                simulator_control_port, self._scene
+            )
         self._assistant = (
             None
             if model_transport is None
@@ -560,7 +587,7 @@ class ProgramRuntime:
             mock_simulation=self._native.mock_simulation,
             scene_transactions=self._scene,
             assistant_requests=self._assistant,
-            simulator_control=self._simulation_control,
+            simulator_control=simulator_control_port,
             program_run_scope=self._native.scope,
             program_run_context=CompositeProgramRunContextPort(*context_members),
             program_interventions=self._interventions,

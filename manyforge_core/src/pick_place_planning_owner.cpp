@@ -84,7 +84,10 @@ template <typename T>
       !same_program_context(approach, descend) || !same_program_context(approach, tool) ||
       !same_program_context(approach, retreat) || !same_motion_target(approach, descend) ||
       !same_motion_target(approach, retreat) || !approach.expected_scene_revision.has_value() ||
-      *approach.expected_scene_revision != current_projection.scene_revision ||
+      !ProjectionIsSameOrForwardInLineage(
+          current_projection,
+          {approach.expected_retained_bundle_id, approach.expected_graph_revision,
+           *approach.expected_scene_revision}) ||
       approach.expected_graph_revision != current_projection.graph_revision ||
       approach.expected_retained_bundle_id != current_projection.retained_bundle_id) {
     return planning_error<void>("pick_place_public_intent_invalid",
@@ -446,20 +449,17 @@ Result<ProjectionRevisionDTO> AddressedPickPlacePlanningOwner::SynchronizePlanni
   if (!synchronized.ok()) {
     return Result<ProjectionRevisionDTO>::Err(synchronized.error());
   }
-  const auto current = scene_.CurrentProjectionRevision();
-  if (!current.valid() || current != synchronized.value() ||
-      current.retained_bundle_id != predecessor.retained_bundle_id ||
-      current.graph_revision != predecessor.graph_revision ||
-      current.scene_revision.scene_id != predecessor.scene_revision.scene_id) {
+  if (!ProjectionIsSameOrForwardInLineage(synchronized.value(), predecessor)) {
     return planning_error<ProjectionRevisionDTO>(
         "planning_scene_synchronization_raced",
-        "pick/place scene changed outside the owner-coordinated latch",
+        "pick/place capture does not include the requested Scene",
         ErrorCode::kSceneChangedDuringValidation);
   }
   for (auto* const operation : {&approach, &descend, &tool, &retreat}) {
-    operation->expected_scene_revision = current.scene_revision;
+    operation->expected_scene_revision = synchronized.value().scene_revision;
   }
-  return Result<ProjectionRevisionDTO>::Ok(current);
+  return synchronized;
+
 }
 
 Result<PickPlacePlanningResultDTO> AddressedPickPlacePlanningOwner::PlanPick(
@@ -499,7 +499,24 @@ Result<PickPlacePlanningResultDTO> AddressedPickPlacePlanningOwner::PlanPick(
   if (!synchronized.ok()) {
     return Result<PickPlacePlanningResultDTO>::Err(synchronized.error());
   }
-  const auto planning_projection = synchronized.value();
+  const ProjectionLeaseId predecessor_lease("pick-place:" + intent.sequence_id + ":predecessor");
+  auto predecessor = projection_.RetainCurrentProjection(predecessor_lease);
+  if (!predecessor.ok()) {
+    return Result<PickPlacePlanningResultDTO>::Err(predecessor.error());
+  }
+  ProjectionLeaseGuard release{projection_, predecessor_lease};
+  const auto planning_projection = predecessor.value().projection_binding.projection_revision;
+  if (!ProjectionIsSameOrForwardInLineage(planning_projection, synchronized.value()) ||
+      !exact_predecessor(predecessor.value(), planning_projection, predecessor_lease)) {
+    return planning_error<PickPlacePlanningResultDTO>(
+        "pick_predecessor_projection_stale",
+        "retained planning projection does not include the pose capture",
+        ErrorCode::kSceneChangedDuringValidation);
+  }
+  for (auto* const operation : {&intent.approach_operation, &intent.descend_operation,
+                                 &intent.tool_operation, &intent.retreat_operation}) {
+    operation->expected_scene_revision = planning_projection.scene_revision;
+  }
   common =
       validate_common(intent.sequence_id, intent.selected_object_id, intent.carrier_frame_role_id,
                       intent.approach_operation, intent.descend_operation, intent.tool_operation,
@@ -537,18 +554,6 @@ Result<PickPlacePlanningResultDTO> AddressedPickPlacePlanningOwner::PlanPick(
     return Result<PickPlacePlanningResultDTO>::Err(roles.error());
   }
 
-  const ProjectionLeaseId predecessor_lease("pick-place:" + intent.sequence_id + ":predecessor");
-  auto predecessor = projection_.RetainProjection(planning_projection, predecessor_lease);
-  if (!predecessor.ok()) {
-    return Result<PickPlacePlanningResultDTO>::Err(predecessor.error());
-  }
-  ProjectionLeaseGuard release{projection_, predecessor_lease};
-  if (!exact_predecessor(predecessor.value(), planning_projection, predecessor_lease)) {
-    return planning_error<PickPlacePlanningResultDTO>(
-        "pick_predecessor_projection_stale",
-        "retained pick projection differs from current scene truth",
-        ErrorCode::kSceneChangedDuringValidation);
-  }
   const auto* selected = find_object(*predecessor.value().logical_scene, intent.selected_object_id);
   if (selected == nullptr ||
       !std::holds_alternative<CellFixedSceneObjectPlacementDTO>(selected->placement)) {
@@ -677,7 +682,24 @@ Result<PickPlacePlanningResultDTO> AddressedPickPlacePlanningOwner::PlanPlace(
   if (!synchronized.ok()) {
     return Result<PickPlacePlanningResultDTO>::Err(synchronized.error());
   }
-  const auto planning_projection = synchronized.value();
+  const ProjectionLeaseId predecessor_lease("pick-place:" + intent.sequence_id + ":predecessor");
+  auto predecessor = projection_.RetainCurrentProjection(predecessor_lease);
+  if (!predecessor.ok()) {
+    return Result<PickPlacePlanningResultDTO>::Err(predecessor.error());
+  }
+  ProjectionLeaseGuard release{projection_, predecessor_lease};
+  const auto planning_projection = predecessor.value().projection_binding.projection_revision;
+  if (!ProjectionIsSameOrForwardInLineage(planning_projection, synchronized.value()) ||
+      !exact_predecessor(predecessor.value(), planning_projection, predecessor_lease)) {
+    return planning_error<PickPlacePlanningResultDTO>(
+        "place_predecessor_projection_stale",
+        "retained planning projection does not include the pose capture",
+        ErrorCode::kSceneChangedDuringValidation);
+  }
+  for (auto* const operation : {&intent.approach_operation, &intent.descend_operation,
+                                 &intent.tool_operation, &intent.retreat_operation}) {
+    operation->expected_scene_revision = planning_projection.scene_revision;
+  }
   common =
       validate_common(intent.sequence_id, intent.selected_object_id, intent.carrier_frame_role_id,
                       intent.approach_operation, intent.descend_operation, intent.tool_operation,
@@ -702,18 +724,6 @@ Result<PickPlacePlanningResultDTO> AddressedPickPlacePlanningOwner::PlanPlace(
         "place_carrier_frame_unresolved", carrier.value(), intent.carrier_frame_role_id);
   }
 
-  const ProjectionLeaseId predecessor_lease("pick-place:" + intent.sequence_id + ":predecessor");
-  auto predecessor = projection_.RetainProjection(planning_projection, predecessor_lease);
-  if (!predecessor.ok()) {
-    return Result<PickPlacePlanningResultDTO>::Err(predecessor.error());
-  }
-  ProjectionLeaseGuard release{projection_, predecessor_lease};
-  if (!exact_predecessor(predecessor.value(), planning_projection, predecessor_lease)) {
-    return planning_error<PickPlacePlanningResultDTO>(
-        "place_predecessor_projection_stale",
-        "retained place projection differs from current scene truth",
-        ErrorCode::kSceneChangedDuringValidation);
-  }
   const auto* selected = find_object(*predecessor.value().logical_scene, intent.selected_object_id);
   const auto* attachment =
       find_attachment(*predecessor.value().logical_scene, intent.selected_object_id);

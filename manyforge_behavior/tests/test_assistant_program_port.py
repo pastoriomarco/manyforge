@@ -230,6 +230,7 @@ class _SceneTransport:
         self.resolved_poses: dict[str, dict[str, Any]] = {}
         self.pose_queries: list[dict[str, Any]] = []
         self.mutate_pose_response = False
+        self.advance_pose_response = 0
         self.revision = {
             "retained_bundle_id": _DIGEST_C,
             "graph_revision": _DIGEST_D,
@@ -290,6 +291,16 @@ class _SceneTransport:
         }
         if self.mutate_pose_response:
             response["projection_revision"]["graph_revision"] = _DIGEST_A
+        if self.advance_pose_response:
+            # A pose-source commit landed between the read and the query.
+            response["projection_revision"]["scene_revision"] = {
+                **response["projection_revision"]["scene_revision"],
+                "revision_id": response["projection_revision"]["scene_revision"][
+                    "revision_id"
+                ]
+                + self.advance_pose_response,
+                "content_hash": _DIGEST_E,
+            }
         return response
 
 
@@ -894,12 +905,23 @@ def test_scene_selection_reads_fixed_and_native_resolved_carried_owner_poses() -
     assert by_id["sphere_part"]["attached"] is True
     assert by_id["cube_part"]["attached"] is False
 
-    transport.mutate_pose_response = True
-    with pytest.raises(ProgramAssistantPortError, match="changed owner revision"):
-        source.selection_objects(
-            _context(_program(), assistant_projection=_assistant_projection()),
-            ["sphere_part"],
-        )
+    # A newer revision of the same Scene is accepted as the latest truth.
+    transport.advance_pose_response = 1
+    _frame_id, newer = source.selection_objects(
+        _context(_program(), assistant_projection=_assistant_projection()),
+        ["sphere_part"],
+    )
+    assert newer[0]["pose_in_cell"] == transport.resolved_poses["sphere_part"]
+
+    # An older revision or another lineage is refused.
+    for advance, mutate in ((-1, False), (0, True)):
+        transport.advance_pose_response = advance
+        transport.mutate_pose_response = mutate
+        with pytest.raises(ProgramAssistantPortError, match="changed owner revision"):
+            source.selection_objects(
+                _context(_program(), assistant_projection=_assistant_projection()),
+                ["sphere_part"],
+            )
 
 
 def test_carried_scene_poses_use_bounded_queries_without_reducing_selection() -> None:

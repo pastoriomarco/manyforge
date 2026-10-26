@@ -1565,6 +1565,9 @@ CanonicalValue compile_activation_deployment(
             intent.policies.find_object_member("interrupt_rules");
         rules && !array(*rules, "interrupt_rules").empty())
       policies.emplace_back("interrupt_rules", *rules);
+    if (const auto *sources =
+            intent.policies.find_object_member("scene_pose_sources"))
+      policies.emplace_back("scene_pose_sources", *sources);
     if (const auto *budget = intent.policies.find_object_member(
             "motion_takeover_preparation_budget_s")) {
       // The shared Deployment decoder below owns positive-finite validation.

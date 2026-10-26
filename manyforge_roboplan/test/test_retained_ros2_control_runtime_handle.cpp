@@ -2774,6 +2774,52 @@ TEST(RetainedRos2ControlRuntimeHandle, InactiveJointStateSamplesAreMeasuredAndRe
   EXPECT_FALSE(reader->current_state(query, 9'000'100).value().velocities.has_value());
 }
 
+TEST(RetainedRos2ControlRuntimeHandle, MeasuredRenderWakeAdvancesOnlyForVisibleChanges) {
+  auto clock = std::make_shared<core::FakeClock>();
+  clock->set(1000);
+  ArmWorld world("arm_controller", std::nullopt, nullptr, ArmBinding(), clock);
+  const auto descriptor = MeasuredSourceDescriptor(world);
+  const auto &query = descriptor.publication.query_context;
+  const auto wake = std::make_shared<RetainedObservationWake>();
+  const auto configured = world.handle->StageMeasuredStateSources(
+      {descriptor}, clock, world.binding, std::nullopt, wake);
+  ASSERT_TRUE(configured.ok()) << configured.error().message;
+  const auto reader = configured.value()->readers().front();
+  configured.value()->EnablePublication();
+  auto publisher = world.handle->node()->create_publisher<sensor_msgs::msg::JointState>(
+      world.prefix + "/joint_states", rclcpp::QoS(1));
+  world.handle->StartBackend();
+  ASSERT_TRUE(fake::WaitUntil([&] { return publisher->get_subscription_count() == 1U; }));
+  std::uint64_t received = 0U;
+  const auto publish = [&](std::vector<std::string> names, std::vector<double> positions) {
+    sensor_msgs::msg::JointState message;
+    message.header.stamp.sec = 2;
+    message.header.stamp.nanosec = static_cast<std::uint32_t>(received + 1U);
+    message.name = std::move(names);
+    message.position = std::move(positions);
+    publisher->publish(message);
+    ASSERT_TRUE(fake::WaitUntil([&] {
+      const auto envelope =
+          reader->publication(query.control_binding_id, query.control_binding_revision);
+      return envelope.ok() && envelope.value().publication_sequence > received;
+    }));
+    received = reader->publication(query.control_binding_id, query.control_binding_revision)
+                   .value().publication_sequence;
+  };
+  publish({"source_joint_1"}, {0.25});
+  ASSERT_TRUE(fake::WaitUntil([&] { return wake->generation() == 1U; }));
+  // An identical freshness sample does not wake; the next real change does.
+  publish({"source_joint_1"}, {0.25});
+  publish({"source_joint_1"}, {0.5});
+  ASSERT_TRUE(fake::WaitUntil([&] { return wake->generation() >= 2U; }));
+  // Losing completeness is visible once; regaining it is visible again.
+  publish({"source_joint_1", "source_joint_1"}, {0.1, 0.2});
+  publish({"source_joint_1", "source_joint_1"}, {0.1, 0.2});
+  publish({"source_joint_1"}, {0.5});
+  ASSERT_TRUE(fake::WaitUntil([&] { return wake->generation() >= 4U; }));
+  EXPECT_EQ(wake->generation(), 4U);
+}
+
 TEST(RetainedRos2ControlRuntimeHandle,
      StagedMeasuredSuccessorStartsEmptyAndPreservesPinnedSource) {
   auto clock = std::make_shared<core::FakeClock>();

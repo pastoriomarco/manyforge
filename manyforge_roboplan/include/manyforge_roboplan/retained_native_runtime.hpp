@@ -606,6 +606,13 @@ struct RetainedNativeRuntime final
       const core::ComponentLifecycleCurrentSnapshotDTO &snapshot,
       const std::shared_ptr<RetainedNativeRuntime> &owning_runtime) const;
 
+  /// Render-only viewer input: the enabled measured source currently prepared
+  /// for this runtime's motion target, or empty. Never waits on the route
+  /// publication fence (contention reads as absent); grants no state
+  /// authority, readiness or freshness beyond the source's own budget.
+  [[nodiscard]] std::optional<core::RequiredRobotMeasuredStateSource>
+  TryReadMotionMeasuredSource() const;
+
 private:
   friend class RetainedNativeGripperRoutePublicationOwner;
   [[nodiscard]] core::Result<std::shared_ptr<RetainedNativeGripperRoutePublicationOwner>>

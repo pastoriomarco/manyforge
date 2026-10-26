@@ -13,7 +13,7 @@ from typing import Any, Callable, Final, Mapping
 from manyforge_headless_api.client import HeadlessHttpClient
 
 
-OBSERVATION_FRAME_SCHEMA: Final = "manyforge.execution_observation_frame.v3"
+OBSERVATION_FRAME_SCHEMA: Final = "manyforge.execution_observation_frame.v4"
 OBSERVATION_CREDIT_SCHEMA: Final = "manyforge.execution_observation_credit.v1"
 OBSERVATION_DEMAND_LEASE_SECONDS: Final = 45.0
 MAXIMUM_OBSERVATION_CLIENTS: Final = 16
@@ -92,6 +92,7 @@ def project_execution_observation(
         != {
             "cell_id",
             "graph_revision",
+            "measured_targets",
             "owner_epoch",
             "retained_bundle_id",
             "schema_version",
@@ -99,7 +100,7 @@ def project_execution_observation(
             "source_sequence",
             "targets",
         }
-        or observed.get("schema_version") != "manyforge.execution_observation.v3"
+        or observed.get("schema_version") != "manyforge.execution_observation.v4"
     ):
         raise ExecutionObservationProjectionError(
             "execution observation schema is unsupported"
@@ -110,20 +111,15 @@ def project_execution_observation(
         raise ExecutionObservationProjectionError(
             "observation targets must contain 0..64 entries"
         )
-    targets = [_project_target(item) for item in raw_targets]
-    addresses = [
-        (target["controllable_component_id"], target["command_target_id"])
-        for target in targets
-    ]
-    compiled = [name for target in targets for name in target["compiled_joint_names"]]
-    if (
-        len(set(addresses)) != len(addresses)
-        or len(set(compiled)) != len(compiled)
-        or len(compiled) > _MAXIMUM_JOINTS
-    ):
+    targets = _project_targets(raw_targets)
+    # Render-only measured comparison rows beside commanded targets; they never
+    # replace the commanded robot pose.
+    raw_measured = observed.get("measured_targets")
+    if not isinstance(raw_measured, list) or len(raw_measured) > 64:
         raise ExecutionObservationProjectionError(
-            "observation targets overlap or exceed the coordinate bound"
+            "observation measured targets must contain 0..64 entries"
         )
+    measured_targets = _project_targets(raw_measured)
     received = _safe_integer(received_at_monotonic_us, "received_at_monotonic_us")
     return {
         "schema_version": OBSERVATION_FRAME_SCHEMA,
@@ -145,7 +141,26 @@ def project_execution_observation(
         ),
         "received_at_monotonic_us": received,
         "targets": targets,
+        "measured_targets": measured_targets,
     }
+
+
+def _project_targets(raw_targets: list[Any]) -> list[dict[str, Any]]:
+    targets = [_project_target(item) for item in raw_targets]
+    addresses = [
+        (target["controllable_component_id"], target["command_target_id"])
+        for target in targets
+    ]
+    compiled = [name for target in targets for name in target["compiled_joint_names"]]
+    if (
+        len(set(addresses)) != len(addresses)
+        or len(set(compiled)) != len(compiled)
+        or len(compiled) > _MAXIMUM_JOINTS
+    ):
+        raise ExecutionObservationProjectionError(
+            "observation targets overlap or exceed the coordinate bound"
+        )
+    return targets
 
 
 def _project_target(raw: Any) -> dict[str, Any]:
@@ -215,6 +230,22 @@ def encode_execution_observation_frame(frame: dict[str, Any]) -> str:
     )
 
 
+def _targets_signature(targets: list[dict[str, Any]]) -> tuple[Any, ...]:
+    return tuple(
+        (
+            target["controllable_component_id"],
+            target["command_target_id"],
+            target["operation_capability_id"],
+            target["source_epoch"],
+            tuple(target["source_joint_names"]),
+            tuple(target["compiled_joint_names"]),
+            tuple(target["coordinate_kinds"]),
+            tuple(target["positions_si"]),
+        )
+        for target in targets
+    )
+
+
 def _render_signature(frame: dict[str, Any]) -> tuple[Any, ...]:
     return (
         frame["owner_epoch"],
@@ -222,19 +253,8 @@ def _render_signature(frame: dict[str, Any]) -> tuple[Any, ...]:
         frame["retained_bundle_id"],
         frame["graph_revision"],
         frame["source_epoch"],
-        tuple(
-            (
-                target["controllable_component_id"],
-                target["command_target_id"],
-                target["operation_capability_id"],
-                target["source_epoch"],
-                tuple(target["source_joint_names"]),
-                tuple(target["compiled_joint_names"]),
-                tuple(target["coordinate_kinds"]),
-                tuple(target["positions_si"]),
-            )
-            for target in frame["targets"]
-        ),
+        _targets_signature(frame["targets"]),
+        _targets_signature(frame["measured_targets"]),
     )
 
 

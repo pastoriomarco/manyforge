@@ -287,6 +287,10 @@ inline const char* kErrorExecutionAborted = "execution_aborted";
 inline const char* kErrorExecutionTimeout = "execution_timeout";
 inline const char* kErrorStopFailed = "stop_failed";
 inline const char* kErrorResetFailed = "reset_failed";
+// The runtime collision monitor could not be prepared at dispatch. A critical
+// fault with no effect: nothing is sent and the operation needs Reset.
+inline const char* kErrorRuntimeCollisionMonitorPrepareFailed =
+    "runtime_collision_monitor_prepare_failed";
 
 // Internal
 inline const char* kErrorInternalError = "internal_error";

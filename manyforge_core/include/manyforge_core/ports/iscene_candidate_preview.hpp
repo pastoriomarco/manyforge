@@ -1,6 +1,7 @@
 #pragma once
 
 #include <manyforge_core/types/error_code.hpp>
+#include <manyforge_core/collision/i_collision_world_snapshot_publisher.hpp>
 #include <manyforge_core/types/scene_transaction.hpp>
 
 namespace manyforge::core {
@@ -15,7 +16,8 @@ class ISceneCandidatePreview {
 
   [[nodiscard]] virtual Result<SceneCandidatePreviewDTO>
   PreviewResolvedSceneCandidate(
-      const ResolvedSceneCandidatePreviewRequestDTO& request) const = 0;
+      const ResolvedSceneCandidatePreviewRequestDTO& request,
+      const CollisionWorldLeaseInventory& predecessor) const = 0;
 };
 
 }  // namespace manyforge::core

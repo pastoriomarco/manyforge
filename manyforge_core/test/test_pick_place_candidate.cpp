@@ -397,7 +397,8 @@ class FakeSceneCandidatePreview final : public ISceneCandidatePreview, public IS
       : predecessor_(std::move(predecessor)) {}
 
   Result<SceneCandidatePreviewDTO> PreviewResolvedSceneCandidate(
-      const ResolvedSceneCandidatePreviewRequestDTO& request) const override {
+      const ResolvedSceneCandidatePreviewRequestDTO& request,
+      const CollisionWorldLeaseInventory&) const override {
     ++call_count;
     last_request = request;
     const auto* attach = std::get_if<AttachCarriedObjectRequestDTO>(&request.request.operation);
@@ -541,6 +542,12 @@ class FakeSceneCandidateProjection final : public IPlannerSceneProjection {
     return Result<CollisionWorldLeaseInventory>::Ok(std::move(retained));
   }
 
+  Result<CollisionWorldLeaseInventory> RetainCurrentProjection(
+      ProjectionLeaseId lease_id) override {
+    return RetainProjection(predecessor_.projection_binding.projection_revision,
+                            std::move(lease_id));
+  }
+
   void ReleaseProjection(const ProjectionLeaseId& lease_id) override {
     ++release_call_count;
     if (retained_lease == std::optional(lease_id)) {
@@ -644,14 +651,18 @@ class ReplacingPlanningSceneSynchronizer final : public IPlanningSceneSynchroniz
  public:
   ReplacingPlanningSceneSynchronizer(FakeSceneCandidatePreview& scene,
                                      FakeSceneCandidateProjection& projection,
-                                     CollisionWorldLeaseInventory successor)
-      : scene_(scene), projection_(projection), successor_(std::move(successor)) {}
+                                     CollisionWorldLeaseInventory successor,
+                                     std::optional<ProjectionRevisionDTO> returned_floor =
+                                         std::nullopt)
+      : scene_(scene), projection_(projection), successor_(std::move(successor)),
+        returned_floor_(std::move(returned_floor)) {}
 
   Result<ProjectionRevisionDTO> SynchronizeBeforePlanning() override {
     ++call_count;
     scene_.SetPredecessor(successor_);
     projection_.SetPredecessor(successor_);
-    return Result<ProjectionRevisionDTO>::Ok(successor_.projection_binding.projection_revision);
+    return Result<ProjectionRevisionDTO>::Ok(
+        returned_floor_.value_or(successor_.projection_binding.projection_revision));
   }
 
   std::size_t call_count{};
@@ -660,6 +671,7 @@ class ReplacingPlanningSceneSynchronizer final : public IPlanningSceneSynchroniz
   FakeSceneCandidatePreview& scene_;
   FakeSceneCandidateProjection& projection_;
   CollisionWorldLeaseInventory successor_;
+  std::optional<ProjectionRevisionDTO> returned_floor_;
 };
 
 [[nodiscard]] PickCandidatePlanningRequestDTO pick_request(
@@ -1114,7 +1126,9 @@ TEST(AddressedPickPlacePlanningOwner, QualifiedSiblingTcpKeepsTheExplicitCarrier
     if (carrier_identity != 0) {
       ASSERT_FALSE(result.ok());
       EXPECT_EQ(result.error().details.at("reason"), "pick_carrier_touch_roles_unresolved");
-      EXPECT_EQ(projection.retain_call_count, 0U);
+      EXPECT_EQ(projection.retain_call_count, 1U);
+      EXPECT_EQ(projection.release_call_count, 1U);
+      EXPECT_FALSE(projection.retained_lease.has_value());
       EXPECT_EQ(scene.call_count, 0U);
     } else {
       ASSERT_TRUE(result.ok()) << result.error().message;
@@ -1139,13 +1153,14 @@ TEST(AddressedPickPlacePlanningOwner, QualifiedSiblingTcpKeepsTheExplicitCarrier
   }
 }
 
-TEST(AddressedPickPlacePlanningOwner, RebindsValidatedPublicIntentToOwnerSynchronizedScene) {
+TEST(AddressedPickPlacePlanningOwner, AcceptsNewerSameLineageProjectionBeyondCaptureFloorForPick) {
   auto predecessor = predecessor_projection();
   auto successor = successor_projection(predecessor);
+  const auto capture_floor = predecessor.projection_binding.projection_revision;
   FakeMotionPreviewOwner motion;
   FakeSceneCandidatePreview scene(predecessor);
   FakeSceneCandidateProjection projection(predecessor);
-  ReplacingPlanningSceneSynchronizer synchronizer(scene, projection, successor);
+  ReplacingPlanningSceneSynchronizer synchronizer(scene, projection, successor, capture_floor);
   AddressedPickPlacePlanningOwner owner(motion, scene, scene, projection, &synchronizer);
   auto synthesis = PickCandidateSynthesisIntentDTO{};
   synthesis.approach_offset_envelope.position_min_m = {0.0, 0.0, 0.05};
@@ -1175,6 +1190,11 @@ TEST(AddressedPickPlacePlanningOwner, RebindsValidatedPublicIntentToOwnerSynchro
   EXPECT_EQ(synchronizer.call_count, 1U);
   const auto& planned = *result.value().plan;
   EXPECT_EQ(planned.predecessor_projection_revision,
+            successor.projection_binding.projection_revision);
+  EXPECT_EQ(planned.predecessor_projection_revision.scene_revision.revision_id,
+            capture_floor.scene_revision.revision_id + 1U);
+  ASSERT_TRUE(scene.last_request);
+  EXPECT_EQ(scene.last_request->request.expected_projection_revision,
             successor.projection_binding.projection_revision);
   EXPECT_EQ(planned.preview_successor_projection_revision.scene_revision.revision_id,
             successor.projection_binding.projection_revision.scene_revision.revision_id + 1U);
@@ -1507,6 +1527,49 @@ TEST(AddressedPickPlacePlanningOwner, ResolvesThePublicInversePlaceWithoutCommit
   EXPECT_TRUE(std::holds_alternative<PoseGoalDTO>(result.value().plan->approach_motion));
   EXPECT_TRUE(std::holds_alternative<CartesianPathDTO>(result.value().plan->descend_motion));
   EXPECT_TRUE(std::holds_alternative<CartesianPathDTO>(result.value().plan->retreat_motion));
+}
+
+TEST(AddressedPickPlacePlanningOwner, AcceptsNewerSameLineageProjectionBeyondCaptureFloorForPlace) {
+  auto predecessor = carried_predecessor_projection();
+  auto successor = successor_projection(predecessor);
+  const auto capture_floor = predecessor.projection_binding.projection_revision;
+  FakeMotionPreviewOwner motion;
+  FakeSceneCandidatePreview scene(predecessor);
+  FakeSceneCandidateProjection projection(predecessor);
+  ReplacingPlanningSceneSynchronizer synchronizer(scene, projection, successor, capture_floor);
+  AddressedPickPlacePlanningOwner owner(motion, scene, scene, projection, &synchronizer);
+  auto approach = motion_operation("floor.place.approach", "place.approach",
+                                  PoseGoalDTO{Pose3DTO{{0.0, 0.0, 0.3}, {}}});
+  auto descend = motion_operation(
+      "floor.place.descend", "place.descend",
+      CartesianPathDTO{{Pose3DTO{{0.0, 0.0, 0.3}, {}}, Pose3DTO{{0.0, 0.0, 0.2}, {}}}});
+  auto retreat = motion_operation(
+      "floor.place.retreat", "place.retreat",
+      CartesianPathDTO{{Pose3DTO{{0.0, 0.0, 0.2}, {}}, Pose3DTO{{0.0, 0.0, 0.3}, {}}}});
+
+  const auto result = owner.PlanPlace(PlaceSequencePlanningIntentDTO{
+      "floor-place-1", SceneResourceId("workpiece"), FrameRoleId("frame-role:tcp"),
+      std::move(approach), std::move(descend), tool_operation("floor.place.tool", 0.04),
+      std::move(retreat)});
+
+  ASSERT_TRUE(result.ok()) << result.error().message;
+  ASSERT_TRUE(result.value().plan.has_value());
+  EXPECT_EQ(result.value().status, PickPlacePlanningStatusDTO::kPlanned);
+  EXPECT_EQ(synchronizer.call_count, 1U);
+  const auto& planned = *result.value().plan;
+  EXPECT_EQ(planned.kind, PickPlaceExecutionKindDTO::kPlace);
+  EXPECT_EQ(planned.predecessor_projection_revision,
+            successor.projection_binding.projection_revision);
+  EXPECT_EQ(planned.predecessor_projection_revision.scene_revision.revision_id,
+            capture_floor.scene_revision.revision_id + 1U);
+  ASSERT_TRUE(scene.last_request);
+  EXPECT_EQ(scene.last_request->request.expected_projection_revision,
+            successor.projection_binding.projection_revision);
+  EXPECT_EQ(planned.preview_successor_projection_revision.scene_revision.revision_id,
+            successor.projection_binding.projection_revision.scene_revision.revision_id + 1U);
+  EXPECT_EQ(scene.commit_count, 0U);
+  EXPECT_EQ(projection.retain_call_count, 1U);
+  EXPECT_EQ(projection.release_call_count, 1U);
 }
 
 }  // namespace

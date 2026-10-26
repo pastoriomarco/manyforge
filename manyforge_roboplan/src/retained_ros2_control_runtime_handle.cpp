@@ -423,12 +423,18 @@ struct PreparedMeasuredStateSources::Storage final {
     std::unique_ptr<core::AddressedObservedStatePublication> publication;
     std::vector<double> positions;
     std::vector<double> velocities;
+    // Last visible coordinates, mirroring the observed-state channel's render
+    // generation: identical freshness samples do not wake the viewer.
+    std::vector<double> render_positions;
+    bool render_valid{false};
   };
   Storage(std::vector<core::MeasuredStateSourceDescriptor> descriptors,
           std::shared_ptr<core::IClock> clock, rclcpp::Node::SharedPtr node,
-          std::shared_ptr<RetainedObservationWake> observation_wake)
+          std::shared_ptr<RetainedObservationWake> observation_wake,
+          std::shared_ptr<RetainedObservationWake> render_wake)
       : descriptors(std::move(descriptors)), clock(std::move(clock)),
-        node(std::move(node)), observation_wake(std::move(observation_wake)) {}
+        node(std::move(node)), observation_wake(std::move(observation_wake)),
+        render_wake(std::move(render_wake)) {}
   ~Storage() {
     std::lock_guard lock(mutex);
     active = false;
@@ -440,6 +446,7 @@ struct PreparedMeasuredStateSources::Storage final {
   const std::shared_ptr<core::IClock> clock;
   const rclcpp::Node::SharedPtr node;
   const std::shared_ptr<RetainedObservationWake> observation_wake;
+  const std::shared_ptr<RetainedObservationWake> render_wake;
   std::vector<Channel> channels;
   rclcpp::Subscription<sensor_msgs::msg::JointState>::SharedPtr subscription;
 };
@@ -464,9 +471,10 @@ RetainedRos2ControlRuntimeHandle::StageMeasuredStateSources(
     std::vector<core::MeasuredStateSourceDescriptor> descriptors,
     std::shared_ptr<core::IClock> receiver_clock,
     const core::RuntimeParticipantBinding &candidate_motion,
-    const std::optional<core::RuntimeParticipantBinding> &candidate_gripper) {
+    const std::optional<core::RuntimeParticipantBinding> &candidate_gripper,
+    std::shared_ptr<RetainedObservationWake> render_wake) {
   return StageMeasuredStateSources(std::move(descriptors), std::move(receiver_clock),
-      std::optional(candidate_motion), candidate_gripper);
+      std::optional(candidate_motion), candidate_gripper, std::move(render_wake));
 }
 
 core::Result<std::shared_ptr<PreparedMeasuredStateSources>>
@@ -474,7 +482,8 @@ RetainedRos2ControlRuntimeHandle::StageMeasuredStateSources(
     std::vector<core::MeasuredStateSourceDescriptor> descriptors,
     std::shared_ptr<core::IClock> receiver_clock,
     const std::optional<core::RuntimeParticipantBinding> &candidate_motion,
-    const std::optional<core::RuntimeParticipantBinding> &candidate_gripper) {
+    const std::optional<core::RuntimeParticipantBinding> &candidate_gripper,
+    std::shared_ptr<RetainedObservationWake> render_wake) {
   using Sources = std::shared_ptr<PreparedMeasuredStateSources>;
   using Readers = std::vector<std::shared_ptr<const core::IObservedStateProvider>>;
   std::lock_guard lock(mutex_);
@@ -562,7 +571,8 @@ RetainedRos2ControlRuntimeHandle::StageMeasuredStateSources(
   auto replacement = std::make_shared<PreparedMeasuredStateSources::Storage>(
       std::move(descriptors), std::move(receiver_clock), resources_->node(),
       arm_ && arm_->transport.mock_reset_position ? reset_observation_wake_
-                                                  : nullptr);
+                                                  : nullptr,
+      std::move(render_wake));
   Readers readers;
   replacement->channels.reserve(replacement->descriptors.size());
   readers.reserve(replacement->descriptors.size());
@@ -573,6 +583,7 @@ RetainedRos2ControlRuntimeHandle::StageMeasuredStateSources(
             descriptor.publication);
     readers.emplace_back(replacement, publication.get());
     replacement->channels.push_back({std::move(publication),
+                                     std::vector<double>(count),
                                      std::vector<double>(count),
                                      std::vector<double>(count)});
   }
@@ -596,6 +607,20 @@ RetainedRos2ControlRuntimeHandle::StageMeasuredStateSources(
             if (!channels->active)
               return;
             const auto received = channels->clock->now();
+            bool render_changed = false;
+            const auto record_render = [&](auto &channel, const bool visible) {
+              if (!channels->render_wake) return;
+              if (!visible) {
+                render_changed = render_changed || channel.render_valid;
+                channel.render_valid = false;
+                return;
+              }
+              if (channel.render_valid && channel.render_positions == channel.positions)
+                return;
+              channel.render_positions = channel.positions;
+              channel.render_valid = true;
+              render_changed = true;
+            };
             const auto source_time = static_cast<std::int64_t>(message->header.stamp.sec) *
                                          1'000'000'000LL + message->header.stamp.nanosec;
             for (std::size_t channel_index = 0;
@@ -606,8 +631,10 @@ RetainedRos2ControlRuntimeHandle::StageMeasuredStateSources(
               // Preserve the existing bounded numeric producer's rejection for
               // oversized input; do not allocate or truncate the ROS sample.
               if (message->name.size() > config.maximum_source_resource_count) {
-                (void)channel.publication->publish(core::ObservedStateSourceKind::kJointState,
-                    message->name, message->position, message->velocity, source_time, received);
+                const auto published = channel.publication->publish(
+                    core::ObservedStateSourceKind::kJointState, message->name,
+                    message->position, message->velocity, source_time, received);
+                if (published.published) record_render(channel, false);
                 continue;
               }
               bool complete = message->name.size() == message->position.size();
@@ -626,16 +653,20 @@ RetainedRos2ControlRuntimeHandle::StageMeasuredStateSources(
               }
               // An incomplete/new invalid sample replaces prior completeness;
               // source names never become authority or compiled coordinate names.
-              (void)channel.publication->publish(core::ObservedStateSourceKind::kJointState,
+              const auto published = channel.publication->publish(
+                  core::ObservedStateSourceKind::kJointState,
                   config.query_context.joint_names,
                   complete ? std::span<const double>(channel.positions) : std::span<const double>{},
                   complete && velocities ? std::span<const double>(channel.velocities) :
                                            std::span<const double>{},
                   source_time, received);
+              if (published.published) record_render(channel, published.complete);
             }
             publication_lock.unlock();
             if (channels->observation_wake)
               channels->observation_wake->notify();
+            if (render_changed)
+              channels->render_wake->notify();
             // This existing NRT sample checkpoint also sees graph edges after
             // the latched activity's matched callback. Refresh's unchanged
             // clean/event fast path performs no SDK graph query when steady.

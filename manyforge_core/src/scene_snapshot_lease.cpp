@@ -6,7 +6,6 @@
 #include <cmath>
 #include <limits>
 #include <sstream>
-#include <string_view>
 #include <unordered_map>
 #include <unordered_set>
 #include <utility>
@@ -15,6 +14,7 @@ namespace manyforge::core {
 namespace {
 
 constexpr double kEpsilon = 1e-12;
+constexpr std::size_t kMaxRecordedObjectDivergences = 16;
 
 std::string to_string(std::uint64_t value) { return std::to_string(value); }
 
@@ -86,27 +86,6 @@ std::optional<PoseDelta> pose_delta(const Pose3DTO& a, const Pose3DTO& b) {
   dot = std::clamp(std::abs(dot), 0.0, 1.0);
   return PoseDelta{std::sqrt(dx * dx + dy * dy + dz * dz),
                    2.0 * std::acos(dot)};
-}
-
-bool exceeds_tolerance(double value, std::optional<double> tolerance) {
-  const double limit = tolerance.value_or(0.0);
-  if (!std::isfinite(value) || !std::isfinite(limit) || limit < 0.0) {
-    return true;
-  }
-  return value > limit;
-}
-
-bool has_pose_drift(const PoseDelta& delta,
-                    std::optional<double> translation_tolerance_m,
-                    std::optional<double> angular_tolerance_rad) {
-  if (exceeds_tolerance(delta.translation_m, translation_tolerance_m)) {
-    return true;
-  }
-  if (angular_tolerance_rad.has_value() &&
-      exceeds_tolerance(delta.angle_rad, angular_tolerance_rad)) {
-    return true;
-  }
-  return false;
 }
 
 std::int64_t age_ns(std::int64_t now_ns, std::int64_t then_ns) {
@@ -253,69 +232,64 @@ std::optional<std::string> duplicate_lease_object_id(
   return std::nullopt;
 }
 
-bool is_collision_authority_role(ObservedSceneObjectRole role) {
-  return role != ObservedSceneObjectRole::kVisualizationOnly &&
-         role != ObservedSceneObjectRole::kRobotRuntimeState;
-}
-
-bool has_collision_identity(const SceneSnapshotLeaseObject& object) {
-  if (object.role == ObservedSceneObjectRole::kSnapshotObstacle) {
-    return object.object_revision_token.has_value();
+// Debug detail (R4): per lease object, what differs in the live snapshot.
+// Bounded so a large changing scene cannot grow the evidence without limit.
+void add_object_divergence_details(
+    SceneSnapshotLeaseValidationResult& result,
+    const SceneSnapshotLease& lease, const LiveObjectMap& live_by_id) {
+  std::size_t divergent = 0;
+  for (const auto& object : lease.objects) {
+    std::map<std::string, std::string> changes;
+    const auto it = live_by_id.find(object.object_id);
+    if (it == live_by_id.end()) {
+      changes["missing"] = "true";
+    } else {
+      const auto& live = *it->second;
+      if (!sorted_vectors_equal(object.collision_body_ids,
+                                live.collision_body_ids)) {
+        changes["bodies"] = "true";
+      }
+      if (object.object_revision_token != live.object_revision_token) {
+        changes["token"] = "true";
+      }
+      for (const auto& [body_id, expected_hash] : object.body_content_hashes) {
+        const auto live_hash = live.body_content_hashes.find(body_id);
+        if (live_hash == live.body_content_hashes.end() ||
+            live_hash->second != expected_hash) {
+          changes["body_hash"] = body_id;
+          break;
+        }
+      }
+      if (object.pose.has_value() && live.pose.has_value()) {
+        const auto delta = pose_delta(*object.pose, *live.pose);
+        if (!delta.has_value()) {
+          changes["pose_delta_m"] = "invalid";
+        } else if (delta->translation_m > 0.0 || delta->angle_rad > 0.0) {
+          changes["pose_delta_m"] = to_string(delta->translation_m);
+          changes["pose_delta_rad"] = to_string(delta->angle_rad);
+        }
+      } else if (object.pose.has_value() != live.pose.has_value()) {
+        changes["pose_delta_m"] = "unavailable";
+      }
+    }
+    if (changes.empty()) {
+      continue;
+    }
+    if (divergent++ >= kMaxRecordedObjectDivergences) {
+      continue;
+    }
+    const std::string prefix = "object_divergence." + object.object_id + ".";
+    for (auto& [key, value] : changes) {
+      result.details[prefix + key] = std::move(value);
+    }
   }
-  return object.object_revision_token.has_value() ||
-         !object.body_content_hashes.empty();
-}
-
-bool is_pose_drift_role(ObservedSceneObjectRole role) {
-  return role == ObservedSceneObjectRole::kObservedTarget ||
-         role == ObservedSceneObjectRole::kObservedDynamicObstacle;
-}
-
-bool uses_frozen_scene_content(ObservedSceneObjectRole role) {
-  return role == ObservedSceneObjectRole::kSnapshotObstacle;
-}
-
-bool runtime_dynamic_coverage_accepts(
-    const RuntimeDynamicSceneCoverage& coverage) {
-  return coverage.configured && coverage.armed && coverage.fresh &&
-         coverage.qualified;
-}
-
-SceneSnapshotLeaseValidationResult topology_rejection(
-    SceneSnapshotLeaseValidationResult result,
-    const std::string& object_id,
-    std::string_view detail_key,
-    std::string_view detail_value) {
-  result.object_id = object_id;
-  result.details[std::string(detail_key)] = std::string(detail_value);
-  return reject(std::move(result),
-                SceneSnapshotLeaseRejection::
-                    kSceneTopologyChangedAfterValidation);
+  if (divergent > kMaxRecordedObjectDivergences) {
+    result.details["object_divergence_truncated_count"] =
+        std::to_string(divergent - kMaxRecordedObjectDivergences);
+  }
 }
 
 }  // namespace
-
-const char* to_string(ObservedSceneObjectRole role) {
-  switch (role) {
-    case ObservedSceneObjectRole::kStaticObstacle:
-      return "static_obstacle";
-    case ObservedSceneObjectRole::kSnapshotObstacle:
-      return "snapshot_obstacle";
-    case ObservedSceneObjectRole::kObservedTarget:
-      return "observed_target";
-    case ObservedSceneObjectRole::kObservedDynamicObstacle:
-      return "observed_dynamic_obstacle";
-    case ObservedSceneObjectRole::kAttachedObject:
-      return "attached_object";
-    case ObservedSceneObjectRole::kSupportContact:
-      return "support_contact";
-    case ObservedSceneObjectRole::kVisualizationOnly:
-      return "visualization_only";
-    case ObservedSceneObjectRole::kRobotRuntimeState:
-      return "robot_runtime_state";
-  }
-  return "unknown";
-}
 
 const char* to_reason_code(SceneSnapshotLeaseRejection rejection) {
   switch (rejection) {
@@ -332,16 +306,8 @@ const char* to_reason_code(SceneSnapshotLeaseRejection rejection) {
     case SceneSnapshotLeaseRejection::
         kProjectionStructureChangedAfterValidation:
       return reason_codes::kProjectionStructureChangedAfterValidation;
-    case SceneSnapshotLeaseRejection::kSceneTopologyChangedAfterValidation:
-      return reason_codes::kSceneTopologyChangedAfterValidation;
-    case SceneSnapshotLeaseRejection::kCollisionPolicyChangedAfterValidation:
-      return reason_codes::kCollisionPolicyChangedAfterValidation;
-    case SceneSnapshotLeaseRejection::kTargetMovedAfterValidation:
-      return reason_codes::kTargetMovedAfterValidation;
-    case SceneSnapshotLeaseRejection::kObstacleMovedAfterValidation:
-      return reason_codes::kObstacleMovedAfterValidation;
-    case SceneSnapshotLeaseRejection::kRuntimeDynamicSceneNotQualified:
-      return reason_codes::kRuntimeDynamicSceneNotQualified;
+    case SceneSnapshotLeaseRejection::kSceneSnapshotStructureInvalid:
+      return reason_codes::kSceneSnapshotStructureInvalid;
   }
   return "unknown_scene_snapshot_lease_rejection";
 }
@@ -409,22 +375,17 @@ SceneSnapshotLeaseValidationResult validate_scene_snapshot_lease(
                   SceneSnapshotLeaseRejection::kSceneSnapshotLeaseExpired);
   }
 
+  // Dispatch accepts the latest scene for every object (2026-10-26): the
+  // runtime monitor checks each tick against the latest published world and
+  // rules. Divergence is recorded as revision-level evidence only.
   const bool topology_epoch_diverged =
       lease.topology_epoch != context.topology_epoch;
   if (topology_epoch_diverged) {
     result.details["live_topology_epoch_diverged"] = "true";
   }
-  if (lease.policy_epoch != context.policy_epoch) {
-    return reject(std::move(result),
-                  SceneSnapshotLeaseRejection::
-                      kCollisionPolicyChangedAfterValidation);
-  }
-  // Policy content may be derived from live geometry. The semantic epoch is the
-  // fail-closed gate; revision/content divergence is evidence on frozen leases.
   if (!revisions_equal(lease.policy_revision, *context.live_policy_revision)) {
     result.details["accepted_live_policy_revision_divergence"] = "true";
   }
-
   if (!revisions_equal(lease.world_revision,
                        *context.live_world_revision)) {
     result.details["accepted_live_world_revision_divergence"] = "true";
@@ -435,194 +396,47 @@ SceneSnapshotLeaseValidationResult validate_scene_snapshot_lease(
     result.object_id = *duplicate;
     result.details["duplicate_lease_object_id"] = "true";
     return reject(std::move(result),
-                  SceneSnapshotLeaseRejection::
-                      kSceneTopologyChangedAfterValidation);
+                  SceneSnapshotLeaseRejection::kSceneSnapshotStructureInvalid);
   }
   if (auto duplicate = duplicate_live_object_id(context.live_objects);
       duplicate.has_value()) {
     result.object_id = *duplicate;
     result.details["duplicate_live_object_id"] = "true";
     return reject(std::move(result),
-                  SceneSnapshotLeaseRejection::
-                      kSceneTopologyChangedAfterValidation);
+                  SceneSnapshotLeaseRejection::kSceneSnapshotStructureInvalid);
   }
-
-  const auto live_by_id = live_object_map(context.live_objects);
   for (const auto& object : lease.objects) {
-    if (is_collision_authority_role(object.role) &&
-        (object.object_id.empty() || object.collision_body_ids.empty() ||
-         !has_collision_identity(object))) {
+    if (object.object_id.empty() || object.collision_body_ids.empty()) {
       result.object_id = object.object_id;
       result.details["missing_collision_object_identity"] = "true";
       return reject(std::move(result),
-                    SceneSnapshotLeaseRejection::
-                        kSceneTopologyChangedAfterValidation);
+                    SceneSnapshotLeaseRejection::kSceneSnapshotStructureInvalid);
     }
+  }
 
-    std::int64_t object_source_age = 0;
-    if (source_is_stale(context.now_ns, object.source_timestamp_ns,
-                        object.source_freshness_budget_ns,
-                        object_source_age)) {
-      result.object_id = object.object_id;
-      result.source_id = object.source_id;
-      result.source_age_ns = object_source_age;
-      if (object.source_freshness_budget_ns.has_value()) {
-        result.details["source_freshness_budget_ns"] =
-            to_string(*object.source_freshness_budget_ns);
-      }
-      return reject(std::move(result),
-                    SceneSnapshotLeaseRejection::
-                        kObservedSceneSourceStale);
-    }
-
-    const auto it = live_by_id.find(object.object_id);
-    const SceneSnapshotLiveObject* live_object =
-        it == live_by_id.end() ? nullptr : it->second;
-    const bool frozen_scene_content = uses_frozen_scene_content(object.role);
-    if (live_object == nullptr) {
-      if (frozen_scene_content) {
-        result.details["accepted_missing_live_snapshot_obstacle"] = "true";
-        continue;
-      }
-      if (is_collision_authority_role(object.role)) {
-        return topology_rejection(std::move(result), object.object_id,
-                                  "missing_live_object", "true");
-      }
-      continue;
-    }
-
-    if (frozen_scene_content) {
-      if (!sorted_vectors_equal(object.collision_body_ids,
-                                live_object->collision_body_ids)) {
-        result.details["accepted_snapshot_obstacle_body_inventory_divergence"] =
-            "true";
-      }
-      if (object.object_revision_token.has_value() &&
-          (!live_object->object_revision_token.has_value() ||
-           object.object_revision_token !=
-               live_object->object_revision_token)) {
-        result.details["accepted_snapshot_obstacle_token_divergence"] = "true";
-      }
-    } else {
-      if (!sorted_vectors_equal(object.collision_body_ids,
-                                live_object->collision_body_ids)) {
-        return topology_rejection(std::move(result), object.object_id,
-                                  "collision_body_ids_changed", "true");
-      }
-      if (object.object_revision_token.has_value() &&
-          (!live_object->object_revision_token.has_value() ||
-           object.object_revision_token !=
-               live_object->object_revision_token)) {
-        return topology_rejection(std::move(result), object.object_id,
-                                  "object_revision_token_changed", "true");
-      }
-      for (const auto& [body_id, expected_hash] : object.body_content_hashes) {
-        const auto live_hash = live_object->body_content_hashes.find(body_id);
-        if (live_hash == live_object->body_content_hashes.end() ||
-            live_hash->second != expected_hash) {
-          result.details["body_id"] = body_id;
-          return topology_rejection(std::move(result), object.object_id,
-                                    "body_content_hash_changed", "true");
-        }
-      }
-    }
-
+  // Freshness is judged on the latest evidence only: a source silent past its
+  // budget means no data, which no later tick can correct. Objects added after
+  // planning are covered because the pass runs over the live snapshot.
+  for (const auto& live_object : context.live_objects) {
     std::int64_t live_source_age = 0;
-    if (!frozen_scene_content &&
-        source_is_stale(context.now_ns, live_object->source_timestamp_ns,
-                        live_object->source_freshness_budget_ns,
+    if (source_is_stale(context.now_ns, live_object.source_timestamp_ns,
+                        live_object.source_freshness_budget_ns,
                         live_source_age)) {
-      result.object_id = object.object_id;
-      result.source_id = live_object->source_id;
+      result.object_id = live_object.object_id;
+      result.source_id = live_object.source_id;
       result.source_age_ns = live_source_age;
-      if (live_object->source_freshness_budget_ns.has_value()) {
+      if (live_object.source_freshness_budget_ns.has_value()) {
         result.details["source_freshness_budget_ns"] =
-            to_string(*live_object->source_freshness_budget_ns);
+            to_string(*live_object.source_freshness_budget_ns);
       }
       return reject(std::move(result),
-                    SceneSnapshotLeaseRejection::
-                        kObservedSceneSourceStale);
+                    SceneSnapshotLeaseRejection::kObservedSceneSourceStale);
     }
+  }
 
-    if (is_pose_drift_role(object.role) && object.pose.has_value()) {
-      if (!live_object->pose.has_value()) {
-        result.object_id = object.object_id;
-        result.source_id = live_object->source_id.value_or(
-            object.source_id.value_or(""));
-        result.details["live_pose_unavailable"] = "true";
-        return reject(std::move(result),
-                      SceneSnapshotLeaseRejection::
-                          kObservedSceneSourceStale);
-      }
-      const auto delta = pose_delta(*object.pose, *live_object->pose);
-      if (!delta.has_value()) {
-        result.object_id = object.object_id;
-        result.details["invalid_pose_drift_input"] = "true";
-        if (object.role == ObservedSceneObjectRole::kObservedTarget) {
-          return reject(std::move(result),
-                        SceneSnapshotLeaseRejection::
-                            kTargetMovedAfterValidation);
-        }
-        return reject(std::move(result),
-                      SceneSnapshotLeaseRejection::
-                          kObstacleMovedAfterValidation);
-      }
-
-      if (object.role == ObservedSceneObjectRole::kObservedTarget) {
-        result.target_drift_m = delta->translation_m;
-        result.target_angular_drift_rad = delta->angle_rad;
-        if (has_pose_drift(*delta, object.target_drift_tolerance_m,
-                           object.target_angular_tolerance_rad)) {
-          result.object_id = object.object_id;
-          result.details["target_drift_tolerance_m"] =
-              to_string(object.target_drift_tolerance_m.value_or(0.0));
-          if (object.target_angular_tolerance_rad.has_value()) {
-            result.details["target_angular_tolerance_rad"] =
-                to_string(*object.target_angular_tolerance_rad);
-          }
-          return reject(std::move(result),
-                        SceneSnapshotLeaseRejection::
-                            kTargetMovedAfterValidation);
-        }
-      } else {
-        result.obstacle_drift_m = delta->translation_m;
-        result.obstacle_angular_drift_rad = delta->angle_rad;
-        if (has_pose_drift(*delta, object.obstacle_drift_tolerance_m,
-                           object.obstacle_angular_tolerance_rad)) {
-          result.object_id = object.object_id;
-          result.details["obstacle_drift_tolerance_m"] =
-              to_string(object.obstacle_drift_tolerance_m.value_or(0.0));
-          if (object.obstacle_angular_tolerance_rad.has_value()) {
-            result.details["obstacle_angular_tolerance_rad"] =
-                to_string(*object.obstacle_angular_tolerance_rad);
-          }
-          if (!object.runtime_dynamic_obstacle_allowed) {
-            return reject(std::move(result),
-                          SceneSnapshotLeaseRejection::
-                              kObstacleMovedAfterValidation);
-          }
-          const auto& coverage = context.runtime_dynamic_scene_coverage;
-          result.details["runtime_dynamic_coverage_configured"] =
-              coverage.configured ? "true" : "false";
-          result.details["runtime_dynamic_coverage_armed"] =
-              coverage.armed ? "true" : "false";
-          result.details["runtime_dynamic_coverage_fresh"] =
-              coverage.fresh ? "true" : "false";
-          result.details["runtime_dynamic_coverage_qualified"] =
-              coverage.qualified ? "true" : "false";
-          if (!coverage.coverage_id.empty()) {
-            result.details["runtime_dynamic_coverage_id"] =
-                coverage.coverage_id;
-          }
-          if (!runtime_dynamic_coverage_accepts(coverage)) {
-            return reject(std::move(result),
-                          SceneSnapshotLeaseRejection::
-                              kRuntimeDynamicSceneNotQualified);
-          }
-          result.details["accepted_runtime_dynamic_obstacle_drift"] = "true";
-        }
-      }
-    }
+  if (context.record_object_divergence) {
+    add_object_divergence_details(result, lease,
+                                  live_object_map(context.live_objects));
   }
 
   result.accepted = true;

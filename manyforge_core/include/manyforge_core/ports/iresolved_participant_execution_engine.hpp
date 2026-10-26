@@ -17,6 +17,16 @@
 
 namespace manyforge::core {
 
+/// Known terminal effects are necessary for motion-free retirement; an
+/// internal consistency failure still requires diagnosis, not acknowledgement.
+inline bool is_settled_execution_failure(const ParticipantExecutionFact& fact) {
+  return fact.kind == ParticipantExecutionFactKind::kLocalFailure &&
+         fact.effect == ParticipantEffectKnowledge::kEffectSettled && fact.error &&
+         fact.error->code != to_string(ErrorCode::kInternalError) &&
+         fact.error->code != to_string(ErrorCode::kInvariantViolation) &&
+         fact.error->code != to_string(ErrorCode::kInvalidStateTransition);
+}
+
 /// Exact process-local handoff after the addressed owner has proved either
 /// physical containment for one dispatched participant or effect-free
 /// cancellation behind the coordinated dispatch barrier. The aggregate Stop
@@ -36,7 +46,7 @@ struct AddressedParticipantStopSettlementRequestDTO final {
 
 /// Participant recovery evidence returned synchronously to the addressed
 /// reducer after it recorded the owner's containment. The participant commits
-/// no outcome; the addressed Kernel owns the Stopped terminal. Repeating the
+/// no outcome; the addressed Kernel owns the operation terminal. Repeating the
 /// exact request returns the same evidence; a conflicting Stop identity is
 /// rejected without changing the participant.
 struct AddressedParticipantStopSettlementDTO final {
@@ -47,6 +57,9 @@ struct AddressedParticipantStopSettlementDTO final {
   ControllerGoalId controller_goal_id;
   ControllerGoalGeneration controller_goal_generation;
   KernelRecoveryAssessmentDTO recovery_assessment;
+  /// A contained local failure keeps its original cause and cannot acquire
+  /// ordinary-Stop retry permission. Absence retains the ordinary Stop path.
+  std::optional<ParticipantExecutionFact> terminal_fact{};
 };
 
 /// Result of the exact process-local Stop fence at the subordinate dispatch

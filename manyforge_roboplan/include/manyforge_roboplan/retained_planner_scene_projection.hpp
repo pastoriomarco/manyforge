@@ -79,6 +79,9 @@ public:
   [[nodiscard]] core::Result<core::CollisionWorldLeaseInventory>
   RetainProjection(const core::ProjectionRevisionDTO &projection_revision,
                    core::ProjectionLeaseId projection_lease_id) override;
+  [[nodiscard]] core::Result<core::CollisionWorldLeaseInventory>
+  RetainCurrentProjection(core::ProjectionLeaseId projection_lease_id) override;
+
   void ReleaseProjection(
       const core::ProjectionLeaseId &projection_lease_id) override;
   [[nodiscard]] core::ProjectionHealthDTO ProjectionHealth() const override;
@@ -148,9 +151,13 @@ private:
     kBootstrap,
   };
 
+  [[nodiscard]] std::shared_ptr<const core::LogicalSceneSnapshotDTO>
+  RetainedScene(const core::ProjectionLeaseBindingDTO &binding) const;
+
   struct RetainedProjectionLease final {
     std::shared_ptr<RetainedCollisionWorldPublisher> publisher;
     std::int64_t captured_at_ns{};
+    std::shared_ptr<const core::LogicalSceneSnapshotDTO> logical_scene;
   };
 
   RetainedPlannerSceneProjection(
@@ -175,6 +182,9 @@ private:
                 core::ErrorDTO error);
   [[nodiscard]] bool
   HealthyAt(const core::ProjectionRevisionDTO &revision) const noexcept;
+  [[nodiscard]] core::Result<core::CollisionWorldLeaseInventory>
+  RetainProjectionLocked(const core::ProjectionRevisionDTO &revision,
+                         core::ProjectionLeaseId lease_id);
   [[nodiscard]] core::ProjectionCommitResultDTO
   RebuildProjectionLocked(
       const core::NativeProjectionRebuildDTO &request,

@@ -595,6 +595,14 @@ RetainedPlannerSceneProjection::RetainProjection(
     const core::ProjectionRevisionDTO &projection_revision,
     core::ProjectionLeaseId projection_lease_id) {
   std::lock_guard lock(mutex_);
+  return RetainProjectionLocked(projection_revision,
+                                std::move(projection_lease_id));
+}
+
+core::Result<core::CollisionWorldLeaseInventory>
+RetainedPlannerSceneProjection::RetainProjectionLocked(
+    const core::ProjectionRevisionDTO &projection_revision,
+    core::ProjectionLeaseId projection_lease_id) {
   if (projection_lease_id.empty()) {
     return projection_error<core::CollisionWorldLeaseInventory>(
         "native projection lease does not name the exact healthy active "
@@ -676,7 +684,7 @@ RetainedPlannerSceneProjection::RetainProjection(
   try {
     const auto [inserted, was_inserted] = retained_lease_publishers_.emplace(
         projection_lease_id,
-        RetainedProjectionLease{publisher, captured_at_ns});
+        RetainedProjectionLease{publisher, captured_at_ns, inventory->logical_scene});
     if (!was_inserted) {
       publisher->release_scene_snapshot_lease_inventory(projection_lease_id);
       return projection_error<core::CollisionWorldLeaseInventory>(
@@ -695,6 +703,30 @@ RetainedPlannerSceneProjection::RetainProjection(
   }
   return core::Result<core::CollisionWorldLeaseInventory>::Ok(
       std::move(*inventory));
+}
+
+core::Result<core::CollisionWorldLeaseInventory>
+RetainedPlannerSceneProjection::RetainCurrentProjection(core::ProjectionLeaseId lease_id) {
+  std::lock_guard lock(mutex_);
+  if (!health_.active_projection_revision) {
+    return projection_error<core::CollisionWorldLeaseInventory>(
+        "current native planning projection is unavailable", "native_projection_lease_unavailable");
+  }
+  return RetainProjectionLocked(*health_.active_projection_revision, std::move(lease_id));
+}
+
+std::shared_ptr<const core::LogicalSceneSnapshotDTO>
+RetainedPlannerSceneProjection::RetainedScene(const core::ProjectionLeaseBindingDTO &binding) const {
+  const auto retained = retained_lease_publishers_.find(binding.projection_lease_id);
+  if (!binding.valid() || health_.state != core::ProjectionHealthState::kHealthy ||
+      !health_.active_projection_revision || !logical_snapshot_ ||
+      !core::ProjectionIsSameOrForwardInLineage(*health_.active_projection_revision,
+                                               binding.projection_revision) ||
+      retained == retained_lease_publishers_.end() || !retained->second.logical_scene ||
+      retained->second.logical_scene->revision != binding.projection_revision.scene_revision) {
+    return nullptr;
+  }
+  return retained->second.logical_scene;
 }
 
 void RetainedPlannerSceneProjection::ReleaseProjection(
@@ -1092,11 +1124,8 @@ core::Result<core::SceneFrameResolutionReceiptDTO>
 RetainedPlannerSceneProjection::ResolveSceneFrame(
     const core::SceneFrameResolutionQueryDTO &query) const {
   std::lock_guard lock(mutex_);
-  if (!query.valid() || !frame_resolver_ ||
-      !HealthyAt(query.projection_binding.projection_revision) ||
-      retained_lease_publishers_.find(
-          query.projection_binding.projection_lease_id) ==
-          retained_lease_publishers_.end()) {
+  const auto retained_scene = RetainedScene(query.projection_binding);
+  if (!query.valid() || !frame_resolver_ || !retained_scene) {
     return projection_error<core::SceneFrameResolutionReceiptDTO>(
         "scene-frame query does not name one retained healthy native "
         "projection",
@@ -1114,7 +1143,7 @@ RetainedPlannerSceneProjection::ResolveSceneFrame(
         "scene-frame resolution clock failed",
         "native_scene_frame_clock_failed");
   }
-  auto resolved = frame_resolver_->Resolve(query, logical_snapshot_, now_ns);
+  auto resolved = frame_resolver_->Resolve(query, retained_scene, now_ns);
   if (!resolved.ok()) {
     return core::Result<core::SceneFrameResolutionReceiptDTO>::Err(
         resolved.error());
@@ -1141,11 +1170,8 @@ core::Result<core::SceneFrameResolutionReceiptDTO>
 RetainedPlannerSceneProjection::ResolveCandidateSceneFrame(
     const core::CandidateSceneFrameResolutionQueryDTO &query) const {
   std::lock_guard lock(mutex_);
-  if (!query.valid() || !frame_resolver_ ||
-      !HealthyAt(query.projection_binding.projection_revision) ||
-      retained_lease_publishers_.find(
-          query.projection_binding.projection_lease_id) ==
-          retained_lease_publishers_.end()) {
+  const auto retained_scene = RetainedScene(query.projection_binding);
+  if (!query.valid() || !frame_resolver_ || !retained_scene) {
     return projection_error<core::SceneFrameResolutionReceiptDTO>(
         "candidate scene-frame query does not name one retained healthy "
         "native projection",
@@ -1165,7 +1191,7 @@ RetainedPlannerSceneProjection::ResolveCandidateSceneFrame(
         "native_candidate_scene_frame_clock_failed");
   }
   auto resolved =
-      frame_resolver_->ResolveCandidate(query, logical_snapshot_, now_ns);
+      frame_resolver_->ResolveCandidate(query, retained_scene, now_ns);
   if (!resolved.ok()) {
     return core::Result<core::SceneFrameResolutionReceiptDTO>::Err(
         resolved.error());
@@ -1200,10 +1226,7 @@ RetainedPlannerSceneProjection::ProjectSceneCandidate(
       candidate_lease_id.empty() ||
       candidate.prior_projection_revision !=
           predecessor_binding.projection_revision ||
-      !HealthyAt(candidate.prior_projection_revision) ||
-      retained_lease_publishers_.find(
-          predecessor_binding.projection_lease_id) ==
-          retained_lease_publishers_.end()) {
+      !RetainedScene(predecessor_binding)) {
     return projection_error<core::CollisionWorldLeaseInventory>(
         "scene candidate does not descend from one retained healthy native "
         "projection",
@@ -1346,18 +1369,13 @@ RetainedPlannerSceneProjection::current_scene_snapshot_lease_inventory() const {
 std::optional<core::CollisionWorldLeaseInventory>
 RetainedPlannerSceneProjection::retain_scene_snapshot_lease_inventory(
     core::ProjectionLeaseId projection_lease_id) {
-  core::ProjectionRevisionDTO revision;
-  {
-    std::lock_guard lock(mutex_);
-    if (!health_.active_projection_revision.has_value()) {
-      return std::nullopt;
-    }
-    revision = *health_.active_projection_revision;
-  }
-  if (projection_lease_id.empty()) {
+  std::lock_guard lock(mutex_);
+  if (!health_.active_projection_revision.has_value() ||
+      projection_lease_id.empty()) {
     return std::nullopt;
   }
-  auto retained = RetainProjection(revision, std::move(projection_lease_id));
+  auto retained = RetainProjectionLocked(*health_.active_projection_revision,
+                                        std::move(projection_lease_id));
   return retained.ok() ? std::optional<core::CollisionWorldLeaseInventory>(
                              std::move(retained.value()))
                        : std::nullopt;

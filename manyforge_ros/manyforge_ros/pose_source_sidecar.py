@@ -475,14 +475,48 @@ def normalize_detection3d_array_message(
     )
 
 
+def read_simulation_entity_states(
+    client: Any,
+    entity_names: Sequence[str],
+    *,
+    coherent: bool,
+) -> tuple[Any, bool]:
+    """Read the named entities once; the flag is true for one-instant reads.
+
+    With ``coherent`` the client's single batch read is used when the
+    simulator offers one. Otherwise the per-entity capture is used, whose
+    states may straddle simulator steps, and the flag is false.
+    """
+
+    batch_read = getattr(client, "capture_entity_states", None)
+    if coherent and callable(batch_read):
+        snapshot = batch_read(entity_names=tuple(entity_names))
+        if snapshot is not None:
+            return snapshot, True
+    return (
+        client.capture(
+            entity_names=tuple(entity_names),
+            include_info=False,
+            include_state=True,
+            include_bounds=False,
+        ),
+        False,
+    )
+
+
 def capture_simulation_entity_poses(
     client: Any,
     requests: Sequence[SimulationEntityPoseRequest],
     *,
     tf_buffer: Any | None = None,
     lookup_time: Any | None = None,
+    snapshot: Any | None = None,
 ) -> SimulationEntityPoseBatch:
-    """Perform one explicit read-only simulator capture with no local state."""
+    """Perform one explicit read-only simulator capture with no local state.
+
+    ``snapshot`` normalizes an already read result for these entities instead
+    of reading the client again.
+    """
 
     request_tuple = _bounded_rows(
         requests,
@@ -498,12 +532,13 @@ def capture_simulation_entity_poses(
     if len(set(entities)) != len(entities):
         raise ValueError("simulation entity requests must be unique")
     try:
-        snapshot = client.capture(
-            entity_names=entities,
-            include_info=False,
-            include_state=True,
-            include_bounds=False,
-        )
+        if snapshot is None:
+            snapshot = client.capture(
+                entity_names=entities,
+                include_info=False,
+                include_state=True,
+                include_bounds=False,
+            )
     except Exception as exc:
         detail = _bounded_detail(exc)
         return SimulationEntityPoseBatch(
@@ -829,6 +864,39 @@ def compose_pose_with_local_offset(
                 offset_orientation,
             ),
             label="composed orientation quaternion",
+        ),
+    )
+
+
+def relative_pose(reference: PoseSnapshot, pose: PoseSnapshot) -> PoseSnapshot:
+    """Express ``pose`` in the frame of ``reference``; both share one frame."""
+
+    normalized_reference = _validated_pose_snapshot(
+        reference, label="reference pose"
+    )
+    normalized_pose = _validated_pose_snapshot(pose, label="source pose")
+    if normalized_reference.frame_id != normalized_pose.frame_id:
+        raise ObservationNormalizationError(
+            "frame_or_pose_invalid",
+            "reference and source poses use different frames",
+        )
+    inverse = _quaternion_conjugate(normalized_reference.orientation_xyzw)
+    offset = normalized_pose.position_xyz
+    origin = normalized_reference.position_xyz
+    return PoseSnapshot(
+        frame_id=normalized_reference.frame_id,
+        stamp_ns=normalized_pose.stamp_ns,
+        position_xyz=_finite_numeric_sequence(
+            _rotate_vector(
+                inverse,
+                (offset[0] - origin[0], offset[1] - origin[1], offset[2] - origin[2]),
+            ),
+            length=3,
+            label="relative position_xyz",
+        ),
+        orientation_xyzw=_normalize_quaternion(
+            _quaternion_multiply(inverse, normalized_pose.orientation_xyzw),
+            label="relative orientation quaternion",
         ),
     )
 

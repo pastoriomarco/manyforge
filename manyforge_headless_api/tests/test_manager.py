@@ -689,15 +689,49 @@ def test_scene_pose_client_fences_and_validates_the_owner_projection(
         }
     ]
 
-    corrupt = exchange({})
-    corrupt["projection_revision"] = {
-        **query.expected_projection_revision.model_dump(),
-        "graph_revision": "sha256:" + "e" * 64,
+    expected = query.expected_projection_revision.model_dump()
+    # A newer revision of the same Scene is the owner's latest truth.
+    newer = exchange({})
+    newer["projection_revision"] = {
+        **expected,
+        "scene_revision": {
+            **expected["scene_revision"],
+            "revision_id": 2,
+            "content_hash": "sha256:" + "f" * 64,
+        },
     }
-    monkeypatch.setattr(client, "_exchange", lambda _command: corrupt)
-    with pytest.raises(HeadlessApiError) as captured:
-        client.resolve_scene_resources(query)
-    assert captured.value.code == "manager_command_response_identity_mismatch"
+    monkeypatch.setattr(client, "_exchange", lambda _command: newer)
+    assert (
+        client.resolve_scene_resources(query)["projection_revision"]
+        == newer["projection_revision"]
+    )
+
+    same_revision_other_content = {
+        **expected,
+        "scene_revision": {
+            **expected["scene_revision"],
+            "content_hash": "sha256:" + "f" * 64,
+        },
+    }
+    other_scene = {
+        **expected,
+        "scene_revision": {
+            **expected["scene_revision"],
+            "scene_id": "sha256:" + "e" * 64,
+            "revision_id": 2,
+        },
+    }
+    for foreign in (
+        {**expected, "graph_revision": "sha256:" + "e" * 64},
+        same_revision_other_content,
+        other_scene,
+    ):
+        corrupt = exchange({})
+        corrupt["projection_revision"] = foreign
+        monkeypatch.setattr(client, "_exchange", lambda _command, value=corrupt: value)
+        with pytest.raises(HeadlessApiError) as captured:
+            client.resolve_scene_resources(query)
+        assert captured.value.code == "manager_command_response_identity_mismatch"
 
     rejected = {
         "api_version": "manyforge.manager_command_response.v1",

@@ -719,6 +719,8 @@ class MockCollisionEngine final : public ICollisionQueryEngine {
   std::atomic<int> cancel_observed_count{0};
   std::atomic<int> runtime_checks_in_flight{0};
   std::atomic<int> runtime_query_prepare_count{0};
+  std::atomic<RuntimeCollisionQueryPrepareStatus> runtime_query_prepare_status{
+      RuntimeCollisionQueryPrepareStatus::kReady};
   std::atomic<int> runtime_snapshot_prepare_count{0};
   std::atomic<bool> runtime_prepare_overlapped_check{false};
   std::mutex cancel_reason_mutex;
@@ -817,7 +819,7 @@ class MockCollisionEngine final : public ICollisionQueryEngine {
     }
     try {
       runtime_joint_names.assign(canonical_joint_names.begin(), canonical_joint_names.end());
-      return RuntimeCollisionQueryPrepareStatus::kReady;
+      return runtime_query_prepare_status.load(std::memory_order_acquire);
     } catch (...) {
       return RuntimeCollisionQueryPrepareStatus::kEngineError;
     }
@@ -1979,11 +1981,9 @@ SceneSnapshotLiveObject make_observed_box_live_object(
     const std::string& object_id, const Pose3DTO& pose,
     std::string object_revision_token = "box-shape-token",
     std::optional<std::int64_t> source_timestamp_ns = 0,
-    std::optional<std::int64_t> freshness_budget_ns = 10'000'000'000,
-    std::optional<ObservedSceneObjectRole> declared_role = std::nullopt) {
+    std::optional<std::int64_t> freshness_budget_ns = 10'000'000'000) {
   SceneSnapshotLiveObject live;
   live.object_id = object_id;
-  live.declared_role = declared_role;
   live.collision_body_ids = {"scene/" + object_id + "/shape/0"};
   live.object_revision_token = std::move(object_revision_token);
   live.pose = pose;
@@ -2444,8 +2444,7 @@ class ExecutionKernelTest : public ::testing::Test {
   void publish_observed_box_for_lease(
       const std::string& object_id, double x_m, CollisionWorldRevision revision,
       std::string body_hash, std::uint64_t topology_epoch = 1, std::uint64_t policy_epoch = 1,
-      std::string object_revision_token = "box-shape-token",
-      std::optional<ObservedSceneObjectRole> declared_role = std::nullopt) {
+      std::string object_revision_token = "box-shape-token") {
     const auto pose = make_test_pose(x_m, 0.0, 0.0);
     collision_world_publisher.current_snapshot = std::make_shared<const CollisionWorldSnapshot>(
         make_test_collision_world_snapshot_with_object(object_id, pose, std::move(revision),
@@ -2456,17 +2455,15 @@ class ExecutionKernelTest : public ::testing::Test {
       collision_world_publisher.current_policy->revision.revision_id = policy_epoch;
     }
     collision_world_publisher.lease_live_objects = {make_observed_box_live_object(
-        object_id, pose, std::move(object_revision_token), 0, 10'000'000'000, declared_role)};
+        object_id, pose, std::move(object_revision_token))};
   }
 
-  void enable_observed_box_lease(
-      const std::string& object_id,
-      std::optional<ObservedSceneObjectRole> declared_role = std::nullopt) {
+  void enable_observed_box_lease(const std::string& object_id) {
     collision_world_publisher.lease_inventory_enabled = true;
     collision_world_publisher.current_policy = make_test_collision_policy_snapshot();
     publish_observed_box_for_lease(object_id, 0.0,
                                    CollisionWorldRevision{1, test_digest("box-world-1")},
-                                   "box-body-hash-1", 1, 1, "box-shape-token", declared_role);
+                                   "box-body-hash-1");
   }
 
   void configure_authoritative_collision_validation(
@@ -3742,7 +3739,7 @@ TEST_F(ExecutionKernelTest, Execute_HappyPath_CachesTrajectory) {
 }
 
 TEST_F(ExecutionKernelTest,
-       Execute_LiveSceneRevisionChangeAfterBorrowedSnapshotFailsBeforeDispatch) {
+       Execute_LiveSceneRevisionChangeAfterBorrowedSnapshotDispatchesOnLatestScene) {
   bool mutated_once = false;
   collision_engine->on_check = [this, &mutated_once](const CollisionQuery&) {
     if (!mutated_once) {
@@ -3754,23 +3751,32 @@ TEST_F(ExecutionKernelTest,
     }
   };
 
+  std::mutex events_mutex;
+  std::vector<KernelEvent> events;
+  kernel.subscribe_events([&](const KernelEvent& event) {
+    std::lock_guard<std::mutex> lock(events_mutex);
+    events.push_back(event);
+  });
+
   auto result = execute_sync(make_test_request("move_scene_changed"));
 
+  // A newer world without lease objects is an ordinary newer scene: the
+  // runtime monitor checks it from the first tick.
   ASSERT_TRUE(result.ok());
-  EXPECT_EQ(ended_as(kernel), "failed");
-  EXPECT_EQ(execution.execute_count, 0);
-  EXPECT_FALSE(peek_cache("move_scene_changed").has_value());
+  EXPECT_EQ(ended_as(kernel), "completed");
+  EXPECT_EQ(execution.execute_count, 1);
   EXPECT_EQ(collision_engine->check_count.load(), 2);
-  const auto snapshot = kernel.get_execution_snapshot();
-  ASSERT_TRUE(snapshot.error.has_value());
-  EXPECT_EQ(snapshot.error->code, kErrorSceneChangedDuringValidation);
-  EXPECT_EQ(snapshot.error->details.at("reason"),
-            "scene_snapshot_lease_missing_collision_coverage");
-  EXPECT_EQ(snapshot.error->details.at("validation_collision_world_revision_id"), "1");
-  EXPECT_EQ(snapshot.error->details.at("live_collision_world_revision_id"), "2");
+  std::lock_guard<std::mutex> lock(events_mutex);
+  const auto accepted = std::find_if(events.begin(), events.end(), [](const KernelEvent& e) {
+    return e.type == KernelEventType::kValidationPassed && e.details.contains("reason") &&
+           e.details.at("reason") == "scene_snapshot_lease_live_divergence_accepted";
+  });
+  ASSERT_NE(accepted, events.end());
+  EXPECT_EQ(accepted->details.at("validation_collision_world_revision_id"), "1");
+  EXPECT_EQ(accepted->details.at("live_collision_world_revision_id"), "2");
 }
 
-TEST_F(ExecutionKernelTest, Execute_SameContentRevisionChangeDuringValidationFailsClosed) {
+TEST_F(ExecutionKernelTest, Execute_SameContentRevisionChangeDuringValidationDispatchesOnLatestScene) {
   bool mutated_once = false;
   collision_engine->on_check = [this, &mutated_once](const CollisionQuery&) {
     if (!mutated_once) {
@@ -3785,21 +3791,13 @@ TEST_F(ExecutionKernelTest, Execute_SameContentRevisionChangeDuringValidationFai
   auto result = execute_sync(make_test_request("move_same_content_revision"));
 
   ASSERT_TRUE(result.ok());
-  EXPECT_EQ(ended_as(kernel), "failed");
-  EXPECT_EQ(execution.execute_count, 0);
-  EXPECT_FALSE(peek_cache("move_same_content_revision").has_value());
-  const auto snapshot = kernel.get_execution_snapshot();
-  ASSERT_TRUE(snapshot.error.has_value());
-  EXPECT_EQ(snapshot.error->code, kErrorSceneChangedDuringValidation);
-  EXPECT_EQ(snapshot.error->details.at("validation_collision_world_revision_id"), "1");
-  EXPECT_EQ(snapshot.error->details.at("live_collision_world_revision_id"), "2");
-  EXPECT_EQ(snapshot.error->details.at("validation_collision_world_content_hash"),
-            test_digest("mock-collision-world"));
-  EXPECT_EQ(snapshot.error->details.at("live_collision_world_content_hash"),
-            test_digest("mock-collision-world"));
+  EXPECT_TRUE(mutated_once);
+  EXPECT_EQ(ended_as(kernel), "completed");
+  EXPECT_EQ(execution.execute_count, 1);
+  EXPECT_FALSE(kernel.get_execution_snapshot().error.has_value());
 }
 
-TEST_F(ExecutionKernelTest, Execute_RepeatedLiveSceneRevisionChangesDuringValidationFailOnce) {
+TEST_F(ExecutionKernelTest, Execute_RepeatedLiveSceneRevisionChangesDuringValidationDispatchOnce) {
   std::uint64_t next_revision = 2;
   collision_engine->on_check = [this, &next_revision](const CollisionQuery&) {
     auto mutated = make_test_collision_world_snapshot();
@@ -3813,14 +3811,10 @@ TEST_F(ExecutionKernelTest, Execute_RepeatedLiveSceneRevisionChangesDuringValida
   auto result = execute_sync(make_test_request("move_scene_changed"));
 
   ASSERT_TRUE(result.ok());
-  EXPECT_EQ(ended_as(kernel), "failed");
-  EXPECT_EQ(execution.execute_count, 0);
-  EXPECT_FALSE(peek_cache("move_scene_changed").has_value());
-  const auto snapshot = kernel.get_execution_snapshot();
-  ASSERT_TRUE(snapshot.error.has_value());
-  EXPECT_EQ(snapshot.error->code, kErrorSceneChangedDuringValidation);
-  EXPECT_EQ(snapshot.error->details.at("validation_collision_world_revision_id"), "1");
-  EXPECT_NE(snapshot.error->details.at("live_collision_world_revision_id"), "1");
+  EXPECT_GT(next_revision, 2U);
+  EXPECT_EQ(ended_as(kernel), "completed");
+  EXPECT_EQ(execution.execute_count, 1);
+  EXPECT_FALSE(kernel.get_execution_snapshot().error.has_value());
 }
 
 TEST_F(ExecutionKernelTest, Execute_ObservedSceneLeaseAcceptsBoundedTargetPoseDriftBeforeDispatch) {
@@ -3889,8 +3883,7 @@ TEST_F(ExecutionKernelTest, Execute_RetainsOneExactProjectionThroughPlanValidati
             collision_world_publisher.current_policy->revision);
 }
 
-TEST_F(ExecutionKernelTest,
-       Execute_ObservedSceneLeaseRejectsTargetMovedBeyondToleranceBeforeDispatch) {
+TEST_F(ExecutionKernelTest, Execute_ObservedSceneLeaseAcceptsTargetMovedAfterValidation) {
   enable_observed_box_lease("box");
   bool mutated_once = false;
   collision_engine->on_check = [this, &mutated_once](const CollisionQuery&) {
@@ -3903,21 +3896,16 @@ TEST_F(ExecutionKernelTest,
 
   auto result = execute_sync(make_relative_object_request("move_lease_target", "box"));
 
+  // The motion goes ahead on the latest scene; the next cycle plans against
+  // the moved target.
   ASSERT_TRUE(result.ok());
-  EXPECT_EQ(ended_as(kernel), "failed");
-  EXPECT_EQ(execution.execute_count, 0);
-  EXPECT_FALSE(peek_cache("move_lease_target").has_value());
-  const auto snapshot = kernel.get_execution_snapshot();
-  ASSERT_TRUE(snapshot.error.has_value());
-  EXPECT_EQ(snapshot.error->code, kErrorSceneChangedDuringValidation);
-  EXPECT_EQ(snapshot.error->message, "Observed target moved after validation and before dispatch");
-  EXPECT_EQ(snapshot.error->details.at("reason"), reason_codes::kTargetMovedAfterValidation);
-  EXPECT_EQ(snapshot.error->details.at("object_id"), "box");
-  EXPECT_EQ(snapshot.error->details.at("validation_collision_world_revision_id"), "1");
-  EXPECT_EQ(snapshot.error->details.at("live_collision_world_revision_id"), "2");
+  EXPECT_TRUE(mutated_once);
+  EXPECT_EQ(ended_as(kernel), "completed");
+  EXPECT_EQ(execution.execute_count, 1);
+  EXPECT_FALSE(kernel.get_execution_snapshot().error.has_value());
 }
 
-TEST_F(ExecutionKernelTest, Execute_ObservedSceneLeaseRejectsTargetShapeChangeBeforeDispatch) {
+TEST_F(ExecutionKernelTest, Execute_ObservedSceneLeaseAcceptsTargetShapeChange) {
   enable_observed_box_lease("box");
   bool mutated_once = false;
   collision_engine->on_check = [this, &mutated_once](const CollisionQuery&) {
@@ -3932,23 +3920,24 @@ TEST_F(ExecutionKernelTest, Execute_ObservedSceneLeaseRejectsTargetShapeChangeBe
   auto result = execute_sync(make_relative_object_request("move_lease_shape", "box"));
 
   ASSERT_TRUE(result.ok());
-  EXPECT_EQ(ended_as(kernel), "failed");
-  EXPECT_EQ(execution.execute_count, 0);
-  const auto snapshot = kernel.get_execution_snapshot();
-  ASSERT_TRUE(snapshot.error.has_value());
-  EXPECT_EQ(snapshot.error->code, kErrorSceneChangedDuringValidation);
-  EXPECT_EQ(snapshot.error->details.at("reason"),
-            reason_codes::kSceneTopologyChangedAfterValidation);
-  EXPECT_EQ(snapshot.error->details.at("validated_topology_epoch"), "1");
-  EXPECT_EQ(snapshot.error->details.at("live_topology_epoch"), "2");
-  EXPECT_EQ(snapshot.error->details.at("object_revision_token_changed"), "true");
+  EXPECT_TRUE(mutated_once);
+  EXPECT_EQ(ended_as(kernel), "completed");
+  EXPECT_EQ(execution.execute_count, 1);
 }
 
-TEST_F(ExecutionKernelTest, Execute_ObservedSceneLeaseRejectsMissingTargetInventory) {
+TEST_F(ExecutionKernelTest, Execute_ObservedSceneLeaseRefusesStaleLiveSourceBeforeDispatch) {
   enable_observed_box_lease("box");
-  collision_world_publisher.lease_live_objects.clear();
+  bool aged_once = false;
+  collision_engine->on_check = [this, &aged_once](const CollisionQuery&) {
+    if (!aged_once) {
+      aged_once = true;
+      // The source goes silent past its budget between validation and dispatch.
+      collision_world_publisher.lease_live_objects.front().source_freshness_budget_ns = 1;
+      clock.advance(10);
+    }
+  };
 
-  auto result = execute_sync(make_relative_object_request("move_lease_missing_target", "box"));
+  auto result = execute_sync(make_test_request("move_lease_stale_source"));
 
   ASSERT_TRUE(result.ok());
   EXPECT_EQ(ended_as(kernel), "failed");
@@ -3956,23 +3945,20 @@ TEST_F(ExecutionKernelTest, Execute_ObservedSceneLeaseRejectsMissingTargetInvent
   const auto snapshot = kernel.get_execution_snapshot();
   ASSERT_TRUE(snapshot.error.has_value());
   EXPECT_EQ(snapshot.error->code, kErrorSceneChangedDuringValidation);
-  EXPECT_EQ(snapshot.error->details.at("reason"),
-            reason_codes::kSceneTopologyChangedAfterValidation);
+  EXPECT_EQ(snapshot.error->details.at("reason"), reason_codes::kObservedSceneSourceStale);
   EXPECT_EQ(snapshot.error->details.at("object_id"), "box");
-  EXPECT_EQ(snapshot.error->details.at("missing_collision_object_identity"), "true");
+  EXPECT_EQ(snapshot.error->details.at("source_id"), "test_pose_source");
 }
 
-TEST_F(ExecutionKernelTest,
-       Execute_ObservedSceneLeaseAcceptsNonTargetObservedTargetAsSnapshotObstacle) {
-  enable_observed_box_lease("box", ObservedSceneObjectRole::kObservedTarget);
+TEST_F(ExecutionKernelTest, Execute_ObservedSceneLeaseAcceptsNonTargetObjectChange) {
+  enable_observed_box_lease("box");
   bool mutated_once = false;
   collision_engine->on_check = [this, &mutated_once](const CollisionQuery&) {
     if (!mutated_once) {
       mutated_once = true;
       publish_observed_box_for_lease(
           "box", 0.005, CollisionWorldRevision{2, test_digest("box-world-2")}, "box-body-hash-2",
-          /*topology_epoch=*/2, /*policy_epoch=*/1, "box-shape-token-v2",
-          ObservedSceneObjectRole::kObservedTarget);
+          /*topology_epoch=*/2, /*policy_epoch=*/1, "box-shape-token-v2");
     }
   };
 
@@ -3983,32 +3969,6 @@ TEST_F(ExecutionKernelTest,
   EXPECT_EQ(execution.execute_count, 1);
   const auto snapshot = kernel.get_execution_snapshot();
   ASSERT_FALSE(snapshot.error.has_value());
-}
-
-TEST_F(ExecutionKernelTest, Execute_ObservedSceneLeaseRejectsExplicitDynamicObstacleDrift) {
-  enable_observed_box_lease("box", ObservedSceneObjectRole::kObservedDynamicObstacle);
-  bool mutated_once = false;
-  collision_engine->on_check = [this, &mutated_once](const CollisionQuery&) {
-    if (!mutated_once) {
-      mutated_once = true;
-      publish_observed_box_for_lease(
-          "box", 0.005, CollisionWorldRevision{2, test_digest("box-world-2")}, "box-body-hash-2", 1,
-          1, "box-shape-token", ObservedSceneObjectRole::kObservedDynamicObstacle);
-    }
-  };
-
-  auto result = execute_sync(make_test_request("move_lease_dynamic_obstacle"));
-
-  ASSERT_TRUE(result.ok());
-  EXPECT_EQ(ended_as(kernel), "failed");
-  EXPECT_EQ(execution.execute_count, 0);
-  const auto snapshot = kernel.get_execution_snapshot();
-  ASSERT_TRUE(snapshot.error.has_value());
-  EXPECT_EQ(snapshot.error->code, kErrorSceneChangedDuringValidation);
-  EXPECT_EQ(snapshot.error->message,
-            "Observed obstacle moved after validation and before dispatch");
-  EXPECT_EQ(snapshot.error->details.at("reason"), reason_codes::kObstacleMovedAfterValidation);
-  EXPECT_EQ(snapshot.error->details.at("object_id"), "box");
 }
 
 TEST_F(ExecutionKernelTest, Execute_ObservedSceneLeaseAcceptsDefaultSnapshotObstacleDrift) {
@@ -4633,6 +4593,31 @@ TEST_F(ExecutionKernelTest, Execute_SynchronizesExternalSceneBeforeRetainingPlan
             test_projection_revision());
 }
 
+TEST_F(ExecutionKernelTest,
+       Execute_AcceptsRetainedProjectionForwardOfSceneSynchronizationFloor) {
+  MockPlanningSceneSynchronizer scene_synchronizer;
+  auto retained_revision = test_projection_revision();
+  retained_revision.scene_revision.revision_id = 2U;
+  retained_revision.scene_revision.content_hash = ContentDigest{kTestDigestA};
+  collision_world_publisher.lease_projection_revision = retained_revision;
+  auto ports = static_cast<ExecutionKernelPorts>(context);
+  ports.planning_scene_synchronizer = &scene_synchronizer;
+  ExecutionKernel synchronized_kernel{planner, ports, execution, clock, scheduler, cache};
+  configure_authoritative_collision_validation(synchronized_kernel, collision_world_publisher,
+                                               collision_engine);
+
+  const auto result = prepare_and_dispatch(
+      synchronized_kernel, make_test_request("move_after_scene_sync_forward_revision"));
+
+  ASSERT_TRUE(result.ok()) << result.error().message;
+  EXPECT_TRUE(synchronized_kernel.wait_for_completion(2'000'000'000));
+  EXPECT_EQ(scene_synchronizer.call_count, 1);
+  ASSERT_EQ(planner.plan_count, 1);
+  EXPECT_EQ(planner.last_request.projection_binding.projection_revision,
+            retained_revision);
+  EXPECT_EQ(execution.execute_count, 1);
+}
+
 TEST_F(ExecutionKernelTest, Execute_SceneSynchronizationFailureBlocksPlanningAndDispatch) {
   MockPlanningSceneSynchronizer scene_synchronizer;
   scene_synchronizer.next_result = Result<ProjectionRevisionDTO>::Err(ErrorDTO{
@@ -4666,6 +4651,50 @@ TEST_F(ExecutionKernelTest, Execute_RejectsProjectionChangeAfterSceneSynchroniza
 
   const auto result =
       prepare_and_dispatch(synchronized_kernel, make_test_request("move_scene_sync_raced"));
+
+  ASSERT_FALSE(result.ok());
+  EXPECT_EQ(result.error().details.at("reason"), "planning_scene_synchronization_raced");
+  EXPECT_EQ(scene_synchronizer.call_count, 1);
+  EXPECT_EQ(planner.plan_count, 0);
+  EXPECT_EQ(execution.execute_count, 0);
+}
+
+TEST_F(ExecutionKernelTest,
+       Execute_RejectsSynchronizedFloorWithEqualRevisionAndDifferentHash) {
+  MockPlanningSceneSynchronizer scene_synchronizer;
+  auto floor = test_projection_revision();
+  floor.scene_revision.content_hash = ContentDigest{kTestDigestA};
+  scene_synchronizer.next_result = Result<ProjectionRevisionDTO>::Ok(floor);
+  auto ports = static_cast<ExecutionKernelPorts>(context);
+  ports.planning_scene_synchronizer = &scene_synchronizer;
+  ExecutionKernel synchronized_kernel{planner, ports, execution, clock, scheduler, cache};
+  configure_authoritative_collision_validation(synchronized_kernel, collision_world_publisher,
+                                               collision_engine);
+
+  const auto result = prepare_and_dispatch(
+      synchronized_kernel, make_test_request("move_scene_sync_equal_revision_hash_mismatch"));
+
+  ASSERT_FALSE(result.ok());
+  EXPECT_EQ(result.error().details.at("reason"), "planning_scene_synchronization_raced");
+  EXPECT_EQ(scene_synchronizer.call_count, 1);
+  EXPECT_EQ(planner.plan_count, 0);
+  EXPECT_EQ(execution.execute_count, 0);
+}
+
+TEST_F(ExecutionKernelTest,
+       Execute_RejectsSynchronizedFloorFromDifferentSceneLineage) {
+  MockPlanningSceneSynchronizer scene_synchronizer;
+  auto floor = test_projection_revision();
+  floor.scene_revision.scene_id = SceneId{kTestDigestD};
+  scene_synchronizer.next_result = Result<ProjectionRevisionDTO>::Ok(floor);
+  auto ports = static_cast<ExecutionKernelPorts>(context);
+  ports.planning_scene_synchronizer = &scene_synchronizer;
+  ExecutionKernel synchronized_kernel{planner, ports, execution, clock, scheduler, cache};
+  configure_authoritative_collision_validation(synchronized_kernel, collision_world_publisher,
+                                               collision_engine);
+
+  const auto result = prepare_and_dispatch(
+      synchronized_kernel, make_test_request("move_scene_sync_different_scene"));
 
   ASSERT_FALSE(result.ok());
   EXPECT_EQ(result.error().details.at("reason"), "planning_scene_synchronization_raced");
@@ -5615,6 +5644,62 @@ TEST_F(ExecutionKernelTest, RuntimeCollisionPublishedBundleFailureFailsClosedWit
 
   controlled_execution.release();
   ASSERT_TRUE(local_kernel.wait_for_completion(1'000'000'000));
+}
+
+TEST_F(ExecutionKernelTest, RuntimeMonitorPrepareFailureIsCriticalFaultWithoutDispatch) {
+  collision_runtime_engine->runtime_query_prepare_status =
+      RuntimeCollisionQueryPrepareStatus::kEngineError;
+  std::mutex events_mutex;
+  std::vector<KernelEvent> events;
+  kernel.subscribe_events([&](const KernelEvent& event) {
+    std::lock_guard<std::mutex> lock(events_mutex);
+    events.push_back(event);
+  });
+
+  const auto failed = execute_sync(make_test_request("monitor_prepare_failure"));
+
+  ASSERT_TRUE(failed.ok());
+  EXPECT_EQ(ended_as(kernel), "failed");
+  EXPECT_EQ(execution.execute_count, 0) << "nothing may be sent without a prepared monitor";
+  const auto snapshot = kernel.get_execution_snapshot();
+  ASSERT_TRUE(snapshot.error.has_value());
+  EXPECT_EQ(snapshot.error->code, kErrorRuntimeCollisionMonitorPrepareFailed);
+  EXPECT_EQ(snapshot.error->details.at("reason_code"),
+            kErrorRuntimeCollisionMonitorPrepareFailed);
+  EXPECT_EQ(snapshot.error->details.at("reason"), "runtime_collision_query_prepare_failed");
+  EXPECT_EQ(snapshot.error->details.at("prepare_error_code"), kErrorValidationCollision);
+  {
+    std::lock_guard<std::mutex> lock(events_mutex);
+    EXPECT_TRUE(std::any_of(events.begin(), events.end(), [](const KernelEvent& e) {
+      return e.type == KernelEventType::kParticipantSettled &&
+             e.details.at("reason") == "execution_critical_fault" &&
+             e.details.at("participant_effect") ==
+                 to_string(ParticipantEffectKnowledge::kNoEffect);
+    }));
+    EXPECT_FALSE(std::any_of(events.begin(), events.end(), [](const KernelEvent& e) {
+      return e.type == KernelEventType::kCollisionDetected;
+    }));
+  }
+
+  // Recovery is the ordinary Reset path, not a Stop-fault latch.
+  scheduler.advance_to(clock.now());
+  const auto assessment = kernel.get_recovery_assessment();
+  EXPECT_EQ(assessment.recovery_class, RecoveryClass::kUnknownFault);
+  EXPECT_EQ(assessment.status, RecoveryAssessmentStatus::kResetRequired);
+  EXPECT_FALSE(
+      apply_recovery_action_after_projection(kernel, RecoveryAction::kRetryAfterSceneRepair)
+          .accepted);
+  const auto reset = kernel.reset_after_certified_containment(failed.value());
+  ASSERT_TRUE(reset.accepted) << reset.error->message;
+  EXPECT_EQ(ended_as(kernel), "working:Idle");
+  EXPECT_TRUE(kernel.get_recovery_assessment().latch_id.empty());
+
+  collision_runtime_engine->runtime_query_prepare_status =
+      RuntimeCollisionQueryPrepareStatus::kReady;
+  const auto next = execute_sync(make_test_request("after_monitor_prepare_reset"));
+  ASSERT_TRUE(next.ok());
+  EXPECT_EQ(ended_as(kernel), "completed");
+  EXPECT_EQ(execution.execute_count, 1);
 }
 
 TEST_F(ExecutionKernelTest, RuntimeProtectionLeaseIsActiveBeforeBackendExecuteStarts) {
@@ -11522,9 +11607,9 @@ TEST_F(PortParticipantKernelTest, TimelyAdoptionPreservesRampDeliveryClockAndQua
   pclock.advance(1);
   Sample(0.1, 0.5 * (0.5 + 0.1 + 0.96 * 0.02), 0.5, scales.back().value);
   const auto stage = StageForProduct(successor, next, 0U);
-  (void)participant->TranslateStopStageForTakeover(stage, BudgetFor(stage), cancel.get_token(),
-                                                   observer);
-  ASSERT_TRUE(observer.point);
+  const auto stopped = participant->TranslateStopStageForTakeover(
+      stage, BudgetFor(stage), cancel.get_token(), observer);
+  ASSERT_TRUE(observer.point) << (stopped.error ? stopped.error->message : "no Stop error");
   EXPECT_NEAR(observer.point->initial.command_path_time_s, 0.1, 1e-12);
   ASSERT_TRUE(observer.point->canonical_return_path_time_s);
   EXPECT_NEAR(*observer.point->canonical_return_path_time_s, 0.1 + 0.96 * 0.02, 1e-12);
@@ -12565,6 +12650,100 @@ StopCertificateDTO kernel_spring_certificate(const ParticipantStopStageResultDTO
   return reduced.value();
 }
 
+TEST_F(ExecutionKernelTest,
+       AddressedContainmentAcknowledgesSettledFailureWithoutMakingItRetryable) {
+  execution.next_terminal_state = ExecutionState::kFailed;
+  execution.snapshot.error = ErrorDTO{kErrorExecutionAborted, "Controller aborted",
+                                     {{"reason", "aborted_path_tolerance"}}};
+  execution.execution_generation = 1U;
+  ExecutionKernel owner(planner, context, execution, clock, scheduler, cache);
+  owner.set_collision_validation_policy_snapshot(make_test_collision_policy_snapshot());
+  owner.set_collision_resources(collision_world_publisher, collision_runtime_engine,
+                                {collision_engine});
+
+  const auto authority = kernel_spring_authority("ack.settled-failure");
+  const auto started = prepare_and_dispatch(owner, authority);
+  ASSERT_TRUE(started.ok()) << started.error().message;
+  ASSERT_TRUE(owner.wait_for_completion(2'000'000'000));
+  const auto failed = owner.get_status();
+  ASSERT_EQ(failed.state, ExecutionState::kExecuting);
+  ASSERT_TRUE(failed.fact.has_value());
+  const auto original_fact = *failed.fact;
+  ASSERT_EQ(original_fact.kind, ParticipantExecutionFactKind::kLocalFailure);
+  ASSERT_EQ(original_fact.effect, ParticipantEffectKnowledge::kEffectSettled);
+  ASSERT_TRUE(original_fact.error.has_value());
+
+  const auto observed = owner.ObservePreparedMotion(started.value());
+  ASSERT_TRUE(observed.ok()) << observed.error().message;
+  ASSERT_TRUE(observed.value().last_dispatched_participant);
+  const auto& binding = authority.execution_request.binding;
+  const auto stage = kernel_spring_stage(
+      *observed.value().last_dispatched_participant,
+      {binding.controller_goal_id, binding.controller_goal_generation}, authority,
+      StopId("ack.settled-failure.stop"), StopGeneration(1U));
+  EXPECT_EQ(owner.fence_addressed_participant_stop(started.value()),
+            AddressedParticipantStopFenceDisposition::kDispatchCommitted);
+  const auto containment = kernel_spring_result(stage);
+  const auto certificate = kernel_spring_certificate(containment);
+  ASSERT_EQ(certificate.result, StopCertificateResultDTO::kSucceededNominal);
+  const auto backend_containment = execution.execute_controlled_stop(
+      *authority.ordinary_stop_plan->participant_stop_profile);
+  ASSERT_TRUE(backend_containment.backend_stop_confirmed);
+  const StopCertificateRefDTO reference{
+      certificate.stop_certificate_id, certificate.stop_certificate_revision,
+      certificate.stop_id, certificate.stop_generation};
+
+  const auto settled = owner.settle_addressed_participant_stop(
+      {started.value(), reference, containment, OperationParticipantPayloadKind::kMotion, false});
+  ASSERT_TRUE(settled.ok()) << settled.error().message;
+  EXPECT_EQ(settled.value().terminal_fact, std::optional(original_fact));
+  const auto& assessment = settled.value().recovery_assessment;
+  EXPECT_EQ(assessment.execution_id, started.value());
+  EXPECT_EQ(assessment.execution_state, ExecutionState::kFailed);
+  EXPECT_FALSE(assessment.retry_admissible);
+  EXPECT_FALSE(assessment.retry_eligibility.eligible);
+  EXPECT_EQ(assessment.status, RecoveryAssessmentStatus::kActionRequired);
+  EXPECT_TRUE(assessment.eligible_close);
+  EXPECT_TRUE(assessment.backend_stop_confirmed);
+  EXPECT_EQ(assessment.stop_certificate_id, reference.stop_certificate_id.value());
+  EXPECT_EQ(assessment.stop_certificate_revision,
+            reference.stop_certificate_revision.value());
+  EXPECT_EQ(assessment.stop_owner_generation, reference.stop_generation.value());
+  EXPECT_TRUE(std::find(assessment.allowed_actions.begin(), assessment.allowed_actions.end(),
+                        RecoveryAction::kCloseOperation) != assessment.allowed_actions.end());
+  EXPECT_EQ(owner.get_status().state, failed.state);
+  EXPECT_EQ(owner.get_status().fact, std::optional(original_fact));
+
+  const auto replay = owner.settle_addressed_participant_stop(
+      {started.value(), reference, containment, OperationParticipantPayloadKind::kMotion, false});
+  ASSERT_TRUE(replay.ok()) << replay.error().message;
+  EXPECT_EQ(replay.value().terminal_fact, std::optional(original_fact));
+  EXPECT_EQ(replay.value().recovery_assessment.stop_certificate_id,
+            reference.stop_certificate_id.value());
+  auto conflicting = reference;
+  conflicting.stop_certificate_revision = StopCertificateRevision(
+      reference.stop_certificate_revision.value() + 1U);
+  const auto conflict = owner.settle_addressed_participant_stop(
+      {started.value(), conflicting, containment, OperationParticipantPayloadKind::kMotion, false});
+  ASSERT_FALSE(conflict.ok());
+  EXPECT_EQ(conflict.error().details.at("reason"), "addressed_motion_stop_identity_conflict");
+
+  const KernelRecoveryActionRequestDTO close{
+      "ack.settled-failure.close", RecoveryAction::kCloseOperation, "operator",
+      assessment.assessment_revision, assessment.control_command_epoch, assessment.execution_id,
+      assessment.latch_id, assessment.stop_certificate_id, assessment.stop_owner_generation,
+      "acknowledge contained failure", false};
+  const auto resets = execution.reset_count;
+  const auto stops = execution.stop_count;
+  const auto retired = owner.apply_recovery_action(close);
+  ASSERT_TRUE(retired.accepted) << (retired.error ? retired.error->message : "closure refused");
+  EXPECT_EQ(owner.get_status().state, ExecutionState::kIdle);
+  EXPECT_EQ(execution.execute_count, 1);
+  EXPECT_EQ(execution.reset_count, resets);
+  EXPECT_EQ(execution.stop_count, stops);
+  EXPECT_EQ(execution.retire_count, 1);
+}
+
 TEST_F(ExecutionKernelTest, SpringColdProductWaitsBeyondPreparationBudgetWithoutReplanning) {
   ColdPreparationExecution backend;
   backend.enable_execution_progress_publication();
@@ -12758,7 +12937,7 @@ TEST_F(ExecutionKernelTest, SpringColdProductWaitsBeyondPreparationBudgetWithout
     ASSERT_TRUE(backend.wait_until_execute_count(next_run ? 4 : 3));
     ASSERT_TRUE(wait_for_state(owner, ExecutionState::kExecuting));
     const auto next_observed = owner.ObservePreparedMotion(next_started.value());
-    ASSERT_TRUE(next_observed.ok());
+    ASSERT_TRUE(next_observed.ok()) << next_observed.error().message;
     ASSERT_TRUE(next_observed.value().last_dispatched_participant);
     const auto& next_binding = next_authority.execution_request.binding;
     const auto next_stage = kernel_spring_stage(

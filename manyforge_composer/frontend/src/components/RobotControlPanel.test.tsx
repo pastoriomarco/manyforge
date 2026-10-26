@@ -1,3 +1,4 @@
+import { readFileSync } from 'node:fs';
 import { renderToStaticMarkup } from 'react-dom/server';
 import { describe, expect, it, vi } from 'vitest';
 
@@ -482,5 +483,14 @@ describe('RobotControlPanel layout', () => {
     expect(markup).toMatch(/disabled=""[^>]*aria-label="Reset operation" title="Confirm each output with unknown acceptance first."/);
     state.phase = 'ready';
     state.operation = null;
+  });
+
+  it('resets typed inputs on another Scene, never on a pose-only Scene revision', () => {
+    const source = readFileSync(new URL('./RobotControlPanel.tsx', import.meta.url), 'utf8');
+    const start = source.indexOf('const inputResetKey = [');
+    const key = source.slice(start, source.indexOf("].join('\\u0000');", start));
+    expect(start).toBeGreaterThan(0);
+    expect(key).toContain('status?.sceneRevision.scene_id');
+    expect(key).not.toMatch(/revision_id|content_hash/);
   });
 });

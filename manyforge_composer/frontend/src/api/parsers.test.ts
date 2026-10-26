@@ -3143,6 +3143,48 @@ describe('headless projection parsers', () => {
     expect(parsed[2]?.payload_quality).toBe('unknown');
   });
 
+  it('parses the versioned gripper-referenced simulation pose payload', () => {
+    const reference = {
+      coherent: true,
+      entity: '/World/gripper',
+      link: 'robotiq_base_link',
+      pose_in_reference: { orientation_xyzw: [0, 0, 0, 1], position_m: [0.02, 0, 0.25] },
+    };
+    const payload = {
+      api_version: 'manyforge.ros_pose_observation.v2',
+      kind: 'simulation_entity_pose_with_reference.v1',
+      pose: {
+        frame_id: 'universe',
+        frame_kind: 'cell_frame',
+        orientation_xyzw: [0, 0, 0, 1],
+        position_m: [0.4, -0.2, 0.1],
+        source_stamp_ns: null,
+      },
+      reference,
+      source: { entity: '/mac_n_cheese_centered' },
+    };
+    const fixture = sceneRuntimeFixture();
+    (fixture.state as Record<string, unknown>).pose_sources = [
+      poseSourceFixture(payload, { eligible: true, object_id: 'isaac_cheese_box' }),
+      poseSourceFixture(
+        { ...payload, reference: { ...reference, coherent: false, pose_in_reference: null } },
+        { eligible: true, object_id: 'isaac_other_box', source_sequence: 8 },
+      ),
+    ];
+    const parsed = parseSceneRuntimeProjection(fixture).state.pose_sources;
+    expect(parsed[0]?.payload).toMatchObject({
+      kind: 'simulation_entity_pose_with_reference.v1',
+      reference: { coherent: true, pose_in_reference: { position_m: [0.02, 0, 0.25] } },
+    });
+    expect(parsed[1]?.payload).toMatchObject({ reference: { pose_in_reference: null } });
+
+    const extra = sceneRuntimeFixture();
+    (extra.state as Record<string, unknown>).pose_sources = [
+      poseSourceFixture({ ...payload, kind: 'simulation_entity_pose' }),
+    ];
+    expect(() => parseSceneRuntimeProjection(extra)).toThrow();
+  });
+
   it('rejects ambiguous or dishonest ROS observation shapes', () => {
     const invalidFrame = sceneRuntimeFixture();
     (invalidFrame.state as Record<string, unknown>).pose_sources = [

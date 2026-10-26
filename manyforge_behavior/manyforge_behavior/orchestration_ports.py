@@ -351,6 +351,22 @@ class OwnerTaskSettlementPendingError(RuntimeError):
     """A terminal task is waiting for its owner to settle an accepted effect."""
 
 
+class PoseSourceLatchError(RuntimeError):
+    """A between-node pose-source latch could not be proven complete."""
+
+    def __init__(
+        self,
+        message: str,
+        *,
+        details: Mapping[str, Any] | None = None,
+    ) -> None:
+        if not isinstance(message, str) or not message:
+            raise ValueError("pose-source latch failure requires a message")
+        self.reason_code = "pose_source_apply_failed"
+        self.details = None if details is None else dict(details)
+        super().__init__(message)
+
+
 @dataclass(frozen=True, slots=True)
 class OwnerInvocationResult:
     succeeded: bool
@@ -942,6 +958,7 @@ __all__ = [
     "OwnerTaskPort",
     "OwnerTaskObservationUnavailableError",
     "OwnerTaskSettlementPendingError",
+    "PoseSourceLatchError",
     "OwnerTaskSnapshot",
     "OwnerTaskState",
     "ProgramRunScopePort",

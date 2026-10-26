@@ -459,7 +459,8 @@ case "$command" in
     [[ -z "$stopped_container_receipt" ]] || session_proof=(--stopped-container-receipt "$stopped_container_receipt")
     python3 "$session_helper" "$runtime_root" --session-id "$session_id" --lock-fd "$session_lock_fd" "${session_proof[@]}" >/dev/null
     session_environment=(-e "MANYFORGE_DEV_COLD_SESSION_ID=$session_id")
-    for variable in MANYFORGE_MOTION_TRACE_DIR MANYFORGE_EXPERIMENTAL_RELEASE_TIMER \
+    for variable in MANYFORGE_MOTION_TRACE_DIR MANYFORGE_DEBUG_SCENE_DIVERGENCE \
+        MANYFORGE_EXPERIMENTAL_RELEASE_TIMER \
         MANYFORGE_EXPERIMENTAL_MIDTICK_STAMP MANYFORGE_EXPERIMENTAL_V0_PAYLOAD \
         MANYFORGE_EXPERIMENTAL_SCHEDULED_SPRING_BACK_FAST \
         MANYFORGE_EXPERIMENTAL_RELEASE_TIMER_LATENCY_MS \

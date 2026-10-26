@@ -266,7 +266,17 @@ bool ResourceAddressedExecutionKernel::operation_close_eligible_locked(
       operation.state.state == OperationStateKind::kFailed ||
       operation.state.state == OperationStateKind::kStopped ||
       operation.state.state == OperationStateKind::kCancelledPreDispatch ||
-      (operation.state.state == OperationStateKind::kInterventionRequired && no_effect);
+      (operation.state.state == OperationStateKind::kInterventionRequired &&
+       (no_effect ||
+        (operation.state.active_stop_id &&
+         std::all_of(operation.state.participants.begin(), operation.state.participants.end(),
+                     [](const auto& row) {
+                       if (row.state == OperationStateKind::kStopped ||
+                           row.state == OperationStateKind::kCompleted) return true;
+                       const auto* fact = selected_cause_terminal_fact(row);
+                       return row.state == OperationStateKind::kFailed && fact &&
+                              is_settled_execution_failure(*fact);
+                     }))));
   if (!terminal_state) return false;
   for (std::size_t index = 0; index < operation.participants.size(); ++index) {
     const auto& row = operation.participants[index];

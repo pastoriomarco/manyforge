@@ -415,6 +415,15 @@ DecodeProjectionStatus(std::string_view value);
 [[nodiscard]] bool IsAuthoredSceneMutation(
     const SceneTransactionRequestDTO &request);
 
+/// Whether a request's expected projection admits the active one. Attach,
+/// both detach kinds, remove and pose updates check their own identities
+/// (object, attachment, carrier) against the current Scene, so they accept
+/// any same-or-older revision of the same Scene. Add, upsert and collision
+/// policy edits keep the exact predecessor.
+[[nodiscard]] bool ExpectedProjectionAdmitsActive(
+    const SceneTransactionRequestDTO &request,
+    const ProjectionRevisionDTO &active);
+
 [[nodiscard]] core::CellAdmissionClaimIntentDTO AuthoredSceneClaimIntent(
     const SceneTransactionRequestDTO &request,
     const ContentDigest &request_digest);

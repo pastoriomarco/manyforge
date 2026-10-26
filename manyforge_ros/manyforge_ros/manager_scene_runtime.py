@@ -57,6 +57,7 @@ _SCENE_APPLICATION_STATUSES = {
     "buffered",
     "committed",
     "deferred_before_planning",
+    "deferred_between_nodes",
     "freshness_confirmed",
     "not_requested",
     "skipped_attached",
@@ -503,6 +504,7 @@ class ManagerSceneRuntimeClient:
             if application_status in {
                 "buffered",
                 "deferred_before_planning",
+                "deferred_between_nodes",
                 "not_requested",
             }:
                 if (
@@ -536,32 +538,14 @@ class ManagerSceneRuntimeClient:
             if not intent.eligible or intent.quality != "good" or not record["fresh"]:
                 if application_status != "not_requested":
                     raise ValueError("ineligible observation reports scene application")
-            elif intent.policy_id == "before_planning":
-                if application_status not in {
-                    "already_applied",
-                    "committed",
-                    "deferred_before_planning",
-                    "freshness_confirmed",
-                    "skipped_attached",
-                }:
-                    raise ValueError(
-                        "before-planning observation has an invalid latch status"
-                    )
             elif disposition in {"buffered", "replaced_buffered"}:
                 if application_status != "buffered":
                     raise ValueError("buffered observation reports another application")
-            elif (
-                intent.policy_id != "continuous_unattached"
-                or disposition not in {"apply_now", "duplicate"}
-                or application_status
-                not in {
-                    "already_applied",
-                    "committed",
-                    "freshness_confirmed",
-                    "skipped_attached",
-                }
-            ):
-                raise ValueError("observation application contradicts its policy")
+            elif application_status == "buffered":
+                raise ValueError("unbuffered observation reports a buffered application")
+            # Application timing belongs to the active Deployment/Manager.
+            # The acquisition binding's policy_id is a stable source key, not
+            # permission to reconstruct the selected application policy here.
         except (TypeError, ValueError) as exc:
             raise _response_invalid("observation response is invalid") from exc
         if (

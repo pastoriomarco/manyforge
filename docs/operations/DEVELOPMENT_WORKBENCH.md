@@ -216,6 +216,12 @@ These are snapshots of the bounded volatile window (16 goals, 1,024 controller
 samples), with explicit coverage and omission counts, not complete Run journals.
 Unavailable or invalid diagnostic files do not fail motion or the debug export.
 
+To record which scene objects changed between validation and dispatch, set
+`MANYFORGE_DEBUG_SCENE_DIVERGENCE=1` before starting. Motions still dispatch on
+the latest scene; the accepted-divergence event then carries up to 16
+`object_divergence.<object>.*` entries plus a truncated count. Leave it unset
+for revision-level evidence only.
+
 Frontend source edits update through HMR. Backend
 startup incrementally builds the current `manyforge_manager_daemon`,
 `manyforge_headless_py`, `manyforge_ros2_control_execution_host`,

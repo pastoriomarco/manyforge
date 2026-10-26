@@ -43,19 +43,6 @@ bool revisions_equal(const CollisionWorldRevision& lhs, const CollisionWorldRevi
   return lhs.revision_id == rhs.revision_id && lhs.content_hash == rhs.content_hash;
 }
 
-bool projection_is_same_or_forward_in_lineage(const ProjectionRevisionDTO& candidate,
-                                              const ProjectionRevisionDTO& floor) noexcept {
-  if (!candidate.valid() || !floor.valid() ||
-      candidate.retained_bundle_id != floor.retained_bundle_id ||
-      candidate.graph_revision != floor.graph_revision ||
-      candidate.scene_revision.scene_id != floor.scene_revision.scene_id ||
-      candidate.scene_revision.revision_id < floor.scene_revision.revision_id) {
-    return false;
-  }
-  return candidate.scene_revision.revision_id != floor.scene_revision.revision_id ||
-         candidate.scene_revision.content_hash == floor.scene_revision.content_hash;
-}
-
 std::optional<CollisionPairId> first_failure_pair(const CollisionValidationDecisionBundle& bundle) {
   if (!bundle.decision.first_failing_waypoint) {
     return std::nullopt;
@@ -560,7 +547,7 @@ void RuntimeCollisionLookaheadSession::request(
   pending.arm.admission_projection_revision = arm_.admission_projection_revision;
   pending.arm.latest_projection_revision = arm_.latest_projection_revision;
   if (arm_.latest_projection_revision.has_value() && bundle->projection_revision.has_value() &&
-      projection_is_same_or_forward_in_lineage(*bundle->projection_revision,
+      ProjectionIsSameOrForwardInLineage(*bundle->projection_revision,
                                                *arm_.latest_projection_revision)) {
     arm_.latest_projection_revision = bundle->projection_revision;
     pending.arm.latest_projection_revision = bundle->projection_revision;
@@ -883,7 +870,7 @@ RuntimeCollisionLookaheadResult RuntimeCollisionLookaheadSession::run_job(const 
     record_projection("lookahead_observed_projection_", job.bundle->projection_revision);
     if (!job.bundle->projection_revision.has_value() ||
         !job.arm.latest_projection_revision.has_value() ||
-        !projection_is_same_or_forward_in_lineage(*job.bundle->projection_revision,
+        !ProjectionIsSameOrForwardInLineage(*job.bundle->projection_revision,
                                                   *job.arm.admission_projection_revision) ||
         *job.bundle->projection_revision != *job.arm.latest_projection_revision) {
       result.reason = "runtime_lookahead_projection_revision_mismatch";

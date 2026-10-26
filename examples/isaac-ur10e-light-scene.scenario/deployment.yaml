@@ -171,6 +171,13 @@
       "motion_scope_arm_timeout_ns": 1000,
       "queue_depth": 8,
       "supervisory_poll_rate_hz": 10
-    }
+    },
+    "scene_pose_sources": [
+      {
+        "apply_policy": "continuous_relative_to_attached",
+        "scene_resource_id": "isaac_cheese_box",
+        "source_id": "isaac_scene_objects"
+      }
+    ]
   }
 }

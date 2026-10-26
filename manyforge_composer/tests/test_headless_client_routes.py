@@ -153,7 +153,7 @@ def _execution_observation() -> dict[str, Any]:
         "command": "observation",
         "ok": True,
         "observation": {
-            "schema_version": "manyforge.execution_observation.v3",
+            "schema_version": "manyforge.execution_observation.v4",
             "owner_epoch": "execution.epoch.1",
             "cell_id": "cell-a",
             "retained_bundle_id": "bundle.1",
@@ -173,6 +173,7 @@ def _execution_observation() -> dict[str, Any]:
                     "positions_si": [0.25],
                 }
             ],
+            "measured_targets": [],
         },
     }
 

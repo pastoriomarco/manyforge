@@ -2716,7 +2716,7 @@ BuildRetainedProductComposition(CompositionBuildInput input) {
     if (composition->planner_scene_projection != nullptr) {
       composition->scene_authority_proxy =
           std::make_shared<ManagerSceneAuthorityProxy>(
-              std::move(input.manager_run_root));
+              std::move(input.manager_run_root), composition->planner_scene_projection);
     }
     return composition;
   }
@@ -2912,7 +2912,7 @@ BuildRetainedProductComposition(CompositionBuildInput input) {
   composition->required_projection_pins = std::move(input.required_projection_pins);
   composition->scene_authority_proxy =
       std::make_shared<ManagerSceneAuthorityProxy>(
-          std::move(input.manager_run_root));
+          std::move(input.manager_run_root), composition->planner_scene_projection);
   return composition;
 }
 
@@ -3494,7 +3494,11 @@ BuildSingleProductComposition(CompositionBuildInput input) {
   runtime_input.planner_model_map = input.model_map;
   runtime_input.control_binding_representatives =
       std::move(control_binding_representatives);
-  runtime_input.observation_wake = std::move(input.observation_wake);
+  // The arm's channels and its render-only measured source share one wake.
+  runtime_input.observation_wake =
+      input.observation_wake != nullptr
+          ? std::move(input.observation_wake)
+          : std::make_shared<RetainedObservationWake>();
   runtime_input.deployment_maximum_tcp_linear_speed_mps =
       deployment_motion_target_limit;
   // Q37 (as main): the Deployment-authored fault Stop profile is the motion
@@ -3745,8 +3749,11 @@ BuildSingleProductComposition(CompositionBuildInput input) {
       ros2_control_backend_config.arm.measured_joint_state_lane;
   const bool pneumatic_gripper = ros2_control_backend_config.gripper &&
       ros2_control_backend_config.gripper->actuation_kind == core::GripperActuationKind::kPneumatic;
+  // This runtime composes commanded arm state only, so its measured source is
+  // also the viewer's render-only measured comparison and wakes that stream.
   runtime_input.prepare_measured_sources =
-      [ros2_control_runtime_handle, measured_receiver_clock, measured_lane, pneumatic_gripper](
+      [ros2_control_runtime_handle, measured_receiver_clock, measured_lane, pneumatic_gripper,
+       render_wake = runtime_input.observation_wake](
           const core::RuntimeParticipantBinding &motion,
           const std::optional<core::RuntimeParticipantBinding> &gripper,
           const std::vector<core::ActiveControlConfigurationDTO> &configurations)
@@ -3797,7 +3804,7 @@ BuildSingleProductComposition(CompositionBuildInput input) {
     }
     if (source_configuration_absent) return Result::Ok(nullptr);
     auto staged = ros2_control_runtime_handle->StageMeasuredStateSources(
-        descriptors, measured_receiver_clock, motion, gripper);
+        descriptors, measured_receiver_clock, motion, gripper, render_wake);
     if (!staged.ok()) return Result::Err(staged.error());
     if (!staged.value()) return Result::Ok(nullptr);
     if (staged.value()->descriptors().size() != staged.value()->readers().size())
@@ -3874,6 +3881,11 @@ BuildSingleProductComposition(CompositionBuildInput input) {
     kernel_config.validation_collision_workers = static_cast<int>(
         *retained_runtime_configuration.validation_collision_workers);
     kernel_config.validation_collision_workers_declared = true;
+  }
+  // Debug only: bounded per-object detail when dispatch accepts a newer scene.
+  if (const char *debug = std::getenv("MANYFORGE_DEBUG_SCENE_DIVERGENCE");
+      debug != nullptr && std::string_view(debug) == "1") {
+    kernel_config.record_scene_divergence_detail = true;
   }
   RetainedNativeRuntimeConfig runtime_config{
       input.owner_epoch,
@@ -4014,7 +4026,7 @@ BuildSingleProductComposition(CompositionBuildInput input) {
   if (composition->planner_scene_projection != nullptr) {
     composition->scene_authority_proxy =
         std::make_shared<ManagerSceneAuthorityProxy>(
-            std::move(input.manager_run_root));
+            std::move(input.manager_run_root), composition->planner_scene_projection);
   }
 #if defined(MANYFORGE_ENABLE_FOCUSED_PICK_PLACE_PLANNING_FIXTURE)
   auto fixture = process_fixture::MakeFocusedPickPlacePlanningFixture();

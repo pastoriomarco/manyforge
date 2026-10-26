@@ -432,6 +432,28 @@ def _text(value: object, *, field: str, maximum_bytes: int = 512) -> str:
     return value
 
 
+def _same_scene_or_forward(candidate: Any, floor: Mapping[str, Any]) -> bool:
+    """Whether ``candidate`` is ``floor`` or a newer revision of its Scene."""
+    if not isinstance(candidate, Mapping) or set(candidate) != set(floor):
+        return False
+    scene = candidate.get("scene_revision")
+    floor_scene = floor["scene_revision"]
+    if not isinstance(scene, Mapping) or set(scene) != set(floor_scene):
+        return False
+    revision = scene.get("revision_id")
+    return (
+        candidate.get("retained_bundle_id") == floor["retained_bundle_id"]
+        and candidate.get("graph_revision") == floor["graph_revision"]
+        and scene.get("scene_id") == floor_scene["scene_id"]
+        and type(revision) is int
+        and revision >= floor_scene["revision_id"]
+        and (
+            revision != floor_scene["revision_id"]
+            or scene.get("content_hash") == floor_scene["content_hash"]
+        )
+    )
+
+
 def _exact(value: Mapping[str, Any], fields: set[str], *, path: str) -> None:
     if set(value) != fields:
         raise ProgramAssistantPortError(f"{path} has wrong fields")
@@ -1270,9 +1292,13 @@ class HeadlessProgramSceneSource:
                 },
                 path="native scene pose projection",
             )
+            # Each batch resolves against the owner's current projection; a
+            # newer revision of the same Scene is the latest truth.
             if (
                 response["api_version"] != _SCENE_POSE_RESPONSE_API
-                or response["projection_revision"] != expected_revision
+                or not _same_scene_or_forward(
+                    response["projection_revision"], expected_revision
+                )
             ):
                 raise ProgramAssistantPortError(
                     "native scene pose projection changed owner revision"

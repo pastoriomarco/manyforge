@@ -632,10 +632,25 @@ class ManagerCommandClient:
                 "manager_command_response_invalid",
                 "scene pose response has an invalid projection revision",
             ) from exc
-        if projection != request.expected_projection_revision:
+        # The owner resolves against its current projection: a newer
+        # revision of the same Scene is the latest truth, a lineage change
+        # or an older revision is not.
+        expected = request.expected_projection_revision
+        if (
+            projection.retained_bundle_id != expected.retained_bundle_id
+            or projection.graph_revision != expected.graph_revision
+            or projection.scene_revision.scene_id != expected.scene_revision.scene_id
+            or projection.scene_revision.revision_id
+            < expected.scene_revision.revision_id
+            or (
+                projection.scene_revision.revision_id
+                == expected.scene_revision.revision_id
+                and projection != expected
+            )
+        ):
             raise HeadlessApiError(
                 "manager_command_response_identity_mismatch",
-                "scene pose response changed the expected projection revision",
+                "scene pose response changed the expected projection lineage",
             )
         poses = response.get("poses")
         if not isinstance(poses, list) or len(poses) != len(

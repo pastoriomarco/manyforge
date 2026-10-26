@@ -6,6 +6,7 @@
 #include <manyforge_core/ports/iplanning_scene_synchronizer.hpp>
 #include <manyforge_core/collision/i_collision_world_snapshot_publisher.hpp>
 #include <stop_token>
+#include <manyforge_core/ports/iplanner_scene_projection.hpp>
 
 namespace manyforge::roboplan_backend::host_detail {
 
@@ -21,15 +22,16 @@ struct ManagerSceneRead final {
 class ManagerSceneAuthorityProxy final : public core::ISceneAuthority,
                                          public core::ISceneCandidatePreview {
 public:
-  explicit ManagerSceneAuthorityProxy(std::filesystem::path manager_run_root);
+  ManagerSceneAuthorityProxy(std::filesystem::path manager_run_root,
+                             std::shared_ptr<core::IPlannerSceneProjection> projection);
 
   [[nodiscard]] core::SceneCommitResultDTO
   Commit(const core::SceneTransactionRequestDTO &request) override;
 
   [[nodiscard]] core::Result<core::SceneCandidatePreviewDTO>
   PreviewResolvedSceneCandidate(
-      const core::ResolvedSceneCandidatePreviewRequestDTO &request)
-      const override;
+      const core::ResolvedSceneCandidatePreviewRequestDTO &request,
+      const core::CollisionWorldLeaseInventory &predecessor) const override;
 
   [[nodiscard]] core::RequestOwnerEpoch
   CurrentRequestOwnerEpoch() const override;
@@ -57,12 +59,13 @@ private:
   Read(const std::stop_token stop_token = {}) const;
 
   std::filesystem::path manager_run_root_;
+  std::shared_ptr<core::IPlannerSceneProjection> projection_;
 };
 
 /// Process-local, non-authoritative join from fresh planning admission to the
 /// Manager-owned observation policy. It retains no pose or scene truth: every
-/// call fences the local predecessor, asks Manager to latch, and requires the
-/// native projection to expose the exact returned successor before planning.
+/// call asks Manager to latch and waits for the native projection to include
+/// that revision before the consumer retains its exact planning snapshot.
 class ManagerPlanningSceneSynchronizer final
     : public core::IPlanningSceneSynchronizer {
 public:

@@ -1320,6 +1320,40 @@ TEST(DeploymentApplicabilityCodec,
       document_for("1", false), "$.policies.motion_takeover_planning_budget_s");
 }
 
+TEST(DeploymentApplicabilityCodec, ScenePosePoliciesAreClosedAndRetained) {
+  const auto document_for = [](const std::string &rows) {
+    auto policies = interrupt_policy_envelope("", "");
+    policies.pop_back();
+    return with_policies(minimal_document(),
+                         policies + ",\"scene_pose_sources\":" + rows + "}");
+  };
+  for (const auto *policy :
+       {"observe_only", "continuous", "continuous_unattached",
+        "continuous_relative_to_attached", "before_planning",
+        "between_nodes"}) {
+    const auto row =
+        std::string(
+            R"({"source_id":"camera","scene_resource_id":"part","apply_policy":")") +
+        policy + R"("})";
+    const auto candidate = decode(document_for("[" + row + "]"));
+    ASSERT_EQ(candidate.value().scene_pose_sources.size(), 1U);
+    EXPECT_EQ(candidate.value().scene_pose_sources.front().apply_policy,
+              policy);
+    const auto revisioned =
+        compute_capability_provider_binding_revisions(candidate);
+    EXPECT_EQ(revisioned.value().scene_pose_sources,
+              candidate.value().scene_pose_sources);
+    EXPECT_EQ(revisioned.normalized_policies(),
+              candidate.normalized_policies());
+    EXPECT_THROW(decode(document_for("[" + row + "," + row + "]")),
+                 std::invalid_argument);
+  }
+  EXPECT_THROW(
+      decode(document_for(
+          R"([{"source_id":"camera","scene_resource_id":"part","apply_policy":"when_idle"}])")),
+      std::invalid_argument);
+}
+
 TEST(DeploymentApplicabilityCodec,
      MotionTakeoverBudgetIsOptionalPositiveAndPreserved) {
   const auto document_for = [](std::string_view value) {

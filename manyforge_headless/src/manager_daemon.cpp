@@ -1,11 +1,12 @@
-#include "program_runner_publisher_fault_internal.hpp"
 #include "manyforge_headless/cell_admission_readiness_reducer.hpp"
-#include <manyforge_deployment/execution_runtime_contract.hpp>
 #include "manyforge_headless/manager_package_generation.hpp"
 #include "manyforge_headless/owner_publication.hpp"
 #include "manyforge_headless/scene_runtime_pose_projector.hpp"
 #include "manyforge_headless/scene_runtime_state_owner.hpp"
 #include "manyforge_headless/source_snapshot.hpp"
+#include "program_runner_publisher_fault_internal.hpp"
+#include "scene_admission_reconciliation_internal.hpp"
+#include <manyforge_deployment/execution_runtime_contract.hpp>
 
 #include <manyforge_component_manager/canonical_empty_bootstrap_coordinator.hpp>
 #include <manyforge_component_manager/durable_store_set.hpp>
@@ -459,6 +460,7 @@ enum class CommandKind {
   kSceneRuntimeObserverOpen,
   kSceneRuntimeObserve,
   kSceneRuntimeLatchBeforePlanning,
+  kSceneRuntimeLatchBetweenNodes,
   kReconcile,
   kShutdownRuntime,
 };
@@ -473,6 +475,7 @@ RequiresCurrentPackageGeneration(const CommandKind command) noexcept {
   case CommandKind::kSceneRuntimeObserverOpen:
   case CommandKind::kSceneRuntimeObserve:
   case CommandKind::kSceneRuntimeLatchBeforePlanning:
+  case CommandKind::kSceneRuntimeLatchBetweenNodes:
   case CommandKind::kReconcile:
     return true;
   case CommandKind::kSceneOwnerRead:
@@ -1336,6 +1339,10 @@ RequiredPoseObserverBindings(const CanonicalValue &value) {
                                 RequiredBool(row, "eligible")};
     if (binding.eligible) {
       Require(binding.policy_id == "continuous_unattached" ||
+                  binding.policy_id == "continuous" ||
+                  binding.policy_id == "continuous_relative_to_attached" ||
+                  binding.policy_id == "between_nodes" ||
+                  binding.policy_id == "observe_only" ||
                   binding.policy_id == "before_planning",
               "eligible pose observer binding uses an unsupported policy");
       Require(!writable_object_id.has_value() ||
@@ -1560,15 +1567,20 @@ ManagerCommand DecodeCommand(const std::string_view bytes) {
     result.pose_payload = payload;
     return result;
   }
-  if (command == "scene_runtime_latch_before_planning") {
-    RequireExactObjectSize(root, 4U,
-                           "scene-runtime before-planning latch command");
-    ManagerCommand result{.kind =
-                              CommandKind::kSceneRuntimeLatchBeforePlanning};
+  if (command == "scene_runtime_latch_before_planning" ||
+      command == "scene_runtime_latch_between_nodes") {
+    const bool between_nodes = command == "scene_runtime_latch_between_nodes";
+    RequireExactObjectSize(
+        root,
+        between_nodes && root.find_object_member("scene_resource_ids") ? 4U : 3U,
+        "scene-runtime before-planning latch command");
+    ManagerCommand result{
+        .kind = between_nodes ? CommandKind::kSceneRuntimeLatchBetweenNodes
+                              : CommandKind::kSceneRuntimeLatchBeforePlanning};
+    if (const auto *ids = root.find_object_member("scene_resource_ids"))
+      result.scene_resource_ids = RequiredSceneResourceIds(*ids);
     result.expected_scene_runtime_identity = RequiredSceneRuntimeIdentity(
         RequiredMember(root, "expected_runtime_identity"));
-    result.expected_scene_projection = RequiredProjectionRevision(
-        RequiredMember(root, "expected_projection_revision"));
     return result;
   }
   if (command == "apply_status") {
@@ -2793,6 +2805,93 @@ public:
     return runtime_products_.back();
   }
 
+  // Fixed pose of an attachment carrier frame in a source-local link of the
+  // carrier's model instance, from the retained model map and the compiled
+  // planning URDF. Only successful resolutions are cached.
+  [[nodiscard]] core::Result<core::Pose3DTO>
+  CarrierInReferenceLink(const core::RetainedBundleId &retained_bundle_id,
+                         const core::ComponentSceneFrameRefDTO &carrier,
+                         const std::string &reference_link) const {
+    using Reply = core::Result<core::Pose3DTO>;
+    const auto refused = [&](std::string code, std::string message) {
+      return Reply::Err(core::ErrorDTO{
+          std::move(code), std::move(message),
+          {{"reference_link", reference_link},
+           {"frame_role_id", carrier.frame_role_id.value()},
+           {"model_instance_id", carrier.model_instance_id.value()}}});
+    };
+    const auto key = std::make_tuple(
+        retained_bundle_id.value(), carrier.controllable_component_id.value(),
+        carrier.model_instance_id.value(), carrier.frame_role_id.value(),
+        reference_link);
+    {
+      std::lock_guard lock(mutex_);
+      if (const auto cached = carrier_reference_poses_.find(key);
+          cached != carrier_reference_poses_.end())
+        return Reply::Ok(cached->second);
+    }
+    try {
+      const auto bundle = get_verified(retained_bundle_id);
+      if (bundle == nullptr)
+        return refused("scene_runtime_pose_reference_unresolved",
+                       "retained bundle is unavailable");
+      const auto &maps = bundle->value().compiled_products.symbol_role_maps;
+      if (maps.size() != 1U)
+        return refused("scene_runtime_pose_reference_unresolved",
+                       "retained bundle has no exact model map");
+      const auto model_map =
+          deployment::FilesystemVerifiedRetainedModelMapSource(package_root_,
+                                                               activation_root_)
+              .get_verified({retained_bundle_id, maps.front().product_id});
+      if (!model_map.has_value())
+        return refused("scene_runtime_pose_reference_unresolved",
+                       "retained model map is unavailable");
+      std::vector<const std::string *> carrier_links;
+      for (const auto &path : model_map->frame_paths())
+        if (const auto *frame =
+                std::get_if<deployment::CompositionComponentModelFrame>(
+                    &path.terminal_frame);
+            frame != nullptr &&
+            frame->controllable_component_id ==
+                carrier.controllable_component_id &&
+            frame->model_instance_id == carrier.model_instance_id &&
+            frame->frame_role_id == carrier.frame_role_id)
+          carrier_links.push_back(&frame->compiled_frame_name);
+      std::vector<const std::string *> reference_links;
+      for (const auto &symbol : model_map->symbols())
+        if (symbol.source.model_instance_id == carrier.model_instance_id &&
+            symbol.source.kind == deployment::OccurrenceSymbolKind::kLink &&
+            symbol.source.scope_name.empty() &&
+            symbol.source.source_name == reference_link)
+          reference_links.push_back(&symbol.compiled_name);
+      if (carrier_links.size() != 1U || reference_links.size() != 1U)
+        return refused("scene_runtime_pose_reference_link_unknown",
+                       "reference link or carrier frame is not one retained "
+                       "model link");
+      const auto &planning = bundle->value().compiled_products.planning_collision_model;
+      const auto urdf = get_verified(deployment::RetainedProductArtifactQuery{
+          retained_bundle_id, planning.product_id, planning.product_kind,
+          core::ArtifactRoleId("urdf")});
+      if (!urdf.has_value())
+        return refused("scene_runtime_pose_reference_unresolved",
+                       "retained planning URDF is unavailable");
+      auto result = SceneRuntimeFixedLinkTransform(
+          deployment::parse_model_documents_for_projection(urdf->bytes(),
+                                                           std::nullopt)
+              .urdf,
+          *reference_links.front(), *carrier_links.front());
+      if (result.ok()) {
+        std::lock_guard lock(mutex_);
+        if (carrier_reference_poses_.size() >= 16U)
+          carrier_reference_poses_.clear();
+        carrier_reference_poses_.emplace(key, result.value());
+      }
+      return result;
+    } catch (const std::exception &error) {
+      return refused("scene_runtime_pose_reference_unresolved", error.what());
+    }
+  }
+
 private:
   std::filesystem::path package_root_;
   std::optional<std::filesystem::path> activation_root_;
@@ -2808,6 +2907,10 @@ private:
       product_artifacts_;
   mutable std::vector<deployment::VerifiedRetainedRuntimeUnitProduct>
       runtime_products_;
+  mutable std::map<std::tuple<std::string, std::string, std::string,
+                              std::string, std::string>,
+                   core::Pose3DTO>
+      carrier_reference_poses_;
 };
 
 [[nodiscard]] bool HasConvergedKernelApplyOwner(
@@ -2977,7 +3080,14 @@ public:
                      verified_package_, native_runtime_adapter_,
                      native_runtime_adapter_),
         original_manager_scene_maintenance_(scene_owner_, native_runtime_adapter_),
-        scene_runtime_pose_projector_(scene_owner_, admission_.cell_id()),
+        scene_runtime_pose_projector_(
+            scene_owner_, admission_.cell_id(),
+            [this](const core::RetainedBundleId &retained_bundle_id,
+                   const core::ComponentSceneFrameRefDTO &carrier,
+                   const std::string &reference_link) {
+              return verified_package_.CarrierInReferenceLink(
+                  retained_bundle_id, carrier, reference_link);
+            }),
         plan_source_(stores_.active_bundle_publication_store(),
                      stores_.apply_journal(),
                      BuildBootstrapRuntimePlan(admission_, verified_package_)),
@@ -4028,6 +4138,15 @@ private:
           scene_owner_.ReconcileAuthoredSceneAdmissionClaims();
       if (!reconciled.ok()) {
         scene_admission_reconciled_.store(false, std::memory_order_release);
+        const auto warning = reconciled.error().code + ": " +
+                             reconciled.error().message.substr(0U, 1024U);
+        if (scene_admission_last_warning_ != warning) {
+          std::cerr << "Scene admission reconciliation remains closed: "
+                    << warning << '\n';
+          scene_admission_last_warning_ = warning;
+        }
+      } else {
+        scene_admission_last_warning_.reset();
       }
     }
     const auto bundle_id =
@@ -5270,6 +5389,20 @@ private:
     }
   }
 
+  static std::string_view
+  EffectivePosePolicy(const deployment::RetainedBundle &bundle,
+                      const PoseObservationKey &key) {
+    const auto &bindings = bundle.value().scene_pose_sources;
+    const auto selected =
+        std::find_if(bindings.begin(), bindings.end(), [&](const auto &row) {
+          return row.source_id == key.source_id &&
+                 row.scene_resource_id == key.object_id;
+        });
+    return selected == bindings.end()
+               ? std::string_view(key.policy_id)
+               : std::string_view(selected->apply_policy);
+  }
+
   core::Result<SceneRuntimePoseApplicationResult>
   ResolvePoseApplication(const SceneRuntimeIdentity &runtime_identity,
                          const PoseSourceObservation &observation,
@@ -5284,34 +5417,6 @@ private:
         observation.payload_quality != PoseSourceQuality::kGood || !acceptance.fresh) {
       return no_application(SceneRuntimePoseApplicationStatus::kNotRequested);
     }
-    if (observation.key.policy_id == "before_planning") {
-      return no_application(
-          SceneRuntimePoseApplicationStatus::kDeferredBeforePlanning);
-    }
-    if (acceptance.disposition == PoseObservationDisposition::kBuffered ||
-        acceptance.disposition ==
-            PoseObservationDisposition::kReplacedBuffered) {
-      return no_application(SceneRuntimePoseApplicationStatus::kBuffered);
-    }
-    if (observation.key.policy_id != "continuous_unattached") {
-      return core::Result<SceneRuntimePoseApplicationResult>::Err(
-          core::ErrorDTO{"scene_runtime_pose_policy_unsupported",
-                         "eligible pose observation uses an unsupported "
-                         "application policy",
-                         {{"policy_id", observation.key.policy_id}}});
-    }
-    const auto owner = scene_runtime_owner_.Snapshot();
-    if (owner.state != SceneInitializationState::kOpen ||
-        (acceptance.disposition != PoseObservationDisposition::kApplyNow &&
-         acceptance.disposition != PoseObservationDisposition::kDuplicate)) {
-      return core::Result<SceneRuntimePoseApplicationResult>::Err(
-          core::ErrorDTO{
-              "scene_runtime_pose_owner_not_open",
-              "scene-runtime owner is not open for continuous pose "
-              "application",
-              {{"initialization_state", std::string(ToString(owner.state))}}});
-    }
-
     std::shared_ptr<const deployment::RetainedBundle> bundle;
     try {
       bundle = verified_package_.get_verified(
@@ -5333,15 +5438,56 @@ private:
               "scene-runtime identity has no exact verified active bundle",
               {}});
     }
+    const auto policy = EffectivePosePolicy(*bundle, observation.key);
+    if (policy == "observe_only")
+      return no_application(SceneRuntimePoseApplicationStatus::kNotRequested);
+    if (policy == "before_planning" || policy == "between_nodes") {
+      return no_application(
+          policy == "between_nodes"
+              ? SceneRuntimePoseApplicationStatus::kDeferredBetweenNodes
+              : SceneRuntimePoseApplicationStatus::kDeferredBeforePlanning);
+    }
+    if (acceptance.disposition == PoseObservationDisposition::kBuffered ||
+        acceptance.disposition ==
+            PoseObservationDisposition::kReplacedBuffered) {
+      return no_application(SceneRuntimePoseApplicationStatus::kBuffered);
+    }
+    if (policy != "continuous_unattached" && policy != "continuous" &&
+        policy != "continuous_relative_to_attached") {
+      return core::Result<SceneRuntimePoseApplicationResult>::Err(
+          core::ErrorDTO{"scene_runtime_pose_policy_unsupported",
+                         "eligible pose observation uses an unsupported "
+                         "application policy",
+                         {{"policy_id", observation.key.policy_id}}});
+    }
+    const auto owner = scene_runtime_owner_.Snapshot();
+    if (owner.state != SceneInitializationState::kOpen ||
+        (acceptance.disposition != PoseObservationDisposition::kApplyNow &&
+         acceptance.disposition != PoseObservationDisposition::kDuplicate)) {
+      return core::Result<SceneRuntimePoseApplicationResult>::Err(
+          core::ErrorDTO{
+              "scene_runtime_pose_owner_not_open",
+              "scene-runtime owner is not open for continuous pose "
+              "application",
+              {{"initialization_state", std::string(ToString(owner.state))}}});
+    }
+
     return scene_runtime_pose_projector_.Apply(
         bundle->value().capability_provider_bindings,
         bundle->retained_bundle_id(), bundle->value().cell_graph.graph_revision,
-        observation);
+        observation, std::nullopt, policy);
   }
 
   core::Result<BeforePlanningLatchResult> LatchBeforePlanningObservations(
       const SceneRuntimeIdentity &runtime_identity,
-      const core::ProjectionRevisionDTO &expected_projection) {
+      const core::ProjectionRevisionDTO &expected_projection,
+      const std::string_view latch_policy = "before_planning",
+      const std::vector<core::SceneResourceId> &resources = {}) {
+    const auto selected_resource = [&](const std::string &id) {
+      return resources.empty() ||
+             std::binary_search(resources.begin(), resources.end(),
+                                core::SceneResourceId(id));
+    };
     const auto failure = [](std::string code, std::string message,
                             std::map<std::string, std::string> details = {}) {
       return core::Result<BeforePlanningLatchResult>::Err(core::ErrorDTO{
@@ -5416,7 +5562,7 @@ private:
     }
     if (expected) {
       for (const auto &binding : expected->bindings) {
-        if (!binding.eligible)
+        if (!binding.eligible || !selected_resource(binding.object_id))
           continue;
         core::SceneObjectStateDTO object{
             core::SceneResourceId(binding.object_id), false, false,
@@ -5427,12 +5573,15 @@ private:
         } catch (const std::exception &error) {
           return failure("scene_runtime_pose_scene_unavailable", error.what());
         }
-        if (!object.exists || object.attached)
+        if (!object.exists ||
+            (object.attached && latch_policy == "before_planning"))
           continue;
         const PoseObservationKey key{expected->launch_facts.source_id,
                                      binding.object_id, binding.policy_id};
-        bool depends_on_source = binding.policy_id == "before_planning";
-        if (binding.policy_id == "continuous_unattached" &&
+        const auto policy = EffectivePosePolicy(*bundle, key);
+        bool depends_on_source = policy == latch_policy;
+        if ((policy == "continuous_unattached" || policy == "continuous" ||
+             policy == "continuous_relative_to_attached") &&
             object.provider_evidence) {
           const auto origin = expected->provider_origins.find(key);
           depends_on_source =
@@ -5480,7 +5629,8 @@ private:
               "source-dependent planning requires a fresh current-runtime "
               "observation",
               {{"source_id", key.source_id}, {"object_id", key.object_id}});
-        if (binding.policy_id == "continuous_unattached") {
+        if (policy == "continuous_unattached" || policy == "continuous" ||
+            policy == "continuous_relative_to_attached") {
           const auto replay = replays.find(key);
           if (replay == replays.end() ||
               replay->second.runtime_identity != runtime_identity ||
@@ -5510,13 +5660,15 @@ private:
         continue;
       }
       for (const auto &binding : session.bindings) {
-        if (!binding.eligible || binding.policy_id != "before_planning") {
+        if (!binding.eligible || !selected_resource(binding.object_id) ||
+            EffectivePosePolicy(*bundle, {source_id, binding.object_id,
+                                          binding.policy_id}) != latch_policy) {
           continue;
         }
         if (expected && source_id == expected->launch_facts.source_id) {
           const auto object = scene_owner_.GetObjectState(
               core::SceneResourceId(binding.object_id));
-          if (object.attached)
+          if (object.attached && latch_policy == "before_planning")
             continue;
         }
         const PoseObservationKey key{source_id, binding.object_id,
@@ -5588,7 +5740,7 @@ private:
           bundle->value().capability_provider_bindings,
           bundle->retained_bundle_id(),
           bundle->value().cell_graph.graph_revision, candidate.observation,
-          candidate.replay->application);
+          candidate.replay->application, latch_policy);
       if (!application.ok()) {
         try {
           publish_results();
@@ -5614,6 +5766,7 @@ private:
         break;
       case SceneRuntimePoseApplicationStatus::kNotRequested:
       case SceneRuntimePoseApplicationStatus::kDeferredBeforePlanning:
+      case SceneRuntimePoseApplicationStatus::kDeferredBetweenNodes:
       case SceneRuntimePoseApplicationStatus::kBuffered:
         try {
           publish_results();
@@ -6144,23 +6297,9 @@ private:
       case CommandKind::kSceneCommit: {
         Require(command.scene_transaction.has_value(),
                 "decoded scene command lacks its transaction");
-        const auto result = [&] {
-          try {
-            const auto committed =
-                scene_owner_.Commit(*command.scene_transaction);
-            if (!committed.success) {
-              scene_admission_reconciled_.store(false,
-                                                std::memory_order_release);
-            }
-            return committed;
-          } catch (...) {
-            // A durable outcome may precede a lost Kernel release reply.
-            // Retry settlement through existing reconciliation, not result
-            // reads.
-            scene_admission_reconciled_.store(false, std::memory_order_release);
-            throw;
-          }
-        }();
+        const auto result = detail::CommitSceneWithAdmissionObservation(
+            scene_owner_, *command.scene_transaction,
+            scene_admission_reconciled_);
         if (result.success) {
           // The durable scene result remains authoritative if this projection
           // write fails. Periodic reconciliation republishes it, and exact
@@ -6211,8 +6350,11 @@ private:
         Require(command.expected_scene_projection.has_value() &&
                     !command.scene_resource_ids.empty(),
                 "decoded scene pose query lacks its exact selection");
+        // Resolve against the current projection. A newer revision of the
+        // same Scene is the latest truth; only a lineage change refuses.
         const auto current = scene_owner_.CurrentProjectionRevision();
-        if (current != *command.expected_scene_projection) {
+        if (!core::ProjectionIsSameOrForwardInLineage(
+                current, *command.expected_scene_projection)) {
           TrySendResponse(
               client.get(),
               ErrorResponse(
@@ -6474,7 +6616,16 @@ private:
               *command.pose_eligible,
               *command.pose_payload,
           };
-          const auto acceptance = scene_runtime_owner_.ObservePose(observation);
+          Require(last_active_bundle_ &&
+                      last_active_bundle_->retained_bundle_id().value() ==
+                          snapshot.runtime_identity->retained_bundle_id &&
+                      last_active_bundle_->value()
+                              .cell_graph.graph_revision.value() ==
+                          snapshot.runtime_identity->graph_revision,
+                  "pose observation has no exact current policy bundle");
+          const auto acceptance = scene_runtime_owner_.ObservePose(
+              observation,
+              EffectivePosePolicy(*last_active_bundle_, observation.key));
           auto [stored, inserted] = pose_observation_replays_.insert_or_assign(
               observation_key,
               PoseObservationReplay{*snapshot.runtime_identity,
@@ -6557,10 +6708,12 @@ private:
                                         *record.publication_generation));
         return false;
       }
-      case CommandKind::kSceneRuntimeLatchBeforePlanning: {
-        Require(command.expected_scene_runtime_identity.has_value() &&
-                    command.expected_scene_projection.has_value(),
-                "decoded scene-runtime before-planning latch is incomplete");
+      case CommandKind::kSceneRuntimeLatchBeforePlanning:
+      case CommandKind::kSceneRuntimeLatchBetweenNodes: {
+        const bool between_nodes =
+            command.kind == CommandKind::kSceneRuntimeLatchBetweenNodes;
+        Require(command.expected_scene_runtime_identity.has_value(),
+                "decoded scene-runtime latch is incomplete");
         const auto owner = scene_runtime_owner_.Snapshot();
         if (!owner.runtime_identity.has_value() ||
             *owner.runtime_identity !=
@@ -6574,7 +6727,9 @@ private:
         }
         const auto result = LatchBeforePlanningObservations(
             *command.expected_scene_runtime_identity,
-            *command.expected_scene_projection);
+            scene_owner_.CurrentProjectionRevision(),
+            between_nodes ? "between_nodes" : "before_planning",
+            command.scene_resource_ids);
         if (!result.ok()) {
           TrySendResponse(client.get(), ErrorResponse(result.error().code,
                                                       result.error().message));
@@ -6653,6 +6808,7 @@ private:
   std::mutex manager_source_mutex_;
   bool kernel_apply_available_{};
   std::atomic<bool> scene_admission_reconciled_{false};
+  std::optional<std::string> scene_admission_last_warning_;
   std::optional<component_manager::ManagerActiveRuntimeConvergenceResult>
       last_runtime_;
   std::shared_ptr<const deployment::RetainedBundle> last_active_bundle_;

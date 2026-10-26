@@ -1184,10 +1184,13 @@ CanonicalValue ResolvedOperation(const core::ResolvedSceneOperationDTO &value) {
       [](const auto &operation) -> CanonicalValue {
         using T = std::decay_t<decltype(operation)>;
         if constexpr (std::is_same_v<T, core::ResolvedUpsertSceneObjectDTO>) {
-          return CanonicalValue(CanonicalValue::Object{
+          CanonicalValue::Object result{
               {"kind", CanonicalValue("upsert_object")},
-              {"object", Object(operation.object)},
-          });
+              {"object", Object(operation.object)}};
+          if (operation.attachment)
+            result.emplace_back("attachment",
+                                Attachment(*operation.attachment));
+          return CanonicalValue(std::move(result));
         } else if constexpr (std::is_same_v<
                                  T, core::ResolvedRemoveSceneObjectDTO>) {
           return CanonicalValue(CanonicalValue::Object{
@@ -1227,9 +1230,13 @@ core::ResolvedSceneOperationDTO
 DecodeResolvedOperation(const CanonicalValue &value) {
   const auto kind = String(Member(value, "kind"), "resolved operation kind");
   if (kind == "upsert_object") {
-    ExactObject(value, 2U, "resolved upsert-object operation");
+    const auto *attachment = value.find_object_member("attachment");
+    ExactObject(value, attachment ? 3U : 2U,
+                "resolved upsert-object operation");
     return core::ResolvedUpsertSceneObjectDTO{
-        DecodeObject(Member(value, "object"))};
+        DecodeObject(Member(value, "object")),
+        attachment ? std::optional(DecodeAttachment(*attachment))
+                   : std::nullopt};
   }
   if (kind == "remove_object") {
     ExactObject(value, 2U, "resolved remove-object operation");

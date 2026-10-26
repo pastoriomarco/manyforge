@@ -27,6 +27,7 @@ import type {
 import type {
   ExecutionObservationFrame,
   ExecutionObservationReader,
+  ExecutionObservationTarget,
 } from '../types/viewerObservation';
 
 export interface RuntimeLinkTransform {
@@ -386,6 +387,60 @@ export function createExecutionRobotPresentationReader(
 }
 
 /**
+ * Render-only measured comparison robot from the same viewer-stream frame and
+ * the same retained-model projection as the solid robot. Each measured row
+ * replaces its commanded row; every other coordinate keeps the solid robot's
+ * value, so the comparison differs only where measurement does. A frame with
+ * no measured row has no comparison robot. This reader never credits or
+ * rejects frames: the solid robot reader owns the capacity-one stream.
+ */
+export function createMeasuredComparisonPresentationReader(
+  reader: ExecutionObservationReader,
+  sourceModel: SourceModelProjection | null,
+  manifest: SceneUrdfManifest | null,
+): MeasuredRobotPresentationReader {
+  let cachedFrame: ExecutionObservationFrame | null | undefined;
+  let cachedPresentation: MeasuredRobotPresentation | null = null;
+  return {
+    readMeasuredRobotPresentation: () => {
+      const frame = reader.getLatestExecutionObservation();
+      if (frame === cachedFrame) return cachedPresentation;
+      cachedFrame = frame;
+      cachedPresentation = null;
+      const measured = frame?.measuredTargets[0];
+      if (frame === null || measured === undefined) return null;
+      const sameTarget = (left: ExecutionObservationTarget, right: ExecutionObservationTarget) => (
+        left.controllableComponentId === right.controllableComponentId
+        && left.commandTargetId === right.commandTargetId
+      );
+      if (!frame.measuredTargets.every((row) => frame.targets.some((target) => sameTarget(row, target)))) {
+        return null;
+      }
+      const presentation = executionObservationRobotPresentation(
+        {
+          ...frame,
+          targets: frame.targets.map((target) => (
+            frame.measuredTargets.find((row) => sameTarget(row, target)) ?? target
+          )),
+        },
+        sourceModel,
+        manifest,
+        null,
+        (BigInt(frame.receivedAtMonotonicUs) * 1_000n).toString(),
+      );
+      cachedPresentation = presentation === null ? null : {
+        ...presentation,
+        objectId: measured.controllableComponentId,
+        sourceId: `measured:${measured.commandTargetId}`,
+      };
+      return cachedPresentation;
+    },
+    subscribeMeasuredRobotPresentation: reader.subscribeExecutionObservation,
+    markMeasuredRobotPresentationApplied: () => undefined,
+  };
+}
+
+/**
  * A reader frozen at one measured-robot presentation. A retained (not
  * verified) robot model keeps its last coherent pose while the control
  * transport is delayed or stale; it neither follows nor credits live samples.
@@ -629,7 +684,12 @@ type JointObservationSource = GoodObservationSource & {
 type PoseObservationSource = GoodObservationSource & {
   payload: Extract<
     SceneRuntimeGoodObservationPayload,
-    { kind: 'simulation_entity_pose' | 'detection3d_pose' }
+    {
+      kind:
+        | 'simulation_entity_pose'
+        | 'simulation_entity_pose_with_reference.v1'
+        | 'detection3d_pose';
+    }
   >;
 };
 
@@ -647,6 +707,7 @@ function isPoseObservation(
   source: GoodObservationSource,
 ): source is PoseObservationSource {
   return source.payload.kind === 'simulation_entity_pose'
+    || source.payload.kind === 'simulation_entity_pose_with_reference.v1'
     || source.payload.kind === 'detection3d_pose';
 }
 
@@ -723,18 +784,20 @@ export function runtimeScenePresentation(
       );
     } else {
       const occurrence = sourceModel.occurrences[0];
-      const coordinateNames = new Set(
-        occurrence.coordinates.map((coordinate) => coordinate.source_joint_name),
+      const viewerJointNames = new Map(
+        occurrence.coordinates.map((coordinate) => [
+          coordinate.source_joint_name, coordinate.viewer_joint_name,
+        ]),
       );
       if (
         occurrence.component_id !== source.object_id
-        || source.payload.joint_names.some((name) => !coordinateNames.has(name))
+        || source.payload.joint_names.some((name) => !viewerJointNames.has(name))
       ) {
         warnings.push('Measured robot observation does not match the retained occurrence.');
       } else {
         const positions = new Map(
           source.payload.joint_names.map((name, index) => [
-            name,
+            viewerJointNames.get(name)!,
             source.payload.positions[index],
           ]),
         );
@@ -758,14 +821,9 @@ export function runtimeScenePresentation(
   const sceneObjectIds = new Set(
     logicalScene.snapshot.objects.map((object) => object.scene_resource_id),
   );
-  const attachedObjectIds = new Set(
-    attached.objects.map((object) => object.object.scene_resource_id),
-  );
   const objectSources = fresh.filter(
     (source): source is PoseObservationSource => isPoseObservation(source)
-      && source.eligible
-      && sceneObjectIds.has(source.object_id)
-      && !attachedObjectIds.has(source.object_id),
+      && sceneObjectIds.has(source.object_id),
   );
   const measuredObjects: MeasuredPosePresentation[] = [];
   for (const objectId of [...new Set(objectSources.map((source) => source.object_id))]

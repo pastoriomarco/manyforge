@@ -1175,15 +1175,30 @@ TEST(RuntimeCollisionQuerySessionTest,
 }
 
 TEST(RuntimeCollisionQuerySessionTest,
-     CommandCapableSessionPinsAdmissionContactPolicyAcrossLiveSceneUpdates) {
-  const CollisionPairId pair{
+     CommandCapableSessionFollowsRuleChangesAndCarriesContactReleaseHistory) {
+  const CollisionPairId released_pair{
       "component/robot1/model/robot1_model/body/finger_left/collision/0",
       "scene/part/shape/0"};
+  const CollisionPairId added_pair{
+      "component/robot1/model/robot1_model/body/finger_right/collision/0",
+      "scene/part/shape/0"};
+  SupportContactPolicyEntry release;
+  release.pair = released_pair;
+  release.max_start_penetration_m = 0.01;
+  SupportContactPolicyEntry added = release;
+  added.pair = added_pair;
+  const auto entry_for = [](const RuntimeContactReleaseStateSnapshot& snapshot,
+                            const CollisionPairId& pair) {
+    for (std::size_t i = 0; i < snapshot.count; ++i) {
+      if (snapshot.entries[i].pair != nullptr && *snapshot.entries[i].pair == pair) {
+        return &snapshot.entries[i];
+      }
+    }
+    return static_cast<const RuntimeContactReleaseStateEntry*>(nullptr);
+  };
+
   CollisionPolicySnapshot admission_policy;
   admission_policy.revision = {5, "admission-contact-release-policy"};
-  SupportContactPolicyEntry release;
-  release.pair = pair;
-  release.max_start_penetration_m = 0.01;
   admission_policy.support_contacts.push_back(release);
   const auto admission_revision = make_projection_revision(1U, 'd');
   const auto admission_bundle = with_projection_revision(
@@ -1195,23 +1210,66 @@ TEST(RuntimeCollisionQuerySessionTest,
       make_projection(), publisher, engine, {}, 10'000'000,
       admission_revision);
   ASSERT_FALSE(session.prepare(admission_bundle).has_value());
-
-  CollisionPolicySnapshot unrelated_live_policy;
-  unrelated_live_policy.revision = {6, "later-base-policy"};
-  publisher.bundle = with_projection_revision(
-      make_bundle(std::move(unrelated_live_policy), 2U),
-      make_projection_revision(2U, 'e'));
-  engine->collide(pair, -0.001);
   const std::array<double, 2> positions{0.0, 0.0};
-  const auto outcome = session.tick(publisher.bundle, positions, 1);
 
-  EXPECT_EQ(outcome.status, RuntimeCollisionTickStatus::kClear);
-  EXPECT_EQ(engine->last_distance_request_mode_,
-            CollisionDistanceRequestMode::kSelectedCollidingPairs);
-  ASSERT_EQ(engine->last_selected_distance_pair_count_, 1U);
-  EXPECT_EQ(engine->last_selected_distance_pair_, pair);
-  const auto state = session.contact_release_state_snapshot();
-  EXPECT_EQ(state.binding_owner, admission_bundle);
+  engine->collide(released_pair, -0.002);
+  EXPECT_EQ(session.tick(publisher.bundle, positions, 1).status,
+            RuntimeCollisionTickStatus::kClear);
+  engine->clear();
+  EXPECT_EQ(session.tick(publisher.bundle, positions, 2).status,
+            RuntimeCollisionTickStatus::kClear);
+
+  // New rules mid-motion: the unchanged pair keeps its released history, the
+  // new pair starts fresh (it may start in contact), and the start-of-motion
+  // baseline is not re-counted.
+  CollisionPolicySnapshot extended_policy;
+  extended_policy.revision = {6, "attach-adds-support-contact"};
+  extended_policy.support_contacts = {release, added};
+  publisher.bundle = with_projection_revision(
+      make_bundle(std::move(extended_policy), 2U),
+      make_projection_revision(2U, 'e'));
+  engine->collide(added_pair, -0.002);
+  const auto rebound = session.tick(publisher.bundle, positions, 3);
+  EXPECT_EQ(rebound.status, RuntimeCollisionTickStatus::kClear);
+  EXPECT_EQ(rebound.initial_contact_pair_count, 1U);
+  EXPECT_EQ(rebound.current_contact_pair_count, 1U);
+  const auto extended = session.contact_release_state_snapshot();
+  ASSERT_TRUE(extended.valid);
+  EXPECT_EQ(extended.binding_owner, publisher.bundle);
+  ASSERT_EQ(extended.count, 2U);
+  const auto* carried = entry_for(extended, released_pair);
+  const auto* fresh = entry_for(extended, added_pair);
+  ASSERT_NE(carried, nullptr);
+  ASSERT_NE(fresh, nullptr);
+  EXPECT_TRUE(carried->release_state.separated);
+  EXPECT_EQ(carried->support_state, SupportContactEvaluationState::kSeparated);
+  EXPECT_TRUE(fresh->release_state.started_in_contact);
+  EXPECT_FALSE(fresh->release_state.separated);
+
+  engine->collide(released_pair, -0.001);
+  const auto recontact = session.tick(publisher.bundle, positions, 4);
+  EXPECT_EQ(recontact.status, RuntimeCollisionTickStatus::kCollision);
+  EXPECT_EQ(recontact.reason, RuntimeCollisionTickReason::kContactReleaseRecontact);
+
+  // A changed rule starts fresh and a removed pair drops out.
+  CollisionPolicySnapshot changed_policy;
+  changed_policy.revision = {7, "changed-support-contact"};
+  SupportContactPolicyEntry changed = release;
+  changed.max_start_penetration_m = 0.02;
+  changed_policy.support_contacts = {changed};
+  publisher.bundle = with_projection_revision(
+      make_bundle(std::move(changed_policy), 3U),
+      make_projection_revision(3U, 'f'));
+  engine->collide(released_pair, -0.001);
+  EXPECT_EQ(session.tick(publisher.bundle, positions, 5).status,
+            RuntimeCollisionTickStatus::kClear);
+  const auto changed_state = session.contact_release_state_snapshot();
+  ASSERT_EQ(changed_state.count, 1U);
+  const auto* restarted = entry_for(changed_state, released_pair);
+  ASSERT_NE(restarted, nullptr);
+  EXPECT_TRUE(restarted->release_state.started_in_contact);
+  EXPECT_FALSE(restarted->release_state.separated);
+  EXPECT_EQ(entry_for(changed_state, added_pair), nullptr);
 }
 
 TEST(RuntimeCollisionQuerySessionTest,

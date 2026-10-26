@@ -11,6 +11,7 @@ import argparse
 import importlib
 import json
 import math
+import re
 import threading
 import time
 from collections.abc import Sequence
@@ -34,7 +35,10 @@ _SERVICE_TYPES: Final = {
     "get_entity_state": "simulation_interfaces/srv/GetEntityState",
     "get_entity_bounds": "simulation_interfaces/srv/GetEntityBounds",
 }
+# Batch state reads are optional and selected apart from the capture services.
+_ENTITIES_STATES_SERVICE_TYPE: Final = "simulation_interfaces/srv/GetEntitiesStates"
 _PREFERRED_SERVICE_LEAVES: Final = {
+    "get_entities_states": "get_entities_states",
     "get_simulator_features": "get_simulator_features",
     "get_entities": "get_entities",
     "get_entity_info": "get_entity_info",
@@ -291,6 +295,66 @@ class SimulationSceneMirrorClient:
             custom_info=custom_info,
             entities=tuple(snapshots),
             errors=feature_errors + entity_errors + missing_requested,
+        )
+
+    def capture_entity_states(
+        self,
+        *,
+        entity_names: Sequence[str],
+    ) -> SceneMirrorSnapshot | None:
+        """Read every named entity state with one ``GetEntitiesStates`` call.
+
+        Isaac Sim serves that call as one coroutine on its main loop that never
+        yields between entities, so every state comes from one simulation
+        step. Returns ``None`` when the simulator advertises no batch service.
+        """
+
+        self._require_active()
+        names = _bounded_unique_names(entity_names, label="entity names")
+        if not names:
+            raise ValueError("entity names must not be empty")
+        candidates = sorted(
+            _simulation_service_graph_by_type(
+                self.node.get_service_names_and_types()
+            ).get(_ENTITIES_STATES_SERVICE_TYPE, ()),
+            key=lambda value: _service_sort_key(value, "get_entities_states"),
+        )
+        if not candidates:
+            return None
+        request = self._srv.GetEntitiesStates.Request()
+        request.filters.filter = (
+            "^(" + "|".join(re.escape(name) for name in names) + ")$"
+        )
+        response = self._call_service(
+            candidates[0], self._srv.GetEntitiesStates, request
+        )
+        if not self._result_ok(response.result):
+            raise RuntimeError(
+                f"GetEntitiesStates failed: {self._result_message(response.result)}"
+            )
+        rows = _bounded_items(response.entities, label="batch entities")
+        states = _bounded_items(response.states, label="batch states")
+        if len(rows) != len(states):
+            raise ValueError("GetEntitiesStates returned unpaired states")
+        snapshots = []
+        for row, state in zip(rows, states):
+            name = _bounded_text(row, label="batch entity name")
+            if name not in names:
+                continue
+            try:
+                snapshots.append(
+                    EntitySnapshot(name=name, pose=pose_snapshot_from_state(state))
+                )
+            except ValueError as error:
+                snapshots.append(
+                    EntitySnapshot(name=name, errors=(_safe_error(error),))
+                )
+        return SceneMirrorSnapshot(
+            service_names={"get_entities_states": candidates[0]},
+            features=(),
+            spawn_formats=(),
+            custom_info="",
+            entities=tuple(snapshots),
         )
 
     def _resolve_service_names(

@@ -9,8 +9,9 @@ namespace manyforge::core {
 ///
 /// A production adapter uses this boundary to latch qualified observation
 /// policies immediately before a fresh planning snapshot is retained. The
-/// returned revision is the exact post-latch projection that the local native
-/// projection must expose. Implementations must be bounded, replay-safe, and
+/// returned revision is the minimum post-latch projection. The consumer retains
+/// one snapshot at or beyond it in the same Scene lineage and binds all planning
+/// inputs to that exact snapshot. Implementations must be bounded, replay-safe, and
 /// fail closed when owner identity, freshness, or projection convergence is
 /// uncertain.
 class IPlanningSceneSynchronizer {

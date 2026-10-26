@@ -50,6 +50,7 @@ import {
   candidateGripperPresentation,
   candidateToolPresentation,
   createExecutionRobotPresentationReader,
+  createMeasuredComparisonPresentationReader,
   frozenMeasuredRobotPresentationReader,
   executionRobotPresentation,
   runtimeScenePresentation,
@@ -1410,7 +1411,7 @@ function SourceOccurrencePanel({
         {runtimeSources.slice(0, 128).map((source) => (
           <div
             className="runtime-source-row"
-            key={`${source.object_id}:${source.policy_id}:${source.source_epoch}:${source.source_id}:${source.source_sequence}`}
+            key={`${source.object_id}:${source.policy_id}:${source.source_epoch}:${source.source_id}`}
           >
             <div>
               <strong>{source.source_id}</strong>
@@ -1440,8 +1441,8 @@ function SourceOccurrencePanel({
         )}
         {runtimeSources.length > 0 && (
           <span className="muted">
-            These owner-issued pose sources are observation-only; the current source contract
-            advertises no mutation action.
+            Scene application follows each source's Deployment policy. Observations and freshness
+            are shown here; edit pose-source policies in Deployment.
           </span>
         )}
       </section>
@@ -1715,6 +1716,15 @@ const SceneViewerBridge = memo(function SceneViewerBridge({
       ? frozenMeasuredRobotPresentationReader(live.readMeasuredRobotPresentation())
       : live;
   }, [modelRetained, motionDescriptor, readyManifest, source, sourceValue]);
+  // The measured comparison robot reads the same stream frames (their measured
+  // rows), never the control-state pose sources: that snapshot deliberately
+  // does not republish while the robot moves.
+  const measuredComparisonPresentation = useMemo(() => {
+    const live = createMeasuredComparisonPresentationReader(source, sourceValue, readyManifest);
+    return modelRetained
+      ? frozenMeasuredRobotPresentationReader(live.readMeasuredRobotPresentation())
+      : live;
+  }, [modelRetained, readyManifest, source, sourceValue]);
   // The measured robot pose comes only from the live observation stream. The
   // control-state copy of observed joints is refreshed only at control changes
   // and motion ends, so it can be older than the robot (and than a pose
@@ -2168,7 +2178,8 @@ const SceneViewerBridge = memo(function SceneViewerBridge({
       onBeginCandidateTcpDrag={beginCandidateDragStable}
       candidateContextKey={JSON.stringify([robotControl.selectedStatus?.ownerEpoch,
         robotControl.selectedStatus?.retainedBundleId, robotControl.selectedStatus?.graphRevision,
-        robotControl.selectedStatus?.directControl?.programBindingId, robotControl.selectedStatus?.sceneRevision,
+        // Scene identity only: pose updates advance its revision during a drag.
+        robotControl.selectedStatus?.directControl?.programBindingId, robotControl.selectedStatus?.sceneRevision.scene_id,
         robotControl.state.mode, robotControl.state.moveToDraft?.source,
         candidatePresentationAllowed, runtimeEnabled])}
       gizmo={gizmo}
@@ -2178,6 +2189,10 @@ const SceneViewerBridge = memo(function SceneViewerBridge({
       correctionRobot={correctionRobot}
       correctionStale={correctionGhost?.stale ?? false}
       runtimePresentation={runtimePresentation}
+      measuredStateGhostPresentation={facts !== null && !resetPresentationHeld
+        && modelPresentation.status === 'ready' ? sceneRuntimePresentation : undefined}
+      measuredStateGhostRobot={measuredComparisonPresentation}
+      measuredStateGhostObjects={objects}
       executionObservationPresentation={executionObservationPresentation}
       sceneOwnerIdentity={sceneOwnerIdentity}
       viewerFrameIdentity={viewerFrameIdentity}

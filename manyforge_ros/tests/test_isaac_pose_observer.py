@@ -266,6 +266,62 @@ def test_normalized_observations_map_to_stable_manager_payloads(
     assert raised.value.code == "joint_set_incomplete"
 
 
+def test_relative_reference_binding_emits_versioned_referenced_payload(
+    tmp_path: Path,
+) -> None:
+    value = _config_value()
+    entity = value["simulation_entities"][0]
+    entity["relative_reference"] = {
+        "entity": "/World/gripper/robotiq_arg2f_base_link",
+        "link": "robotiq_base_link",
+        "source_header_frame_id": "robotiq_arg2f_base_link",
+    }
+    path = tmp_path / "site.json"
+    _write_config(path, value)
+    binding = load_isaac_pose_observer_site_config(path).simulation_entities[0]
+    assert binding.reference is not None
+    assert binding.reference.link == "robotiq_base_link"
+    assert binding.reference.request.source_coordinate_frame_id == "world"
+    assert binding.reference.request.target_frame_id == "universe"
+    assert binding.reference.request.local_position_xyz == (0.0, 0.0, 0.0)
+
+    observation = SimulationEntityPoseObservation(
+        entity="/mac_n_cheese_centered",
+        pose=PoseSnapshot("universe", 13, (0.4, -0.2, 0.1), (0.0, 0.0, 0.0, 1.0)),
+    )
+    relative = PoseSnapshot("universe", 13, (0.02, 0.0, 0.25), (0.0, 0.0, 0.0, 1.0))
+    payload = simulation_entity_observation_intent(
+        binding, observation, pose_in_reference=relative, coherent=True
+    ).payload_value()
+    assert payload["kind"] == "simulation_entity_pose_with_reference.v1"
+    assert payload["pose"]["position_m"] == [0.4, -0.2, 0.1]
+    assert payload["reference"] == {
+        "coherent": True,
+        "entity": "/World/gripper/robotiq_arg2f_base_link",
+        "link": "robotiq_base_link",
+        "pose_in_reference": {
+            "orientation_xyzw": [0.0, 0.0, 0.0, 1.0],
+            "position_m": [0.02, 0.0, 0.25],
+        },
+    }
+    unavailable = simulation_entity_observation_intent(
+        binding, observation, coherent=True
+    ).payload_value()["reference"]
+    assert unavailable["coherent"] is False
+    assert unavailable["pose_in_reference"] is None
+    assert (
+        unknown_observation_intent(
+            binding, code="source_error", detail="down", source_key=""
+        ).payload_value()["kind"]
+        == "simulation_entity_pose_with_reference.v1"
+    )
+
+    entity["relative_reference"] = {"entity": "/World/gripper", "link": "x"}
+    _write_config(path, value)
+    with pytest.raises(IsaacPoseObserverConfigError):
+        load_isaac_pose_observer_site_config(path)
+
+
 class _FakeSceneRuntimeClient:
     def __init__(self, *, fail_first: bool = False, clock=None) -> None:
         self.fail_first = fail_first

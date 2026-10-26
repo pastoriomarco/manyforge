@@ -11,7 +11,7 @@ export interface ExecutionObservationTarget {
 }
 
 export interface ExecutionObservationFrame {
-  schemaVersion: 'manyforge.execution_observation_frame.v3';
+  schemaVersion: 'manyforge.execution_observation_frame.v4';
   ownerEpoch: string;
   cellId: string;
   retainedBundleId: string;
@@ -20,6 +20,11 @@ export interface ExecutionObservationFrame {
   sourceSequence: number;
   receivedAtMonotonicUs: number;
   targets: ExecutionObservationTarget[];
+  /**
+   * Render-only measured coordinates beside commanded targets (for example a
+   * simulator's own joint states). Never the solid robot's pose source.
+   */
+  measuredTargets: ExecutionObservationTarget[];
 }
 
 export interface ExecutionObservationReader {

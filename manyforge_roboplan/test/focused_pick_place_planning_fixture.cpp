@@ -265,7 +265,8 @@ public:
       : predecessor_(std::move(predecessor)) {}
 
   Result<SceneCandidatePreviewDTO> PreviewResolvedSceneCandidate(
-      const ResolvedSceneCandidatePreviewRequestDTO &request) const override {
+      const ResolvedSceneCandidatePreviewRequestDTO &request,
+      const CollisionWorldLeaseInventory&) const override {
     const auto *attach =
         std::get_if<AttachCarriedObjectRequestDTO>(&request.request.operation);
     const auto *detach =
@@ -494,6 +495,12 @@ public:
     retained.projection_binding.projection_lease_id = std::move(lease_id);
     retained_lease_ = retained.projection_binding.projection_lease_id;
     return Result<CollisionWorldLeaseInventory>::Ok(std::move(retained));
+  }
+
+  Result<CollisionWorldLeaseInventory>
+  RetainCurrentProjection(ProjectionLeaseId lease_id) override {
+    return RetainProjection(predecessor_.projection_binding.projection_revision,
+                            std::move(lease_id));
   }
 
   void ReleaseProjection(const ProjectionLeaseId &lease_id) override {

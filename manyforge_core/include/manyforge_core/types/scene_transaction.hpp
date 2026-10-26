@@ -144,6 +144,7 @@ struct ResolvedSceneCandidatePreviewRequestDTO final {
 /// normalized into the semantic cell frame and contains no authored frame.
 struct ResolvedUpsertSceneObjectDTO final {
   SceneObjectSnapshotDTO object;
+  std::optional<CarriedObjectAttachmentDTO> attachment{};
 
   friend bool operator==(const ResolvedUpsertSceneObjectDTO&,
                          const ResolvedUpsertSceneObjectDTO&) = default;

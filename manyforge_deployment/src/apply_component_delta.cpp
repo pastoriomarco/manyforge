@@ -1,4 +1,5 @@
 #include "manyforge_deployment/apply_component_delta.hpp"
+#include "manyforge_deployment/scene_pose_source_policy_codec.hpp"
 
 #include <algorithm>
 #include <map>
@@ -309,12 +310,18 @@ RuntimeFamilies(const RetainedBundle &bundle,
   // cell-wide fallback.
   // Preserve the historical family bytes when the optional budget is absent.
   if (const auto budget = bundle.value().motion_takeover_preparation_budget_s;
-      budget.has_value()) {
+      budget.has_value() || !bundle.value().scene_pose_sources.empty()) {
     Object policies{
         {"retained_policy_records",
          CanonicalValue(MemberArray(root, "retained_policy_records"))},
-        {"motion_takeover_preparation_budget_s", CanonicalValue(*budget)},
     };
+    if (budget)
+      policies.emplace_back("motion_takeover_preparation_budget_s",
+                            CanonicalValue(*budget));
+    if (!bundle.value().scene_pose_sources.empty())
+      policies.emplace_back(
+          "scene_pose_sources",
+          EncodeScenePoseSources(bundle.value().scene_pose_sources));
     if (const auto planning = bundle.value().motion_takeover_planning_budget_s)
       policies.emplace_back("motion_takeover_planning_budget_s",
                             CanonicalValue(*planning));

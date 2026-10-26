@@ -59,6 +59,7 @@ from manyforge_behavior.orchestration_ports import (
     OwnerTaskSettlementPendingError,
     OwnerTaskSnapshot,
     OwnerTaskState,
+    PoseSourceLatchError,
     ProgramRunPortContext,
     ProgramRunScopeSnapshot,
     ProgramRunScopeState,
@@ -97,6 +98,7 @@ def _held_selection_revision(error: KernelOperationAdmissionRejectedError) -> in
 _MAX_CONTEXTS: Final = 4_096
 _MAX_TASKS: Final = 65_536
 _MAX_SCENE_NODE_STALE_RETRIES: Final = 16
+_MAX_PENDING_SIMULATION_RESETS: Final = 4_096
 _SCENE_INITIALIZATION_SETTLEMENT_TIMEOUT_S: Final = 2.0
 _SCENE_INITIALIZATION_SETTLEMENT_POLL_S: Final = 0.01
 _PROGRAM_RESET_SETTLEMENT_TIMEOUT_S: Final = 5.0
@@ -110,6 +112,108 @@ _AUTHORED_SCENE_OPERATIONS: Final = frozenset(
         "set_collision_policy",
     }
 )
+_SCENE_RUNTIME_COMMAND_VERSION: Final = "manyforge.manager_command.v1"
+_SCENE_RUNTIME_RESPONSE_VERSION: Final = "manyforge.manager_command_response.v1"
+_SCENE_RUNTIME_IDENTITY_FIELDS: Final = frozenset(
+    {
+        "retained_bundle_id",
+        "graph_revision",
+        "deployment_generation",
+        "program_generation",
+        "runtime_generation",
+    }
+)
+_SCENE_PROJECTION_REVISION_FIELDS: Final = frozenset(
+    {"retained_bundle_id", "graph_revision", "scene_revision"}
+)
+_SCENE_REVISION_FIELDS: Final = frozenset(
+    {"scene_id", "revision_id", "content_hash"}
+)
+_SCENE_RUNTIME_LATCH_RESPONSE_FIELDS: Final = frozenset(
+    {
+        "already_applied_observation_count",
+        "api_version",
+        "committed_observation_count",
+        "initial_projection_revision",
+        "latched_observation_count",
+        "ok",
+        "projection_revision",
+        "runtime_identity",
+        "scene_runtime_source_generation",
+        "skipped_attached_observation_count",
+    }
+)
+
+
+def _scene_runtime_identity_value(value: object, *, field: str) -> dict[str, Any]:
+    record = _mapping(value, field=field)
+    if set(record) != _SCENE_RUNTIME_IDENTITY_FIELDS:
+        raise ProductionPortError(f"{field} has an unknown or missing field")
+    identity = {
+        "retained_bundle_id": _text(
+            record.get("retained_bundle_id"), field=f"{field}.retained_bundle_id"
+        ),
+        "graph_revision": _text(
+            record.get("graph_revision"), field=f"{field}.graph_revision"
+        ),
+    }
+    for name in ("deployment_generation", "program_generation", "runtime_generation"):
+        value = record.get(name)
+        minimum = 1 if name == "runtime_generation" else 0
+        if type(value) is not int or not minimum <= value <= 9_007_199_254_740_991:
+            raise ProductionPortError(f"{field}.{name} is not an exact safe integer")
+        identity[name] = value
+    return identity
+
+
+def _scene_projection_revision_value(value: object, *, field: str) -> dict[str, Any]:
+    record = _mapping(value, field=field)
+    if set(record) != _SCENE_PROJECTION_REVISION_FIELDS:
+        raise ProductionPortError(f"{field} has an unknown or missing field")
+    scene = _mapping(record.get("scene_revision"), field=f"{field}.scene_revision")
+    if set(scene) != _SCENE_REVISION_FIELDS:
+        raise ProductionPortError(f"{field}.scene_revision has an unknown or missing field")
+    scene_revision_id = scene.get("revision_id")
+    if (
+        type(scene_revision_id) is not int
+        or not 1 <= scene_revision_id <= 9_007_199_254_740_991
+    ):
+        raise ProductionPortError(f"{field}.scene_revision.revision_id is invalid")
+    return {
+        "retained_bundle_id": _text(
+            record.get("retained_bundle_id"), field=f"{field}.retained_bundle_id"
+        ),
+        "graph_revision": _text(
+            record.get("graph_revision"), field=f"{field}.graph_revision"
+        ),
+        "scene_revision": {
+            "scene_id": _text(scene.get("scene_id"), field=f"{field}.scene_revision.scene_id"),
+            "revision_id": scene_revision_id,
+            "content_hash": _text(
+                scene.get("content_hash"), field=f"{field}.scene_revision.content_hash"
+            ),
+        },
+    }
+
+
+def _projection_same_or_forward(candidate: object, floor: Mapping[str, Any]) -> bool:
+    """Whether ``candidate`` is ``floor`` or a newer revision of its Scene."""
+    try:
+        current = _scene_projection_revision_value(candidate, field="projection revision")
+    except ProductionPortError:
+        return False
+    current_scene = current["scene_revision"]
+    floor_scene = floor["scene_revision"]
+    return (
+        current["retained_bundle_id"] == floor["retained_bundle_id"]
+        and current["graph_revision"] == floor["graph_revision"]
+        and current_scene["scene_id"] == floor_scene["scene_id"]
+        and current_scene["revision_id"] >= floor_scene["revision_id"]
+        and (
+            current_scene["revision_id"] != floor_scene["revision_id"]
+            or current_scene["content_hash"] == floor_scene["content_hash"]
+        )
+    )
 
 
 class ProductionPortError(RuntimeError):
@@ -1214,6 +1318,7 @@ class NativeKernelProgramPort:
         *,
         current_owner_epoch: Callable[[], str] | None = None,
         stop_terminal: Callable[..., Mapping[str, Any] | None] | None = None,
+        scene_pose_source_latch: Callable[..., None] | None = None,
     ) -> None:
         if not isinstance(kernel, KernelClient):
             raise TypeError("kernel must be one bounded KernelClient")
@@ -1221,8 +1326,11 @@ class NativeKernelProgramPort:
             raise TypeError("current_owner_epoch must be callable")
         if stop_terminal is not None and not callable(stop_terminal):
             raise TypeError("stop_terminal must be callable")
+        if scene_pose_source_latch is not None and not callable(scene_pose_source_latch):
+            raise TypeError("scene_pose_source_latch must be callable")
         self._kernel = kernel
         self._current_owner_epoch = current_owner_epoch
+        self._scene_pose_source_latch = scene_pose_source_latch
         # The Runner's existing events reader: the Stop terminal projection
         # of exactly (stop_id, stop_generation), or None (SX-2215); with
         # read_to_end=True it first reads the events to that record.
@@ -1535,6 +1643,33 @@ class NativeKernelProgramPort:
             ),
         )
         return context, participant.target, dict(participant.payload)
+
+    def _latch_motion_between_nodes(
+        self,
+        identity: NodeAttemptIdentity,
+        payload: Mapping[str, Any],
+    ) -> None:
+        """Latch only normalized Scene resources from this motion's references."""
+
+        if self._scene_pose_source_latch is None:
+            return
+        resource_ids = tuple(
+            sorted(
+                {
+                    reference["scene_resource_id"]
+                    for name in ("target_reference", "offset_reference")
+                    if isinstance((reference := payload.get(name)), Mapping)
+                    and reference.get("type") == "scene_resource"
+                    and isinstance(reference.get("scene_resource_id"), str)
+                    and reference["scene_resource_id"]
+                }
+            )
+        )
+        if resource_ids:
+            self._scene_pose_source_latch(
+                identity,
+                scene_resource_ids=resource_ids,
+            )
 
     def motion_preview_intent(
         self,
@@ -2358,6 +2493,26 @@ class NativeKernelProgramPort:
             inputs.parameters,
         )
         self._require_scope_open(identity.program_run_id)
+        if kind == "pick" and self._scene_pose_source_latch is not None:
+            self._scene_pose_source_latch(
+                identity,
+                scene_resource_ids=(selected_object_id,),
+            )
+            context = self._context(identity.program_run_id)
+            current_owner_epoch, current_scene_revision = self._owner_status(context)
+            for phase in ("approach", "descend", "tool", "retreat"):
+                operation = intent.get(f"{phase}_operation")
+                if not isinstance(operation, dict):
+                    raise ProductionPortError(f"pick {phase} operation is invalid")
+                request_context = operation.get("request_context")
+                if (
+                    not isinstance(request_context, Mapping)
+                    or request_context.get("request_owner_epoch") != current_owner_epoch
+                ):
+                    raise ProductionPortError(
+                        "Kernel owner changed during between-nodes pose latching"
+                    )
+                operation["expected_scene_revision"] = dict(current_scene_revision)
         response = (
             self._kernel.plan_pick(intent)
             if kind == "pick"
@@ -2482,6 +2637,8 @@ class NativeKernelProgramPort:
             "payload": payload,
         }
         self._require_scope_open(identity.program_run_id)
+        if node_id in _MOTION_NODE_IDS or node_id in _INTERRUPT_MOTION_NODE_IDS:
+            self._latch_motion_between_nodes(identity, payload)
         owner_epoch, scene_revision = preset_owner_status or self._owner_status(context)
         request_id = _request_identity(
             "program-node", identity.program_run_id, identity.node_attempt_id
@@ -5228,6 +5385,7 @@ class HeadlessSceneProgramPort:
         self,
         transport: _SceneProgramTransport,
         *,
+        manager_command: Callable[[dict[str, Any]], dict[str, Any]] | None = None,
         program_node_evidence: (
             Callable[[NodeAttemptIdentity, str], Mapping[str, Any]] | None
         ) = None,
@@ -5240,7 +5398,10 @@ class HeadlessSceneProgramPort:
         ):
             if not callable(getattr(transport, method, None)):
                 raise TypeError(f"scene transport has no callable {method}")
+        if manager_command is not None and not callable(manager_command):
+            raise TypeError("manager_command must be callable")
         self._transport = transport
+        self._manager_command = manager_command
         self._program_node_evidence = program_node_evidence
         if program_node_evidence is not None and not callable(
             getattr(transport, "scene_transaction_status", None)
@@ -5250,6 +5411,7 @@ class HeadlessSceneProgramPort:
         self._contexts: dict[str, _SceneBoundContext] = {}
         self._prepared: dict[str, dict[str, Any]] = {}
         self._lock = RLock()
+        self._pose_source_latch_lock = RLock()
 
     def bind(self, context: ProgramRunPortContext) -> None:
         if not isinstance(context, ProgramRunPortContext):
@@ -5268,6 +5430,216 @@ class HeadlessSceneProgramPort:
     def unbind(self, program_run_id: str) -> None:
         with self._lock:
             self._contexts.pop(program_run_id, None)
+
+    def latch_between_nodes(
+        self,
+        identity: NodeAttemptIdentity,
+        *,
+        scene_resource_ids: Sequence[str] | None,
+    ) -> None:
+        """Apply one exact Manager between-nodes latch to authoritative Scene.
+
+        Manager captures the current Scene at the command boundary. The exact
+        runtime identity fences the captured deployment; ordinary object-pose
+        updates do not invalidate an earlier, unnecessary Scene pre-read.
+        """
+
+        if not isinstance(identity, NodeAttemptIdentity):
+            raise PoseSourceLatchError("between-nodes latch has no exact node identity")
+        if self._manager_command is None:
+            raise PoseSourceLatchError("Manager scene-runtime latch is unavailable")
+        resource_ids: tuple[str, ...] | None = None
+        if scene_resource_ids is not None:
+            try:
+                resource_ids = tuple(
+                    _text(value, field="scene_resource_ids item")
+                    for value in scene_resource_ids
+                )
+            except (TypeError, ProductionPortError) as error:
+                raise PoseSourceLatchError(
+                    "between-nodes latch resource selection is invalid",
+                    details={"reason": "scene_resource_ids_invalid"},
+                ) from error
+            if not resource_ids or resource_ids != tuple(sorted(set(resource_ids))):
+                raise PoseSourceLatchError(
+                    "between-nodes latch resource selection is not canonical",
+                    details={"reason": "scene_resource_ids_invalid"},
+                )
+
+        with self._pose_source_latch_lock:
+            try:
+                with self._lock:
+                    context = self._contexts.get(identity.program_run_id)
+                if context is None:
+                    raise ProductionPortError(
+                        "between-nodes latch has no captured Program-run context"
+                    )
+                owner = self._manager_command(
+                    {
+                        "api_version": _SCENE_RUNTIME_COMMAND_VERSION,
+                        "command": "scene_runtime_owner_read",
+                    }
+                )
+                self._raise_pose_latch_refusal(owner, phase="Manager identity read")
+                if set(owner) != {
+                    "api_version",
+                    "cell_id",
+                    "initialization_generation",
+                    "initialization_state",
+                    "ok",
+                    "runtime_identity",
+                    "scene_runtime_owner_epoch",
+                }:
+                    raise ProductionPortError(
+                        "scene-runtime owner response has an unknown or missing field"
+                    )
+                if owner.get("api_version") != _SCENE_RUNTIME_RESPONSE_VERSION or owner.get(
+                    "ok"
+                ) is not True:
+                    raise ProductionPortError("scene-runtime owner response is invalid")
+                _text(owner.get("cell_id"), field="scene-runtime cell_id")
+                _text(
+                    owner.get("scene_runtime_owner_epoch"),
+                    field="scene-runtime owner epoch",
+                )
+                state_generation = owner.get("initialization_generation")
+                if (
+                    type(state_generation) is not int
+                    or not 0 <= state_generation <= 9_007_199_254_740_991
+                ):
+                    raise ProductionPortError(
+                        "scene-runtime initialization generation is invalid"
+                    )
+                _text(
+                    owner.get("initialization_state"),
+                    field="scene-runtime initialization state",
+                )
+                runtime_identity = _scene_runtime_identity_value(
+                    owner.get("runtime_identity"), field="scene-runtime identity"
+                )
+                if (
+                    runtime_identity["retained_bundle_id"]
+                    != context.capture.retained_bundle_id
+                    or runtime_identity["graph_revision"] != context.capture.graph_revision
+                ):
+                    raise ProductionPortError(
+                        "scene-runtime owner and captured Program deployment disagree"
+                    )
+
+                request: dict[str, Any] = {
+                    "api_version": _SCENE_RUNTIME_COMMAND_VERSION,
+                    "command": "scene_runtime_latch_between_nodes",
+                    "expected_runtime_identity": runtime_identity,
+                }
+                if resource_ids is not None:
+                    request["scene_resource_ids"] = list(resource_ids)
+                response = self._manager_command(request)
+                self._raise_pose_latch_refusal(response, phase="between-nodes latch")
+                if (
+                    set(response) != _SCENE_RUNTIME_LATCH_RESPONSE_FIELDS
+                    or response.get("api_version") != _SCENE_RUNTIME_RESPONSE_VERSION
+                    or response.get("ok") is not True
+                ):
+                    raise ProductionPortError(
+                        "between-nodes latch response has an unknown or missing field"
+                    )
+                echoed_identity = _scene_runtime_identity_value(
+                    response.get("runtime_identity"),
+                    field="between-nodes latch runtime identity",
+                )
+                if echoed_identity != runtime_identity:
+                    raise ProductionPortError(
+                        "between-nodes latch response selected another runtime"
+                    )
+                initial_projection = _scene_projection_revision_value(
+                    response.get("initial_projection_revision"),
+                    field="between-nodes initial projection revision",
+                )
+                if (
+                    initial_projection["retained_bundle_id"] != context.capture.retained_bundle_id
+                    or initial_projection["graph_revision"] != context.capture.graph_revision
+                ):
+                    raise ProductionPortError(
+                        "between-nodes latch started from another captured deployment"
+                    )
+                projection = _scene_projection_revision_value(
+                    response.get("projection_revision"),
+                    field="between-nodes projection revision",
+                )
+                if (
+                    projection["retained_bundle_id"]
+                    != initial_projection["retained_bundle_id"]
+                    or projection["graph_revision"] != initial_projection["graph_revision"]
+                    or projection["scene_revision"]["scene_id"]
+                    != initial_projection["scene_revision"]["scene_id"]
+                    or projection["scene_revision"]["revision_id"]
+                    < initial_projection["scene_revision"]["revision_id"]
+                ):
+                    raise ProductionPortError(
+                        "between-nodes latch response changed Scene lineage"
+                    )
+                counters: dict[str, int] = {}
+                for name in (
+                    "latched_observation_count",
+                    "committed_observation_count",
+                    "already_applied_observation_count",
+                    "skipped_attached_observation_count",
+                    "scene_runtime_source_generation",
+                ):
+                    value = response.get(name)
+                    minimum = 1 if name == "scene_runtime_source_generation" else 0
+                    if (
+                        type(value) is not int
+                        or not minimum <= value <= 9_007_199_254_740_991
+                    ):
+                        raise ProductionPortError(
+                            f"between-nodes latch {name} is invalid"
+                        )
+                    counters[name] = value
+                if counters["latched_observation_count"] != sum(
+                    counters[name]
+                    for name in (
+                        "committed_observation_count",
+                        "already_applied_observation_count",
+                        "skipped_attached_observation_count",
+                    )
+                ):
+                    raise ProductionPortError(
+                        "between-nodes latch observation counts do not reconcile"
+                    )
+            except PoseSourceLatchError:
+                raise
+            except Exception as error:
+                reason = getattr(error, "code", None)
+                raise PoseSourceLatchError(
+                    f"between-nodes pose-source apply failed: {str(error) or type(error).__name__}",
+                    details={
+                        "reason": (
+                            reason if isinstance(reason, str) and reason
+                            else "scene_runtime_latch_failed"
+                        )
+                    },
+                ) from error
+
+    @staticmethod
+    def _raise_pose_latch_refusal(response: object, *, phase: str) -> None:
+        if not isinstance(response, Mapping):
+            raise ProductionPortError(f"{phase} response is not an object")
+        if response.get("ok") is not False:
+            return
+        error = response.get("error")
+        if (
+            not isinstance(error, Mapping)
+            or not isinstance(error.get("code"), str)
+            or not error["code"]
+            or not isinstance(error.get("message"), str)
+            or not error["message"]
+        ):
+            raise ProductionPortError(f"{phase} refusal is malformed")
+        raise PoseSourceLatchError(
+            f"{phase} was refused ({error['code']}): {error['message']}",
+            details={"reason": error["code"]},
+        )
 
     @staticmethod
     def _parse_context(context: ProgramRunPortContext) -> _SceneBoundContext:
@@ -5602,6 +5974,12 @@ class HeadlessSceneProgramPort:
                 )
         try:
             response = self._scene.commit(body)
+        except SceneTransactionRejectedError as error:
+            # SceneClient has validated the receipt against the serialized
+            # request. Retain that final ID because authored requests receive
+            # an admission-generation-derived ID inside this method.
+            error._manyforge_submitted_request_id = body["request_context"]["request_id"]
+            raise
         except SceneOutcomeUnknownError as error:
             if program_node_evidence is None:
                 raise
@@ -5674,6 +6052,57 @@ class HeadlessSceneProgramPort:
                 "scene commit changed captured structural or lineage identity"
             )
         return committed
+
+    @staticmethod
+    def _scene_owner_epoch_no_effect(
+        error: SceneTransactionRejectedError,
+        *,
+        submitted_owner_epoch: str,
+    ) -> bool:
+        """Whether a stale-owner-epoch rejection of this request had no effect.
+
+        History compaction by any writer (continuous pose sources are the
+        dominant one) rotates the request owner epoch. The rejection only
+        names the new epoch when this request itself triggered compaction, so
+        the caller re-reads the view instead of trusting the details.
+        """
+        response = error.response
+        submitted_request_id = getattr(error, "_manyforge_submitted_request_id", None)
+        return bool(
+            error.code == "stale_request_owner_epoch"
+            and isinstance(submitted_request_id, str)
+            and submitted_request_id
+            and response.get("ok") is False
+            and response.get("request_id") == submitted_request_id
+            and response.get("request_owner_epoch") == submitted_owner_epoch
+            and response.get("projection_status") == "not_attempted"
+            and response.get("committed_projection_revision") is None
+            and response.get("transaction_sequence") is None
+            and response.get("update_status") is None
+        )
+
+    def _scene_refresh_matches(
+        self,
+        context: _SceneBoundContext,
+        previous: _SceneView,
+        refreshed: _SceneView,
+    ) -> bool:
+        """Whether a re-read view is the same Scene, at its revision or later.
+
+        Scene identity only: the owner epoch (history compaction) and the
+        revision (pose sources) may both have advanced.
+        """
+        # The bound Applied Program is the runtime identity available to this
+        # port; _read_view has also checked its exact retained bundle and graph.
+        with self._lock:
+            if self._contexts.get(context.capture.program_run_id) != context:
+                return False
+        return (
+            refreshed.cell_id == previous.cell_id
+            and _projection_same_or_forward(
+                refreshed.projection_revision, previous.projection_revision
+            )
+        )
 
     @staticmethod
     def _initial_pose_and_frame(
@@ -5972,9 +6401,23 @@ class HeadlessSceneProgramPort:
             "retained_bundle_id": context.capture.retained_bundle_id,
             "graph_revision": context.capture.graph_revision,
             "desired_scene_digest": desired_scene_digest,
-            "scene_owner_epoch": view.request_owner_epoch,
+            "scene_identity": HeadlessSceneProgramPort._scene_identity(view),
             "projection_revision": deepcopy(view.projection_revision),
         }
+
+    @staticmethod
+    def _scene_identity(view: _SceneView) -> dict[str, Any]:
+        # Verification before capture compares the prepared scene's identity,
+        # not its revision or owner epoch: continuous pose sources advance the
+        # revision, and history compaction the epoch, between preparation and
+        # capture without changing which scene was prepared.
+        identity = {
+            key: deepcopy(value)
+            for key, value in view.projection_revision.items()
+            if key != "scene_revision"
+        }
+        identity["scene_id"] = view.projection_revision["scene_revision"]["scene_id"]
+        return identity
 
     @staticmethod
     def _proof_matches(
@@ -5984,6 +6427,20 @@ class HeadlessSceneProgramPort:
         proof: Mapping[str, Any],
     ) -> bool:
         return dict(proof) == HeadlessSceneProgramPort._proof(context, view, desired_scene_digest)
+
+    @staticmethod
+    def _proof_identifies(
+        context: _SceneBoundContext,
+        view: _SceneView,
+        desired_scene_digest: str,
+        proof: Mapping[str, Any],
+    ) -> bool:
+        current = HeadlessSceneProgramPort._proof(context, view, desired_scene_digest)
+        return (
+            {key: value for key, value in proof.items() if key != "projection_revision"}
+            == {key: value for key, value in current.items() if key != "projection_revision"}
+            and not view.attachments
+        )
 
     def _remember_proof(self, desired_scene_digest: str, proof: Mapping[str, Any]) -> None:
         with self._lock:
@@ -6075,21 +6532,23 @@ class HeadlessSceneProgramPort:
         ordinal = 0
 
         def commit(operation: Mapping[str, Any], coordinate: str) -> None:
-            nonlocal expected, ordinal
+            nonlocal expected, ordinal, view
             ordinal += 1
             attempt = 0
+            owner_epoch_rotation_used = False
             deadline = time.monotonic() + _SCENE_INITIALIZATION_SETTLEMENT_TIMEOUT_S
             while True:
+                request_id = _request_identity(
+                    "scene-init",
+                    context.program_run_id,
+                    str(ordinal),
+                    coordinate,
+                    str(attempt),
+                )
                 try:
                     expected, _response = self._commit(
                         context=parsed,
-                        request_id=_request_identity(
-                            "scene-init",
-                            context.program_run_id,
-                            str(ordinal),
-                            coordinate,
-                            str(attempt),
-                        ),
+                        request_id=request_id,
                         correlation_id=context.program_run_id,
                         request_owner_epoch=view.request_owner_epoch,
                         expected_projection_revision=expected,
@@ -6099,6 +6558,24 @@ class HeadlessSceneProgramPort:
                     return
                 except Exception as error:
                     code = getattr(error, "code", None)
+                    if code == "stale_request_owner_epoch":
+                        if (
+                            owner_epoch_rotation_used
+                            or not isinstance(error, SceneTransactionRejectedError)
+                            or not self._scene_owner_epoch_no_effect(
+                                error,
+                                submitted_owner_epoch=view.request_owner_epoch,
+                            )
+                        ):
+                            raise
+                        refreshed = self._read_view(parsed)
+                        if not self._scene_refresh_matches(parsed, view, refreshed):
+                            raise
+                        view = refreshed
+                        expected = refreshed.projection_revision
+                        owner_epoch_rotation_used = True
+                        attempt += 1
+                        continue
                     if code not in {
                         "stale_revision",
                         "stale_generation",
@@ -6112,10 +6589,11 @@ class HeadlessSceneProgramPort:
                         ) from error
                     time.sleep(_SCENE_INITIALIZATION_SETTLEMENT_POLL_S)
                     refreshed = self._read_view(parsed)
-                    if refreshed.request_owner_epoch != view.request_owner_epoch:
+                    if not self._scene_refresh_matches(parsed, view, refreshed):
                         raise ProductionPortError(
-                            "logical-scene owner changed during initialization"
+                            "logical scene changed identity during initialization"
                         ) from error
+                    view = refreshed
                     expected = refreshed.projection_revision
                     attempt += 1
 
@@ -6149,8 +6627,10 @@ class HeadlessSceneProgramPort:
             )
         if view.attachments:
             refreshed = self._read_view(parsed)
-            if refreshed.request_owner_epoch != view.request_owner_epoch:
-                raise ProductionPortError("logical-scene owner changed during initialization")
+            if not self._scene_refresh_matches(parsed, view, refreshed):
+                raise ProductionPortError(
+                    "logical scene changed identity during initialization"
+                )
             view = refreshed
             expected = view.projection_revision
 
@@ -6175,8 +6655,7 @@ class HeadlessSceneProgramPort:
             )
         verified = self._read_view(parsed)
         if (
-            verified.request_owner_epoch != view.request_owner_epoch
-            or verified.projection_revision != expected
+            self._scene_identity(verified) != self._scene_identity(view)
             or verified.attachments
             or tuple(verified.objects)
             != tuple(sorted(str(item["scene_resource_id"]) for item in operations))
@@ -6201,7 +6680,7 @@ class HeadlessSceneProgramPort:
         view = self._read_view(parsed)
         operations = self._initial_scene_operations(parsed, initial_scene, cell_id=view.cell_id)
         desired_scene_digest = self._desired_scene_digest(parsed, operations)
-        if not self._proof_matches(parsed, view, desired_scene_digest, proof):
+        if not self._proof_identifies(parsed, view, desired_scene_digest, proof):
             raise ProductionPortError("prepared logical scene changed before Program capture")
 
     def release(self, program_run_id: str) -> None:
@@ -6244,10 +6723,13 @@ class HeadlessSceneProgramPort:
             )
             rows = _sequence(response.get("poses"), field="resolved poses", length=1)
             row = _mapping(rows[0], field="resolved pose")
+            # The owner resolves against its current projection; a newer
+            # revision of the same Scene is the latest truth.
             if (
                 response.get("api_version") != "manyforge.scene_resource_pose_response.v1"
-                or dict(_mapping(response.get("projection_revision"), field="revision"))
-                != view.projection_revision
+                or not _projection_same_or_forward(
+                    response.get("projection_revision"), view.projection_revision
+                )
                 or row.get("scene_resource_id") != resource_id
             ):
                 raise ProductionPortError("native scene pose projection changed owner revision")
@@ -6427,12 +6909,10 @@ class HeadlessSceneProgramPort:
                 identity.node_attempt_id,
                 node_id,
             )
-            for attempt in range(_MAX_SCENE_NODE_STALE_RETRIES):
-                request_id = (
-                    base_request_id
-                    if attempt == 0
-                    else _request_identity("scene-node-retry", base_request_id, str(attempt))
-                )
+            stale_retry_count = 0
+            owner_epoch_rotation_used = False
+            request_id = base_request_id
+            while True:
                 try:
                     committed, response = self._commit(
                         context=context,
@@ -6444,6 +6924,25 @@ class HeadlessSceneProgramPort:
                         program_node_evidence=evidence,
                     )
                 except SceneTransactionRejectedError as error:
+                    if error.code == "stale_request_owner_epoch":
+                        if owner_epoch_rotation_used or not self._scene_owner_epoch_no_effect(
+                            error,
+                            submitted_owner_epoch=view.request_owner_epoch,
+                        ):
+                            raise
+                        refreshed = self._read_view(context)
+                        if not self._scene_refresh_matches(context, view, refreshed):
+                            raise
+                        previous_epoch = view.request_owner_epoch
+                        view = refreshed
+                        owner_epoch_rotation_used = True
+                        request_id = _request_identity(
+                            "scene-node-owner-epoch-retry",
+                            base_request_id,
+                            previous_epoch,
+                            view.request_owner_epoch,
+                        )
+                        continue
                     # Only a proven no-effect rejection can retry. An admission
                     # revision race uses the same bounded fresh-request path as
                     # a Scene revision race; owner/claim changes do not.
@@ -6453,15 +6952,21 @@ class HeadlessSceneProgramPort:
                     )
                     if (
                         not (error.code == "stale_revision" or stale_admission)
-                        or attempt + 1 == _MAX_SCENE_NODE_STALE_RETRIES
+                        or stale_retry_count + 1 >= _MAX_SCENE_NODE_STALE_RETRIES
                     ):
                         raise
                     refreshed = self._read_view(context)
-                    if refreshed.request_owner_epoch != view.request_owner_epoch:
+                    if not self._scene_refresh_matches(context, view, refreshed):
                         raise ProductionPortError(
-                            "logical-scene owner changed during node mutation"
+                            "logical scene changed identity during node mutation"
                         ) from error
                     view = refreshed
+                    stale_retry_count += 1
+                    request_id = _request_identity(
+                        "scene-node-retry",
+                        base_request_id,
+                        str(stale_retry_count),
+                    )
                     continue
                 return OwnerInvocationResult(
                     True,
@@ -6469,10 +6974,9 @@ class HeadlessSceneProgramPort:
                     metadata={
                         "transaction_sequence": response.get("transaction_sequence"),
                         "update_status": response.get("update_status"),
-                        "stale_revision_retry_count": attempt,
+                        "stale_revision_retry_count": stale_retry_count,
                     },
                 )
-            raise AssertionError("scene-node retry loop did not terminate")
         except OwnerInvocationPendingError:
             raise
         except Exception as exc:
@@ -6489,11 +6993,82 @@ class HeadlessSceneProgramPort:
             )
 
 
+class SimulationResetPoseSourceTaskPort:
+    """Apply the old post-reset between-nodes latch before reset reports success."""
+
+    def __init__(self, port: Any, scene: Any) -> None:
+        if any(
+            not callable(getattr(port, method, None))
+            for method in ("acknowledge", "cancel", "observe", "start")
+        ):
+            raise TypeError("pose-source task wrapper requires one OwnerTaskPort")
+        if not callable(getattr(scene, "latch_between_nodes", None)):
+            raise TypeError("pose-source task wrapper requires a between-nodes latch port")
+        self._port = port
+        self._scene = scene
+        self._pending_resets: dict[str, NodeAttemptIdentity] = {}
+        self._lock = RLock()
+
+    def __getattr__(self, name: str) -> Any:
+        return getattr(self._port, name)
+
+    def start(
+        self,
+        node_id: str,
+        identity: NodeAttemptIdentity,
+        inputs: OwnerNodeInputs,
+    ) -> OwnerTaskSnapshot:
+        if not isinstance(identity, NodeAttemptIdentity) or not isinstance(
+            inputs, OwnerNodeInputs
+        ):
+            raise TypeError("pose-source task start requires an exact node attempt")
+        if node_id == "simulation.reset":
+            with self._lock:
+                if (
+                    len(self._pending_resets) >= _MAX_PENDING_SIMULATION_RESETS
+                    and identity not in self._pending_resets.values()
+                ):
+                    raise ProductionPortError(
+                        "pending simulation reset pose-latch retention is full"
+                    )
+
+        task = self._port.start(node_id, identity, inputs)
+        if node_id == "simulation.reset":
+            if task.state is OwnerTaskState.SUCCEEDED:
+                self._scene.latch_between_nodes(identity, scene_resource_ids=None)
+            elif task.state is OwnerTaskState.ACTIVE:
+                with self._lock:
+                    current = self._pending_resets.get(task.task_id)
+                    if current is not None and current != identity:
+                        raise ProductionPortError(
+                            "simulation reset task identity was reused"
+                        )
+                    self._pending_resets[task.task_id] = identity
+        return task
+
+    def observe(self, task_id: str) -> OwnerTaskSnapshot:
+        task = self._port.observe(task_id)
+        identity: NodeAttemptIdentity | None = None
+        if task.state is not OwnerTaskState.ACTIVE:
+            with self._lock:
+                identity = self._pending_resets.pop(task.task_id, None)
+        if identity is not None and task.state is OwnerTaskState.SUCCEEDED:
+            self._scene.latch_between_nodes(identity, scene_resource_ids=None)
+        return task
+
+    def cancel(self, task_id: str, identity: NodeAttemptIdentity) -> None:
+        self._port.cancel(task_id, identity)
+        with self._lock:
+            if self._pending_resets.get(task_id) == identity:
+                self._pending_resets.pop(task_id, None)
+
+
 __all__ = [
     "HeadlessSceneProgramPort",
     "NativeKernelProgramPort",
     "ProductionPortError",
     "ProgramMotionParticipant",
     "ProgramMotionPreviewUnavailableError",
+    "SimulationResetPoseSourceTaskPort",
     "program_motion_participant",
 ]

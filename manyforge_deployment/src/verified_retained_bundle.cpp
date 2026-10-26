@@ -1,4 +1,5 @@
 #include "manyforge_deployment/verified_retained_bundle.hpp"
+#include "manyforge_deployment/scene_pose_source_policy_codec.hpp"
 #include <manyforge_deployment/io_provider_domain.hpp>
 #include <manyforge_deployment/io_signal_catalog.hpp>
 
@@ -1463,7 +1464,8 @@ verify_current_retained_bundle_projection(const CanonicalValue &root) {
        "compiled_products", "provenance"},
       {"site_overlay_ref", "external_resources", "assistant",
        "motion_takeover_preparation_budget_s",
-       "motion_takeover_planning_budget_s", "interrupt_policy_configuration"},
+       "motion_takeover_planning_budget_s", "interrupt_policy_configuration",
+       "scene_pose_sources"},
       "retained_bundle");
   if (require_string(require_member(object, "api_version", "retained_bundle"),
                      "retained_bundle.api_version") !=
@@ -2042,6 +2044,10 @@ verify_current_retained_bundle_projection(const CanonicalValue &root) {
       std::move(runtime_contract_requirements),
       motion_takeover_preparation_budget_s,
       motion_takeover_planning_budget_s,
+      root.find_object_member("scene_pose_sources")
+          ? DecodeScenePoseSources(
+                *root.find_object_member("scene_pose_sources"))
+          : std::vector<core::ScenePoseSourcePolicyDTO>{},
   };
 }
 

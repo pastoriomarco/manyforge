@@ -1,4 +1,5 @@
 #include <gtest/gtest.h>
+#include <manyforge_deployment/scene_pose_source_policy_codec.hpp>
 
 #include <manyforge_core/component_lifecycle_plan_catalog_codec.hpp>
 #include <manyforge_core/runtime_contract_manifest_codec.hpp>
@@ -231,10 +232,11 @@ array_member(const CanonicalValue &value, std::string_view name) {
          "\"capability_provider_bindings\":[]}";
 }
 
-[[nodiscard]] RetentionQualifiedDeployment
-qualify_empty(std::string_view cell_id,
-              std::optional<double> takeover_budget_s = std::nullopt,
-              std::optional<double> planning_budget_s = std::nullopt) {
+[[nodiscard]] RetentionQualifiedDeployment qualify_empty(
+    std::string_view cell_id,
+    std::optional<double> takeover_budget_s = std::nullopt,
+    std::optional<double> planning_budget_s = std::nullopt,
+    const std::vector<core::ScenePoseSourcePolicyDTO> &pose_sources = {}) {
   auto root = parse_strict_json_model_yaml(deployment_document(cell_id))
                   .root()
                   .as_object();
@@ -274,6 +276,18 @@ qualify_empty(std::string_view cell_id,
                         CanonicalValue(*planning_budget_s));
     *policies = CanonicalValue(std::move(fields));
   }
+  if (!pose_sources.empty()) {
+    auto policy = std::find_if(root.begin(), root.end(), [](const auto &row) {
+      return row.first == "policies";
+    });
+    if (policy == root.end())
+      throw std::invalid_argument(
+          "pose policy fixture requires policy envelope");
+    auto fields = policy->second.as_object();
+    fields.emplace_back("scene_pose_sources",
+                        EncodeScenePoseSources(pose_sources));
+    policy->second = CanonicalValue(std::move(fields));
+  }
   const auto deployment = compute_deployment_artifact_revision(
       parse_strict_json_model_yaml(
           canonical_json(CanonicalValue(std::move(root)))),
@@ -291,12 +305,13 @@ qualify_empty(std::string_view cell_id,
                                           compile_cell_ir(applicability));
 }
 
-[[nodiscard]] std::shared_ptr<const RetainedBundle>
-materialize_empty(std::string_view cell_id, IRawArtifactStore &store,
-                  std::optional<double> takeover_budget_s = std::nullopt,
-                  std::optional<double> planning_budget_s = std::nullopt) {
-  const auto qualified =
-      qualify_empty(cell_id, takeover_budget_s, planning_budget_s);
+[[nodiscard]] std::shared_ptr<const RetainedBundle> materialize_empty(
+    std::string_view cell_id, IRawArtifactStore &store,
+    std::optional<double> takeover_budget_s = std::nullopt,
+    std::optional<double> planning_budget_s = std::nullopt,
+    const std::vector<core::ScenePoseSourcePolicyDTO> &pose_sources = {}) {
+  const auto qualified = qualify_empty(cell_id, takeover_budget_s,
+                                       planning_budget_s, pose_sources);
   const detail::RejectingCompilerInputArtifactSource input_source;
   detail::RejectingCatalogArtifactStore catalog_store;
   return detail::RetainedBundleMaterializer::materialize(
@@ -3718,6 +3733,27 @@ TEST(RetainedBundleMaterializer,
                 second_artifacts[index].content_digest);
     }
   }
+}
+
+TEST(RetainedBundleMaterializer, ScenePosePolicySelectionSurvivesSealedReload) {
+  test::InMemoryRawArtifactStoreFixture store;
+  const std::vector<core::ScenePoseSourcePolicyDTO> policies{
+      {"camera", "part", "continuous_unattached"}};
+  const auto ordinary = materialize_empty("i3_pose_policy_cell", store, 1.0);
+  const auto selected = materialize_empty("i3_pose_policy_cell", store, 1.0,
+                                          std::nullopt, policies);
+  EXPECT_EQ(selected->value().scene_pose_sources, policies);
+  EXPECT_NE(selected->retained_bundle_id(), ordinary->retained_bundle_id());
+  const auto reloaded = detail::RetainedBundleReloadAuthority::reload(
+      selected->canonical_bytes());
+  EXPECT_EQ(reloaded->value().scene_pose_sources, policies);
+  EXPECT_EQ(reloaded->value(), selected->value());
+  const auto tampered = replace_root_member(
+      selected->normalized_root(), "scene_pose_sources",
+      EncodeScenePoseSources({{"camera", "part", "continuous"}}));
+  EXPECT_THROW(static_cast<void>(detail::RetainedBundleReloadAuthority::reload(
+                   canonical_json(tampered))),
+               RetainedBundleError);
 }
 
 TEST(RetainedBundleMaterializer,

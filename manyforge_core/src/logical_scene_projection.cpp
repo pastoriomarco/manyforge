@@ -104,6 +104,7 @@ Result<LogicalSceneSnapshotDTO> ApplyResolvedSceneTransaction(
               candidate.objects, operation.object.scene_resource_id,
               [](const SceneObjectSnapshotDTO& object) { return object.scene_resource_id; });
           if (found == candidate.objects.end()) {
+            if (operation.attachment) return false;
             const auto insertion = std::lower_bound(
                 candidate.objects.begin(), candidate.objects.end(),
                 operation.object.scene_resource_id,
@@ -114,6 +115,32 @@ Result<LogicalSceneSnapshotDTO> ApplyResolvedSceneTransaction(
             content_changed = true;
             topology_changed = true;
             return true;
+          }
+          if (operation.attachment) {
+            const auto& next = *operation.attachment;
+            const auto* carried = std::get_if<CarriedSceneObjectPlacementDTO>(&found->placement);
+            const auto previous =
+                find_exact(candidate.carried_object_attachments, next.carried_object_attachment_id,
+                           [](const CarriedObjectAttachmentDTO& value) {
+                             return value.carried_object_attachment_id;
+                           });
+            const auto* placement =
+                std::get_if<CarriedSceneObjectPlacementDTO>(&operation.object.placement);
+            if (!carried || !placement || !next.locally_valid() ||
+                previous == candidate.carried_object_attachments.end() ||
+                carried->carried_object_attachment_id != next.carried_object_attachment_id ||
+                carried->carried_object_attachment_revision !=
+                    previous->carried_object_attachment_revision ||
+                placement->carried_object_attachment_id != next.carried_object_attachment_id ||
+                placement->carried_object_attachment_revision !=
+                    next.carried_object_attachment_revision ||
+                next.scene_resource_id != operation.object.scene_resource_id ||
+                next.controllable_component_id != previous->controllable_component_id ||
+                next.command_target_id != previous->command_target_id ||
+                next.carrier_frame_ref != previous->carrier_frame_ref ||
+                next.touch_body_roles != previous->touch_body_roles)
+              return false;
+            *previous = next;
           }
           if (*found == operation.object) {
             return true;

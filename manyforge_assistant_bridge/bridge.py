@@ -94,7 +94,10 @@ def _prim_path_matches(path: str, root: str) -> bool:
 
 def _simulation_entity_path(source: dict[str, Any]) -> str | None:
     payload = source.get("payload")
-    if type(payload) is not dict or payload.get("kind") != "simulation_entity_pose":
+    if type(payload) is not dict or payload.get("kind") not in {
+        "simulation_entity_pose",
+        "simulation_entity_pose_with_reference.v1",
+    }:
         return None
     descriptor = payload.get("source")
     if type(descriptor) is dict and type(descriptor.get("entity")) is str:

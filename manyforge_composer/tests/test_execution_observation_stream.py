@@ -24,7 +24,7 @@ def _status(*, sequence: int = 7, position: float = 0.25) -> dict[str, Any]:
         "command": "observation",
         "ok": True,
         "observation": {
-            "schema_version": "manyforge.execution_observation.v3",
+            "schema_version": "manyforge.execution_observation.v4",
             "owner_epoch": "execution-owner.1",
             "cell_id": "cell-1",
             "retained_bundle_id": "bundle-1",
@@ -44,6 +44,7 @@ def _status(*, sequence: int = 7, position: float = 0.25) -> dict[str, Any]:
                     "positions_si": [position, -position],
                 }
             ],
+            "measured_targets": [],
         },
     }
 
@@ -53,7 +54,7 @@ def test_project_execution_observation_is_exact_and_compact() -> None:
         _status(), received_at_monotonic_us=123_456
     )
     assert frame == {
-        "schema_version": "manyforge.execution_observation_frame.v3",
+        "schema_version": "manyforge.execution_observation_frame.v4",
         "owner_epoch": "execution-owner.1",
         "cell_id": "cell-1",
         "retained_bundle_id": "bundle-1",
@@ -74,6 +75,7 @@ def test_project_execution_observation_is_exact_and_compact() -> None:
                 "positions_si": [0.25, -0.25],
             }
         ],
+        "measured_targets": [],
     }
 
     crossed = _status()
@@ -122,6 +124,33 @@ def test_gripper_only_changes_are_typed_and_not_deduplicated_as_idle_arm() -> No
     target["compiled_joint_names"] = ["robot__joint1"]
     with pytest.raises(stream.ExecutionObservationProjectionError, match="overlap"):
         stream.project_execution_observation(response, received_at_monotonic_us=3)
+
+
+def test_measured_targets_are_validated_and_publish_measured_only_changes() -> None:
+    response = _status()
+    measured = dict(response["observation"]["targets"][0])
+    measured.update(source_epoch="measured-source.1", positions_si=[0.2, -0.2])
+    response["observation"]["measured_targets"] = [measured]
+    before = stream.project_execution_observation(response, received_at_monotonic_us=1)
+    assert before["measured_targets"][0]["positions_si"] == [0.2, -0.2]
+    assert before["targets"][0]["positions_si"] == [0.25, -0.25]
+    measured["positions_si"] = [0.21, -0.2]
+    measured["source_sequence"] = 8
+    response["observation"]["source_sequence"] += 1
+    after = stream.project_execution_observation(response, received_at_monotonic_us=2)
+    assert before["targets"] == after["targets"]
+    assert stream._render_signature(before) != stream._render_signature(after)
+    response["observation"]["measured_targets"] = [measured, dict(measured)]
+    with pytest.raises(stream.ExecutionObservationProjectionError, match="overlap"):
+        stream.project_execution_observation(response, received_at_monotonic_us=3)
+    response["observation"]["measured_targets"] = [
+        {**measured, "coordinate_kinds": ["angular"]}
+    ]
+    with pytest.raises(stream.ExecutionObservationProjectionError):
+        stream.project_execution_observation(response, received_at_monotonic_us=4)
+    del response["observation"]["measured_targets"]
+    with pytest.raises(stream.ExecutionObservationProjectionError, match="unsupported"):
+        stream.project_execution_observation(response, received_at_monotonic_us=5)
 
 
 def test_encode_execution_observation_frame_is_one_canonical_payload() -> None:

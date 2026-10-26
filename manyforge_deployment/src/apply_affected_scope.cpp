@@ -432,6 +432,7 @@ derive_apply_configuration_fence_scope_verified_values(
       old_graph.component_attachments != new_graph.component_attachments ||
       old_bundle.retained_policy_records !=
           new_bundle.retained_policy_records ||
+      old_bundle.scene_pose_sources != new_bundle.scene_pose_sources ||
       old_bundle.motion_takeover_preparation_budget_s !=
           new_bundle.motion_takeover_preparation_budget_s ||
       old_bundle.motion_takeover_planning_budget_s !=

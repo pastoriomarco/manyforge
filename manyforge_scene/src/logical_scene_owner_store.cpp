@@ -1054,7 +1054,7 @@ ReadSceneTransactionStoreState(sqlite3 *database,
         stored_request.request_context.request_owner_epoch.value() !=
             intent.request_owner_epoch ||
         stored_request.request_context.request_id != intent.request_id ||
-        stored_request.expected_projection_revision != intent.prior ||
+        !ExpectedProjectionAdmitsActive(stored_request, intent.prior) ||
         intent.resolved_operation_json.empty() ||
         intent.resolved_operation_json.size() >
             kMaximumLogicalSceneTransactionBytes ||

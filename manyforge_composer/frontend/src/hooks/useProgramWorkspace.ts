@@ -10,7 +10,7 @@ import {
 import { api, authoringRefusalMessage, isStaleWorkspaceError, savedNotAdoptedMessage } from '../api/client';
 import { errorMessage } from '../state/structuralResource';
 import { parseManagerApplyAvailability, parseLogicalSceneProjection } from '../api/parsers';
-import { freshClosePolicy, managerPublicationMatches } from '../state/scenarioClose';
+import { freshClosePolicy, managerPublicationMatches, sceneAtOrAfter } from '../state/scenarioClose';
 import type { ManagerApplyIdentity } from '../state/managerApply';
 import {
   programLocalFence,
@@ -91,12 +91,6 @@ type ScenarioCloseSceneHandoff = ScenarioCloseHandoff & {
   policyResetRequired?: boolean;
   policy?: Record<string, JsonValue>;
 };
-function sameSceneProjection(left: ProjectionRevision, right: ProjectionRevision): boolean {
-  return left.retained_bundle_id === right.retained_bundle_id && left.graph_revision === right.graph_revision
-    && left.scene_revision.scene_id === right.scene_revision.scene_id
-    && left.scene_revision.revision_id === right.scene_revision.revision_id
-    && left.scene_revision.content_hash === right.scene_revision.content_hash;
-}
 function closeSceneRemovalOrder(objects: LogicalSceneObject[]): string[] {
   // Same dependent-before-support order as initial Scene reconciliation.
   const dependents = new Map(objects.map((object) => [object.scene_resource_id, 0]));
@@ -357,17 +351,19 @@ export function useProgramWorkspace(
         return { status: 'waiting', message: 'Waiting for the closed configuration in the logical Scene.' };
       if (content.carried_object_attachments.length > 0 || content.objects.some((object) => object.placement.kind !== 'cell_fixed'))
         throw new Error('Close cannot clear carried Scene objects after their carrier was retired. The editors were kept; no detach or object removal was sent.');
-      if (progress !== null && !sameSceneProjection(active, progress.expected)) {
-        if (progress.predecessor !== null && sameSceneProjection(active, progress.predecessor))
+      // Same Scene at its latest revision: pose updates may advance it at any time.
+      if (progress !== null && !sceneAtOrAfter(active, progress.expected)) {
+        if (progress.predecessor !== null && sceneAtOrAfter(active, progress.predecessor))
           return { status: 'waiting', message: 'Waiting for the accepted Scene removal publication.' };
         throw new Error('The logical Scene changed outside this Close. No further object removal was sent.');
       }
       if (progress !== null && progress.admissionGeneration !== null
         && snapshot.authoringAdmission.admissionGeneration <= progress.admissionGeneration)
         return { status: 'waiting', message: 'Waiting for current authoring admission after the Scene removal.' };
-      const next = progress ?? { ownerId: section.sourceOwnerId, ownerEpoch: section.sourceOwnerEpoch,
-        expected: active, predecessor: null, remaining: closeSceneRemovalOrder(content.objects), removed: 0, admissionGeneration: null };
-      if (progress === null && !sameSceneProjection(active, closed.publication.projection_revision as unknown as ProjectionRevision))
+      const next = progress !== null ? { ...progress, expected: active } : { ownerId: section.sourceOwnerId,
+        ownerEpoch: section.sourceOwnerEpoch, expected: active, predecessor: null,
+        remaining: closeSceneRemovalOrder(content.objects), removed: 0, admissionGeneration: null };
+      if (progress === null && !sceneAtOrAfter(active, closed.publication.projection_revision as unknown as ProjectionRevision))
         throw new Error('The logical Scene changed after the completed Close. No object removal was sent.');
       if (content.objects.length !== next.remaining.length
         || content.objects.some((object) => !next.remaining.includes(object.scene_resource_id)))
@@ -788,8 +784,10 @@ export function useProgramWorkspace(
   ): Promise<ScenarioCloseSceneProgress> => {
     const step = scenarioCloseSceneHandoff(predecessor, closed, confirmed, progress);
     const fence = scenarioFence();
-    if (step.status !== 'ready' || (!step.objectId && !step.policyResetRequired) || fence === null)
+    if (step.status !== 'ready' || step.progress === undefined || (!step.objectId && !step.policyResetRequired) || fence === null)
       throw new Error(step.message ?? 'Scene cleanup is not admitted.');
+    // The handoff rebased the expected projection onto the latest revision of the same Scene.
+    const latest = step.progress;
     const requestId = identity('composer-close-scene');
     const revision = step.policy?.revision;
     if (!step.objectId && (revision === null || typeof revision !== 'object' || Array.isArray(revision)
@@ -797,9 +795,9 @@ export function useProgramWorkspace(
       || typeof revision.content_hash !== 'string' || !revision.content_hash))
       throw new Error('The current collision policy revision is unavailable. Editors were kept.');
     const response = await api.scene.commit({
-      request_context: { request_id: requestId, request_owner_epoch: progress.ownerEpoch,
+      request_context: { request_id: requestId, request_owner_epoch: latest.ownerEpoch,
         source_label: 'composer_ui', correlation_id: requestId },
-      expected_projection_revision: progress.expected,
+      expected_projection_revision: latest.expected,
       expected_authoring_workspace: confirmed.authoring,
       expected_admission_generation: fence.expectedAdmissionGeneration,
       expected_draft_id: fence.draftId, expected_draft_revision: fence.expectedDraftRevision,
@@ -811,15 +809,13 @@ export function useProgramWorkspace(
       },
     });
     const committed = response.committed_projection_revision;
-    if (response.request_id !== requestId || response.request_owner_epoch !== progress.ownerEpoch
-      || committed.retained_bundle_id !== progress.expected.retained_bundle_id
-      || committed.graph_revision !== progress.expected.graph_revision
-      || committed.scene_revision.scene_id !== progress.expected.scene_revision.scene_id
-      || committed.scene_revision.revision_id !== progress.expected.scene_revision.revision_id + 1)
-      throw new Error('The Scene cleanup receipt is not the exact requested successor; its outcome is unresolved.');
-    return { ...progress, predecessor: progress.expected, expected: committed,
-      remaining: step.objectId ? progress.remaining.slice(1) : progress.remaining,
-      removed: progress.removed + (step.objectId ? 1 : 0),
+    if (response.request_id !== requestId || response.request_owner_epoch !== latest.ownerEpoch
+      || !sceneAtOrAfter(committed, latest.expected)
+      || committed.scene_revision.revision_id === latest.expected.scene_revision.revision_id)
+      throw new Error('The Scene cleanup receipt is not a successor of the requested Scene; its outcome is unresolved.');
+    return { ...latest, predecessor: latest.expected, expected: committed,
+      remaining: step.objectId ? latest.remaining.slice(1) : latest.remaining,
+      removed: latest.removed + (step.objectId ? 1 : 0),
       admissionGeneration: fence.expectedAdmissionGeneration, policyReset: !step.objectId };
   }, [scenarioCloseSceneHandoff, scenarioFence]);
 
@@ -841,7 +837,7 @@ export function useProgramWorkspace(
       retainedBundleId: closed.retainedBundleId, graphRevision: closed.graphRevision,
       publication: closed.publication, deploymentDraftId, expectedDeploymentDraftRevision,
       sceneOwnerId: progress.ownerId, sceneOwnerEpoch: progress.ownerEpoch,
-      sceneProjectionRevision: progress.expected,
+      sceneProjectionRevision: admission.progress?.expected ?? progress.expected,
     });
     return workspaceResult(next, 'Scenario closed. Program and Scene editors emptied; saved files are unchanged.');
   }), [run, scenarioCloseSceneHandoff, scenarioFence]);

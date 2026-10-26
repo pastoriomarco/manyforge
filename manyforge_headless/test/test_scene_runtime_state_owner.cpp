@@ -45,6 +45,40 @@ PoseSourceObservation Observation(const std::uint64_t sequence,
 }
 
 TEST(SceneRuntimeStateOwner,
+     DeploymentPolicyControlsAcceptanceWithoutChangingSourceKey) {
+  SceneRuntimeStateOwner owner([] { return 10; },
+                               [] { return "policy-token"; });
+  owner.EstablishOpenRuntime(RuntimeIdentity(1U), 1U, "bootstrap");
+  auto observed = Observation(1U, 10, 100);
+  observed.key.policy_id = "before_planning";
+  EXPECT_EQ(owner.ObservePose(observed, "continuous").disposition,
+            PoseObservationDisposition::kApplyNow);
+  ASSERT_EQ(owner.Snapshot().pose_sources.size(), 1U);
+  EXPECT_EQ(owner.Snapshot().pose_sources.front().observation.key.policy_id,
+            "before_planning");
+  observed.source_sequence = 2U;
+  EXPECT_EQ(owner.ObservePose(observed, "observe_only").disposition,
+            PoseObservationDisposition::kObservedOnly);
+  const auto token =
+      owner.BeginInitialization(RuntimeIdentity(2U), false, "next");
+  observed.source_sequence = 3U;
+  EXPECT_EQ(owner.ObservePose(observed, "continuous").disposition,
+            PoseObservationDisposition::kBuffered);
+  owner.PrepareReset(token, "reset");
+  owner.MarkSeeded(token);
+  const auto batch = owner.BeginReplay(token);
+  ASSERT_EQ(batch.observations.size(), 1U);
+  EXPECT_EQ(batch.observations.front(), observed);
+  owner.FailReplay(batch, "apply failed");
+  owner.PrepareReset(token, "retry");
+  owner.MarkSeeded(token);
+  const auto retry = owner.BeginReplay(token);
+  EXPECT_EQ(retry.observations, batch.observations);
+  owner.CompleteReplay(retry, 1U);
+  EXPECT_EQ(owner.Snapshot().state, SceneInitializationState::kOpen);
+}
+
+TEST(SceneRuntimeStateOwner,
      ConfiguredSourceLossClosesFreshnessWithoutErasingCoordinates) {
   std::int64_t now = 10;
   SceneRuntimeStateOwner owner([&] { return now; }, [] { return "token"; });

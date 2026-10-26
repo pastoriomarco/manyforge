@@ -6,7 +6,8 @@ import { scenarioCloseUncertainOutputRefusal, uncertainOutputs } from '../utils/
 import type { ComposerHeadlessState } from '../types/headless';
 import { api } from '../api/client';
 import { awaitActivationCompletion, browserRequestIdentity, cclcRequestOwnerEpoch, lifecycleRequestFromSnapshot, requestContext } from '../hooks/useCCLC';
-import type { JsonValue, ManagerActiveProjection, ProjectionRevision } from '../types/api';
+import type { CarriedObjectAttachment, JsonValue, ManagerActiveProjection, ProjectionRevision,
+  SceneTransactionResponse } from '../types/api';
 import type { ComponentProcessStopResult } from '../types/cclc';
 import type { ManagerApplyIdentity } from './managerApply';
 import { errorMessage } from './structuralResource';
@@ -98,6 +99,48 @@ export function freshClosePolicy(policy: Record<string, JsonValue>): boolean {
 const sameProjection = (left: ProjectionRevision, right: ProjectionRevision) =>
   sameJson(left as unknown as JsonValue, right as unknown as JsonValue);
 
+/** The same Scene (bundle, graph, scene id) at the same or a later revision.
+ * Runtime pose updates advance the revision at any time during Close. */
+export function sceneAtOrAfter(current: ProjectionRevision, base: ProjectionRevision): boolean {
+  return current.retained_bundle_id === base.retained_bundle_id && current.graph_revision === base.graph_revision
+    && current.scene_revision.scene_id === base.scene_revision.scene_id
+    && (current.scene_revision.revision_id > base.scene_revision.revision_id || sameProjection(current, base));
+}
+
+const attachmentIdentity = (row: CarriedObjectAttachment) => JSON.stringify([row.carried_object_attachment_id,
+  row.scene_resource_id, row.controllable_component_id, row.command_target_id]);
+function sameMembers(left: string[], right: string[]): boolean {
+  const [a, b] = [[...left].sort(), [...right].sort()];
+  return a.length === b.length && a.every((value, index) => value === b[index]);
+}
+
+/** Which Scene, objects, attachments and policy: not their poses or revisions. */
+function sameSceneStructure(left: JsonValue | undefined, right: JsonValue | undefined): boolean {
+  if (left === undefined || right === undefined || left === null || right === null) return left === right;
+  try {
+    const [a, b] = [parseLogicalSceneProjection(left), parseLogicalSceneProjection(right)];
+    const [pa, pb] = [a.access.active_projection, b.access.active_projection];
+    if (pa === null || pb === null || a.snapshot === null || b.snapshot === null)
+      return pa === pb && a.snapshot === b.snapshot;
+    return pa.retained_bundle_id === pb.retained_bundle_id && pa.graph_revision === pb.graph_revision
+      && pa.scene_revision.scene_id === pb.scene_revision.scene_id
+      && sameMembers(a.snapshot.objects.map((row) => row.scene_resource_id), b.snapshot.objects.map((row) => row.scene_resource_id))
+      && sameMembers(a.snapshot.carried_object_attachments.map(attachmentIdentity),
+        b.snapshot.carried_object_attachments.map(attachmentIdentity))
+      && sameJson(a.snapshot.configured_collision_policy as JsonValue, b.snapshot.configured_collision_policy as JsonValue);
+  } catch {
+    return false;
+  }
+}
+
+/** The owner refused before any effect only because a newer Scene revision is active. */
+function staleSceneRevision(error: unknown): boolean {
+  const payload = (error as { payload?: JsonValue } | null)?.payload;
+  return object(payload) && payload.ok === false && object(payload.error) && payload.error.code === 'stale_revision';
+}
+/** Bounded read-latest-and-retry of a detach refused only for a newer revision. */
+const DETACH_STALE_ATTEMPTS = 8;
+
 function currentCloseSnapshot(expected: ManagerActiveProjection, preparation: ClosePreparationInputs, signal: AbortSignal): ComposerHeadlessState {
   signal.throwIfAborted();
   const current = preparation.readSnapshot();
@@ -148,7 +191,8 @@ export async function prepareProgramCycleForClose(
       || cycle.terminalOrSettlementReference !== confirmedCycle.terminalOrSettlementReference
       || initial.runtime.sections.logicalScene?.sourceOwnerId !== confirmedScene.sourceOwnerId
       || initial.runtime.sections.logicalScene?.sourceOwnerEpoch !== confirmedScene.sourceOwnerEpoch
-      || !sameJson(initial.runtime.sections.logicalScene?.payload as JsonValue, confirmedScene.payload as JsonValue))
+      || !sameSceneStructure(initial.runtime.sections.logicalScene?.payload as JsonValue | undefined,
+        confirmedScene.payload as JsonValue | undefined))
       throw new Error('The confirmed Program cycle or logical Scene changed.');
     const run = cycle.run;
     const controls = cycle.runtimeControls;
@@ -213,9 +257,12 @@ interface PreparedClose {
   detached: string[];
   idleCycle?: ProgramResetExpectation;
   sceneProjection?: ProjectionRevision;
+  /** The cell-fixed objects Close leaves in place; their poses may still update. */
+  sceneObjects?: string[];
 }
 
-/** Existing Reset and runtime detach only; no retries or invented poses. */
+/** Existing Reset and runtime detach only; no invented poses. Only a detach refused
+ * for a newer Scene revision is read again and resent, bounded. */
 export async function prepareSceneForClose(input: CloseInputs): Promise<PreparedClose> {
   const { expected, signal, waitForObservation, progress, preparation } = input;
   const detached: string[] = [];
@@ -245,52 +292,66 @@ export async function prepareSceneForClose(input: CloseInputs): Promise<Prepared
     const owner = { id: view.section.sourceOwnerId, epoch: view.section.sourceOwnerEpoch };
     const attachments = [...view.content.carried_object_attachments];
     let expectedScene = view.projection;
-    for (const attachment of attachments) {
-      view = scene();
-      if (view.section.sourceOwnerId !== owner.id || view.section.sourceOwnerEpoch !== owner.epoch
-        || !sameProjection(view.projection, expectedScene))
-        throw new Error('The logical Scene changed outside this Close.');
-      if (!view.access.scene_writes_open || !view.access.projection_leases_open)
-        throw new Error('The logical Scene owner currently fences detachment.');
-      attempted = attachment.scene_resource_id;
-      progress(`Detaching ${attempted} at its current pose…`);
-      const requestId = identity();
-      const response = await api.scene.commit({
-        request_context: { request_id: requestId, request_owner_epoch: owner.epoch!,
-          source_label: 'composer_ui', correlation_id: requestId },
-        expected_projection_revision: expectedScene,
-        expected_authoring_workspace: preparation.confirmed.authoring,
-        operation: { kind: 'detach_carried_object_at_current_pose',
-          carried_object_attachment_id: attachment.carried_object_attachment_id,
-          expected_carried_object_attachment_revision: attachment.carried_object_attachment_revision,
-          expected_scene_resource_id: attachment.scene_resource_id,
-          expected_controllable_component_id: attachment.controllable_component_id,
-          expected_command_target_id: attachment.command_target_id },
-      }, signal);
-      const committed = response.committed_projection_revision;
-      if (response.request_id !== requestId || response.request_owner_epoch !== owner.epoch
-        || committed.retained_bundle_id !== expectedScene.retained_bundle_id
-        || committed.graph_revision !== expectedScene.graph_revision
-        || committed.scene_revision.scene_id !== expectedScene.scene_revision.scene_id
-        || committed.scene_revision.revision_id !== expectedScene.scene_revision.revision_id + 1)
-        throw new Error('The detach receipt is not the exact requested Scene successor.');
-      detached.push(attempted); attempted = null;
+    for (const confirmed of attachments) {
+      let committed: ProjectionRevision | null = null;
+      for (let attempt = 1; committed === null; attempt += 1) {
+        view = scene();
+        if (view.section.sourceOwnerId !== owner.id || view.section.sourceOwnerEpoch !== owner.epoch
+          || !sceneAtOrAfter(view.projection, expectedScene))
+          throw new Error('The logical Scene changed outside this Close.');
+        if (!view.access.scene_writes_open || !view.access.projection_leases_open)
+          throw new Error('The logical Scene owner currently fences detachment.');
+        // Pose updates advance the attachment revision; the ids are its identity.
+        const attachment = view.content.carried_object_attachments.find((row) =>
+          attachmentIdentity(row) === attachmentIdentity(confirmed));
+        if (attachment === undefined) throw new Error('The logical Scene changed outside this Close.');
+        expectedScene = view.projection;
+        attempted = confirmed.scene_resource_id;
+        progress(`Detaching ${attempted} at its current pose…`);
+        const requestId = identity();
+        let response: SceneTransactionResponse;
+        try {
+          response = await api.scene.commit({
+            request_context: { request_id: requestId, request_owner_epoch: owner.epoch!,
+              source_label: 'composer_ui', correlation_id: requestId },
+            expected_projection_revision: expectedScene,
+            expected_authoring_workspace: preparation.confirmed.authoring,
+            operation: { kind: 'detach_carried_object_at_current_pose',
+              carried_object_attachment_id: attachment.carried_object_attachment_id,
+              expected_carried_object_attachment_revision: attachment.carried_object_attachment_revision,
+              expected_scene_resource_id: attachment.scene_resource_id,
+              expected_controllable_component_id: attachment.controllable_component_id,
+              expected_command_target_id: attachment.command_target_id },
+          }, signal);
+        } catch (error) {
+          // A pose update landed between the read and the detach: read the latest Scene again.
+          if (attempt < DETACH_STALE_ATTEMPTS && staleSceneRevision(error)) continue;
+          throw error;
+        }
+        const receipt = response.committed_projection_revision;
+        if (response.request_id !== requestId || response.request_owner_epoch !== owner.epoch
+          || !sceneAtOrAfter(receipt, expectedScene) || sameProjection(receipt, expectedScene))
+          throw new Error('The detach receipt is not a successor of the requested Scene.');
+        committed = receipt;
+      }
+      detached.push(confirmed.scene_resource_id); attempted = null;
       for (;;) {
         view = scene();
         if (view.section.sourceOwnerId !== owner.id || view.section.sourceOwnerEpoch !== owner.epoch)
           throw new Error('The logical Scene owner changed after detach.');
-        if (sameProjection(view.projection, committed)) break;
-        if (!sameProjection(view.projection, expectedScene)) throw new Error('The logical Scene changed outside this Close.');
+        if (sceneAtOrAfter(view.projection, committed)) break;
+        if (!sceneAtOrAfter(view.projection, expectedScene)) throw new Error('The logical Scene changed outside this Close.');
         await waitForObservation();
       }
       expectedScene = committed;
     }
     view = scene();
     if (view.section.sourceOwnerId !== owner.id || view.section.sourceOwnerEpoch !== owner.epoch
-      || !sameProjection(view.projection, expectedScene) || view.content.carried_object_attachments.length > 0
+      || !sceneAtOrAfter(view.projection, expectedScene) || view.content.carried_object_attachments.length > 0
       || view.content.objects.some((object) => object.placement.kind !== 'cell_fixed'))
       throw new Error('The logical Scene still has carried objects or changed outside this Close.');
-    return { resetDone, detached, idleCycle, sceneProjection: expectedScene };
+    return { resetDone, detached, idleCycle, sceneProjection: expectedScene,
+      sceneObjects: view.content.objects.map((object) => object.scene_resource_id) };
   } catch (error) {
     throw new Error(`${errorMessage(error, 'Close preparation is unresolved.')} ${resetDone
       ? 'Reset done; Close not completed.' : 'Close not completed.'} Detached objects confirmed: ${detached.join(', ') || 'none'}.${attempted
@@ -323,8 +384,12 @@ export async function closeScenario({ expected, signal, admissionGeneration,
     const section = latest.runtime.sections.logicalScene;
     if (!section?.available || section.freshness !== 'fresh' || section.knownGaps.length > 0 || section.payload === null)
       throw new Error('The current logical Scene projection is unavailable before Close.');
-    const projection = parseLogicalSceneProjection(section.payload).access.active_projection;
-    if (projection === null || preparedClose.sceneProjection === undefined || !sameProjection(projection, preparedClose.sceneProjection))
+    const parsed = parseLogicalSceneProjection(section.payload);
+    const projection = parsed.access.active_projection;
+    if (projection === null || parsed.snapshot === null || preparedClose.sceneProjection === undefined
+      || !sceneAtOrAfter(projection, preparedClose.sceneProjection)
+      || parsed.snapshot.carried_object_attachments.length > 0
+      || !sameMembers(parsed.snapshot.objects.map((object) => object.scene_resource_id), preparedClose.sceneObjects ?? []))
       throw new Error('The logical Scene changed before Close completed. No further lifecycle effect was sent.');
   };
   try {

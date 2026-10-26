@@ -96,7 +96,8 @@ bool IsPending(const SceneInitializationState state) noexcept {
 }
 
 bool IsImmediatePosePolicy(const std::string_view policy_id) noexcept {
-  return policy_id == "continuous" || policy_id == "continuous_unattached";
+  return policy_id == "continuous" || policy_id == "continuous_unattached" ||
+         policy_id == "continuous_relative_to_attached";
 }
 
 CanonicalValue Number(const std::uint64_t value, const std::string_view label,
@@ -549,8 +550,8 @@ SceneRuntimeStateOwner::BeginReplay(const std::string_view token) {
     if (!record.buffered) {
       continue;
     }
-    if (IsImmediatePosePolicy(record.observation.key.policy_id) &&
-        record.observation.payload_quality == PoseSourceQuality::kGood &&
+    // Buffering already selected the effective continuous policy.
+    if (record.observation.payload_quality == PoseSourceQuality::kGood &&
         record.observation.eligible &&
         record.observation.expires_at_ns >= now) {
       observations.push_back(record.observation);
@@ -684,7 +685,8 @@ void SceneRuntimeStateOwner::Retire(const std::string_view token,
 }
 
 PoseObservationAcceptance
-SceneRuntimeStateOwner::ObservePose(PoseSourceObservation observation) {
+SceneRuntimeStateOwner::ObservePose(PoseSourceObservation observation,
+                                    const std::string_view apply_policy) {
   ValidateObservation(observation);
   const auto observation_key = observation.key;
   const auto now = Now();
@@ -728,8 +730,11 @@ SceneRuntimeStateOwner::ObservePose(PoseSourceObservation observation) {
 
   const bool fresh = observation.payload_quality == PoseSourceQuality::kGood &&
                      observation.expires_at_ns >= now;
-  const bool can_apply = fresh && observation.eligible &&
-                         IsImmediatePosePolicy(observation.key.policy_id);
+  const bool can_apply =
+      fresh && observation.eligible &&
+      IsImmediatePosePolicy(apply_policy.empty()
+                                ? std::string_view(observation.key.policy_id)
+                                : apply_policy);
   const bool was_buffered =
       found != pose_records_.end() && found->second.buffered;
   PoseObservationDisposition disposition =

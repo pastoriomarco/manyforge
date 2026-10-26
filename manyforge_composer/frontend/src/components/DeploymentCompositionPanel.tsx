@@ -1,3 +1,4 @@
+import { parseSceneRuntimeProjection } from '../api/parsers';
 import type { CCLCController } from '../hooks/useCCLC';
 import { useCallback, useEffect, useMemo, useState } from 'react';
 
@@ -166,6 +167,13 @@ export function DeploymentCompositionPanel({
     return () => controller.abort();
   }, [enabled, reloadToken]);
 
+  const poseSources = useMemo(() => {
+    const payload = snapshot?.runtime.sections.sceneRuntime.payload;
+    if (payload === null || payload === undefined) return [];
+    try { return parseSceneRuntimeProjection(payload).state.pose_sources; }
+    catch { return []; }
+  }, [snapshot?.runtime.sections.sceneRuntime.payload]);
+
   const componentIds = useMemo(
     () => readModel === null ? [] : controllableComponentIds(readModel.graph),
     [readModel],
@@ -256,6 +264,7 @@ export function DeploymentCompositionPanel({
             gripperDescriptors={gripperDescriptors}
             programKeys={programKeys}
             executionGroupIds={executionGroupIds}
+            poseSources={poseSources}
           />
           <details className="dcard">
             <summary>Advanced compiled Deployment artifact</summary>

@@ -1892,7 +1892,13 @@ TEST(RetainedNativeRuntimeUnitAdapter,
   ASSERT_TRUE(observation_ok->is_bool());
   EXPECT_TRUE(observation_ok->as_bool());
   EXPECT_EQ(TextMember(*observation, "schema_version"),
-            "manyforge.execution_observation.v3");
+            "manyforge.execution_observation.v4");
+  // A native commanded owner without a measured source adds no comparison row.
+  const auto *measured_targets =
+      observation->find_object_member("measured_targets");
+  ASSERT_NE(measured_targets, nullptr);
+  ASSERT_TRUE(measured_targets->is_array());
+  EXPECT_TRUE(measured_targets->as_array().empty());
   const auto *observation_targets =
       observation->find_object_member("targets");
   ASSERT_NE(observation_targets, nullptr);

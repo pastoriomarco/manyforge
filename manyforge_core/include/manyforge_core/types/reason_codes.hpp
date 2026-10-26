@@ -27,16 +27,8 @@ inline constexpr char kObservedSceneSourceStale[] =
     "observed_scene_source_stale";
 inline constexpr char kProjectionStructureChangedAfterValidation[] =
     "projection_structure_changed_after_validation";
-inline constexpr char kSceneTopologyChangedAfterValidation[] =
-    "scene_topology_changed_after_validation";
-inline constexpr char kCollisionPolicyChangedAfterValidation[] =
-    "collision_policy_changed_after_validation";
-inline constexpr char kTargetMovedAfterValidation[] =
-    "target_moved_after_validation";
-inline constexpr char kObstacleMovedAfterValidation[] =
-    "obstacle_moved_after_validation";
-inline constexpr char kRuntimeDynamicSceneNotQualified[] =
-    "runtime_dynamic_scene_not_qualified";
+inline constexpr char kSceneSnapshotStructureInvalid[] =
+    "scene_snapshot_structure_invalid";
 
 inline constexpr char kRuntimeContactGraspMonitor[] =
     "runtime_contact_grasp_monitor";

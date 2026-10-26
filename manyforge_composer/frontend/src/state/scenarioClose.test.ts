@@ -10,7 +10,7 @@ const apiMock = vi.hoisted(() => ({ manager: { status: vi.fn(), canonicalEmptySe
     componentProcessStopOffer: vi.fn(), stopComponentProcess: vi.fn(), componentProcessStopResult: vi.fn() },
   scene: { commit: vi.fn() } }));
 vi.mock('../api/client', () => ({ api: apiMock }));
-import { closeScenario, prepareSceneForClose, resetCloseSnapshot, type ClosePreparationInputs } from './scenarioClose';
+import { closeScenario, prepareSceneForClose, resetCloseSnapshot, sceneAtOrAfter, type ClosePreparationInputs } from './scenarioClose';
 import { parseComponentProcessStopOffer } from '../api/processStopParsers';
 import { errorMessage } from './structuralResource';
 
@@ -574,6 +574,66 @@ it('idle manual detaches are sequential exact Scene successors without an author
     expect(transaction.operation).not.toHaveProperty('pose_in_cell');
   }
   expect(apiMock.scene.commit.mock.invocationCallOrder[1]).toBeLessThan(apiMock.cclc.retireTargets.mock.invocationCallOrder[0]);
+});
+
+const staleRevision = () => Object.assign(new Error('expected composite projection revision is no longer active'),
+  { payload: { ok: false, error: { code: 'stale_revision' }, projection_status: 'not_attempted' } });
+
+it('compares Scene lineage and accepts a same-or-later revision only', () => {
+  const base = { retained_bundle_id: 'bundle', graph_revision: 'graph', scene_revision: { scene_id: 'scene', revision_id: 4, content_hash: 'h4' } };
+  const at = (patch: Partial<typeof base.scene_revision>, other: Partial<typeof base> = {}) =>
+    ({ ...base, ...other, scene_revision: { ...base.scene_revision, ...patch } });
+  expect(sceneAtOrAfter(at({}), base)).toBe(true);
+  expect(sceneAtOrAfter(at({ revision_id: 9, content_hash: 'h9' }), base)).toBe(true);
+  expect(sceneAtOrAfter(at({ revision_id: 3, content_hash: 'h3' }), base)).toBe(false);
+  expect(sceneAtOrAfter(at({ content_hash: 'forked' }), base)).toBe(false);
+  expect(sceneAtOrAfter(at({ scene_id: 'other', revision_id: 9 }), base)).toBe(false);
+  expect(sceneAtOrAfter(at({ revision_id: 9 }, { retained_bundle_id: 'other' }), base)).toBe(false);
+  expect(sceneAtOrAfter(at({ revision_id: 9 }, { graph_revision: 'other' }), base)).toBe(false);
+});
+
+it('pose-only Scene revisions during Close detach at the latest revision and keep every later step', async () => {
+  const test = standaloneFixture('idle_after_reset', ['held.1']);
+  // A pose update after confirmation: new Scene and attachment revisions, same objects.
+  test.publishScene(3, ['held.1']);
+  const moved = test.current.runtime.sections.logicalScene!.payload as unknown as LogicalSceneProjection;
+  moved.snapshot!.carried_object_attachments[0].carried_object_attachment_revision = 'sha256:' + 'b'.repeat(64);
+  // Another one lands between the read and the detach: refused, read again, retried once.
+  apiMock.scene.commit.mockImplementationOnce(async () => { test.publishScene(4, ['held.1']); throw staleRevision(); });
+  test.request.waitForObservation.mockImplementationOnce(async () => { test.publishScene(7, []); });
+  apiMock.cclc.targetRetirementOffer.mockImplementationOnce(async () => {
+    test.publishScene(8, []);
+    return { scope, targets: [] };
+  });
+  expect(await closeScenario(test.request)).toEqual(empty);
+  expect(apiMock.scene.commit).toHaveBeenCalledTimes(2);
+  const [[first], [second]] = apiMock.scene.commit.mock.calls;
+  expect(first.expected_projection_revision.scene_revision).toEqual({ scene_id: 'scene', revision_id: 3, content_hash: 'hash.3' });
+  expect(first.operation).toMatchObject({ carried_object_attachment_id: 'attachment.held.1',
+    expected_carried_object_attachment_revision: 'sha256:' + 'b'.repeat(64) });
+  expect(second.expected_projection_revision.scene_revision).toEqual({ scene_id: 'scene', revision_id: 4, content_hash: 'hash.4' });
+  expect(second.operation).toMatchObject({ expected_carried_object_attachment_revision: 'sha256:' + 'a'.repeat(64) });
+  expect(apiMock.cclc.retireTargets).toHaveBeenCalledTimes(1);
+  expect(apiMock.manager.applyCandidate).toHaveBeenCalledTimes(1);
+});
+
+it('a changed attachment set since confirmation still refuses Close before any effect', async () => {
+  const test = standaloneFixture('idle_after_reset', ['held.1']);
+  test.publishScene(2, []);
+  await expect(closeScenario(test.request)).rejects.toThrow('The confirmed Program cycle or logical Scene changed.');
+  expect(apiMock.scene.commit).not.toHaveBeenCalled();
+  expect(apiMock.cclc.retireTargets).not.toHaveBeenCalled();
+});
+
+it('bounds the read-latest retry of a detach refused only for a newer revision', async () => {
+  const test = standaloneFixture('idle_after_reset', ['held.1']);
+  let revision = 1;
+  apiMock.scene.commit.mockImplementation(async () => { revision += 1; test.publishScene(revision, ['held.1']); throw staleRevision(); });
+  await expect(closeScenario(test.request)).rejects.toThrow('Detach of held.1 was refused or is unconfirmed');
+  expect(apiMock.scene.commit).toHaveBeenCalledTimes(8);
+  expect(apiMock.scene.commit.mock.calls.map(([request]) => request.expected_projection_revision.scene_revision.revision_id))
+    .toEqual([1, 2, 3, 4, 5, 6, 7, 8]);
+  expect(apiMock.cclc.retireTargets).not.toHaveBeenCalled();
 });
 
 it.each(['refused', 'unconfirmed'] as const)('Reset %s stops without any Close continuation or resend', async (status) => {

@@ -2407,6 +2407,7 @@ struct StopParticipantWork final {
   /// Contract77: an interrupt-selected response follows its qualified suffix
   /// sequentially. Ordinary/operator and collision strongest jumps stay intact.
   bool selected_interrupt_suffix{};
+  bool participant_failure_preserved{};
 
   /// No subordinate terminal handoff exists for a never-dispatched participant
   /// that either never received an execution identity or whose preparation

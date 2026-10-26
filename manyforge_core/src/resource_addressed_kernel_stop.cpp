@@ -4183,6 +4183,7 @@ void ResourceAddressedExecutionKernel::ProgressStop(const StopControlWorkToken t
             runtime_collision_containment &&
             active_participant->runtime_collision_error.has_value();
         participant_state->state =
+            item.participant_failure_preserved ? OperationStateKind::kFailed :
             participant_settled && !runtime_collision_participant
                 ? (io_source_failed ? OperationStateKind::kFailed : OperationStateKind::kStopped)
                 : OperationStateKind::kInterventionRequired;
@@ -4286,7 +4287,8 @@ void ResourceAddressedExecutionKernel::ProgressStop(const StopControlWorkToken t
               participant_state->terminal_fact = ParticipantExecutionFact{
                   ParticipantExecutionFactKind::kLocalFailure,
                   ParticipantEffectKnowledge::kNoEffect, participant_state->terminal_error};
-          } else if (participant_settled && !runtime_collision_participant) {
+          } else if (participant_settled && !runtime_collision_participant &&
+                     !item.participant_failure_preserved) {
             // These are the same containment/local-settlement proofs used
             // above, not an inference from the public Stopped state. A
             // deferred pre-dispatch cleanup still retains its existing borrow.
@@ -4495,6 +4497,15 @@ void ResourceAddressedExecutionKernel::ProgressStop(const StopControlWorkToken t
         const auto& request = handoff.request;
         const auto& stage = request.containment.request;
         const auto& recovery = value.recovery_assessment;
+        const bool failed_contained = value.terminal_fact &&
+            is_settled_execution_failure(*value.terminal_fact) &&
+            request.payload_kind == OperationParticipantPayloadKind::kMotion &&
+            recovery.execution_state == ExecutionState::kFailed &&
+            !recovery.retry_admissible;
+        const bool ordinary_stopped = !value.terminal_fact &&
+            recovery.execution_state == ExecutionState::kStopped &&
+            recovery.recovery_class == RecoveryClass::kOrdinaryOperatorStop &&
+            recovery.status == RecoveryAssessmentStatus::kRetryReady && recovery.retry_admissible;
         const bool exact = value.execution_id == request.execution_id &&
                            value.aggregate_stop_certificate == request.aggregate_stop_certificate &&
                            value.operation_id == stage.operation_id &&
@@ -4502,10 +4513,7 @@ void ResourceAddressedExecutionKernel::ProgressStop(const StopControlWorkToken t
                            value.controller_goal_id == stage.controller_goal_id &&
                            value.controller_goal_generation == stage.controller_goal_generation &&
                            recovery.execution_id == request.execution_id &&
-                           recovery.execution_state == ExecutionState::kStopped &&
-                           recovery.recovery_class == RecoveryClass::kOrdinaryOperatorStop &&
-                           recovery.status == RecoveryAssessmentStatus::kRetryReady &&
-                           recovery.retry_admissible && recovery.backend_stop_confirmed &&
+                           (ordinary_stopped || failed_contained) && recovery.backend_stop_confirmed &&
                            recovery.stop_owner_generation != 0U &&
                            recovery.stop_certificate_id ==
                                request.aggregate_stop_certificate.stop_certificate_id.value() &&
@@ -4540,6 +4548,28 @@ void ResourceAddressedExecutionKernel::ProgressStop(const StopControlWorkToken t
         continue;
       }
       item->participant_settlement_complete = true;
+      if (settled.ok() && settled.value().terminal_fact) {
+        auto* operation = find_active_operation_locked(handoff.operation_id);
+        auto state = operation == nullptr ? nullptr : [&]() -> OperationParticipantStateDTO* {
+          const auto row = std::find_if(operation->state.participants.begin(),
+                                       operation->state.participants.end(), [&](const auto& candidate) {
+            return candidate.participant_id == handoff.participant_id;
+          });
+          return row == operation->state.participants.end() ? nullptr : &*row;
+        }();
+        const auto& fact = *settled.value().terminal_fact;
+        if (state == nullptr || (state->terminal_fact && *state->terminal_fact != fact) ||
+            (state->terminal_error && state->terminal_error != fact.error)) {
+          settled = Result<AddressedParticipantStopSettlementDTO>::Err(
+              error(std::string(to_string(ErrorCode::kInvariantViolation)),
+                    "participant returned a different contained failure",
+                    "participant_stop_settlement_mismatch"));
+        } else {
+          state->terminal_fact = fact;
+          state->terminal_error = fact.error;
+          item->participant_failure_preserved = true;
+        }
+      }
       if (!settled.ok()) {
         item->participant_settlement_error = settled.error();
         motion_admission_closed_ = true;

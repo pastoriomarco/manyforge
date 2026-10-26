@@ -247,6 +247,13 @@ if(BUILD_TESTING)
   gtest_discover_tests(test_scene_runtime_state_owner
     PROPERTIES TIMEOUT ${MANYFORGE_HEADLESS_GTEST_TIMEOUT_SECONDS})
 
+  add_executable(test_scene_admission_reconciliation
+    test/test_scene_admission_reconciliation.cpp)
+  target_link_libraries(test_scene_admission_reconciliation PRIVATE
+    manyforge_headless GTest::gtest_main)
+  gtest_discover_tests(test_scene_admission_reconciliation
+    PROPERTIES TIMEOUT ${MANYFORGE_HEADLESS_GTEST_TIMEOUT_SECONDS})
+
   add_executable(test_scene_runtime_pose_projector
     test/test_scene_runtime_pose_projector.cpp)
   target_link_libraries(test_scene_runtime_pose_projector PRIVATE

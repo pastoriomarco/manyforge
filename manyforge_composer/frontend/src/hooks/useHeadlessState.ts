@@ -42,7 +42,7 @@ const RECONNECT_DELAY_MS = 1000;
 // execution-control settlement.
 export const HEADLESS_SHELL_PUBLICATION_MS = 50;
 
-const EXECUTION_OBSERVATION_SCHEMA = 'manyforge.execution_observation_frame.v3';
+const EXECUTION_OBSERVATION_SCHEMA = 'manyforge.execution_observation_frame.v4';
 const EXECUTION_OBSERVATION_CREDIT_SCHEMA = 'manyforge.execution_observation_credit.v1';
 const EXECUTION_OBSERVATION_RENEWAL_MS = 15_000;
 const observationTextEncoder = new TextEncoder();
@@ -51,6 +51,24 @@ function isObservationText(value: unknown): value is string {
   // need no per-coordinate buffer allocation to enforce the wire byte limit.
   return typeof value === 'string' && value.length > 0 && value.length <= 2048
     && (value.length <= 682 || observationTextEncoder.encode(value).length <= 2048);
+}
+
+function sameExecutionObservationTargets(
+  current: readonly ExecutionObservationTarget[],
+  candidate: readonly ExecutionObservationTarget[],
+): boolean {
+  return current.length === candidate.length
+    && current.every((target, index) => {
+      const next = candidate[index];
+      return target.controllableComponentId === next.controllableComponentId
+        && target.commandTargetId === next.commandTargetId
+        && target.sourceEpoch === next.sourceEpoch
+        && sameStrings(target.sourceJointNames, next.sourceJointNames)
+        && sameStrings(target.compiledJointNames, next.compiledJointNames)
+        && sameStrings(target.coordinateKinds, next.coordinateKinds)
+        && target.positionsSi.length === next.positionsSi.length
+        && target.positionsSi.every((value, joint) => value === next.positionsSi[joint]);
+    });
 }
 
 function sameExecutionObservationFrame(
@@ -63,18 +81,8 @@ function sameExecutionObservationFrame(
     && current.cellId === candidate.cellId
     && current.retainedBundleId === candidate.retainedBundleId
     && current.graphRevision === candidate.graphRevision
-    && current.targets.length === candidate.targets.length
-    && current.targets.every((target, index) => {
-      const next = candidate.targets[index];
-      return target.controllableComponentId === next.controllableComponentId
-        && target.commandTargetId === next.commandTargetId
-        && target.sourceEpoch === next.sourceEpoch
-        && sameStrings(target.sourceJointNames, next.sourceJointNames)
-        && sameStrings(target.compiledJointNames, next.compiledJointNames)
-        && sameStrings(target.coordinateKinds, next.coordinateKinds)
-        && target.positionsSi.length === next.positionsSi.length
-        && target.positionsSi.every((value, joint) => value === next.positionsSi[joint]);
-    });
+    && sameExecutionObservationTargets(current.targets, candidate.targets)
+    && sameExecutionObservationTargets(current.measuredTargets, candidate.measuredTargets);
 }
 
 export function parseExecutionObservationFrame(raw: unknown): ExecutionObservationFrame {
@@ -89,6 +97,7 @@ export function parseExecutionObservationFrame(raw: unknown): ExecutionObservati
   const record = object(raw, [
     'cell_id',
     'graph_revision',
+    'measured_targets',
     'owner_epoch',
     'received_at_monotonic_us',
     'retained_bundle_id',
@@ -123,11 +132,7 @@ export function parseExecutionObservationFrame(raw: unknown): ExecutionObservati
   if (record.schema_version !== EXECUTION_OBSERVATION_SCHEMA) {
     throw new Error('Execution observation schema is unsupported.');
   }
-  // H1a-IF.2: a cell may have no observable coordinate at all.
-  if (!Array.isArray(record.targets) || record.targets.length > 64) {
-    throw new Error('Execution observation target count is invalid.');
-  }
-  const targets: ExecutionObservationTarget[] = record.targets.map((rawTarget) => {
+  const parseTarget = (rawTarget: unknown): ExecutionObservationTarget => {
     const target = object(rawTarget, ['controllable_component_id', 'command_target_id',
       'operation_capability_id', 'source_epoch', 'source_sequence', 'source_joint_names',
       'compiled_joint_names', 'coordinate_kinds', 'positions_si']);
@@ -152,12 +157,23 @@ export function parseExecutionObservationFrame(raw: unknown): ExecutionObservati
       coordinateKinds: [...kinds] as Array<'angular' | 'linear'>,
       positionsSi: [...positions] as number[],
     });
-  });
-  const addresses = targets.map((target) => JSON.stringify([target.controllableComponentId, target.commandTargetId]));
-  const compiled = targets.flatMap((target) => target.compiledJointNames);
-  if (new Set(addresses).size !== addresses.length || new Set(compiled).size !== compiled.length || compiled.length > 1024) {
-    throw new Error('Execution observation targets overlap or exceed the coordinate bound.');
-  }
+  };
+  const parseTargets = (key: 'targets' | 'measured_targets'): ExecutionObservationTarget[] => {
+    // H1a-IF.2: a cell may have no observable coordinate at all.
+    const raw = record[key];
+    if (!Array.isArray(raw) || raw.length > 64) {
+      throw new Error('Execution observation target count is invalid.');
+    }
+    const targets = raw.map(parseTarget);
+    const addresses = targets.map((target) => JSON.stringify([target.controllableComponentId, target.commandTargetId]));
+    const compiled = targets.flatMap((target) => target.compiledJointNames);
+    if (new Set(addresses).size !== addresses.length || new Set(compiled).size !== compiled.length || compiled.length > 1024) {
+      throw new Error('Execution observation targets overlap or exceed the coordinate bound.');
+    }
+    return targets;
+  };
+  const targets = parseTargets('targets');
+  const measuredTargets = parseTargets('measured_targets');
   return Object.freeze({
     schemaVersion: EXECUTION_OBSERVATION_SCHEMA,
     ownerEpoch: text('owner_epoch'),
@@ -168,6 +184,7 @@ export function parseExecutionObservationFrame(raw: unknown): ExecutionObservati
     sourceSequence: integer('source_sequence'),
     receivedAtMonotonicUs: integer('received_at_monotonic_us'),
     targets,
+    measuredTargets,
   });
 }
 

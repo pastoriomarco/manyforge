@@ -527,6 +527,20 @@ KernelRecoveryAssessmentDTO build_recovery_assessment(const RecoveryAuthorityCap
   assessment.stronger_authority_active = capture.stronger_authority_active;
   assessment.queued_latch_present = capture.queued_latch_present;
 
+  // Containment evidence and the execution's failure are independent facts.
+  const auto& addressed = capture.addressed_motion_stop_evidence;
+  const bool addressed_contained = addressed && addressed->backend_stop_confirmed &&
+      addressed->execution_id == capture.execution_id &&
+      addressed->stop_owner_generation == capture.operator_stop_owner_generation &&
+      addressed->aggregate_stop_certificate.locally_valid();
+  if (addressed_contained) {
+    assessment.backend_stop_confirmed = true;
+    assessment.stop_owner_generation = addressed->stop_owner_generation;
+    assessment.stop_certificate_id = addressed->aggregate_stop_certificate.stop_certificate_id.value();
+    assessment.stop_certificate_revision =
+        addressed->aggregate_stop_certificate.stop_certificate_revision.value();
+  }
+
   const bool any_stop_owner_active =
       capture.fault_preempt_stop_active || capture.fault_preempt_worker_active ||
       capture.operator_stop_active || capture.motion_trip_stop_active;
@@ -770,6 +784,12 @@ KernelRecoveryAssessmentDTO build_recovery_assessment(const RecoveryAuthorityCap
       capture.terminal_effect != ParticipantEffectKnowledge::kEffectUncertain &&
       !any_stop_owner_active && !capture.stronger_authority_active &&
       !capture.queued_latch_present && !capture.active_latch;
+  if (capture.execution_state == ExecutionState::kFailed && addressed_contained &&
+      !assessment.retry_admissible && assessment.eligible_close) {
+    assessment.status = RecoveryAssessmentStatus::kActionRequired;
+    assessment.reason_code = "contained_failure_acknowledgement_required";
+    assessment.allowed_actions.push_back(RecoveryAction::kCloseOperation);
+  }
   finish_assessment(assessment, previous_revision);
   return assessment;
 }

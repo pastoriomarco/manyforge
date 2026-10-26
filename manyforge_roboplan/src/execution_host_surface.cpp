@@ -2221,11 +2221,14 @@ CanonicalValue ExecutionCommandSurface::IoWatchResponse(
       std::shared_ptr<RetainedObservedStateChannel> channel;
       core::ControllableComponentId controllable_component_id;
       bool pneumatic_display{};
+      // Render-only measured coordinates beside a commanded motion authority.
+      std::optional<core::RequiredRobotMeasuredStateSource> measured{};
     };
     std::vector<ObservationSource> sources;
     sources.reserve(2U * (1U + composition.participant_compositions.size()));
     std::vector<ObservationRow> rows;
     rows.reserve(2U * (1U + composition.participant_compositions.size()));
+    std::vector<ObservationRow> measured_rows;
     const auto append_target = [&](
         const std::shared_ptr<IRetainedObservedStateChannel> &selected_channel,
         const core::ControllableComponentId &owner_component_id,
@@ -2236,6 +2239,64 @@ CanonicalValue ExecutionCommandSurface::IoWatchResponse(
               selected_channel),
           owner_component_id, pneumatic_display});
     };
+    // A measured row is presentation only: a stale, incomplete or mismatched
+    // sample omits the row and never fails the commanded observation.
+    const auto project_measured =
+        [&](const core::RequiredRobotMeasuredStateSource &measured,
+            const core::RuntimeParticipantBinding &binding,
+            const std::int64_t now) {
+          const auto observed = measured.reader->current_state(
+              measured.descriptor.publication.query_context, now);
+          if (!observed.ok()) return;
+          const auto &state = observed.value();
+          const auto &resources = binding.value().resources;
+          if (!state.complete || state.resources.size() != resources.size() ||
+              state.joint_names.size() != resources.size() ||
+              state.positions.size() != resources.size())
+            return;
+          CanonicalValue::Array source_names, compiled_names, kinds, positions;
+          for (std::size_t index = 0U; index < resources.size(); ++index) {
+            const auto &resource = resources[index];
+            const auto *angular =
+                std::get_if<core::AngularPositionDTO>(&state.positions[index]);
+            const auto *linear =
+                std::get_if<core::LinearPositionDTO>(&state.positions[index]);
+            if (!resource.source_joint_name.has_value() ||
+                state.resources[index] != resource.resource_id ||
+                state.joint_names[index] != resource.compiled_resource_name ||
+                !((angular && resource.coordinate_kind ==
+                                  core::CoordinateKind::kAngular) ||
+                  (linear && resource.coordinate_kind ==
+                                 core::CoordinateKind::kLinear)))
+              return;
+            const double value = angular ? angular->value_rad : linear->value_m;
+            if (!std::isfinite(value)) return;
+            source_names.emplace_back(*resource.source_joint_name);
+            compiled_names.emplace_back(resource.compiled_resource_name);
+            kinds.emplace_back(angular ? "angular" : "linear");
+            positions.emplace_back(value);
+          }
+          const auto &value = binding.value();
+          measured_rows.push_back(ObservationRow{
+              {value.controllable_component_id.value(),
+               value.command_target_id.value(), value.capability_id.value()},
+              CanonicalValue(CanonicalValue::Object{
+                  {"command_target_id",
+                   CanonicalValue(value.command_target_id.value())},
+                  {"compiled_joint_names",
+                   CanonicalValue(std::move(compiled_names))},
+                  {"controllable_component_id",
+                   CanonicalValue(value.controllable_component_id.value())},
+                  {"operation_capability_id",
+                   CanonicalValue(value.capability_id.value())},
+                  {"coordinate_kinds", CanonicalValue(std::move(kinds))},
+                  {"positions_si", CanonicalValue(std::move(positions))},
+                  {"source_epoch", CanonicalValue(state.source_epoch.value())},
+                  {"source_joint_names", CanonicalValue(std::move(source_names))},
+                  {"source_sequence",
+                   CanonicalValue(static_cast<double>(state.sequence))},
+              })});
+        };
     const auto project_target = [&](const ObservationSource &source) {
       if (source.pneumatic_display) {
         const auto render = source.channel->current_bound_render_state();
@@ -2419,6 +2480,8 @@ CanonicalValue ExecutionCommandSurface::IoWatchResponse(
               {"source_sequence",
                CanonicalValue(static_cast<double>(state.sequence))},
           })});
+      if (source.measured.has_value())
+        project_measured(*source.measured, observed.value().binding, now);
     };
 
     const auto append_owner = [&](Composition &owner) {
@@ -2430,6 +2493,12 @@ CanonicalValue ExecutionCommandSurface::IoWatchResponse(
         if (owner.direct_control_motion_binding.has_value()) {
           append_target(owner.runtime->motion_state_channel,
                         owner.controllable_component_id);
+          // Selected by data: a commanded authority with a prepared measured
+          // source. A measured-primary channel already renders measurement.
+          if (owner.runtime->motion_state_channel->source_kind() ==
+              core::ObservedStateSourceKind::kCommandedState)
+            sources.back().measured =
+                owner.runtime->TryReadMotionMeasuredSource();
         }
         if (owner.direct_control_gripper_binding.has_value()) {
           append_target(owner.runtime->gripper_state_channel,
@@ -2481,6 +2550,14 @@ CanonicalValue ExecutionCommandSurface::IoWatchResponse(
     targets.reserve(rows.size());
     for (auto &row : rows)
       targets.emplace_back(std::move(row.value));
+    std::sort(measured_rows.begin(), measured_rows.end(),
+              [](const auto &left, const auto &right) {
+                return left.key < right.key;
+              });
+    CanonicalValue::Array measured_targets;
+    measured_targets.reserve(measured_rows.size());
+    for (auto &row : measured_rows)
+      measured_targets.emplace_back(std::move(row.value));
     const auto &bundle = *composition.bundle;
     auto response = CanonicalValue(CanonicalValue::Object{
         {"api_version", CanonicalValue(std::string(kResponseApiVersion))},
@@ -2491,11 +2568,12 @@ CanonicalValue ExecutionCommandSurface::IoWatchResponse(
               CanonicalValue(bundle.value().cell_graph.cell_id.value())},
              {"graph_revision",
               CanonicalValue(bundle.value().cell_graph.graph_revision.value())},
+             {"measured_targets", CanonicalValue(std::move(measured_targets))},
              {"owner_epoch", CanonicalValue(owner_epoch_.value())},
              {"retained_bundle_id",
               CanonicalValue(bundle.retained_bundle_id().value())},
              {"schema_version",
-              CanonicalValue("manyforge.execution_observation.v3")},
+              CanonicalValue("manyforge.execution_observation.v4")},
              {"source_epoch", CanonicalValue(stream_epoch)},
              {"source_sequence",
               CanonicalValue(static_cast<double>(change_generation))},
@@ -3245,34 +3323,15 @@ CanonicalValue ExecutionCommandSurface::ExecuteLogicalProduct(
             "motion preview requires an installed motion-capable component");
       }
       auto preview_intent = *command.operation;
-      const auto predecessor = composition.runtime->collision_publisher
-                                   ->current_scene_snapshot_lease_inventory();
-      // A preview receipt is explanatory evidence, not authority (spec 210
-      // §3.10.1): the client's status read may lag the owner-minted,
-      // monotonic Scene revision. Accept an earlier revision of the same
-      // Scene and compute on the current one; the receipt names the revision
-      // actually used. A future revision or a different Scene is refused.
-      if (!predecessor.has_value() ||
-          !preview_intent.expected_scene_revision.has_value() ||
-          preview_intent.expected_scene_revision->scene_id !=
-              predecessor->projection_binding.projection_revision
-                  .scene_revision.scene_id ||
-          preview_intent.expected_scene_revision->revision_id >
-              predecessor->projection_binding.projection_revision
-                  .scene_revision.revision_id ||
-          // An equal revision id names exactly the current revision.
-          (preview_intent.expected_scene_revision->revision_id ==
-               predecessor->projection_binding.projection_revision
-                   .scene_revision.revision_id &&
-           *preview_intent.expected_scene_revision !=
-               predecessor->projection_binding.projection_revision
-                   .scene_revision)) {
-        return ErrorResponse(
-            "scene_changed_during_validation",
-            "motion preview does not name the pre-latch scene revision");
+      if (!preview_intent.expected_scene_revision.has_value()) {
+        return ErrorResponse("scene_changed_during_validation",
+                             "motion preview requires a Scene revision");
       }
-      preview_intent.expected_scene_revision =
-          predecessor->projection_binding.projection_revision.scene_revision;
+      const core::ProjectionRevisionDTO requested{
+          preview_intent.expected_retained_bundle_id,
+          preview_intent.expected_graph_revision,
+          *preview_intent.expected_scene_revision};
+      auto minimum = requested;
       if (composition.runtime->planning_scene_synchronizer != nullptr) {
         auto synchronized = composition.runtime->planning_scene_synchronizer
                                 ->SynchronizeBeforePlanning();
@@ -3283,8 +3342,11 @@ CanonicalValue ExecutionCommandSurface::ExecuteLogicalProduct(
               {"ok", CanonicalValue(false)},
           });
         }
-        preview_intent.expected_scene_revision =
-            synchronized.value().scene_revision;
+        minimum = synchronized.value();
+        if (!core::ProjectionIsSameOrForwardInLineage(minimum, requested)) {
+          return ErrorResponse("scene_changed_during_validation",
+                               "motion preview request is ahead of or outside the captured Scene");
+        }
       }
       const auto preview_lease_id = core::ProjectionLeaseId{
           "motion-preview." +
@@ -3300,6 +3362,13 @@ CanonicalValue ExecutionCommandSurface::ExecuteLogicalProduct(
       CollisionLeaseRelease release(
           *composition.runtime->collision_publisher,
           inventory->projection_binding.projection_lease_id);
+      const auto &selected = inventory->projection_binding.projection_revision;
+      if (!core::ProjectionIsSameOrForwardInLineage(selected, minimum)) {
+        return ErrorResponse("scene_changed_during_validation",
+                             "motion preview snapshot does not include the capture");
+      }
+      // The receipt, frame resolution and collision inputs all name this pin.
+      preview_intent.expected_scene_revision = selected.scene_revision;
       auto session =
           composition.active_addressed_kernel()
               ->begin_motion_preview_session(

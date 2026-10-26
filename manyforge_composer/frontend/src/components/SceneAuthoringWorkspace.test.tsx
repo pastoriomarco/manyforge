@@ -220,3 +220,25 @@ describe('viewer object panel during a Program run', () => {
     expect(workspace).toContain('objectControlSurface={objectControlSurface(objectsEditable)}');
   });
 });
+
+describe('Scene revision changes in the authoring workspace', () => {
+  const workspace = () => readFileSync(new URL('./SceneAuthoringWorkspace.tsx', import.meta.url), 'utf8');
+
+  it('keys the candidate-TCP gizmo by Scene identity, so pose updates never cancel a drag', () => {
+    const source = workspace();
+    const start = source.indexOf('candidateContextKey={JSON.stringify([');
+    const key = source.slice(start, source.indexOf('])}', start));
+    expect(start).toBeGreaterThan(0);
+    expect(key).toContain('robotControl.selectedStatus?.sceneRevision.scene_id');
+    expect(key).not.toMatch(/sceneRevision[,\]]/);
+    expect(key).not.toMatch(/revision_id|content_hash/);
+  });
+
+  it('keys runtime pose-source rows by source identity, not by observation sequence', () => {
+    const source = workspace();
+    const start = source.indexOf('className="runtime-source-row"');
+    const row = source.slice(start, source.indexOf('>', start));
+    expect(row).toContain('key={`${source.object_id}:${source.policy_id}:${source.source_epoch}:${source.source_id}`}');
+    expect(row).not.toContain('source_sequence');
+  });
+});
