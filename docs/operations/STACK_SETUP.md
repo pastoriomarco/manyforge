@@ -22,7 +22,7 @@ This runbook covers:
 
 - ManyForge-only bring-up
 - ManyForge plus ROS 2 controller execution
-- direct, OpenClaw, and Hermes assistant-provider selection
+- the optional AI assistant (an `ai_model` Deployment component)
 - the current recommended commands
 
 It does not cover:
@@ -35,8 +35,8 @@ For runtime/operator-facing reference docs see:
 
 - [`../reference/REST_API.md`](../reference/REST_API.md) — Composer REST surface
 - [`../reference/MCP_RUNTIME_CONTRACT.md`](../reference/MCP_RUNTIME_CONTRACT.md) — MCP tool contract
-- [`../reference/ASSISTANT_PROVIDER_CONTRACT.md`](../reference/ASSISTANT_PROVIDER_CONTRACT.md) — assistant provider HTTP wire format
-- [`../operations/ASSISTANT_E2E_COOKBOOK.md`](./ASSISTANT_E2E_COOKBOOK.md) — end-to-end recipes
+- [`../reference/ASSISTANT_PROVIDER_CONTRACT.md`](../reference/ASSISTANT_PROVIDER_CONTRACT.md) — AI model endpoint and bridge contract
+- [`../operations/ASSISTANT_E2E_COOKBOOK.md`](./ASSISTANT_E2E_COOKBOOK.md) — AI assistant setup and checks
 
 (Internal architectural design rationale, platform-gap investigations, and
 sprint history are tracked in the private `manyforge_specs` repository, which
@@ -44,65 +44,37 @@ is not required for deployment or operation of this repo.)
 
 ## Clean Machine Install Order
 
-Use this section when a Thor/workstation has been freshly formatted and the
-whole ManyForge + NemoClaw/OpenClaw assistant stack needs to be installed from
-zero. For Jetson Orin AGX with a small eMMC root and a secondary NVMe, start at
+Use this section when a machine has been freshly formatted. For Jetson Orin
+AGX with a small eMMC root and a secondary NVMe, start at
 [`ORIN_STACK_SETUP.md`](ORIN_STACK_SETUP.md) instead; it adds the required
 storage staging before the same runtime flow.
 
-`scripts/launch.sh` is the repeatable runtime launcher. It starts and wires
-components after the host prerequisites and first-time NemoClaw sandbox
-onboarding already exist. It does **not** install Docker/NVIDIA runtime,
-Node.js, NemoClaw, or OpenShell, and it does **not** create the first
-`my-assistant` sandbox with `nemoclaw onboard`.
-
-1. Prepare the host: Docker Engine + Compose v2, NVIDIA Container Toolkit for
-   assistant/model serving, `git`, `curl`, enough disk for Docker images and
-   model caches, Hugging Face token/licence acceptance for gated models.
-1. Clone the sibling repos under `${HOME}/workspaces/dev_ws/src/`. Use the
-   same tested branch/tag across `manyforge` and `NemoClaw-Thor`; do not mix a
-   migration branch in one repo with `main` in the other.
+1. Prepare the host: Docker Engine + Compose v2, `git`, `curl`, and enough
+   disk for Docker images and build caches.
+1. Clone `manyforge` under `${HOME}/workspaces/dev_ws/src/`.
 1. Build the ManyForge image:
    ```bash
    cd ${HOME}/workspaces/dev_ws/src/manyforge
    ./scripts/setup-docker.sh
    ```
-1. Install the NemoClaw/OpenShell toolchain from `NemoClaw-Thor` and verify
-   `nemoclaw`, `openshell`, and Docker work from the operator account.
-1. Start the local model once from `NemoClaw-Thor/serving/` and confirm
-   `curl http://127.0.0.1:8000/v1/models` returns the served model.
-1. Run first-time `nemoclaw onboard` to create the `my-assistant` sandbox.
-   The onboard wizard probes the model endpoint, so the model must already be
-   running.
-1. After `my-assistant` exists, use the launcher for repeatable bring-up:
-   ```bash
-   cd ${HOME}/workspaces/dev_ws/src/manyforge
-   ./scripts/launch.sh restart
-   ```
-1. Verify the live stack:
-   ```bash
-   curl -fsS http://127.0.0.1:9000/api/infra/heartbeat
-   curl -fsS http://127.0.0.1:8000/v1/models
-   curl -fsS http://127.0.0.1:8200/healthz
-   ```
-
-The launcher may re-apply provider config, egress policy, skills, MCP server
-registration, gateway startup, and bridge startup on every run. That is
-intentional and idempotent. The non-idempotent first-time step is creating the
-sandbox itself with `nemoclaw onboard`.
+1. Start the stack with the development workbench
+   ([`DEVELOPMENT_WORKBENCH.md`](DEVELOPMENT_WORKBENCH.md)).
+1. Optional, for the AI tab: run your own OpenAI-compatible model server and
+   add an `ai_model` component to the Deployment
+   ([`ASSISTANT_E2E_COOKBOOK.md`](ASSISTANT_E2E_COOKBOOK.md)).
 
 ## Runtime Selection
 
-Robot execution and assistant-provider selection are independent. Select one
-execution lane, then optionally select one assistant provider. An assistant
-choice never changes motion authority, controller binding, or robot-state
+Robot execution and the AI assistant are independent. Select one execution
+lane; the assistant is enabled by the Deployment's `ai_model` component and
+never changes motion authority, controller binding, or robot-state
 precedence.
 
 ### Robot execution lanes
 
 #### Historical ManyForge-only native
 
-No LLM, no NemoClaw/OpenClaw dependency.
+No model server dependency.
 
 Use when:
 
@@ -173,9 +145,10 @@ operator aid: the backend and execution adapter enforce the same refusal.
 
 #### Runtime model nodes
 
-Runtime nodes such as `query_model` can use a deployment-declared local
-OpenAI-compatible endpoint such as vLLM. This is independent of the Composer
-assistant provider.
+Runtime nodes such as `query_model` name a model alias of the Deployment's
+assistant profile; each alias resolves to one of the Deployment's `ai_model`
+components (the chat uses the same mechanism for its alias). A token, if any,
+comes from the component's `api_key_env` variable (`MANYFORGE_AI_*`).
 
 Use when:
 
@@ -183,42 +156,25 @@ Use when:
 - validating bounded model interactions
 - running semantic-selection programs on the current text-only baseline
 
-#### Composer assistant provider
+#### Composer AI assistant
 
-Three first-class assistant-provider lanes exist — `direct`, `openclaw`,
-`hermes` — and the live stack runs exactly one per Composer process,
-selected at startup via `ASSISTANT_PROVIDER`. **OpenClaw + Gemma 4 12B GGUF
-(`openclaw` provider, `gemma4-12b-it-gguf`) is the demo default** as
-of 2026-06-11. The canonical per-lane bring-up, switch procedure, and
-provisioning/onboarding matrix is
-[`LANE_BRINGUP.md`](LANE_BRINGUP.md). The launcher
-[`scripts/demo-assistant-known-good.sh`](../../scripts/demo-assistant-known-good.sh)
-sets `ASSISTANT_PROVIDER=openclaw` and `MODEL_PROFILE=gemma4-12b-it-gguf`
-by default.
+The AI tab chats with a model that edits the Program Draft through a fixed
+tool set (mode `composer-assistant`). The model server is yours: any
+OpenAI-compatible server with tool calling (llama.cpp `llama-server --jinja`,
+vLLM `--enable-auto-tool-choice --tool-call-parser ...`). The Deployment names
+it with an `ai_model` component (`base_url`, `model`, optional token
+environment variable name `api_key_env`, which must start with
+`MANYFORGE_AI_`) next to an assistant profile. Run
+`export MANYFORGE_AI_<NAME>=<token>` before starting the workbench. Prepare
+and Enable never refuse because of the model server (with the default warning/auto `endpoint` stream); its reachability is the
+component's `endpoint` stream warning.
 
-| Provider                    | Bridge/agent path                                                                                              | Placement and use                                                                                                                                                                    |
-| --------------------------- | -------------------------------------------------------------------------------------------------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------ |
-| `direct` (`nemoclaw` alias) | In-tree `manyforge_assistant_bridge` on `:8100`; bridge runs the bounded agent loop against the model endpoint | Standard in-tree launcher starts a host peer. A platform deployment may place the same bridge in a policy-configured sandbox. Useful for local iteration and fallback qualification. |
-| `openclaw`                  | NemoClaw-Thor adapter on `:8200`; OpenClaw gateway owns the agent loop                                         | Sandboxed current Thor demo default.                                                                                                                                                 |
-| `hermes`                    | NemoClaw-Thor adapter on `:8300`; Hermes sessions own the agent loop                                           | Sandboxed and opt-in; provision with `scripts/setup-hermes.sh`, not `nemoclaw onboard`.                                                                                              |
+The launcher always starts the bridge on `127.0.0.1:8100`. The AI tab is
+enabled when the active Deployment has an AI model component; otherwise it
+shows "No AI model component in this Deployment". Assistant edits land in the
+Draft; Apply, or Discard/Revert, as for manual edits.
 
-All lanes preserve the same bounded-autonomy contract on the ManyForge
-side: mode-scoped catalog enforcement, callback validation, review boundaries,
-and audit identity. Provider IDs and catalog metadata are configuration, not
-proof of live process placement; use `LANE_BRINGUP.md` health/process checks.
-Switching providers is a startup choice, not a runtime execution transition.
-
-Setup recipe:
-[`./ASSISTANT_E2E_COOKBOOK.md`](./ASSISTANT_E2E_COOKBOOK.md) →
-"Recipe: Known-Good Assistant Demo Launcher".
-Integration design:
-[`MANYFORGE-MCP-INTEGRATION.md`](https://github.com/pastoriomarco/NemoClaw-Thor/blob/main/manyforge/docs/MANYFORGE-MCP-INTEGRATION.md)
-in NemoClaw-Thor.
-
-Use when:
-
-- validating provider-to-ManyForge agent flows
-- working on assistant, monitoring, or delegated-recovery integration
+Setup and checks: [`ASSISTANT_E2E_COOKBOOK.md`](ASSISTANT_E2E_COOKBOOK.md).
 
 ## Prerequisites
 
@@ -232,8 +188,8 @@ primarily "a machine that runs Docker." Specifics:
   the assistant and Isaac lanes — Isaac Sim and NVIDIA-runtime workloads
   require a Linux host with NVIDIA drivers.
 - **Architecture**: amd64 (x86_64) is the reference. arm64 is supported
-  for the dev image and the official full ROS Lyrical image; the Jetson Thor deployment target is
-  arm64+CUDA via NemoClaw-Thor. Isaac Sim itself is x86_64-only.
+  for the dev image and the official full ROS Lyrical image. Isaac Sim itself
+  is x86_64-only.
 The official Lyrical tooling image must be built before its compatibility aliases
 are run. Actual Isaac topic-control and experimental real-Lite6 image defaults
 remain on their current bases temporarily until the Lyrical topic-control roundtrip and xArm
@@ -250,29 +206,21 @@ unavailable there until an exact qualified image is explicitly supplied.
 - **Docker**: Docker Engine with BuildKit, plus the Compose v2 plugin
   (`docker compose ...`, not the legacy `docker-compose`).
 - **GPU / driver**: not required for native execution without a local model.
-  Required for the reference local-model assistant deployments, which
-  expect an OpenAI-compatible model server reachable from the host;
-  on Thor that is the NemoClaw-Thor-managed vLLM container, which
-  needs the NVIDIA Container Toolkit (`nvidia-ctk`) configured.
+  A local model server for the AI assistant usually needs one; it runs
+  outside ManyForge.
   Required for the Isaac lane (NVIDIA driver + RTX-class GPU).
 - **RAM**: 16 GB minimum for native execution with a comfortable C++ build.
-  32 GB recommended for local-model warm-up and for the Isaac lane.
-  Jetson Thor 64 GB unified memory is the supported assistant-lane
-  deployment target.
-- **Disk**: ~10 GB for the Docker image plus build cache. The vLLM
-  model cache can grow to 30-60 GB depending on which models
-  are pulled — that cache lives outside the manyforge tree, under
-  NemoClaw-Thor's volume.
-- **Local model server (model-backed assistant only)**: an OpenAI-compatible HTTP
-  endpoint such as vLLM, llama.cpp, or any other server that implements
-  `/v1/chat/completions`. Default port 8000.
+  32 GB recommended for the Isaac lane. A local model server needs its own
+  memory on top.
+- **Disk**: ~10 GB for the Docker image plus build cache. Model files live
+  outside the manyforge tree.
+- **Model server (AI assistant only)**: an OpenAI-compatible HTTP server with
+  tool calling, such as llama.cpp or vLLM, named by the Deployment's
+  `ai_model` component.
 
 ### Repositories
 
 - `manyforge` (this repo) — required.
-- `NemoClaw-Thor` — required for the reference Thor model-serving stack and
-  the OpenClaw/Hermes adapters; not required for native operation or a direct
-  bridge pointed at another compatible endpoint.
 - `manyforge_specs` — **dev-only**, not required for runtime/operation.
   Cloned alongside `manyforge` only by maintainers working on specs/ADRs.
 
@@ -303,10 +251,8 @@ manually; they are documented here for traceability.
 | FastAPI                                                                              | `0.135.3`                                                          | PyPI                                                             | Dockerfile L67; Composer backend                                                                                                                                                                                                                                                                                           |
 | MCP (Model Context Protocol)                                                         | `1.27.0`                                                           | PyPI                                                             | Dockerfile L71; assistant-lane MCP server                                                                                                                                                                                                                                                                                  |
 
-Reference model endpoints are configured in
-[`examples/model_endpoint_profiles.yaml`](../../examples/model_endpoint_profiles.yaml).
-The runtime model server (vLLM) is provisioned by NemoClaw-Thor — see
-its repo for model pinning.
+The AI model endpoint is the Deployment's `ai_model` component; the model
+server itself is not part of ManyForge.
 
 **Confirming the RoboPlan ref baked into your image.** The
 `package.xml` `<version>` field can lag the actual code (PR branches
@@ -421,8 +367,7 @@ Purpose:
 
 Operators do not need this script. It requires the private
 `manyforge_specs` repo on disk and is intended for maintainer
-dev-assist agents only. For deployment / operator bring-up, use
-`scripts/demo-assistant-known-good.sh`.
+dev-assist agents only.
 
 ## Recommended Bring-Up Sequences
 
@@ -562,23 +507,13 @@ ManyForge-authored state. In this profile:
   independent safety/supervisor chain, not ManyForge acting as the certified
   safety controller.
 
-### Direct local model testing
+### AI assistant
 
-1. Start the model server separately.
-1. Point ManyForge deployment/model alias at that endpoint.
-1. Prefer the semantic demo in text-only mode first.
+1. Start your model server and check `curl {base_url}/models` lists the model.
+1. Add the `ai_model` component and an assistant profile to the Deployment.
+1. Start the stack, Prepare/Enable, and open the AI tab.
 
-### NemoClaw/OpenClaw integration
-
-1. Bring up the current assistant path with `scripts/launch.sh` or
-   `scripts/demo-assistant-known-good.sh`.
-1. Do not recreate the removed `configure-manyforge-provider.sh` mux/plugin
-   compatibility transport.
-1. Validate tool discovery and health before testing agent behavior.
-
-(Maintainers working on specs/ADRs additionally run
-`scripts/dev-agent-session-start.sh` to seed sandbox dev-context;
-operators don't need it.)
+See [`ASSISTANT_E2E_COOKBOOK.md`](ASSISTANT_E2E_COOKBOOK.md).
 
 ## Operational Notes
 
@@ -594,8 +529,9 @@ be treated as durable repository content.
 
 ### Model aliasing
 
-Composer nodes select deployment aliases, not raw model IDs. In single-alias
-cases the UI should show resolved read-only info, not fake choice.
+Assistant profiles name model aliases; the Deployment's single `ai_model`
+component serves every alias, so the served model is always the component's
+`model`.
 
 ### Blackboard inspection baseline
 
@@ -652,19 +588,9 @@ If testing image-enabled demos:
 
 ### Model selection appears ignored
 
-Check deployment aliases rather than raw model names. The node chooses the
-alias; the deployment maps that alias to the actual provider/model endpoint.
-
-### Sandbox agent cannot reach ManyForge cleanly
-
-That is expected on the current platform baseline. The OpenClaw lane
-provisioner ([`manyforge/setup-manyforge-assistant.sh`](https://github.com/pastoriomarco/NemoClaw-Thor/blob/main/manyforge/setup-manyforge-assistant.sh))
-configures the SSRF egress preset, MCP server registration, and proxy envs
-required for the in-sandbox MCP bridge to call back into Composer. Run that
-provisioner whenever the deployment sandbox is recreated. For diagnosis,
-work through [`COMPOSER-ASSISTANT-RUNBOOK.md`](https://github.com/pastoriomarco/NemoClaw-Thor/blob/main/manyforge/docs/COMPOSER-ASSISTANT-RUNBOOK.md)
-gates 4-9 (gateway in sandbox netns, vLLM reachability, bundle-mcp policy,
-proxy envs in MCP server config, SSRF L7 paths).
+The model name sent to the server is the `ai_model` component's `model`. The
+server must serve exactly that name (llama.cpp `--alias`, vLLM
+`--served-model-name`).
 
 ## Keep This File Small
 

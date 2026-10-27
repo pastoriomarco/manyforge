@@ -33,6 +33,22 @@
         },
         "runtime_configuration": {
           "collision_monitor_period_ms": 50.0,
+          "component_streams": [
+            {
+              "budget_ns": 1000000000,
+              "controllable_component_id": "lite6_robot",
+              "recovery": "ack",
+              "severity": "fault",
+              "stream_id": "gripper_feedback"
+            },
+            {
+              "budget_ns": 250000000,
+              "controllable_component_id": "lite6_robot",
+              "recovery": "ack",
+              "severity": "fault",
+              "stream_id": "measured_joints"
+            }
+          ],
           "execution_tick_hz": 100,
           "gripper_target_configurations": [
             {
@@ -50,7 +66,6 @@
               "mount_frame": "link_eef",
               "open_state_ref": "open",
               "output_mode": "commanded",
-              "state_freshness_timeout_s": 1.0,
               "tcp_frame": "link_tcp",
               "touch_links": [
                 "lite_gripper_base_link",
@@ -68,7 +83,6 @@
             0.0
           ],
           "mock_profile": "lite6_lite_gripper",
-          "mode": "commanded_sim",
           "planner_rng_seed": 12345
         },
         "runtime_kind": "ros2_control"
@@ -353,7 +367,7 @@
           }
         },
         "idle_behaviour": "latch",
-        "latch_release": "operator",
+        "on_trip": "full_stop",
         "priority": 0,
         "rule_id": "light_curtain",
         "scope": "all_motion"

@@ -25,7 +25,6 @@
 #include <manyforge_deployment/deployment_artifact_codec.hpp>
 #include <manyforge_deployment/model_asset_codec.hpp>
 #include <manyforge_deployment/model_source.hpp>
-#include <manyforge_deployment/native_execution_runtime_contract.hpp>
 #include <manyforge_deployment/program_binding.hpp>
 #include <manyforge_deployment/program_binding_compiler.hpp>
 #include <manyforge_deployment/program_contract.hpp>
@@ -66,37 +65,60 @@ namespace {
 namespace core = manyforge::core;
 namespace deployment = manyforge::deployment;
 
+// The cell-scoped canonical-empty predecessor keeps the candidate's one ROS
+// execution host but with the build-qualified empty-host configuration
+// (canonical_empty_package_generator.cpp). The host is retained across the
+// component-owned Apply that follows, so the predecessor must share the host's
+// identity and its launch product exactly; the unit configuration and its
+// configuration manifest are component data and necessarily differ.
 [[nodiscard]] bool canonical_empty_runtime_units_match(
     const std::vector<core::RuntimeUnitDTO> &candidate,
     const std::vector<core::RuntimeUnitDTO> &empty) {
-  if (candidate.size() != empty.size()) {
+  if (candidate.size() != 1U || empty.size() != 1U) {
     return false;
   }
-  // DX753: preserve this identity-only branch while multi-unit work is held.
-  if (candidate.size() == 1U &&
-      candidate.front().runtime_profile_id.value() ==
-          deployment::native_execution_runtime_contract::kRuntimeProfileId) {
-    const auto &candidate_host = candidate.front();
-    const auto &empty_host = empty.front();
-    return candidate_host.runtime_unit_id == empty_host.runtime_unit_id &&
-           candidate_host.runtime_profile_id == empty_host.runtime_profile_id &&
-           candidate_host.runtime_profile_revision ==
-               empty_host.runtime_profile_revision &&
-           candidate_host.dependency_runtime_unit_ids ==
-               empty_host.dependency_runtime_unit_ids;
-  }
-  if (candidate.size() == 1U &&
-      candidate.front().runtime_profile_id.value() ==
-          deployment::ros2_control_execution_runtime_contract::kRuntimeProfileId) {
-    auto expected = candidate.front();
-    for (const auto name : {"io_signals", "io_provider_devices", "pose_sources"}) {
-      const auto field = expected.configuration.find(name);
-      if (field != expected.configuration.end())
-        field->second = core::JsonValueDTO{core::JsonValueDTO::Array{}};
+  const auto &candidate_host = candidate.front();
+  const auto &empty_host = empty.front();
+  return candidate_host.runtime_unit_id == empty_host.runtime_unit_id &&
+         candidate_host.runtime_profile_id == empty_host.runtime_profile_id &&
+         candidate_host.runtime_profile_revision ==
+             empty_host.runtime_profile_revision &&
+         candidate_host.dependency_runtime_unit_ids ==
+             empty_host.dependency_runtime_unit_ids;
+}
+
+[[nodiscard]] bool canonical_empty_host_products_match(
+    const std::vector<core::RetainedRuntimeUnitProductsDTO> &candidate,
+    const std::vector<core::RetainedRuntimeUnitProductsDTO> &empty) {
+  const auto launch = [](const core::RetainedProductDTO &product)
+      -> std::optional<core::RetainedArtifactRefDTO> {
+    for (const auto &artifact : product.artifact_refs) {
+      if (artifact.artifact_role_id.value() ==
+          deployment::detail::
+              kRos2ControlExecutionRuntimeLaunchDescriptorArtifactRole) {
+        return artifact;
+      }
     }
-    return expected == empty.front();
+    return std::nullopt;
+  };
+  if (candidate.size() != 1U || empty.size() != 1U ||
+      candidate.front().runtime_unit_id != empty.front().runtime_unit_id ||
+      candidate.front().products.size() != empty.front().products.size()) {
+    return false;
   }
-  return candidate == empty;
+  for (std::size_t index = 0U; index < candidate.front().products.size();
+       ++index) {
+    const auto &left = candidate.front().products[index];
+    const auto &right = empty.front().products[index];
+    const auto left_launch = launch(left);
+    if (left.product_kind != right.product_kind ||
+        left.product_contract_id != right.product_contract_id ||
+        left.product_contract_revision != right.product_contract_revision ||
+        !left_launch.has_value() || left_launch != launch(right)) {
+      return false;
+    }
+  }
+  return true;
 }
 
 struct Options final {
@@ -695,6 +717,9 @@ void verify_gripper_resource_semantics(
         "maintained gripper proof requires a controllable component");
   }
   const auto provider_only = [&](const auto &component) {
+    // CP8 step 1: an arm-only component type has no gripper target to prove.
+    if (component.component_type_id.value().ends_with(".arm_only.component"))
+      return true;
     return component.model_role_bindings.empty() &&
            std::any_of(graph.control_domains.begin(),
                        graph.control_domains.end(), [&](const auto &domain) {
@@ -1085,8 +1110,9 @@ materialize_scenarios(const std::filesystem::path &root,
       if (!canonical_empty_runtime_units_match(
               bundle->value().cell_graph.runtime_units,
               empty_bundle->value().cell_graph.runtime_units) ||
-          empty_bundle->value().compiled_products.runtime_unit_products !=
-              bundle->value().compiled_products.runtime_unit_products) {
+          !canonical_empty_host_products_match(
+              bundle->value().compiled_products.runtime_unit_products,
+              empty_bundle->value().compiled_products.runtime_unit_products)) {
         throw std::logic_error(
             "cell-scoped canonical predecessor does not retain the "
             "candidate's exact execution host product");
@@ -1577,7 +1603,7 @@ qualify_catalog(const std::filesystem::path &root,
   QualifiedCatalogClosure result;
 
   for (const auto &path :
-       source_files(catalog_root / "capability_definition", 46U)) {
+       source_files(catalog_root / "capability_definition", 47U)) {
     const std::string bytes = read_file(path);
     const auto reference =
         make_reference<core::CapabilityDefinitionCatalogRecordRefDTO>(bytes);
@@ -1595,13 +1621,14 @@ qualify_catalog(const std::filesystem::path &root,
       target_capabilities.push_back(capability);
     }
   }
-  if (target_capabilities.size() != 25U) {
+  if (target_capabilities.size() != 26U) {
     throw std::logic_error(
         "maintained component closure has the wrong target-capability count");
   }
   // Five native component types plus the fixed-scale ROS type of every
-  // family with an Isaac or offline mock controller profile (Q63-Q68).
-  constexpr std::size_t kMaintainedComponentTypeCount = 9U;
+  // family with an Isaac or offline mock controller profile (Q63-Q68), and the
+  // arm-only fixed-scale type of every family with a Real profile (CP8 step 1).
+  constexpr std::size_t kMaintainedComponentTypeCount = 10U;
   for (const auto &path :
        source_files(catalog_root / "component_type",
                     kMaintainedComponentTypeCount)) {
@@ -1685,11 +1712,12 @@ qualify_catalog(const std::filesystem::path &root,
     insert_reference(result, reference);
   }
 
-  bool found_lite6_arm_lifecycle_manifest = false;
-  bool found_lite6_gripper_lifecycle_manifest = false;
+  bool found_xarm_arm_lifecycle_manifest = false;
+  bool found_xarm_gripper_lifecycle_manifest = false;
   bool found_ros2_control_lifecycle_manifest = false;
+  bool found_xarm_ros2_control_lifecycle_manifest = false;
   for (const auto &path :
-       source_files(catalog_root / "provider_manifest", 9U)) {
+       source_files(catalog_root / "provider_manifest", 11U)) {
     const std::string bytes = read_file(path);
     const auto reference =
         make_reference<core::ProviderManifestCatalogRecordRefDTO>(bytes);
@@ -1704,23 +1732,25 @@ qualify_catalog(const std::filesystem::path &root,
                                   role_id;
                          });
     };
-    if (manifest.value().provider_manifest_id.value() == "lite6_arm_provider") {
-      if (found_lite6_arm_lifecycle_manifest ||
+    if (manifest.value().provider_manifest_id.value() == "xarm_arm_provider") {
+      if (found_xarm_arm_lifecycle_manifest ||
           !manifest.value().lifecycle_plan_catalog.has_value() ||
           manifest.value()
                   .lifecycle_plan_catalog->catalog_api_version.value() !=
               core::kBrandLifecyclePlanCatalogApiVersion ||
-          manifest.value().offered_capabilities.size() != 14U ||
+          // R7 package 5: the xArm catalog has only the Recover plan, so the
+          // lifecycle offers are observe and recover (no prepare/enable/disable).
+          manifest.value().offered_capabilities.size() != 11U ||
           manifest.value().provider_contracts.size() != 2U ||
           !has_contract_role("software_hard_stop") ||
           !has_contract_role("stop_contract")) {
         throw std::logic_error(
-            "maintained Lite6 arm lifecycle provider manifest is not exact");
+            "maintained xArm arm lifecycle provider manifest is not exact");
       }
-      found_lite6_arm_lifecycle_manifest = true;
+      found_xarm_arm_lifecycle_manifest = true;
     } else if (manifest.value().provider_manifest_id.value() ==
-               "lite6_gripper_provider") {
-      if (found_lite6_gripper_lifecycle_manifest ||
+               "xarm_gripper_provider") {
+      if (found_xarm_gripper_lifecycle_manifest ||
           !manifest.value().lifecycle_plan_catalog.has_value() ||
           manifest.value()
                   .lifecycle_plan_catalog->catalog_api_version.value() !=
@@ -1728,10 +1758,28 @@ qualify_catalog(const std::filesystem::path &root,
           manifest.value().offered_capabilities.size() != 7U ||
           manifest.value().provider_contracts.size() != 1U ||
           !has_contract_role("software_hard_stop")) {
-        throw std::logic_error("maintained Lite6 gripper lifecycle provider "
+        throw std::logic_error("maintained xArm gripper lifecycle provider "
                                "manifest is not exact");
       }
-      found_lite6_gripper_lifecycle_manifest = true;
+      found_xarm_gripper_lifecycle_manifest = true;
+    } else if (manifest.value().provider_manifest_id.value() ==
+               "manyforge.provider.ros2_control.xarm") {
+      // R7 package 4: the Real xArm arm's provider has the shared provider's
+      // offers and contracts; only its lifecycle catalog differs.
+      if (found_xarm_ros2_control_lifecycle_manifest ||
+          !manifest.value().lifecycle_plan_catalog.has_value() ||
+          manifest.value()
+                  .lifecycle_plan_catalog->catalog_api_version.value() !=
+              core::kBrandLifecyclePlanCatalogApiVersion ||
+          manifest.value().offered_capabilities.size() != 25U ||
+          manifest.value().provider_contracts.size() != 3U ||
+          !has_contract_role("gripper_logical_cancel") ||
+          !has_contract_role("software_hard_stop") ||
+          !has_contract_role("stop_contract")) {
+        throw std::logic_error(
+            "maintained Real xArm ROS control provider manifest is not exact");
+      }
+      found_xarm_ros2_control_lifecycle_manifest = true;
     } else if (manifest.value().provider_manifest_id.value() ==
                "manyforge.provider.ros2_control") {
       if (found_ros2_control_lifecycle_manifest ||
@@ -1754,9 +1802,10 @@ qualify_catalog(const std::filesystem::path &root,
                      reference.content_digest, bytes);
     insert_reference(result, reference);
   }
-  if (!found_lite6_arm_lifecycle_manifest ||
-      !found_lite6_gripper_lifecycle_manifest ||
-      !found_ros2_control_lifecycle_manifest) {
+  if (!found_xarm_arm_lifecycle_manifest ||
+      !found_xarm_gripper_lifecycle_manifest ||
+      !found_ros2_control_lifecycle_manifest ||
+      !found_xarm_ros2_control_lifecycle_manifest) {
     throw std::logic_error(
         "maintained lifecycle provider manifest closure is missing");
   }
@@ -1939,7 +1988,7 @@ void verify_scenarios(const std::filesystem::path &root,
              "maintained_deployment_sources.v1.json");
   if (deployment::sha256_digest(description_bytes) !=
       "sha256:"
-      "294e30271585f711d37d5a5fc7c7c8ce0a5861f263be1325f828c6585f132bef") {
+      "38cbea3f756a8e17852ea963c594ee00a9786caa4f47a12b67880e06865b6c8c") {
     throw std::invalid_argument(
         "maintained runtime input source differs from its qualified source pin");
   }
@@ -1949,7 +1998,7 @@ void verify_scenarios(const std::filesystem::path &root,
       root / "manyforge_deployment/resources/maintained/"
              "maintained_assistant_profiles.v1.json");
   if (deployment::sha256_digest(assistant_source_bytes) !=
-      "sha256:8455446637204644221bde2905ce9af3978c110a4eb086a44ef38e6886aca00a") {
+      "sha256:dd4cf88073b87c6afa1952516eaac892066f84404fbf73e65bf8352ac5744170") {
     throw std::invalid_argument("maintained assistant source differs from its source pin");
   }
   const auto assistant_source =
@@ -2335,8 +2384,6 @@ void verify_scenarios(const std::filesystem::path &root,
         {"execution_tick_hz", core::JsonValueDTO{100.0}},
         {"initial_joint_positions_rad",
          core::JsonValueDTO{std::move(initial_positions)}},
-        {"mode",
-         core::JsonValueDTO{std::string("commanded_sim")}},
         {"planner_rng_seed", core::JsonValueDTO{12345.0}},
     };
     const auto motion_targets =
@@ -2417,6 +2464,26 @@ void verify_scenarios(const std::filesystem::path &root,
       static_cast<void>(
           deployment::detail::decode_ros2_control_execution_gripper_target_configurations(
               *rows));
+    }
+    // CP9: the stream defaults are rebound exactly as the gripper rows.
+    {
+      deployment::CanonicalValue::Array expected_streams;
+      for (const auto &row : require_array(
+               require_member(source_runtime, "component_streams", "source runtime"),
+               "source stream rows")) {
+        deployment::CanonicalValue::Object rebound;
+        for (const auto &[name, value] : require_object(row, "source stream row")) {
+          rebound.emplace_back(name, name == "controllable_component_id"
+                                         ? deployment::CanonicalValue(component_id)
+                                         : value);
+        }
+        expected_streams.emplace_back(std::move(rebound));
+      }
+      if (require_member(actual_configuration, "component_streams",
+                         "verified runtime configuration") !=
+          deployment::CanonicalValue(std::move(expected_streams))) {
+        throw std::invalid_argument("maintained stream defaults differ from their exact source");
+      }
     }
     if (scenario.ros2_control_execution) {
       const auto &component_id = graph.controllable_components.front()
@@ -2531,10 +2598,11 @@ void verify_scenarios(const std::filesystem::path &root,
       expected_runtime_configuration.emplace("validation_collision_workers",
                                              core::JsonValueDTO{4.0});
     }
-    // The complete gripper member was proved separately against independently
+    // The complete gripper and stream members were proved separately against independently
     // pinned source above; retain the exact comparison for every other field.
     auto remaining_runtime_configuration = runtime.configuration;
     remaining_runtime_configuration.erase("gripper_target_configurations");
+    remaining_runtime_configuration.erase("component_streams");
     if (remaining_runtime_configuration != expected_runtime_configuration) {
       throw std::invalid_argument(
           "maintained scenario loses its exact historical runtime inputs: " +
@@ -2658,10 +2726,15 @@ PreparedActivationMaterialization materialize_prepared_activation(
                                  prepared_models);
   auto io_types = prepare_activation_io_types(intent, component_profiles,
                                               catalog.capabilities);
-  // Pose sources reuse the model-free derived-type pipeline.
+  // Pose sources and AI models reuse the model-free derived-type pipeline.
   for (auto &prepared : prepare_activation_pose_source_types(
            intent, component_profiles, catalog.capabilities))
     io_types.push_back(std::move(prepared));
+  for (auto &prepared : prepare_activation_ai_model_types(
+           intent, component_profiles, catalog.capabilities))
+    io_types.push_back(std::move(prepared));
+  const auto assistant_profile =
+      resolve_activation_assistant_profile(options.workspace_root, intent);
   for (const auto &prepared : io_types) {
     const auto &reference = prepared.type.reference();
     input_source.add(reference.content_addressed_store_key,
@@ -2682,7 +2755,7 @@ PreparedActivationMaterialization materialize_prepared_activation(
     compiled = compile_activation_deployment(
         intent, runtime_cell_id, component_profiles, prepared_models,
         catalog_records, catalog.runtime_profiles, io_types,
-        catalog.provider_manifests);
+        catalog.provider_manifests, assistant_profile);
   } catch (const std::bad_alloc &) {
     throw std::runtime_error(
         "activation Deployment compiler exhausted memory");

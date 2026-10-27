@@ -305,6 +305,46 @@ ExistingRegularFile(std::filesystem::path path, std::string_view label,
   return result;
 }
 
+/// Reads one Manager-captured run-root snapshot; `label` names it in failures.
+[[nodiscard]] std::string
+ReadManagedSnapshot(const std::filesystem::path &path,
+                    const std::string &label) {
+  FileDescriptor file(::open(path.c_str(),
+                             O_RDONLY | O_CLOEXEC | O_NONBLOCK | O_NOFOLLOW));
+  if (file.get() < 0) {
+    FailErrno("open managed " + label + " snapshot " + path.string());
+  }
+  struct stat status {};
+  if (::fstat(file.get(), &status) != 0) {
+    FailErrno("inspect managed " + label + " snapshot " + path.string());
+  }
+  Require(S_ISREG(status.st_mode),
+          "managed " + label + " snapshot must be a regular file: " +
+              path.string());
+  std::string document;
+  std::array<char, 4096U> buffer{};
+  while (true) {
+    const auto count = ::read(file.get(), buffer.data(), buffer.size());
+    if (count < 0 && errno == EINTR) {
+      continue;
+    }
+    if (count < 0) {
+      FailErrno("read managed " + label + " snapshot " + path.string());
+    }
+    if (count == 0) {
+      break;
+    }
+    document.append(buffer.data(), static_cast<std::size_t>(count));
+  }
+  return document;
+}
+
+[[nodiscard]] component_manager::SiteSettings
+LoadManagedSiteSettings(const std::filesystem::path &path) {
+  return component_manager::ParseSiteSettings(
+      ReadManagedSnapshot(path, "site settings"));
+}
+
 [[nodiscard]] bool
 IsPortableRuntimeIdentity(const std::string_view value) noexcept {
   if (value.empty() || value.size() > 128U ||
@@ -357,6 +397,8 @@ ParseManagedRuntimeArguments(const int argc, char **argv) {
       config.program_artifact_root_fd = ParseFileDescriptor(value);
     } else if (option == "--manyforge-managed-scene-asset-root-fd") {
       config.scene_asset_root_fd = ParseFileDescriptor(value);
+    } else if (option == "--manyforge-managed-site-settings") {
+      config.site_settings = LoadManagedSiteSettings(value);
     } else if (option == "--manyforge-managed-manager-state-root") {
       config.manager_state_root = value;
     } else if (option == "--manyforge-managed-manager-run-root") {
@@ -389,7 +431,7 @@ ParseManagedRuntimeArguments(const int argc, char **argv) {
       Fail("unknown managed runtime option " + option);
     }
   }
-  Require(seen.size() >= 15U && seen.size() <= 19U &&
+  Require(seen.size() >= 15U && seen.size() <= 20U &&
               config.manager_channel_fd >= 0 &&
               config.manager_liveness_channel_fd >= 0 &&
               config.manager_liveness_channel_fd != config.manager_channel_fd &&

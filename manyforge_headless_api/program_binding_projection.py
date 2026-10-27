@@ -33,9 +33,12 @@ _APPLIED_SELECTION_FIELDS = frozenset(
         "source_document_digest",
         "scenario_id",
         "schema_version",
+        "simulation_scene",
         "source",
     }
 )
+_SIMULATION_SCENE_FIELDS = frozenset({"cell_frame_id", "scene_entities"})
+_SCENE_ENTITY_FIELDS = frozenset({"entity", "scene_resource_id"})
 _APPLIED_SOURCE_FIELDS = frozenset(
     {
         "record_digest",
@@ -130,6 +133,28 @@ def _binding_correspondence(
     return binding
 
 
+def _validate_simulation_scene(value: object, label: str) -> None:
+    """Simulator entity mapping of the active Deployment links, or null."""
+
+    if value is None:
+        return
+    if not isinstance(value, dict) or set(value) != _SIMULATION_SCENE_FIELDS:
+        _fail(label, "null or the closed simulation scene record")
+    _text(value["cell_frame_id"], f"{label}.cell_frame_id", 256)
+    entities = value["scene_entities"]
+    if not isinstance(entities, list) or not entities:
+        _fail(f"{label}.scene_entities", "a non-empty array")
+    ids: list[str] = []
+    for index, entity in enumerate(entities):
+        entity_label = f"{label}.scene_entities[{index}]"
+        if not isinstance(entity, dict) or set(entity) != _SCENE_ENTITY_FIELDS:
+            _fail(entity_label, "the closed scene entity record")
+        _text(entity["entity"], f"{entity_label}.entity", 1024)
+        ids.append(_text(entity["scene_resource_id"], f"{entity_label}.scene_resource_id", 256))
+    if ids != sorted(set(ids)):
+        _fail(f"{label}.scene_entities", "unique entries sorted by scene_resource_id")
+
+
 def validate_applied_program_selection(
     value: object,
     *,
@@ -147,6 +172,7 @@ def validate_applied_program_selection(
         value.get("assistant_projection"), dict
     ):
         _fail(f"{label}.assistant_projection", "an object or null")
+    _validate_simulation_scene(value.get("simulation_scene"), f"{label}.simulation_scene")
     owner_identities = value.get("owner_identities")
     if not isinstance(owner_identities, list) or not owner_identities:
         _fail(f"{label}.owner_identities", "a non-empty array")

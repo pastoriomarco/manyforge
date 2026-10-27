@@ -1843,6 +1843,8 @@ class FakeOperationJournal final : public IOperationJournal {
   Result<OperationJournalRecoveryDTO> BeginOwnerEpoch(const RequestOwnerEpoch&, std::int64_t,
                                                       std::size_t,
                                                       const std::vector<ResourceId>&) override {
+    if (begin_owner_epoch_error)
+      return Result<OperationJournalRecoveryDTO>::Err(*begin_owner_epoch_error);
     calls = {"begin"};
     states.clear();
     return Result<OperationJournalRecoveryDTO>::Ok(recovery);
@@ -2093,6 +2095,7 @@ class FakeOperationJournal final : public IOperationJournal {
   }
 
   OperationJournalRecoveryDTO recovery;
+  std::optional<ErrorDTO> begin_owner_epoch_error;
   std::optional<std::string> fail_next_kind;
   std::optional<std::string> throw_after_capture_kind;
   bool fail_next_cell_release{};
@@ -8519,8 +8522,9 @@ TEST(ResourceAddressedExecutionKernelTest, ProgramHaltKeepsReadyWorkReadyAfterRe
   ASSERT_EQ(during.value().held_nodes.size(), 1U);
   EXPECT_EQ(during.value().held_nodes.front().state, ProgramNodeHoldStateDTO::kReady);
   ASSERT_TRUE(during.value().selection_release_block_reason.has_value());
+  // A nominal Halt leaves cell motion admission open; its own fence blocks.
   EXPECT_EQ(*during.value().selection_release_block_reason,
-            ProgramSelectionReleaseBlockReasonDTO::kCellMotionAdmissionClosed);
+            ProgramSelectionReleaseBlockReasonDTO::kProgramHaltActive);
 
   // Neither Run nor Resume ends the Halt; only its release does.
   const auto resume_while_halted = kernel.release_program_selection(
@@ -8528,8 +8532,8 @@ TEST(ResourceAddressedExecutionKernelTest, ProgramHaltKeepsReadyWorkReadyAfterRe
   ASSERT_FALSE(resume_while_halted.ok());
   EXPECT_EQ(resume_while_halted.error().details.at("reason"), "program_selection_not_releasable");
   EXPECT_EQ(resume_while_halted.error().details.at("selection_release_block_reason"),
-            "cell_motion_admission_closed");
-  EXPECT_NE(resume_while_halted.error().message.find("Cell motion admission is closed"),
+            "program_halt_active");
+  EXPECT_NE(resume_while_halted.error().message.find("Program Halt is still active"),
             std::string::npos);
   EXPECT_EQ(kernel.get_program_execution_scope(ProgramRunId("run.1")).value().selection_revision,
             during.value().selection_revision);
@@ -14372,6 +14376,182 @@ TEST(ResourceAddressedExecutionKernelTest, FocusedGripperReplaysAndSettlesExactB
   }
 }
 
+// A ROS action gripper whose cancel terminal arrives after the Stop (Q58).
+// Admission closes on every invalidation and reopens only through
+// try_authorize once that terminal has arrived (b9c5798c).
+class CancelTerminalGripperBackend final : public IGripperCommandBackend {
+ public:
+  mutable std::mutex mutex;
+  GripperCommandStatusDTO status;
+  bool admission_open{true};
+  std::atomic<int> commands{};
+  std::atomic<int> refused{};
+  std::atomic<int> opens{};
+  std::atomic<bool> cancel_unsettled{true};
+  GripperCommandResultDTO command_gripper(const GripperCommandRequestDTO& request) override {
+    std::lock_guard lock(mutex);
+    if (!admission_open) {
+      ++refused;
+      return {false, 0U, 0U,
+              ErrorDTO{"gripper_command_not_authorized",
+                       "Gripper command admission is closed by the execution lifecycle", {}}};
+    }
+    ++commands;
+    status.gripper_id = request.gripper_id;
+    status.command_id = 40U + static_cast<std::uint64_t>(commands.load());
+    status.generation += 10U;
+    status.state = GripperCommandState::kExecuting;
+    ++status.revision;
+    return {true, status.command_id, status.generation, std::nullopt};
+  }
+  GripperCommandStatusDTO get_gripper_status(const std::string&) const override {
+    std::lock_guard lock(mutex);
+    return status;
+  }
+  GripperCommandResultDTO mark_gripper_grasp_lost(const std::string&, std::uint64_t,
+                                                  std::uint64_t, const std::string&,
+                                                  const std::string&,
+                                                  const std::string&) override {
+    return {};
+  }
+  void invalidate_gripper_commands(GripperInvalidationReason) noexcept override {
+    std::lock_guard lock(mutex);
+    admission_open = false;
+    status.state = GripperCommandState::kIdle;
+    ++status.generation;
+    ++status.revision;
+  }
+  void authorize_gripper_commands() noexcept override {
+    std::lock_guard lock(mutex);
+    admission_open = true;
+    ++opens;
+  }
+  Result<void> try_authorize_gripper_commands() noexcept override {
+    if (cancel_unsettled)
+      return Result<void>::Err(ErrorDTO{"gripper_cancellation_unsettled",
+                                        "The prior gripper cancellation remains unsettled", {}});
+    authorize_gripper_commands();
+    return Result<void>::Ok();
+  }
+};
+
+TEST(ResourceAddressedExecutionKernelTest, GripperFullStopSettlesBeforeItsCancelTerminalArrives) {
+  CancelTerminalGripperBackend backend;
+  FakeClock clock;
+  ManualScheduler scheduler;
+  GripperParticipantEngine gripper(backend, clock);
+  const ProgramCommandSchemaRefDTO schema{
+      CommandSchemaId(std::string(kGripperPositionCommandSchemaId)),
+      CommandSchemaRevision(std::string(kGripperPositionCommandSchemaRevision))};
+  auto row = LogicalGripperRegistration(make_binding("gripper", "gripper.target", "tool.gripper.command",
+                                                      CoordinateKind::kLinear, schema), gripper);
+  ResourceAddressedExecutionKernel kernel(
+      {row}, clock, scheduler, default_journal,
+      {RequestOwnerEpoch("kernel.epoch.1"), CellId("cell.test"), 8U});
+  const auto accepted = kernel.execute(command_operation());
+  ASSERT_TRUE(accepted.ok()) << accepted.error().message;
+  const auto stopped = kernel.full_stop(FullStopIntentDTO{
+      {RequestId("cancel-pending.stop"), RequestOwnerEpoch("kernel.epoch.1"), "test", {}},
+      StopGeneration(0U),
+      {}});
+  ASSERT_TRUE(stopped.ok()) << stopped.error().message;
+  ASSERT_TRUE(wait_until(
+      [&] {
+        const auto status = kernel.get_stop_status(stopped.value().stop_id);
+        return status.ok() && status.value().stop_certificate.has_value();
+      },
+      std::chrono::seconds(1)));
+  const auto status = kernel.get_stop_status(stopped.value().stop_id);
+  ASSERT_TRUE(status.ok());
+  EXPECT_EQ(status.value().state, StopStatusStateDTO::kSucceeded);  // was kPartial
+  EXPECT_TRUE(status.value().unsettled.empty());
+  EXPECT_TRUE(status.value().failed.empty());
+  ASSERT_TRUE(wait_until([&] {
+    const auto state = kernel.get_operation_state(accepted.value().operation_id);
+    return state.ok() && state.value().state == OperationStateKind::kStopped;
+  }));
+  EXPECT_EQ(backend.opens.load(), 0);  // admission not reopened before the terminal
+
+  // Cycle Reset: the operation Reset reaches reset_gripper and reopens once
+  // the terminal has arrived.
+  backend.cancel_unsettled = false;
+  const auto before_reset = kernel.get_operation_state(accepted.value().operation_id);
+  ASSERT_TRUE(before_reset.ok());
+  const auto reset = kernel.reset(control_request("cancel-pending.reset", accepted.value(),
+                                                  before_reset.value().operation_revision.value()));
+  ASSERT_TRUE(reset.ok()) << reset.error().message;
+  ASSERT_TRUE(wait_until([&] { return backend.opens.load() == 1; }));
+}
+
+TEST(ResourceAddressedExecutionKernelTest, GripperStopResumeReopensAdmissionAfterCancelTerminal) {
+  CancelTerminalGripperBackend backend;
+  FakeClock clock;
+  ManualScheduler scheduler;
+  GripperParticipantEngine gripper(backend, clock);
+  const ProgramCommandSchemaRefDTO schema{
+      CommandSchemaId(std::string(kGripperPositionCommandSchemaId)),
+      CommandSchemaRevision(std::string(kGripperPositionCommandSchemaRevision))};
+  auto row = LogicalGripperRegistration(make_binding("gripper", "gripper.target", "tool.gripper.command",
+                                                      CoordinateKind::kLinear, schema), gripper);
+  ResourceAddressedExecutionKernel kernel(
+      {row}, clock, scheduler, default_journal,
+      {RequestOwnerEpoch("kernel.epoch.1"), CellId("cell.test"), 8U});
+  const auto accepted = kernel.execute(command_operation());
+  ASSERT_TRUE(accepted.ok()) << accepted.error().message;
+  const auto before_stop = kernel.get_operation_state(accepted.value().operation_id);
+  ASSERT_TRUE(before_stop.ok());
+  const auto stopped = kernel.stop(stop_request("resume.stop", accepted.value(),
+                                                before_stop.value().operation_revision.value()));
+  ASSERT_TRUE(stopped.ok()) << stopped.error().message;
+  ASSERT_TRUE(wait_until([&] {
+    const auto stop = kernel.get_stop_status(stopped.value().stop_id);
+    return stop.ok() && stop.value().stop_certificate.has_value();
+  }));
+  EXPECT_EQ(kernel.get_stop_status(stopped.value().stop_id).value().state,
+            StopStatusStateDTO::kSucceeded);
+  ASSERT_TRUE(wait_until([&] {
+    const auto state = kernel.get_operation_state(accepted.value().operation_id);
+    return state.ok() && state.value().state == OperationStateKind::kStopped;
+  }));
+  const auto resume = [&](const std::string& request_id) {
+    const auto projection = kernel.get_operation_recovery_assessment(accepted.value().operation_id);
+    EXPECT_TRUE(projection.ok());
+    const auto& assessment = projection.value().assessment;
+    KernelRecoveryActionRequestDTO request{request_id,
+                                           RecoveryAction::kReplanFromStoppedState,
+                                           "operator",
+                                           assessment.assessment_revision,
+                                           assessment.control_command_epoch,
+                                           assessment.execution_id,
+                                           assessment.latch_id,
+                                           assessment.stop_certificate_id,
+                                           assessment.stop_owner_generation,
+                                           "resume stopped node",
+                                           false};
+    return kernel.apply_operation_recovery_action(accepted.value().operation_id,
+                                                  projection.value().operation_revision, request);
+  };
+
+  // Resume before the cancel terminal refuses cleanly with the typed reason.
+  const auto early = resume("resume.early");
+  ASSERT_TRUE(early.ok()) << early.error().message;
+  EXPECT_FALSE(early.value().accepted);
+  ASSERT_TRUE(early.value().error);
+  EXPECT_EQ(early.value().error->code, "gripper_cancellation_unsettled");
+  EXPECT_EQ(backend.opens.load(), 0);
+
+  // After the terminal, Resume reopens admission and the next command is sent.
+  backend.cancel_unsettled = false;
+  const auto resumed = resume("resume.after-terminal");
+  ASSERT_TRUE(resumed.ok()) << resumed.error().message;
+  EXPECT_TRUE(resumed.value().accepted);
+  EXPECT_EQ(backend.opens.load(), 1);
+  const auto next = kernel.execute(command_operation("request.command.2"));
+  ASSERT_TRUE(next.ok()) << next.error().message;
+  ASSERT_TRUE(wait_until([&] { return backend.commands.load() == 2; }));
+  EXPECT_EQ(backend.refused.load(), 0);
+}
+
 TEST(ResourceAddressedExecutionKernelTest, GripperStopFencesTheActualReleasedButUnenteredDispatch) {
   for (const auto actuation : {GripperActuationKind::kPositionCommanded}) {
     SCOPED_TRACE(static_cast<int>(actuation));
@@ -15899,6 +16079,23 @@ TEST(ResourceAddressedExecutionKernelTest,
     const auto current = kernel.get_operation_projection(first.value().operation_id);
     return current.ok() && !current.value().resident;
   }));
+}
+
+TEST(ResourceAddressedExecutionKernelTest, DurableOwnerAdmissionFailureRefusesConstructionCleanly) {
+  // The Stop-stage and operation-control lanes exist before the durable owner
+  // epoch is admitted. A journal refusal must throw out of the constructor,
+  // with the never-drained lanes draining themselves, not terminate.
+  FakeClock clock;
+  ManualScheduler scheduler;
+  FakeParticipantEngine engine;
+  FakeOperationJournal journal;
+  journal.begin_owner_epoch_error = ErrorDTO{"journal_unavailable", "fixture refusal", {}};
+  const auto binding =
+      make_binding("arm", "arm", "execution.trajectory.execute", CoordinateKind::kAngular);
+  EXPECT_THROW((ResourceAddressedExecutionKernel(
+                   {registration(binding, engine)}, clock, scheduler, journal,
+                   {RequestOwnerEpoch("kernel.epoch.1"), CellId("cell.test"), 16U})),
+               std::runtime_error);
 }
 
 TEST(ResourceAddressedExecutionKernelTest, RetiringUnusedEnginePreservesResidentCleanupLane) {
@@ -19526,6 +19723,57 @@ TEST(ResourceAddressedExecutionKernelTest,
   EXPECT_EQ(engine.execute_calls, 0);
 }
 
+
+TEST(ResourceAddressedExecutionKernelTest,
+     ComponentIncidentContainmentRecoveryClearsOnlyItsOwnLatchWithoutResuming) {
+  // CP9 `fault` + `auto`: the incident closed by itself; its containment
+  // latch is recovered like the operator's Recover cell, nothing resumes.
+  FakeClock clock;
+  ManualScheduler scheduler;
+  clock.set(100);
+  FakeParticipantEngine engine;
+  FakeOperationJournal journal;
+  const auto binding =
+      make_binding("arm", "arm", "execution.trajectory.execute", CoordinateKind::kAngular);
+  ResourceAddressedExecutionKernelConfig config{RequestOwnerEpoch("kernel.epoch.1"),
+                                                CellId("cell.test"), 16U};
+  config.stop_fault_recovery_facts_resolver = installed_domain_recovery_facts({binding});
+  ResourceAddressedExecutionKernel kernel({registration(binding, engine)}, clock, scheduler,
+                                          journal, std::move(config));
+  IKernelCellAdmissionPort& port = kernel;
+  // Unknown incident: nothing to do here (the operator's).
+  const auto unknown = port.RecoverComponentIncidentContainment("incident.unknown");
+  ASSERT_TRUE(unknown.ok()) << unknown.error().message;
+  EXPECT_TRUE(unknown.value());
+
+  const auto contained = port.RequestComponentIncidentContainment(
+      {"incident.arm.auto", ControllableComponentId("component.arm"),
+       LifecycleBlockingCauseClassDTO::kProviderLost});
+  ASSERT_TRUE(contained.ok()) << contained.error().message;
+  ASSERT_TRUE(wait_until(
+      [&] { return stop_terminal_recorded(kernel, contained.value().stop_id); }));
+  EXPECT_FALSE(kernel.execute(motion_operation("request.auto.blocked")).ok());
+  bool done = false;
+  ASSERT_TRUE(wait_until([&] {
+    clock.advance(10'000'000);
+    scheduler.advance_to(clock.now());
+    static_cast<void>(kernel.refresh_stop_fault_recovery_assessment());
+    const auto recovered = port.RecoverComponentIncidentContainment("incident.arm.auto");
+    done = recovered.ok() && recovered.value();
+    return done;
+  }));
+  EXPECT_FALSE(kernel.get_stop_fault_latch().has_value() &&
+               kernel.get_stop_fault_latch()->state != StopFaultLatchStateDTO::kCleared);
+  EXPECT_EQ(journal.stop_fault_clear_calls.load(), 1);
+  EXPECT_EQ(engine.execute_calls, 0);
+  // Again: nothing left to recover; no second clear.
+  const auto again = port.RecoverComponentIncidentContainment("incident.arm.auto");
+  ASSERT_TRUE(again.ok()) << again.error().message;
+  EXPECT_TRUE(again.value());
+  EXPECT_EQ(journal.stop_fault_clear_calls.load(), 1);
+  // New motion is admissible again.
+  EXPECT_TRUE(kernel.execute(motion_operation("request.auto.after")).ok());
+}
 
 TEST(ResourceAddressedExecutionKernelTest,
      StopCancelsAReservedOperationWhileItsOrdinaryJournalIsBlockedWithoutDispatch) {
@@ -33754,7 +34002,8 @@ struct GlobalMotionRuleFixture final {
       std::string global_rule_id = "global.guard", bool additional_loss_guard = false,
       bool command_sibling = false, bool waiting_program_key = false,
       std::shared_ptr<GlobalRuleCatalogObservedService>* observe_retirement = nullptr,
-      bool no_applied_program = false, bool lifecycle_test_owner = false) {
+      bool no_applied_program = false, bool lifecycle_test_owner = false,
+      bool full_stop_on_trip = false) {
     IoConditionDefinitionDTO definition;
     definition.inputs.push_back({program_io_descriptor().signal_id, IoConditionValueKind::kBoolean});
     definition.nodes.emplace_back(IoConditionCompareDTO{IoConditionComparison::kEqual,
@@ -33849,7 +34098,8 @@ struct GlobalMotionRuleFixture final {
           condition,
           {program_io_descriptor().source_id}, std::move(scope), idle, global_priority, std::nullopt, release,
           waiting_program_key && no_applied_program ? std::vector<std::string>{"flag"}
-                                                    : std::vector<std::string>{}}},
+                                                    : std::vector<std::string>{},
+          full_stop_on_trip}},
         (group || waiting_program_key) && !no_applied_program ? std::optional(program) : std::nullopt,
         waiting_program_key && !no_applied_program ? std::vector<std::string>{"flag"}
                                                  : std::vector<std::string>{}});
@@ -34214,6 +34464,108 @@ TEST(ResourceAddressedExecutionKernelTest,
   ASSERT_TRUE(offers.ok());
   ASSERT_EQ(offers.value().size(), 1U);
   EXPECT_EQ(offers.value().front().latch_cause, IoGlobalRuleLatchCauseDTO::kCondition);
+}
+
+// on_trip gate (compiled: idle latch, auto release on clear, scoped Stop).
+TEST(ResourceAddressedExecutionKernelTest,
+     GlobalRuleGateRefusesScopedMotionUpfrontWhileActiveAndAllowsItAfterClear) {
+  GlobalMotionRuleFixture fixture(true, true,
+      InterruptPostLatchDisposition::kAutoClearOnSignalRelease, IoRuleIdleBehaviourDTO::kLatch);
+  ASSERT_TRUE(fixture.Publish(true).ok());
+  ASSERT_TRUE(fixture.kernel->ProcessIoRuleEvidence().ok());
+  const auto blocked = fixture.kernel->execute(fixture.Intent());
+  ASSERT_FALSE(blocked.ok());
+  EXPECT_EQ(blocked.error().details.at("reason"), "global_interrupt_gated");
+  EXPECT_EQ(blocked.error().details.at("rule_id"), "global.guard");
+  EXPECT_EQ(fixture.engine.execute_calls, 0);
+  const auto offers = fixture.kernel->ReadGlobalIoRuleRecoveryOffers();
+  ASSERT_TRUE(offers.ok());
+  ASSERT_EQ(offers.value().size(), 1U);
+  EXPECT_EQ(offers.value().front().post_latch_disposition,
+            InterruptPostLatchDisposition::kAutoClearOnSignalRelease);
+  // Clearing the signal releases the gate with no operator action.
+  ASSERT_TRUE(fixture.Publish(false).ok());
+  ASSERT_TRUE(fixture.kernel->ProcessIoRuleEvidence().ok());
+  EXPECT_TRUE(fixture.kernel->ReadGlobalIoRuleRecoveryOffers().value().empty());
+  const auto allowed = fixture.kernel->execute(fixture.Intent(false, "global.gate.after.clear"));
+  ASSERT_TRUE(allowed.ok()) << allowed.error().message;
+  EXPECT_EQ(fixture.engine.execute_calls, 1);
+}
+
+TEST(ResourceAddressedExecutionKernelTest,
+     GlobalRuleGateStopsRunningScopedMotionOnlyAndReleasesOnClear) {
+  GlobalMotionRuleFixture fixture(true, true,
+      InterruptPostLatchDisposition::kAutoClearOnSignalRelease, IoRuleIdleBehaviourDTO::kLatch);
+  const auto first = fixture.kernel->execute(fixture.Intent());
+  const auto other = fixture.kernel->execute(fixture.Intent(true, "global.gate.disjoint"));
+  ASSERT_TRUE(first.ok()) << first.error().message;
+  ASSERT_TRUE(other.ok()) << other.error().message;
+  ASSERT_TRUE(fixture.Publish(true).ok());
+  ASSERT_TRUE(fixture.kernel->ProcessIoRuleEvidence().ok());
+  ASSERT_TRUE(wait_until([&] { return fixture.Certified(first.value().operation_id); }));
+  const auto ended = fixture.kernel->get_operation_state(first.value().operation_id).value();
+  ASSERT_TRUE(ended.participants.front().terminal_error);
+  EXPECT_EQ(ended.participants.front().terminal_error->code, "interrupt_fault");
+  const auto running = fixture.kernel->get_operation_state(other.value().operation_id).value();
+  EXPECT_EQ(running.state, OperationStateKind::kExecuting);
+  EXPECT_FALSE(running.active_stop_id);
+  EXPECT_EQ(fixture.other_engine.translate_stop_stage_calls, 0);
+  ASSERT_EQ(fixture.kernel->ReadGlobalIoRuleRecoveryOffers().value().size(), 1U);
+  ASSERT_TRUE(fixture.Publish(false).ok());
+  ASSERT_TRUE(fixture.kernel->ProcessIoRuleEvidence().ok());
+  EXPECT_TRUE(fixture.kernel->ReadGlobalIoRuleRecoveryOffers().value().empty());
+}
+
+// on_trip full_stop (compiled: operator release, cell Full Stop).
+TEST(ResourceAddressedExecutionKernelTest,
+     GlobalRuleFullStopTripStopsTheWholeCellAndLatchesForTheOperator) {
+  GlobalMotionRuleFixture fixture(true, true,
+      InterruptPostLatchDisposition::kAwaitOperatorAck, IoRuleIdleBehaviourDTO::kLatch,
+      {}, 20, "global.guard", false, false, false, nullptr, false, false, true);
+  const auto first = fixture.kernel->execute(fixture.Intent());
+  const auto other = fixture.kernel->execute(fixture.Intent(true, "global.full.disjoint"));
+  ASSERT_TRUE(first.ok()) << first.error().message;
+  ASSERT_TRUE(other.ok()) << other.error().message;
+  ASSERT_TRUE(fixture.Publish(true).ok());
+  ASSERT_TRUE(fixture.kernel->ProcessIoRuleEvidence().ok());
+  ASSERT_TRUE(wait_until([&] { return fixture.Certified(first.value().operation_id); }));
+  // The Full Stop also stops motion outside the rule's own scope.
+  const auto stopped_other = fixture.kernel->get_operation_state(other.value().operation_id).value();
+  EXPECT_TRUE(stopped_other.active_stop_id);
+  const auto offers = fixture.kernel->ReadGlobalIoRuleRecoveryOffers();
+  ASSERT_TRUE(offers.ok());
+  ASSERT_EQ(offers.value().size(), 1U);
+  EXPECT_EQ(offers.value().front().latch_cause, IoGlobalRuleLatchCauseDTO::kCondition);
+  EXPECT_EQ(offers.value().front().post_latch_disposition,
+            InterruptPostLatchDisposition::kAwaitOperatorAck);
+  // A cleared signal does not release it; only the operator does.
+  ASSERT_TRUE(fixture.Publish(false).ok());
+  ASSERT_TRUE(fixture.kernel->ProcessIoRuleEvidence().ok());
+  EXPECT_EQ(fixture.kernel->ReadGlobalIoRuleRecoveryOffers().value().size(), 1U);
+  const auto cleared = fixture.kernel->recover_global_io_rule(fixture.Recovery());
+  ASSERT_TRUE(cleared.ok()) << cleared.error().message;
+  EXPECT_TRUE(fixture.kernel->ReadGlobalIoRuleRecoveryOffers().value().empty());
+}
+
+TEST(ResourceAddressedExecutionKernelTest,
+     GlobalRuleFullStopLatchRefusesScopedMotionUntilOperatorRelease) {
+  GlobalMotionRuleFixture fixture(true, true,
+      InterruptPostLatchDisposition::kAwaitOperatorAck, IoRuleIdleBehaviourDTO::kLatch,
+      {}, 20, "global.guard", false, false, false, nullptr, false, false, true);
+  ASSERT_TRUE(fixture.Publish(true).ok());
+  ASSERT_TRUE(fixture.kernel->ProcessIoRuleEvidence().ok());
+  const auto recovery = fixture.Recovery();
+  ASSERT_TRUE(fixture.Publish(false).ok());
+  ASSERT_TRUE(fixture.kernel->ProcessIoRuleEvidence().ok());
+  const auto blocked = fixture.kernel->execute(fixture.Intent());
+  ASSERT_FALSE(blocked.ok());
+  EXPECT_EQ(blocked.error().details.at("reason"), "global_interrupt_latched");
+  EXPECT_EQ(blocked.error().details.at("rule_id"), "global.guard");
+  EXPECT_EQ(fixture.engine.execute_calls, 0);
+  const auto cleared = fixture.kernel->recover_global_io_rule(recovery);
+  ASSERT_TRUE(cleared.ok()) << cleared.error().message;
+  const auto allowed = fixture.kernel->execute(fixture.Intent(false, "global.full.after.release"));
+  ASSERT_TRUE(allowed.ok()) << allowed.error().message;
 }
 
 TEST(ResourceAddressedExecutionKernelTest,

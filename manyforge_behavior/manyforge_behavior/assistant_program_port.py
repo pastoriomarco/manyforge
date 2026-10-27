@@ -126,7 +126,15 @@ class ProgramAssistantPortError(RuntimeError):
 
 
 class ProgramModelTransportError(RuntimeError):
-    """A bounded model transport failed before returning a valid response."""
+    """A bounded model transport failed before returning a valid response.
+
+    ``reason_code`` types a failure the transport classifies itself (e.g.
+    ``ai_model_token_unavailable``); otherwise the port classifies it.
+    """
+
+    def __init__(self, message: str, reason_code: str | None = None) -> None:
+        super().__init__(message)
+        self.reason_code = reason_code
 
 
 class ProgramSnapshotSourceError(RuntimeError):
@@ -150,6 +158,9 @@ class ProgramModelRequest:
     model_endpoint_alias: str
     external_resource_alias: str
     model_id: str
+    # The Deployment's AI model component serving every model alias.
+    base_url: str
+    api_key_env: str | None
     prompt_template_id: str
     prompt_template_version: str
     prompt_template_digest: str
@@ -166,12 +177,17 @@ class ProgramModelRequest:
             "model_endpoint_alias",
             "external_resource_alias",
             "model_id",
+            "base_url",
             "prompt_template_id",
             "prompt_template_version",
         ):
             value = getattr(self, field_name)
             if not isinstance(value, str) or not value:
                 raise ValueError(f"{field_name} must be non-empty text")
+        if self.api_key_env is not None and (
+            not isinstance(self.api_key_env, str) or not self.api_key_env
+        ):
+            raise ValueError("api_key_env must be absent or non-empty text")
         _digest(self.prompt_template_digest, field="prompt_template_digest")
         if (
             not isinstance(self.prompt, str)
@@ -303,7 +319,7 @@ class ProgramModelResponse:
 
 
 class ProgramModelTransport(Protocol):
-    """Site-owned transport that resolves config without runtime discovery."""
+    """Transport that sends each request to its AI model component."""
 
     def validate_endpoint(
         self,
@@ -352,6 +368,9 @@ class _AssistantContract:
     audit_policy: Mapping[str, bool]
     endpoints: Mapping[str, Mapping[str, Any]]
     templates: Mapping[str, Mapping[str, Any]]
+    # The Deployment's AI model components by id; a model alias names its
+    # component through `external_resource_alias`.
+    ai_models: Mapping[str, Mapping[str, Any]]
 
 
 @dataclass(frozen=True, slots=True)
@@ -549,6 +568,7 @@ def _parse_assistant(value: Mapping[str, Any]) -> _AssistantContract:
     _exact(
         root,
         {
+            "ai_models",
             "api_version",
             "projection_digest",
             "audit_policy",
@@ -573,6 +593,19 @@ def _parse_assistant(value: Mapping[str, Any]) -> _AssistantContract:
     )
     if any(type(value) is not bool for value in audit.values()):
         raise ProgramAssistantPortError("assistant audit policy must contain booleans")
+    ai_models: dict[str, Mapping[str, Any]] = {}
+    for index, raw in enumerate(_sequence(root["ai_models"], field="ai_models")):
+        row = dict(_mapping(raw, field=f"ai_models[{index}]"))
+        _exact(
+            row,
+            {"api_key_env", "base_url", "controllable_component_id", "model"},
+            path=f"ai_models[{index}]",
+        )
+        for name in ("base_url", "controllable_component_id", "model"):
+            _text(row[name], field=f"ai_models.{name}", maximum_bytes=4_096)
+        if row["api_key_env"] is not None:
+            _text(row["api_key_env"], field="ai_models.api_key_env", maximum_bytes=128)
+        ai_models[row["controllable_component_id"]] = MappingProxyType(row)
 
     endpoints: dict[str, Mapping[str, Any]] = {}
     previous = ""
@@ -714,6 +747,7 @@ def _parse_assistant(value: Mapping[str, Any]) -> _AssistantContract:
         MappingProxyType(audit),
         MappingProxyType(endpoints),
         MappingProxyType(templates),
+        MappingProxyType(ai_models),
     )
 
 
@@ -2022,6 +2056,13 @@ class ProgramAssistantPort:
             parameters.get("prompt_template_id"), field="prompt_template_id"
         )
         endpoint = context.assistant.endpoints[endpoint_alias]
+        ai_model = context.assistant.ai_models.get(endpoint["external_resource_alias"])
+        if ai_model is None:
+            raise _TaskFailure(
+                "assistant_ai_model_absent",
+                f"model endpoint {endpoint_alias!r} has no AI model component "
+                "in the active Deployment",
+            )
         template = context.assistant.templates[template_id]
         raw_variables, prompt_variables = self._template_variables(
             inputs, template["variables"]
@@ -2079,6 +2120,8 @@ class ProgramAssistantPort:
                 model_endpoint_alias=endpoint_alias,
                 external_resource_alias=endpoint["external_resource_alias"],
                 model_id=endpoint["model_id"],
+                base_url=ai_model["base_url"],
+                api_key_env=ai_model["api_key_env"],
                 prompt_template_id=template_id,
                 prompt_template_version=template["version"],
                 prompt_template_digest=template["content_digest"],
@@ -2120,21 +2163,26 @@ class ProgramAssistantPort:
                 timed_out = self._clock() >= deadline_s or "timed out" in str(
                     exc
                 ).lower()
+                reason = (
+                    exc.reason_code
+                    if isinstance(exc, ProgramModelTransportError)
+                    and exc.reason_code is not None
+                    else "model_request_timeout"
+                    if timed_out
+                    else "model_request_failed"
+                )
                 self._commit_model_attempt(
                     task,
                     ordinal,
-                    outcome="timeout" if timed_out else "transport_error",
-                    error_code=(
-                        "model_request_timeout"
-                        if timed_out
-                        else "model_request_failed"
+                    outcome=(
+                        "timeout"
+                        if reason == "model_request_timeout"
+                        else "transport_error"
                     ),
+                    error_code=reason,
                     error_message=str(exc),
                 )
-                raise _TaskFailure(
-                    "model_request_timeout" if timed_out else "model_request_failed",
-                    str(exc),
-                ) from exc
+                raise _TaskFailure(reason, str(exc)) from exc
             if not isinstance(response, ProgramModelResponse):
                 self._commit_model_attempt(
                     task,

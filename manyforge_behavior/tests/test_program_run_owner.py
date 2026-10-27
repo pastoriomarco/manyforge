@@ -4350,6 +4350,7 @@ def _scenario_selection(admission: ProgramRunAdmission) -> dict[str, Any]:
         "node_environment_digest": environment.environment_digest,
         "assistant_mode": "forbidden",
         "assistant_projection": None,
+        "simulation_scene": None,
         "owner_identities": [
             {
                 "owner_role": "headless_projection",
@@ -4476,6 +4477,12 @@ def test_applied_program_publication_is_complete_run_input() -> None:
             "baseline_program_binding_id": admission.program_binding_id,
             "preparation_digest": _DIGEST_C,
             "source": {"record_digest": _DIGEST_B},
+            "simulation_scene": {
+                "cell_frame_id": "universe",
+                "scene_entities": [
+                    {"entity": "/World/box", "scene_resource_id": "box"}
+                ],
+            },
         }
     )
 
@@ -4491,6 +4498,10 @@ def test_applied_program_publication_is_complete_run_input() -> None:
     assert joined.owner_identities[0].owner_role == "headless_projection"
     # The Applied Scenario project folder scopes the run's persistent values.
     assert joined.project_path == admission.project_path
+    # The simulator entity mapping reaches the client ports frozen.
+    scene = joined.port_context("program-run.1").simulation_scene
+    assert scene["cell_frame_id"] == "universe"
+    assert scene["scene_entities"][0]["entity"] == "/World/box"
     applied["graph_revision"] = _DIGEST_A
     try:
         build_applied_program_run_admission(

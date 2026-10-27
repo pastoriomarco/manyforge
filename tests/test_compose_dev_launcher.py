@@ -169,6 +169,8 @@ esac
         "FAKE_DOCKER_STARTED": str(tmp_path / "docker-started"),
         **settings,
     }
+    if "MANYFORGE_DEV_SITE_SETTINGS" not in settings:
+        environment.pop("MANYFORGE_DEV_SITE_SETTINGS", None)
     return environment
 
 
@@ -346,6 +348,10 @@ def test_start_preserves_ros_topology_by_default_and_refuses_removed_flag(
         environment.pop(name, None)
         if experiment_enabled:
             environment[name] = value
+    for name in [name for name in environment if name.startswith("MANYFORGE_AI_")]:
+        environment.pop(name)
+    if experiment_enabled:
+        environment["MANYFORGE_AI_CHAT_TOKEN"] = "secret-token-value"
     environment.pop("MANYFORGE_MOTION_TRACE_DIR", None)
     if trace_enabled:
         environment["MANYFORGE_MOTION_TRACE_DIR"] = "/tmp/manyforge-state/motion-traces"
@@ -403,6 +409,8 @@ esac
     assert ("--env MANYFORGE_MOTION_TRACE_DIR" in command) is trace_enabled
     for name in experiments:
         assert (f"--env {name}" in command) is experiment_enabled
+    assert ("--env MANYFORGE_AI_CHAT_TOKEN" in command) is experiment_enabled
+    assert "secret-token-value" not in command
     assert os.access(workspace, os.W_OK)
     assert f"-v {workspace}:/workspace" in command
     runtime_root = tmp_path / "cache/runtime" / container_name
@@ -431,6 +439,60 @@ esac
     assert "ROS_STATIC_PEERS=orin;laptop" not in command
 
 
+def test_developer_start_forwards_explicit_site_settings(tmp_path: Path) -> None:
+    launcher = _copy_writable_launcher(tmp_path)
+    inputs = tmp_path / "site-inputs"
+    inputs.mkdir()
+    site = inputs / "manyforge.site.json"
+    site.write_text(
+        '{"schema":"manyforge.site.v1","device_addresses":{"lite6_main":"192.168.1.31"}}\n',
+        encoding="utf-8",
+    )
+    environment = _fake_docker_environment(
+        tmp_path,
+        FAKE_WORKSPACE=str(launcher.parents[1]),
+        FAKE_CONTAINER_PRESENT="false",
+        MANYFORGE_DEV_IMAGE="sha256:test",
+        MANYFORGE_DEV_SITE_SETTINGS=str(site),
+    )
+    completed = subprocess.run(
+        ["/bin/bash", str(launcher), "start"],
+        cwd=launcher.parents[1],
+        env=environment,
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+
+    assert completed.returncode == 0, completed.stderr
+    command = next(
+        call
+        for call in Path(environment["FAKE_DOCKER_CALLS"]).read_text().splitlines()
+        if call.startswith("run ")
+    )
+    assert command.count(f"-v {inputs}:{inputs}:ro") == 1
+    assert command.endswith(
+        "sha256:test python3 scripts/dev-workbench.py serve "
+        f"--site-settings {site}"
+    )
+
+
+@pytest.mark.parametrize("setting", ["relative/site.json", "/missing/manyforge.site.json"])
+def test_developer_start_refuses_unavailable_site_settings(
+    tmp_path: Path, setting: str
+) -> None:
+    completed, environment = _run_launcher(
+        tmp_path,
+        "start",
+        FAKE_CONTAINER_PRESENT="false",
+        MANYFORGE_DEV_IMAGE="sha256:test",
+        MANYFORGE_DEV_SITE_SETTINGS=setting,
+    )
+
+    assert completed.returncode == 64
+    assert "Development site settings" in completed.stderr
+    calls = Path(environment["FAKE_DOCKER_CALLS"]).read_text().splitlines()
+    assert not any(call.startswith("run ") for call in calls)
 @pytest.mark.parametrize("same_root", [False, True])
 def test_start_refuses_shared_live_state_but_allows_another_root(tmp_path: Path, same_root: bool) -> None:
     launcher = LAUNCHER if same_root else _copy_writable_launcher(tmp_path)
@@ -450,6 +512,190 @@ def test_start_refuses_shared_live_state_but_allows_another_root(tmp_path: Path,
     else:
         assert completed.returncode == 0, completed.stderr
         assert f"-v {state_root}:/tmp/manyforge-state" in next(call for call in calls if call.startswith("run "))
+
+
+def test_start_mounts_external_project_folders_with_stable_composer_roots(tmp_path: Path) -> None:
+    launcher = _copy_writable_launcher(tmp_path)
+    folders = [
+        tmp_path / parent / "user projects" for parent in ("first, group", "second", "third")
+    ]
+    for folder in folders:
+        folder.mkdir(parents=True)
+    site = tmp_path / "manyforge.site.json"
+    site.write_text(json.dumps({"schema": "manyforge.site.v1", "project_folders": list(map(str, folders))}))
+    environment = _fake_docker_environment(
+        tmp_path,
+        FAKE_WORKSPACE=str(launcher.parents[1]),
+        MANYFORGE_DEV_IMAGE="sha256:test",
+        FAKE_CONTAINER_PRESENT="false",
+        MANYFORGE_DEV_SITE_SETTINGS=str(site),
+    )
+    completed = subprocess.run(
+        ["bash", str(launcher), "start"], cwd=REPOSITORY_ROOT,
+        env=environment, capture_output=True, text=True, check=False,
+    )
+    assert completed.returncode == 0, completed.stderr
+    command = next(
+        line for line in Path(environment["FAKE_DOCKER_CALLS"]).read_text().splitlines()
+        if line.startswith("run ")
+    )
+    roots = ["/projects/user projects", "/projects/user projects-2", "/projects/user projects-3"]
+    for folder, root in zip(folders, roots):
+        assert f"-v {folder}:{root}" in command
+    assert f"-e MANYFORGE_DEV_PROJECT_ROOTS={','.join(roots)}" in command
+    mappings = [
+        {"hostPath": str(folder), "containerPath": root}
+        for folder, root in zip(folders, roots)
+    ]
+    assert (
+        "-e MANYFORGE_PROJECT_ROOT_MAPPINGS=" + json.dumps(mappings, separators=(",", ":"))
+    ) in command
+
+
+def test_start_accepts_site_without_project_folders(tmp_path: Path) -> None:
+    launcher = _copy_writable_launcher(tmp_path)
+    site = tmp_path / "manyforge.site.json"
+    site.write_text(json.dumps({"schema": "manyforge.site.v1", "device_addresses": {}}))
+    environment = _fake_docker_environment(
+        tmp_path, FAKE_WORKSPACE=str(launcher.parents[1]),
+        MANYFORGE_DEV_IMAGE="sha256:test", FAKE_CONTAINER_PRESENT="false",
+        MANYFORGE_DEV_SITE_SETTINGS=str(site),
+    )
+    completed = subprocess.run(
+        ["bash", str(launcher), "start"], cwd=REPOSITORY_ROOT,
+        env=environment, capture_output=True, text=True, check=False,
+    )
+    assert completed.returncode == 0, completed.stderr
+    command = next(
+        line for line in Path(environment["FAKE_DOCKER_CALLS"]).read_text().splitlines()
+        if line.startswith("run ")
+    )
+    assert "MANYFORGE_DEV_PROJECT_ROOTS" not in command
+
+
+@pytest.mark.parametrize("folder", ["relative/folder", "/nonexistent/project/folder"])
+def test_start_refuses_unavailable_project_folders(tmp_path: Path, folder: str) -> None:
+    launcher = _copy_writable_launcher(tmp_path)
+    site = tmp_path / "manyforge.site.json"
+    site.write_text(json.dumps({"schema": "manyforge.site.v1", "project_folders": [folder]}))
+    environment = _fake_docker_environment(
+        tmp_path,
+        FAKE_WORKSPACE=str(launcher.parents[1]),
+        MANYFORGE_DEV_IMAGE="sha256:test",
+        FAKE_CONTAINER_PRESENT="false",
+        MANYFORGE_DEV_SITE_SETTINGS=str(site),
+    )
+    completed = subprocess.run(
+        ["bash", str(launcher), "start"], cwd=REPOSITORY_ROOT,
+        env=environment, capture_output=True, text=True, check=False,
+    )
+    assert completed.returncode == 64
+    assert "project_folder_invalid" in completed.stderr
+    assert "existing absolute directory" in completed.stderr
+    assert not any(
+        line.startswith("run ") for line in Path(environment["FAKE_DOCKER_CALLS"]).read_text().splitlines()
+    )
+
+
+@pytest.mark.parametrize("name", ["project,one", " leading", "trailing ", "trailing\u00a0", "project:one"])
+def test_start_refuses_project_folder_names_unsupported_by_root_encoding(
+    tmp_path: Path, name: str,
+) -> None:
+    launcher = _copy_writable_launcher(tmp_path)
+    folder = tmp_path / name
+    folder.mkdir()
+    site = tmp_path / "manyforge.site.json"
+    site.write_text(json.dumps({"schema": "manyforge.site.v1", "project_folders": [str(folder)]}))
+    environment = _fake_docker_environment(
+        tmp_path,
+        FAKE_WORKSPACE=str(launcher.parents[1]),
+        MANYFORGE_DEV_IMAGE="sha256:test",
+        FAKE_CONTAINER_PRESENT="false",
+        MANYFORGE_DEV_SITE_SETTINGS=str(site),
+    )
+    completed = subprocess.run(
+        ["bash", str(launcher), "start"], cwd=REPOSITORY_ROOT,
+        env=environment, capture_output=True, text=True, check=False,
+    )
+    assert completed.returncode == 64
+    assert "project_folder_invalid" in completed.stderr
+    assert "':'" in completed.stderr
+    assert not any(
+        line.startswith("run ") for line in Path(environment["FAKE_DOCKER_CALLS"]).read_text().splitlines()
+    )
+
+
+def test_start_refuses_colon_in_project_folder_parent(tmp_path: Path) -> None:
+    launcher = _copy_writable_launcher(tmp_path)
+    folder = tmp_path / "parent:one" / "projects"
+    folder.mkdir(parents=True)
+    site = tmp_path / "manyforge.site.json"
+    site.write_text(json.dumps({"schema": "manyforge.site.v1", "project_folders": [str(folder)]}))
+    environment = _fake_docker_environment(
+        tmp_path, FAKE_WORKSPACE=str(launcher.parents[1]),
+        MANYFORGE_DEV_IMAGE="sha256:test", FAKE_CONTAINER_PRESENT="false",
+        MANYFORGE_DEV_SITE_SETTINGS=str(site),
+    )
+    completed = subprocess.run(
+        ["bash", str(launcher), "start"], cwd=REPOSITORY_ROOT,
+        env=environment, capture_output=True, text=True, check=False,
+    )
+    assert completed.returncode == 64
+    assert "project_folder_invalid" in completed.stderr and "':'" in completed.stderr
+    assert not any(
+        line.startswith("run ") for line in Path(environment["FAKE_DOCKER_CALLS"]).read_text().splitlines()
+    )
+
+
+@pytest.mark.parametrize("contents", [
+    "{invalid json", "[]", "{}", '{"schema": "wrong"}',
+    '{"schema": "manyforge.site.v1", "unknown": true}',
+    '{"schema": "manyforge.site.v1", "project_folders": "not-a-list"}',
+])
+def test_start_refuses_invalid_project_folder_site_settings(tmp_path: Path, contents: str) -> None:
+    launcher = _copy_writable_launcher(tmp_path)
+    site = tmp_path / "manyforge.site.json"
+    site.write_text(contents)
+    environment = _fake_docker_environment(
+        tmp_path, FAKE_WORKSPACE=str(launcher.parents[1]),
+        MANYFORGE_DEV_IMAGE="sha256:test", FAKE_CONTAINER_PRESENT="false",
+        MANYFORGE_DEV_SITE_SETTINGS=str(site),
+    )
+    completed = subprocess.run(
+        ["bash", str(launcher), "start"], cwd=REPOSITORY_ROOT,
+        env=environment, capture_output=True, text=True, check=False,
+    )
+    assert completed.returncode == 64
+    assert "project_folder_invalid" in completed.stderr
+    if contents == "{invalid json":
+        assert "site settings file must be JSON" in completed.stderr
+    assert not any(
+        line.startswith("run ") for line in Path(environment["FAKE_DOCKER_CALLS"]).read_text().splitlines()
+    )
+
+
+def test_start_refuses_duplicate_project_folders(tmp_path: Path) -> None:
+    launcher = _copy_writable_launcher(tmp_path)
+    folder = tmp_path / "projects"
+    folder.mkdir()
+    site = tmp_path / "manyforge.site.json"
+    site.write_text(json.dumps({
+        "schema": "manyforge.site.v1", "project_folders": [str(folder), str(folder)],
+    }))
+    environment = _fake_docker_environment(
+        tmp_path, FAKE_WORKSPACE=str(launcher.parents[1]),
+        MANYFORGE_DEV_IMAGE="sha256:test", FAKE_CONTAINER_PRESENT="false",
+        MANYFORGE_DEV_SITE_SETTINGS=str(site),
+    )
+    completed = subprocess.run(
+        ["bash", str(launcher), "start"], cwd=REPOSITORY_ROOT,
+        env=environment, capture_output=True, text=True, check=False,
+    )
+    assert completed.returncode == 64
+    assert "project_folder_invalid" in completed.stderr and "project_folders repeats" in completed.stderr
+    assert not any(
+        line.startswith("run ") for line in Path(environment["FAKE_DOCKER_CALLS"]).read_text().splitlines()
+    )
 
 
 def test_start_does_not_infer_unique_state_root_from_failed_inspection(tmp_path: Path) -> None:
@@ -581,9 +827,9 @@ def test_g_export_failure_keeps_container_and_never_starts_replacement(tmp_path,
 
 def test_g_failed_start_returns_exact_metadata_and_leaves_ros_client_for_owner_cleanup(tmp_path):
     environment = _g_environment(tmp_path, FAKE_CONTAINER_PRESENT="false", FAKE_EXIT_AFTER_RUN="true")
-    # Fixture storage is owned scratch under HOME, representing persistent host
-    # storage. Production rejects /tmp and tmpfs; no test-only bypass is used.
-    with tempfile.TemporaryDirectory(prefix="manyforge-q93-fixture-", dir=Path.home()) as persistent:
+    # Keep scratch on the repository's mounted filesystem, independently of the
+    # invoking user's HOME. Production rejects /tmp and tmpfs; no bypass is used.
+    with tempfile.TemporaryDirectory(prefix="manyforge-q93-fixture-", dir=REPOSITORY_ROOT) as persistent:
         install = tmp_path / "qualified-package"
         install.mkdir()
         workspace = tmp_path / "workspace"
@@ -991,3 +1237,43 @@ def test_owned_extra_entries_removed_in_place_without_adding_failed_capture_sibl
     assert not list((root/'evidence').glob('*.partial'))
     assert Path(environment['FAKE_DOCKER_REMOVED']).exists()
     assert outside.read_bytes() == b'foreign target'
+
+
+def test_start_creates_owner_only_writable_runtime_under_group_umask(tmp_path: Path) -> None:
+    environment = _fake_docker_environment(tmp_path, MANYFORGE_DEV_IMAGE="sha256:test",
+        FAKE_CONTAINER_PRESENT="false")
+    completed = subprocess.run(["bash", "-c", 'umask 0002; exec bash "$0" start', str(LAUNCHER)],
+        cwd=REPOSITORY_ROOT, env=environment, capture_output=True, text=True, check=False)
+    assert completed.returncode == 0, completed.stderr
+    runtime_root = tmp_path / "cache/runtime/manyforge-development-workbench"
+    for directory in (runtime_root, runtime_root / "current"):
+        assert directory.stat().st_mode & 0o022 == 0, directory
+
+
+def test_build_prepares_sources_then_builds_the_default_full_ros_image(tmp_path: Path) -> None:
+    launcher = _copy_writable_launcher(tmp_path)
+    workspace = launcher.parents[1]
+    calls = tmp_path / "calls"
+    setup = launcher.parent / "setup-docker.sh"
+    setup.write_text(f'#!/usr/bin/env bash\nprintf "setup %s\\n" "$*" >> {calls}\n')
+    setup.chmod(0o755)
+    fake_bin = tmp_path / "bin"
+    fake_bin.mkdir()
+    docker = fake_bin / "docker"
+    docker.write_text(f'#!/usr/bin/env bash\nprintf "docker %s image=%s suite=%s\\n" "$*" '
+                      f'"$MANYFORGE_ROS_FULL_IMAGE" "$NVIDIA_ISAAC_ROS_RELEASE_SUITE" >> {calls}\n')
+    docker.chmod(0o755)
+    environment = {key: value for key, value in os.environ.items()
+                   if key not in ("MANYFORGE_DEV_IMAGE", "MANYFORGE_ROS_FULL_IMAGE",
+                                  "NVIDIA_ISAAC_ROS_RELEASE_SUITE")}
+    environment["PATH"] = f"{fake_bin}:{environment['PATH']}"
+    completed = subprocess.run(["bash", str(launcher), "build"], cwd=tmp_path, env=environment,
+        capture_output=True, text=True, check=False)
+    assert completed.returncode == 0, completed.stderr
+    suite = "noble-jetpack" if Path("/etc/nv_tegra_release").exists() else "noble"
+    assert calls.read_text().splitlines() == [
+        "setup --prepare-only",
+        f"docker compose -f {workspace}/docker-compose.yaml --profile ros-full build ros-jazzy-full "
+        f"image=manyforge-ros-lyrical-full suite={suite}",
+    ]
+    assert "compose-dev.sh start" in completed.stdout

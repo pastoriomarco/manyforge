@@ -25,17 +25,13 @@ import uuid
 sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
 from scripts.lib.export_retention import (
     _check_root_identity, _mounted_children, _safe_path, _MAX_SCAN_ENTRIES,
+    _LEGACY_SESSION_ENTRIES,
 )
 
 MARKER_SCHEMA = "manyforge.workbench_session.v1"
 REPORT_SCHEMA = "manyforge.workbench_previous_session.v1"
 _ID = re.compile(r"[0-9a-f]{32}\Z")
-_LEGACY = frozenset({
-    "manager", "manager-run", "execution-state", "execution-run", "publications",
-    "artifacts", "composer-authoring", "installed-targets", "workbench-startup-timing.json",
-    *(name + suffix for name in ("program-cycle.sqlite3", "logical-scene.sqlite3")
-      for suffix in ("", "-wal", "-shm", "-journal")),
-})
+_LEGACY = _LEGACY_SESSION_ENTRIES
 _STABLE = frozenset({
     "current", "previous-sessions", "session-reports", "evidence",
     # The simulated PLC's own per-device settings, kept across sessions.
@@ -221,7 +217,7 @@ def _effect_observations(folder: Path) -> tuple[str, list[str], list[str]]:
                 if application is not None and (database.execute("PRAGMA application_id").fetchone() != (application,) or database.execute("PRAGMA user_version").fetchone()[0] not in (version if isinstance(version, tuple) else (version,))):
                     raise ValueError("unsupported journal schema")
                 if family == "program_cycle":
-                    if database.execute("SELECT singleton,schema_version FROM program_cycle_metadata").fetchall() != [(1, 7)]:
+                    if database.execute("SELECT singleton,schema_version FROM program_cycle_metadata").fetchall() not in ([(1, 7)], [(1, 8)]):
                         raise ValueError("unsupported Program journal schema")
                     if database.execute("SELECT singleton FROM program_cycle").fetchall() != [(1,)]:
                         raise ValueError("Program owner row absent or invalid")
@@ -273,6 +269,13 @@ def _report(root: Path, identity: str, marker: dict | None) -> dict:
     if not source.exists():
         source = root / "current"
     effects, unknown, unresolved = _effect_observations(source) if marker is not None else ("unknown", ["program_cycle", "scene", "manager", "cclc", "kernel_operation"], [])
+    message = (f"Previous workbench session {identity}: effects are {effects}"
+               + ("; shutdown was unclean or could not be verified." if shutdown != "clean" else "; owned processes stopped normally.")
+               + " The new cell is empty; no previous state was adopted or replayed."
+               + (" Unresolved journal families: " + ", ".join(unresolved) + "." if unresolved else "")
+               + (" Unknown journal families: " + ", ".join(unknown) + "." if unknown else "")
+               + " Previous journal events may be absent from History.")
+    legacy_message = message + " All previous journals are kept for investigation."
     value = {
         "schema_version": REPORT_SCHEMA,
         "session_id": identity,
@@ -281,22 +284,21 @@ def _report(root: Path, identity: str, marker: dict | None) -> dict:
         "effects": effects,
         "history_coverage": "not_imported",
         "journal_families": ["program_cycle", "scene", "manager", "cclc", "kernel_operation"],
-        "message": (f"Previous workbench session {identity}: effects are {effects}"
-                    + ("; shutdown was unclean or could not be verified." if shutdown != "clean" else "; owned processes stopped normally.")
-                    + " The new cell is empty; no previous state was adopted or replayed."
-                    + (" Unresolved journal families: " + ", ".join(unresolved) + "." if unresolved else "")
-                    + (" Unknown journal families: " + ", ".join(unknown) + "." if unknown else "")
-                    + " Previous journal events may be absent from History. All previous journals are kept for investigation."),
+        "message": (message + " Up to five previous sessions are normally kept; "
+                    "copy any journals you want to retain."),
     }
     reports = _directory(root, "session-reports")
     completed = reports / (identity + ".json")
     pending = _directory(reports, "pending") / (identity + ".json")
-    if completed.exists() or completed.is_symlink():
-        if _read(completed) != value:
+    existing = completed if completed.exists() or completed.is_symlink() else pending
+    if existing.exists() or existing.is_symlink():
+        recorded = _read(existing)
+        # An interrupted selection can contain the exact old report text.
+        # Keep that report byte-for-byte so the durable selection still matches.
+        legacy = dict(value, message=legacy_message)
+        if recorded != value and recorded != legacy:
             raise ValueError("recorded previous-session report conflicts with its archive; preserved")
-    elif pending.exists() or pending.is_symlink():
-        if _read(pending) != value:
-            raise ValueError("pending previous-session report conflicts with its archive; preserved")
+        value = recorded
     else:
         _write(pending, value)
     return value

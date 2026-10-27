@@ -492,6 +492,55 @@ void expect_refused(const ControllerRobotDescriptionRequest &request,
   }
 }
 
+// CP8 step 2a: a measured hardware (Real) uses the same generator with its
+// own plugin, parameters and command interfaces and writes no initial value.
+TEST(ControllerRobotDescription, MeasuredHardwareSectionIsTheSpecWithoutInitialValues) {
+  const auto text = read_repository_file(
+      "manyforge_example_models/models/lite6_lite_gripper/lite6_lite_gripper.urdf");
+  const std::vector<std::string> arm{"joint1", "joint2", "joint3",
+                                     "joint4", "joint5", "joint6"};
+  Ros2ControlHardwareSpec hardware;
+  hardware.plugin = "vendor_hardware/System";
+  hardware.parameters = {{"address", "R10.0.0.1"}, {"mode", "a&b"}};
+  hardware.joint_command_interfaces = {"position", "velocity"};
+  hardware.seeds_initial_positions = false;
+  auto request = mock_request(text, arm, {});
+  std::get<MockControllerLane>(request.lane).hardware = hardware;
+  const auto generated = generate_controller_robot_description(request);
+  expect_model_unchanged(text, generated, "ManyForgeMockSystem", 2U);
+  const auto section = generated.substr(generated.find("  <ros2_control "));
+  EXPECT_EQ(section.substr(0U, section.find("    <joint name=\"joint2\">")),
+            "  <ros2_control name=\"ManyForgeMockSystem\" type=\"system\">\n"
+            "    <hardware>\n"
+            "      <plugin>vendor_hardware/System</plugin>\n"
+            "      <param name=\"address\">R10.0.0.1</param>\n"
+            "      <param name=\"mode\">a&amp;b</param>\n"
+            "    </hardware>\n"
+            "    <joint name=\"joint1\">\n"
+            "      <command_interface name=\"position\"/>\n"
+            "      <command_interface name=\"velocity\"/>\n"
+            "      <state_interface name=\"position\"/>\n"
+            "      <state_interface name=\"velocity\"/>\n"
+            "    </joint>\n");
+  EXPECT_EQ(generated.find("initial_value"), std::string::npos);
+
+  // A deployment pose is never written into measured hardware.
+  auto seeded = mock_request(text, arm, ramp(arm.size()));
+  std::get<MockControllerLane>(seeded.lane).hardware = hardware;
+  EXPECT_THROW(static_cast<void>(generate_controller_robot_description(seeded)),
+               ControllerRobotDescriptionError);
+  // The hardware data must name a plugin and a command interface.
+  auto no_plugin = request;
+  std::get<MockControllerLane>(no_plugin.lane).hardware.plugin.clear();
+  EXPECT_THROW(static_cast<void>(generate_controller_robot_description(no_plugin)),
+               ControllerRobotDescriptionError);
+  auto no_interface = request;
+  std::get<MockControllerLane>(no_interface.lane)
+      .hardware.joint_command_interfaces.clear();
+  EXPECT_THROW(static_cast<void>(generate_controller_robot_description(no_interface)),
+               ControllerRobotDescriptionError);
+}
+
 TEST(ControllerRobotDescription, FailsClosedOnInvalidInputs) {
   const std::string text = kSynthetic;
   const auto nan = std::numeric_limits<double>::quiet_NaN();

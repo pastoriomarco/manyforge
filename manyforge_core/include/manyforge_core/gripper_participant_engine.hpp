@@ -90,6 +90,10 @@ class GripperParticipantEngine final : public IResolvedParticipantExecutionEngin
     return Result<T>::Err(unsupported_error());
   }
   std::uint64_t bump_control_command_epoch();
+  /// reset_gripper without reopening admission: stale check plus the Reset
+  /// invalidation of the exact backend command generation.
+  Result<void> close_gripper_generation(const std::string& gripper_id, std::uint64_t command_id,
+                                        std::uint64_t generation);
   void emit_event(KernelEvent event);
   struct PreparedCapabilityCommandSession;
   IGripperCommandBackend& backend_;

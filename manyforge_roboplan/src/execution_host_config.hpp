@@ -7,6 +7,7 @@
 #include <string>
 #include <string_view>
 #include <manyforge_component_manager/selected_runtime_composition.hpp>
+#include <manyforge_component_manager/site_settings.hpp>
 #include <manyforge_content_identity/content_identity.hpp>
 #include <manyforge_core/sqlite_cclc_journal.hpp>
 #include <manyforge_core/types/cell_admission.hpp>
@@ -95,6 +96,9 @@ struct ManagedRuntimeChildConfig final {
   /// Approved scene-asset root for relative scene meshes; absent when the
   /// Manager has none configured (relative scene meshes then fail closed).
   std::optional<int> scene_asset_root_fd;
+  /// Generic machine site facts (`manyforge.site.v1`); absent when the
+  /// Manager has no site settings file configured.
+  std::optional<component_manager::SiteSettings> site_settings;
   std::filesystem::path package_root;
   std::filesystem::path program_artifact_root;
   std::filesystem::path manager_state_root;

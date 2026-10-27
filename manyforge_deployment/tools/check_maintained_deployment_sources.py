@@ -195,16 +195,29 @@ _UI6I_RUNTIME_RESTORATION_ACCEPTANCE: Final = [
     },
 ]
 # Q63-Q66: the offline mock lane replaces the native simulated executor; every
-# retained native value keeps its historical source, the lane selection and
-# controller profile are maintainer decisions (no native direct-control field).
+# retained native value keeps its historical source and the controller profile
+# is a maintainer decision (no native direct-control field). The cell-wide
+# `mode` field is deleted (maintainer decision 2026-10-25): the selected
+# controller profile alone decides each component's state authority.
 _MOCK_RUNTIME_RESTORATION_SOURCE_FIELDS: Final = {
     **{
         field: source
         for field, source in _RUNTIME_RESTORATION_SOURCE_FIELDS.items()
-        if field != "direct_control_joint_limits"
+        if field not in {"direct_control_joint_limits", "mode"}
     },
     "mock_profile": "maintainer_decision.Q69.model_family_id",
-    "mode": "maintainer_decision.Q63_Q66.offline_mock_lane",
+}
+# CP8 step 1: the Real lane reuses the Mock example values unchanged; only the
+# vendor controller profile is a maintainer decision. The arm reports measured
+# state; the gripper is Mock's pneumatic target with no output (display only)
+# and no gripper_feedback stream (maintainer decision 2026-10-27).
+_REAL_RUNTIME_RESTORATION_SOURCE_FIELDS: Final = {
+    **{
+        field: source
+        for field, source in _MOCK_RUNTIME_RESTORATION_SOURCE_FIELDS.items()
+        if field != "mock_profile"
+    },
+    "real_profile": "maintainer_decision.CP8_step1.real_lane_vendor_profile",
 }
 _ROS2_CONTROL_RUNTIME_RESTORATION_SOURCE_FIELDS: Final = {
     "collision_monitor_period_ms": "orchestrator.config.collision_monitor_period_ms",
@@ -216,7 +229,6 @@ _ROS2_CONTROL_RUNTIME_RESTORATION_SOURCE_FIELDS: Final = {
         "adapters.execution.config.initial_joint_positions_rad"
     ),
     "isaac_profile": "robot_config.robot_id",
-    "mode": "adapters.execution.config.execution_state_source_mode",
     "operator_stop_profile": "adapters.execution.config.operator_stop_profile",
     "planner_rng_seed": "adapters.planning.config.rng_seed",
     "runtime_collision_immediate_query_budget_ms": (
@@ -276,46 +288,61 @@ _ROS2_CONTROL_RUNTIME_RESTORATION_ACCEPTANCE: Final = [
         "acceptance_steps": ["I9/I"],
     },
 ]
+_REAL_RUNTIME_RESTORATION_ACCEPTANCE: Final = [
+    *_RUNTIME_RESTORATION_ACCEPTANCE,
+    {
+        "obligation_id": "real_measured_state_authority_and_vendor_adapter",
+        "acceptance_steps": ["CP8"],
+    },
+]
 _EXPECTED_RUNTIME_RESTORATION_PROFILE_DIGESTS: Final = {
+    "ai_model_v0": (
+        "bccfd7ba8d8437b5be1c464abdb4532713e0664df0863d7464be920abded1c52"
+    ),
     "io_device_v0": (
         "28b47a00f2ae915e3281bc6a58c0927f164aaa8a8d4a4635a997a49e6436f6b1"
     ),
     "lite6_isaac_commanded_v0": (
-        "350f4d6e6ccaf544ef5b94358ba4cb1bd98c693e7db9cec49c9701b298b5ba5a"
+        "7af7704209054402d706fe67877821bbd29d20ebea7a04b9089e586ef7e57cc9"
     ),
     "lite6_mock_commanded_v0": (
-        "2a854c48a0abe25d4f9484c95ab84220ad14a8e6799829d870ee1944b61c6887"
+        "f1ff9fe2d962b6efd85f35654d4a92ab4ee3e41c3d0ac1d045040279120c746d"
+    ),
+    "lite6_real_measured_v0": (
+        "bd34d00e6fddef5ddb86d2e644341a05e84b2d70afeff1ad53c805ae6a29e4cd"
     ),
     "pose_source_v0": (
         "a28e7e7a46931cb858ad4bc15c45ac13a5e42eb9d76be318ff28e75600e7ec58"
     ),
     "ur10e_robotiq_assistant_isaac_commanded_v0": (
-        "a2a7cfdac8d6decab6123c353fdeb29d17c85290a1c9a9b6434c3f7c7134c1a1"
+        "8cd6035fd0b4a781a779290b43b87a6829a99e19840a8441fd4121a533685a49"
     ),
     "ur10e_robotiq_assistant_mock_commanded_v0": (
-        "f1639309835d38c8e846ba8a9645df5e566826d4fb82f06fed410d9529a3f8ab"
+        "7fd76b2afa80b3b57acf6a4c099ac9bd78c82e3fa6b36376564eb1e7005b5ecf"
     ),
     "ur10e_robotiq_isaac_commanded_v0": (
-        "f0f0f155cb958c4ab1f318fd50d566fb41e8d0875899532213c91ffe9b42c3b4"
+        "f83e6fb244841ba9ab4b996dd638a786c24a9dbb86e940ebadb0b3a740e1b999"
     ),
     "ur10e_robotiq_mock_commanded_v0": (
-        "1ce483999e32e1831d6fd7227176f4e71c1a183583a7ff6da3fd47aa9aee8c5a"
+        "30319bf8b9bfa9735acb2ac1c08c3cc7db4873bfdab4cd8874268f2422a2de05"
     ),
     "ur5_mock_commanded_v0": (
-        "e4b832ee25720120dafb59ceffcc825d9818b6891c0aa4f23e2552b77c171c0a"
+        "6d510e8311d1af79c24e3c9ff7b5ddd62be1da0552f133f7da67103224a98de6"
     ),
     "ur5e_robotiq_mock_commanded_v0": (
-        "78de6e26b63cf831c0187e289b2846e080d62b43a16068ddb5afebafe26bb526"
+        "f01881be78f8fe572c85b186c07c4e2e60fc73397c7b588b43d8c4020a01d445"
     ),
 }
 # Model-free component profiles: runtime member -> exact profile id.
 _MODEL_FREE_PROFILE_IDS: Final = {
+    "ai_model_runtime": "ai_model_v0",
     "io_provider_runtime": "io_device_v0",
     "pose_source_runtime": "pose_source_v0",
 }
 _EXPECTED_RUNTIME_RESTORATION_PROFILE_FAMILIES: Final = {
     "lite6_isaac_commanded_v0": "lite6_lite_gripper",
     "lite6_mock_commanded_v0": "lite6_lite_gripper",
+    "lite6_real_measured_v0": "lite6_lite_gripper",
     "ur10e_robotiq_assistant_isaac_commanded_v0": "ur10e_robotiq_2f_140",
     "ur10e_robotiq_assistant_mock_commanded_v0": "ur10e_robotiq_2f_140",
     "ur10e_robotiq_isaac_commanded_v0": "ur10e_robotiq_2f_140",
@@ -981,7 +1008,7 @@ def _validate_assistant_profiles(source: Path) -> set[str]:
         mode_profiles["scene_authoring"],
         path="assistant_profiles.mode_profiles.scene_authoring",
     )
-    if set(modes) != {"query", "composer-assistant"}:
+    if set(modes) != {"composer-assistant"}:
         raise SourceDescriptionError(
             "assistant scene-authoring profile changes the reserved mode set"
         )
@@ -1000,11 +1027,10 @@ def _validate_assistant_profiles(source: Path) -> set[str]:
             required=frozenset({"session_kind", "approval_mode", "review_policy"}),
             path=f"{mode_path}.grant_policy",
         )
-        expected_review = "not_required" if mode_id == "query" else "required"
         if (
             grant["session_kind"] is not None
             or grant["approval_mode"] is not None
-            or grant["review_policy"] != expected_review
+            or grant["review_policy"] != "required"
         ):
             raise SourceDescriptionError(
                 f"{mode_path}.grant_policy changes reserved offline semantics"
@@ -1630,18 +1656,96 @@ def _validate_role_assignment(
     return scenario_id, aliases
 
 
+_AI_MODEL_API_KEY_ENV: Final = re.compile(r"MANYFORGE_AI_[A-Z0-9_]{1,115}")
+
+
+def _validate_ai_models(
+    value: object, assistant_model_components: object, *,
+    component_occurrence_id: object, path: str
+) -> None:
+    """The optional model-free AI model components of a Deployment and the
+    optional alias -> component mapping of its assistant profile."""
+    component_ids = [
+        _validate_ai_model(
+            row, component_occurrence_id=component_occurrence_id,
+            path=f"{path}.ai_models[{index}]",
+        )
+        for index, row in enumerate(_array(value, path=f"{path}.ai_models"))
+    ]
+    if not component_ids:
+        raise SourceDescriptionError(f"{path}.ai_models must not be empty")
+    _canonical_unique(component_ids, path=f"{path}.ai_models")
+    if assistant_model_components is None:
+        return
+    mapping = _object(
+        assistant_model_components, path=f"{path}.assistant_model_components"
+    )
+    for alias, component in mapping.items():
+        _identifier(alias, path=f"{path}.assistant_model_components")
+        if component not in component_ids:
+            raise SourceDescriptionError(
+                f"{path}.assistant_model_components.{alias} must name an "
+                "ai_models component"
+            )
+
+
+def _validate_ai_model(
+    value: object, *, component_occurrence_id: object, path: str
+) -> str:
+    """Shape of one model-free AI model component of a Deployment."""
+    ai_model = _exact(
+        value,
+        required=frozenset({"component_id", "runtime_configuration"}),
+        path=path,
+    )
+    component_id = _identifier(ai_model["component_id"], path=f"{path}.component_id")
+    if component_id == component_occurrence_id:
+        raise SourceDescriptionError(
+            f"{path}.component_id must differ from the robot component"
+        )
+    configuration = _exact(
+        ai_model["runtime_configuration"],
+        required=frozenset({"base_url", "model", "api_key_env"}),
+        path=f"{path}.runtime_configuration",
+    )
+    base_url = _text(
+        configuration["base_url"], path=f"{path}.runtime_configuration.base_url"
+    )
+    if not base_url.startswith(("http://", "https://")):
+        raise SourceDescriptionError(
+            f"{path}.runtime_configuration.base_url must be an http(s) URL"
+        )
+    _text(configuration["model"], path=f"{path}.runtime_configuration.model")
+    api_key_env = configuration["api_key_env"]
+    if api_key_env is not None and (
+        type(api_key_env) is not str
+        or _AI_MODEL_API_KEY_ENV.fullmatch(api_key_env) is None
+    ):
+        raise SourceDescriptionError(
+            f"{path}.runtime_configuration.api_key_env must be null or a "
+            "MANYFORGE_AI_ environment variable name"
+        )
+    return component_id
+
+
 def _validate_pose_source(
     value: object, *, component_occurrence_id: object, path: str
 ) -> None:
     """Shape of the model-free pose-source component of an Isaac Deployment.
 
     The runtime configuration itself is checked by the closed Deployment
-    schema; this only keeps the generator projection coherent.
+    schema; this only keeps the generator projection coherent: the authored
+    component, its per-object links and its pose stream-budget rows.
     """
     pose_source = _exact(
         value,
         required=frozenset(
-            {"component_id", "runtime_configuration", "scene_pose_sources"}
+            {
+                "component_id",
+                "runtime_configuration",
+                "scene_pose_sources",
+                "component_streams",
+            }
         ),
         path=path,
     )
@@ -1652,34 +1756,68 @@ def _validate_pose_source(
         raise SourceDescriptionError(
             f"{path}.component_id must differ from the robot component"
         )
-    configuration = _exact(
-        pose_source["runtime_configuration"],
-        required=frozenset({"pose_sources"}),
-        path=f"{path}.runtime_configuration",
+    configuration = _object(
+        pose_source["runtime_configuration"], path=f"{path}.runtime_configuration"
     )
-    rows = _array(
-        configuration["pose_sources"],
-        path=f"{path}.runtime_configuration.pose_sources",
+    unknown = sorted(
+        set(configuration)
+        - {"stream_budget_ns", "simulation", "detection3d", "robot_overlay"}
     )
-    if (
-        len(rows) != 1
-        or _object(rows[0], path=f"{path}.runtime_configuration.pose_sources[0]").get(
-            "controllable_component_id"
-        )
-        != component_id
-    ):
+    if "stream_budget_ns" not in configuration or unknown:
         raise SourceDescriptionError(
-            f"{path}.runtime_configuration.pose_sources must be one row of "
-            "this component"
+            f"{path}.runtime_configuration needs stream_budget_ns and only "
+            f"simulation, detection3d, robot_overlay; unknown={unknown}"
         )
+    overlay = configuration.get("robot_overlay")
+    if overlay is not None and _object(
+        overlay, path=f"{path}.runtime_configuration.robot_overlay"
+    ).get("robot_component_id") != component_occurrence_id:
+        raise SourceDescriptionError(
+            f"{path}.runtime_configuration.robot_overlay must name the robot component"
+        )
+    # Every authored Isaac entity names its header frame explicitly.
+    entities = [
+        ("simulation.relative_reference",
+         configuration.get("simulation", {}).get("relative_reference")),
+        ("robot_overlay.tcp_entity", (overlay or {}).get("tcp_entity")),
+    ]
+    entities += [
+        (f"scene_pose_sources[{index}].source_key.simulation_entity",
+         row.get("source_key", {}).get("simulation_entity"))
+        for index, row in enumerate(pose_source["scene_pose_sources"])
+    ]
+    for label, entity in entities:
+        if entity is not None and not isinstance(
+            _object(entity, path=f"{path}.{label}").get("source_header_frame_id"), str
+        ):
+            raise SourceDescriptionError(
+                f"{path}.{label}.source_header_frame_id is required"
+            )
+    objects: set[str] = set()
     for index, row in enumerate(
         _array(pose_source["scene_pose_sources"], path=f"{path}.scene_pose_sources")
     ):
-        if _object(row, path=f"{path}.scene_pose_sources[{index}]").get(
-            "source_id"
-        ) != component_id:
+        link = _object(row, path=f"{path}.scene_pose_sources[{index}]")
+        if link.get("source_id") != component_id:
             raise SourceDescriptionError(
                 f"{path}.scene_pose_sources[{index}].source_id must be this component"
+            )
+        object_id = link.get("scene_resource_id")
+        if object_id in objects:
+            raise SourceDescriptionError(
+                f"{path}.scene_pose_sources[{index}] repeats an object"
+            )
+        objects.add(object_id)
+    for index, row in enumerate(
+        _array(pose_source["component_streams"], path=f"{path}.component_streams")
+    ):
+        stream = _object(row, path=f"{path}.component_streams[{index}]")
+        if stream.get("controllable_component_id") != component_id or not str(
+            stream.get("stream_id", "")
+        ).startswith("poses/"):
+            raise SourceDescriptionError(
+                f"{path}.component_streams[{index}] must be a pose stream "
+                "of this component"
             )
 
 
@@ -1961,12 +2099,20 @@ def validate(source: Path, root: Path) -> None:
             )
         if model_free_runtime is not None:
             continue
-        is_mock = is_ros2_control and "mock_profile" in _object(
-            profile["ros2_control_runtime"], path=f"{path}.ros2_control_runtime"
+        ros2_control_runtime = (
+            _object(
+                profile["ros2_control_runtime"], path=f"{path}.ros2_control_runtime"
+            )
+            if is_ros2_control
+            else {}
         )
+        is_mock = "mock_profile" in ros2_control_runtime
+        is_real = "real_profile" in ros2_control_runtime
         expected_source_fields = (
             _MOCK_RUNTIME_RESTORATION_SOURCE_FIELDS
             if is_mock
+            else _REAL_RUNTIME_RESTORATION_SOURCE_FIELDS
+            if is_real
             else _ROS2_CONTROL_RUNTIME_RESTORATION_SOURCE_FIELDS
             if is_ros2_control
             else _RUNTIME_RESTORATION_SOURCE_FIELDS
@@ -1974,6 +2120,7 @@ def validate(source: Path, root: Path) -> None:
         if profile_id in {
             "lite6_isaac_commanded_v0",
             "lite6_mock_commanded_v0",
+            "lite6_real_measured_v0",
             "ur10e_robotiq_assistant_isaac_commanded_v0",
             "ur10e_robotiq_assistant_mock_commanded_v0",
             "ur10e_robotiq_isaac_commanded_v0",
@@ -1984,12 +2131,41 @@ def validate(source: Path, root: Path) -> None:
                 **expected_source_fields,
                 "gripper_target_configurations": "grippers",
             }
+        if is_ros2_control:
+            # CP9: the component's declared streams with their defaults.
+            expected_source_fields = {
+                **expected_source_fields,
+                "component_streams": "maintainer_decision.CP9.component_stream_defaults",
+            }
+            runtime = profile["ros2_control_runtime"]
+            stream_ids = [
+                _object(row, path=f"{path}.ros2_control_runtime.component_streams[]").get(
+                    "stream_id"
+                )
+                for row in _array(
+                    runtime.get("component_streams"),
+                    path=f"{path}.ros2_control_runtime.component_streams",
+                )
+            ]
+            # A Real pneumatic gripper has no gripper_feedback stream.
+            expected_stream_ids = (
+                ["gripper_feedback"]
+                if runtime.get("gripper_target_configurations") and not is_real
+                else []
+            ) + ["measured_joints"]
+            if stream_ids != expected_stream_ids:
+                raise SourceDescriptionError(
+                    f"{path}.ros2_control_runtime.component_streams must declare "
+                    "exactly the component's streams"
+                )
         if profile["source_fields"] != expected_source_fields:
             raise SourceDescriptionError(
                 f"{path}.source_fields changes the pinned I0 field mapping"
             )
         expected_acceptance = (
-            _ROS2_CONTROL_RUNTIME_RESTORATION_ACCEPTANCE
+            _REAL_RUNTIME_RESTORATION_ACCEPTANCE
+            if is_real
+            else _ROS2_CONTROL_RUNTIME_RESTORATION_ACCEPTANCE
             if is_ros2_control and not is_mock
             else _RUNTIME_RESTORATION_ACCEPTANCE
         )
@@ -2045,6 +2221,10 @@ def validate(source: Path, root: Path) -> None:
             "component_occurrence_id",
             "program_role_assignments",
         }
+        if "ai_models" in raw_deployment_object:
+            deployment_fields.add("ai_models")
+            if "assistant_model_components" in raw_deployment_object:
+                deployment_fields.add("assistant_model_components")
         if is_i9:
             deployment_fields.update(
                 {
@@ -2150,6 +2330,13 @@ def validate(source: Path, root: Path) -> None:
                 )
         if row["model_family_id"] not in family_ids:
             raise SourceDescriptionError(f"{path}.model_family_id is unavailable")
+        if "ai_models" in row:
+            _validate_ai_models(
+                row["ai_models"],
+                row.get("assistant_model_components"),
+                component_occurrence_id=row["component_occurrence_id"],
+                path=path,
+            )
         if is_i9:
             _validate_pose_source(
                 row["pose_source"],

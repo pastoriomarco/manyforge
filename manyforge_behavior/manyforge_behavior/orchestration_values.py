@@ -417,6 +417,9 @@ class ProgramValueStore:
         self._declarations = program.blackboard_keys
         self._parameters = MappingProxyType(_program_parameter_values(program))
         self._values: dict[str, ProgramValueRecord] = {}
+        # Mirror writes per interrupt_state key, unchanged values included:
+        # each is one reading of the Kernel rule state (Rule 2 gate wait).
+        self._interrupt_state_readings: dict[str, int] = {}
         self._lock = RLock()
         self._published: frozenset[str] | None = None
         self._on_published: Callable[[PublishedKeyChange], None] | None = None
@@ -859,6 +862,7 @@ class ProgramValueStore:
         if state is not None and state not in INTERRUPT_STATE_VALUES:
             raise ProgramValueError(f"{state!r} is not an interrupt rule state")
         with self._lock:
+            self._interrupt_state_readings[key] = self._interrupt_state_readings.get(key, 0) + 1
             current = self._values.get(key)
             if state is None:
                 if current is None:
@@ -872,6 +876,20 @@ class ProgramValueStore:
                 )
             self._publish_locked(key, current)
         return True
+
+    def interrupt_state_reading(self, rule_id: str) -> tuple[int, str | None]:
+        """(readings, state) of one global rule: how many mirror readings this
+        store received for it, and the current state (None: unavailable or
+        not declared). A motion node gated by the rule re-evaluates its
+        admission only on a newer reading that is ``clear``."""
+
+        key = interrupt_state_key(rule_id)
+        with self._lock:
+            current = self._values.get(key)
+            return (
+                self._interrupt_state_readings.get(key, 0),
+                None if current is None else current.value,
+            )
 
     def reset_to_initial(
         self, key: str, *, metadata: Mapping[str, Any] | None = None

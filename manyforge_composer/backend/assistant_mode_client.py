@@ -238,15 +238,8 @@ def _tools(value: Any, mode: str) -> dict[str, dict[str, Any]]:
         previous = tool_id
         _text(tool["description"], f"{path}.description", maximum_bytes=16_384)
         effect = _text(tool["effect"], f"{path}.effect")
-        if effect not in {
-            "read_only",
-            "proposal",
-            "composer_draft_mutating",
-            "runtime_mutating",
-        }:
+        if effect not in {"read_only", "composer_draft_mutating"}:
             raise _invalid(f"{path}.effect is unsupported")
-        if mode == "composer-assistant" and effect == "runtime_mutating":
-            raise _invalid("composer-assistant exposes a runtime-mutating tool")
         schema = _object(tool["input_schema"], f"{path}.input_schema")
         declared = _digest(tool["input_schema_hash"], f"{path}.input_schema_hash")
         if declared != raw_sha256_digest(canonical_json_bytes(schema)):
@@ -393,11 +386,22 @@ def verify_active_assistant_mode(
     model = _object(projection["model_endpoint"], "model_endpoint")
     _closed(
         model,
-        {"model_endpoint_alias", "model_id", "request_contract"},
+        {
+            "ai_model_component_id",
+            "api_key_env",
+            "base_url",
+            "model_endpoint_alias",
+            "model_id",
+            "request_contract",
+        },
         "model_endpoint",
     )
     _text(model["model_endpoint_alias"], "model_endpoint.model_endpoint_alias")
     _text(model["model_id"], "model_endpoint.model_id")
+    _text(model["ai_model_component_id"], "model_endpoint.ai_model_component_id")
+    _text(model["base_url"], "model_endpoint.base_url")
+    if model["api_key_env"] is not None:
+        _text(model["api_key_env"], "model_endpoint.api_key_env", maximum_bytes=128)
     request_contract = _model_request_contract(model["request_contract"])
     if request_contract["tool_call_family"] != "openai_chat_tools":
         raise _invalid("direct bridge requires the openai_chat_tools parser family")

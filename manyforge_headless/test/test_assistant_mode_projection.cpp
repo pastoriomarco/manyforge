@@ -25,40 +25,20 @@ TEST(AssistantModeProjection, CanonicalEmptyBundleHasNoAssistantAuthority) {
   }
 }
 
-TEST(AssistantModeProjection,
-     RetainedComposerModePublishesExactDraftDescriptorsWithoutGrantingEffects) {
+TEST(AssistantModeProjection, AssistantWithoutAiModelComponentIsUnavailable) {
+  // The fixture retains assistant settings but no AI model component: no mode
+  // can name a model endpoint.
   const auto bundle = test::LoadAssistantAuthoringBundle();
 
-  const auto projection = ProjectAssistantMode(*bundle, "composer-assistant");
-  const auto bytes = content_identity::canonical_json(projection);
-
-  EXPECT_NE(bytes.find("\"schema_version\":\"manyforge.assistant_mode_projection.v1\""),
-            std::string::npos);
-  EXPECT_NE(bytes.find("\"mode\":\"composer-assistant\""), std::string::npos);
-  EXPECT_NE(bytes.find("\"tool_id\":\"program_read\""), std::string::npos);
-  EXPECT_NE(bytes.find("\"tool_id\":\"scene_draft_add_object\""), std::string::npos);
-  EXPECT_NE(bytes.find("\"effect\":\"composer_draft_mutating\""), std::string::npos);
-  EXPECT_NE(bytes.find("\"input_schema_hash\":\"sha256:"), std::string::npos);
-  EXPECT_NE(bytes.find("\"request_contract\":"), std::string::npos);
-  EXPECT_NE(bytes.find("\"tool_call_family\":\"openai_chat_tools\""),
-            std::string::npos);
-  EXPECT_EQ(bytes.find("runtime_mutating"), std::string::npos);
-  EXPECT_EQ(bytes.find("availability_granted"), std::string::npos);
+  try {
+    (void)ProjectAssistantMode(*bundle, "composer-assistant");
+    FAIL() << "assistant mode without an AI model component unexpectedly projected";
+  } catch (const AssistantModeProjectionError& error) {
+    EXPECT_EQ(error.code(), "assistant_ai_model_absent");
+  }
 }
 
-TEST(AssistantModeProjection,
-     RetainedQueryModePublishesTheOwnerRoutedIsaacInspector) {
-  const auto bundle = test::LoadAssistantAuthoringBundle();
-
-  const auto projection = ProjectAssistantMode(*bundle, "query");
-  const auto bytes = content_identity::canonical_json(projection);
-
-  EXPECT_NE(bytes.find("\"tool_id\":\"inspect_isaac_scene\""),
-            std::string::npos);
-  EXPECT_NE(bytes.find("\"effect\":\"read_only\""), std::string::npos);
-}
-
-TEST(AssistantModeProjection, IndexPublishesOnlyEnabledDiscoverableModes) {
+TEST(AssistantModeProjection, IndexPublishesEnabledModesAndTheAbsentAiModel) {
   const auto bundle = test::LoadAssistantAuthoringBundle();
 
   const auto index = ProjectAssistantModeIndex(*bundle);
@@ -67,7 +47,7 @@ TEST(AssistantModeProjection, IndexPublishesOnlyEnabledDiscoverableModes) {
   EXPECT_NE(bytes.find("\"schema_version\":\"manyforge.assistant_mode_index.v1\""),
             std::string::npos);
   EXPECT_NE(bytes.find("\"mode\":\"composer-assistant\""), std::string::npos);
-  EXPECT_NE(bytes.find("\"mode\":\"query\""), std::string::npos);
+  EXPECT_NE(bytes.find("\"ai_model_component_id\":null"), std::string::npos);
   EXPECT_EQ(bytes.find("tool_id"), std::string::npos);
   EXPECT_EQ(bytes.find("provider_alias"), std::string::npos);
 }

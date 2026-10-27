@@ -141,10 +141,10 @@ function valid(draft: SupportContactDraft): boolean {
   return values.every((value) => Number.isFinite(value) && value >= 0);
 }
 
-function nextDefault(objectIds: string[]): SupportContactDraft {
+function nextDefault(objectIds: string[], supportedObjectId: string): SupportContactDraft {
   return {
-    supportedObjectId: objectIds[0] ?? '',
-    supportObjectId: objectIds[1] ?? '',
+    supportedObjectId,
+    supportObjectId: objectIds.find((id) => id !== supportedObjectId) ?? '',
     modality: 'signed_penetration',
     enforceMaxStart: true,
     maxStartPenetrationM: 0,
@@ -157,46 +157,44 @@ function nextDefault(objectIds: string[]): SupportContactDraft {
   };
 }
 
+/** The support contacts of one Program scene object (the supported object), on its Object panel. */
 export function ProgramSupportContactEditor({
   program,
   draftRevision,
   busy,
   busyReason = null,
   mutate,
+  supportedObjectId,
 }: {
   program: ProgramAuthoringDocument;
   draftRevision: number;
   busy: boolean;
   busyReason?: string | null;
   mutate: ProgramWorkspaceController['mutate'];
+  supportedObjectId: string;
 }) {
   const blockedTitle = busy ? busyReason ?? undefined : undefined;
   const objectIds = useMemo(
     () => (program.scene ?? []).map((row) => row.scene_resource_id).sort(),
     [program.scene],
   );
-  const rows = useMemo(() => (program.scene ?? []).flatMap((resource) => (
-    rawContacts(resource).flatMap((contact) => {
-      const draft = draftFromContact(resource.scene_resource_id, contact);
-      return draft === null ? [] : [draft];
-    })
-  )), [program.scene]);
+  const resource = program.scene?.find((row) => row.scene_resource_id === supportedObjectId);
+  const rows = useMemo(() => (resource === undefined ? [] : rawContacts(resource)).flatMap((contact) => {
+    const draft = draftFromContact(supportedObjectId, contact);
+    return draft === null ? [] : [draft];
+  }), [resource, supportedObjectId]);
   const [selectedKey, setSelectedKey] = useState('');
   const selected = rows.find((row) => (
     `${row.supportedObjectId}\0${row.supportObjectId}` === selectedKey
   )) ?? null;
-  const [draft, setDraft] = useState(() => nextDefault(objectIds));
+  const [draft, setDraft] = useState(() => nextDefault(objectIds, supportedObjectId));
 
   useEffect(() => {
-    setDraft(selected ?? nextDefault(objectIds));
-  }, [draftRevision, objectIds, selected]);
+    setDraft(selected ?? nextDefault(objectIds, supportedObjectId));
+  }, [draftRevision, objectIds, selected, supportedObjectId]);
 
   const replace = (next: SupportContactDraft, remove = false) => {
-    if (busy || (!remove && !valid(next))) return;
-    const resource = program.scene?.find(
-      (row) => row.scene_resource_id === next.supportedObjectId,
-    );
-    if (resource === undefined) return;
+    if (busy || (!remove && !valid(next)) || resource === undefined) return;
     const previousSupportId = selected?.supportObjectId ?? next.supportObjectId;
     const contacts = rawContacts(resource).filter(
       (row) => row.support_object_id !== previousSupportId,
@@ -222,9 +220,9 @@ export function ProgramSupportContactEditor({
 
   return (
     <details className="dcard" open>
-      <summary>Object support contacts</summary>
+      <summary>Support contacts</summary>
       <p className="muted">
-        Declare which Program scene object supports another and what geometric
+        Declare which Program scene objects support this one and what geometric
         evidence is required. Current contact evidence remains read-only.
       </p>
       {objectIds.length < 2 ? (
@@ -244,7 +242,7 @@ export function ProgramSupportContactEditor({
                   `${candidate.supportedObjectId}\0${candidate.supportObjectId}`
                     === key
                 ));
-                setDraft(row ?? nextDefault(objectIds));
+                setDraft(row ?? nextDefault(objectIds, supportedObjectId));
               }}
             >
               <option value="">New support contact</option>
@@ -252,49 +250,27 @@ export function ProgramSupportContactEditor({
                 const key = `${row.supportedObjectId}\0${row.supportObjectId}`;
                 return (
                   <option key={key} value={key}>
-                    {row.supportedObjectId} supported by {row.supportObjectId}
+                    Supported by {row.supportObjectId}
                   </option>
                 );
               })}
             </select>
           </label>
-          <div className="program-template-grid dgrid">
-            <label>
-              <span>Supported object</span>
-              <select
-                value={draft.supportedObjectId}
-                disabled={busy || selected !== null}
-                title={blockedTitle}
-                onChange={(event) => {
-                  const supportedObjectId = event.currentTarget.value;
-                  update({
-                    ...draft,
-                    supportedObjectId,
-                    supportObjectId: draft.supportObjectId === supportedObjectId
-                      ? objectIds.find((id) => id !== supportedObjectId) ?? ''
-                      : draft.supportObjectId,
-                  });
-                }}
-              >
-                {objectIds.map((id) => <option key={id}>{id}</option>)}
-              </select>
-            </label>
-            <label>
-              <span>Support object</span>
-              <select
-                value={draft.supportObjectId}
-                disabled={busy}
-                title={blockedTitle}
-                onChange={(event) => update(
-                  { ...draft, supportObjectId: event.currentTarget.value },
-                  selected !== null,
-                )}
-              >
-                {objectIds.filter((id) => id !== draft.supportedObjectId)
-                  .map((id) => <option key={id}>{id}</option>)}
-              </select>
-            </label>
-          </div>
+          <label>
+            <span>Support object</span>
+            <select
+              value={draft.supportObjectId}
+              disabled={busy}
+              title={blockedTitle}
+              onChange={(event) => update(
+                { ...draft, supportObjectId: event.currentTarget.value },
+                selected !== null,
+              )}
+            >
+              {objectIds.filter((id) => id !== draft.supportedObjectId)
+                .map((id) => <option key={id}>{id}</option>)}
+            </select>
+          </label>
           <label>
             <span>Validation evidence</span>
             <select

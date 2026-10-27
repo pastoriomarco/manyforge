@@ -593,7 +593,7 @@ manyforge_embed_closed_schema(
 manyforge_embed_closed_schema(
   kEmbeddedPoseSourceComponentConfigurationSchema
   pose_source_component_configuration
-  resources/closed_schema/value/manyforge.value_schema.runtime.pose_source_execution.v1.yaml
+  resources/closed_schema/value/manyforge.value_schema.runtime.pose_source.v2.yaml
   mf_pose_cfg)
 manyforge_embed_closed_schema(
   kEmbeddedEmptyProviderContractSchema
@@ -1294,6 +1294,14 @@ if(BUILD_TESTING)
     manyforge_preparation_support manyforge_deployment GTest::gtest_main)
   gtest_discover_tests(test_activation_pose_source PROPERTIES TIMEOUT ${MANYFORGE_GTEST_TIMEOUT_SECONDS})
 
+  add_executable(test_activation_ai_model test/test_activation_ai_model.cpp)
+  target_compile_definitions(test_activation_ai_model PRIVATE
+    MANYFORGE_WORKSPACE_ROOT="${_MANYFORGE_WORKSPACE_ROOT}")
+  target_include_directories(test_activation_ai_model PRIVATE "${CMAKE_CURRENT_SOURCE_DIR}/src")
+  target_link_libraries(test_activation_ai_model PRIVATE
+    manyforge_preparation_support manyforge_deployment GTest::gtest_main)
+  gtest_discover_tests(test_activation_ai_model PROPERTIES TIMEOUT ${MANYFORGE_GTEST_TIMEOUT_SECONDS})
+
   add_executable(test_io_signal_catalog test/test_io_signal_catalog.cpp)
   target_include_directories(test_io_signal_catalog PRIVATE
     "${CMAKE_CURRENT_SOURCE_DIR}/src")
@@ -1817,6 +1825,10 @@ if(BUILD_TESTING)
     PrepareActivationStopLimitNames
     "examples/lite6_pick_and_place.scenario"
     --stop-limit-names)
+  manyforge_add_prepare_activation_test(
+    PrepareActivationRealMeasured
+    "examples/lite6_real_arm_observation.scenario"
+    --real-measured)
   manyforge_add_prepare_activation_test(
     PrepareActivationRos2Control
     "examples/isaac-ur10e-light-scene.scenario"

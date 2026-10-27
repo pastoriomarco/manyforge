@@ -1,0 +1,165 @@
+{
+  "api_version": "manyforge.deployment_intent.v2",
+  "assistant_profile_id": null,
+  "attachments": [],
+  "compatibility": {
+    "lane": "manyforge-only",
+    "provides": [],
+    "tags": [
+      "lite6",
+      "real-robot"
+    ]
+  },
+  "components": [
+    {
+      "component_id": "lite6_robot",
+      "component_profile_id": "lite6_real_measured_v0",
+      "configuration": {
+        "default_fault_stop_profile": {
+          "deceleration_time_s": 1.0,
+          "per_joint_max_deceleration_rad_s2": {
+            "joint1": 10.0,
+            "joint2": 10.0,
+            "joint3": 10.0,
+            "joint4": 10.0,
+            "joint5": 10.0,
+            "joint6": 10.0
+          },
+          "profile_id": "fault_spring_back_fast",
+          "require_backend_confirmation": true,
+          "stop_mode": "spring_back_fast"
+        },
+        "runtime_configuration": {
+          "collision_monitor_period_ms": 50.0,
+          "component_streams": [
+            {
+              "budget_ns": 250000000,
+              "controllable_component_id": "lite6_robot",
+              "recovery": "ack",
+              "severity": "fault",
+              "stream_id": "measured_joints"
+            }
+          ],
+          "device_address_ref": "lite6_main",
+          "execution_tick_hz": 100,
+          "gripper_target_configurations": [
+            {
+              "actuation_kind": "pneumatic",
+              "attach_frame": "link_tcp",
+              "auxiliary_frames": [
+                "lite_gripper_base_link"
+              ],
+              "closed_state_ref": "closed",
+              "command_duration_s": 0.8,
+              "command_target_id": "gripper",
+              "controllable_component_id": "lite6_robot",
+              "delivery_result_timeout_s": 1.0,
+              "description": "UFACTORY lite pneumatic gripper, no output on Real (display only).",
+              "mount_frame": "link_eef",
+              "open_state_ref": "open",
+              "output_mode": "none",
+              "tcp_frame": "link_tcp",
+              "touch_links": [
+                "lite_gripper_base_link",
+                "lite_gripper_left_finger",
+                "lite_gripper_right_finger"
+              ]
+            }
+          ],
+          "initial_joint_positions_rad": [
+            0.0,
+            0.0,
+            1.57,
+            0.0,
+            0.0,
+            0.0
+          ],
+          "planner_rng_seed": 12345,
+          "real_profile": "lite6_real"
+        },
+        "runtime_kind": "ros2_control"
+      },
+      "frame_prefix": "",
+      "model_source": {
+        "package_roots": {
+          "manyforge_example_models": {
+            "project_path": "../../manyforge_example_models"
+          }
+        },
+        "srdf": {
+          "project_path": "../../manyforge_example_models/models/lite6_lite_gripper/lite6_lite_gripper.srdf"
+        },
+        "urdf": {
+          "project_path": "../../manyforge_example_models/models/lite6_lite_gripper/lite6_lite_gripper.urdf"
+        }
+      },
+      "root_pose_in_cell": {
+        "orientation_xyzw": [
+          0.0,
+          0.0,
+          0.0,
+          1.0
+        ],
+        "position_m": [
+          0.0,
+          0.0,
+          0.0
+        ]
+      },
+      "target_settings": {
+        "arm": {
+          "controlled_stop": {
+            "allow_natural_completion_on_short_path": true,
+            "deceleration_time_s": 1.0,
+            "jerk_limits_enabled": true,
+            "per_joint_limits": [
+              {
+                "max_deceleration_rad_s2": 10.0,
+                "settle_velocity_threshold_rad_s": 0.01,
+                "source_joint_name": "joint1"
+              },
+              {
+                "max_deceleration_rad_s2": 10.0,
+                "settle_velocity_threshold_rad_s": 0.01,
+                "source_joint_name": "joint2"
+              },
+              {
+                "max_deceleration_rad_s2": 10.0,
+                "settle_velocity_threshold_rad_s": 0.01,
+                "source_joint_name": "joint3"
+              },
+              {
+                "max_deceleration_rad_s2": 10.0,
+                "settle_velocity_threshold_rad_s": 0.01,
+                "source_joint_name": "joint4"
+              },
+              {
+                "max_deceleration_rad_s2": 10.0,
+                "settle_velocity_threshold_rad_s": 0.01,
+                "source_joint_name": "joint5"
+              },
+              {
+                "max_deceleration_rad_s2": 10.0,
+                "settle_velocity_threshold_rad_s": 0.01,
+                "source_joint_name": "joint6"
+              }
+            ],
+            "stop_mode": "soft_on_path"
+          },
+          "maximum_tcp_linear_speed_mps": 0.15
+        }
+      }
+    }
+  ],
+  "deployment_artifact_id": "lite6_real_arm_observation",
+  "description": "Real robot, arm only, measured state, using the same robot model as the Mock pick-and-place example. The robot address is a site fact: device_address_ref lite6_main resolves in the machine site settings (manyforge.site.v1). The gripper is the Mock pneumatic target with no output on Real (display only, no gripper feedback).",
+  "name": "lite6_real_arm_observation",
+  "policies": {
+    "interrupt_config": {
+      "cancel_validation_timeout_ns": 1000,
+      "motion_scope_arm_timeout_ns": 1000,
+      "queue_depth": 8,
+      "supervisory_poll_rate_hz": 10
+    }
+  }
+}

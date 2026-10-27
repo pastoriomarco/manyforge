@@ -8,7 +8,7 @@
       "frame_kind": "cell_frame",
       "lifetime_ns": 5000000000,
       "object_id": "graspable",
-      "policy_id": "before_planning",
+      "policy_id": "scene",
       "selector": {
         "class_id": "",
         "confidence_min": 0,

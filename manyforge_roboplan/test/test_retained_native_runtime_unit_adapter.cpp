@@ -29,6 +29,7 @@
 #include <manyforge_content_identity/content_identity.hpp>
 #include <manyforge_core/logical_scene_identity.hpp>
 #include <manyforge_core/sqlite_operation_journal.hpp>
+#include <manyforge_core/time/stuck_drain_wait.hpp>
 #include <manyforge_core/types/native_projection_capability.hpp>
 #include <manyforge_deployment/artifact_codec.hpp>
 #include <manyforge_deployment/model_source.hpp>
@@ -55,6 +56,7 @@
 #include "../../manyforge_component_manager/src/manager_liveness_rpc_internal.hpp"
 #include "../../manyforge_component_manager/src/native_projection_rpc_internal.hpp"
 #include "../../manyforge_component_manager/src/selected_runtime_composition_rpc_internal.hpp"
+#include "../src/ros_managed_runtime_host.hpp"
 
 namespace manyforge::roboplan_backend {
 namespace {
@@ -71,6 +73,55 @@ constexpr std::string_view kIntentDigest =
     "sha256:1111111111111111111111111111111111111111111111111111111111111111";
 constexpr std::string_view kZeroDigest =
     "sha256:0000000000000000000000000000000000000000000000000000000000000000";
+
+TEST(ManagedRuntimeDrainTest, MissedDrainRefusesRenewalButShutdownOnlyDoesNot) {
+  namespace rpc = component_manager::detail;
+  const char *observed_drain = nullptr;
+  unsigned renewed = 0;
+  const auto renew = [&] {
+    ++renewed;
+    return std::string("renewed");
+  };
+  const auto refuse = [](const char *drain) {
+    return rpc::EncodeManagerLivenessRpcRejection(std::string("drain_stuck.") +
+                                                  drain);
+  };
+
+  EXPECT_EQ(host_detail::DispatchHeartbeatForDrain(
+                nullptr, false, observed_drain, renew, refuse),
+            "renewed");
+
+  int attempts = 0;
+  testing::internal::CaptureStderr();
+  core::WaitForDrain("kernel_runtime.test_drain", std::chrono::nanoseconds(1),
+                     [&](std::chrono::nanoseconds) { return ++attempts == 2; });
+  static_cast<void>(testing::internal::GetCapturedStderr());
+  ASSERT_EQ(attempts, 2);
+  const auto *first = core::FirstStuckDrainName();
+  ASSERT_NE(first, nullptr);
+  EXPECT_STREQ(first, "kernel_runtime.test_drain");
+
+  const auto rejected = host_detail::DispatchHeartbeatForDrain(
+      first, false, observed_drain, renew, refuse);
+  try {
+    static_cast<void>(rpc::DecodeManagerLivenessRpcResponse(rejected));
+    FAIL() << "expected the liveness protocol to reject renewal";
+  } catch (const rpc::ManagerLivenessRpcRejection &error) {
+    EXPECT_EQ(error.reason(), "drain_stuck.kernel_runtime.test_drain");
+  }
+  EXPECT_EQ(renewed, 1U);
+  // A fault seen during service stays sticky if teardown begins later.
+  EXPECT_EQ(host_detail::DispatchHeartbeatForDrain(first, true, observed_drain,
+                                                   renew, refuse),
+            rejected);
+  EXPECT_EQ(renewed, 1U);
+
+  const char *shutdown_only = nullptr;
+  EXPECT_EQ(host_detail::DispatchHeartbeatForDrain(first, true, shutdown_only,
+                                                   renew, refuse),
+            "renewed");
+  EXPECT_EQ(renewed, 2U);
+}
 
 class FixedPlanningSceneSynchronizer final
     : public core::IPlanningSceneSynchronizer {
@@ -1247,7 +1298,7 @@ TEST(RetainedNativeRuntimeUnitAdapter,
   const auto absent_offer = read_stop_fault();
   const auto absent_encoded = content_identity::canonical_json(absent_offer);
   ASSERT_TRUE(absent_offer.is_object()) << absent_encoded;
-  EXPECT_EQ(absent_offer.as_object().size(), 4U) << absent_encoded;
+  EXPECT_EQ(absent_offer.as_object().size(), 5U) << absent_encoded;
   EXPECT_EQ(TextMember(absent_offer, "api_version"),
             "manyforge.execution_command_response.v1");
   EXPECT_EQ(TextMember(absent_offer, "command"), "get_stop_fault");
@@ -1260,6 +1311,11 @@ TEST(RetainedNativeRuntimeUnitAdapter,
   const auto *absent_fault = absent_offer.find_object_member("stop_fault");
   ASSERT_NE(absent_fault, nullptr) << absent_encoded;
   EXPECT_TRUE(absent_fault->is_null()) << absent_encoded;
+  const auto *absent_global_offers =
+      absent_offer.find_object_member("global_rule_recovery_offers");
+  ASSERT_NE(absent_global_offers, nullptr) << absent_encoded;
+  ASSERT_TRUE(absent_global_offers->is_array()) << absent_encoded;
+  EXPECT_TRUE(absent_global_offers->as_array().empty()) << absent_encoded;
   const std::string attribution =
       R"("attribution":{"transport":"internal","assurance":"unverified","principal_id":null})";
   const auto packet = [&](std::string_view command, std::string_view request) {
@@ -1831,7 +1887,11 @@ TEST(RetainedNativeRuntimeUnitAdapter,
   const auto *target_command = target.find_object_member("command");
   ASSERT_NE(target_command, nullptr);
   ASSERT_TRUE(target_command->is_object());
-  ASSERT_EQ(target_command->as_object().size(), 9U);
+  // Motion targets carry the product-backed Stop metadata projection; an
+  // unavailable source would add stop_response_error instead of a value.
+  ASSERT_EQ(target_command->as_object().size(), 10U);
+  ASSERT_NE(target_command->find_object_member("stop_response"), nullptr);
+  EXPECT_EQ(target_command->find_object_member("stop_response_error"), nullptr);
   EXPECT_EQ(target_command->find_object_member("controllable_component_id"),
             nullptr);
   EXPECT_EQ(target_command->find_object_member("command_target_id"), nullptr);
@@ -3505,6 +3565,14 @@ int RunSelectedAdapterPacketChild(const int argc, char **argv) {
   const core::RuntimeEpoch epoch(arguments.at("--runtime-epoch"));
   const auto run_root = std::filesystem::path(
       arguments.at("--manyforge-managed-execution-run-root"));
+  if (arguments.contains("--manyforge-managed-site-settings")) {
+    std::ofstream captured(run_root / "site.arguments", std::ios::binary);
+    for (int index = 1; index < argc; ++index) {
+      captured << argv[index];
+      captured.put('\0');
+    }
+    if (!captured) throw std::runtime_error("site argv fixture capture failed");
+  }
   if (std::filesystem::exists(run_root / "shutdown-probe.mode")) {
     return RunShutdownPacketProbe(
         channel,
@@ -4451,6 +4519,60 @@ TEST(RetainedNativeRuntimeUnitAdapter,
 
 } // namespace
 
+TEST(RetainedNativeRuntimeUnitAdapter,
+     GenericSiteDocumentAddsOnlyItsRetainedSnapshotArgumentWhenConfigured) {
+  NativeFixture fixture;
+  ScopedTemporaryRoot targets;
+  static_cast<void>(InstallSelectedPacketTestTargets(targets.path()));
+  const auto arguments_path = fixture.execution_run_root.path() / "site.arguments";
+  const std::string site_document =
+      R"({"schema":"manyforge.site.v1","device_addresses":{"lite6_main":"192.168.1.31"}})";
+  const auto launch = [&](std::optional<std::string> site) {
+    std::filesystem::remove(arguments_path);
+    auto adapter = component_manager::RetainedNativeRuntimeUnitAdapter(
+        targets.path(), fixture.root / "retained-package",
+        fixture.manager_state_root.path(), fixture.manager_run_root.path(),
+        fixture.execution_state_root.path(), fixture.execution_run_root.path(),
+        fixture.bundle_source, fixture.artifact_source,
+        std::string(contract::kOperatingSystem),
+        std::string(contract::kLaunchEnvironmentContract), {}, {}, {}, {},
+        std::move(site));
+    EXPECT_EQ(adapter.EnsureRunning(*fixture.query).state(),
+              component_manager::ProcessPresenceState::kPresent);
+    for (int attempt = 0; attempt < 200 &&
+         !std::filesystem::exists(arguments_path); ++attempt) {
+      std::this_thread::sleep_for(std::chrono::milliseconds(10));
+    }
+    std::vector<std::string> arguments;
+    if (std::filesystem::exists(arguments_path)) {
+      std::istringstream captured(ReadFile(arguments_path));
+      for (std::string argument; std::getline(captured, argument, '\0');)
+        arguments.push_back(std::move(argument));
+    }
+    EXPECT_EQ(adapter.EnsureStopped(*fixture.query).state(),
+              component_manager::ProcessPresenceState::kAbsent);
+    return arguments;
+  };
+  // Unconfigured: the child never sees the option (the fixture captures argv
+  // only when the option is present).
+  EXPECT_TRUE(launch(std::nullopt).empty());
+  const auto configured = launch(site_document);
+  ASSERT_EQ(std::count(configured.begin(), configured.end(),
+                       "--manyforge-managed-site-settings"), 1);
+  const auto option = std::find(configured.begin(), configured.end(),
+                                "--manyforge-managed-site-settings");
+  ASSERT_NE(std::next(option), configured.end());
+  const std::filesystem::path snapshot_path = *std::next(option);
+  EXPECT_EQ(snapshot_path.parent_path(), fixture.manager_run_root.path());
+  EXPECT_TRUE(snapshot_path.filename().string().starts_with("site-settings-"));
+  EXPECT_EQ(snapshot_path.extension(), ".json");
+  struct stat snapshot_status {};
+  ASSERT_EQ(::lstat(snapshot_path.c_str(), &snapshot_status), 0);
+  EXPECT_TRUE(S_ISREG(snapshot_status.st_mode));
+  EXPECT_EQ(snapshot_status.st_mode & 0777, 0600);
+  // Child retirement and adapter destruction keep the run evidence.
+  EXPECT_EQ(ReadFile(snapshot_path), site_document);
+}
 } // namespace manyforge::roboplan_backend
 
 int main(int argc, char **argv) {

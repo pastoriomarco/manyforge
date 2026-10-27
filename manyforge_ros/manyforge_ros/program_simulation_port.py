@@ -16,7 +16,7 @@ import os
 import stat
 from collections.abc import Mapping, Sequence
 from concurrent.futures import Future, ThreadPoolExecutor
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 from pathlib import Path
 from threading import RLock, Thread
 from types import MappingProxyType
@@ -34,7 +34,7 @@ from .simulation_control import SimulationControlClient
 
 
 SIMULATION_PROGRAM_SITE_CONFIG_VERSION: Final = (
-    "manyforge.simulation_program_site_config.v1"
+    "manyforge.simulation_program_site_config.v2"
 )
 _NODE_IDS: Final = frozenset(
     {
@@ -45,10 +45,16 @@ _NODE_IDS: Final = frozenset(
     }
 )
 _MAX_CONFIG_BYTES: Final = 1024 * 1024
-_MAX_SCENARIOS: Final = 256
-_MAX_SCENE_ENTITIES: Final = 4096
 _MAX_TEXT_BYTES: Final = 4096
 _MAX_MESSAGE_BYTES: Final = 4096
+
+
+class _NodeRefused(ValueError):
+    """A typed per-node refusal reported as one failed owner task."""
+
+    def __init__(self, code: str, message: str) -> None:
+        super().__init__(message)
+        self.code = code
 
 
 class _ControlClient(Protocol):
@@ -80,50 +86,18 @@ def _text(value: object, *, field_name: str) -> str:
 
 
 @dataclass(frozen=True, slots=True)
-class SimulationScenarioSiteConfig:
-    """Site-only mapping from portable scene identity to simulator identity."""
-
-    scenario_id: str
-    cell_frame_id: str
-    scene_entities: Mapping[str, str] = field(
-        default_factory=lambda: MappingProxyType({})
-    )
-
-    def __post_init__(self) -> None:
-        _text(self.scenario_id, field_name="scenario_id")
-        _text(self.cell_frame_id, field_name="cell_frame_id")
-        if not isinstance(self.scene_entities, Mapping):
-            raise TypeError("scene_entities must be a mapping")
-        rows = {
-            _text(key, field_name="scene_resource_id"): _text(
-                value,
-                field_name="simulator entity",
-            )
-            for key, value in self.scene_entities.items()
-        }
-        if len(rows) > _MAX_SCENE_ENTITIES:
-            raise ValueError("scene entity mappings exceed their bound")
-        if len(set(rows.values())) != len(rows):
-            raise ValueError("simulator entities must not alias scene resources")
-        object.__setattr__(
-            self,
-            "scene_entities",
-            MappingProxyType(dict(sorted(rows.items()))),
-        )
-
-
-@dataclass(frozen=True, slots=True)
 class SimulationProgramSiteConfig:
-    """Strict launcher-owned configuration for one ROS simulator owner."""
+    """Launcher-owned machine facts of one ROS simulator owner.
+
+    The simulator entity mapping and cell frame come from the active
+    Deployment's object links (``ProgramRunPortContext.simulation_scene``).
+    """
 
     service_prefix: str
     service_timeout_s: float
-    scenarios: tuple[SimulationScenarioSiteConfig, ...]
 
     def __post_init__(self) -> None:
-        prefix = _text(self.service_prefix, field_name="service_prefix")
-        if any(character.isspace() for character in prefix):
-            raise ValueError("service_prefix must not contain whitespace")
+        _text(self.service_prefix, field_name="service_prefix")
         if isinstance(self.service_timeout_s, bool) or not isinstance(
             self.service_timeout_s,
             (int, float),
@@ -132,27 +106,7 @@ class SimulationProgramSiteConfig:
         timeout = float(self.service_timeout_s)
         if not math.isfinite(timeout) or not 0.05 <= timeout <= 120.0:
             raise ValueError("service_timeout_s must be finite and in [0.05, 120]")
-        if (
-            not isinstance(self.scenarios, tuple)
-            or not 1 <= len(self.scenarios) <= _MAX_SCENARIOS
-            or any(
-                not isinstance(row, SimulationScenarioSiteConfig)
-                for row in self.scenarios
-            )
-        ):
-            raise ValueError("scenarios must be a bounded non-empty tuple")
-        scenario_ids = tuple(row.scenario_id for row in self.scenarios)
-        if scenario_ids != tuple(sorted(set(scenario_ids))):
-            raise ValueError("scenarios must be canonical-sorted and unique")
         object.__setattr__(self, "service_timeout_s", timeout)
-
-    def scenario(self, scenario_id: str) -> SimulationScenarioSiteConfig:
-        selected = [row for row in self.scenarios if row.scenario_id == scenario_id]
-        if len(selected) != 1:
-            raise ValueError(
-                f"scenario {scenario_id!r} has no exact simulator site mapping"
-            )
-        return selected[0]
 
 
 def _json_object(pairs: list[tuple[str, Any]]) -> dict[str, Any]:
@@ -220,7 +174,6 @@ def load_simulation_program_site_config(
         ) from error
     if not isinstance(root, dict) or set(root) != {
         "api_version",
-        "scenarios",
         "service_prefix",
         "service_timeout_s",
     }:
@@ -229,76 +182,19 @@ def load_simulation_program_site_config(
         )
     if root["api_version"] != SIMULATION_PROGRAM_SITE_CONFIG_VERSION:
         raise ValueError("simulation Program site configuration version is unsupported")
-    raw_scenarios = root["scenarios"]
-    if not isinstance(raw_scenarios, list):
-        raise ValueError("simulation Program scenarios must be an array")
-    scenarios: list[SimulationScenarioSiteConfig] = []
-    for index, raw_scenario in enumerate(raw_scenarios):
-        label = f"scenarios[{index}]"
-        if not isinstance(raw_scenario, dict) or set(raw_scenario) != {
-            "cell_frame_id",
-            "scenario_id",
-            "scene_entities",
-        }:
-            raise ValueError(f"{label} has unknown or missing fields")
-        raw_entities = raw_scenario["scene_entities"]
-        if not isinstance(raw_entities, list):
-            raise ValueError(f"{label}.scene_entities must be an array")
-        entity_rows: list[tuple[str, str]] = []
-        for entity_index, raw_entity in enumerate(raw_entities):
-            entity_label = f"{label}.scene_entities[{entity_index}]"
-            if not isinstance(raw_entity, dict) or set(raw_entity) != {
-                "entity",
-                "scene_resource_id",
-            }:
-                raise ValueError(f"{entity_label} has unknown or missing fields")
-            entity_rows.append(
-                (
-                    _text(
-                        raw_entity["scene_resource_id"],
-                        field_name=f"{entity_label}.scene_resource_id",
-                    ),
-                    _text(
-                        raw_entity["entity"],
-                        field_name=f"{entity_label}.entity",
-                    ),
-                )
-            )
-        resource_ids = tuple(row[0] for row in entity_rows)
-        entity_names = tuple(row[1] for row in entity_rows)
-        if (
-            entity_rows != sorted(entity_rows)
-            or len(set(resource_ids)) != len(resource_ids)
-            or len(set(entity_names)) != len(entity_names)
-        ):
-            raise ValueError(
-                f"{label}.scene_entities must be canonical-sorted, unique, "
-                "and non-aliasing"
-            )
-        scenarios.append(
-            SimulationScenarioSiteConfig(
-                scenario_id=_text(
-                    raw_scenario["scenario_id"],
-                    field_name=f"{label}.scenario_id",
-                ),
-                cell_frame_id=_text(
-                    raw_scenario["cell_frame_id"],
-                    field_name=f"{label}.cell_frame_id",
-                ),
-                scene_entities=dict(entity_rows),
-            )
-        )
     return SimulationProgramSiteConfig(
         service_prefix=root["service_prefix"],
         service_timeout_s=root["service_timeout_s"],
-        scenarios=tuple(scenarios),
     )
 
 
 @dataclass(frozen=True, slots=True)
 class _BoundRun:
     context: ProgramRunPortContext
-    site: SimulationScenarioSiteConfig
+    # None when the active Deployment has no simulation object link.
+    cell_frame_id: str | None
+    # Declared scene resource -> simulator entity (Deployment links).
+    scene_entities: Mapping[str, str]
     declared_scene_resources: frozenset[str]
     target_frames: Mapping[tuple[str, str], str]
 
@@ -331,6 +227,28 @@ def _declared_scene_resources(program: Mapping[str, Any]) -> frozenset[str]:
             raise ValueError("captured Program scene resources are not unique")
         result.add(resource_id)
     return frozenset(result)
+
+
+def _simulation_scene(
+    simulation_scene: Mapping[str, Any] | None,
+    declared: frozenset[str],
+) -> tuple[str | None, Mapping[str, str]]:
+    """Cell frame and entity map of the Deployment links.
+
+    A link to an object the Program does not declare (orphan) is ignored.
+    """
+
+    if simulation_scene is None:
+        return None, MappingProxyType({})
+    cell_frame_id = _text(
+        simulation_scene["cell_frame_id"], field_name="simulation_scene.cell_frame_id"
+    )
+    entities = {
+        row["scene_resource_id"]: _text(row["entity"], field_name="simulator entity")
+        for row in simulation_scene["scene_entities"]
+        if row["scene_resource_id"] in declared
+    }
+    return cell_frame_id, MappingProxyType(entities)
 
 
 def _target_frames(
@@ -412,7 +330,13 @@ def _pose_for_simulator(
         raise ValueError("simulation.set_entity_pose pose.frame_ref is invalid")
     kind = frame.get("kind")
     if kind == "cell_frame":
-        frame_id = bound.site.cell_frame_id
+        if bound.cell_frame_id is None:
+            raise _NodeRefused(
+                "simulation_cell_frame_unavailable",
+                "the active Deployment links no simulation entity, so the "
+                "simulator cell frame is unknown",
+            )
+        frame_id = bound.cell_frame_id
     elif kind == "target_frame":
         key = (
             _text(frame.get("target_role"), field_name="target_role"),
@@ -432,7 +356,7 @@ def _pose_for_simulator(
         if resource_id not in bound.declared_scene_resources:
             raise ValueError("pose frame does not name a declared scene resource")
         try:
-            frame_id = bound.site.scene_entities[resource_id]
+            frame_id = bound.scene_entities[resource_id]
         except KeyError as error:
             raise ValueError(
                 f"scene resource {resource_id!r} has no simulator entity mapping"
@@ -495,17 +419,14 @@ class SimulationProgramTaskPort:
     def bind(self, context: ProgramRunPortContext) -> None:
         if not isinstance(context, ProgramRunPortContext):
             raise TypeError("simulation context must be a ProgramRunPortContext")
-        site = self._site_config.scenario(context.scenario_id)
         declared = _declared_scene_resources(context.program)
-        unknown_mappings = set(site.scene_entities) - declared
-        if unknown_mappings:
-            raise ValueError(
-                "simulator site mapping names undeclared scene resources: "
-                f"{sorted(unknown_mappings)}"
-            )
+        cell_frame_id, scene_entities = _simulation_scene(
+            context.simulation_scene, declared
+        )
         bound = _BoundRun(
             context=context,
-            site=site,
+            cell_frame_id=cell_frame_id,
+            scene_entities=scene_entities,
             declared_scene_resources=declared,
             target_frames=_target_frames(context.program_binding),
         )
@@ -574,19 +495,17 @@ class SimulationProgramTaskPort:
             )
             if resource_id not in bound.declared_scene_resources:
                 raise ValueError("scene_resource_id is not declared by the Program")
+            pose = parameters["pose"]
+            if not isinstance(pose, Mapping):
+                raise ValueError("simulation.set_entity_pose pose is invalid")
+            simulator_pose = _pose_for_simulator(pose, bound=bound)
             try:
-                entity = bound.site.scene_entities[resource_id]
+                entity = bound.scene_entities[resource_id]
             except KeyError as error:
                 raise ValueError(
                     f"scene resource {resource_id!r} has no simulator entity mapping"
                 ) from error
-            pose = parameters["pose"]
-            if not isinstance(pose, Mapping):
-                raise ValueError("simulation.set_entity_pose pose is invalid")
-            return "set_entity_state", {
-                "entity": entity,
-                "pose": _pose_for_simulator(pose, bound=bound),
-            }
+            return "set_entity_state", {"entity": entity, "pose": simulator_pose}
         raise ValueError(f"unsupported simulator Program node: {node_id}")
 
     def _invoke(self, operation: str, arguments: Mapping[str, Any]) -> object:
@@ -624,7 +543,15 @@ class SimulationProgramTaskPort:
                 raise ValueError(
                     "Program-run simulation context is not bound"
                 ) from error
-            operation, arguments = self._prepare(node_id, inputs, bound)
+            try:
+                operation, arguments = self._prepare(node_id, inputs, bound)
+            except _NodeRefused as refused:
+                return OwnerTaskSnapshot(
+                    task_id=task_id,
+                    state=OwnerTaskState.FAILED,
+                    reason_code=refused.code,
+                    message=str(refused),
+                )
             request_digest = _digest(
                 {
                     "arguments": arguments,
@@ -902,7 +829,6 @@ __all__ = [
     "SIMULATION_PROGRAM_SITE_CONFIG_VERSION",
     "SimulationProgramSiteConfig",
     "SimulationProgramTaskPort",
-    "SimulationScenarioSiteConfig",
     "create_ros_simulation_program_port",
     "load_simulation_program_site_config",
 ]

@@ -944,6 +944,7 @@ describe('Program product projections', () => {
     const appliedInput = {
       assistant_mode: 'forbidden',
       assistant_projection: null,
+      simulation_scene: null,
       baseline_program_binding_id: digestA,
       deployment_artifact_id: 'cell-a',
       deployment_revision: digestB,
@@ -3585,6 +3586,60 @@ describe('headless projection parsers', () => {
     );
   });
 
+  it('accepts optional Manager component simulator rows and still rejects unknown keys', () => {
+    const source = {
+      available: true,
+      freshness: 'fresh',
+      known_gaps: [],
+      projection_generation: 4,
+      projection_owner_epoch: 'projection.epoch.1',
+      receiver_age_ns: 10,
+      source_content_digest: 'sha256:' + 'a'.repeat(64),
+      source_generation: 2,
+      source_owner_epoch: 'manager.epoch.1',
+      source_owner_id: 'component-manager.cell-a',
+    };
+    const rows = [{ controllable_component_id: 'arm', simulator: 'none' }];
+    const active = {
+      canonical_empty: false,
+      cell_graph: { cell_id: 'cell-a', components: [] },
+      graph_revision: 'graph.1',
+      retained_bundle_id: 'bundle.1',
+      publication: {},
+    };
+    const status = (activeWire: Record<string, unknown>) => ({
+      schema_version: 'manyforge.manager_status_projection.v1',
+      source,
+      status: {
+        api_version: 'manyforge.manager_source.v1',
+        active: activeWire,
+        apply: { mutation_available: true, records: [], unavailable_reason_code: null },
+        cell_id: 'cell-a',
+        manager_ready: true,
+        runtime: { converged: true, desired_units: [], observed_units: [] },
+      },
+    });
+    const graph = {
+      schema_version: 'manyforge.manager_graph_projection.v1',
+      source,
+      graph_revision: 'graph.1',
+      retained_bundle_id: 'bundle.1',
+      cell_graph: { cell_id: 'cell-a', components: [] },
+    };
+
+    for (const activeWire of [active, { ...active, component_simulator_dependencies: rows }]) {
+      expect(parseManagerStatusProjection(status(activeWire)).status.active.graphRevision)
+        .toBe('graph.1');
+    }
+    for (const graphWire of [graph, { ...graph, component_simulator_dependencies: rows }]) {
+      expect(parseManagerGraphProjection(graphWire).retainedBundleId).toBe('bundle.1');
+    }
+    expect(() => parseManagerStatusProjection(status({ ...active, unexpected: true })))
+      .toThrow('managerStatus.status.active');
+    expect(() => parseManagerGraphProjection({ ...graph, unexpected: true }))
+      .toThrow('managerGraph');
+  });
+
   it('accepts exact runtime and four-state alarm snapshots', () => {
     const runtime = parseHeadlessRuntimeSnapshot(runtimeSnapshotFixture());
     const alarms = parseOperatorAlarmSnapshot(alarmSnapshotFixture());
@@ -4777,6 +4832,20 @@ describe('addressed Robot Control parsers', () => {
       expect(parsed.observedGripper).toBeNull();
       expect(parsed.observedMotion?.positionsRad).toEqual(observedMotion.positions_rad);
     }
+    const mappedPneumatic = structuredClone(pneumaticAbsent);
+    Object.assign(mappedPneumatic.status.direct_control_gripper.target_descriptor, {
+      output_mode: 'commanded', completion_policy: 'no_output',
+      pneumatic_outputs: [{ controllable_component_id: 'valve_io', signal_name: 'clamp', open_value: false, close_value: true }],
+    });
+    const mappedDescriptor = parseExecutionOwnerStatus(composed(mappedPneumatic)).directControlGripper!.targetDescriptor;
+    expect(mappedDescriptor.pneumaticOutputs).toEqual([{ controllableComponentId: 'valve_io', signalName: 'clamp', openValue: false, closeValue: true }]);
+    const unmappedNoOutput = structuredClone(mappedPneumatic);
+    delete (unmappedNoOutput.status.direct_control_gripper.target_descriptor as Record<string, unknown>).pneumatic_outputs;
+    expect(() => parseExecutionOwnerStatus(composed(unmappedNoOutput))).toThrow();
+    const duplicateOutputs = structuredClone(mappedPneumatic);
+    const duplicate = { controllable_component_id: 'valve_io', signal_name: 'clamp', open_value: false, close_value: true };
+    Object.assign(duplicateOutputs.status.direct_control_gripper.target_descriptor, { pneumatic_outputs: [duplicate, duplicate] });
+    expect(() => parseExecutionOwnerStatus(composed(duplicateOutputs))).toThrow();
     const positionAbsent = structuredClone(response);
     Object.assign(positionAbsent.status.direct_control_gripper, { observed_state: null });
     expect(() => parseExecutionOwnerStatus(composed(positionAbsent)))

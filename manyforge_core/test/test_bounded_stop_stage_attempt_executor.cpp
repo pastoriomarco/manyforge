@@ -450,5 +450,16 @@ TEST(BoundedStopStageAttemptExecutorTest, CapturesIngressAgeAfterQueueWithoutCha
   EXPECT_EQ(executor.Release(*started.handle), StopStageAttemptReleaseStatus::kReleased);
 }
 
+TEST(BoundedStopStageAttemptExecutorTest, DestructionWithoutOwnerDrainDrainsInsteadOfTerminating) {
+  // E.g. the owning Kernel's constructor throws after building its lanes.
+  CompletionReceiver receiver;
+  testing::internal::CaptureStderr();
+  {
+    BoundedStopStageAttemptExecutor executor(8U, 1U, receiver);
+    EXPECT_TRUE(executor.prequalified_ready());
+  }
+  EXPECT_EQ(testing::internal::GetCapturedStderr(), "");
+}
+
 }  // namespace
 }  // namespace manyforge::core

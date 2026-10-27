@@ -23,6 +23,7 @@
 #include <manyforge_ros2_control_execution/ros2_control_execution_backend.hpp>
 #include <manyforge_ros2_control_execution/ros2_gripper_command_backend.hpp>
 #include <manyforge_ros2_control_execution/ros2_transport_resources.hpp>
+#include <sensor_msgs/msg/joint_state.hpp>
 
 namespace manyforge::roboplan_backend {
 
@@ -51,10 +52,19 @@ struct RetainedRos2ControlArmActivity final {
   bool controller_loaded{false};
   bool controller_active{false};
   bool hardware_active{false};
+  /// The joint state broadcaster (`kJointStateBroadcasterControllerName`) is
+  /// active. Reported as a fact only for a Real arm (R7 package 4).
+  bool broadcaster_active{false};
 
   friend bool operator==(const RetainedRos2ControlArmActivity &,
                          const RetainedRos2ControlArmActivity &) = default;
 };
+
+/// The joint state broadcaster of every generated controllers file. A vendor
+/// plugin that deactivates all controllers while its robot is not ready
+/// deactivates it too; ManyForge never does (R7 §3.3).
+inline constexpr std::string_view kJointStateBroadcasterControllerName =
+    "joint_state_broadcaster";
 
 /// Outcome of one CCLC controller switch primitive.
 enum class RetainedRos2ControlSwitchOutcome {
@@ -123,6 +133,66 @@ struct RetainedRos2ControlArmGuardHooks final {
   std::function<void()> stop{};
 };
 
+/// R7 package 3 (vendor-adapter principle): the status a Real component's
+/// vendor adapter normalizes from its own unmodified driver, as the common
+/// cause class plus `device.*` and `manyforge.vendor_code.*` facts (sorted by
+/// id). The adapter owns the vendor message, rate, freshness rule and code
+/// table; stale or missing status is `availability`.
+struct RetainedDeviceStatus final {
+  core::LifecycleBlockingCauseClassDTO cause{
+      core::LifecycleBlockingCauseClassDTO::kAvailability};
+  std::vector<core::LifecycleFactDTO> facts;
+
+  friend bool operator==(const RetainedDeviceStatus &,
+                         const RetainedDeviceStatus &) = default;
+};
+
+/// The vendor adapter of a Real component's arm: the handle merges its status
+/// into the motion domain's lifecycle observation (R7 package 3) and routes
+/// the vendor's own primitives and Enable gate to it (package 4).
+class IRetainedDeviceStatusAdapter {
+public:
+  virtual ~IRetainedDeviceStatusAdapter() = default;
+  /// Once, from `StartBackend`, before the executor starts: create the
+  /// adapter's subscriptions and service clients on the handle's node,
+  /// stamping receipt on the handle's clock. Both outlive them.
+  virtual void Start(rclcpp::Node &node, core::IClock &clock) = 0;
+  /// The lifecycle Observe checkpoint: classify and commit vendor history.
+  [[nodiscard]] virtual RetainedDeviceStatus Observe(core::TimePoint now_ns) = 0;
+  /// Pure health: the same classification without committing anything.
+  [[nodiscard]] virtual RetainedDeviceStatus
+  ReadHealth(core::TimePoint now_ns) const = 0;
+  /// The handle's own hardware activation (arming, the vendor plugin's
+  /// `on_activate`) or deactivation is in flight: its vendor mode/state
+  /// changes are ManyForge's own, never external control.
+  virtual void BeginHardwareTransition(bool activate) = 0;
+  /// It returned; with a possible effect the explanation lasts a bounded
+  /// settle window.
+  virtual void SettleHardwareTransition(bool activate, bool effect_possible,
+                                        core::TimePoint now_ns) = 0;
+  /// The vendor part of the Enable gate (R7 §3.6), pure: the robot is ready
+  /// and the measured joints (controller joint order, already fresh and
+  /// finite) agree with its own reported angles within the component's
+  /// tolerance. An error refuses the activation before effect.
+  [[nodiscard]] virtual core::Result<void>
+  CheckActivation(core::TimePoint now_ns,
+                  const std::vector<double> &measured_positions) const = 0;
+  /// One vendor primitive of the component's catalog (xArm: `xarm.clear_*`):
+  /// one call, never retried; a timeout or a vendor failure is an uncertain
+  /// outcome reconciled by observation. Other ids are refused before effect.
+  [[nodiscard]] virtual RetainedRos2ControlSwitchResult
+  Dispatch(const core::LifecyclePrimitiveId &primitive,
+           std::stop_token cancellation) = 0;
+  /// D11: at Enable, after the gate and before the switch, apply the
+  /// component's configured tool payload: one vendor call, never retried.
+  /// Anything but success refuses the Enable before the switch is sent.
+  /// Without a configured payload, or without a vendor call for it, nothing.
+  [[nodiscard]] virtual RetainedRos2ControlSwitchResult
+  ApplyToolPayload(std::stop_token /*cancellation*/) {
+    return {RetainedRos2ControlSwitchOutcome::kSucceeded, std::nullopt};
+  }
+};
+
 /// Build-owned measured JointState role of the selected lane. Instance
 /// identity remains the verified physical provider/binding/runtime tuple.
 inline constexpr std::string_view kMeasuredJointStateAuthorityId =
@@ -135,10 +205,15 @@ struct RetainedMeasuredJointStateLane final {
   core::Duration freshness_budget_ns;
   core::StateAuthorityId measured_state_authority_id;
   std::string measured_source_profile_id;
-  /// CP9 adapter-kind defaults of the component's `measured_joints` stream
-  /// (budget = `freshness_budget_ns`, message-stamp liveness).
-  core::StreamSeverityDTO stream_severity{core::StreamSeverityDTO::kFault};
-  core::StreamRecoveryDTO stream_recovery{core::StreamRecoveryDTO::kAck};
+  /// CP9 defaults of the component's `measured_joints` stream row (budget =
+  /// `freshness_budget_ns`, message-stamp liveness).
+  core::StreamSeverityDTO stream_severity;
+  core::StreamRecoveryDTO stream_recovery;
+  /// CP9, Mock grippers (stock GripperCommand) only: the gripper's
+  /// `gripper_feedback` stream rides this lane. Its sample is the gripper
+  /// joint in this JointState; defaults are the component's row. Isaac
+  /// grippers record their raw feedback in the gripper backend instead.
+  std::optional<core::StreamDeclarationDTO> gripper_feedback_stream;
 
   friend bool operator==(const RetainedMeasuredJointStateLane &,
                          const RetainedMeasuredJointStateLane &) = default;
@@ -318,6 +393,17 @@ public:
   /// Installs the lane guard's hooks; only before `StartBackend`.
   void InstallGuardHooks(RetainedRos2ControlArmGuardHooks hooks);
 
+  /// R7 package 3: a Real arm's vendor adapter. A vendor intervention cause
+  /// (emergency stop, collision, fault, external control) faults the motion
+  /// domain with that cause and its vendor codes; stale or missing vendor
+  /// status is `availability`; its device facts join the domain's facts,
+  /// with the hardware, broadcaster and controller activity and the measured
+  /// joints' validity (package 4). It enables the hardware primitives, the
+  /// Enable gate and the vendor primitives. Once, before `StartBackend` (it
+  /// may precede `Bind`); never for Mock or Isaac.
+  void InstallDeviceStatusAdapter(
+      std::shared_ptr<IRetainedDeviceStatusAdapter> adapter);
+
   /// Q80: the component's Manager-owned controller launch. Once the source
   /// reports an exit reason, the arm and gripper domains report a `fault`
   /// (the component is failed and motion admission closes); nothing restarts
@@ -346,6 +432,13 @@ public:
   /// commanded-state publication). Only before `StartBackend`.
   void InstallSampleObserver(
       std::function<void(const core::ExecutionControllerSampleDTO &)> observer);
+
+  /// CP8 step 1: a measured-authority arm's addressed state comes from its
+  /// bound measured JointState lane instead of the controller reference.
+  /// Called on the transport executor with every received message. Only
+  /// before `StartBackend`; exclusive with `InstallSampleObserver`.
+  void InstallMeasuredStateObserver(
+      std::function<void(const sensor_msgs::msg::JointState &)> observer);
 
   /// Verify the live factory-bound participant and its current sealed physical
   /// bindings.
@@ -387,8 +480,28 @@ public:
   /// (inactive) controller on active hardware is the prepared state.
   [[nodiscard]] RetainedRos2ControlSwitchResult PrepareArmController();
 
+  /// R7 package 4, Real arm only (`ros2_control.hardware.activate`): set the
+  /// arm's hardware component active through the controller manager's stock
+  /// `set_hardware_component_state`; the vendor plugin's activation arms the
+  /// robot. Refused before effect with stale status or a vendor error, an
+  /// active controller or no loaded controller. Already active hardware
+  /// succeeds without a request. One request bounded at 4 s; no answer is an
+  /// uncertain outcome. The lifecycle state stays unarmed until
+  /// `PrepareArmController`.
+  [[nodiscard]] RetainedRos2ControlSwitchResult
+  ActivateArmHardware(std::stop_token cancellation);
+
+  /// R7 package 4 (`ros2_control.hardware.deactivate`, D4): set it inactive
+  /// (the vendor plugin selects position mode); the arm is then Disabled, not
+  /// armed. Refused while the trajectory controller is active; already
+  /// inactive hardware succeeds without a request.
+  [[nodiscard]] RetainedRos2ControlSwitchResult
+  DeactivateArmHardware(std::stop_token cancellation);
+
   /// CCLC Enable primitive: activate the arm's trajectory controller
   /// (`switch_controller`, strict). Waits for the answer until `cancellation`.
+  /// A Real arm passes the Enable gate first (R7 §3.6): fresh, finite
+  /// measured joints and the vendor adapter's readiness and agreement check.
   [[nodiscard]] RetainedRos2ControlSwitchResult
   ActivateArmController(std::stop_token cancellation);
 
@@ -492,6 +605,13 @@ private:
   SwitchGripperController(bool activate, std::stop_token cancellation);
   void PublishReadinessLocked();
   [[nodiscard]] core::Result<void> RotateEpochLocked();
+  /// A Real arm's measured joints in controller joint order: fresh within the
+  /// measured lane's budget, every joint present and finite.
+  [[nodiscard]] core::Result<std::vector<double>>
+  MeasuredJointsLocked(core::TimePoint now_ns) const;
+  [[nodiscard]] RetainedRos2ControlSwitchResult
+  SendHardwareState(bool active, std::stop_token cancellation,
+                    IRetainedDeviceStatusAdapter &device);
   [[nodiscard]] RetainedRos2ControlSwitchResult
   SendSwitch(bool activate, std::stop_token cancellation,
              std::optional<std::string> selected_controller = {});
@@ -535,8 +655,15 @@ private:
   /// CP9 `measured_joints` stream of the bound component, declared with the
   /// first staged measured source and recorded by every staged subscription.
   std::shared_ptr<core::StreamRecorder> measured_stream_;
+  /// CP9 Mock `gripper_feedback` stream (lane `gripper_feedback_stream`),
+  /// declared and recorded the same way.
+  std::shared_ptr<core::StreamRecorder> gripper_feedback_stream_;
   std::weak_ptr<RetainedObservedStateChannel> gripper_display_channel_;
   std::optional<RetainedRos2ControlArmGuardHooks> guard_hooks_;
+  std::shared_ptr<IRetainedDeviceStatusAdapter> device_status_adapter_;
+  /// A Real arm's latest measured JointState (the Enable gate's input).
+  struct DeviceMeasuredJoints;
+  std::shared_ptr<DeviceMeasuredJoints> device_measured_joints_;
   std::function<std::optional<std::string>()> process_fault_source_;
   std::function<core::Result<std::optional<std::string>>()>
       process_health_source_;
@@ -546,6 +673,9 @@ private:
   std::function<void(const core::ExecutionControllerSampleDTO &)>
       sample_observer_;
   rclcpp::TimerBase::SharedPtr sample_timer_;
+  std::function<void(const sensor_msgs::msg::JointState &)>
+      measured_state_observer_;
+  rclcpp::SubscriptionBase::SharedPtr measured_state_subscription_;
   std::optional<std::pair<std::uint64_t, std::uint64_t>> last_observed_sample_;
   bool start_attempted_{false};
   std::exception_ptr start_failure_;

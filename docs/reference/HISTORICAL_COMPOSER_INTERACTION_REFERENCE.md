@@ -32,7 +32,6 @@ The following documents remain in-tree with a historical/non-activatable
 banner because they capture useful behavior and safety intent:
 
 - [`MCP_RUNTIME_CONTRACT.md`](MCP_RUNTIME_CONTRACT.md);
-- [`ASSISTANT_PROVIDER_CONTRACT.md`](ASSISTANT_PROVIDER_CONTRACT.md);
 - [`../../agent-skills/manyforge-composer/SKILL.md`](../../agent-skills/manyforge-composer/SKILL.md);
 - [`../../agent-skills/manyforge-composer/workspace-AGENTS.md`](../../agent-skills/manyforge-composer/workspace-AGENTS.md);
 - [`../../scripts/templates/AGENTS.md`](../../scripts/templates/AGENTS.md);

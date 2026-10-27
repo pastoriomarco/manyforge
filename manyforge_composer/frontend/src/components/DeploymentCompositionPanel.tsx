@@ -1,4 +1,3 @@
-import { parseSceneRuntimeProjection } from '../api/parsers';
 import type { CCLCController } from '../hooks/useCCLC';
 import { useCallback, useEffect, useMemo, useState } from 'react';
 
@@ -60,6 +59,8 @@ interface DeploymentCompositionPanelProps {
   gripperDescriptors: ManualControlGripperDescriptor[];
   /** Keys a global interrupt rule may read (the Program Draft's keys). */
   programKeys?: readonly BlackboardKeyDeclaration[] | null;
+  /** The Program Draft's scene object ids (orphan pose links); null without a Program. */
+  programSceneIds?: readonly string[] | null;
   /** The Applied Program's execution group ids; null when no Program is applied. */
   executionGroupIds?: readonly string[] | null;
   /** The workbench's single observation of the advertised maintenance
@@ -109,6 +110,7 @@ export function DeploymentCompositionPanel({
   stopChains,
   gripperDescriptors,
   programKeys,
+  programSceneIds = null,
   executionGroupIds = null,
   maintenanceStatus: advertisedStatus,
 }: DeploymentCompositionPanelProps) {
@@ -166,13 +168,6 @@ export function DeploymentCompositionPanel({
       });
     return () => controller.abort();
   }, [enabled, reloadToken]);
-
-  const poseSources = useMemo(() => {
-    const payload = snapshot?.runtime.sections.sceneRuntime.payload;
-    if (payload === null || payload === undefined) return [];
-    try { return parseSceneRuntimeProjection(payload).state.pose_sources; }
-    catch { return []; }
-  }, [snapshot?.runtime.sections.sceneRuntime.payload]);
 
   const componentIds = useMemo(
     () => readModel === null ? [] : controllableComponentIds(readModel.graph),
@@ -264,7 +259,7 @@ export function DeploymentCompositionPanel({
             gripperDescriptors={gripperDescriptors}
             programKeys={programKeys}
             executionGroupIds={executionGroupIds}
-            poseSources={poseSources}
+            programSceneIds={programSceneIds}
           />
           <details className="dcard">
             <summary>Advanced compiled Deployment artifact</summary>

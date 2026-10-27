@@ -8,12 +8,12 @@
   "description": "trocar_lite6_foundationpose_pick\n\nRetained Isaac Lite6 trocar pick deployment using the commanded ROS 2 control runtime and the qualified FoundationPose Detection3D pose-source client.",
   "members": {
     "assignment.yaml": "sha256:1a04360d772c4925b8f0b02708b479388500d222c3b642d3eb039df7d79528f5",
-    "deployment.yaml": "sha256:0191171a3c367a19e80ca87807e2d7f75b27dac09e42a3510a14afc8d5c016aa",
+    "deployment.yaml": "sha256:77f346dda8049e159082c6335de9c0832c8db02247ab8508035db3d279f7e4ed",
     "program.yaml": "sha256:4dc50a5a25c9fbced2aab9828ec0882a18f2c2fb9304bfa2b19a5b5a068a40a9"
   },
   "name": "isaac-lite6-trocar-foundationpose",
   "saved_status": {
-    "checked_content_digest": "sha256:244ab9e2b146b2ef4e09cf570156d88d74ed415c0f2f0f8643fc66ca3b855065",
+    "checked_content_digest": "sha256:7de85783821937d71d3005631adebb596d3203ca1a79f85f58df53a1becd7ca5",
     "last_known_status": "ready",
     "manyforge_version": "0.1.0"
   },
@@ -97,7 +97,7 @@
         "source_id": "component:isaac_lite6_trocar_robot:srdf"
       },
       {
-        "content_digest": "sha256:448485049362a14643f3a6418cee4a9e2119bc86509f0a127607aad54803b641",
+        "content_digest": "sha256:c205aea7474737989e1195fbbff16cb9d3f287fee3cefcd550c7ad2e4e606e90",
         "source_id": "component:isaac_lite6_trocar_robot:urdf"
       }
     ],

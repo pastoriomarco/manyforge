@@ -33,6 +33,9 @@ import {
   takeoverFallbackText,
   ioSourceAuditText,
   ioSourceUnavailableNodes,
+  motionGateAuditText,
+  motionGateWaitNodes,
+  motionGateWaitText,
   resetKeptMessage,
 } from './ProgramRuntimePanel';
 import { readStyleSource } from '../styles/readStyleSource';
@@ -432,6 +435,25 @@ describe('Program runtime projection', () => {
     };
     expect(renderToStaticMarkup(<ProgramRuntimePanel enabled controller={withAudit} />))
       .toContain('Stop fallback on move · takeover preparation late (prep 12 of 30 ms)');
+  });
+
+  it('shows a running motion node waiting for a gate rule as Motion waits, and both transitions as events', () => {
+    const gate = (eventRevision: number, waiting: boolean, node = 'move'): RuntimeControlAuditEvent => ({
+      eventRevision,
+      kind: waiting ? 'program_node_motion_gated' : 'program_node_motion_gate_released',
+      facts: { node_instance_id: node, node_attempt_id: `${node}.1`, rule_id: 'curtain' },
+    });
+    expect(motionGateAuditText(gate(2, true))).toBe('Motion of move waits for global interrupt rule curtain');
+    expect(motionGateAuditText(gate(3, false))).toBe('Global interrupt rule curtain cleared: motion of move admitted');
+    expect(motionGateAuditText({ eventRevision: 4, kind: 'program_node_retry', facts: {} })).toBeNull();
+    const running = { move: 'running', done: 'failure' } as const;
+    expect(motionGateWaitNodes([gate(2, true), gate(3, false)], running)).toEqual([]);
+    expect(motionGateWaitNodes([gate(2, true, 'done')], running)).toEqual([]);
+    const waits = motionGateWaitNodes([gate(2, false), gate(3, true)], running);
+    expect(waits).toEqual([{ waiting: true, nodeInstanceId: 'move', ruleId: 'curtain' }]);
+    expect(motionGateWaitText(waits[0])).toBe(
+      'move: Motion waits: global interrupt rule curtain is active. Motion is allowed again when its condition clears.',
+    );
   });
 
   it('shows a running io wait whose input source is unavailable in amber, and both transitions as events', () => {

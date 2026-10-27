@@ -23,8 +23,10 @@
 #include "manyforge_deployment/artifact_codec.hpp"
 #include "manyforge_deployment/content_identity.hpp"
 #include "program_binding_internal.hpp"
+#include "ros2_control_execution_runtime_unit_internal.hpp"
 #include <manyforge_core/io_signal_descriptor.hpp>
 #include <manyforge_deployment/io_signal_catalog.hpp>
+#include <manyforge_deployment/ros2_control_execution_runtime_contract.hpp>
 
 namespace manyforge::deployment {
 namespace {
@@ -413,6 +415,29 @@ void normalize_and_validate(core::ProgramBindingDTO& value) {
       fail("target nested binding table exceeds fixed bound");
     }
 
+    if (target.pneumatic_io) {
+      auto &route = *target.pneumatic_io;
+      if (route.outputs.empty() || route.outputs.size() > 2U ||
+          route.inputs.size() > 4U)
+        fail("pneumatic I/O binding has invalid row counts");
+      for (const auto &row : route.outputs) {
+        require_identity(row.target_role_id.value(), "pneumatic output target role");
+        require_identity(row.resource_role_id.value(), "pneumatic output resource role");
+      }
+      sort_unique(route.outputs, [](const auto &row) {
+        return std::tie(row.target_role_id, row.resource_role_id);
+      }, "pneumatic output bindings");
+      for (const auto &row : route.inputs) {
+        if (row.input != "open" && row.input != "closed" && row.input != "pressure" &&
+            row.input != "workpiece_grasped")
+          fail("pneumatic input binding has an unknown input");
+        require_identity(row.target_role_id.value(), "pneumatic input target role");
+        require_identity(row.resource_role_id.value(), "pneumatic input resource role");
+      }
+      sort_unique(route.inputs, [](const auto &row) { return row.input; },
+                  "pneumatic input bindings");
+    }
+
     for (auto& frame : target.frame_role_bindings) {
       require_identity(frame.frame_role_id.value(),
                        "frame_role_bindings.frame_role_id");
@@ -592,6 +617,33 @@ void normalize_and_validate(core::ProgramBindingDTO& value) {
         component->controllable_component_id !=
             target.controllable_component_id) {
       fail("target role does not resolve through its component role binding");
+    }
+    if (target.pneumatic_io) {
+      const auto validate_signal = [&](const auto &row, core::IoSignalDirection direction) {
+        const auto selected = std::lower_bound(
+            value.target_role_bindings.begin(), value.target_role_bindings.end(), row.target_role_id,
+            [](const auto &candidate, const auto &id) { return candidate.target_role_id < id; });
+        if (selected == value.target_role_bindings.end() || selected->target_role_id != row.target_role_id)
+          fail("pneumatic I/O target is absent from the Program Binding");
+        const auto signal = std::lower_bound(
+            selected->signal_role_bindings.begin(), selected->signal_role_bindings.end(), row.resource_role_id,
+            [](const auto &candidate, const auto &id) { return candidate.resource_role_id < id; });
+        if (signal == selected->signal_role_bindings.end() || signal->resource_role_id != row.resource_role_id ||
+            signal->direction != direction || signal->value_type != core::IoSignalValueType::kBoolean)
+          fail("pneumatic I/O signal is absent or has the wrong direction");
+        const auto capability = direction == core::IoSignalDirection::kOutput
+                                    ? "io.gpio.set_output" : "io.gpio.get_input";
+        if (std::none_of(selected->capability_bindings.begin(), selected->capability_bindings.end(),
+                         [&](const auto &value) { return value.capability_id.value() == capability; }))
+          fail("pneumatic I/O target has no required capability");
+      };
+      if (std::none_of(target.capability_bindings.begin(), target.capability_bindings.end(),
+                       [](const auto &row) { return row.capability_id.value() == "tool.gripper.command"; }))
+        fail("pneumatic I/O mapping requires a gripper command target");
+      for (const auto &row : target.pneumatic_io->outputs)
+        validate_signal(row, core::IoSignalDirection::kOutput);
+      for (const auto &row : target.pneumatic_io->inputs)
+        validate_signal(row, core::IoSignalDirection::kInput);
     }
   }
 
@@ -1046,7 +1098,7 @@ template <typename StrongType>
                     "controllable_component_id", "command_target_id",
                     "frame_role_bindings", "resource_role_bindings",
                     "collision_body_role_bindings", "capability_bindings"},
-                   {"signal_role_bindings"}, path);
+                   {"signal_role_bindings", "pneumatic_io"}, path);
 
     std::vector<core::ProgramFrameRoleBindingDTO> frames;
     const std::string frames_path = child_path(path, "frame_role_bindings");
@@ -1301,6 +1353,32 @@ template <typename StrongType>
                  require_member(row, "signal_descriptor_digest", path), path)});
       }
     }
+    std::optional<core::ProgramPneumaticIoBindingDTO> pneumatic_io;
+    if (const auto *supplied = find_member(target, "pneumatic_io")) {
+      const auto &route = require_object(*supplied, child_path(path, "pneumatic_io"));
+      require_exact_fields(route, {"outputs", "inputs"}, child_path(path, "pneumatic_io"));
+      core::ProgramPneumaticIoBindingDTO decoded;
+      for (const auto &item : require_array(require_member(route, "outputs", path), path)) {
+        const auto &row = require_object(item, path);
+        require_exact_fields(row, {"target_role_id", "resource_role_id", "open_value", "close_value"}, path);
+        const auto &open = require_member(row, "open_value", path);
+        const auto &close = require_member(row, "close_value", path);
+        if (!open.is_bool() || !close.is_bool()) fail(path + ": pneumatic output values must be boolean");
+        decoded.outputs.push_back({
+            parse_identity<core::TargetRoleId>(require_member(row, "target_role_id", path), path),
+            parse_identity<core::ResourceRoleId>(require_member(row, "resource_role_id", path), path),
+            open.as_bool(), close.as_bool()});
+      }
+      for (const auto &item : require_array(require_member(route, "inputs", path), path)) {
+        const auto &row = require_object(item, path);
+        require_exact_fields(row, {"input", "target_role_id", "resource_role_id"}, path);
+        decoded.inputs.push_back({
+            require_string(require_member(row, "input", path), path),
+            parse_identity<core::TargetRoleId>(require_member(row, "target_role_id", path), path),
+            parse_identity<core::ResourceRoleId>(require_member(row, "resource_role_id", path), path)});
+      }
+      pneumatic_io = std::move(decoded);
+    }
     targets.push_back(core::ProgramTargetRoleBindingDTO{
         parse_identity<core::TargetRoleId>(
             require_member(target, "target_role_id", path),
@@ -1319,6 +1397,7 @@ template <typename StrongType>
         std::move(collision_bodies),
         std::move(capabilities),
         std::move(signals),
+        std::move(pneumatic_io),
     });
   }
 
@@ -1791,6 +1870,66 @@ void verify_binding_context(const core::ProgramBindingDTO& binding,
         fail("signal role binding differs from the exact retained descriptor");
     }
 
+    const bool is_gripper = std::any_of(
+        target_binding.capability_bindings.begin(), target_binding.capability_bindings.end(),
+        [](const auto &row) { return row.capability_id.value() == "tool.gripper.command"; });
+    if (is_gripper || target_binding.pneumatic_io) {
+      using PneumaticIo = ros2_control_execution_runtime_contract::Configuration::PneumaticIo;
+      std::optional<PneumaticIo> expected;
+      std::size_t matches = 0U;
+      for (const auto &unit : graph.runtime_units) {
+        if (unit.runtime_profile_id.value() != ros2_control_execution_runtime_contract::kRuntimeProfileId)
+          continue;
+        const auto rows = unit.configuration.find("gripper_target_configurations");
+        if (rows == unit.configuration.end()) continue;
+        const auto *array = std::get_if<core::JsonValueDTO::Array>(&rows->second.value);
+        if (!array) fail("retained gripper configuration is not an array");
+        for (const auto &row : detail::decode_ros2_control_execution_gripper_target_configurations(*array)) {
+          if (row.controllable_component_id == target_binding.controllable_component_id &&
+              row.command_target_id == target_binding.command_target_id) {
+            ++matches;
+            expected = row.pneumatic_io;
+          }
+        }
+      }
+      if (matches > 1U || expected.has_value() != target_binding.pneumatic_io.has_value())
+        fail("pneumatic I/O binding differs from its retained gripper configuration");
+      if (expected) {
+        const auto &actual = *target_binding.pneumatic_io;
+        const auto signal_id = [&](const auto &row) -> core::IoSignalId {
+          const auto selected = std::lower_bound(binding.target_role_bindings.begin(),
+              binding.target_role_bindings.end(), row.target_role_id,
+              [](const auto &item, const auto &id) { return item.target_role_id < id; });
+          if (selected == binding.target_role_bindings.end() || selected->target_role_id != row.target_role_id)
+            fail("pneumatic I/O binding has no retained target");
+          const auto signal = std::lower_bound(selected->signal_role_bindings.begin(),
+              selected->signal_role_bindings.end(), row.resource_role_id,
+              [](const auto &item, const auto &id) { return item.resource_role_id < id; });
+          if (signal == selected->signal_role_bindings.end() || signal->resource_role_id != row.resource_role_id)
+            fail("pneumatic I/O binding has no retained signal");
+          return {selected->controllable_component_id, signal->signal_name};
+        };
+        if (actual.outputs.size() != expected->outputs.size() || actual.inputs.size() != expected->inputs.size())
+          fail("pneumatic I/O binding has a different retained mapping");
+        std::set<core::IoSignalId> seen_outputs;
+        for (const auto &row : actual.outputs) {
+          const auto id = signal_id(row);
+          if (!seen_outputs.insert(id).second)
+            fail("pneumatic output repeats a retained physical signal");
+          const auto found = std::find_if(expected->outputs.begin(), expected->outputs.end(),
+              [&](const auto &item) { return item.signal == id; });
+          if (found == expected->outputs.end() || found->open_value != row.open_value ||
+              found->close_value != row.close_value)
+            fail("pneumatic output differs from its retained mapping");
+        }
+        for (const auto &row : actual.inputs) {
+          const auto found = expected->inputs.find(row.input);
+          if (found == expected->inputs.end() || found->second != signal_id(row))
+            fail("pneumatic input differs from its retained mapping");
+        }
+      }
+    }
+
     for (const auto& resource_binding : target_binding.resource_role_bindings) {
       std::optional<std::pair<std::vector<core::ResourceId>,
                               std::vector<std::string>>>
@@ -2064,6 +2203,24 @@ CanonicalValue program_binding_projection(
       }
       target_projection.emplace_back("signal_role_bindings",
                                      CanonicalValue(std::move(signals)));
+    }
+    if (target.pneumatic_io) {
+      CanonicalValue::Array outputs;
+      for (const auto &row : target.pneumatic_io->outputs)
+        outputs.emplace_back(CanonicalValue::Object{
+            {"target_role_id", CanonicalValue(row.target_role_id.value())},
+            {"resource_role_id", CanonicalValue(row.resource_role_id.value())},
+            {"open_value", CanonicalValue(row.open_value)},
+            {"close_value", CanonicalValue(row.close_value)}});
+      CanonicalValue::Array inputs;
+      for (const auto &row : target.pneumatic_io->inputs)
+        inputs.emplace_back(CanonicalValue::Object{
+            {"input", CanonicalValue(row.input)},
+            {"target_role_id", CanonicalValue(row.target_role_id.value())},
+            {"resource_role_id", CanonicalValue(row.resource_role_id.value())}});
+      target_projection.emplace_back("pneumatic_io", CanonicalValue(CanonicalValue::Object{
+          {"outputs", CanonicalValue(std::move(outputs))},
+          {"inputs", CanonicalValue(std::move(inputs))}}));
     }
     targets.emplace_back(std::move(target_projection));
   }

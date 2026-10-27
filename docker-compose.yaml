@@ -112,17 +112,22 @@ services:
     profiles:
       - ros
 
-  # Full ROS-capable ManyForge development/build/test toolchain image.
+  # Full ROS-capable ManyForge image: the workbench image started by
+  # scripts/compose-dev.sh (build it with `./scripts/compose-dev.sh build`),
+  # also used for development/build/test checks. It includes the pinned
+  # controller overlay and the xArm driver.
   # Host networking is intentional for ROS 2 DDS discovery during development.
   ros-jazzy-full:
-    # This is the sole build owner for the ROS-full toolchain image. Runtime
-    # services below remain fenced port targets until their restoration gates.
+    # This is the sole build owner for the ROS-full image.
     image: ${MANYFORGE_ROS_FULL_IMAGE:-manyforge-ros-lyrical-full}
     build:
       context: .
       dockerfile: Dockerfile.ros-lyrical-full
       args:
         ROBOPLAN_SOURCE_MODE: ${ROBOPLAN_SOURCE_MODE:-qualified}
+        # noble on x86_64, noble-jetpack on Jetson (compose-dev.sh build selects it).
+        NVIDIA_ISAAC_ROS_RELEASE_SUITE: ${NVIDIA_ISAAC_ROS_RELEASE_SUITE:-noble}
+        CMAKE_BUILD_PARALLEL_LEVEL: ${CMAKE_BUILD_PARALLEL_LEVEL:-4}
     logging: *default-logging
     network_mode: host
     ipc: host
@@ -140,62 +145,3 @@ services:
     tty: true
     profiles:
       - ros-full
-
-  # ROS Composer porting target. Its start script exits with the stable
-  # composable-cell unavailable result before loading ROS adapters or touching
-  # a runtime. Only the shared ROS toolchain/container inputs remain here;
-  # deleted Composer runtime wires are not kept as dormant environment fields.
-  composer-ros:
-    image: ${MANYFORGE_ROS_FULL_IMAGE:-manyforge-ros-lyrical-full}
-    logging: *default-logging
-    restart: "no"
-    network_mode: host
-    ipc: host
-    volumes:
-      - .:/workspace
-      - ros-full-build-cache:/tmp/manyforge-build
-    environment:
-      - ROS_DOMAIN_ID=${ROS_DOMAIN_ID:-0}
-      - RMW_IMPLEMENTATION=${RMW_IMPLEMENTATION:-rmw_fastrtps_cpp}
-      - ROS_AUTOMATIC_DISCOVERY_RANGE
-      - ROS_STATIC_PEERS
-      - FASTRTPS_DEFAULT_PROFILES_FILE
-      - FASTDDS_DEFAULT_PROFILES_FILE
-    working_dir: /workspace
-    command: ["bash", "-lc", "./scripts/ros/start-composer-ros.sh"]
-    profiles:
-      - ros-full
-
-  # Developer tool: standalone I9 Isaac ros2_control qualification, separate
-  # from the Manager-owned component/world launch. Isaac remains a separately
-  # owned laptop process; this Orin-side service builds into the persistent
-  # cache, then exposes JTC and thin adapters for the user-opened Isaac scene.
-  # Composer/Program auto-load and DemoSupervisor ownership remain absent.
-  # Temporary qualification hold (Q120): preserve the current Isaac lane
-  # image until the Lyrical topic-control roundtrip is qualified.
-  # This exact amd64 image exists on the laptop; Orin/Thor need an explicitly
-  # supplied qualified held image. The common Lyrical override cannot select it.
-  isaac-topic-control:
-    image: ${MANYFORGE_ISAAC_ROS_IMAGE:-manyforge-ros-jazzy-full:q44-20261010}
-    logging: *default-logging
-    restart: "no"
-    network_mode: host
-    ipc: host
-    volumes:
-      - .:/workspace
-      - ros-full-build-cache:/tmp/manyforge-build
-    environment:
-      - ROS_DOMAIN_ID=${ROS_DOMAIN_ID:-0}
-      - RMW_IMPLEMENTATION=${RMW_IMPLEMENTATION:-rmw_fastrtps_cpp}
-      - ROS_AUTOMATIC_DISCOVERY_RANGE=${ROS_AUTOMATIC_DISCOVERY_RANGE:-LOCALHOST}
-      - ROS_STATIC_PEERS=${ROS_STATIC_PEERS:-192.168.1.132;192.168.1.68}
-      - FASTRTPS_DEFAULT_PROFILES_FILE
-      - FASTDDS_DEFAULT_PROFILES_FILE
-    working_dir: /workspace
-    command: ["bash", "-lc", "./scripts/ros/launch-isaac-topic-based-control.sh"]
-    profiles:
-      - ros-full
-
-volumes:
-  ros-full-build-cache:
-    name: ${MANYFORGE_ROS_FULL_BUILD_CACHE_VOLUME:-manyforge_ros-full-build-cache}

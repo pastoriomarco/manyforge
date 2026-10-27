@@ -852,7 +852,7 @@ export function parseDeploymentWorkspaceResponse(
     allowedKeysAt(document,
       ['api_version', 'deployment_artifact_id', 'name',
         'components', 'attachments', 'policies'],
-      ['description', 'assistant_profile_id', 'compatibility'],
+      ['description', 'assistant_profile_id', 'assistant_model_components', 'compatibility'],
       `${path}.draft.document`);
     if (stringAt(document.deployment_artifact_id,
       `${path}.draft.document.deployment_artifact_id`) !== deploymentArtifactId) {
@@ -1358,6 +1358,7 @@ export function parseAppliedProgramSelection(value: unknown): AppliedProgramSele
       'source_document_digest',
       'scenario_id',
       'schema_version',
+      'simulation_scene',
       'source',
     ],
     path,
@@ -1373,6 +1374,10 @@ export function parseAppliedProgramSelection(value: unknown): AppliedProgramSele
   const assistantProjection = record.assistant_projection === null
     ? null
     : jsonRecordAt(record.assistant_projection, `${path}.assistant_projection`);
+  // Simulator entity mapping for the Program's simulation nodes; not shown here.
+  if (record.simulation_scene !== null) {
+    jsonRecordAt(record.simulation_scene, `${path}.simulation_scene`);
+  }
   const ownerIdentities = boundedArrayAt(
     record.owner_identities,
     `${path}.owner_identities`,

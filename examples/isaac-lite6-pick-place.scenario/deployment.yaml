@@ -20,29 +20,21 @@
       "component_profile_id": "pose_source_v0",
       "configuration": {
         "runtime_configuration": {
-          "pose_sources": [
-            {
-              "controllable_component_id": "isaac_lite6_observer",
-              "detection3d_sources": [],
-              "joint_state": {
-                "eligible": false,
-                "lifetime_ns": 1000000000,
-                "object_id": "isaac_lite6_robot",
-                "policy_id": "viewer.measured_robot",
-                "required_joint_names": [
-                  "joint1",
-                  "joint2",
-                  "joint3",
-                  "joint4",
-                  "joint5",
-                  "joint6"
-                ],
-                "topic": "/isaac_joint_states"
-              },
-              "simulation_entities": [],
-              "simulation_poll_period_ms": 250
-            }
-          ]
+          "robot_overlay": {
+            "joint_state": {
+              "required_joint_names": [
+                "joint1",
+                "joint2",
+                "joint3",
+                "joint4",
+                "joint5",
+                "joint6"
+              ],
+              "topic": "/isaac_joint_states"
+            },
+            "robot_component_id": "isaac_lite6_robot"
+          },
+          "stream_budget_ns": 1000000000
         },
         "runtime_kind": "pose_source"
       },
@@ -68,6 +60,22 @@
         },
         "runtime_configuration": {
           "collision_monitor_period_ms": 50.0,
+          "component_streams": [
+            {
+              "budget_ns": 1000000000,
+              "controllable_component_id": "isaac_lite6_robot",
+              "recovery": "auto",
+              "severity": "warning",
+              "stream_id": "gripper_feedback"
+            },
+            {
+              "budget_ns": 250000000,
+              "controllable_component_id": "isaac_lite6_robot",
+              "recovery": "auto",
+              "severity": "warning",
+              "stream_id": "measured_joints"
+            }
+          ],
           "execution_tick_hz": 100,
           "gripper_target_configurations": [
             {
@@ -85,7 +93,6 @@
               "mount_frame": "link_eef",
               "open_state_ref": "open",
               "output_mode": "commanded",
-              "state_freshness_timeout_s": 1.0,
               "tcp_frame": "link_tcp",
               "touch_links": [
                 "lite_gripper_base_link",
@@ -103,7 +110,6 @@
             0.0
           ],
           "isaac_profile": "lite6",
-          "mode": "commanded_sim",
           "planner_rng_seed": 12345
         },
         "runtime_kind": "ros2_control"

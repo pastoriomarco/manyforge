@@ -36,6 +36,12 @@ struct IoSignalProviderConfiguration final {
   /// contact bodies are derived from this exact endpoint definition.
   std::optional<GeometricContactEndpoint> endpoint{};
   std::optional<core::SceneResourceId> target_scene_resource_id{};
+  /// xArm physical GPIO address, resolved beneath this robot's driver.
+  std::optional<core::ControllableComponentId> robot_component_id{};
+  std::optional<std::string> bank{};
+  /// Optional synthetic feedback from an output of this I/O component.
+  std::optional<std::string> echo_output_signal_name{};
+  std::optional<core::Duration> echo_delay_ns{};
   friend bool operator==(const IoSignalProviderConfiguration &,
                          const IoSignalProviderConfiguration &) = default;
 };
@@ -54,14 +60,14 @@ struct RetainedIoProviderDeviceConfiguration final {
   core::RuntimeUnitId runtime_unit_id;
   core::ControllableComponentId controllable_component_id;
   core::Duration lifecycle_command_timeout_ns;
-  /// Required after normalization for actual ROS SetBool or UR SetIO outputs.
+  /// Required after normalization for acknowledged ROS service outputs.
   /// Mock outputs have immediate synthetic acceptance and no deadline budget.
   std::optional<core::Duration> output_source_ack_timeout_ns{};
 };
 
 /// Applies the approved 30 s per-device default before schema normalization
 /// and graph identity. Ordinary configurations gain no synthetic device rows;
-/// the deferred xArm profile is not admitted in this R5 catalog.
+/// provider-owned outputs get the same acknowledged-service policy.
 [[nodiscard]] core::Result<void> MaterializeRetainedIoProviderDevices(
     core::CellGraphDTO &graph,
     const std::optional<core::RuntimeUnitId> &runtime_unit_id = std::nullopt);
@@ -84,14 +90,15 @@ ResolveRetainedIoSignalCatalog(
 struct RetainedPoseSourceConfiguration final {
   core::RuntimeUnitId runtime_unit_id;
   core::ControllableComponentId controllable_component_id;
-  /// Sorted, unique `poses/<object_id>/<policy_id>` of every binding.
+  /// Sorted, unique stream ids (`PoseSourceStreamId`) of every binding.
   std::vector<std::string> stream_ids;
   /// The normalized unit-configuration row.
   core::JsonValueDTO row;
 };
 
-/// `poses/<object_id>/<policy_id>`: one stream (and provider-domain member)
-/// per pose-source binding.
+/// One stream (and provider-domain member) per pose-source binding:
+/// `poses/<object_id>` for an object link (`policy_id == "scene"`), else
+/// `poses/<object_id>/<policy_id>` (robot viewer overlays).
 [[nodiscard]] std::string PoseSourceStreamId(std::string_view object_id,
                                              std::string_view policy_id);
 
@@ -106,10 +113,36 @@ ResolveRetainedPoseSources(
     const core::CellGraphDTO &graph,
     const std::optional<core::RuntimeUnitId> &runtime_unit_id = std::nullopt);
 
+/// The capability of the single `endpoint` target of an AI model component.
+inline constexpr std::string_view kAiModelCapabilityId = "ai.model.invoke";
+inline constexpr std::string_view kAiModelTargetId = "endpoint";
+
+/// One model-free AI model row (`ai_models`) of a runtime unit: an external
+/// OpenAI-compatible endpoint. `api_key_env` names the token's environment
+/// variable (absent: no token).
+struct RetainedAiModelConfiguration final {
+  core::RuntimeUnitId runtime_unit_id;
+  core::ControllableComponentId controllable_component_id;
+  std::string base_url;
+  std::string model;
+  std::optional<std::string> api_key_env;
+  /// The normalized unit-configuration row.
+  core::JsonValueDTO row;
+};
+
+/// Reads the normalized `ai_models` rows (the closed schema proved every
+/// field, one row per component): hosted owner. Typed reasons:
+/// `ai_model_owner_mismatch`, `ai_model_configuration_invalid`.
+[[nodiscard]] core::Result<std::vector<RetainedAiModelConfiguration>>
+ResolveRetainedAiModels(
+    const core::CellGraphDTO &graph,
+    const std::optional<core::RuntimeUnitId> &runtime_unit_id = std::nullopt);
+
 /// Rechecks direct provider scope against the retained component and actual
 /// configured signal owners. Component-type role classification is proved by
 /// the ordinary applicability qualifier before sealing. `scene.pose.observe`
-/// on the `poses` target of a configured pose source has no endpoint.
+/// on the `poses` target of a configured pose source, and `ai.model.invoke` on
+/// the `endpoint` target of a configured AI model, have no endpoint.
 [[nodiscard]] core::Result<void> ValidateNonCoordinateProviderTarget(
     const core::CellGraphDTO &graph,
     const core::CapabilityProviderBindingDTO &provider);

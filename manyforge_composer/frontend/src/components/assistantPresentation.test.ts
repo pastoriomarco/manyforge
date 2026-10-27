@@ -2,6 +2,8 @@ import { describe, expect, it } from 'vitest';
 
 import type { AssistantProviderStatus } from '../types/assistant';
 import {
+  NO_ASSISTANT_CHAT_MODE,
+  assistantAvailability,
   assistantFailureText,
   summarizeAssistantToolResult,
 } from './AssistantOverlay';
@@ -27,7 +29,41 @@ describe('assistant operator presentation', () => {
     expect(assistantFailureText(failed('assistant_projection_stale', 'bundle changed')))
       .toContain('Refresh mode discovery');
     expect(assistantFailureText(failed('response_rejected', 'tool was outside mode')))
-      .toContain('selected mode');
+      .toContain('tools available');
+    expect(assistantFailureText(failed('assistant_ai_model_absent', 'absent')))
+      .toBe('No AI model component in this Deployment');
+    expect(assistantFailureText(failed('ai_model_token_unavailable', 'MY_TOKEN is not set')))
+      .toContain('MY_TOKEN is not set');
+  });
+
+  it('opens the AI tab only with an assistant profile and an AI model component', () => {
+    const index = (aiModelComponentId: string | null, modes = ['composer-assistant']) => ({
+      status: 'ready' as const,
+      data: {
+        retainedBundleId: 'bundle.1',
+        graphRevision: 'graph.1',
+        assistantProjectionDigest: `sha256:${'1'.repeat(64)}`,
+        instrumentRegistryDigest: `sha256:${'2'.repeat(64)}`,
+        aiModelComponentId,
+        modes: modes.map((mode) => ({
+          mode,
+          description: 'Draft authoring',
+          grantPolicy: { approval_mode: null, review_policy: 'required', session_kind: null },
+        })),
+      },
+    });
+    expect(assistantAvailability(index('assistant_model')).unavailableReason).toBeNull();
+    expect(assistantAvailability(index(null)).unavailableReason)
+      .toBe('No AI model component in this Deployment');
+    expect(assistantAvailability(index('assistant_model', [])).unavailableReason)
+      .toBe(NO_ASSISTANT_CHAT_MODE);
+    expect(assistantAvailability({
+      status: 'absent',
+      message: 'No AI model component in this Deployment',
+    }).unavailableReason).toBe('No AI model component in this Deployment');
+    const failedRead = assistantAvailability({ status: 'error', message: 'read failed' });
+    expect(failedRead.unavailableReason).toBeNull();
+    expect(failedRead.modeError).toBe('read failed');
   });
 
   it('retains a bounded useful tool-result summary without transcript payloads', () => {

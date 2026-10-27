@@ -237,7 +237,6 @@ inline void map_robotiq_gripper_only_graph(CanonicalValue::Object &members) {
                 {"mount_frame", CanonicalValue("robotiq_85_base_link")},
                 {"open_state_ref", CanonicalValue("open")},
                 {"output_mode", CanonicalValue("commanded")},
-                {"state_freshness_timeout_s", CanonicalValue(1.0)},
                 {"tcp_frame", CanonicalValue("robotiq_85_base_link")},
                 {"touch_links", CanonicalValue(CanonicalValue::Array{
                     CanonicalValue("robotiq_85_base_link"),

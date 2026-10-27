@@ -1,350 +1,85 @@
 # ManyForge
 
-Repository for a modular robot-execution framework built around headless C++
-semantic owners and thin authoring/operator clients. Execution uses the ROS
-host for offline mock, Isaac and real controller adapters. The native simulator
-and its executable have been removed; shared governance, planning, cell ownership
-and runtime-unit plumbing remain.
+ManyForge is a robot-programming and execution framework. Composer provides a
+visual editor for Programs, Scenes and Deployments; the backend plans and
+executes motions, monitors the cell and reports operation status. A Program
+can be used with different compatible Deployments without embedding a robot
+backend in the Program.
 
-> **Current `dev` qualification:** the ROS Workbench empty bootstrap reached
-> ready, and a combined mock check passed (2026-10-14).
-> These checks do not qualify Isaac or physical operation, the complete Compose
-> wrapper, or an observed GUI journey. The final M1 mock milestone, including
-> gripper-only execution, remains pending. Use
-> [`DEVELOPMENT_WORKBENCH.md`](docs/operations/DEVELOPMENT_WORKBENCH.md) for
-> the source-based development entrypoint. Historical aggregate launch and
-> packaged installation remain separate delivery work.
+The source workbench uses ROS 2 controller adapters. It supports a mock lane
+and can connect to a separately running Isaac Sim scene. Physical robot use
+requires the appropriate robot integration and attended hardware qualification;
+a simulated run does not qualify a physical robot.
 
-> **For LLMs** (Claude, ChatGPT, agentic IDEs): read
-> [`AGENTS.md`](AGENTS.md) before making any change. It tells you what
-> this repo is, which runtime surfaces are unavailable, how to interpret the
-> historical operator material, and the branch + commit workflow that applies
-> to LLM contributors. The full contributor
-> reference is [`CONTRIBUTING.md`](CONTRIBUTING.md).
+## Start the workbench
 
-## Documentation map
-
-| You want to…                                        | Start here                                                                                                                                 |
-| --------------------------------------------------- | ------------------------------------------------------------------------------------------------------------------------------------------ |
-| Start the current development workbench             | [`docs/operations/DEVELOPMENT_WORKBENCH.md`](docs/operations/DEVELOPMENT_WORKBENCH.md)                                                      |
-| Study historical operator workflows                 | [`docs/INDEX.md`](docs/INDEX.md) → runbooks, each marked as restoration input                                                              |
-| Understand architecture and authority boundaries    | [`docs/reference/ARCHITECTURE.md`](docs/reference/ARCHITECTURE.md)                                                                         |
-| Inspect current REST or historical client contracts | [`docs/INDEX.md`](docs/INDEX.md) → structural REST and historical interaction references                                                   |
-| Study the historical robot-import workflow          | [`docs/operations/ADDING_A_ROBOT.md`](docs/operations/ADDING_A_ROBOT.md); v0 migration/reference input until the replacement gates qualify |
-| Contribute code or documentation                    | [`CONTRIBUTING.md`](CONTRIBUTING.md); LLM agents also read [`AGENTS.md`](AGENTS.md)                                                        |
-
-The public structural-shell and historical operator documentation is
-self-contained in this repository. Private maintainer specifications are not
-needed to inspect those surfaces. The maintained native path is available
-through explicit owner entrypoints; packaged installation, historical aggregate
-bring-up, and the I9-I11 product lanes are still unavailable.
-
-## Disclaimer
-
-This software is released under the Apache-2.0 license (see
-[`LICENSE`](LICENSE) for details).
-
-**Safety notice:** ManyForge does **not** implement functional safety. Its
-fail-closed behaviors (command gating, bounded stops, intervention
-acknowledgement) are software-level execution controls, not safety
-functions. You **must** integrate appropriate safety measures compliant
-with local regulations (hardware e-stops, safety-rated controllers, risk
-assessment) before deploying on real hardware.
-
-**Experimental:** the project is under active development; pre-1.0 APIs may
-change between minor versions (see [`CHANGELOG.md`](CHANGELOG.md)).
-
-## Quick Start
-
-Requires Docker (with BuildKit) and git.
+Follow the [workbench guide](docs/operations/DEVELOPMENT_WORKBENCH.md) for
+host prerequisites and the matching ROS image. Once the image is available,
+start from the repository root:
 
 ```bash
-# 1. Clone RoboPlan dependency and build the Docker image (~10 min first time)
-./scripts/setup-docker.sh
-
-# 2. Enter the dev container
-docker compose run --rm dev bash
-
-# 3. Run the explicit retained aggregate qualification in the container
-./scripts/test-all.sh retained
+./scripts/compose-dev.sh start --project examples/lite6_pick_and_place.scenario
 ```
 
-**Working on the current Composer UI?** Start the complete simulated native
-development workbench:
+Open **http://localhost:3000**. Omit `--project` to start with an empty
+workspace. Use `./scripts/compose-dev.sh status` to inspect the workbench and
+`./scripts/compose-dev.sh stop` to stop it. Starting the workbench does not run
+its test suite or authorize robot motion.
 
-```bash
-./scripts/compose-dev.sh start \
-  --project examples/lite6_pick_and_place.scenario
-```
+For Isaac, open the matching scene and its ROS simulation interfaces in Isaac
+Sim separately, then load the corresponding ManyForge Scenario. The workbench
+connects to the scene already open in Isaac; it does not start Isaac or load the
+world. Configure ROS discovery so the two hosts can communicate. Check component
+and stream status before executing.
 
-Omit `--project` to start with an empty authoring workspace. The launcher builds
-the repository-owned empty bootstrap, current Manager/Headless, native
-execution/candidate-worker and Deployment authoring targets with their
-dependencies. A selected project is activated through the ordinary application
-path. `status` and `stop` are separate commands. Vite HMR is served at
-`http://localhost:3000`. The launcher does not run tests, sanitizers,
-qualification or proof generation. The
-selected workbench lane is simulated and cannot authorize physical execution.
-See the
-[`development workbench runbook`](docs/operations/DEVELOPMENT_WORKBENCH.md).
-Installed product launch and distribution remain later gates.
+## Using ManyForge
 
-**Restoring or designing the new robot-import workflow?** See
-[`docs/operations/ADDING_A_ROBOT.md`](docs/operations/ADDING_A_ROBOT.md) —
-historical URDF/SRDF requirements, v0 artifact behavior, adapter-selection
-intent, and smoke acceptance inputs. It is not the current artifact schema or
-a runnable recipe. All operator docs are catalogued at
-[`docs/INDEX.md`](docs/INDEX.md).
+A Scenario project contains the Program, Deployment, assignment and referenced
+assets. **Save** persists authored changes; **Apply** makes the selected
+configuration available to the runtime. Loading or applying a Scenario does not
+execute its Program. Inspect component readiness and Runtime/history before
+issuing motion, and do not infer command success from a lost connection.
 
-**Studying the former physical Lite6 qualification?** The staged procedure in
-[`docs/operations/LITE6_LIVE_QUALIFICATION.md`](docs/operations/LITE6_LIVE_QUALIFICATION.md)
-is pinned as I10/R reimplementation and acceptance input. Do not run it from
-the current branch; the real-robot product lane and its launcher are
-unavailable.
+Configured host project folders appear in Composer as `/projects/<name>`. Use
+the displayed container path or a relative path in the picker, not a pasted host
+path. After changing configured folders, stop the workbench and start it again
+to update their mounts; running `start` on an already running workbench does
+not change them. See [Project folders](docs/operations/DEVELOPMENT_WORKBENCH.md#project-folders).
 
-## Running Tests
+Previous session journals are kept under the workbench's runtime state root.
+Retention is limited; see the [session note](docs/operations/FRESH_CHECKOUT_CHECKLIST.md)
+if you need to copy records for longer-term use.
 
-All commands run inside the container (`docker compose run --rm dev bash`).
+The optional Composer AI tab uses your OpenAI-compatible model server,
+configured through an `ai_model` component and an assistant profile. Its
+tools edit the Draft; review those edits and Apply or Discard them yourself.
+See the [assistant setup guide](docs/operations/ASSISTANT_E2E_COOKBOOK.md).
 
-```bash
-# Current retained structural/offline aggregate
-./scripts/test-all.sh retained
+See the [documentation index](docs/INDEX.md) for the workbench, authoring and
+API references. The [interrupts guide](docs/authoring/INTERRUPTS.md) explains
+signals, node rules and global rules.
 
-# Individual suites
-./scripts/test-all.sh cpp          # all C++ package tests
-./scripts/test-all.sh roboplan     # retained-model RoboPlan qualification only
-./scripts/test-all.sh bindings     # ROS-free I2 compiler bindings and API contract
-./scripts/test-all.sh python       # manyforge_behavior
-./scripts/test-all.sh integration  # historical aggregate selector; still unavailable
-./scripts/test-all.sh composer     # structural Composer tests + frontend build
-```
+## Architecture
 
-The historical no-argument and `all` forms intentionally return
-`composable_cell_runtime_unavailable`: they formerly meant the complete
-product matrix and must not silently succeed after that matrix was narrowed.
-Use the named retained or focused selectors above.
+The Program runner orchestrates Program nodes. The ROS-free execution kernel
+owns motion execution and Stop semantics; ManyForge's collision layer validates
+and monitors motions. Deployment and component owners manage the selected
+configuration and component lifecycle. Composer presents and edits those owners'
+state; it is not the authority for robot motion.
 
-The generic `all`/`integration` script selectors are not current product-suite
-qualification entrypoints. Current I7/I8 qualification uses the bounded CMake
-targets and focused ROS mock process workflows.
-The `bindings` selector builds and tests the qualified ROS-free
-`manyforge_core_py` compiler surface and generated API contract. I2 closed on
-the exact executable commit `0ee506a0d1c05006d2d0f5356cc93db17dca0b98`,
-tree `22de99ef24350e533616d899534914478cb53cee`, after its complete cumulative
-offline matrix and independent closure review. I3 subsequently closed on
-implementation freeze `62df57ca76b55991c8ac01d3a316dfc8a3b450aa`, tree
-`968422a59dd1216a0db07ec398c9f49b1a9ff7cc`, after cumulative Release,
-sanitizer, deterministic-regeneration, static-boundary, and adversarial
-qualification. I3's retained products are offline inputs to later owners; they
-do not by themselves start processes or restore a runtime. The current ROS host and focused mock checks use those retained products.
-The historical aggregate, Isaac and physical product-lane qualification remain
-unavailable.
+## Safety
 
-The official full ROS Lyrical image supplies focused ROS development checks
-on amd64 and arm64. Legacy Compose service names are compatibility aliases
-for this same image; such checks do not restore or qualify a ROS product:
+ManyForge does **not** implement functional safety. Its software Stops,
+command gates and acknowledgement controls are not safety-rated functions.
+Integrate appropriate safety measures, including hardware emergency stops and
+safety-rated controls, and perform a risk assessment before using real
+hardware. Closing the browser does not stop the runtime.
 
-```bash
-docker compose --profile ros-full build ros-jazzy-full
-docker compose --profile ros run --rm ros-jazzy ./scripts/test-ros.sh
-```
+## Contributing and project information
 
-`Dockerfile.ros-lyrical-full` starts from pinned Ubuntu Noble and keeps ROS
-Python dependencies apt-managed. Its cache derivative adds pinned ccache
-tooling to an immutable local image; it does not define another runtime lane.
-ROS execution requires a source-matched full ROS image. ROS-free compiler and
-governance libraries remain transport-independent.
+See [CONTRIBUTING.md](CONTRIBUTING.md) for development and test instructions.
+Agents should also read [AGENTS.md](AGENTS.md). The current version is in
+[VERSION](VERSION); release notes are in [CHANGELOG.md](CHANGELOG.md).
 
-The held image overrides are separate: `MANYFORGE_ISAAC_ROS_IMAGE` and
-`MANYFORGE_REAL_LITE6_ROS_BASE_IMAGE`, both defaulting to the existing laptop
-Jazzy tag `manyforge-ros-jazzy-full:q44-20261010`. Preserve this existing image;
-the common full-image build does not recreate it. That amd64 image is not
-available on current Orin/Thor inventories; their held lanes remain unavailable
-until an exact qualified image is supplied.
-
-The temporary qualification hold keeps the actual Isaac topic-control and experimental real-Lite6
-overlay image defaults on their current bases. Migrating these defaults awaits a
-Lyrical topic-control roundtrip and xArm driver build/mock bring-up, respectively.
-This hold is a qualification boundary, not a second official development image;
-no live Isaac or hardware qualification follows from toolchain checks.
-
-The same full Lyrical toolchain also backs the legacy `ros-jazzy-full` alias,
-but its product entry point is explicitly unavailable:
-
-```bash
-docker compose --profile ros-full run --rm ros-jazzy-full ./scripts/test-ros-full.sh
-```
-
-`test-ros-full.sh` returns the stable cutover reason and exit 78; it must not
-build, probe a cached product, or be cited as lane evidence.
-
-To build C++ manually:
-
-```bash
-cd /tmp/manyforge-build/core
-cmake /workspace/manyforge_core -DCMAKE_BUILD_TYPE=Release
-make -j$(nproc)
-ctest --output-on-failure
-```
-
-## Project Structure
-
-```
-manyforge_core/          C++ library: execution kernel, state machine, DTOs, ports
-  python/                pybind11 DTO and graph/compiler projections; no runtime-owner bindings
-manyforge_content_identity/  Shared ROS-free canonical JSON and content-digest primitives
-manyforge_persistence/   Shared ROS-free mechanical durable-storage safety primitives
-manyforge_scene/         Canonical-empty and bounded runtime-only Apply logical-scene owner
-manyforge_deployment/    ROS-free composable-cell codec, qualification, final C++ trust boundary, and retention substrate
-manyforge_component_manager/  ROS-free I4 owner for the bounded M0 Apply/runtime fixture
-manyforge_headless/      C++ Manager/scene/alarm/history and retained-product projection owners
-manyforge_headless_api/  Bounded FastAPI/CLI projection and attributed intent transport
-manyforge_program_runner/ Independent Program capture/tree/tick/status/Stop orchestration process
-manyforge_collision/     C++ planner-neutral collision query implementation
-manyforge_roboplan/      Retained planning-model staging and bounded N3 native execution host
-manyforge_ros2_control_execution/  Retained C++ ROS execution/admission library; no current product lane
-manyforge_cclc_msgs/     ROS IDL for the bounded same-host CCLC request transport
-manyforge_xarm_adapter/  Experimental xArm model/binding/observation inputs; no live lane
-manyforge_xarm_control/  Build-owned Lite6 catalog and restricted xarm_ros2 CCLC adapter
-manyforge_behavior/      Build-owned v2 node environment and Program orchestration/client mechanisms
-manyforge_composer/      Structural FastAPI/React shell and thin H0/N6/N7 authoring/operator clients
-manyforge_assistant_bridge/ Strict bounded direct/nemoclaw provider mediation; no runtime ownership
-manyforge_ros/           Retained pure contracts and explicit unavailable runtime boundaries
-tests/                   Cutover and package contract tests
-scripts/                 Build/test/setup scripts
-docs/                    Architecture reference
-```
-
-## Target architecture
-
-```
-Program YAML --> Program Runner --> ExecutionKernel (C++) --> Planner / execution adapters
-                      |                    |                         |
-            Behavior tree/catalog   validation + stop       RoboPlan / ros2_control
-                      |             collision authority              |
-                      |                     |                  robot / Isaac
-                      +---------- Headless facts/intents ------------+
-                                            |
-                                     Composer / viewer
-```
-
-This diagram and the ownership statements below describe both the current
-maintained native boundary and the later transport lanes. The kernel owns
-terminal and Stop
-authority; ManyForge's collision layer owns collision admission; the
-independent Program runner hosts Behavior orchestration and run identity;
-Headless owners publish runtime, scene, alarm, and history facts. Composer owns
-authoring and presentation only—not motion, alarm, scene, or runtime authority.
-For the full component map, deployment lanes, scene
-initialization, recovery, and observability model, see
-[`docs/reference/ARCHITECTURE.md`](docs/reference/ARCHITECTURE.md).
-
-- **manyforge_core** is ROS-free, pure C++20. All robot-framework-specific code lives in adapter packages.
-- **manyforge_roboplan** provides retained planning-model staging and the
-  current native motion/gripper/pick-place execution, CCLC composition, and
-  addressed Stop/recovery host. ROS/Isaac and physical product lanes remain
-  unavailable.
-- Python code calls C++ through pybind11 bindings -- no duplicate state machines.
-- The Docker container includes all dependencies (Pinocchio, RoboPlan, pybind11).
-
-## Historical pick-and-place workflow — unavailable
-
-The former workflow was:
-
-```bash
-./scripts/launch.sh --lane manyforge-only --assistant off --scenario ur5-pick-place --non-interactive --yes
-```
-
-The command now fails before effects. Use its workflow only as historical
-reimplementation input; the demo shim and native viewer are removed.
-
-## Current inspection APIs and historical LLM interactions
-
-The structural Composer REST surface and the independent I5/H0 headless
-projection are current. Provider-backed assistant conversations and a public
-MCP server remain unavailable; their former interactions are retained as
-historical design inputs:
-
-- **REST API** — FastAPI backend at `http://localhost:9000/api/`. Operator-
-  facing reference: [`docs/reference/REST_API.md`](docs/reference/REST_API.md).
-  The live OpenAPI schema is also available at `http://localhost:9000/docs`
-  and `http://localhost:9000/openapi.json` once Composer is running.
-- **Headless REST/CLI** — the independent Manager, runtime, scene, alarm,
-  history, health, and thin addressed execution/preview projection defaults to
-  `http://127.0.0.1:9010` when
-  started with `python -m manyforge_headless_api serve`. Contract:
-  [`docs/reference/HEADLESS_REST_API.md`](docs/reference/HEADLESS_REST_API.md).
-  It exposes the selected bounded native execution owner, confirmed CCLC
-  lifecycle/route requests, scoped Stop, Full Stop, and Stop-fault recovery.
-  Robot Control preview never moves a resource, and approval uses the ordinary
-  operation endpoint. An absent owner is reported as unavailable rather than
-  inferred from client state.
-- **MCP Server (historical)** — former Model Context Protocol interface.
-  Reference-only tool contract:
-  [`docs/reference/MCP_RUNTIME_CONTRACT.md`](docs/reference/MCP_RUNTIME_CONTRACT.md).
-- **Assistant Provider Bridge (historical)** — former HTTP mediation service
-  between Composer and an LLM endpoint. Reference-only wire contract:
-  [`docs/reference/ASSISTANT_PROVIDER_CONTRACT.md`](docs/reference/ASSISTANT_PROVIDER_CONTRACT.md).
-
-See [`docs/reference/HISTORICAL_COMPOSER_INTERACTION_REFERENCE.md`](docs/reference/HISTORICAL_COMPOSER_INTERACTION_REFERENCE.md)
-for the exact source commit and the rule for translating interaction intent
-onto new headless owners.
-
-## Docker Details
-
-The container runs as a non-root user (`manyforge`, uid 1000). The entrypoint
-(`docker-entrypoint.sh`) only establishes the runtime environment:
-
-- Sets `PYTHONPATH` for `manyforge_behavior`
-- Uses `/tmp/manyforge-build/` for out-of-tree builds (avoids conflicts with host build dirs)
-- Refuses a non-writable build root; it never builds or deletes cached products
-
-Canonical `docker compose run --rm dev ...` test containers use an ephemeral
-build root. No product launcher may consume a retained runtime cache during the
-cutover.
-
-To rebuild the image after Dockerfile changes:
-
-```bash
-docker compose build
-```
-
-To rebuild from scratch (e.g. after RoboPlan update):
-
-```bash
-rm -rf .docker/roboplan
-./scripts/setup-docker.sh
-```
-
-## Versioning, releases, security
-
-- **Current version**: see [`VERSION`](VERSION) (single line, SemVer).
-  Sub-packages match this version; CI enforces with
-  `./scripts/ci/verify-version-sync.sh`.
-- **What changed**: [`CHANGELOG.md`](CHANGELOG.md) (Keep-a-Changelog format).
-- **What's next**: [`ROADMAP.md`](ROADMAP.md).
-- **License**: Apache 2.0 — see [`LICENSE`](LICENSE) and
-  [`NOTICE`](NOTICE) for third-party attribution.
-- **Reporting a security vulnerability**: see
-  [`SECURITY.md`](SECURITY.md). Do NOT use public issues for security
-  topics.
-
-## Contributing
-
-Both human contributors and LLM agents are first-class. The branch
-workflow (`main` = released, `dev` = integration where work lands,
-squash-merge `dev → main` on release) and the LLM-specific commit/push
-rules are documented in [`CONTRIBUTING.md`](CONTRIBUTING.md) and
-reinforced in [`AGENTS.md`](AGENTS.md).
-
-ManyForge development is spec-driven by private maintainer specs. Those specs
-are not needed to inspect the current public structural and Program Draft/Saved
-authoring shell or historical operator references, but non-trivial behavior
-changes need maintainer audit against them.
-Without that context, contributions should stay to bounded fixes,
-tests, docs, or proposals that explicitly call out the audit need.
-
-The historical assistant baseline was tested with **NemoClaw-Thor 0.1.x** on
-Jetson Thor. That evidence does not qualify the current assistant lane; see the
-companion repo at
-<https://github.com/pastoriomarco/NemoClaw-Thor>.
+ManyForge is licensed under Apache 2.0; see [LICENSE](LICENSE) and
+[NOTICE](NOTICE). Report security issues as described in [SECURITY.md](SECURITY.md).

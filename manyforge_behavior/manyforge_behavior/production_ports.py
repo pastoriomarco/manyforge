@@ -52,6 +52,7 @@ from manyforge_behavior.orchestration_ports import (
     NodeAttemptIdentity,
     OwnerInvocationResult,
     OwnerInvocationPendingError,
+    OwnerInvocationGatedError,
     OwnerInvocationHeldError,
     OwnerInvocationRefusedByPriorityError,
     OwnerNodeInputs,
@@ -754,6 +755,7 @@ class _TargetBinding:
     # once (signal and coordinate rows, or repeated signal rows).
     signals: Mapping[str, _SignalBinding] = field(default_factory=dict)
     ambiguous_signal_roles: frozenset[str] = frozenset()
+    pneumatic_io: Mapping[str, Any] | None = None
 
 
 def _signal_role_bindings(
@@ -1423,6 +1425,7 @@ class NativeKernelProgramPort:
                 capabilities,
                 signals,
                 ambiguous_signal_roles,
+                row.get("pneumatic_io"),
             )
         contact_grasps: dict[str, _ContactGraspBinding] = {}
         raw_contact_grasps = binding.get("contact_grasp_bindings", ())
@@ -1819,6 +1822,9 @@ class NativeKernelProgramPort:
             ("position_commanded", "commanded", "goal_fenced_target_reached", "binding_feedback_required"),
             ("pneumatic", "commanded", "output_delivery", "not_required"),
             ("pneumatic", "none", "no_output", "not_required"),
+        ) and not (
+            configuration == ("pneumatic", "commanded", "no_output", "not_required")
+            and target.pneumatic_io is not None
         ):
             raise ProductionPortError("gripper descriptor has no complete configured output semantics")
         else:
@@ -2576,6 +2582,8 @@ class NativeKernelProgramPort:
         node_id: str,
         identity: NodeAttemptIdentity,
         inputs: OwnerNodeInputs,
+        *,
+        pneumatic_output_step: int | None = None,
     ) -> OwnerTaskSnapshot:
         if not isinstance(identity, NodeAttemptIdentity):
             raise TypeError("operation start requires one node-attempt identity")
@@ -2628,8 +2636,13 @@ class NativeKernelProgramPort:
         if node_id in _MOTION_NODE_IDS or node_id in _INTERRUPT_MOTION_NODE_IDS:
             self._latch_motion_between_nodes(identity, payload)
         owner_epoch = preset_owner_status or self._owner_status(context)
-        request_id = _request_identity(
-            "program-node", identity.program_run_id, identity.node_attempt_id
+        request_id = (
+            _request_identity(
+                "program-pneumatic-output", identity.program_run_id,
+                identity.node_attempt_id, str(pneumatic_output_step),
+            )
+            if pneumatic_output_step is not None
+            else _request_identity("program-node", identity.program_run_id, identity.node_attempt_id)
         )
         operation_intent = self._operation_intent(
             context,
@@ -2644,6 +2657,10 @@ class NativeKernelProgramPort:
             revision = _held_selection_revision(error)
             if revision is not None:
                 raise OwnerInvocationHeldError(revision) from error
+            rule_id = error.details.get("rule_id")
+            if error.details.get("reason") == "global_interrupt_gated" and isinstance(rule_id, str):
+                # Rule 2: a gate refusal is a wait at the node, not a failure.
+                raise OwnerInvocationGatedError(rule_id, error) from error
             if error.code == "refused_by_priority":
                 raise OwnerInvocationRefusedByPriorityError(
                     str(error),
@@ -5251,6 +5268,72 @@ class _NativeKernelOperationTaskPort:
         inputs: OwnerNodeInputs,
     ) -> OwnerTaskSnapshot:
         return self._owner._start(node_id, identity, inputs)
+
+    def pneumatic_plan(
+        self, identity: NodeAttemptIdentity, inputs: OwnerNodeInputs
+    ) -> Mapping[str, Any] | None:
+        """Resolve the captured gripper route before issuing any effects."""
+        owner = self._owner
+        context = owner._context(identity.program_run_id)
+        owner._require_scope_open(identity.program_run_id)
+        target = owner._target(
+            context, _text(inputs.parameters.get("target_role"), field="target_role"),
+            "tool.gripper.command",
+        )
+        if target.pneumatic_io is None:
+            return None
+        route = _mapping(target.pneumatic_io, field="captured pneumatic route")
+        epoch = owner._owner_status(context)
+        descriptor = owner._gripper_descriptor(context, target, expected_owner_epoch=epoch)
+        opened = owner._named_gripper_position(descriptor, {"kind": "named_preset", "name": "open"})
+        closed = owner._named_gripper_position(descriptor, {"kind": "named_preset", "name": "closed"})
+        requested = _mapping(inputs.parameters.get("position"), field="position")
+        position = (owner._named_gripper_position(descriptor, requested)
+                    if requested.get("kind") == "named_preset" else requested)
+        kind = opened["kind"]
+        field_name = "value_rad" if kind == "angular_rad" else "value_m"
+        if position.get("kind") != kind or closed.get("kind") != kind:
+            raise ProductionPortError("pneumatic position does not match the gripper coordinate kind")
+        wanted = _number(position.get(field_name), field="gripper position")
+        if not descriptor["min_position"] <= wanted <= descriptor["max_position"]:
+            raise ProductionPortError("pneumatic position is outside the gripper limits")
+        is_open = abs(wanted - opened[field_name]) < abs(wanted - closed[field_name])
+        logical = {**inputs.parameters, "position": opened if is_open else closed}
+        dwell = _number(inputs.parameters.get("command_duration_s", descriptor["command_duration_s"]),
+                        field="gripper Program dwell")
+        if dwell < 0:
+            raise ProductionPortError("pneumatic Program dwell cannot be negative")
+        outputs = []
+        for raw in _sequence(route.get("outputs"), field="pneumatic outputs"):
+            row = _mapping(raw, field="pneumatic output")
+            target_role = _text(row.get("target_role_id"), field="pneumatic output target")
+            resource_role = _text(row.get("resource_role_id"), field="pneumatic output resource")
+            signal = _io_signal(context.targets, target_role, resource_role, output=True)
+            level = row.get("open_value" if is_open else "close_value")
+            if type(level) is not bool:
+                raise ProductionPortError("pneumatic output value must be boolean")
+            outputs.append((level, context.targets[target_role].controllable_component_id, signal.signal_name,
+                            {"target_role": target_role, "resource_role": resource_role, "value": level}))
+        outputs.sort(key=lambda row: row[:3])
+        declared = {row["input"]: row for row in route.get("inputs", ())}
+        required = []
+        for raw in _sequence(inputs.parameters.get("required_inputs", ()), field="required inputs"):
+            item = _mapping(raw, field="required input")
+            row = declared.get(item.get("input"))
+            if row is None or type(item.get("value")) is not bool:
+                raise ProductionPortError("pneumatic required input is not declared")
+            target_role = _text(row.get("target_role_id"), field="pneumatic input target")
+            resource_role = _text(row.get("resource_role_id"), field="pneumatic input resource")
+            _io_signal(context.targets, target_role, resource_role)
+            required.append({"target_role": target_role, "resource_role": resource_role,
+                             "expected_value": item["value"]})
+        return {"outputs": [row[3] for row in outputs], "inputs": required,
+                "logical": OwnerNodeInputs(logical, inputs.blackboard), "dwell_s": dwell}
+
+    def start_pneumatic_output(
+        self, identity: NodeAttemptIdentity, inputs: OwnerNodeInputs, step: int
+    ) -> OwnerTaskSnapshot:
+        return self._owner._start("io.set_output", identity, inputs, pneumatic_output_step=step)
 
     def observe(self, task_id: str) -> OwnerTaskSnapshot:
         return self._owner._observe_task(task_id)

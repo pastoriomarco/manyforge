@@ -196,6 +196,11 @@ class ObservedRobotStatePublication final {
   /// freshness. This is the immutable latest-publication surface; admission
   /// callers must use acquire(now_ns) instead.
   [[nodiscard]] ReadView acquire_latest() const noexcept;
+  /// The sequence the next publication receives. A sample with a lower
+  /// sequence was committed (or had begun committing) before this read.
+  [[nodiscard]] std::uint64_t next_sequence() const noexcept {
+    return next_sequence_.load(std::memory_order_acquire);
+  }
   /// NRT value-copy surface for bindings/diagnostics. RT consumers use
   /// acquire() so no allocation or mutable storage crosses the hot path.
   [[nodiscard]] std::optional<ObservedRobotStateSnapshotDTO> snapshot(std::int64_t now_ns) const;

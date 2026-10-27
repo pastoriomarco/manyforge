@@ -56,6 +56,18 @@
       "node_id": "sequence"
     },
     {
+      "node_id": "simulation.reset"
+    },
+    {
+      "node_id": "simulation.set_entity_pose"
+    },
+    {
+      "node_id": "simulation.set_state"
+    },
+    {
+      "node_id": "simulation.step"
+    },
+    {
       "node_id": "timer"
     }
   ],
@@ -1702,979 +1714,6 @@
       "tool_id": "program_validate"
     },
     {
-      "description": "Build reviewable v2 scene-operation node proposals from scene resources.",
-      "effect": "proposal",
-      "input_schema": {
-        "additionalProperties": false,
-        "allOf": [
-          {
-            "if": {
-              "properties": {
-                "operations": {
-                  "contains": {
-                    "const": "scene.attach_carried_object"
-                  }
-                }
-              },
-              "required": [
-                "operations"
-              ]
-            },
-            "then": {
-              "required": [
-                "target_role",
-                "carrier_frame_role",
-                "touch_body_roles"
-              ]
-            }
-          },
-          {
-            "if": {
-              "properties": {
-                "operations": {
-                  "contains": {
-                    "const": "scene.detach_carried_object"
-                  }
-                }
-              },
-              "required": [
-                "operations"
-              ]
-            },
-            "then": {
-              "required": [
-                "target_role"
-              ]
-            }
-          }
-        ],
-        "properties": {
-          "carrier_frame_role": {
-            "maxLength": 256,
-            "pattern": "^[a-z][a-z0-9_.-]*$",
-            "type": "string"
-          },
-          "operations": {
-            "items": {
-              "enum": [
-                "scene.add_object",
-                "scene.attach_carried_object",
-                "scene.detach_carried_object",
-                "scene.remove_object",
-                "scene.upsert_object"
-              ],
-              "type": "string"
-            },
-            "maxItems": 4096,
-            "minItems": 1,
-            "type": "array",
-            "uniqueItems": true
-          },
-          "scene_resources": {
-            "items": {
-              "additionalProperties": false,
-              "properties": {
-                "collision_policy_ids": {
-                  "items": {
-                    "maxLength": 256,
-                    "pattern": "^[a-z][a-z0-9_.-]*$",
-                    "type": "string"
-                  },
-                  "maxItems": 4096,
-                  "minItems": 1,
-                  "type": "array",
-                  "uniqueItems": true
-                },
-                "pose": {
-                  "additionalProperties": false,
-                  "properties": {
-                    "frame_ref": {
-                      "oneOf": [
-                        {
-                          "additionalProperties": false,
-                          "properties": {
-                            "kind": {
-                              "const": "cell_frame"
-                            }
-                          },
-                          "required": [
-                            "kind"
-                          ],
-                          "type": "object"
-                        },
-                        {
-                          "additionalProperties": false,
-                          "properties": {
-                            "component_role": {
-                              "maxLength": 256,
-                              "pattern": "^[a-z][a-z0-9_.-]*$",
-                              "type": "string"
-                            },
-                            "frame_role": {
-                              "maxLength": 256,
-                              "pattern": "^[a-z][a-z0-9_.-]*$",
-                              "type": "string"
-                            },
-                            "kind": {
-                              "const": "component_frame"
-                            },
-                            "model_role": {
-                              "maxLength": 256,
-                              "pattern": "^[a-z][a-z0-9_.-]*$",
-                              "type": "string"
-                            }
-                          },
-                          "required": [
-                            "kind",
-                            "component_role",
-                            "model_role",
-                            "frame_role"
-                          ],
-                          "type": "object"
-                        }
-                      ]
-                    },
-                    "orientation": {
-                      "additionalProperties": false,
-                      "oneOf": [
-                        {
-                          "required": [
-                            "xyzw"
-                          ]
-                        },
-                        {
-                          "required": [
-                            "rpy_deg"
-                          ]
-                        }
-                      ],
-                      "properties": {
-                        "rpy_deg": {
-                          "items": {
-                            "type": "number"
-                          },
-                          "maxItems": 3,
-                          "minItems": 3,
-                          "type": "array"
-                        },
-                        "xyzw": {
-                          "items": {
-                            "type": "number"
-                          },
-                          "maxItems": 4,
-                          "minItems": 4,
-                          "type": "array"
-                        }
-                      },
-                      "type": "object"
-                    },
-                    "position_m": {
-                      "items": {
-                        "type": "number"
-                      },
-                      "maxItems": 3,
-                      "minItems": 3,
-                      "type": "array"
-                    }
-                  },
-                  "required": [
-                    "frame_ref",
-                    "position_m",
-                    "orientation"
-                  ],
-                  "type": "object"
-                },
-                "resource_roles": {
-                  "items": {
-                    "maxLength": 256,
-                    "pattern": "^[a-z][a-z0-9_.-]*$",
-                    "type": "string"
-                  },
-                  "maxItems": 4096,
-                  "minItems": 1,
-                  "type": "array",
-                  "uniqueItems": true
-                },
-                "scene_resource_id": {
-                  "maxLength": 256,
-                  "pattern": "^[a-z][a-z0-9_.-]*$",
-                  "type": "string"
-                },
-                "shape": {
-                  "additionalProperties": false,
-                  "allOf": [
-                    {
-                      "if": {
-                        "properties": {
-                          "type": {
-                            "const": "box"
-                          }
-                        },
-                        "required": [
-                          "type"
-                        ]
-                      },
-                      "then": {
-                        "required": [
-                          "box_dimensions_m"
-                        ]
-                      }
-                    },
-                    {
-                      "if": {
-                        "properties": {
-                          "type": {
-                            "const": "cylinder"
-                          }
-                        },
-                        "required": [
-                          "type"
-                        ]
-                      },
-                      "then": {
-                        "required": [
-                          "cylinder_height_m",
-                          "cylinder_radius_m"
-                        ]
-                      }
-                    },
-                    {
-                      "if": {
-                        "properties": {
-                          "type": {
-                            "const": "mesh"
-                          }
-                        },
-                        "required": [
-                          "type"
-                        ]
-                      },
-                      "then": {
-                        "required": [
-                          "mesh_resource_uri"
-                        ]
-                      }
-                    },
-                    {
-                      "if": {
-                        "properties": {
-                          "type": {
-                            "const": "sphere"
-                          }
-                        },
-                        "required": [
-                          "type"
-                        ]
-                      },
-                      "then": {
-                        "required": [
-                          "sphere_radius_m"
-                        ]
-                      }
-                    },
-                    {
-                      "if": {
-                        "not": {
-                          "properties": {
-                            "type": {
-                              "const": "box"
-                            }
-                          },
-                          "required": [
-                            "type"
-                          ]
-                        }
-                      },
-                      "then": {
-                        "not": {
-                          "required": [
-                            "box_dimensions_m"
-                          ]
-                        }
-                      }
-                    },
-                    {
-                      "if": {
-                        "not": {
-                          "properties": {
-                            "type": {
-                              "const": "cylinder"
-                            }
-                          },
-                          "required": [
-                            "type"
-                          ]
-                        }
-                      },
-                      "then": {
-                        "not": {
-                          "required": [
-                            "cylinder_height_m"
-                          ]
-                        }
-                      }
-                    },
-                    {
-                      "if": {
-                        "not": {
-                          "properties": {
-                            "type": {
-                              "const": "cylinder"
-                            }
-                          },
-                          "required": [
-                            "type"
-                          ]
-                        }
-                      },
-                      "then": {
-                        "not": {
-                          "required": [
-                            "cylinder_radius_m"
-                          ]
-                        }
-                      }
-                    },
-                    {
-                      "if": {
-                        "not": {
-                          "properties": {
-                            "type": {
-                              "const": "mesh"
-                            }
-                          },
-                          "required": [
-                            "type"
-                          ]
-                        }
-                      },
-                      "then": {
-                        "not": {
-                          "required": [
-                            "mesh_resource_uri"
-                          ]
-                        }
-                      }
-                    },
-                    {
-                      "if": {
-                        "not": {
-                          "properties": {
-                            "type": {
-                              "const": "mesh"
-                            }
-                          },
-                          "required": [
-                            "type"
-                          ]
-                        }
-                      },
-                      "then": {
-                        "not": {
-                          "required": [
-                            "mesh_scale"
-                          ]
-                        }
-                      }
-                    },
-                    {
-                      "if": {
-                        "not": {
-                          "properties": {
-                            "type": {
-                              "const": "sphere"
-                            }
-                          },
-                          "required": [
-                            "type"
-                          ]
-                        }
-                      },
-                      "then": {
-                        "not": {
-                          "required": [
-                            "sphere_radius_m"
-                          ]
-                        }
-                      }
-                    }
-                  ],
-                  "properties": {
-                    "box_dimensions_m": {
-                      "items": {
-                        "exclusiveMinimum": 0.0,
-                        "type": "number"
-                      },
-                      "maxItems": 3,
-                      "minItems": 3,
-                      "type": "array"
-                    },
-                    "cylinder_height_m": {
-                      "exclusiveMinimum": 0.0,
-                      "type": "number"
-                    },
-                    "cylinder_radius_m": {
-                      "exclusiveMinimum": 0.0,
-                      "type": "number"
-                    },
-                    "mesh_resource_uri": {
-                      "type": "string"
-                    },
-                    "mesh_scale": {
-                      "items": {
-                        "exclusiveMinimum": 0.0,
-                        "type": "number"
-                      },
-                      "maxItems": 3,
-                      "minItems": 3,
-                      "type": "array"
-                    },
-                    "sphere_radius_m": {
-                      "exclusiveMinimum": 0.0,
-                      "type": "number"
-                    },
-                    "type": {
-                      "enum": [
-                        "box",
-                        "sphere",
-                        "cylinder",
-                        "mesh"
-                      ],
-                      "type": "string"
-                    }
-                  },
-                  "required": [
-                    "type"
-                  ],
-                  "type": "object"
-                }
-              },
-              "required": [
-                "scene_resource_id",
-                "shape",
-                "pose"
-              ],
-              "type": "object"
-            },
-            "maxItems": 4096,
-            "minItems": 1,
-            "type": "array"
-          },
-          "target_role": {
-            "maxLength": 256,
-            "pattern": "^[a-z][a-z0-9_.-]*$",
-            "type": "string"
-          },
-          "touch_body_roles": {
-            "items": {
-              "maxLength": 256,
-              "pattern": "^[a-z][a-z0-9_.-]*$",
-              "type": "string"
-            },
-            "maxItems": 4096,
-            "minItems": 1,
-            "type": "array",
-            "uniqueItems": true
-          }
-        },
-        "required": [
-          "scene_resources",
-          "operations"
-        ],
-        "type": "object"
-      },
-      "tool_id": "propose_scene_object_nodes"
-    },
-    {
-      "description": "Convert normalized scene-inspection candidates into reviewable Draft resources.",
-      "effect": "proposal",
-      "input_schema": {
-        "additionalProperties": false,
-        "properties": {
-          "inspection_report": {
-            "additionalProperties": false,
-            "properties": {
-              "objects": {
-                "items": {
-                  "additionalProperties": false,
-                  "properties": {
-                    "collider_paths": {
-                      "items": {
-                        "maxLength": 4096,
-                        "minLength": 1,
-                        "type": "string"
-                      },
-                      "maxItems": 4096,
-                      "type": "array",
-                      "uniqueItems": true
-                    },
-                    "scene_resource": {
-                      "additionalProperties": false,
-                      "properties": {
-                        "collision_policy_ids": {
-                          "items": {
-                            "maxLength": 256,
-                            "pattern": "^[a-z][a-z0-9_.-]*$",
-                            "type": "string"
-                          },
-                          "maxItems": 4096,
-                          "minItems": 1,
-                          "type": "array",
-                          "uniqueItems": true
-                        },
-                        "pose": {
-                          "additionalProperties": false,
-                          "properties": {
-                            "frame_ref": {
-                              "oneOf": [
-                                {
-                                  "additionalProperties": false,
-                                  "properties": {
-                                    "kind": {
-                                      "const": "cell_frame"
-                                    }
-                                  },
-                                  "required": [
-                                    "kind"
-                                  ],
-                                  "type": "object"
-                                },
-                                {
-                                  "additionalProperties": false,
-                                  "properties": {
-                                    "component_role": {
-                                      "maxLength": 256,
-                                      "pattern": "^[a-z][a-z0-9_.-]*$",
-                                      "type": "string"
-                                    },
-                                    "frame_role": {
-                                      "maxLength": 256,
-                                      "pattern": "^[a-z][a-z0-9_.-]*$",
-                                      "type": "string"
-                                    },
-                                    "kind": {
-                                      "const": "component_frame"
-                                    },
-                                    "model_role": {
-                                      "maxLength": 256,
-                                      "pattern": "^[a-z][a-z0-9_.-]*$",
-                                      "type": "string"
-                                    }
-                                  },
-                                  "required": [
-                                    "kind",
-                                    "component_role",
-                                    "model_role",
-                                    "frame_role"
-                                  ],
-                                  "type": "object"
-                                }
-                              ]
-                            },
-                            "orientation": {
-                              "additionalProperties": false,
-                              "oneOf": [
-                                {
-                                  "required": [
-                                    "xyzw"
-                                  ]
-                                },
-                                {
-                                  "required": [
-                                    "rpy_deg"
-                                  ]
-                                }
-                              ],
-                              "properties": {
-                                "rpy_deg": {
-                                  "items": {
-                                    "type": "number"
-                                  },
-                                  "maxItems": 3,
-                                  "minItems": 3,
-                                  "type": "array"
-                                },
-                                "xyzw": {
-                                  "items": {
-                                    "type": "number"
-                                  },
-                                  "maxItems": 4,
-                                  "minItems": 4,
-                                  "type": "array"
-                                }
-                              },
-                              "type": "object"
-                            },
-                            "position_m": {
-                              "items": {
-                                "type": "number"
-                              },
-                              "maxItems": 3,
-                              "minItems": 3,
-                              "type": "array"
-                            }
-                          },
-                          "required": [
-                            "frame_ref",
-                            "position_m",
-                            "orientation"
-                          ],
-                          "type": "object"
-                        },
-                        "resource_roles": {
-                          "items": {
-                            "maxLength": 256,
-                            "pattern": "^[a-z][a-z0-9_.-]*$",
-                            "type": "string"
-                          },
-                          "maxItems": 4096,
-                          "minItems": 1,
-                          "type": "array",
-                          "uniqueItems": true
-                        },
-                        "scene_resource_id": {
-                          "maxLength": 256,
-                          "pattern": "^[a-z][a-z0-9_.-]*$",
-                          "type": "string"
-                        },
-                        "shape": {
-                          "additionalProperties": false,
-                          "allOf": [
-                            {
-                              "if": {
-                                "properties": {
-                                  "type": {
-                                    "const": "box"
-                                  }
-                                },
-                                "required": [
-                                  "type"
-                                ]
-                              },
-                              "then": {
-                                "required": [
-                                  "box_dimensions_m"
-                                ]
-                              }
-                            },
-                            {
-                              "if": {
-                                "properties": {
-                                  "type": {
-                                    "const": "cylinder"
-                                  }
-                                },
-                                "required": [
-                                  "type"
-                                ]
-                              },
-                              "then": {
-                                "required": [
-                                  "cylinder_height_m",
-                                  "cylinder_radius_m"
-                                ]
-                              }
-                            },
-                            {
-                              "if": {
-                                "properties": {
-                                  "type": {
-                                    "const": "mesh"
-                                  }
-                                },
-                                "required": [
-                                  "type"
-                                ]
-                              },
-                              "then": {
-                                "required": [
-                                  "mesh_resource_uri"
-                                ]
-                              }
-                            },
-                            {
-                              "if": {
-                                "properties": {
-                                  "type": {
-                                    "const": "sphere"
-                                  }
-                                },
-                                "required": [
-                                  "type"
-                                ]
-                              },
-                              "then": {
-                                "required": [
-                                  "sphere_radius_m"
-                                ]
-                              }
-                            },
-                            {
-                              "if": {
-                                "not": {
-                                  "properties": {
-                                    "type": {
-                                      "const": "box"
-                                    }
-                                  },
-                                  "required": [
-                                    "type"
-                                  ]
-                                }
-                              },
-                              "then": {
-                                "not": {
-                                  "required": [
-                                    "box_dimensions_m"
-                                  ]
-                                }
-                              }
-                            },
-                            {
-                              "if": {
-                                "not": {
-                                  "properties": {
-                                    "type": {
-                                      "const": "cylinder"
-                                    }
-                                  },
-                                  "required": [
-                                    "type"
-                                  ]
-                                }
-                              },
-                              "then": {
-                                "not": {
-                                  "required": [
-                                    "cylinder_height_m"
-                                  ]
-                                }
-                              }
-                            },
-                            {
-                              "if": {
-                                "not": {
-                                  "properties": {
-                                    "type": {
-                                      "const": "cylinder"
-                                    }
-                                  },
-                                  "required": [
-                                    "type"
-                                  ]
-                                }
-                              },
-                              "then": {
-                                "not": {
-                                  "required": [
-                                    "cylinder_radius_m"
-                                  ]
-                                }
-                              }
-                            },
-                            {
-                              "if": {
-                                "not": {
-                                  "properties": {
-                                    "type": {
-                                      "const": "mesh"
-                                    }
-                                  },
-                                  "required": [
-                                    "type"
-                                  ]
-                                }
-                              },
-                              "then": {
-                                "not": {
-                                  "required": [
-                                    "mesh_resource_uri"
-                                  ]
-                                }
-                              }
-                            },
-                            {
-                              "if": {
-                                "not": {
-                                  "properties": {
-                                    "type": {
-                                      "const": "mesh"
-                                    }
-                                  },
-                                  "required": [
-                                    "type"
-                                  ]
-                                }
-                              },
-                              "then": {
-                                "not": {
-                                  "required": [
-                                    "mesh_scale"
-                                  ]
-                                }
-                              }
-                            },
-                            {
-                              "if": {
-                                "not": {
-                                  "properties": {
-                                    "type": {
-                                      "const": "sphere"
-                                    }
-                                  },
-                                  "required": [
-                                    "type"
-                                  ]
-                                }
-                              },
-                              "then": {
-                                "not": {
-                                  "required": [
-                                    "sphere_radius_m"
-                                  ]
-                                }
-                              }
-                            }
-                          ],
-                          "properties": {
-                            "box_dimensions_m": {
-                              "items": {
-                                "exclusiveMinimum": 0.0,
-                                "type": "number"
-                              },
-                              "maxItems": 3,
-                              "minItems": 3,
-                              "type": "array"
-                            },
-                            "cylinder_height_m": {
-                              "exclusiveMinimum": 0.0,
-                              "type": "number"
-                            },
-                            "cylinder_radius_m": {
-                              "exclusiveMinimum": 0.0,
-                              "type": "number"
-                            },
-                            "mesh_resource_uri": {
-                              "type": "string"
-                            },
-                            "mesh_scale": {
-                              "items": {
-                                "exclusiveMinimum": 0.0,
-                                "type": "number"
-                              },
-                              "maxItems": 3,
-                              "minItems": 3,
-                              "type": "array"
-                            },
-                            "sphere_radius_m": {
-                              "exclusiveMinimum": 0.0,
-                              "type": "number"
-                            },
-                            "type": {
-                              "enum": [
-                                "box",
-                                "sphere",
-                                "cylinder",
-                                "mesh"
-                              ],
-                              "type": "string"
-                            }
-                          },
-                          "required": [
-                            "type"
-                          ],
-                          "type": "object"
-                        }
-                      },
-                      "required": [
-                        "scene_resource_id",
-                        "shape",
-                        "pose"
-                      ],
-                      "type": "object"
-                    },
-                    "source_root": {
-                      "maxLength": 4096,
-                      "minLength": 1,
-                      "type": "string"
-                    },
-                    "warnings": {
-                      "items": {
-                        "maxLength": 4096,
-                        "type": "string"
-                      },
-                      "maxItems": 4096,
-                      "type": "array"
-                    }
-                  },
-                  "required": [
-                    "source_root",
-                    "scene_resource"
-                  ],
-                  "type": "object"
-                },
-                "maxItems": 4096,
-                "type": "array"
-              }
-            },
-            "required": [
-              "objects"
-            ],
-            "type": "object"
-          },
-          "max_proposals": {
-            "maximum": 4096,
-            "minimum": 1,
-            "type": "integer"
-          },
-          "mesh_resource_overrides": {
-            "items": {
-              "additionalProperties": false,
-              "properties": {
-                "mesh_resource_uri": {
-                  "maxLength": 4096,
-                  "minLength": 1,
-                  "type": "string"
-                },
-                "source_root": {
-                  "maxLength": 4096,
-                  "minLength": 1,
-                  "type": "string"
-                }
-              },
-              "required": [
-                "source_root",
-                "mesh_resource_uri"
-              ],
-              "type": "object"
-            },
-            "maxItems": 4096,
-            "type": "array",
-            "uniqueItems": true
-          },
-          "scene_resource_id_prefix": {
-            "maxLength": 256,
-            "type": "string"
-          },
-          "source_roots": {
-            "items": {
-              "maxLength": 4096,
-              "minLength": 1,
-              "type": "string"
-            },
-            "maxItems": 4096,
-            "type": "array",
-            "uniqueItems": true
-          }
-        },
-        "required": [
-          "inspection_report"
-        ],
-        "type": "object"
-      },
-      "tool_id": "propose_scene_objects"
-    },
-    {
       "description": "Add one detached logical scene resource to the in-memory Composer Draft.",
       "effect": "composer_draft_mutating",
       "input_schema": {
@@ -2683,17 +1722,6 @@
           "scene_resource": {
             "additionalProperties": false,
             "properties": {
-              "collision_policy_ids": {
-                "items": {
-                  "maxLength": 256,
-                  "pattern": "^[a-z][a-z0-9_.-]*$",
-                  "type": "string"
-                },
-                "maxItems": 4096,
-                "minItems": 1,
-                "type": "array",
-                "uniqueItems": true
-              },
               "pose": {
                 "additionalProperties": false,
                 "properties": {
@@ -3107,17 +2135,6 @@
           "scene_resource": {
             "additionalProperties": false,
             "properties": {
-              "collision_policy_ids": {
-                "items": {
-                  "maxLength": 256,
-                  "pattern": "^[a-z][a-z0-9_.-]*$",
-                  "type": "string"
-                },
-                "maxItems": 4096,
-                "minItems": 1,
-                "type": "array",
-                "uniqueItems": true
-              },
               "pose": {
                 "additionalProperties": false,
                 "oneOf": [
@@ -3686,17 +2703,6 @@
             "items": {
               "additionalProperties": false,
               "properties": {
-                "collision_policy_ids": {
-                  "items": {
-                    "maxLength": 256,
-                    "pattern": "^[a-z][a-z0-9_.-]*$",
-                    "type": "string"
-                  },
-                  "maxItems": 4096,
-                  "minItems": 1,
-                  "type": "array",
-                  "uniqueItems": true
-                },
                 "pose": {
                   "additionalProperties": false,
                   "oneOf": [
@@ -5176,6 +4182,19 @@
               "$ref": "#/$defs/s_2c5fb61ff814332a"
             }
           },
+          "s_5e98cb2bd216d46b": {
+            "additionalProperties": false,
+            "properties": {
+              "pose": {
+                "$ref": "#/$defs/s_3eb46c08a10d222d"
+              },
+              "scene_resource_id": {
+                "type": "string",
+                "x-manyforge-semantic-type": "scene_resource"
+              }
+            },
+            "type": "object"
+          },
           "s_62874ee639d2bbf4": {
             "allOf": [
               {
@@ -5509,6 +4528,19 @@
             "not": {
               "$ref": "#/$defs/s_209b5c74cad87057"
             }
+          },
+          "s_aa667adbebf70448": {
+            "additionalProperties": false,
+            "minProperties": 1,
+            "properties": {
+              "pose": {
+                "$ref": "#/$defs/s_239060e26cdf11f6"
+              },
+              "scene_resource_id": {
+                "$ref": "#/$defs/s_239060e26cdf11f6"
+              }
+            },
+            "type": "object"
           },
           "s_ab38980932f15fa2": {
             "not": {
@@ -6131,6 +5163,36 @@
                         }
                       ]
                     }
+                  },
+                  {
+                    "not": {
+                      "allOf": [
+                        {
+                          "properties": {
+                            "parameters": {
+                              "required": [
+                                "required_inputs"
+                              ]
+                            }
+                          },
+                          "required": [
+                            "parameters"
+                          ]
+                        },
+                        {
+                          "properties": {
+                            "value_sources": {
+                              "required": [
+                                "required_inputs"
+                              ]
+                            }
+                          },
+                          "required": [
+                            "value_sources"
+                          ]
+                        }
+                      ]
+                    }
                   }
                 ],
                 "properties": {
@@ -6403,6 +5465,32 @@
                         ],
                         "type": "object"
                       },
+                      "required_inputs": {
+                        "items": {
+                          "additionalProperties": false,
+                          "properties": {
+                            "input": {
+                              "enum": [
+                                "open",
+                                "closed",
+                                "pressure",
+                                "workpiece_grasped"
+                              ],
+                              "type": "string"
+                            },
+                            "value": {
+                              "type": "boolean"
+                            }
+                          },
+                          "required": [
+                            "input",
+                            "value"
+                          ],
+                          "type": "object"
+                        },
+                        "maxItems": 4,
+                        "type": "array"
+                      },
                       "target_role": {
                         "type": "string",
                         "x-manyforge-semantic-type": "target_role"
@@ -6427,6 +5515,9 @@
                         "$ref": "#/$defs/s_239060e26cdf11f6"
                       },
                       "position": {
+                        "$ref": "#/$defs/s_239060e26cdf11f6"
+                      },
+                      "required_inputs": {
                         "$ref": "#/$defs/s_239060e26cdf11f6"
                       }
                     },
@@ -8297,30 +7388,10 @@
                     "const": "scene.update_object_pose"
                   },
                   "parameters": {
-                    "additionalProperties": false,
-                    "properties": {
-                      "pose": {
-                        "$ref": "#/$defs/s_3eb46c08a10d222d"
-                      },
-                      "scene_resource_id": {
-                        "type": "string",
-                        "x-manyforge-semantic-type": "scene_resource"
-                      }
-                    },
-                    "type": "object"
+                    "$ref": "#/$defs/s_5e98cb2bd216d46b"
                   },
                   "value_sources": {
-                    "additionalProperties": false,
-                    "minProperties": 1,
-                    "properties": {
-                      "pose": {
-                        "$ref": "#/$defs/s_239060e26cdf11f6"
-                      },
-                      "scene_resource_id": {
-                        "$ref": "#/$defs/s_239060e26cdf11f6"
-                      }
-                    },
-                    "type": "object"
+                    "$ref": "#/$defs/s_aa667adbebf70448"
                   }
                 },
                 "required": [
@@ -8368,6 +7439,185 @@
                   "parameters": {
                     "additionalProperties": false,
                     "properties": {},
+                    "type": "object"
+                  }
+                },
+                "required": [
+                  "node_id",
+                  "parameters"
+                ],
+                "type": "object"
+              },
+              {
+                "additionalProperties": false,
+                "properties": {
+                  "node_id": {
+                    "const": "simulation.reset"
+                  },
+                  "parameters": {
+                    "additionalProperties": false,
+                    "properties": {},
+                    "type": "object"
+                  }
+                },
+                "required": [
+                  "node_id",
+                  "parameters"
+                ],
+                "type": "object"
+              },
+              {
+                "additionalProperties": false,
+                "allOf": [
+                  {
+                    "$ref": "#/$defs/s_5e24d9e8298e3fc0"
+                  },
+                  {
+                    "$ref": "#/$defs/s_f32141df5dcacbc2"
+                  }
+                ],
+                "properties": {
+                  "node_id": {
+                    "const": "simulation.set_entity_pose"
+                  },
+                  "parameters": {
+                    "$ref": "#/$defs/s_5e98cb2bd216d46b"
+                  },
+                  "value_sources": {
+                    "$ref": "#/$defs/s_aa667adbebf70448"
+                  }
+                },
+                "required": [
+                  "node_id",
+                  "parameters"
+                ],
+                "type": "object"
+              },
+              {
+                "additionalProperties": false,
+                "allOf": [
+                  {
+                    "not": {
+                      "allOf": [
+                        {
+                          "properties": {
+                            "parameters": {
+                              "required": [
+                                "state"
+                              ]
+                            }
+                          },
+                          "required": [
+                            "parameters"
+                          ]
+                        },
+                        {
+                          "properties": {
+                            "value_sources": {
+                              "required": [
+                                "state"
+                              ]
+                            }
+                          },
+                          "required": [
+                            "value_sources"
+                          ]
+                        }
+                      ]
+                    }
+                  }
+                ],
+                "properties": {
+                  "node_id": {
+                    "const": "simulation.set_state"
+                  },
+                  "parameters": {
+                    "additionalProperties": false,
+                    "properties": {
+                      "state": {
+                        "enum": [
+                          "play",
+                          "pause"
+                        ],
+                        "type": "string"
+                      }
+                    },
+                    "type": "object"
+                  },
+                  "value_sources": {
+                    "additionalProperties": false,
+                    "minProperties": 1,
+                    "properties": {
+                      "state": {
+                        "$ref": "#/$defs/s_239060e26cdf11f6"
+                      }
+                    },
+                    "type": "object"
+                  }
+                },
+                "required": [
+                  "node_id",
+                  "parameters"
+                ],
+                "type": "object"
+              },
+              {
+                "additionalProperties": false,
+                "allOf": [
+                  {
+                    "not": {
+                      "allOf": [
+                        {
+                          "properties": {
+                            "parameters": {
+                              "required": [
+                                "steps"
+                              ]
+                            }
+                          },
+                          "required": [
+                            "parameters"
+                          ]
+                        },
+                        {
+                          "properties": {
+                            "value_sources": {
+                              "required": [
+                                "steps"
+                              ]
+                            }
+                          },
+                          "required": [
+                            "value_sources"
+                          ]
+                        }
+                      ]
+                    }
+                  }
+                ],
+                "properties": {
+                  "node_id": {
+                    "const": "simulation.step"
+                  },
+                  "parameters": {
+                    "additionalProperties": false,
+                    "properties": {
+                      "steps": {
+                        "maximum": 1000000,
+                        "minimum": 1,
+                        "type": "integer"
+                      }
+                    },
+                    "type": "object"
+                  },
+                  "value_sources": {
+                    "additionalProperties": false,
+                    "minProperties": 1,
+                    "properties": {
+                      "steps": {
+                        "$ref": "#/$defs/s_239060e26cdf11f6"
+                      }
+                    },
                     "type": "object"
                   }
                 },
@@ -8708,6 +7958,36 @@
                     }
                   },
                   {
+                    "not": {
+                      "allOf": [
+                        {
+                          "properties": {
+                            "parameters": {
+                              "required": [
+                                "required_inputs"
+                              ]
+                            }
+                          },
+                          "required": [
+                            "parameters"
+                          ]
+                        },
+                        {
+                          "properties": {
+                            "value_sources": {
+                              "required": [
+                                "required_inputs"
+                              ]
+                            }
+                          },
+                          "required": [
+                            "value_sources"
+                          ]
+                        }
+                      ]
+                    }
+                  },
+                  {
                     "oneOf": [
                       {
                         "properties": {
@@ -9019,6 +8299,32 @@
                         ],
                         "type": "object"
                       },
+                      "required_inputs": {
+                        "items": {
+                          "additionalProperties": false,
+                          "properties": {
+                            "input": {
+                              "enum": [
+                                "open",
+                                "closed",
+                                "pressure",
+                                "workpiece_grasped"
+                              ],
+                              "type": "string"
+                            },
+                            "value": {
+                              "type": "boolean"
+                            }
+                          },
+                          "required": [
+                            "input",
+                            "value"
+                          ],
+                          "type": "object"
+                        },
+                        "maxItems": 4,
+                        "type": "array"
+                      },
                       "target_role": {
                         "type": "string",
                         "x-manyforge-semantic-type": "target_role"
@@ -9046,6 +8352,9 @@
                         "$ref": "#/$defs/s_239060e26cdf11f6"
                       },
                       "position": {
+                        "$ref": "#/$defs/s_239060e26cdf11f6"
+                      },
+                      "required_inputs": {
                         "$ref": "#/$defs/s_239060e26cdf11f6"
                       }
                     },
@@ -11275,30 +10584,10 @@
                     "const": "scene.update_object_pose"
                   },
                   "parameters": {
-                    "additionalProperties": false,
-                    "properties": {
-                      "pose": {
-                        "$ref": "#/$defs/s_3eb46c08a10d222d"
-                      },
-                      "scene_resource_id": {
-                        "type": "string",
-                        "x-manyforge-semantic-type": "scene_resource"
-                      }
-                    },
-                    "type": "object"
+                    "$ref": "#/$defs/s_5e98cb2bd216d46b"
                   },
                   "value_sources": {
-                    "additionalProperties": false,
-                    "minProperties": 1,
-                    "properties": {
-                      "pose": {
-                        "$ref": "#/$defs/s_239060e26cdf11f6"
-                      },
-                      "scene_resource_id": {
-                        "$ref": "#/$defs/s_239060e26cdf11f6"
-                      }
-                    },
-                    "type": "object"
+                    "$ref": "#/$defs/s_aa667adbebf70448"
                   }
                 },
                 "required": [
@@ -11385,6 +10674,307 @@
                   "parameters": {
                     "additionalProperties": false,
                     "properties": {},
+                    "type": "object"
+                  }
+                },
+                "required": [
+                  "node_id",
+                  "parameters",
+                  "instance_id",
+                  "children"
+                ],
+                "type": "object"
+              },
+              {
+                "additionalProperties": false,
+                "properties": {
+                  "children": {
+                    "items": {
+                      "$ref": "#/$defs/node"
+                    },
+                    "maxItems": 0,
+                    "minItems": 0,
+                    "type": "array"
+                  },
+                  "instance_id": {
+                    "maxLength": 256,
+                    "pattern": "^[a-z][a-z0-9_.-]*$",
+                    "type": "string"
+                  },
+                  "node_id": {
+                    "const": "simulation.reset"
+                  },
+                  "parameters": {
+                    "additionalProperties": false,
+                    "properties": {},
+                    "type": "object"
+                  }
+                },
+                "required": [
+                  "node_id",
+                  "parameters",
+                  "instance_id",
+                  "children"
+                ],
+                "type": "object"
+              },
+              {
+                "additionalProperties": false,
+                "allOf": [
+                  {
+                    "$ref": "#/$defs/s_5e24d9e8298e3fc0"
+                  },
+                  {
+                    "$ref": "#/$defs/s_f32141df5dcacbc2"
+                  },
+                  {
+                    "$ref": "#/$defs/s_17a2ae38ca31bbe4"
+                  },
+                  {
+                    "$ref": "#/$defs/s_fff72238bc423091"
+                  }
+                ],
+                "properties": {
+                  "children": {
+                    "items": {
+                      "$ref": "#/$defs/node"
+                    },
+                    "maxItems": 0,
+                    "minItems": 0,
+                    "type": "array"
+                  },
+                  "instance_id": {
+                    "maxLength": 256,
+                    "pattern": "^[a-z][a-z0-9_.-]*$",
+                    "type": "string"
+                  },
+                  "node_id": {
+                    "const": "simulation.set_entity_pose"
+                  },
+                  "parameters": {
+                    "$ref": "#/$defs/s_5e98cb2bd216d46b"
+                  },
+                  "value_sources": {
+                    "$ref": "#/$defs/s_aa667adbebf70448"
+                  }
+                },
+                "required": [
+                  "node_id",
+                  "parameters",
+                  "instance_id",
+                  "children"
+                ],
+                "type": "object"
+              },
+              {
+                "additionalProperties": false,
+                "allOf": [
+                  {
+                    "not": {
+                      "allOf": [
+                        {
+                          "properties": {
+                            "parameters": {
+                              "required": [
+                                "state"
+                              ]
+                            }
+                          },
+                          "required": [
+                            "parameters"
+                          ]
+                        },
+                        {
+                          "properties": {
+                            "value_sources": {
+                              "required": [
+                                "state"
+                              ]
+                            }
+                          },
+                          "required": [
+                            "value_sources"
+                          ]
+                        }
+                      ]
+                    }
+                  },
+                  {
+                    "oneOf": [
+                      {
+                        "properties": {
+                          "parameters": {
+                            "required": [
+                              "state"
+                            ]
+                          }
+                        },
+                        "required": [
+                          "parameters"
+                        ]
+                      },
+                      {
+                        "properties": {
+                          "value_sources": {
+                            "required": [
+                              "state"
+                            ]
+                          }
+                        },
+                        "required": [
+                          "value_sources"
+                        ]
+                      }
+                    ]
+                  }
+                ],
+                "properties": {
+                  "children": {
+                    "items": {
+                      "$ref": "#/$defs/node"
+                    },
+                    "maxItems": 0,
+                    "minItems": 0,
+                    "type": "array"
+                  },
+                  "instance_id": {
+                    "maxLength": 256,
+                    "pattern": "^[a-z][a-z0-9_.-]*$",
+                    "type": "string"
+                  },
+                  "node_id": {
+                    "const": "simulation.set_state"
+                  },
+                  "parameters": {
+                    "additionalProperties": false,
+                    "properties": {
+                      "state": {
+                        "enum": [
+                          "play",
+                          "pause"
+                        ],
+                        "type": "string"
+                      }
+                    },
+                    "type": "object"
+                  },
+                  "value_sources": {
+                    "additionalProperties": false,
+                    "minProperties": 1,
+                    "properties": {
+                      "state": {
+                        "$ref": "#/$defs/s_239060e26cdf11f6"
+                      }
+                    },
+                    "type": "object"
+                  }
+                },
+                "required": [
+                  "node_id",
+                  "parameters",
+                  "instance_id",
+                  "children"
+                ],
+                "type": "object"
+              },
+              {
+                "additionalProperties": false,
+                "allOf": [
+                  {
+                    "not": {
+                      "allOf": [
+                        {
+                          "properties": {
+                            "parameters": {
+                              "required": [
+                                "steps"
+                              ]
+                            }
+                          },
+                          "required": [
+                            "parameters"
+                          ]
+                        },
+                        {
+                          "properties": {
+                            "value_sources": {
+                              "required": [
+                                "steps"
+                              ]
+                            }
+                          },
+                          "required": [
+                            "value_sources"
+                          ]
+                        }
+                      ]
+                    }
+                  },
+                  {
+                    "oneOf": [
+                      {
+                        "properties": {
+                          "parameters": {
+                            "required": [
+                              "steps"
+                            ]
+                          }
+                        },
+                        "required": [
+                          "parameters"
+                        ]
+                      },
+                      {
+                        "properties": {
+                          "value_sources": {
+                            "required": [
+                              "steps"
+                            ]
+                          }
+                        },
+                        "required": [
+                          "value_sources"
+                        ]
+                      }
+                    ]
+                  }
+                ],
+                "properties": {
+                  "children": {
+                    "items": {
+                      "$ref": "#/$defs/node"
+                    },
+                    "maxItems": 0,
+                    "minItems": 0,
+                    "type": "array"
+                  },
+                  "instance_id": {
+                    "maxLength": 256,
+                    "pattern": "^[a-z][a-z0-9_.-]*$",
+                    "type": "string"
+                  },
+                  "node_id": {
+                    "const": "simulation.step"
+                  },
+                  "parameters": {
+                    "additionalProperties": false,
+                    "properties": {
+                      "steps": {
+                        "maximum": 1000000,
+                        "minimum": 1,
+                        "type": "integer"
+                      }
+                    },
+                    "type": "object"
+                  },
+                  "value_sources": {
+                    "additionalProperties": false,
+                    "minProperties": 1,
+                    "properties": {
+                      "steps": {
+                        "$ref": "#/$defs/s_239060e26cdf11f6"
+                      }
+                    },
                     "type": "object"
                   }
                 },
@@ -12471,6 +12061,19 @@
               "$ref": "#/$defs/s_2c5fb61ff814332a"
             }
           },
+          "s_5e98cb2bd216d46b": {
+            "additionalProperties": false,
+            "properties": {
+              "pose": {
+                "$ref": "#/$defs/s_3eb46c08a10d222d"
+              },
+              "scene_resource_id": {
+                "type": "string",
+                "x-manyforge-semantic-type": "scene_resource"
+              }
+            },
+            "type": "object"
+          },
           "s_62874ee639d2bbf4": {
             "allOf": [
               {
@@ -12832,6 +12435,19 @@
             "not": {
               "$ref": "#/$defs/s_209b5c74cad87057"
             }
+          },
+          "s_aa667adbebf70448": {
+            "additionalProperties": false,
+            "minProperties": 1,
+            "properties": {
+              "pose": {
+                "$ref": "#/$defs/s_239060e26cdf11f6"
+              },
+              "scene_resource_id": {
+                "$ref": "#/$defs/s_239060e26cdf11f6"
+              }
+            },
+            "type": "object"
           },
           "s_ab38980932f15fa2": {
             "not": {
@@ -13640,6 +13256,36 @@
                     }
                   },
                   {
+                    "not": {
+                      "allOf": [
+                        {
+                          "properties": {
+                            "parameters": {
+                              "required": [
+                                "required_inputs"
+                              ]
+                            }
+                          },
+                          "required": [
+                            "parameters"
+                          ]
+                        },
+                        {
+                          "properties": {
+                            "value_sources": {
+                              "required": [
+                                "required_inputs"
+                              ]
+                            }
+                          },
+                          "required": [
+                            "value_sources"
+                          ]
+                        }
+                      ]
+                    }
+                  },
+                  {
                     "oneOf": [
                       {
                         "properties": {
@@ -13951,6 +13597,32 @@
                         ],
                         "type": "object"
                       },
+                      "required_inputs": {
+                        "items": {
+                          "additionalProperties": false,
+                          "properties": {
+                            "input": {
+                              "enum": [
+                                "open",
+                                "closed",
+                                "pressure",
+                                "workpiece_grasped"
+                              ],
+                              "type": "string"
+                            },
+                            "value": {
+                              "type": "boolean"
+                            }
+                          },
+                          "required": [
+                            "input",
+                            "value"
+                          ],
+                          "type": "object"
+                        },
+                        "maxItems": 4,
+                        "type": "array"
+                      },
                       "target_role": {
                         "type": "string",
                         "x-manyforge-semantic-type": "target_role"
@@ -13978,6 +13650,9 @@
                         "$ref": "#/$defs/s_239060e26cdf11f6"
                       },
                       "position": {
+                        "$ref": "#/$defs/s_239060e26cdf11f6"
+                      },
+                      "required_inputs": {
                         "$ref": "#/$defs/s_239060e26cdf11f6"
                       }
                     },
@@ -16207,30 +15882,10 @@
                     "const": "scene.update_object_pose"
                   },
                   "parameters": {
-                    "additionalProperties": false,
-                    "properties": {
-                      "pose": {
-                        "$ref": "#/$defs/s_3eb46c08a10d222d"
-                      },
-                      "scene_resource_id": {
-                        "type": "string",
-                        "x-manyforge-semantic-type": "scene_resource"
-                      }
-                    },
-                    "type": "object"
+                    "$ref": "#/$defs/s_5e98cb2bd216d46b"
                   },
                   "value_sources": {
-                    "additionalProperties": false,
-                    "minProperties": 1,
-                    "properties": {
-                      "pose": {
-                        "$ref": "#/$defs/s_239060e26cdf11f6"
-                      },
-                      "scene_resource_id": {
-                        "$ref": "#/$defs/s_239060e26cdf11f6"
-                      }
-                    },
-                    "type": "object"
+                    "$ref": "#/$defs/s_aa667adbebf70448"
                   }
                 },
                 "required": [
@@ -16317,6 +15972,307 @@
                   "parameters": {
                     "additionalProperties": false,
                     "properties": {},
+                    "type": "object"
+                  }
+                },
+                "required": [
+                  "node_id",
+                  "parameters",
+                  "instance_id",
+                  "children"
+                ],
+                "type": "object"
+              },
+              {
+                "additionalProperties": false,
+                "properties": {
+                  "children": {
+                    "items": {
+                      "$ref": "#/$defs/node"
+                    },
+                    "maxItems": 0,
+                    "minItems": 0,
+                    "type": "array"
+                  },
+                  "instance_id": {
+                    "maxLength": 256,
+                    "pattern": "^[a-z][a-z0-9_.-]*$",
+                    "type": "string"
+                  },
+                  "node_id": {
+                    "const": "simulation.reset"
+                  },
+                  "parameters": {
+                    "additionalProperties": false,
+                    "properties": {},
+                    "type": "object"
+                  }
+                },
+                "required": [
+                  "node_id",
+                  "parameters",
+                  "instance_id",
+                  "children"
+                ],
+                "type": "object"
+              },
+              {
+                "additionalProperties": false,
+                "allOf": [
+                  {
+                    "$ref": "#/$defs/s_5e24d9e8298e3fc0"
+                  },
+                  {
+                    "$ref": "#/$defs/s_f32141df5dcacbc2"
+                  },
+                  {
+                    "$ref": "#/$defs/s_17a2ae38ca31bbe4"
+                  },
+                  {
+                    "$ref": "#/$defs/s_fff72238bc423091"
+                  }
+                ],
+                "properties": {
+                  "children": {
+                    "items": {
+                      "$ref": "#/$defs/node"
+                    },
+                    "maxItems": 0,
+                    "minItems": 0,
+                    "type": "array"
+                  },
+                  "instance_id": {
+                    "maxLength": 256,
+                    "pattern": "^[a-z][a-z0-9_.-]*$",
+                    "type": "string"
+                  },
+                  "node_id": {
+                    "const": "simulation.set_entity_pose"
+                  },
+                  "parameters": {
+                    "$ref": "#/$defs/s_5e98cb2bd216d46b"
+                  },
+                  "value_sources": {
+                    "$ref": "#/$defs/s_aa667adbebf70448"
+                  }
+                },
+                "required": [
+                  "node_id",
+                  "parameters",
+                  "instance_id",
+                  "children"
+                ],
+                "type": "object"
+              },
+              {
+                "additionalProperties": false,
+                "allOf": [
+                  {
+                    "not": {
+                      "allOf": [
+                        {
+                          "properties": {
+                            "parameters": {
+                              "required": [
+                                "state"
+                              ]
+                            }
+                          },
+                          "required": [
+                            "parameters"
+                          ]
+                        },
+                        {
+                          "properties": {
+                            "value_sources": {
+                              "required": [
+                                "state"
+                              ]
+                            }
+                          },
+                          "required": [
+                            "value_sources"
+                          ]
+                        }
+                      ]
+                    }
+                  },
+                  {
+                    "oneOf": [
+                      {
+                        "properties": {
+                          "parameters": {
+                            "required": [
+                              "state"
+                            ]
+                          }
+                        },
+                        "required": [
+                          "parameters"
+                        ]
+                      },
+                      {
+                        "properties": {
+                          "value_sources": {
+                            "required": [
+                              "state"
+                            ]
+                          }
+                        },
+                        "required": [
+                          "value_sources"
+                        ]
+                      }
+                    ]
+                  }
+                ],
+                "properties": {
+                  "children": {
+                    "items": {
+                      "$ref": "#/$defs/node"
+                    },
+                    "maxItems": 0,
+                    "minItems": 0,
+                    "type": "array"
+                  },
+                  "instance_id": {
+                    "maxLength": 256,
+                    "pattern": "^[a-z][a-z0-9_.-]*$",
+                    "type": "string"
+                  },
+                  "node_id": {
+                    "const": "simulation.set_state"
+                  },
+                  "parameters": {
+                    "additionalProperties": false,
+                    "properties": {
+                      "state": {
+                        "enum": [
+                          "play",
+                          "pause"
+                        ],
+                        "type": "string"
+                      }
+                    },
+                    "type": "object"
+                  },
+                  "value_sources": {
+                    "additionalProperties": false,
+                    "minProperties": 1,
+                    "properties": {
+                      "state": {
+                        "$ref": "#/$defs/s_239060e26cdf11f6"
+                      }
+                    },
+                    "type": "object"
+                  }
+                },
+                "required": [
+                  "node_id",
+                  "parameters",
+                  "instance_id",
+                  "children"
+                ],
+                "type": "object"
+              },
+              {
+                "additionalProperties": false,
+                "allOf": [
+                  {
+                    "not": {
+                      "allOf": [
+                        {
+                          "properties": {
+                            "parameters": {
+                              "required": [
+                                "steps"
+                              ]
+                            }
+                          },
+                          "required": [
+                            "parameters"
+                          ]
+                        },
+                        {
+                          "properties": {
+                            "value_sources": {
+                              "required": [
+                                "steps"
+                              ]
+                            }
+                          },
+                          "required": [
+                            "value_sources"
+                          ]
+                        }
+                      ]
+                    }
+                  },
+                  {
+                    "oneOf": [
+                      {
+                        "properties": {
+                          "parameters": {
+                            "required": [
+                              "steps"
+                            ]
+                          }
+                        },
+                        "required": [
+                          "parameters"
+                        ]
+                      },
+                      {
+                        "properties": {
+                          "value_sources": {
+                            "required": [
+                              "steps"
+                            ]
+                          }
+                        },
+                        "required": [
+                          "value_sources"
+                        ]
+                      }
+                    ]
+                  }
+                ],
+                "properties": {
+                  "children": {
+                    "items": {
+                      "$ref": "#/$defs/node"
+                    },
+                    "maxItems": 0,
+                    "minItems": 0,
+                    "type": "array"
+                  },
+                  "instance_id": {
+                    "maxLength": 256,
+                    "pattern": "^[a-z][a-z0-9_.-]*$",
+                    "type": "string"
+                  },
+                  "node_id": {
+                    "const": "simulation.step"
+                  },
+                  "parameters": {
+                    "additionalProperties": false,
+                    "properties": {
+                      "steps": {
+                        "maximum": 1000000,
+                        "minimum": 1,
+                        "type": "integer"
+                      }
+                    },
+                    "type": "object"
+                  },
+                  "value_sources": {
+                    "additionalProperties": false,
+                    "minProperties": 1,
+                    "properties": {
+                      "steps": {
+                        "$ref": "#/$defs/s_239060e26cdf11f6"
+                      }
+                    },
                     "type": "object"
                   }
                 },
@@ -17403,6 +17359,19 @@
               "$ref": "#/$defs/s_2c5fb61ff814332a"
             }
           },
+          "s_5e98cb2bd216d46b": {
+            "additionalProperties": false,
+            "properties": {
+              "pose": {
+                "$ref": "#/$defs/s_3eb46c08a10d222d"
+              },
+              "scene_resource_id": {
+                "type": "string",
+                "x-manyforge-semantic-type": "scene_resource"
+              }
+            },
+            "type": "object"
+          },
           "s_62874ee639d2bbf4": {
             "allOf": [
               {
@@ -17764,6 +17733,19 @@
             "not": {
               "$ref": "#/$defs/s_209b5c74cad87057"
             }
+          },
+          "s_aa667adbebf70448": {
+            "additionalProperties": false,
+            "minProperties": 1,
+            "properties": {
+              "pose": {
+                "$ref": "#/$defs/s_239060e26cdf11f6"
+              },
+              "scene_resource_id": {
+                "$ref": "#/$defs/s_239060e26cdf11f6"
+              }
+            },
+            "type": "object"
           },
           "s_ab38980932f15fa2": {
             "not": {
@@ -19618,6 +19600,19 @@
               "$ref": "#/$defs/s_209b5c74cad87057"
             }
           },
+          "s_aa667adbebf70448": {
+            "additionalProperties": false,
+            "minProperties": 1,
+            "properties": {
+              "pose": {
+                "$ref": "#/$defs/s_239060e26cdf11f6"
+              },
+              "scene_resource_id": {
+                "$ref": "#/$defs/s_239060e26cdf11f6"
+              }
+            },
+            "type": "object"
+          },
           "s_ab38980932f15fa2": {
             "not": {
               "$ref": "#/$defs/s_e9b16b9864d776ea"
@@ -19650,6 +19645,19 @@
                 ]
               }
             ]
+          },
+          "s_ae0b367f80cd6b62": {
+            "additionalProperties": false,
+            "properties": {
+              "pose": {
+                "$ref": "#/$defs/s_e6548fbcf583f9d3"
+              },
+              "scene_resource_id": {
+                "type": "string",
+                "x-manyforge-semantic-type": "scene_resource"
+              }
+            },
+            "type": "object"
           },
           "s_b4e8de2f44d7cc3e": {
             "allOf": [
@@ -20340,6 +20348,36 @@
                 }
               },
               {
+                "not": {
+                  "allOf": [
+                    {
+                      "properties": {
+                        "parameters": {
+                          "required": [
+                            "required_inputs"
+                          ]
+                        }
+                      },
+                      "required": [
+                        "parameters"
+                      ]
+                    },
+                    {
+                      "properties": {
+                        "value_sources": {
+                          "required": [
+                            "required_inputs"
+                          ]
+                        }
+                      },
+                      "required": [
+                        "value_sources"
+                      ]
+                    }
+                  ]
+                }
+              },
+              {
                 "anyOf": [
                   {
                     "required": [
@@ -20639,6 +20677,32 @@
                     ],
                     "type": "object"
                   },
+                  "required_inputs": {
+                    "items": {
+                      "additionalProperties": false,
+                      "properties": {
+                        "input": {
+                          "enum": [
+                            "open",
+                            "closed",
+                            "pressure",
+                            "workpiece_grasped"
+                          ],
+                          "type": "string"
+                        },
+                        "value": {
+                          "type": "boolean"
+                        }
+                      },
+                      "required": [
+                        "input",
+                        "value"
+                      ],
+                      "type": "object"
+                    },
+                    "maxItems": 4,
+                    "type": "array"
+                  },
                   "target_role": {
                     "type": "string",
                     "x-manyforge-semantic-type": "target_role"
@@ -20663,6 +20727,9 @@
                     "$ref": "#/$defs/s_239060e26cdf11f6"
                   },
                   "position": {
+                    "$ref": "#/$defs/s_239060e26cdf11f6"
+                  },
+                  "required_inputs": {
                     "$ref": "#/$defs/s_239060e26cdf11f6"
                   }
                 },
@@ -22963,30 +23030,10 @@
                 "type": "boolean"
               },
               "parameters": {
-                "additionalProperties": false,
-                "properties": {
-                  "pose": {
-                    "$ref": "#/$defs/s_e6548fbcf583f9d3"
-                  },
-                  "scene_resource_id": {
-                    "type": "string",
-                    "x-manyforge-semantic-type": "scene_resource"
-                  }
-                },
-                "type": "object"
+                "$ref": "#/$defs/s_ae0b367f80cd6b62"
               },
               "value_sources": {
-                "additionalProperties": false,
-                "minProperties": 1,
-                "properties": {
-                  "pose": {
-                    "$ref": "#/$defs/s_239060e26cdf11f6"
-                  },
-                  "scene_resource_id": {
-                    "$ref": "#/$defs/s_239060e26cdf11f6"
-                  }
-                },
-                "type": "object"
+                "$ref": "#/$defs/s_aa667adbebf70448"
               }
             },
             "required": [
@@ -23094,6 +23141,303 @@
               "parameters": {
                 "additionalProperties": false,
                 "properties": {},
+                "type": "object"
+              }
+            },
+            "required": [
+              "instance_id",
+              "expected_node_id"
+            ],
+            "type": "object"
+          },
+          {
+            "additionalProperties": false,
+            "allOf": [
+              {
+                "anyOf": [
+                  {
+                    "required": [
+                      "parameters"
+                    ]
+                  },
+                  {
+                    "required": [
+                      "value_sources"
+                    ]
+                  }
+                ]
+              }
+            ],
+            "properties": {
+              "expected_node_id": {
+                "const": "simulation.reset"
+              },
+              "instance_id": {
+                "oneOf": [
+                  {
+                    "maxLength": 256,
+                    "pattern": "^[a-z][a-z0-9_.-]*$",
+                    "type": "string"
+                  },
+                  {
+                    "const": "@root"
+                  }
+                ]
+              },
+              "merge": {
+                "type": "boolean"
+              },
+              "parameters": {
+                "additionalProperties": false,
+                "properties": {},
+                "type": "object"
+              }
+            },
+            "required": [
+              "instance_id",
+              "expected_node_id"
+            ],
+            "type": "object"
+          },
+          {
+            "additionalProperties": false,
+            "allOf": [
+              {
+                "$ref": "#/$defs/s_5e24d9e8298e3fc0"
+              },
+              {
+                "$ref": "#/$defs/s_f32141df5dcacbc2"
+              },
+              {
+                "anyOf": [
+                  {
+                    "required": [
+                      "parameters"
+                    ]
+                  },
+                  {
+                    "required": [
+                      "value_sources"
+                    ]
+                  }
+                ]
+              }
+            ],
+            "properties": {
+              "expected_node_id": {
+                "const": "simulation.set_entity_pose"
+              },
+              "instance_id": {
+                "oneOf": [
+                  {
+                    "maxLength": 256,
+                    "pattern": "^[a-z][a-z0-9_.-]*$",
+                    "type": "string"
+                  },
+                  {
+                    "const": "@root"
+                  }
+                ]
+              },
+              "merge": {
+                "type": "boolean"
+              },
+              "parameters": {
+                "$ref": "#/$defs/s_ae0b367f80cd6b62"
+              },
+              "value_sources": {
+                "$ref": "#/$defs/s_aa667adbebf70448"
+              }
+            },
+            "required": [
+              "instance_id",
+              "expected_node_id"
+            ],
+            "type": "object"
+          },
+          {
+            "additionalProperties": false,
+            "allOf": [
+              {
+                "not": {
+                  "allOf": [
+                    {
+                      "properties": {
+                        "parameters": {
+                          "required": [
+                            "state"
+                          ]
+                        }
+                      },
+                      "required": [
+                        "parameters"
+                      ]
+                    },
+                    {
+                      "properties": {
+                        "value_sources": {
+                          "required": [
+                            "state"
+                          ]
+                        }
+                      },
+                      "required": [
+                        "value_sources"
+                      ]
+                    }
+                  ]
+                }
+              },
+              {
+                "anyOf": [
+                  {
+                    "required": [
+                      "parameters"
+                    ]
+                  },
+                  {
+                    "required": [
+                      "value_sources"
+                    ]
+                  }
+                ]
+              }
+            ],
+            "properties": {
+              "expected_node_id": {
+                "const": "simulation.set_state"
+              },
+              "instance_id": {
+                "oneOf": [
+                  {
+                    "maxLength": 256,
+                    "pattern": "^[a-z][a-z0-9_.-]*$",
+                    "type": "string"
+                  },
+                  {
+                    "const": "@root"
+                  }
+                ]
+              },
+              "merge": {
+                "type": "boolean"
+              },
+              "parameters": {
+                "additionalProperties": false,
+                "properties": {
+                  "state": {
+                    "enum": [
+                      "play",
+                      "pause"
+                    ],
+                    "type": "string"
+                  }
+                },
+                "type": "object"
+              },
+              "value_sources": {
+                "additionalProperties": false,
+                "minProperties": 1,
+                "properties": {
+                  "state": {
+                    "$ref": "#/$defs/s_239060e26cdf11f6"
+                  }
+                },
+                "type": "object"
+              }
+            },
+            "required": [
+              "instance_id",
+              "expected_node_id"
+            ],
+            "type": "object"
+          },
+          {
+            "additionalProperties": false,
+            "allOf": [
+              {
+                "not": {
+                  "allOf": [
+                    {
+                      "properties": {
+                        "parameters": {
+                          "required": [
+                            "steps"
+                          ]
+                        }
+                      },
+                      "required": [
+                        "parameters"
+                      ]
+                    },
+                    {
+                      "properties": {
+                        "value_sources": {
+                          "required": [
+                            "steps"
+                          ]
+                        }
+                      },
+                      "required": [
+                        "value_sources"
+                      ]
+                    }
+                  ]
+                }
+              },
+              {
+                "anyOf": [
+                  {
+                    "required": [
+                      "parameters"
+                    ]
+                  },
+                  {
+                    "required": [
+                      "value_sources"
+                    ]
+                  }
+                ]
+              }
+            ],
+            "properties": {
+              "expected_node_id": {
+                "const": "simulation.step"
+              },
+              "instance_id": {
+                "oneOf": [
+                  {
+                    "maxLength": 256,
+                    "pattern": "^[a-z][a-z0-9_.-]*$",
+                    "type": "string"
+                  },
+                  {
+                    "const": "@root"
+                  }
+                ]
+              },
+              "merge": {
+                "type": "boolean"
+              },
+              "parameters": {
+                "additionalProperties": false,
+                "properties": {
+                  "steps": {
+                    "maximum": 1000000,
+                    "minimum": 1,
+                    "type": "integer"
+                  }
+                },
+                "type": "object"
+              },
+              "value_sources": {
+                "additionalProperties": false,
+                "minProperties": 1,
+                "properties": {
+                  "steps": {
+                    "$ref": "#/$defs/s_239060e26cdf11f6"
+                  }
+                },
                 "type": "object"
               }
             },

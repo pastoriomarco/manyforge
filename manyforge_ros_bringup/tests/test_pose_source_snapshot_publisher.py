@@ -459,7 +459,7 @@ def test_relative_reference_is_read_with_its_object_in_one_batch(
     # every poll is an arrival sample ("0" on the wire); a zero stamp must
     # not freeze the stream after its first sample (live r10-E: stale).
     for stream_id in (
-        "poses/isaac_cheese_box/continuous_unattached",
+        "poses/isaac_cheese_box",
         "poses/isaac_ur10e_light_robot/viewer.measured_tcp",
     ):
         published = sinks.published[stream_id]
@@ -629,7 +629,7 @@ def test_entrypoint_has_no_retired_composer_or_deployment_owner_surface() -> Non
             {
                 ("isaac_ur10e_light_robot", "viewer.measured_robot"),
                 ("isaac_ur10e_light_robot", "viewer.measured_tcp"),
-                ("isaac_cheese_box", "continuous_unattached"),
+                ("isaac_cheese_box", "scene"),
             },
         ),
         (
@@ -639,7 +639,7 @@ def test_entrypoint_has_no_retired_composer_or_deployment_owner_surface() -> Non
             {
                 ("isaac_ur10e_collision_robot", "viewer.measured_robot"),
                 ("isaac_ur10e_collision_robot", "viewer.measured_tcp"),
-                ("isaac_cheese_box", "continuous_unattached"),
+                ("isaac_cheese_box", "scene"),
             },
         ),
         (
@@ -649,7 +649,7 @@ def test_entrypoint_has_no_retired_composer_or_deployment_owner_surface() -> Non
             {
                 ("isaac_ur10e_assistant_robot", "viewer.measured_robot"),
                 ("isaac_ur10e_assistant_robot", "viewer.measured_tcp"),
-                ("isaac_cheese_box", "continuous_unattached"),
+                ("isaac_cheese_box", "scene"),
             },
         ),
         (
@@ -664,7 +664,7 @@ def test_entrypoint_has_no_retired_composer_or_deployment_owner_surface() -> Non
             "isaac_lite6_trocar_robot",
             {
                 ("isaac_lite6_trocar_robot", "viewer.measured_robot"),
-                ("graspable", "before_planning"),
+                ("graspable", "scene"),
             },
         ),
     ],

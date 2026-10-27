@@ -44,7 +44,7 @@ inline constexpr std::string_view
 inline constexpr std::string_view
     kRos2ControlExecutionRuntimeConfigurationSchemaRevision =
         "sha256:"
-        "eb4a5f93825a6aede99963d3910f981c5159bdadcb7d48e1c8df1b2356fe2173";
+        "725d71567d7d2a0d9645cd71e657ed123d6ce8829d71cb2ea20b6eb8b392c4e4";
 inline constexpr std::string_view kRos2ControlExecutionRuntimeRoleId =
     ros2_control_execution_runtime_contract::kRuntimeRoleId;
 inline constexpr std::string_view
@@ -101,17 +101,29 @@ void require_no_exclusive_ros_controller_topic_collision(
 [[nodiscard]] bool ros_gripper_delivery_result_timeout_is_valid(
     std::string_view actuation_kind, double timeout_s) noexcept;
 
-/// Required ROS gripper feedback staleness threshold, shared like the timeout.
-[[nodiscard]] bool ros_gripper_state_freshness_timeout_is_valid(
-    double timeout_s) noexcept;
-
-/// Strict active ROS fourteen-field row, with an optional pneumatic-only
-/// delivery_result_timeout_s field (fifteen fields when present). The archival
+/// Strict active ROS thirteen-field row, with an optional pneumatic-only
+/// delivery_result_timeout_s field (fourteen fields when present). The archival
 /// neutral twelve-field decoder receives only its exact private data projection.
 [[nodiscard]] std::vector<
     ros2_control_execution_runtime_contract::Configuration::GripperTargetConfiguration>
 decode_ros2_control_execution_gripper_target_configurations(
     const core::JsonValueDTO::Array &rows);
+
+/// D11: one controller profile row's optional `tool_payload`, exactly
+/// `{mass_kg >= 0, center_of_mass_m: [x, y, z]}` with finite values.
+/// Throws RetainedBundleError otherwise.
+[[nodiscard]] ros2_control_execution_runtime_contract::Configuration::ToolPayload
+decode_ros2_control_tool_payload(const core::JsonValueDTO &value);
+
+/// CP9: the strict `component_streams` rows of one ROS unit configuration,
+/// sorted by (component, stream). Exactly `measured_joints` for every
+/// controller-profile component plus `gripper_feedback` for every gripper-row
+/// component; `fault` + `auto` is refused. Shared by the pre-Draft row hook
+/// and the retained decoder.
+[[nodiscard]] std::vector<
+    ros2_control_execution_runtime_contract::Configuration::ComponentStream>
+decode_ros2_control_execution_component_streams(
+    const core::JsonObjectDTO &configuration);
 
 /// DX817: one source classifier for the already-qualified selected graph.
 /// Absence preserves the historical physical/default Stop contract. A returned

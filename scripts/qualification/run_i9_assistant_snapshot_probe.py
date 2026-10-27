@@ -30,10 +30,7 @@ import httpx
 from websockets.sync.client import connect
 
 from manyforge_behavior.assistant_program_port import ProgramModelRequest
-from manyforge_headless_api.program_model_transport import (
-    OpenAICompatibleProgramModelTransport,
-    ProgramModelEndpointConfig,
-)
+from manyforge_headless_api.program_model_transport import OpenAICompatibleProgramModelTransport
 from manyforge_program_runner.snapshot_source import ComposerProgramSnapshotSource
 
 
@@ -396,20 +393,14 @@ def run_probe(composer_url: str) -> dict[str, Any]:
             cancel_event=Event(),
         )
         source = attachment["source"]
-        endpoint = ProgramModelEndpointConfig(
-            external_resource_alias="i9_snapshot_fixture",
-            chat_completions_url=(
-                f"http://127.0.0.1:{server.server_port}/v1/chat/completions"
-            ),
-            model_endpoint_aliases=("i9_snapshot_model",),
-            model_ids=("i9-snapshot-fixture",),
-        )
-        model_transport = OpenAICompatibleProgramModelTransport((endpoint,))
+        model_transport = OpenAICompatibleProgramModelTransport()
         response = model_transport.complete(
             ProgramModelRequest(
                 model_endpoint_alias="i9_snapshot_model",
                 external_resource_alias="i9_snapshot_fixture",
                 model_id="i9-snapshot-fixture",
+                base_url=f"http://127.0.0.1:{server.server_port}/v1",
+                api_key_env=None,
                 prompt_template_id="i9.snapshot.probe",
                 prompt_template_version="1",
                 prompt_template_digest=_DIGEST,

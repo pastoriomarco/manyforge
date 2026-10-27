@@ -3,6 +3,7 @@ import { afterEach, describe, expect, it, vi } from 'vitest';
 
 import type { DeploymentWorkspaceController } from '../hooks/useDeploymentWorkspace';
 import type { JsonValue } from '../types/api';
+import { api } from '../api/client';
 import { reactPropsHost } from '../test/reactPropsHost';
 import { DeploymentFocusedEditor } from './DeploymentFocusedEditor';
 
@@ -40,29 +41,43 @@ const poseSource = {
   configuration: {
     runtime_kind: 'pose_source',
     runtime_configuration: {
-      pose_sources: [{
-        controllable_component_id: 'isaac_scene_objects',
-        simulation_poll_period_ms: 250,
-        joint_state: {
-          eligible: false, lifetime_ns: 1000000000, object_id: 'robot', policy_id: 'viewer.measured_robot',
-          required_joint_names: ['joint_1'], topic: '/isaac_joint_states',
-        },
-        simulation_entities: [{
-          eligible: true, entity: '/mac_n_cheese_centered', frame_kind: 'cell_frame', lifetime_ns: 2000000000,
-          local_orientation_xyzw: [0, 0, 0, 1], local_position_xyz: [0, 0, 0],
-          object_id: 'isaac_cheese_box', policy_id: 'continuous_unattached',
-          source_coordinate_frame_id: 'universe', source_header_frame_id: 'mac_n_cheese_centered',
-          target_frame_id: 'universe',
-        }],
-        detection3d_sources: [],
-      }],
+      stream_budget_ns: 1000000000,
+      simulation: { poll_period_ms: 250, source_coordinate_frame_id: 'universe', target_frame_id: 'universe' },
+      robot_overlay: {
+        robot_component_id: 'arm',
+        joint_state: { topic: '/isaac_joint_states', required_joint_names: ['joint_1'] },
+      },
     },
   },
 };
 
-afterEach(() => vi.unstubAllGlobals());
+const aiModel = {
+  component_id: 'assistant_model',
+  component_profile_id: 'ai_model_v0',
+  target_settings: {},
+  configuration: {
+    runtime_kind: 'ai_model',
+    runtime_configuration: { base_url: 'http://127.0.0.1:8000/v1', model: 'gemma4-12b-it-gguf', api_key_env: null },
+  },
+};
 
-async function mount(components: JsonValue[]) {
+const links = [
+  { scene_resource_id: 'cheese', source_id: 'isaac_scene_objects',
+    source_key: { simulation_entity: { entity: '/cheese' } }, apply_policy: 'continuous_unattached' },
+  { scene_resource_id: 'gone', source_id: 'isaac_scene_objects',
+    source_key: { simulation_entity: { entity: '/gone' } }, apply_policy: 'observe_only' },
+];
+
+afterEach(() => {
+  vi.unstubAllGlobals();
+  vi.restoreAllMocks();
+});
+
+async function mount(
+  components: JsonValue[],
+  programSceneIds: string[] | null = null,
+  extra: Record<string, JsonValue> = {},
+) {
   const controller = {
     workspace: {
       draft: {
@@ -72,7 +87,8 @@ async function mount(components: JsonValue[]) {
           name: 'Cell A',
           components,
           attachments: [],
-          policies: {},
+          policies: { scene_pose_sources: links },
+          ...extra,
         },
       },
     },
@@ -85,17 +101,23 @@ async function mount(components: JsonValue[]) {
   const { createRoot } = await import('react-dom/client');
   const root = createRoot(host as unknown as Element);
   await act(() => root.render(<DeploymentFocusedEditor controller={controller}
-    sourceModel={{ status: 'loading' }} motionDescriptors={[]} gripperDescriptors={[]} />));
+    sourceModel={{ status: 'loading' }} motionDescriptors={[]} gripperDescriptors={[]}
+    programSceneIds={programSceneIds} />));
   const control = (label: string) => find((props) => props['aria-label'] === label);
   return {
     controller, control, all,
     type: (label: string, value: string) => act(() => control(label).onChange?.({ target: { value } })),
+    commit: async (label: string, value: string) => {
+      await act(() => (control(label).onFocus as (event: unknown) => void)({}));
+      await act(() => control(label).onChange?.({ target: { value } }));
+      await act(() => (control(label).onBlur as (event: unknown) => void)({}));
+    },
     unmount: () => act(() => root.unmount()),
   };
 }
 
 describe('Deployment pose sources', () => {
-  it('keeps a pose source out of the robot sections and shows it read-only', async () => {
+  it('keeps a pose source out of the robot sections and edits its own configuration', async () => {
     const mounted = await mount([arm, poseSource]);
     try {
       // The native runtime section lists the arm only.
@@ -104,15 +126,44 @@ describe('Deployment pose sources', () => {
           ?.props?.children?.[0]?.props?.children));
       expect(units).toEqual(['arm']);
       expect(mounted.control('isaac_scene_objects pose source')).toBeDefined();
-      const cells = mounted.all((props) => typeof props.children === 'string').map((props) => props.children);
-      for (const text of ['robot', 'viewer.measured_robot', 'isaac_cheese_box', 'continuous_unattached',
-        '/mac_n_cheese_centered']) {
-        expect(cells).toContain(text);
-      }
-      expect(cells).toContain(JSON.stringify(poseSource.configuration.runtime_configuration, null, 2));
-      // No editable control is offered for it.
-      expect(mounted.all((props) => typeof props.onChange === 'function'
-        && String(props['aria-label'] ?? '').startsWith('isaac_scene_objects'))).toHaveLength(0);
+      const path = ['components', 1, 'configuration', 'runtime_configuration'];
+      const configuration = poseSource.configuration.runtime_configuration;
+      await mounted.commit('isaac_scene_objects Stream budget (s)', '2.5');
+      expect(mounted.controller.mutate).toHaveBeenLastCalledWith(path, 'set',
+        { ...configuration, stream_budget_ns: 2500000000 });
+      await mounted.commit('isaac_scene_objects Poll period (ms)', '100');
+      expect(mounted.controller.mutate).toHaveBeenLastCalledWith(path, 'set',
+        { ...configuration, simulation: { ...configuration.simulation, poll_period_ms: 100 } });
+      await mounted.commit('isaac_scene_objects Joint names', 'a, b');
+      expect(mounted.controller.mutate).toHaveBeenLastCalledWith(path, 'set', { ...configuration, robot_overlay: {
+        robot_component_id: 'arm', joint_state: { topic: '/isaac_joint_states', required_joint_names: ['a', 'b'] },
+      } });
+      // A new block is written only once its required fields are set.
+      vi.mocked(mounted.controller.mutate).mockClear();
+      await act(() => mounted.control('isaac_scene_objects 3D detections').onChange?.({ target: { checked: true } }));
+      await mounted.commit('isaac_scene_objects Detection topic', '/output');
+      expect(mounted.controller.mutate).not.toHaveBeenCalled();
+      await mounted.commit('isaac_scene_objects Detection target frame', 'link_base');
+      expect(mounted.controller.mutate).toHaveBeenCalledExactlyOnceWith(path, 'set', { ...configuration,
+        detection3d: { topic: '/output', target_frame_id: 'link_base', fallback_frame_id: '' } });
+      // The linked objects are listed read-only.
+      const items = mounted.all((props) => Array.isArray(props.children)).flatMap((props) => props.children as unknown[]);
+      expect(items).toContain('cheese');
+      expect(items).toContain('/cheese');
+    } finally { await mounted.unmount(); }
+  });
+
+  it('lists links to objects missing from the Program and removes one', async () => {
+    let mounted = await mount([arm, poseSource]);
+    try {
+      expect(() => mounted.control('Remove pose link of gone')).toThrow();
+    } finally { await mounted.unmount(); }
+    mounted = await mount([arm, poseSource], ['cheese']);
+    try {
+      expect(() => mounted.control('Remove pose link of cheese')).toThrow();
+      await act(() => mounted.control('Remove pose link of gone').onClick?.());
+      expect(mounted.controller.mutate).toHaveBeenCalledExactlyOnceWith(['policies'], 'set',
+        { scene_pose_sources: [links[0]] });
     } finally { await mounted.unmount(); }
   });
 
@@ -128,6 +179,74 @@ describe('Deployment pose sources', () => {
       );
       const document = mounted.controller.workspace!.draft.document as unknown as { components: JsonValue[] };
       expect(document.components[2]).toEqual(original);
+    } finally { await mounted.unmount(); }
+  });
+
+  it('keeps an AI model out of the robot sections and edits its endpoint fields', async () => {
+    const mounted = await mount([arm, aiModel]);
+    try {
+      const units = mounted.all((props) => props.className === 'deployment-runtime-unit')
+        .map((props) => ((props.children as Array<{ props?: { children?: Array<{ props?: { children?: unknown } }> } }>)[0]
+          ?.props?.children?.[0]?.props?.children));
+      expect(units).toEqual(['arm']);
+      expect(mounted.control('assistant_model AI model')).toBeDefined();
+      const path = ['components', 1, 'configuration', 'runtime_configuration'];
+      const configuration = aiModel.configuration.runtime_configuration;
+      await mounted.commit('assistant_model Token environment variable', 'MANYFORGE_AI_TOKEN');
+      expect(mounted.controller.mutate).toHaveBeenLastCalledWith(path, 'set',
+        { ...configuration, api_key_env: 'MANYFORGE_AI_TOKEN' });
+      vi.mocked(mounted.controller.mutate).mockClear();
+      await mounted.commit('assistant_model Token environment variable', 'MY_TOKEN');
+      expect(mounted.controller.mutate).not.toHaveBeenCalled();
+      await mounted.commit('assistant_model Base URL', 'not a url');
+      expect(mounted.controller.mutate).not.toHaveBeenCalled();
+      await mounted.commit('assistant_model Model', 'qwen');
+      expect(mounted.controller.mutate).toHaveBeenLastCalledWith(path, 'set', { ...configuration, model: 'qwen' });
+    } finally { await mounted.unmount(); }
+  });
+
+  it('adds a second AI model component with a unique id', async () => {
+    const mounted = await mount([arm, aiModel]);
+    try {
+      const add = mounted.all((props) => props.children === 'Add AI model')[0];
+      await act(() => (add.onClick as () => void)());
+      await mounted.type('New AI model Model', 'qwen');
+      await mounted.type('New AI model Token environment variable', 'MANYFORGE_AI_QWEN');
+      const create = mounted.all((props) => props.children === 'Create AI model')[0];
+      await act(() => (create.onClick as () => void)());
+      expect(mounted.controller.mutate).toHaveBeenLastCalledWith(['components'], 'append', {
+        component_id: 'ai_model_3',
+        component_profile_id: 'ai_model_v0',
+        target_settings: {},
+        configuration: {
+          runtime_kind: 'ai_model',
+          runtime_configuration: {
+            base_url: 'http://127.0.0.1:8000/v1', model: 'qwen', api_key_env: 'MANYFORGE_AI_QWEN',
+          },
+        },
+      });
+    } finally { await mounted.unmount(); }
+  });
+
+  it('maps each assistant profile alias to an AI model component', async () => {
+    vi.spyOn(api.deploymentWorkspace, 'assistantProfiles').mockResolvedValue({
+      semantic_shape_selection: ['assistant_model', 'selection_model'],
+    });
+    const selection = { ...aiModel, component_id: 'selection_model' };
+    const mounted = await mount([arm, aiModel, selection], null, {
+      assistant_profile_id: 'semantic_shape_selection',
+      assistant_model_components: { selection_model: 'selection_model' },
+    });
+    try {
+      await act(async () => { await Promise.resolve(); });
+      expect(mounted.control('Model alias selection_model').value).toBe('selection_model');
+      expect(mounted.control('Model alias assistant_model').value).toBe('');
+      expect(mounted.all((props) => props.children === 'Choose the AI model for this alias.')).toHaveLength(1);
+      await act(() => mounted.control('Model alias assistant_model').onChange?.({
+        target: { value: 'assistant_model' } }));
+      expect(mounted.controller.mutate).toHaveBeenLastCalledWith(['assistant_model_components'], 'set', {
+        selection_model: 'selection_model', assistant_model: 'assistant_model',
+      });
     } finally { await mounted.unmount(); }
   });
 });

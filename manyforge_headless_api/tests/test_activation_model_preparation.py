@@ -45,7 +45,14 @@ _POSE_ROW = {
     "stop_profiles": {},
     "acceptance_obligations": [],
 }
-_MODEL_FREE_MARKERS = ("io_provider_runtime", "pose_source_runtime")
+_AI_ROW = {
+    "runtime_restoration_profile_id": "ai_model_v0",
+    "ai_model_runtime": {},
+    "source_fields": {},
+    "stop_profiles": {},
+    "acceptance_obligations": [],
+}
+_MODEL_FREE_MARKERS = ("io_provider_runtime", "pose_source_runtime", "ai_model_runtime")
 _MOCK_PROFILE = "lite6_mock_commanded_v0"
 _SOURCE_SCHEMA = "manyforge.activation_model_source_closure.v1"
 
@@ -66,6 +73,12 @@ def _maintained(order: str) -> dict[str, object]:
         rows.extend(io_rows)
     assert io_rows == [_IO_ROW]
     assert [row for row in rows if "pose_source_runtime" in row] == [_POSE_ROW]
+    # The AI model row is added by the compiler change; append it when absent.
+    ai_rows = [row for row in rows if "ai_model_runtime" in row]
+    if not ai_rows:
+        ai_rows = [copy.deepcopy(_AI_ROW)]
+        rows.extend(ai_rows)
+    assert ai_rows == [_AI_ROW]
     if order == "io_first":
         rows.remove(_IO_ROW)
         rows.insert(0, copy.deepcopy(_IO_ROW))
@@ -144,7 +157,23 @@ def _pose_source() -> dict[str, object]:
         "target_settings": {},
         "configuration": {
             "runtime_kind": "pose_source",
-            "runtime_configuration": {"pose_sources": []},
+            "runtime_configuration": {"stream_budget_ns": 1_000_000_000},
+        },
+    }
+
+
+def _ai_model() -> dict[str, object]:
+    return {
+        "component_id": "assistant_model",
+        "component_profile_id": "ai_model_v0",
+        "target_settings": {},
+        "configuration": {
+            "runtime_kind": "ai_model",
+            "runtime_configuration": {
+                "base_url": "http://127.0.0.1:8000/v1",
+                "model": "m",
+                "api_key_env": None,
+            },
         },
     }
 
@@ -199,6 +228,7 @@ def test_registry_with_model_free_io_profile_constructs_ros_only_preparer(
 
     assert profiles["io_device_v0"] == "io_provider"
     assert profiles["pose_source_v0"] == "pose_source"
+    assert profiles["ai_model_v0"] == "ai_model"
     assert profiles[_MOCK_PROFILE] == (
         "lite6_lite_gripper",
         "package://manyforge_example_models/models/lite6_lite_gripper/",
@@ -421,7 +451,7 @@ def test_closure_join_skips_the_model_free_pose_source_component(
     profiles = _model_preparation_profiles(_capability_root(tmp_path, registry))
 
     closure = _prepare_model_closure(
-        deployment={"components": [_pose_source(), _io_device(), _mock_robot()]},
+        deployment={"components": [_pose_source(), _io_device(), _ai_model(), _mock_robot()]},
         model_source_closure=_closure("robot"),
         profiles=profiles,
     )
@@ -436,8 +466,16 @@ def test_closure_join_skips_the_model_free_pose_source_component(
         {**_pose_source(), "model_source": {"kind": "package"}},
         {**_pose_source(), "configuration": {"runtime_kind": "io_provider"}},
         {**_io_device(), "configuration": {"runtime_kind": "pose_source"}},
+        {**_ai_model(), "model_source": {"kind": "package"}},
+        {**_ai_model(), "configuration": {"runtime_kind": "pose_source"}},
     ],
-    ids=["pose-with-model-source", "pose-profile-io-kind", "io-profile-pose-kind"],
+    ids=[
+        "pose-with-model-source",
+        "pose-profile-io-kind",
+        "io-profile-pose-kind",
+        "ai-with-model-source",
+        "ai-profile-pose-kind",
+    ],
 )
 def test_model_free_profile_requires_its_own_runtime_kind_and_no_model(
     registry: dict[str, object],

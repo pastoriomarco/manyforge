@@ -15,8 +15,10 @@ from manyforge_behavior.canonical_artifact import compute_content_identity, load
 from manyforge_behavior.catalog import NodeCatalog
 from manyforge_behavior.nodes import v2_owner
 from manyforge_behavior.nodes.v2_owner import MotionTaskAdapter
+from manyforge_behavior.kernel_client import KernelOperationAdmissionRejectedError
 from manyforge_behavior.orchestration_ports import (
     NodeAttemptIdentity,
+    OwnerInvocationGatedError,
     OwnerInvocationRefusedByPriorityError,
     OwnerNodeInputs,
     OwnerTaskObservationUnavailableError,
@@ -1742,3 +1744,93 @@ def test_a_smooth_or_absent_takeover_records_nothing(metadata) -> None:
         _tick(adapter)
     assert adapter.status is _SUCCESS
     assert adapter.audit_events == []
+
+
+# Rule 2: a gate rule's refusal is a wait at the node, not a failure ---------
+
+
+class _GateStore(_Store):
+    """The run store's mirrored rule state and its reading count."""
+
+    def __init__(self) -> None:
+        super().__init__()
+        self.readings = 0
+        self.state: str | None = "latched"
+
+    def read(self, state: str | None) -> None:
+        self.readings += 1
+        self.state = state
+
+    def interrupt_state_reading(self, rule_id: str) -> tuple[int, str | None]:
+        assert rule_id == "curtain"
+        return self.readings, self.state
+
+
+def _gated() -> OwnerInvocationGatedError:
+    refusal = KernelOperationAdmissionRejectedError(
+        "invalid_state_transition",
+        "Global interrupt rule curtain is active",
+        {"reason": "global_interrupt_gated", "rule_id": "curtain"},
+    )
+    return OwnerInvocationGatedError("curtain", refusal)
+
+
+def _gate_motion(starts: list[Any]) -> tuple[_MotionPort, _Time, _GateStore, MotionTaskAdapter]:
+    port = _MotionPort(starts)
+    time, clock = _clocked()
+    store = _GateStore()
+    adapter = _motion(port, clock, store=store, resolved={"execution_timeout_s": 5.0})
+    return port, time, store, adapter
+
+
+def test_a_gated_motion_waits_then_is_admitted_after_a_clear_reading() -> None:
+    port, time, store, adapter = _gate_motion([_gated(), _succeeded()])
+
+    assert _tick(adapter) is _RUNNING
+    assert adapter.cached_control_state() == "inactive"  # Nothing admitted.
+    assert adapter.feedback_message.startswith("Motion waits: global interrupt rule curtain")
+    store.read("latched")
+    time.now = 1.0
+    assert _tick(adapter) is _RUNNING
+    assert len(port.starts) == 1  # Still latched: no new evaluation.
+    store.state = "clear"  # Not a newer reading (the refusal's own reading).
+    store.readings -= 1
+    assert _tick(adapter) is _RUNNING and len(port.starts) == 1
+    store.read("clear")
+    assert _tick(adapter) is _SUCCESS
+    assert len(port.starts) == 2
+    # A fresh attempt of the same series evaluated admission once more.
+    assert port.starts[1][0].node_attempt_id != port.starts[0][0].node_attempt_id
+    assert [(event["kind"], event["rule_id"]) for event in adapter.audit_events] == [
+        ("program_node_motion_gated", "curtain"),
+        ("program_node_motion_gate_released", "curtain"),
+    ]
+
+
+def test_a_gate_refused_again_keeps_waiting_and_its_timeout_fails_the_node() -> None:
+    port, time, store, adapter = _gate_motion([_gated()])
+
+    assert _tick(adapter) is _RUNNING
+    time.now = 3.0
+    store.read("clear")  # Cleared, but tripped again before admission.
+    assert _tick(adapter) is _RUNNING
+    assert len(port.starts) == 2
+    assert _tick(adapter) is _RUNNING and len(port.starts) == 2  # No blind retry.
+    time.now = 5.0  # The node's own execution_timeout_s, from the first refusal.
+    assert _tick(adapter) is _FAILURE
+    assert len(port.starts) == 2
+    assert adapter.failure_reason_code == "owner_request_failed"
+    assert adapter.failure_details["reason"] == "global_interrupt_gated"
+    assert [event["kind"] for event in adapter.audit_events] == ["program_node_motion_gated"]
+
+
+def test_stop_ends_a_gate_wait_without_any_later_motion() -> None:
+    port, _time, store, adapter = _gate_motion([_gated(), _succeeded()])
+
+    assert _tick(adapter) is _RUNNING
+    adapter.stop(_INVALID)  # Program Stop or Reset invalidates the tree.
+    store.read("clear")
+    adapter.observe_while_operator_stop_held()
+    assert adapter.status is _INVALID
+    assert len(port.starts) == 1
+    assert port.cancelled == [] and port.closes == []

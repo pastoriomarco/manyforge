@@ -1,4 +1,5 @@
 #include "resource_addressed_execution_kernel_internal.hpp"
+#include <manyforge_core/time/stuck_drain_wait.hpp>
 
 namespace manyforge::core {
 
@@ -621,11 +622,12 @@ ResourceAddressedExecutionKernel::~ResourceAddressedExecutionKernel() {
     {
       std::unique_lock state_lock(state_mutex_);
       stop_surveillance_shutting_down_ = true;
-      if (!stop_surveillance_schedule_cv_.wait_for(state_lock, std::chrono::seconds(5), [&] {
-            return stop_surveillance_schedule_publications_ == 0U;
-          })) {
-        std::terminate();
-      }
+      WaitForDrain("kernel.stop_surveillance_schedule_publications", std::chrono::seconds(5),
+                   [&](std::chrono::nanoseconds bound) {
+                     return stop_surveillance_schedule_cv_.wait_for(state_lock, bound, [&] {
+                       return stop_surveillance_schedule_publications_ == 0U;
+                     });
+                   });
       for (const auto& record : stop_terminal_history_) {
         if (record != nullptr && record->surveillance_schedule_handle.has_value()) {
           surveillance_handles.push_back(*record->surveillance_schedule_handle);
@@ -642,9 +644,10 @@ ResourceAddressedExecutionKernel::~ResourceAddressedExecutionKernel() {
       }
     }
     try {
-      if (!scheduler_.drain_for(SchedulerPriority::Monitoring, std::chrono::seconds(5))) {
-        std::terminate();
-      }
+      WaitForDrain("kernel.scheduler_monitoring_lane", std::chrono::seconds(5),
+                   [&](std::chrono::nanoseconds bound) {
+                     return scheduler_.drain_for(SchedulerPriority::Monitoring, bound);
+                   });
     } catch (...) {
       std::terminate();
     }
@@ -653,32 +656,36 @@ ResourceAddressedExecutionKernel::~ResourceAddressedExecutionKernel() {
   // settle all causally accepted work before its worker object is retired.
   if (operation_control_executor_ != nullptr) {
     operation_control_executor_->CloseIngress();
-    if (!operation_control_executor_->DrainFor(std::chrono::seconds(5))) {
-      std::terminate();
-    }
+    WaitForDrain("kernel.operation_control_executor", std::chrono::seconds(5),
+                 [&](std::chrono::nanoseconds bound) {
+                   return operation_control_executor_->DrainFor(bound);
+                 });
   }
   if (stop_stage_attempt_executor_ != nullptr) {
     stop_stage_attempt_executor_->CloseIngress();
-    if (!stop_stage_attempt_executor_->DrainFor(std::chrono::seconds(5))) {
-      std::terminate();
-    }
+    WaitForDrain("kernel.stop_stage_attempt_executor", std::chrono::seconds(5),
+                 [&](std::chrono::nanoseconds bound) {
+                   return stop_stage_attempt_executor_->DrainFor(bound);
+                 });
   }
   if (stop_control_executor_ != nullptr) {
     // Attempt completion callbacks remain allowed to rearm/publish their
     // owning StopControl slot until every isolated provider call has drained.
     // Drain those causal wakeups before closing StopControl ingress.
-    if (!stop_control_executor_->DrainFor(std::chrono::seconds(5))) {
-      std::terminate();
-    }
+    WaitForDrain("kernel.stop_control_executor", std::chrono::seconds(5),
+                 [&](std::chrono::nanoseconds bound) {
+                   return stop_control_executor_->DrainFor(bound);
+                 });
     stop_control_executor_->CloseIngress();
   }
   if (stop_projection_worker_ != nullptr) {
     // Accepted Stop projections settle here, while the journal, clock,
     // scheduler and every participant engine are still alive.
     stop_projection_worker_->Close();
-    if (!stop_projection_worker_->DrainFor(std::chrono::seconds(5))) {
-      std::terminate();
-    }
+    WaitForDrain("kernel.stop_projection_worker", std::chrono::seconds(5),
+                 [&](std::chrono::nanoseconds bound) {
+                   return stop_projection_worker_->DrainFor(bound);
+                 });
   }
   // Only now may the drained lanes themselves be destroyed. Nothing can reach
   // them afterwards, so a lane cannot publish into the journal below.

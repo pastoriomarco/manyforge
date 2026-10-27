@@ -31,6 +31,9 @@ import {
   type DraftGroupVisibility,
 } from './ProgramRuntimePanel';
 import { ProgramContactPolicyEditor } from './ProgramContactPolicyEditor';
+import { ProgramSupportContactEditor } from './ProgramSupportContactEditor';
+import { ObjectPoseSourceCard } from './ObjectPoseSourceCard';
+import type { DeploymentWorkspaceController } from '../hooks/useDeploymentWorkspace';
 import { RobotControlPanelView } from './RobotControlPanel';
 import { ToolIoPanel } from './ToolIoPanel';
 import { useGizmoSettings } from './common/GizmoControls';
@@ -116,6 +119,8 @@ interface SceneAuthoringWorkspaceProps {
   onRetryManifest: () => void;
   onRetrySourceModel: () => void;
   programController: ProgramWorkspaceController;
+  /** The Deployment Draft owner: an object's pose-source link is stored there. */
+  deploymentController: DeploymentWorkspaceController;
   programRuntime: ProgramRuntimeController;
   robotControl: RobotControlController;
   /** The advisory failed-node correction preview, shown as its own ghost. */
@@ -876,6 +881,7 @@ export function ProgramSceneEditor({
   liveObjects,
   selectedResourceId,
   onSelectResource,
+  deploymentController,
 }: {
   program: ProgramAuthoringDocument;
   draftRevision: number;
@@ -886,6 +892,8 @@ export function ProgramSceneEditor({
   liveObjects: LogicalSceneObject[];
   selectedResourceId: string | null;
   onSelectResource: (sceneResourceId: string | null) => void;
+  /** The Deployment Draft owner for the object's pose-source link; the card is hidden without it. */
+  deploymentController?: DeploymentWorkspaceController;
 }) {
   const blockedTitle = busy ? busyReason ?? undefined : undefined;
   const resources = program.scene ?? EMPTY_PROGRAM_RESOURCES;
@@ -901,6 +909,10 @@ export function ProgramSceneEditor({
   const dirty = staged !== null && selected !== null
     && JSON.stringify(staged) !== JSON.stringify(selected);
   const stagedError = programSceneResourceError(staged);
+  // Support contacts have their own editor; the rest of the metadata is shown raw.
+  const metadataEntries = Object.entries(staged?.metadata ?? {})
+    .filter(([key]) => key !== 'support_contacts');
+  const otherMetadata = metadataEntries.length === 0 ? null : Object.fromEntries(metadataEntries);
   const frameOptions = useMemo(() => programComponentFrameOptions(program), [program]);
   const commitStaged = () => {
     if (busy || !dirty || staged === null || stagedError !== null) return;
@@ -1147,17 +1159,24 @@ export function ProgramSceneEditor({
             <p className="scene-commit-error inline-message severity-error" role="alert">{stagedError}</p>
           )}
           </section>
+          {deploymentController !== undefined && (
+            <ObjectPoseSourceCard controller={deploymentController} sceneResourceId={staged.scene_resource_id} />
+          )}
+          <ProgramSupportContactEditor
+            program={program}
+            draftRevision={draftRevision}
+            busy={busy}
+            busyReason={busyReason}
+            mutate={mutate}
+            supportedObjectId={staged.scene_resource_id}
+          />
           <details className="dcard">
-            <summary>Roles and collision metadata</summary>
+            <summary>Roles and metadata</summary>
             <dl>
               <div><dt>Resource roles</dt><dd>{staged.resource_roles?.join(', ') || 'none'}</dd></div>
-              <div><dt>Collision policies</dt><dd>{staged.collision_policy_ids?.join(', ') || 'none'}</dd></div>
-              <div><dt>Support contacts</dt><dd>{Array.isArray(staged.metadata?.support_contacts)
-                ? staged.metadata.support_contacts.length
-                : 0}</dd></div>
             </dl>
-            {staged.metadata !== undefined && (
-              <pre className="dcode">{JSON.stringify(staged.metadata, null, 2)}</pre>
+            {otherMetadata !== null && (
+              <pre className="dcode">{JSON.stringify(otherMetadata, null, 2)}</pre>
             )}
           </details>
           <section className="dcard">
@@ -2285,6 +2304,7 @@ export function SceneAuthoringWorkspace({
   onRetryManifest,
   onRetrySourceModel,
   programController,
+  deploymentController,
   programRuntime,
   robotControl,
   correctionGhost = null,
@@ -2588,6 +2608,7 @@ export function SceneAuthoringWorkspace({
       onSelectResource={(identity) => setSelection(identity === null
         ? null
         : { kind: 'program_resource', id: identity })}
+      deploymentController={deploymentController}
     />
   );
 

@@ -1,4 +1,5 @@
 import { normalizePublicRequestContext, parseComponentProcessStopResult, parseComponentProcessStopOffer } from './processStopParsers';
+import type { ManualValveIntent } from '../state/pneumaticManual';
 import { parseCanonicalEmptySelection, parseLifecycleOwnerSettlement, parseLifecycleTargetRetirementOffer,
   parseLifecycleTargetRetirementResult, parseLifecycleTargetRetirementLookup } from './scenarioCloseParsers';
 import type { CanonicalEmptySelection, LifecycleOwnerSettlementResult, LifecycleTargetRetirementIntent,
@@ -41,6 +42,7 @@ import {
   parseManagerDeploymentCandidatePreviewResponse,
   parseManagerApplyResponse,
   parseObjectResponse,
+  parseOperationObservation,
   parseProgramWorkspaceResponse,
   parseProgramWorkspaceTransitionResponse,
   parseCurrentScenarioResponse,
@@ -140,6 +142,7 @@ import type {
   DirectControlOperationIntent,
   ExecutionIdentity,
   MotionPreviewReceipt,
+  OperationObservation,
   ManualControlAvailability,
   GlobalRuleRecoveryOffer,
   GlobalRuleRecoveryResult,
@@ -500,6 +503,25 @@ export type PersistentKeyValueEditBody = PersistentKeyRequestIdentity & Persiste
 /** The Applied Scenario project's values; an edit names the folder it saw. */
 function persistentValuesPath(suffix = ''): string {
   return `/api/program/persistent-values${suffix}`;
+}
+
+/** Maintained assistant profile id -> its model endpoint aliases. */
+export type AssistantProfileAliases = Record<string, string[]>;
+
+function parseAssistantProfileAliases(value: unknown): AssistantProfileAliases {
+  const root = value as { schemaVersion?: unknown; profiles?: unknown } | null;
+  if (root?.schemaVersion !== 'manyforge.composer_assistant_profile_aliases.v1'
+    || !Array.isArray(root.profiles)) {
+    throw new Error('assistantProfiles must be the supported alias listing');
+  }
+  return Object.fromEntries(root.profiles.map((row: unknown) => {
+    const profile = row as { profileId?: unknown; modelEndpointAliases?: unknown };
+    if (typeof profile.profileId !== 'string' || !Array.isArray(profile.modelEndpointAliases)
+      || profile.modelEndpointAliases.some((alias) => typeof alias !== 'string')) {
+      throw new Error('assistantProfiles.profiles must name aliases per profile');
+    }
+    return [profile.profileId, profile.modelEndpointAliases as string[]];
+  }));
 }
 
 async function requestJson<T>(
@@ -1076,6 +1098,8 @@ export const api = {
     ),
   },
   deploymentWorkspace: {
+    assistantProfiles: (signal?: AbortSignal): Promise<AssistantProfileAliases> =>
+      requestJson('/api/deployment/assistant-profiles', parseAssistantProfileAliases, signal),
     get: (signal?: AbortSignal): Promise<DeploymentWorkspaceResponse> =>
       requestJson(
         '/api/deployment/workspace',
@@ -1341,11 +1365,13 @@ export const api = {
       kind: FileBrowseKind,
       path?: string,
       signal?: AbortSignal,
+      rootsOnly = false,
     ): Promise<FileBrowserResponse> => {
       const params = new URLSearchParams({ kind });
       if (path) {
         params.set('path', path);
       }
+      if (rootsOnly) params.set('roots_only', 'true');
       return requestJson(
         `/api/files/browse?${params.toString()}`,
         parseFileBrowserResponse,
@@ -1441,6 +1467,33 @@ export const api = {
     ),
   },
   execution: {
+    /** Read one accepted manual valve operation; a read never retries its effect. */
+    readManualValveOperation: (
+      operationId: string,
+      intent: ManualValveIntent,
+      componentId: string,
+      commandTargetId: string,
+      signal?: AbortSignal,
+    ): Promise<OperationObservation> => requestJson(
+      `/api/execution/operations/${encodeURIComponent(operationId)}`,
+      (value) => {
+        const observation = parseOperationObservation(value);
+        const envelope = value as Record<string, unknown>;
+        const operation = envelope.operation as Record<string, unknown>;
+        const participant = (operation.participants as Array<Record<string, unknown>>)[0];
+        if (envelope.owner_epoch !== intent.request_context.request_owner_epoch
+          || operation.program_binding_id !== intent.program_binding_id
+          || operation.program_run_id !== intent.program_run_id
+          || observation.operationId !== operationId
+          || participant.capability_id !== intent.participants[0].required_capability_id
+          || participant.payload_kind !== 'capability_command'
+          || observation.controllableComponentId !== componentId
+          || observation.commandTargetId !== commandTargetId) {
+          throw new Error('The valve operation observation does not match the accepted command.');
+        }
+        return observation;
+      }, signal,
+    ),
     /** Read one bound boolean signal (`query_target` kind `io_signal`); no effect. */
     readIoSignal: (selector: IoSignalSelector, signal?: AbortSignal): Promise<IoSignalReading> =>
       requestJson(

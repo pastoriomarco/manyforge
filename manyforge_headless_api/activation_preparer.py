@@ -85,6 +85,7 @@ _MODEL_FREE_PROFILES = {
     for marker, profile_id, runtime_kind in (
         ("io_provider_runtime", "io_device_v0", "io_provider"),
         ("pose_source_runtime", "pose_source_v0", "pose_source"),
+        ("ai_model_runtime", "ai_model_v0", "ai_model"),
     )
 }
 
@@ -97,8 +98,8 @@ def _model_preparation_profiles(
     Native preparation independently validates the complete profile and intent
     join.  This projection only supplies the model identity and accepted package
     prefix required to rewrite the already captured source bytes.  An approved
-    model-free profile (I/O device ``io_provider_runtime`` or pose source
-    ``pose_source_runtime``) maps to its components' Deployment runtime kind:
+    model-free profile (I/O device ``io_provider_runtime``, pose source
+    ``pose_source_runtime`` or AI model ``ai_model_runtime``) maps to its components' Deployment runtime kind:
     it has no model to prepare.  Only its exact approved row is accepted;
     every other row must name a known model family.
     """

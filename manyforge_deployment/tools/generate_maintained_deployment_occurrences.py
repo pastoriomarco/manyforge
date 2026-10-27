@@ -53,7 +53,7 @@ ROS2_CONTROL_RUNTIME_CONFIGURATION_SCHEMA_ID: Final = (
     "manyforge.value_schema.runtime.ros2_control_execution.v1"
 )
 ROS2_CONTROL_RUNTIME_CONFIGURATION_SCHEMA_REVISION: Final = (
-    "sha256:eb4a5f93825a6aede99963d3910f981c5159bdadcb7d48e1c8df1b2356fe2173"
+    "sha256:725d71567d7d2a0d9645cd71e657ed123d6ce8829d71cb2ea20b6eb8b392c4e4"
 )
 EMPTY_PROVIDER_CONTRACT_SCHEMA_ID: Final = (
     "manyforge.value_schema.provider_contract.empty.v1"
@@ -68,11 +68,15 @@ MOTION_CONTROLLED_STOP_SCHEMA_REVISION: Final = (
     "sha256:65e6f4462981225916834490d4e3cb4d42b70611a2287e1b76fdb1cbcabcb113"
 )
 LIFECYCLE_CATALOG_API_VERSION: Final = "manyforge.brand_lifecycle_plan_catalog.v1"
-LITE6_LIFECYCLE_PROVIDER_ID: Final = "lite6_arm_provider"
-LITE6_GRIPPER_LIFECYCLE_PROVIDER_ID: Final = "lite6_gripper_provider"
+# R7 D12: the xArm-family arm and gripper lifecycle providers.
+XARM_LIFECYCLE_PROVIDER_ID: Final = "xarm_arm_provider"
+XARM_GRIPPER_LIFECYCLE_PROVIDER_ID: Final = "xarm_gripper_provider"
 LITE6_NATIVE_MODEL_FAMILY_ID: Final = "lite6_lite_gripper"
 LIFECYCLE_INTENTS: Final = ("disable", "enable", "observe", "prepare", "recover")
 ROS2_CONTROL_PROVIDER_ID: Final = "manyforge.provider.ros2_control"
+# R7 package 4: a Real xArm-family arm's ros2_control provider. Same offers as
+# ROS2_CONTROL_PROVIDER_ID; only the lifecycle catalog differs.
+XARM_ROS2_CONTROL_PROVIDER_ID: Final = "manyforge.provider.ros2_control.xarm"
 
 CAPABILITIES: Final = {
     "io.gpio.set_output": (
@@ -98,6 +102,11 @@ CAPABILITIES: Final = {
     "assistant.model.invoke": (
         "sha256:f900f43ad7bbc61f49c09295a2a63e5fabe93eb57bc9c5f44c26e3c4eeeac158",
         "cell_global",
+        "capability_provider_binding",
+    ),
+    "ai.model.invoke": (
+        "sha256:c458ea512ad5b71be1a3a9f92908d8a36b2a9a8f5cb3b31556c42e0d468c9270",
+        "target_binding",
         "capability_provider_binding",
     ),
     "component.lifecycle.disable": (
@@ -599,8 +608,17 @@ def capability_selector(capability_id: str) -> dict[str, str]:
 
 
 def component_type_document(
-    family: dict[str, Any], *, runtime_scaling: bool = True
+    family: dict[str, Any], *, runtime_scaling: bool = True, arm_only: bool = False
 ) -> dict[str, Any]:
+    """Return a component type of one model family.
+
+    ``arm_only`` (fixed-scale only) drops the gripper target and tag: the
+    model's gripper geometry stays passive, as for a Real component in CP8
+    step 1 that controls its arm only.
+    """
+
+    if arm_only and runtime_scaling:
+        raise GenerationError("the arm-only component type is fixed-scale only")
     family_id = family["model_family_id"]
     semantics = family["semantics"]
     group_roles = {
@@ -613,7 +631,9 @@ def component_type_document(
         row["collision_body_role_id"]
         for row in semantics["collision_body_role_bindings"]
     }
-    physical_gripper = "gripper" in group_roles and "fingers" in resource_roles
+    physical_gripper = (
+        not arm_only and "gripper" in group_roles and "fingers" in resource_roles
+    )
     arm_collision_roles = [
         {
             "collision_body_role_id": role,
@@ -640,7 +660,10 @@ def component_type_document(
     }
     value = {
         "api_version": "manyforge.component_type.v1",
-        "component_type_id": f"{family_id}{'' if runtime_scaling else '.fixed_scale'}.component",
+        "component_type_id": (
+            f"{family_id}{'' if runtime_scaling else '.fixed_scale'}"
+            f"{'.arm_only' if arm_only else ''}.component"
+        ),
         "tags": ["articulated-arm", *(["gripper"] if physical_gripper else [])],
         "model_roles": [{"model_role_id": "arm_model", "cardinality": "exactly_one"}],
         "component_root": {
@@ -1003,195 +1026,47 @@ def lifecycle_transition(
     }
 
 
-def lite6_lifecycle_plans() -> list[dict[str, Any]]:
+def xarm_lifecycle_plans() -> list[dict[str, Any]]:
+    """The xArm arm catalog after R7 package 5: the operator's Recover clears
+    the vendor error, then the warning, through the unmodified driver's
+    `clean_error`/`clean_warn` (`xarm.clear_*`). The vendor plugin's own
+    activation does the rest of the ready sequence (R7 D1)."""
     boolean = lifecycle_boolean
-    token = lifecycle_token
-    prepared = lifecycle_predicate(
-        ["prepared"],
-        {
-            "xarm.motion_enabled": boolean(True),
-            "xarm.position_valid": boolean(True),
-            "xarm.joint_servo_mode_selected": boolean(True),
-            "xarm.vendor_control_ready": boolean(False),
-            "xarm.vendor_stopped": boolean(False),
-            "xarm.fault_present": boolean(False),
-            "xarm.recovery_required": boolean(False),
-            "xarm.warning_present": boolean(False),
-            "xarm.vendor_feedback_class": token("mode_changed"),
-        },
-    )
-    enabled_stopped = lifecycle_predicate(
-        ["degraded"],
-        {
-            "xarm.motion_enabled": boolean(True),
-            "xarm.position_valid": boolean(True),
-            "xarm.vendor_stopped": boolean(True),
-            "xarm.fault_present": boolean(False),
-            "xarm.recovery_required": boolean(False),
-            "xarm.warning_present": boolean(False),
-            "xarm.vendor_feedback_class": token("stopped"),
-        },
-    )
-    active = lifecycle_predicate(
-        ["active"],
-        {
-            "xarm.motion_enabled": boolean(True),
-            "xarm.position_valid": boolean(True),
-            "xarm.joint_servo_mode_selected": boolean(True),
-            "xarm.vendor_control_ready": boolean(True),
-            "xarm.vendor_stopped": boolean(False),
-            "xarm.fault_present": boolean(False),
-            "xarm.recovery_required": boolean(False),
-            "xarm.warning_present": boolean(False),
-            "xarm.vendor_feedback_class": token("ready"),
-        },
-    )
-    disabled = lifecycle_predicate(
-        ["disabled"],
-        {
-            "xarm.motion_enabled": boolean(False),
-            "xarm.vendor_control_ready": boolean(False),
-            "xarm.vendor_stopped": boolean(True),
-            "xarm.vendor_feedback_class": token("stopped"),
-        },
-    )
-    stopped_enabled = lifecycle_predicate(
-        ["degraded", "faulted"],
-        {
-            "xarm.motion_enabled": boolean(True),
-            "xarm.vendor_control_ready": boolean(False),
-            "xarm.vendor_stopped": boolean(True),
-            "xarm.vendor_feedback_class": token("stopped"),
-        },
-    )
     recovered = lifecycle_predicate(
         ["disabled"],
         {
-            "xarm.motion_enabled": boolean(False),
-            "xarm.vendor_stopped": boolean(True),
-            "xarm.fault_present": boolean(False),
-            "xarm.recovery_required": boolean(False),
-            "xarm.warning_present": boolean(False),
-            "xarm.vendor_feedback_class": token("stopped"),
+            "device.error_present": boolean(False),
+            "device.warning_present": boolean(False),
         },
     )
-    timeout_ns = 30_000_000_000
     return [
-        {
-            "intent": "prepare",
-            "requested_state": "prepared",
-            "requested_postcondition": prepared,
-            "timeout_duration_ns": timeout_ns,
-            "transitions": [
-                lifecycle_transition(
-                    "xarm.enable_motion",
-                    lifecycle_predicate(
-                        ["declared", "disabled"],
-                        {
-                            "xarm.motion_enabled": boolean(False),
-                            "xarm.vendor_stopped": boolean(True),
-                            "xarm.fault_present": boolean(False),
-                            "xarm.recovery_required": boolean(False),
-                            "xarm.warning_present": boolean(False),
-                            "xarm.vendor_feedback_class": token("stopped"),
-                        },
-                    ),
-                    enabled_stopped,
-                ),
-                lifecycle_transition(
-                    "xarm.select_joint_servo_mode", enabled_stopped, prepared
-                ),
-            ],
-        },
-        {
-            "intent": "enable",
-            "requested_state": "active",
-            "requested_postcondition": active,
-            "timeout_duration_ns": timeout_ns,
-            "transitions": [
-                lifecycle_transition(
-                    "xarm.set_ready_state",
-                    lifecycle_predicate(
-                        prepared["allowed_states"],
-                        {
-                            **{
-                                row["lifecycle_fact_id"]: row["expected_value"]
-                                for row in prepared["fact_predicates"]
-                            },
-                            "xarm.ready_state_request_eligible": boolean(True),
-                        },
-                    ),
-                    active,
-                )
-            ],
-        },
-        {
-            "intent": "disable",
-            "requested_state": "disabled",
-            "requested_postcondition": disabled,
-            "timeout_duration_ns": timeout_ns,
-            "transitions": [
-                lifecycle_transition(
-                    "xarm.set_stopped_state",
-                    lifecycle_predicate(
-                        ["prepared", "active", "degraded", "faulted"],
-                        {
-                            "xarm.motion_enabled": boolean(True),
-                            "xarm.vendor_stopped": boolean(False),
-                        },
-                    ),
-                    stopped_enabled,
-                ),
-                lifecycle_transition("xarm.disable_motion", stopped_enabled, disabled),
-            ],
-        },
         {
             "intent": "recover",
             "requested_state": "disabled",
             "recover_target_eligibility": lifecycle_predicate(
-                ["disabled"],
-                {
-                    "xarm.motion_enabled": boolean(False),
-                    "xarm.vendor_stopped": boolean(True),
-                    "xarm.vendor_feedback_class": token("stopped"),
-                },
+                ["disabled", "faulted"], {}
             ),
             "requested_postcondition": recovered,
-            "timeout_duration_ns": timeout_ns,
+            "timeout_duration_ns": 30_000_000_000,
             "transitions": [
                 lifecycle_transition(
                     "xarm.clear_error",
                     lifecycle_predicate(
-                        ["disabled"],
-                        {
-                            "xarm.motion_enabled": boolean(False),
-                            "xarm.vendor_stopped": boolean(True),
-                            "xarm.fault_present": boolean(True),
-                            "xarm.vendor_feedback_class": token("stopped"),
-                        },
+                        ["disabled", "faulted"],
+                        {"device.error_present": boolean(True)},
                     ),
                     lifecycle_predicate(
-                        ["disabled"],
-                        {
-                            "xarm.motion_enabled": boolean(False),
-                            "xarm.vendor_stopped": boolean(True),
-                            "xarm.fault_present": boolean(False),
-                            "xarm.recovery_required": boolean(False),
-                            "xarm.vendor_feedback_class": token("stopped"),
-                        },
+                        ["disabled", "faulted"],
+                        {"device.error_present": boolean(False)},
                     ),
                 ),
                 lifecycle_transition(
                     "xarm.clear_warning",
                     lifecycle_predicate(
-                        ["disabled"],
+                        ["disabled", "faulted"],
                         {
-                            "xarm.motion_enabled": boolean(False),
-                            "xarm.vendor_stopped": boolean(True),
-                            "xarm.fault_present": boolean(False),
-                            "xarm.recovery_required": boolean(False),
-                            "xarm.warning_present": boolean(True),
-                            "xarm.vendor_feedback_class": token("stopped"),
+                            "device.error_present": boolean(False),
+                            "device.warning_present": boolean(True),
                         },
                     ),
                     recovered,
@@ -1340,8 +1215,14 @@ def pose_source_lifecycle_product() -> tuple[dict[str, Any], dict[str, Any]]:
     )
 
 
-def lite6_lifecycle_product() -> tuple[dict[str, Any], dict[str, Any]]:
-    return lifecycle_product(LITE6_LIFECYCLE_PROVIDER_ID, lite6_lifecycle_plans())
+def ai_model_lifecycle_product() -> tuple[dict[str, Any], dict[str, Any]]:
+    return io_lifecycle_product(
+        "manyforge.provider.ai_model", ("ai.model.invoke",), []
+    )
+
+
+def xarm_lifecycle_product() -> tuple[dict[str, Any], dict[str, Any]]:
+    return lifecycle_product(XARM_LIFECYCLE_PROVIDER_ID, xarm_lifecycle_plans())
 
 
 def lite6_gripper_lifecycle_predicate(
@@ -1418,7 +1299,7 @@ def lite6_gripper_lifecycle_plans() -> list[dict[str, Any]]:
 
 def lite6_gripper_lifecycle_product() -> tuple[dict[str, Any], dict[str, Any]]:
     return lifecycle_product(
-        LITE6_GRIPPER_LIFECYCLE_PROVIDER_ID, lite6_gripper_lifecycle_plans()
+        XARM_GRIPPER_LIFECYCLE_PROVIDER_ID, lite6_gripper_lifecycle_plans()
     )
 
 
@@ -1568,14 +1449,304 @@ def ros2_control_lifecycle_plans() -> list[dict[str, Any]]:
     ]
 
 
+def xarm_ros2_control_lifecycle_plans() -> list[dict[str, Any]]:
+    """Real xArm-family arm on stock ros2_control plus the driver's
+    `clean_error`/`clean_warn` (R7 package 4; mirrors
+    `manyforge_xarm_control::make_xarm_ros2_control_lifecycle_plans`).
+
+    Prepare arms through the hardware activation (D1), absorbs the plugin's
+    reactivate-all and marks the arm prepared; Enable activates the trajectory
+    controller; Disable switches off the controller, then the hardware (D4
+    option B); Recover switches both off and clears the vendor error, then the
+    warning (D10)."""
+    boolean = lifecycle_boolean
+    ready_for_commands = "device.accepts_commands"
+    error = "device.error_present"
+    warning = "device.warning_present"
+    broadcaster = "external.broadcaster_active"
+    controller_active = "external.controller_active"
+    ready = "external.controller_configuration_ready"
+    loaded = "external.controller_loaded"
+    spawned = "external.controller_spawned"
+    fault = "external.fault_present"
+    hardware = "external.hardware_active"
+    measured = "external.measured_joints_valid"
+    transport = "external.transport_ready"
+    unarmed = ["declared", "disabled"]
+    any_state = ["declared", "prepared", "active", "degraded", "faulted", "disabled"]
+    prepared = lifecycle_predicate(
+        ["prepared"],
+        {
+            ready_for_commands: boolean(True),
+            broadcaster: boolean(True),
+            controller_active: boolean(False),
+            loaded: boolean(True),
+            fault: boolean(False),
+            hardware: boolean(True),
+            measured: boolean(True),
+            transport: boolean(True),
+        },
+    )
+    armed = lifecycle_predicate(
+        unarmed,
+        {
+            ready_for_commands: boolean(True),
+            broadcaster: boolean(True),
+            fault: boolean(False),
+            hardware: boolean(True),
+            transport: boolean(True),
+        },
+    )
+    active = lifecycle_predicate(
+        ["active"],
+        {
+            ready_for_commands: boolean(True),
+            ready: boolean(True),
+            loaded: boolean(True),
+            fault: boolean(False),
+            transport: boolean(True),
+        },
+    )
+    disabled = lifecycle_predicate(
+        ["disabled"],
+        {
+            ready: boolean(False),
+            controller_active: boolean(False),
+            fault: boolean(False),
+            hardware: boolean(False),
+            transport: boolean(True),
+        },
+    )
+    recovered = lifecycle_predicate(
+        unarmed,
+        {
+            error: boolean(False),
+            warning: boolean(False),
+            controller_active: boolean(False),
+            fault: boolean(False),
+            hardware: boolean(False),
+            transport: boolean(True),
+        },
+    )
+    timeout_ns = 30_000_000_000
+    return [
+        {
+            "intent": "prepare",
+            "requested_state": "prepared",
+            "requested_postcondition": prepared,
+            "timeout_duration_ns": timeout_ns,
+            "transitions": [
+                lifecycle_transition(
+                    "ros2_control.hardware.activate",
+                    lifecycle_predicate(
+                        unarmed,
+                        {
+                            error: boolean(False),
+                            spawned: boolean(True),
+                            fault: boolean(False),
+                            hardware: boolean(False),
+                            transport: boolean(True),
+                        },
+                    ),
+                    armed,
+                ),
+                lifecycle_transition(
+                    "ros2_control.controller.deactivate",
+                    lifecycle_predicate(
+                        ["declared", "prepared", "disabled"],
+                        {
+                            controller_active: boolean(True),
+                            fault: boolean(False),
+                            hardware: boolean(True),
+                            transport: boolean(True),
+                        },
+                    ),
+                    lifecycle_predicate(
+                        ["disabled"],
+                        {
+                            controller_active: boolean(False),
+                            fault: boolean(False),
+                            hardware: boolean(True),
+                            transport: boolean(True),
+                        },
+                    ),
+                ),
+                lifecycle_transition(
+                    "ros2_control.controller.prepare",
+                    lifecycle_predicate(
+                        unarmed,
+                        {
+                            ready_for_commands: boolean(True),
+                            broadcaster: boolean(True),
+                            controller_active: boolean(False),
+                            loaded: boolean(True),
+                            fault: boolean(False),
+                            hardware: boolean(True),
+                            measured: boolean(True),
+                            transport: boolean(True),
+                        },
+                    ),
+                    prepared,
+                ),
+            ],
+        },
+        {
+            "intent": "enable",
+            "requested_state": "active",
+            "requested_postcondition": active,
+            "timeout_duration_ns": timeout_ns,
+            "transitions": [
+                lifecycle_transition(
+                    "ros2_control.controller.activate",
+                    lifecycle_predicate(
+                        ["prepared"],
+                        {
+                            ready_for_commands: boolean(True),
+                            broadcaster: boolean(True),
+                            ready: boolean(False),
+                            controller_active: boolean(False),
+                            loaded: boolean(True),
+                            fault: boolean(False),
+                            measured: boolean(True),
+                            transport: boolean(True),
+                        },
+                    ),
+                    active,
+                )
+            ],
+        },
+        {
+            "intent": "disable",
+            "requested_state": "disabled",
+            "requested_postcondition": disabled,
+            "timeout_duration_ns": timeout_ns,
+            "transitions": [
+                lifecycle_transition(
+                    "ros2_control.controller.deactivate",
+                    lifecycle_predicate(
+                        ["prepared", "active", "degraded"],
+                        {controller_active: boolean(True), transport: boolean(True)},
+                    ),
+                    lifecycle_predicate(
+                        ["disabled"],
+                        {controller_active: boolean(False), transport: boolean(True)},
+                    ),
+                ),
+                lifecycle_transition(
+                    "ros2_control.hardware.deactivate",
+                    lifecycle_predicate(
+                        ["declared", "prepared", "degraded", "disabled"],
+                        {
+                            controller_active: boolean(False),
+                            hardware: boolean(True),
+                            transport: boolean(True),
+                        },
+                    ),
+                    disabled,
+                ),
+            ],
+        },
+        {
+            "intent": "recover",
+            "requested_state": "disabled",
+            "recover_target_eligibility": lifecycle_predicate(
+                ["degraded", "faulted"], {transport: boolean(True)}
+            ),
+            "requested_postcondition": recovered,
+            "timeout_duration_ns": timeout_ns,
+            "transitions": [
+                lifecycle_transition(
+                    "ros2_control.controller.deactivate",
+                    lifecycle_predicate(
+                        any_state,
+                        {controller_active: boolean(True), transport: boolean(True)},
+                    ),
+                    lifecycle_predicate(
+                        any_state,
+                        {controller_active: boolean(False), transport: boolean(True)},
+                    ),
+                ),
+                lifecycle_transition(
+                    "ros2_control.hardware.deactivate",
+                    lifecycle_predicate(
+                        any_state,
+                        {
+                            controller_active: boolean(False),
+                            hardware: boolean(True),
+                            transport: boolean(True),
+                        },
+                    ),
+                    lifecycle_predicate(
+                        any_state,
+                        {
+                            controller_active: boolean(False),
+                            hardware: boolean(False),
+                            transport: boolean(True),
+                        },
+                    ),
+                ),
+                lifecycle_transition(
+                    "xarm.clear_error",
+                    lifecycle_predicate(
+                        any_state,
+                        {
+                            error: boolean(True),
+                            controller_active: boolean(False),
+                            hardware: boolean(False),
+                            transport: boolean(True),
+                        },
+                    ),
+                    lifecycle_predicate(
+                        any_state,
+                        {
+                            error: boolean(False),
+                            controller_active: boolean(False),
+                            hardware: boolean(False),
+                            transport: boolean(True),
+                        },
+                    ),
+                ),
+                lifecycle_transition(
+                    "xarm.clear_warning",
+                    lifecycle_predicate(
+                        any_state,
+                        {
+                            error: boolean(False),
+                            warning: boolean(True),
+                            controller_active: boolean(False),
+                            hardware: boolean(False),
+                            transport: boolean(True),
+                        },
+                    ),
+                    lifecycle_predicate(
+                        any_state,
+                        {
+                            error: boolean(False),
+                            warning: boolean(False),
+                            controller_active: boolean(False),
+                            hardware: boolean(False),
+                            transport: boolean(True),
+                        },
+                    ),
+                ),
+            ],
+        },
+    ]
+
+
 def ros2_control_provider_manifest(
     control_capabilities: tuple[str, ...],
     planner_capabilities: tuple[str, ...],
+    provider_id: str = ROS2_CONTROL_PROVIDER_ID,
 ) -> dict[str, Any]:
-    plans = ros2_control_lifecycle_plans()
+    plans = (
+        xarm_ros2_control_lifecycle_plans()
+        if provider_id == XARM_ROS2_CONTROL_PROVIDER_ID
+        else ros2_control_lifecycle_plans()
+    )
     semantic_projection = {
         "api_version": LIFECYCLE_CATALOG_API_VERSION,
-        "provider_manifest_id": ROS2_CONTROL_PROVIDER_ID,
+        "provider_manifest_id": provider_id,
         "plans": plans,
     }
     semantic_digest = sha256_digest(
@@ -1603,7 +1774,7 @@ def ros2_control_provider_manifest(
     return revisioned_document(
         {
             "api_version": "manyforge.provider_manifest.v1",
-            "provider_manifest_id": ROS2_CONTROL_PROVIDER_ID,
+            "provider_manifest_id": provider_id,
             "offered_capabilities": [
                 {
                     **capability_selector(capability_id),
@@ -1630,22 +1801,6 @@ def ros2_control_provider_manifest(
         api_version="manyforge.provider_manifest.v1",
         revision_field="provider_manifest_revision",
     )
-
-
-def lite6_lifecycle_identity_header(
-    manifest: dict[str, Any], catalog: dict[str, Any]
-) -> bytes:
-    semantic_digest = manifest["lifecycle_plan_catalog"]["semantic_digest"]
-    return (
-        "// Generated by generate_maintained_deployment_occurrences.py; do not edit.\n"
-        "#pragma once\n\n"
-        "#include <string_view>\n\n"
-        "namespace manyforge::xarm_control::generated {\n"
-        f'inline constexpr std::string_view kLite6LifecycleCatalogSemanticDigest = "{semantic_digest}";\n'
-        f'inline constexpr std::string_view kLite6LifecycleProviderManifestRevision = "{manifest["provider_manifest_revision"]}";\n'
-        f'inline constexpr std::string_view kLite6LifecycleCatalogDigest = "{catalog["catalog_digest"]}";\n'
-        "} // namespace manyforge::xarm_control::generated\n"
-    ).encode("utf-8")
 
 
 def gripper_logical_cancel_stop_policy() -> dict[str, Any]:
@@ -2038,7 +2193,7 @@ def catalog_sources(
             if CAPABILITIES[capability_id][2] == "capability_provider_binding"
         )
     )
-    lifecycle_manifest, lifecycle_catalog = lite6_lifecycle_product()
+    lifecycle_manifest, _lifecycle_catalog = xarm_lifecycle_product()
     gripper_lifecycle_manifest, _gripper_lifecycle_catalog = (
         lite6_gripper_lifecycle_product()
     )
@@ -2068,9 +2223,11 @@ def catalog_sources(
     )
     io_signal_manifest, _io_signal_catalog = io_signal_lifecycle_product()
     pose_source_manifest, _pose_source_catalog = pose_source_lifecycle_product()
+    ai_model_manifest, _ai_model_catalog = ai_model_lifecycle_product()
     manifests = {
         "io_signals": io_signal_manifest,
         "pose_source": pose_source_manifest,
+        "ai_model": ai_model_manifest,
         "planning": provider_manifest(
             "manyforge.provider.native_planning",
             planner_capabilities,
@@ -2100,6 +2257,15 @@ def catalog_sources(
                 if value != "execution.runtime_scale.operation_scoped"
             ),
             planner_capabilities,
+        ),
+        "ros2_control_xarm": ros2_control_provider_manifest(
+            tuple(
+                value
+                for value in control_capabilities
+                if value != "execution.runtime_scale.operation_scoped"
+            ),
+            planner_capabilities,
+            XARM_ROS2_CONTROL_PROVIDER_ID,
         ),
     }
     for key, document in manifests.items():
@@ -2179,6 +2345,13 @@ def catalog_sources(
         for profile in description["runtime_restoration_profiles"]
         if "ros2_control_runtime" in profile
     }
+    # CP8 step 1: a family with a Real controller profile also has the
+    # fixed-scale arm-only type a Real component selects (no gripper target).
+    arm_only_families = {
+        profile["model_family_id"]
+        for profile in description["runtime_restoration_profiles"]
+        if "real_profile" in profile.get("ros2_control_runtime", {})
+    }
     for family in description["model_families"]:
         document = component_type_document(family)
         family_id = family["model_family_id"]
@@ -2214,6 +2387,25 @@ def catalog_sources(
                 schema_id="manyforge.component_type.v1",
                 schema_revision=schemas["component_type"],
                 value=fixed,
+            )
+        if family_id in arm_only_families:
+            arm_only = component_type_document(
+                family, runtime_scaling=False, arm_only=True
+            )
+            sources[f"component:fixed_scale_arm_only:{family_id}"] = (
+                generated_catalog_document(
+                    root=root,
+                    relative_path=(
+                        "manyforge_deployment/resources/maintained/catalog/"
+                        f"component_type/{arm_only['component_type_id']}.json"
+                    ),
+                    kind="component_type",
+                    record_id=arm_only["component_type_id"],
+                    record_revision=arm_only["component_type_revision"],
+                    schema_id="manyforge.component_type.v1",
+                    schema_revision=schemas["component_type"],
+                    value=arm_only,
+                )
             )
 
     command_path = (
@@ -2272,25 +2464,10 @@ def catalog_sources(
                 payload=payload,
             ),
         )
-    lifecycle_outputs = [
-        (
-            root
-            / "manyforge_xarm_control/resources/lifecycle/lite6_arm_provider.lifecycle_plan_catalog.json",
-            canonical_bytes(lifecycle_catalog),
-            "build-owned Lite6 lifecycle plan catalog",
-        ),
-        (
-            root / "manyforge_xarm_control/resources/lifecycle/lite6_arm_provider.json",
-            canonical_bytes(lifecycle_manifest),
-            "build-owned Lite6 lifecycle provider manifest",
-        ),
-        (
-            root
-            / "manyforge_xarm_control/include/manyforge_xarm_control/generated/lite6_brand_lifecycle_product_identity.hpp",
-            lite6_lifecycle_identity_header(lifecycle_manifest, lifecycle_catalog),
-            "build-owned Lite6 lifecycle product identity",
-        ),
-    ]
+    # R7 package 5 (2026-10-25): the build-owned C++ copy of the supervised
+    # Lite 6 lifecycle catalog was removed with the supervised mode;
+    # manyforge_xarm_control mirrors the xArm plans above and tests the digest.
+    lifecycle_outputs: list[tuple[Path, bytes, str]] = []
     return sources, component_references, lifecycle_outputs
 
 
@@ -2416,7 +2593,10 @@ def graph_and_applicability(
                 selectors[0]: runtime_configuration.pop(selectors[0]),
             }
         ]
-        for row in runtime_configuration.get("gripper_target_configurations", []):
+        for row in (
+            *runtime_configuration.get("gripper_target_configurations", []),
+            *runtime_configuration["component_streams"],
+        ):
             row["controllable_component_id"] = occurrence
     key_prefix = "ros2_control:" if ros2_control else ""
     component_ref = refs[
@@ -3319,7 +3499,10 @@ def _deployment_intent(
     )
     runtime_key = f"{runtime_kind}_runtime"
     runtime_configuration = copy.deepcopy(runtime_profile[runtime_key])
-    for row in runtime_configuration.get("gripper_target_configurations", []):
+    for row in (
+        *runtime_configuration.get("gripper_target_configurations", []),
+        *runtime_configuration.get("component_streams", []),
+    ):
         row["controllable_component_id"] = deployment["component_occurrence_id"]
     motion_limits = runtime_configuration.pop("motion_target_limits", [])
     target_settings: dict[str, dict[str, Any]] = {}
@@ -3434,10 +3617,40 @@ def _deployment_intent(
             }
         )
         result["components"].sort(key=lambda row: row["component_id"])
+        # Per-object links and their stream-budget overrides, canonically sorted.
+        policies = result["policies"]
         if pose_source["scene_pose_sources"]:
-            result["policies"]["scene_pose_sources"] = copy.deepcopy(
-                pose_source["scene_pose_sources"]
+            policies["scene_pose_sources"] = sorted(
+                copy.deepcopy(pose_source["scene_pose_sources"]),
+                key=lambda row: (row["source_id"], row["scene_resource_id"]),
             )
+        if pose_source["component_streams"]:
+            policies["component_streams"] = sorted(
+                policies.get("component_streams", [])
+                + copy.deepcopy(pose_source["component_streams"]),
+                key=lambda row: (row["controllable_component_id"], row["stream_id"]),
+            )
+    for ai_model in deployment.get("ai_models", []):
+        # Model-free AI model component: one external OpenAI-compatible
+        # endpoint serving model aliases of the assistant profile.
+        result["components"].append(
+            {
+                "component_id": ai_model["component_id"],
+                "component_profile_id": "ai_model_v0",
+                "configuration": {
+                    "runtime_kind": "ai_model",
+                    "runtime_configuration": copy.deepcopy(
+                        ai_model["runtime_configuration"]
+                    ),
+                },
+                "target_settings": {},
+            }
+        )
+        result["components"].sort(key=lambda row: row["component_id"])
+    if "assistant_model_components" in deployment:
+        result["assistant_model_components"] = copy.deepcopy(
+            deployment["assistant_model_components"]
+        )
     return result
 
 
@@ -3461,10 +3674,13 @@ def _scenario_project_outputs(
         scenario_description = f"{name}\n\n{description}" if description else name
     for component in deployment_intent["components"]:
         configuration = component["configuration"]["runtime_configuration"]
-        for row in configuration.get("gripper_target_configurations", []):
+        for row in (
+            *configuration.get("gripper_target_configurations", []),
+            *configuration.get("component_streams", []),
+        ):
             if row["controllable_component_id"] != component["component_id"]:
                 raise GenerationError(
-                    "maintained Scenario gripper configuration has a foreign component"
+                    "maintained Scenario component row has a foreign component"
                 )
     program_draft = _program_draft(program, catalog)
     role_assignment = _role_assignment(assignment)
@@ -3743,6 +3959,9 @@ def generate(args: argparse.Namespace) -> None:
         "manyforge_deployment/resources/maintained/catalog/control_interface_contract/manyforge.native_arm_position.json",
         "manyforge_deployment/resources/maintained/catalog/control_interface_contract/manyforge.native_gripper_position.json",
         "manyforge_roboplan/resources/lifecycle/native_control.lifecycle_plan_catalog.json",
+        # R7 D12 (2026-10-25): renamed to xarm_arm_provider/xarm_gripper_provider.
+        "manyforge_deployment/resources/maintained/catalog/provider_manifest/lite6_arm_provider.json",
+        "manyforge_deployment/resources/maintained/catalog/provider_manifest/lite6_gripper_provider.json",
     ):
         require_obsolete_output_absent(root / relative, update=args.update)
     for deployment in description["deployments"]:

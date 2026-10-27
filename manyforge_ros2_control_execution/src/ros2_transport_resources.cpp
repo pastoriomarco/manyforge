@@ -15,6 +15,7 @@
 #include <manyforge_ros2_control_execution/ros2_transport_resources.hpp>
 
 #include "scene_projection_worker.hpp"
+#include <manyforge_core/time/stuck_drain_wait.hpp>
 #include <chrono>
 #include <stdexcept>
 #include <utility>
@@ -104,12 +105,12 @@ void Ros2TransportResources::quiesce() noexcept {
   // last owner determines final shutdown after local callback drains.
   if (owns_private_context_)
     context_->shutdown("manyforge ROS transport shutdown");
-  if (scene_projection_worker_ &&
-      !scene_projection_worker_->stop_and_join_for(std::chrono::seconds(1))) {
-    RCLCPP_FATAL(node_->get_logger(),
-                 "Timed out draining scene projection callbacks during ROS "
-                 "transport shutdown");
-    std::terminate();
-  }
+  if (scene_projection_worker_)
+    core::WaitForDrain("ros_transport.scene_projection_worker",
+                       std::chrono::seconds(1),
+                       [this](std::chrono::nanoseconds bound) {
+                         return scene_projection_worker_->stop_and_join_for(
+                             bound);
+                       });
 }
 } // namespace manyforge::ros2_control_execution

@@ -132,22 +132,7 @@ def test_compiles_exact_generated_production_binding() -> None:
         binding.trajectory_controller_manager_name
         == 'lite6_traj_controller'
     )
-    assert (
-        binding.supervised_state_topic
-        == '/ufactory/supervised_lifecycle/state'
-    )
-    assert (
-        binding.supervised_execute_service
-        == '/ufactory/supervised_lifecycle/execute'
-    )
-    assert (
-        binding.supervised_command_gate_service
-        == '/ufactory/supervised_lifecycle/set_command_gate'
-    )
-    assert (
-        binding.supervised_shutdown_controller_service
-        == '/ufactory/supervised_lifecycle/shutdown_controller'
-    )
+    assert not any('supervised' in key for key in binding.to_dict())
     assert (
         binding.trajectory_controller_type
         == 'joint_trajectory_controller/JointTrajectoryController'
@@ -187,7 +172,7 @@ def test_compiles_exact_generated_production_binding() -> None:
     )
 
 
-def test_supervised_runtime_has_no_implicit_vendor_startup_owner() -> None:
+def test_runtime_carries_only_the_unmodified_vendor_plugin_parameters() -> None:
     profile = load_profile(_PROFILE)
     runtime = supervised_runtime_urdf(
         _runtime_urdf(),
@@ -206,16 +191,21 @@ def test_supervised_runtime_has_no_implicit_vendor_startup_owner() -> None:
         item.get('name'): item.text
         for item in control.findall('./hardware/param')
     }
-    assert 'backend' not in parameters
-    assert parameters['access_mode'] == 'supervised_lifecycle'
-    assert parameters['transport_owner_id'] == (
-        '__MANYFORGE_TRANSPORT_OWNER_ID__'
-    )
-    assert parameters['observation_lease_ms'] == '1000'
-    assert parameters['command_gate_max_lease_ms'] == '1000'
-    assert parameters['transport_loss_timeout_ms'] == '2000'
-    assert parameters['lifecycle_command_timeout_ms'] == '4000'
-    assert 'fake_backend_confirmation' not in parameters
+    # R7 package 5: no supervised access mode, lease or owner parameter.
+    assert set(parameters) == {
+        'robot_ip',
+        'report_type',
+        'dof',
+        'robot_type',
+        'prefix',
+        'hw_ns',
+        'velocity_control',
+        'add_gripper',
+        'add_bio_gripper',
+    }
+    assert parameters['robot_ip'] == '__MANYFORGE_RUNTIME_ROBOT_IP__'
+    assert parameters['velocity_control'] == 'false'
+
 
 
 def test_binding_rejects_fake_qualification_urdf_as_production() -> None:

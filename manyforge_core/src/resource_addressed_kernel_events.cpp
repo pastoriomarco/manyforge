@@ -896,7 +896,8 @@ Result<void> ResourceAddressedExecutionKernel::release_prepared_dispatch_barrier
           if (!qualified.ok()) return qualified;
           for (const auto& candidate : operation->participants) {
             const auto refusal = global_io_rule_command_refusal_locked(candidate.binding.value(), operation);
-            if (refusal && refusal->details.at("reason") == "global_interrupt_latched") {
+            if (refusal && (refusal->details.at("reason") == "global_interrupt_latched" ||
+                            refusal->details.at("reason") == "global_interrupt_gated")) {
               state_lock.unlock();
               commit.release();
               return fail_pre_dispatch(operation_id, nullptr, *refusal);
@@ -1062,7 +1063,8 @@ Result<void> ResourceAddressedExecutionKernel::release_prepared_dispatch_barrier
         if (!qualified.ok()) return qualified;
         global_dispatch_refusal = global_io_rule_command_refusal_locked(participant->binding.value(), operation);
         const bool already_latched = global_dispatch_refusal &&
-            global_dispatch_refusal->details.at("reason") == "global_interrupt_latched";
+            (global_dispatch_refusal->details.at("reason") == "global_interrupt_latched" ||
+             global_dispatch_refusal->details.at("reason") == "global_interrupt_gated");
         if (!already_latched) {
           auto response = process_io_rule_evidence_locked(io_stop_handoff, &operation_id);
           if (response.ok() && !io_stop_handoff.control && !io_stop_handoff.projection)

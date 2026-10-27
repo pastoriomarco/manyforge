@@ -11,6 +11,7 @@
 #include <manyforge_roboplan/retained_externally_managed_lifecycle_ports.hpp>
 #include <manyforge_roboplan/ros_boolean_input_provider.hpp>
 #include <manyforge_roboplan/ros_boolean_output_provider.hpp>
+#include <manyforge_roboplan/xarm_digital_input_provider.hpp>
 #include <memory>
 #include <mutex>
 #include <span>
@@ -24,6 +25,7 @@ struct IoProviderInputSourceInstallation final {
   std::shared_ptr<core::IIoSignalIngress> ingress;
   core::IoSourceIncarnation incarnation;
   std::optional<GeometricContactInputBinding> geometric_contact;
+  std::shared_ptr<core::IScheduler> scheduler{};
 };
 
 struct IoProviderOutputChannelInstallation final {
@@ -119,12 +121,15 @@ public:
   void SetSupervisedProcessFaultSource(
       std::function<std::optional<core::ErrorDTO>()> source);
 
-  // CP9 pose source (`kPoseSourceLifecycleManifestId`): no I/O members. Its
-  // resources are the declared stream recorders (one per binding, ids equal
-  // to the domain's signal names); installed means resources and transport
-  // ready. The recorders live until Shutdown (destruction undeclares).
-  [[nodiscard]] bool pose_source() const noexcept;
-  core::Result<void> InstallPoseSourceLocked(
+  // CP9 model-free stream observers: pose source
+  // (`kPoseSourceLifecycleManifestId`) and AI model
+  // (`kAiModelLifecycleManifestId`). No I/O members. Its resources are the
+  // declared stream recorders (ids equal to the domain's signal names: one
+  // per pose binding, or the AI model's `endpoint`); installed means
+  // resources and transport ready. The recorders live until Shutdown
+  // (destruction undeclares).
+  [[nodiscard]] bool stream_observer() const noexcept;
+  core::Result<void> InstallObserverStreamsLocked(
       std::vector<std::unique_ptr<core::StreamRecorder>> streams);
 
   // Only the actual retiring driver owner calls this. An old activation that

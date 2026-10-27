@@ -29,7 +29,7 @@ def _module():
 
 def _context(
     tmp_path, *, plugin="mock_components/GenericSystem", gripper_name="", frame_prefix="",
-    reset_position_name="",
+    reset_position_name="", hardware=None,
 ):
     description = tmp_path / "retained.urdf"
     description.write_text(
@@ -52,6 +52,13 @@ def _context(
         gripper_controller_name=gripper_name,
         frame_prefix=frame_prefix,
     )
+    # Unset hardware arguments take their launch defaults (Mock's).
+    for action in _module().generate_launch_description().entities:
+        if isinstance(action, DeclareLaunchArgument) and action.name not in (
+            context.launch_configurations
+        ):
+            action.execute(context)
+    context.launch_configurations.update(hardware or {})
     return context
 
 
@@ -67,6 +74,7 @@ def test_mock_launch_requires_retained_artifacts_and_no_second_pose_input():
         "reset_position_controller_name",
         "gripper_controller_name",
         "frame_prefix",
+        "hardware_plugin", "driver_parameters_file", "hardware_remappings",
     }
 
 
@@ -94,6 +102,23 @@ def test_observation_and_inactive_arm_use_exact_manager_route(tmp_path):
     manager_parameters = evaluate_parameters(context, nodes[1]._Node__parameters)
     assert manager_parameters[0] == tmp_path / "controllers.yaml"
     assert manager_parameters[1] == {"use_sim_time": False}
+    assert len(manager_parameters) == 2
+    assert _remaps(context, nodes[1]) == [("~/robot_description", "robot_description")]
+    # Only the manager node is named; a process-wide name would also rename
+    # the hardware plugin's own in-process nodes.
+    assert nodes[1]._Node__node_name is None
+    assert nodes[1]._Node__ros_arguments == [
+        "--disable-external-lib-logs", "-r", "controller_manager:__node:=control",
+    ]
+
+
+def _remaps(context, node):
+    from launch.utilities import perform_substitutions
+
+    return [
+        (perform_substitutions(context, source), perform_substitutions(context, target))
+        for source, target in node._Node__remappings
+    ]
 
 
 def test_configuration_scoped_position_writer_is_loaded_inactive(tmp_path):
@@ -317,4 +342,90 @@ def test_owned_nodes_disable_external_library_log_files():
     assert nodes
     for node in nodes:
         arguments = next(keyword.value for keyword in node.keywords if keyword.arg == "ros_arguments")
-        assert ast.literal_eval(arguments) == ["--disable-external-lib-logs"]
+        assert ast.literal_eval(arguments.elts[0]) == "--disable-external-lib-logs"
+
+
+# CP8 step 2a: the same launch runs a Real component; its hardware data comes
+# from the generated artifacts.
+REAL_PLUGIN = "uf_robot_hardware/UFRobotSystemHardware"
+REAL_REMAPS = (
+    "/controller_manager/list_controllers=/fixture/arm/control/list_controllers;"
+    "/controller_manager/switch_controller=/fixture/arm/control/switch_controller;"
+    "/rviz/moveit/update_goal_state=/fixture/arm/update_goal_state"
+)
+
+
+def _real_context(tmp_path, **hardware):
+    driver = tmp_path / "driver_parameters.yaml"
+    driver.write_text("/fixture/arm/ufactory_driver:\n  ros__parameters: {}\n", encoding="utf-8")
+    values = {
+        "hardware_plugin": REAL_PLUGIN,
+        "driver_parameters_file": str(driver),
+        "hardware_remappings": REAL_REMAPS,
+    }
+    values.update(hardware)
+    return _context(tmp_path, plugin=REAL_PLUGIN, hardware=values)
+
+
+def test_real_hardware_data_reaches_ros2_control_node(tmp_path):
+    context = _real_context(tmp_path)
+    nodes = _module().launch_setup(context)
+    assert [node._Node__node_executable for node in nodes] == [
+        "robot_state_publisher", "ros2_control_node", "spawner", "spawner",
+    ]
+    parameters = evaluate_parameters(context, nodes[1]._Node__parameters)
+    assert parameters[0] == tmp_path / "controllers.yaml"
+    assert parameters[1] == tmp_path / "driver_parameters.yaml"
+    assert parameters[2] == {"use_sim_time": False}
+    assert _remaps(context, nodes[1]) == [
+        ("~/robot_description", "robot_description"),
+        ("/controller_manager/list_controllers", "/fixture/arm/control/list_controllers"),
+        ("/controller_manager/switch_controller", "/fixture/arm/control/switch_controller"),
+        ("/rviz/moveit/update_goal_state", "/fixture/arm/update_goal_state"),
+    ]
+    # The same spawner mechanism loads Real's arm controller inactive with the
+    # generated controller parameters.
+    assert nodes[3]._Node__arguments == [
+        "arm_controller", "--inactive", "--controller-manager", "/fixture/arm/control",
+        "--param-file", str(tmp_path / "controllers.yaml"),
+    ]
+    assert _remaps(context, nodes[0]) == []
+
+
+@pytest.mark.parametrize(
+    ("description_plugin", "expected_plugin"),
+    [
+        ("mock_components/GenericSystem", REAL_PLUGIN),
+        (REAL_PLUGIN, "mock_components/GenericSystem"),
+        ("topic_based_ros2_control/TopicBasedSystem", REAL_PLUGIN),
+    ],
+)
+def test_a_description_plugin_other_than_the_explicit_one_is_refused(
+    tmp_path, description_plugin, expected_plugin,
+):
+    context = _context(
+        tmp_path, plugin=description_plugin, hardware={"hardware_plugin": expected_plugin},
+    )
+    with pytest.raises(ValueError, match="must use only " + expected_plugin):
+        _module().launch_setup(context)
+
+
+@pytest.mark.parametrize(
+    "remaps",
+    [
+        "/a",
+        "a=/b",
+        "/a=b",
+        "/a=/b=/c",
+        "/a=/b;/a=/c",
+    ],
+)
+def test_malformed_hardware_remappings_are_refused(tmp_path, remaps):
+    with pytest.raises(ValueError, match="hardware_remappings"):
+        _module().launch_setup(_real_context(tmp_path, hardware_remappings=remaps))
+
+
+def test_missing_driver_parameters_file_is_refused(tmp_path):
+    context = _real_context(tmp_path, driver_parameters_file=str(tmp_path / "missing.yaml"))
+    with pytest.raises(ValueError, match="driver_parameters_file"):
+        _module().launch_setup(context)

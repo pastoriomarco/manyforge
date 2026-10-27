@@ -318,7 +318,17 @@ core::Result<void> CCLCRuntimeComposition::Start() {
           [this](const core::ControllableComponentId &component,
                  const core::ComponentStreamVerdictDTO &verdict) {
             bool cell_wide = false;
-            if (verdict.motion_hold) {
+            auto hold = verdict.motion_hold;
+            // Streams are expected only while the lifecycle target is active:
+            // a prepared/disabled component holds nothing.
+            if (hold) {
+              const auto view = target_driver_.ReadTargetView(component);
+              if (view.ok() && view.value().target &&
+                  view.value().target->requested_state !=
+                      core::LifecycleTargetStateDTO::kActive)
+                hold.reset();
+            }
+            if (hold) {
               const auto current = ReadCurrentComponentSnapshot(component);
               cell_wide = current.ok() && !current.value().domains.empty() &&
                           std::all_of(current.value().domains.begin(),
@@ -328,7 +338,7 @@ core::Result<void> CCLCRuntimeComposition::Start() {
                                       });
             }
             static_cast<void>(kernel_cell_admission_port_.PublishComponentStreamHold(
-                component, verdict.motion_hold, cell_wide));
+                component, hold, cell_wide));
             target_driver_.Wake();
           });
     }

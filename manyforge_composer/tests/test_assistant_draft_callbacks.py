@@ -190,6 +190,9 @@ def _assistant_mode(
         "instrument_registry_digest": _REGISTRY_DIGEST,
         "mode": "composer-assistant",
         "model_endpoint": {
+            "ai_model_component_id": "assistant_model",
+            "api_key_env": None,
+            "base_url": "http://127.0.0.1:8000/v1",
             "model_endpoint_alias": "assistant_model",
             "model_id": "test-model",
             "request_contract": {

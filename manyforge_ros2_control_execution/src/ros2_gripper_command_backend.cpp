@@ -18,6 +18,7 @@
 #include <algorithm>
 #include <cmath>
 #include <limits>
+#include <manyforge_core/time/stuck_drain_wait.hpp>
 #include <manyforge_core/types/error_code.hpp>
 #include <manyforge_ros2_control_execution/ros2_control_capability.hpp>
 #include <manyforge_ros2_control_execution/ros2_gripper_command_backend.hpp>
@@ -75,6 +76,13 @@ rejected_gripper_command(std::string reason_code, std::string message,
   return core::GripperCommandResultDTO{
       false, command_id, generation,
       core::ErrorDTO{std::move(reason_code), std::move(message), {}}};
+}
+
+bool requires_pneumatic_commanded_projection(
+    const Ros2GripperActionConfig &config) noexcept {
+  return config.actuation_kind == core::GripperActuationKind::kPneumatic &&
+         config.output_mode == core::GripperOutputMode::kNone &&
+         config.state_topic.empty() && !config.group_id.empty();
 }
 
 bool gripper_request_matches_transport(
@@ -138,12 +146,12 @@ void Ros2GripperCommandBackend::shutdown() noexcept {
   if (shutdown_started_.exchange(true, std::memory_order_acq_rel))
     return;
   invalidate_gripper_commands(core::GripperInvalidationReason::kShutdown);
-  if (!scheduler_.drain_for(core::SchedulerPriority::ControllerCommand,
-                            std::chrono::seconds(1))) {
-    RCLCPP_FATAL(node_->get_logger(),
-                 "Timed out draining gripper controller-command callbacks");
-    std::terminate();
-  }
+  core::WaitForDrain("gripper_backend.scheduler_controller_command_lane",
+                     std::chrono::seconds(1),
+                     [this](std::chrono::nanoseconds bound) {
+                       return scheduler_.drain_for(
+                           core::SchedulerPriority::ControllerCommand, bound);
+                     });
 }
 
 void Ros2GripperCommandBackend::advance_pneumatic_locked(
@@ -399,7 +407,9 @@ void Ros2GripperCommandBackend::configure_gripper_action(
   if (!std::isfinite(config.state_freshness_timeout_s) ||
       !std::isfinite(config.wait_for_action_server_timeout_s) ||
       !std::isfinite(*config.result_timeout_s) ||
-      config.state_freshness_timeout_s <= 0.0 ||
+      (config.state_freshness_timeout_s <= 0.0 &&
+       !(no_output && config.state_topic.empty() &&
+         config.state_freshness_timeout_s == 0.0)) ||
       config.wait_for_action_server_timeout_s < 0.0 ||
       *config.result_timeout_s < 0.0 ||
       (pneumatic && *config.result_timeout_s == 0.0)) {
@@ -942,8 +952,16 @@ void Ros2GripperCommandBackend::invalidate_gripper_commands(
         continue;
       }
       goal_handle = runtime->active_goal_handle;
-      const bool command_unsettled = runtime->executing || goal_handle;
-      if (command_unsettled && !runtime->lifecycle_disable_pending) {
+      // A local no-output command has no physical action goal to cancel.
+      const bool command_unsettled =
+          (runtime->executing &&
+           runtime->config.output_mode != core::GripperOutputMode::kNone) ||
+          goal_handle;
+      // Only a ROS action goal has a remote terminal to settle. A scheduled
+      // (Isaac publish) command is settled by this generation fence itself.
+      if (command_unsettled &&
+          runtime->config.transport_kind == "ros_gripper_command" &&
+          !runtime->lifecycle_disable_pending) {
         runtime->lifecycle_disable_pending = true;
         runtime->lifecycle_disable_terminal = false;
         runtime->lifecycle_disable_failed = false;
@@ -1731,8 +1749,10 @@ core::GripperCommandResultDTO Ros2GripperCommandBackend::command_gripper(
     runtime->evidence = request.evidence;
     runtime->evidence_state = request.evidence_state;
     runtime->projection_state = (runtime_config.group_id.empty() ||
-                                 runtime_config.actuation_kind ==
-                                     core::GripperActuationKind::kPneumatic)
+                                 (runtime_config.actuation_kind ==
+                                      core::GripperActuationKind::kPneumatic &&
+                                  !requires_pneumatic_commanded_projection(
+                                      runtime_config)))
                                     ? core::GripperProjectionState::kNotRequired
                                     : core::GripperProjectionState::kPending;
     runtime->projection_reason.clear();
@@ -1742,7 +1762,8 @@ core::GripperCommandResultDTO Ros2GripperCommandBackend::command_gripper(
     runtime->reason_code.clear();
     if (runtime_config.output_mode == core::GripperOutputMode::kNone) {
       add_unique_evidence(runtime->evidence, "pneumatic_no_output");
-      advance_pneumatic_locked(*runtime);
+      if (!requires_pneumatic_commanded_projection(runtime_config))
+        advance_pneumatic_locked(*runtime);
     }
   }
   if (superseded_lifecycle_handle.has_value()) {
@@ -1755,7 +1776,43 @@ core::GripperCommandResultDTO Ros2GripperCommandBackend::command_gripper(
   }
 
   if (runtime_config.output_mode == core::GripperOutputMode::kNone) {
-    publish_pneumatic_display(runtime, request.target_position);
+    if (requires_pneumatic_commanded_projection(runtime_config)) {
+      {
+        std::lock_guard<std::mutex> lock(runtime->mutex);
+        if (runtime->command_id != command_id ||
+            runtime->generation != generation || !runtime->executing)
+          return {true, command_id, generation, std::nullopt};
+      }
+      // Do not hold gripper locks while the existing state owner waits for the
+      // model. Reset can retire this generation while publication is in flight.
+      core::ExecutionStateSinkResult projected{
+          core::ExecutionStateSinkStatus::kException};
+      try {
+        projected = execution_state_sink_->apply_group_joint_position(
+            runtime_config.group_id, runtime_config.joint_name,
+            request.target_position, core::ExecutionStateUpdateMode::kBlocking);
+      } catch (...) {
+        // Report the existing typed projection failure below.
+      }
+      std::lock_guard<std::mutex> lock(runtime->mutex);
+      if (runtime->command_id != command_id ||
+          runtime->generation != generation || !runtime->executing)
+        return {true, command_id, generation, std::nullopt};
+      if (projected.applied()) {
+        runtime->projection_state = core::GripperProjectionState::kApplied;
+        advance_pneumatic_locked(*runtime);
+      } else {
+        runtime->projection_state = core::GripperProjectionState::kFailed;
+        runtime->projection_reason = "scene_projection_unavailable";
+        runtime->state = "failed";
+        runtime->executing = false;
+        runtime->error = "Could not publish the commanded gripper scene position";
+        runtime->reason_code = "gripper_projection_failed";
+        ++runtime->revision;
+      }
+    } else {
+      publish_pneumatic_display(runtime, request.target_position);
+    }
     return {true, command_id, generation, std::nullopt};
   }
 
@@ -2430,7 +2487,9 @@ core::GripperCommandStatusDTO Ros2GripperCommandBackend::get_gripper_status(
   std::lock_guard<std::mutex> lock(runtime->mutex);
   if (runtime->config.actuation_kind ==
           core::GripperActuationKind::kPneumatic &&
-      !runtime->lifecycle_handle)
+      !runtime->lifecycle_handle &&
+      !(requires_pneumatic_commanded_projection(runtime->config) &&
+        runtime->projection_state == core::GripperProjectionState::kPending))
     advance_pneumatic_locked(*runtime);
   core::GripperCommandStatusDTO status;
   status.state =

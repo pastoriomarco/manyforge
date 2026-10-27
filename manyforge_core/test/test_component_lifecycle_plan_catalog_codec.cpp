@@ -214,6 +214,24 @@ TEST(ComponentLifecyclePlanCatalogCodec, PoseSourceManifestReusesIoPlans) {
   EXPECT_FALSE(MakeIoProviderLifecycleCatalog(manifest).ok());
 }
 
+TEST(ComponentLifecyclePlanCatalogCodec, AiModelManifestReusesIoPlans) {
+  const auto plans = MakeIoProviderLifecyclePlans();
+  ASSERT_TRUE(plans.ok());
+  const auto catalog = MakeBrandLifecyclePlanCatalog(
+      ProviderManifestId(std::string(kAiModelLifecycleManifestId)),
+      ProviderManifestRevision(
+          "sha256:a35dbf3fac9051b766361afbd48486a59a2841dc32cde69eb29b22584d38a0e3"),
+      plans.value());
+  ASSERT_TRUE(catalog.ok());
+  auto manifest = ManifestFor(catalog.value());
+  // Same digest as the generated maintained AI model provider manifest.
+  EXPECT_EQ(manifest.lifecycle_plan_catalog->semantic_digest.value(),
+            "sha256:a2c5c8391d356e7bfe3f1931a2e14743674a82b2b798b56868d7b8ab792d02a2");
+  const auto actual = MakeIoProviderLifecycleCatalog(manifest);
+  ASSERT_TRUE(actual.ok()) << actual.error().message;
+  EXPECT_EQ(actual.value().plans, catalog.value().plans);
+}
+
 TEST(ComponentLifecyclePlanCatalogCodec, RejectsInvalidDigestAndUnsafeJsonInteger) {
   auto catalog = Catalog();
   catalog.catalog_digest =

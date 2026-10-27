@@ -40,14 +40,15 @@ From a new checkout, after authorization to install/start:
 ```bash
 git clone --branch dev https://github.com/pastoriomarco/manyforge.git
 cd manyforge
-./scripts/setup-docker.sh --prepare-only
-docker compose build dev
+./scripts/compose-dev.sh build
 ./scripts/compose-dev.sh start \
   --project examples/lite6_pick_and_place.scenario
 ```
 
-The setup command prepares pinned dependencies; it may recreate stale/modified
-dependency trees under `.docker/`.
+`build` prepares pinned dependencies and builds the full ROS Lyrical image
+(`Dockerfile.ros-lyrical-full`, with the pinned controller overlay and the xArm
+driver); it may recreate stale/modified dependency trees under `.docker/`.
+The `dev` Compose service is the ROS-free test toolchain, not the workbench.
 Do not run it over dependency edits you need to preserve. Startup incrementally
 builds required native targets and starts one workbench; an optional project is
 loaded through the ordinary application path;

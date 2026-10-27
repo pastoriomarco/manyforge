@@ -647,9 +647,6 @@ CanonicalValue AttachmentPayload(const CarriedObjectAttachmentDTO& attachment,
     result.emplace_back(
         "grasp_lost_check",
         CanonicalValue(CanonicalValue::Object{
-            {"attach_pose_in_carrier_frame",
-             Pose(check.attach_pose_in_carrier_frame,
-                  label + ".attach_pose_in_carrier_frame")},
             {"bound",
              CanonicalValue(CanonicalValue::Object{
                  {"rotation_rad", Number(check.bound.rotation_rad,

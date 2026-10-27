@@ -33,14 +33,19 @@ class AssistantModeProjectionError : public std::runtime_error {
 /// Build one exact mode projection from an independently verified bundle.
 ///
 /// This publishes descriptors and their retained identities. It grants no
-/// callback or runtime availability by itself.
+/// callback or runtime availability by itself. `model_endpoint` carries the
+/// AI model component serving the mode's alias (the row named by the alias's
+/// `external_resource_alias`: `ai_model_component_id`, `base_url`,
+/// `api_key_env` name or null); without it the projection fails
+/// `assistant_ai_model_absent`.
 [[nodiscard]] manyforge::content_identity::CanonicalValue ProjectAssistantMode(
     const manyforge::deployment::RetainedBundle& active_bundle, std::string_view mode_id);
 
 /// Build the bounded index of enabled modes from the same independently
 /// verified assistant projection used by ProjectAssistantMode.
 ///
-/// The index exists for discovery only. A caller must still fetch the exact
+/// The index exists for discovery only. `ai_model_component_id` is the AI
+/// model component of the chat alias (`assistant_model`), or null. A caller must still fetch the exact
 /// selected mode projection before offering or invoking any instrument.
 [[nodiscard]] manyforge::content_identity::CanonicalValue ProjectAssistantModeIndex(
     const manyforge::deployment::RetainedBundle& active_bundle);

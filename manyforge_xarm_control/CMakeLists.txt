@@ -8,8 +8,6 @@ set(CMAKE_CXX_EXTENSIONS OFF)
 add_compile_options(-Wall -Wextra -Werror -pedantic)
 
 find_package(ament_cmake REQUIRED)
-find_package(controller_manager_msgs REQUIRED)
-find_package(lifecycle_msgs REQUIRED)
 find_package(rclcpp REQUIRED)
 find_package(xarm_msgs REQUIRED)
 
@@ -20,9 +18,9 @@ set(
   "Path to the ROS-independent ManyForge Core source tree")
 if(NOT TARGET manyforge_core)
   if(NOT EXISTS
-     "${MANYFORGE_CORE_SOURCE_DIR}/include/manyforge_core/ports/ibrand_lifecycle_port.hpp")
+     "${MANYFORGE_CORE_SOURCE_DIR}/include/manyforge_core/types/lifecycle_cause.hpp")
     message(FATAL_ERROR
-      "manyforge_xarm_control requires the current Core brand-lifecycle port")
+      "manyforge_xarm_control requires the current Core lifecycle causes")
   endif()
   set(_MANYFORGE_XARM_BUILD_TESTING "${BUILD_TESTING}")
   set(BUILD_TESTING OFF)
@@ -33,51 +31,34 @@ if(NOT TARGET manyforge_core)
   set(BUILD_TESTING "${_MANYFORGE_XARM_BUILD_TESTING}")
   unset(_MANYFORGE_XARM_BUILD_TESTING)
 endif()
-
-set(
-  MANYFORGE_LITE6_PRODUCT_SOURCE_DIR
-  "${CMAKE_CURRENT_SOURCE_DIR}/../manyforge_lite6_product"
-  CACHE PATH
-  "Path to the ROS-independent Lite6 product source tree")
-if(NOT TARGET manyforge_lite6_product)
-  add_subdirectory(
-    "${MANYFORGE_LITE6_PRODUCT_SOURCE_DIR}"
-    "${CMAKE_CURRENT_BINARY_DIR}/manyforge_lite6_product"
-    EXCLUDE_FROM_ALL)
-endif()
 if(NOT TARGET manyforge_core)
   message(FATAL_ERROR "manyforge_xarm_control could not resolve manyforge_core")
 endif()
 
+# The xArm vendor adapter (R7): status classification, the robot_states
+# transport, the two recovery services and the lifecycle profiles.
 add_library(${PROJECT_NAME}_brand_lifecycle SHARED
-  src/lite6_brand_lifecycle_catalog.cpp
-  src/lite6_brand_lifecycle_port.cpp
-  src/xarm_ros_transport_session.cpp
+  src/lifecycle_profile.cpp
+  src/xarm_brand_lifecycle_port.cpp
+  src/xarm_driver_services.cpp
+  src/xarm_robot_states_transport.cpp
 )
 target_include_directories(${PROJECT_NAME}_brand_lifecycle PUBLIC
   $<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}/include>
   $<INSTALL_INTERFACE:include>
 )
 ament_target_dependencies(${PROJECT_NAME}_brand_lifecycle
-  controller_manager_msgs
-  lifecycle_msgs
   rclcpp
   xarm_msgs
 )
 set_property(TARGET ${PROJECT_NAME}_brand_lifecycle APPEND PROPERTY
-  LINK_LIBRARIES manyforge_core manyforge_lite6_product)
+  LINK_LIBRARIES manyforge_core)
 set_property(TARGET ${PROJECT_NAME}_brand_lifecycle APPEND PROPERTY
-  INTERFACE_LINK_LIBRARIES
-    "$<BUILD_INTERFACE:manyforge_core>"
-    "$<BUILD_INTERFACE:manyforge_lite6_product>")
+  INTERFACE_LINK_LIBRARIES "$<BUILD_INTERFACE:manyforge_core>")
 
 install(
   DIRECTORY include/
   DESTINATION include
-)
-install(
-  DIRECTORY resources/
-  DESTINATION share/${PROJECT_NAME}/resources
 )
 install(
   TARGETS ${PROJECT_NAME}_brand_lifecycle
@@ -91,32 +72,40 @@ if(BUILD_TESTING)
   find_package(ament_cmake_gtest REQUIRED)
   find_package(ament_lint_auto REQUIRED)
 
-  ament_add_gtest(test_lite6_brand_lifecycle
-    test/test_lite6_brand_lifecycle.cpp
+  ament_add_gtest(test_xarm_brand_lifecycle_port
+    test/test_xarm_brand_lifecycle_port.cpp
   )
   target_link_libraries(
-    test_lite6_brand_lifecycle
+    test_xarm_brand_lifecycle_port
     ${PROJECT_NAME}_brand_lifecycle
     manyforge_core
   )
-  target_compile_definitions(test_lite6_brand_lifecycle PRIVATE
-    MANYFORGE_LITE6_LIFECYCLE_PRODUCT_ROOT="${CMAKE_CURRENT_SOURCE_DIR}/.."
+  target_compile_definitions(test_xarm_brand_lifecycle_port PRIVATE
+    MANYFORGE_XARM_CONTROL_SOURCE_ROOT="${CMAKE_CURRENT_SOURCE_DIR}/.."
   )
 
-  ament_add_gtest(test_xarm_ros_transport_session
-    test/test_xarm_ros_transport_session.cpp
+  ament_add_gtest(test_xarm_robot_states_transport
+    test/test_xarm_robot_states_transport.cpp
   )
   target_link_libraries(
-    test_xarm_ros_transport_session
+    test_xarm_robot_states_transport
     ${PROJECT_NAME}_brand_lifecycle
+    manyforge_core
+  )
+
+  ament_add_gtest(test_xarm_driver_services
+    test/test_xarm_driver_services.cpp
+  )
+  target_link_libraries(
+    test_xarm_driver_services
+    ${PROJECT_NAME}_brand_lifecycle
+    manyforge_core
   )
 
   ament_lint_auto_find_test_dependencies()
 endif()
 
 ament_export_dependencies(
-  controller_manager_msgs
-  lifecycle_msgs
   rclcpp
   xarm_msgs
 )

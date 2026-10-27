@@ -1236,7 +1236,12 @@ class ProgramRuntime:
         retained_bundle_id: str,
         graph_revision: str,
     ) -> tuple[bool, AvailabilityFact]:
-        """Separate captured dependency from current typed simulator eligibility."""
+        """Separate captured dependency from current typed simulator eligibility.
+
+        The simulator a ROS-hosted component depends on is the Manager's
+        deployment-derived ``component_simulator_dependencies`` row, never a
+        decoded lane selector, so Mock, Isaac and Real components share one rule.
+        """
 
         unavailable = AvailabilityFact(False, ("program_runtime_owner_unavailable",))
         configured = AvailabilityFact(True) if self._simulation_control is not None else unavailable
@@ -1280,25 +1285,43 @@ class ProgramRuntime:
         graph_components = rows(graph.get("controllable_components"))
         units = rows(graph.get("runtime_units"))
 
-        def ros_profiles(unit: Mapping[str, Any]) -> tuple[Mapping[str, Any], Sequence[Mapping[str, Any]]]:
+        def ros_profiles(unit: Mapping[str, Any]) -> Sequence[Mapping[str, Any]]:
             configuration = unit.get("configuration")
             if not isinstance(configuration, Mapping):
                 raise ProgramRunOwnerError("Program simulation dependency has invalid ROS configuration")
-            if configuration.get("mode") != "commanded_sim":
-                raise ProgramRunOwnerError(
-                    "Program simulator dependency does not support non-simulated ROS modes"
-                )
-            return configuration, rows(configuration.get("controller_profiles"))
+            return rows(configuration.get("controller_profiles"))
 
-        def isaac_profile(profile: Mapping[str, Any]) -> bool:
-            isaac, mock = profile.get("isaac_profile"), profile.get("mock_profile")
-            if (("isaac_profile" in profile) == ("mock_profile" in profile)
-                or not isinstance(isaac if "isaac_profile" in profile else mock, str)
-                or not (isaac if "isaac_profile" in profile else mock)):
-                raise ProgramRunOwnerError("Program simulation dependency has invalid typed lane")
-            if "isaac_profile" not in profile:
-                return False
-            return True
+        dependencies: dict[str, str] | None = None
+
+        def isaac_dependency(component: str) -> bool:
+            # Exactly one closed row per ROS controller profile component.
+            nonlocal dependencies
+            if dependencies is None:
+                published = projection.get("component_simulator_dependencies")
+                if not isinstance(published, (list, tuple)):
+                    raise ProgramRunOwnerError(
+                        "Program simulation dependency has no Manager component simulator rows")
+                parsed: dict[str, str] = {}
+                for row in published:
+                    name = row.get("controllable_component_id") if isinstance(row, Mapping) else None
+                    if (not isinstance(row, Mapping)
+                        or set(row) != {"controllable_component_id", "simulator"}
+                        or not isinstance(name, str) or not name or name in parsed
+                        or row.get("simulator") not in ("none", "isaac")):
+                        raise ProgramRunOwnerError(
+                            "Program simulation dependency has invalid component simulator rows")
+                    parsed[name] = row["simulator"]
+                profiled = [
+                    profile.get("controllable_component_id")
+                    for unit in units
+                    if unit.get("runtime_profile_id") == "manyforge.ros2_control_execution_runtime"
+                    for profile in ros_profiles(unit)
+                ]
+                if any(not isinstance(name, str) for name in profiled) or set(parsed) != set(profiled):
+                    raise ProgramRunOwnerError(
+                        "Program simulation dependency rows do not match the ROS controller profiles")
+                dependencies = parsed
+            return dependencies[component] == "isaac"
 
         if simulator_node:
             # CELL_GLOBAL means the actual applied cell, not unused Program roles.
@@ -1307,15 +1330,14 @@ class ProgramRuntime:
             for unit in units:
                 if unit.get("runtime_profile_id") != "manyforge.ros2_control_execution_runtime":
                     continue
-                configuration, profiles = ros_profiles(unit)
-                for profile in profiles:
+                for profile in ros_profiles(unit):
                     component = profile.get("controllable_component_id")
                     matches = [row for row in graph_components if row.get("controllable_component_id") == component]
                     if (not isinstance(component, str) or component in seen or len(matches) != 1
                         or unit.get("runtime_unit_id") not in matches[0].get("runtime_unit_ids", ())):
                         raise ProgramRunOwnerError("Program global simulator profile has foreign runtime ownership")
                     seen.add(component)
-                    eligible |= isaac_profile(profile)
+                    eligible |= isaac_dependency(component)
             return True, configured if eligible else unavailable
 
         targets = rows(program_binding.get("target_role_bindings"))
@@ -1336,7 +1358,7 @@ class ProgramRuntime:
                 raise ProgramRunOwnerError("Program simulation dependency crosses its component binding")
             selected.add(component)
         # A provider-only I/O component (provider-kind control domain and no
-        # controller binding) has no controller profile and no simulator lane;
+        # controller binding) has no controller profile and no simulator row;
         # CCLC activation gates it. A component that also has a controller
         # binding keeps the controller-profile check.
         io_providers: set[Any] = set()
@@ -1370,12 +1392,11 @@ class ProgramRuntime:
                     raise ProgramRunOwnerError("Program simulation dependency has no runtime profile")
                 if profile_id != "manyforge.ros2_control_execution_runtime" or component in io_providers:
                     continue
-                configuration, profiles = ros_profiles(unit)
-                matches = [row for row in profiles if row.get("controllable_component_id") == component]
+                matches = [row for row in ros_profiles(unit) if row.get("controllable_component_id") == component]
                 if len(matches) != 1 or seen_profile:
                     raise ProgramRunOwnerError("Program simulation dependency has no unique ROS controller profile")
                 seen_profile = True
-                required |= isaac_profile(matches[0])
+                required |= isaac_dependency(component)
         return required, configured if required else unavailable
 
     def _current_node_owner_availability(
@@ -3406,6 +3427,9 @@ class ProgramRuntime:
         def poll() -> None:
             try:
                 mirror.poll()
+                # Every read is a reading, also when no state changed: a
+                # motion node waiting for a gate rule re-evaluates on it.
+                self._apply_interrupt_states(mirror.current())
             except Exception:
                 _LOGGER.exception("interrupt rule state mirror poll failed")
             finally:

@@ -99,8 +99,7 @@ class QualifiedAssistantSettings final {
   std::shared_ptr<const Data> data_;
 
   friend QualifiedAssistantSettings qualify_assistant_settings(
-      const TypedAssistantSettingsCandidate&,
-      std::span<const core::ExternalResourceDTO>);
+      const TypedAssistantSettingsCandidate&);
   friend QualifiedAssistantSettings verify_retained_assistant_projection(
       const CanonicalValue&);
 };
@@ -110,15 +109,12 @@ decode_assistant_settings_candidate(
     const ParsedArtifactCandidate& parsed_deployment);
 
 [[nodiscard]] QualifiedAssistantSettings qualify_assistant_settings(
-    const TypedAssistantSettingsCandidate& candidate,
-    std::span<const core::ExternalResourceDTO> external_resources);
+    const TypedAssistantSettingsCandidate& candidate);
 
 /// Independently reconstructs one retained non-empty projection. A disabled
 /// deployment has no retained assistant object and therefore never calls this
 /// function.
 [[nodiscard]] QualifiedAssistantSettings
-verify_retained_assistant_projection(
-    const CanonicalValue& projection,
-    std::span<const core::ExternalResourceDTO> external_resources);
+verify_retained_assistant_projection(const CanonicalValue& projection);
 
 }  // namespace manyforge::deployment

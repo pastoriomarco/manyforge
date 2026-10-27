@@ -12,6 +12,7 @@ import {
 } from '../api/parsers/ioSignals';
 import type { ProgramBindingDocument } from '../types/api';
 import { reactPropsHost } from '../test/reactPropsHost';
+import { acknowledgedUncertainOutputs, uncertainOutputs } from '../utils/uncertainOutputs';
 import {
   ToolIoPanel,
   ToolIoPanelView,
@@ -430,6 +431,16 @@ describe('ioSignalBindingsAt', () => {
       signalRoleBindings: [{ resourceRoleId: 'a', signalDescriptorDigest: REVISION }, { resourceRoleId: 'b' }] });
   });
 
+  it('accepts the sealed direct output command metadata only for an output', () => {
+    const output = { ...signalRow('valve'), direction: 'output' };
+    const command = { program_id: 'direct-io', program_revision: REVISION, program_run_id: 'direct-control-io-owner', component_role_id: 'io-role',
+      capability_id: 'io.gpio.set_output', command_schema_id: 'io.write', command_schema_revision: REVISION };
+    const result = ioSignalBindingsAt([{ ...row('a', 'io', [output]), output_command: command }], 'rows');
+    expect(result[0].outputCommand).toMatchObject({ programId: 'direct-io', componentRoleId: 'io-role', capabilityId: 'io.gpio.set_output' });
+    expect(() => ioSignalBindingsAt([{ ...row('a', 'io', [signalRow('valve')]), output_command: command }], 'rows')).toThrow();
+    expect(() => ioSignalBindingsAt([{ ...row('a', 'io', [output]), output_command: { ...command, program_id: '' } }], 'rows')).toThrow();
+  });
+
   it.each([
     ['an empty array', []],
     ['an unordered array', [row('b', 'io'), row('a', 'io')]],
@@ -488,6 +499,30 @@ describe('execution targets io_signal_bindings', () => {
     )).toThrow();
     expect(() => ioSignalBindingsAt([{ ...rows[0], signal_sources: [{ resource_role_id: 1, source_kind: 'mock' }] }], 'rows'))
       .toThrow();
+  });
+
+  it('restores an uncertain manual output from the owner snapshot for targeted Reset', async () => {
+    const { parseExecutionControlStatus } = await import('../api/parsers/execution');
+    const row = { ...rows[0], signal_role_bindings: [{ ...rows[0].signal_role_bindings[0], direction: 'output' }],
+      output_command: { program_id: 'direct-io', program_revision: REVISION, program_run_id: 'direct-control-io-owner',
+        component_role_id: 'io-role', capability_id: 'io.gpio.set_output', command_schema_id: 'io.write', command_schema_revision: REVISION } };
+    const operation = { program_run_id: 'direct-control-io-owner', program_binding_id: BINDING_ID,
+      operation_id: 'valve-op', operation_revision: 2, state: 'intervention_required',
+      participants: [{ progress: 0, terminal_error: { message: 'acceptance unknown' },
+        controllable_component_id: 'station', command_target_id: 'io', output_evidence: 'acceptance_unknown' }],
+      active_stop_id: null, active_stop_generation: null };
+    const state = { ...control, control_state: { ...control.control_state,
+      manual_operations: [{ operation, resident: true }] } };
+    const recovered = parseExecutionControlStatus(targets({ io_signal_bindings: [row] }), state);
+    const uncertain = uncertainOutputs(recovered.manualOperations);
+    expect(uncertain).toEqual([{ operationId: 'valve-op', operationRevision: 2, label: 'station · io (valve-op)' }]);
+    expect(acknowledgedUncertainOutputs('valve-op', uncertain))
+      .toEqual([{ operation_id: 'valve-op', operation_revision: 2 }]);
+    expect(() => parseExecutionControlStatus(targets({ io_signal_bindings: [row] }), {
+      ...state, control_state: { ...state.control_state, manual_operations: [{
+        operation: { ...operation, program_binding_id: `sha256:${'f'.repeat(64)}` }, resident: true,
+      }] },
+    })).toThrow(/direct I\/O bindings/);
   });
 });
 

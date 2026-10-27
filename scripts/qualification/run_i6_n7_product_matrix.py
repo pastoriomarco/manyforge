@@ -21,6 +21,7 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from threading import Thread
 from urllib.error import HTTPError
+from urllib.parse import urlsplit
 from urllib.request import Request, urlopen
 
 from manyforge_behavior.canonical_artifact import load_strict_json_yaml
@@ -35,7 +36,6 @@ INSTALLED = Path(os.environ["N7_MATRIX_INSTALLED"]).resolve()
 NODE_CATALOG = WORKSPACE / "manyforge_behavior/resources/node_catalog.yaml"
 ALARM_CATALOG = Path(WORKSPACE / "manyforge_headless/resources/operator-alarm-catalog.v1.yaml")
 MODEL_ID = "qwen3.6-35b-a3b-nvfp4-tq-mtp-manyforge"
-POSE_MODEL_ID = "cosmos-reason2-8b"
 EXPECTED_SNAPSHOT_SOURCE_GATE = "model_snapshot_image_source_unavailable"
 
 SCENARIOS = (
@@ -241,7 +241,6 @@ def _process_commands(
     scenario_id: str,
     cell_id: str,
     admission_filename: str,
-    model_config: Path,
     api_port: int,
     runner_port: int,
     composer_port: int,
@@ -302,8 +301,6 @@ def _process_commands(
             str(program_runner_liveness_socket),
             "--cell-id",
             cell_id,
-            "--model-endpoint-config",
-            str(model_config),
         ],
         "headless": [
             sys.executable,
@@ -368,7 +365,6 @@ def qualify_scenario(
     cell_id: str,
     admission_filename: str,
     expected_state: str,
-    model_config: Path,
 ) -> dict[str, object]:
     started_at = time.monotonic()
     with tempfile.TemporaryDirectory(prefix=f"n7-{scenario_id}-") as raw_root:
@@ -392,7 +388,6 @@ def qualify_scenario(
                 scenario_id=scenario_id,
                 cell_id=cell_id,
                 admission_filename=admission_filename,
-                model_config=model_config,
                 api_port=api_port,
                 runner_port=runner_port,
                 composer_port=composer_port,
@@ -552,47 +547,37 @@ def qualify_scenario(
             log.close()
 
 
+def _ai_model_port() -> int:
+    """Port of the semantic Scenario's selection AI model component (MODEL_ID).
+
+    The fake serves it; the Scenario's chat component is not called.
+    """
+
+    deployment = load_strict_json_yaml(
+        WORKSPACE / "examples/ur5_semantic_shape_pick.scenario/deployment.yaml"
+    )
+    (base_url,) = (
+        component["configuration"]["runtime_configuration"]["base_url"]
+        for component in deployment["components"]
+        if component["configuration"].get("runtime_kind") == "ai_model"
+        and component["configuration"]["runtime_configuration"]["model"] == MODEL_ID
+    )
+    port = urlsplit(base_url).port
+    if port is None:
+        raise RuntimeError(f"AI model base_url has no explicit port: {base_url}")
+    return port
+
+
 def main() -> int:
-    model_port = free_port()
-    server = ThreadingHTTPServer(("127.0.0.1", model_port), ModelHandler)
+    server = ThreadingHTTPServer(("127.0.0.1", _ai_model_port()), ModelHandler)
     thread = Thread(target=server.serve_forever, daemon=True)
     thread.start()
     try:
-        with tempfile.TemporaryDirectory(prefix="n7-model-config-") as raw_root:
-            model_config = Path(raw_root) / "site.json"
-            model_config.write_text(
-                json.dumps(
-                    {
-                        "api_version": "manyforge.program_model_site_config.v1",
-                        "endpoints": [
-                            {
-                                "bearer_token_env": None,
-                                "chat_completions_url": (
-                                    f"http://127.0.0.1:{model_port}/v1/chat/completions"
-                                ),
-                                "external_resource_alias": alias,
-                                "headers": {},
-                                "model_endpoint_aliases": [alias],
-                                "model_ids": (
-                                    [MODEL_ID]
-                                    if alias == "selection_model"
-                                    else [POSE_MODEL_ID, MODEL_ID]
-                                ),
-                                "tool_call_families": ["openai_chat_tools"],
-                            }
-                            for alias in ("selection_model", "vision_model")
-                        ],
-                    },
-                    separators=(",", ":"),
-                    sort_keys=True,
-                ),
-                encoding="utf-8",
-            )
-            selected_id = os.environ.get("N7_MATRIX_SCENARIO")
-            rows = tuple(row for row in SCENARIOS if selected_id is None or row[0] == selected_id)
-            if not rows:
-                raise RuntimeError("N7_MATRIX_SCENARIO selected no scenario")
-            results = [qualify_scenario(*row, model_config) for row in rows]
+        selected_id = os.environ.get("N7_MATRIX_SCENARIO")
+        rows = tuple(row for row in SCENARIOS if selected_id is None or row[0] == selected_id)
+        if not rows:
+            raise RuntimeError("N7_MATRIX_SCENARIO selected no scenario")
+        results = [qualify_scenario(*row) for row in rows]
         expected_model_calls = int(any(row[0] == "ur5_semantic_shape_pick" for row in rows))
         if len(model_requests) != expected_model_calls:
             raise RuntimeError(

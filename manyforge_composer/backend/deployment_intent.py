@@ -308,8 +308,11 @@ IO_DEVICE_PROFILE_ID = "io_device_v0"
 IO_PROVIDER_RUNTIME_KIND = "io_provider"
 POSE_SOURCE_PROFILE_ID = "pose_source_v0"
 POSE_SOURCE_RUNTIME_KIND = "pose_source"
-# Runtime kinds of model-free components (I/O device, pose source).
-MODEL_FREE_RUNTIME_KINDS = frozenset({IO_PROVIDER_RUNTIME_KIND, POSE_SOURCE_RUNTIME_KIND})
+AI_MODEL_RUNTIME_KIND = "ai_model"
+# Runtime kinds of model-free components (I/O device, pose source, AI model).
+MODEL_FREE_RUNTIME_KINDS = frozenset(
+    {IO_PROVIDER_RUNTIME_KIND, POSE_SOURCE_RUNTIME_KIND, AI_MODEL_RUNTIME_KIND}
+)
 
 
 def _is_model_free_component(component: dict[str, Any]) -> bool:
@@ -323,8 +326,8 @@ def _is_model_free_component(component: dict[str, Any]) -> bool:
 def _validate_model_free_component(
     component: dict[str, Any], label: str
 ) -> dict[str, Any]:
-    """Validate a model-free component envelope (runtime_kind io_provider or
-    pose_source).
+    """Validate a model-free component envelope (runtime_kind io_provider,
+    pose_source or ai_model).
 
     It has no model source, root pose, frame prefix or Stop fields and empty
     target settings; its runtime configuration stays opaque here (the closed
@@ -372,7 +375,12 @@ def validate_deployment_intent(value: Any, *, source: str) -> dict[str, Any]:
         "attachments",
         "policies",
     }
-    optional = {"description", "assistant_profile_id", "compatibility"}
+    optional = {
+        "description",
+        "assistant_profile_id",
+        "assistant_model_components",
+        "compatibility",
+    }
     _require_exact_fields(
         intent, required=required, optional=optional, label=f"{source}: Deployment intent"
     )
@@ -492,6 +500,17 @@ def validate_deployment_intent(value: Any, *, source: str) -> dict[str, Any]:
         if assistant is not None:
             assistant = _require_id(assistant, f"{source}: assistant_profile_id")
         result["assistant_profile_id"] = assistant
+    if "assistant_model_components" in intent:
+        # Profile model alias -> ai_model component id; the compiler resolves it.
+        mapping = _require_object(
+            intent["assistant_model_components"], f"{source}: assistant_model_components"
+        )
+        result["assistant_model_components"] = {
+            _require_id(alias, f"{source}: assistant_model_components key"): _require_id(
+                component_id, f"{source}: assistant_model_components.{alias}"
+            )
+            for alias, component_id in sorted(mapping.items())
+        }
     if "compatibility" in intent:
         result["compatibility"] = deepcopy(
             _require_object(intent["compatibility"], f"{source}: compatibility")

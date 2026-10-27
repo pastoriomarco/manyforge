@@ -34,7 +34,7 @@ _FIELDS = {
     "node_environment": ("catalog_id", "content_version", "catalog_digest", "environment_digest"),
     "component": ("component_role_id", "controllable_component_id", "component_type_id", "component_type_revision", "model_role_bindings"),
     "model": ("model_role_id", "model_instance_id", "model_revision"),
-    "target": ("target_role_id", "component_role_id", "controllable_component_id", "command_target_id", "frame_role_bindings", "resource_role_bindings", "collision_body_role_bindings", "capability_bindings", "signal_role_bindings"),
+    "target": ("target_role_id", "component_role_id", "controllable_component_id", "command_target_id", "frame_role_bindings", "resource_role_bindings", "collision_body_role_bindings", "capability_bindings", "signal_role_bindings", "pneumatic_io"),
     "frame": ("frame_role_id", "model_instance_id", "model_revision", "compiled_frame_name", "contact_body_role_ids"),
     "resource": ("resource_role_id", "resource_ids", "compiled_resource_names"),
     "collision": ("collision_body_role_id", "model_instance_id", "model_revision", "compiled_collision_body_names"),
@@ -49,9 +49,12 @@ _FIELDS = {
     "provenance": ("binding_compiler_contract_digest", "role_assignment_digest", "source_records", "resolved_output_records"),
     "provenance_record": ("record_kind", "record_id", "revision"),
     "signal": ("resource_role_id", "signal_name", "value_type", "direction", "transition_capability", "signal_descriptor_digest"),
+    "pneumatic_io": ("outputs", "inputs"),
+    "pneumatic_output": ("target_role_id", "resource_role_id", "open_value", "close_value"),
+    "pneumatic_input": ("input", "target_role_id", "resource_role_id"),
     "contact_release": ("contact_policy_id", "contact_policy_revision", "runtime_object_id", "allowed_body_bindings", "mode", "release_evidence_mode", "enforce_max_start_penetration", "max_start_penetration_m", "min_release_progress_m", "release_tolerance_m", "require_strictly_decreasing_penetration", "require_separation_by_end", "allow_recontact", "bodies_from_motion_endpoint"),
 }
-_OPTIONAL_FIELDS = {'recovery_policy': ('intervention_stop_scope',), 'target': ('signal_role_bindings',), 'frame': ('contact_body_role_ids',), 'contact': ('bodies_from_motion_endpoint',), 'contact_release': ('bodies_from_motion_endpoint',)}
+_OPTIONAL_FIELDS = {'recovery_policy': ('intervention_stop_scope',), 'target': ('signal_role_bindings', 'pneumatic_io'), 'frame': ('contact_body_role_ids',), 'contact': ('bodies_from_motion_endpoint',), 'contact_release': ('bodies_from_motion_endpoint',)}
 _STOP_POLICIES = frozenset(('inherit', 'hold', 'continue'))
 _INTERVENTION_STOP_SCOPES = frozenset(('all', 'own_groups'))
 _PROGRAM_ID = re.compile(r"^[a-z][a-z0-9_.-]*\Z")
@@ -290,6 +293,36 @@ def validate_program_binding(value: object, *, label: str = "program_binding") -
         _sorted_unique(capabilities, lambda x: x["capability_id"], f"{path}.capability_bindings")
         target_by_role[target["target_role_id"]] = target
     _sorted_unique(targets, lambda x: x["target_role_id"], f"{label}.target_role_bindings")
+
+    for index, target in enumerate(targets):
+        if "pneumatic_io" not in target:
+            continue
+        path = f"{label}.target_role_bindings[{index}].pneumatic_io"
+        route = _record(target["pneumatic_io"], _FIELDS["pneumatic_io"], path)
+        if not any(cap["capability_id"] == "tool.gripper.command" for cap in target["capability_bindings"]):
+            _fail(path, "requires a gripper command target")
+        outputs = _array(route["outputs"], f"{path}.outputs", minimum=1, maximum=2)
+        inputs = _array(route["inputs"], f"{path}.inputs", maximum=4)
+        for rows, kind in ((outputs, "output"), (inputs, "input")):
+            for ri, raw in enumerate(rows):
+                rp = f"{path}.{kind}s[{ri}]"
+                row = _record(raw, _FIELDS[f"pneumatic_{kind}"], rp)
+                _identity(row["target_role_id"], f"{rp}.target_role_id")
+                _identity(row["resource_role_id"], f"{rp}.resource_role_id")
+                if kind == "output":
+                    if type(row["open_value"]) is not bool or type(row["close_value"]) is not bool:
+                        _fail(rp, "output levels must be boolean")
+                elif row["input"] not in ("open", "closed", "pressure", "workpiece_grasped"):
+                    _fail(rp, "unknown pneumatic input")
+                selected = target_by_role.get(row["target_role_id"])
+                signal = next((item for item in selected.get("signal_role_bindings", ())
+                               if item["resource_role_id"] == row["resource_role_id"]), None) if selected else None
+                capability = "io.gpio.set_output" if kind == "output" else "io.gpio.get_input"
+                if (selected is None or signal is None or signal["direction"] != kind
+                    or not any(cap["capability_id"] == capability for cap in selected["capability_bindings"])):
+                    _fail(rp, "signal does not resolve through its exact bound I/O target")
+        _sorted_unique(outputs, lambda x: (x["target_role_id"], x["resource_role_id"]), f"{path}.outputs")
+        _sorted_unique(inputs, lambda x: x["input"], f"{path}.inputs")
 
     node_policies = _array(
         root["node_policies"], f"{label}.node_policies",

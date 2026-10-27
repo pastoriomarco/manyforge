@@ -1891,6 +1891,11 @@ TEST(RetainedNativeCellRuntimeTest,
   transport.group_id = binding.value().model_groups.front().compiled_group_name;
   transport.joint_name = joint;
   config.gripper = transport;
+  config.arm.measured_joint_state_lane = RetainedMeasuredJointStateLane{
+      config.node_namespace + "/joint_states", 1'000'000'000,
+      core::StateAuthorityId(std::string(kMeasuredJointStateAuthorityId)),
+      std::string(kMeasuredJointStateProfileId), core::StreamSeverityDTO::kFault,
+      core::StreamRecoveryDTO::kAck, std::nullopt};
   auto backend = make_retained_ros2_control_gripper_backend(
       config, binding, channel, *clock, *scheduler, handle);
   auto gripper = std::make_unique<RetainedNativeGripperRuntime>(

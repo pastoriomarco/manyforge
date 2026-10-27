@@ -1,6 +1,7 @@
 #include "manyforge_deployment/program_binding_compiler.hpp"
 
 #include <algorithm>
+#include <iterator>
 #include <map>
 #include <optional>
 #include <set>
@@ -27,6 +28,8 @@
 #include "program_io_condition_compiler_internal.hpp"
 #include <manyforge_core/io_signal_descriptor.hpp>
 #include <manyforge_deployment/io_signal_catalog.hpp>
+#include <manyforge_deployment/ros2_control_execution_runtime_contract.hpp>
+#include "ros2_control_execution_runtime_unit_internal.hpp"
 
 namespace manyforge::deployment {
 namespace {
@@ -1579,6 +1582,129 @@ compile_program_binding_contract(
       return nullptr;
     }
 
+    // Add only the exact signal roles selected by an authored pneumatic
+    // gripper. These are ordinary sealed I/O targets, not caller-selected
+    // hardware addresses or an alternate dispatch authority.
+    using PneumaticIo = ros2_control_execution_runtime_contract::Configuration::PneumaticIo;
+    std::map<std::pair<core::ControllableComponentId, core::CommandTargetId>, PneumaticIo>
+        pneumatic_by_target;
+    for (const auto &unit : bundle.cell_graph.runtime_units) {
+      if (unit.runtime_profile_id.value() != ros2_control_execution_runtime_contract::kRuntimeProfileId)
+        continue;
+      const auto rows = unit.configuration.find("gripper_target_configurations");
+      if (rows == unit.configuration.end()) continue;
+      const auto *array = std::get_if<core::JsonValueDTO::Array>(&rows->second.value);
+      if (!array) fail("retained gripper configuration is not an array");
+      for (const auto &row : detail::decode_ros2_control_execution_gripper_target_configurations(*array)) {
+        if (row.pneumatic_io && !pneumatic_by_target.emplace(
+              std::pair{row.controllable_component_id, row.command_target_id}, *row.pneumatic_io).second)
+          fail("retained pneumatic target has multiple I/O mappings");
+      }
+    }
+    std::vector<core::ProgramComponentRoleBindingDTO> private_components;
+    std::vector<core::ProgramTargetRoleBindingDTO> private_targets;
+    const auto private_id = [](std::string_view domain, std::string_view first,
+                               std::string_view second, std::string_view third) {
+      std::string preimage(domain);
+      for (const auto part : {first, second, third}) {
+        preimage.push_back('\0');
+        preimage.append(part);
+      }
+      return std::string("mf.pneumatic.") + sha256_digest(preimage).substr(7U);
+    };
+    const auto bind_signal = [&](const core::IoSignalId &id,
+                                 const core::IoSignalDirection direction)
+        -> std::pair<core::TargetRoleId, core::ResourceRoleId> {
+      const auto signal = std::find_if(io_catalog.value().begin(), io_catalog.value().end(),
+          [&](const auto &row) { return row.descriptor.signal_id == id; });
+      if (signal == io_catalog.value().end() || signal->descriptor.direction != direction)
+        fail("pneumatic I/O signal is missing or has the wrong direction");
+      const auto wanted = direction == core::IoSignalDirection::kOutput
+                              ? "io.gpio.set_output" : "io.gpio.get_input";
+      // Reuse an authored target that already resolves this exact signal.
+      // Otherwise the same Program would register two aliases for one output
+      // and the existing participant resolver would report an ambiguity.
+      const auto matches_authored = [&](const auto &row) {
+            return row.controllable_component_id == id.controllable_component_id &&
+                   row.command_target_id == signal->command_target_id &&
+                   std::any_of(row.capability_bindings.begin(), row.capability_bindings.end(),
+                       [&](const auto &cap) { return cap.capability_id.value() == wanted; }) &&
+                   std::any_of(row.signal_role_bindings.begin(), row.signal_role_bindings.end(),
+                       [&](const auto &item) {
+                         return item.resource_role_id == signal->resource_role_id &&
+                                item.signal_name == id.name && item.direction == direction;
+                       });
+          };
+      const auto authored = std::find_if(target_bindings.begin(), target_bindings.end(), matches_authored);
+      if (authored != target_bindings.end() &&
+          std::find_if(std::next(authored), target_bindings.end(), matches_authored) != target_bindings.end()) {
+        std::string names;
+        for (const auto &row : target_bindings)
+          if (matches_authored(row))
+            names += (names.empty() ? "" : ", ") + row.target_role_id.value();
+        fail("pneumatic_io_signal_ambiguous_target: " + id.controllable_component_id.value() +
+             "/" + id.name + " matches target roles " + names);
+      }
+      if (authored != target_bindings.end())
+        return {authored->target_role_id, signal->resource_role_id};
+      const core::ComponentRoleId component_role(private_id(
+          "component", id.controllable_component_id.value(), "", ""));
+      const core::TargetRoleId target_role(private_id(
+          "signal", id.controllable_component_id.value(), id.name, ""));
+      if (std::any_of(component_bindings.begin(), component_bindings.end(),
+                      [&](const auto &row) { return row.component_role_id == component_role; }) ||
+          std::any_of(target_bindings.begin(), target_bindings.end(),
+                      [&](const auto &row) { return row.target_role_id == target_role; }))
+        fail("pneumatic private role conflicts with an authored Program role");
+      if (std::none_of(private_targets.begin(), private_targets.end(),
+                       [&](const auto &row) { return row.target_role_id == target_role; })) {
+        const auto direct = compile_direct_control_io_program_binding(
+            id.controllable_component_id, signal->command_target_id,
+            retained_bundle, retained_model_map, catalog_artifact_store);
+        if (direct->value().component_role_bindings.size() != 1U ||
+            direct->value().target_role_bindings.size() != 1U)
+          fail("pneumatic I/O has no unique direct binding");
+        auto component = direct->value().component_role_bindings.front();
+        component.component_role_id = component_role;
+        auto target = direct->value().target_role_bindings.front();
+        target.target_role_id = target_role;
+        target.component_role_id = component_role;
+        std::erase_if(target.signal_role_bindings,
+                      [&](const auto &row) { return row.resource_role_id != signal->resource_role_id; });
+        std::erase_if(target.capability_bindings,
+                      [&](const auto &row) { return row.capability_id.value() != wanted; });
+        if (target.signal_role_bindings.size() != 1U || target.capability_bindings.size() != 1U)
+          fail("pneumatic I/O direct binding does not resolve its exact signal");
+        if (std::none_of(private_components.begin(), private_components.end(),
+                         [&](const auto &row) { return row.component_role_id == component_role; }))
+          private_components.push_back(std::move(component));
+        private_targets.push_back(std::move(target));
+      }
+      return {target_role, signal->resource_role_id};
+    };
+    for (auto &target : target_bindings) {
+      const auto selected = pneumatic_by_target.find(
+          {target.controllable_component_id, target.command_target_id});
+      if (selected == pneumatic_by_target.end() ||
+          std::none_of(target.capability_bindings.begin(), target.capability_bindings.end(),
+                       [](const auto &row) { return row.capability_id.value() == "tool.gripper.command"; }))
+        continue;
+      core::ProgramPneumaticIoBindingDTO route;
+      for (const auto &row : selected->second.outputs) {
+        const auto [target_role, resource_role] =
+            bind_signal(row.signal, core::IoSignalDirection::kOutput);
+        route.outputs.push_back({target_role, resource_role, row.open_value, row.close_value});
+      }
+      for (const auto &[name, signal] : selected->second.inputs) {
+        const auto [target_role, resource_role] =
+            bind_signal(signal, core::IoSignalDirection::kInput);
+        route.inputs.push_back({name, target_role, resource_role});
+      }
+      target.pneumatic_io = std::move(route);
+    }
+    component_bindings.insert(component_bindings.end(), private_components.begin(), private_components.end());
+    target_bindings.insert(target_bindings.end(), private_targets.begin(), private_targets.end());
+
     std::vector<core::RetainedSourceRecordDTO> resolved_records;
     for (const auto& component : component_bindings) {
       add_component_provenance(bundle, component, resolved_records);
@@ -2254,9 +2380,12 @@ compile_direct_control_gripper_program_binding(
         contract, std::move(assignment), retained_bundle,
         retained_model_map, catalog_artifact_store);
     const auto& targets = binding->value().target_role_bindings;
-    if (targets.size() != 1U ||
-        targets.front().resource_role_bindings.size() != 1U ||
-        targets.front().resource_role_bindings.front().resource_ids.size() !=
+    const auto bound = std::find_if(targets.begin(), targets.end(), [](const auto &row) {
+      return row.target_role_id.value() == kDirectControlTargetRoleId;
+    });
+    if (bound == targets.end() ||
+        bound->resource_role_bindings.size() != 1U ||
+        bound->resource_role_bindings.front().resource_ids.size() !=
             1U) {
       fail("direct-control gripper target does not resolve to one exact "
            "command coordinate");

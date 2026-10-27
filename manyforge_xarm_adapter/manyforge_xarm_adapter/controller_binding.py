@@ -130,10 +130,6 @@ class ProductionControllerBinding:
     trajectory_controller_name: str
     trajectory_controller_type: str
     follow_joint_trajectory_action: str
-    supervised_state_topic: str
-    supervised_execute_service: str
-    supervised_command_gate_service: str
-    supervised_shutdown_controller_service: str
     controller_state_topic: str
     joint_state_topic: str
     validated_joint_state_topic: str
@@ -242,14 +238,6 @@ def compile_production_controller_binding(
     if 'backend' in parameters:
         raise ValueError(
             'production controller binding must not use a ManyForge backend'
-        )
-    if parameters.get('access_mode') != 'supervised_lifecycle':
-        raise ValueError(
-            'production hardware must use supervised_lifecycle access'
-        )
-    if not parameters.get('transport_owner_id'):
-        raise ValueError(
-            'production hardware must declare one transport owner'
         )
     expected_activity_topic = f'{resolved.controller_manager}/activity'
 
@@ -432,14 +420,6 @@ def compile_production_controller_binding(
         'follow_joint_trajectory_action': (
             resolved.follow_joint_trajectory_action
         ),
-        'supervised_state_topic': resolved.supervised_state_topic,
-        'supervised_execute_service': resolved.supervised_execute_service,
-        'supervised_command_gate_service': (
-            resolved.supervised_command_gate_service
-        ),
-        'supervised_shutdown_controller_service': (
-            resolved.supervised_shutdown_controller_service
-        ),
         'controller_state_topic': (
             f'{resolved.trajectory_controller}/controller_state'
         ),
@@ -487,14 +467,6 @@ def compile_production_controller_binding(
         trajectory_controller_type=controller_type,
         follow_joint_trajectory_action=(
             resolved.follow_joint_trajectory_action
-        ),
-        supervised_state_topic=resolved.supervised_state_topic,
-        supervised_execute_service=resolved.supervised_execute_service,
-        supervised_command_gate_service=(
-            resolved.supervised_command_gate_service
-        ),
-        supervised_shutdown_controller_service=(
-            resolved.supervised_shutdown_controller_service
         ),
         controller_state_topic=(
             f'{resolved.trajectory_controller}/controller_state'

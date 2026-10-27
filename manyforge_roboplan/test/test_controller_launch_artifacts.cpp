@@ -435,6 +435,7 @@ TEST(ControllerLaunchArtifacts, BothIsaacProfilesUseTheGeneratedDescriptionAndRe
             root.path(), "isaac_robot", model, item.arm,
             IsaacControllerArtifactsInput{item.profile, item.lane}});
     EXPECT_EQ(written.lane, ControllerLaunchLane::kIsaac);
+    EXPECT_FALSE(written.vendor_adapter.has_value());
     const auto description = read_file(written.robot_description_file);
     EXPECT_EQ(count(description, "<ros2_control "), 1U);
     EXPECT_NE(description.find("<plugin>topic_based_ros2_control/TopicBasedSystem"
@@ -1174,6 +1175,393 @@ TEST(ControllerLaunchArtifacts, MockProfilesCarryQ79FamilyValuesAndTheTemplateCa
     EXPECT_DOUBLE_EQ(rates.action_monitor_rate_hz, 20.0) << ur;
   }
   EXPECT_THROW(static_cast<void>(mock_controller_lane_rates("unknown")),
+               ControllerLaunchArtifactError);
+}
+
+} // namespace
+
+namespace {
+
+// CP8 step 2a characterization: the exact bytes of every Mock artifact and its
+// launch arguments, pinned on the code before the shared Mock/Real start-up
+// path. Mock must stay byte-identical through that change.
+struct PinnedMockArtifacts final {
+  std::string description_sha256;
+  std::string controllers_sha256;
+  std::vector<std::string> launch_arguments;
+};
+
+[[nodiscard]] std::vector<std::string>
+root_relative(const ControllerLaunchArtifacts &written,
+              const std::filesystem::path &root) {
+  std::vector<std::string> result;
+  for (auto argument : written.launch_arguments) {
+    const auto at = argument.find(root.string());
+    if (at != std::string::npos) argument.replace(at, root.string().size(), "<root>");
+    result.push_back(std::move(argument));
+  }
+  return result;
+}
+
+void expect_pinned(const ControllerLaunchArtifacts &written,
+                   const std::filesystem::path &root,
+                   const PinnedMockArtifacts &pinned) {
+  EXPECT_EQ(written.robot_description_sha256, pinned.description_sha256);
+  EXPECT_EQ(written.controllers_sha256, pinned.controllers_sha256);
+  EXPECT_EQ(root_relative(written, root), pinned.launch_arguments);
+  // R7 package 3: no Mock component selects a vendor adapter.
+  EXPECT_FALSE(written.vendor_adapter.has_value());
+}
+
+TEST(ControllerLaunchArtifactsCharacterization, EveryMockProfileKeepsItsExactArtifacts) {
+  const auto arguments = [](const std::string &component,
+                            const std::string &arm_controller,
+                            const std::string &writer_digest,
+                            const std::optional<std::string> &gripper) {
+    std::vector<std::string> result{
+        "robot_description_file:=<root>/" + component + "/robot_description.urdf",
+        "controllers_file:=<root>/" + component + "/controllers.yaml",
+        "runtime_namespace:=/manyforge/" + component,
+        "controller_manager_name:=controller_manager",
+        "arm_controller_name:=" + arm_controller,
+        "reset_position_controller_name:=manyforge_reset_position_" + writer_digest};
+    if (gripper) result.push_back("gripper_controller_name:=" + *gripper);
+    result.push_back("frame_prefix:=pre/");
+    return result;
+  };
+  const std::map<std::string, PinnedMockArtifacts> pinned{
+      {"lite6_lite_gripper",
+       {"sha256:17d491767b4e0a0f2c7465f76f038061133d1efa31683a69783b4bd99eb512a3",
+        "sha256:4c4d5deb25c6556674f96dc24895fa644f28fe4251eae925762ab13e2d0ee7cd",
+        arguments("robot_lite6_lite_gripper", "lite6_traj_controller",
+                  "6cd824e84e129f5e61ece6691a143c783f711304f93050e55aada275410ff38d",
+                  "lite_gripper_controller")}},
+      {"ur10e_robotiq_2f_140",
+       {"sha256:b574bbf2058c22408642d92e86d002a51f6249fc96cdba9186838cb10fa14426",
+        "sha256:b2d27a9c1da41e0fce8dab51e2d27ea4f40dc7f588d3036d27547a323ce83137",
+        arguments("robot_ur10e_robotiq_2f_140", "joint_trajectory_controller",
+                  "3c8b89392e8ce79e0364007a3f01ec4ccf3c582654ec488059c6649ffc5be030",
+                  "robotiq_gripper_controller")}},
+      {"ur5_roboplan",
+       {"sha256:887213f8e460c80a0cd0744423985825cb2df1794ceb9c27e1666b5e351a29d1",
+        "sha256:cba2dbcf49adc1121d8499b01aef5244059004159fc2adab5f043b854f02627f",
+        arguments("robot_ur5_roboplan", "joint_trajectory_controller",
+                  "3218aa237a5e27a61133127b1090c6e1f7a5003275fde0cae4dec6b43e9ea474",
+                  std::nullopt)}},
+      {"ur5e_robotiq_2f_85",
+       {"sha256:19588f4906aa9ed01ed94da212430b7af19a6739ead4b00da52b851e7fd1fbb1",
+        "sha256:bec492d593dd3463b7f643baee3cda30065398857cd8531086e306b503dcc1ff",
+        arguments("robot_ur5e_robotiq_2f_85", "joint_trajectory_controller",
+                  "98b85126a58332dff2634af54e03c423daf17f57fcc521f7c769b010ed89c7a4",
+                  "robotiq_gripper_controller")}},
+  };
+  for (const auto &profile : offline_profiles()) {
+    SCOPED_TRACE(profile.mock_profile);
+    const TemporaryRoot root;
+    const auto written = write_host(mock_component(
+        root.path(), "robot_" + profile.mock_profile, profile, "pre/", 9.5));
+    expect_pinned(written, root.path(), pinned.at(profile.mock_profile));
+  }
+}
+
+TEST(ControllerLaunchArtifactsCharacterization, GripperOnlyAndNoOutputMockKeepTheirExactArtifacts) {
+  const auto lite6 = offline_profiles().front();
+  const TemporaryRoot root;
+  auto tool = mock_component(root.path(), "tool", lite6, "tool/", 10.0);
+  tool.input.initial_joint_positions_rad.clear();
+  tool.input.controlled_stop_max_deceleration_rad_s2.clear();
+  expect_pinned(
+      write_component_controller_launch_artifacts(
+          std::optional<core::RuntimeParticipantBinding>{}, tool.input),
+      root.path(),
+      {"sha256:7e6585d3a92e5ca7b5d717fd820df10e661c0eab6f43994785b6cea55d1d67a9",
+       "sha256:2ded4ba668f425d08ee64080248fd9218d3c3972dab2d14aaa7dd7810fb6624a",
+       {"robot_description_file:=<root>/tool/robot_description.urdf",
+        "controllers_file:=<root>/tool/controllers.yaml",
+        "runtime_namespace:=/manyforge/tool",
+        "controller_manager_name:=controller_manager",
+        "gripper_controller_name:=lite_gripper_controller",
+        "frame_prefix:=tool/"}});
+
+  auto robot = mock_component(root.path(), "robot", lite6, "", 10.0);
+  robot.input.gripper_output_mode = core::GripperOutputMode::kNone;
+  robot.input.gripper_projected_position.reset();
+  expect_pinned(
+      write_host(robot), root.path(),
+      {"sha256:cd7a29e835ceb6024909e7c5e64c3b3e14ab4487b23f6cd9a9f878939f503ca5",
+       "sha256:198d49044b9b6e425e565ef09e3e44d36245f84c037d22a272623adba9ac77a6",
+       {"robot_description_file:=<root>/robot/robot_description.urdf",
+        "controllers_file:=<root>/robot/controllers.yaml",
+        "runtime_namespace:=/manyforge/robot",
+        "controller_manager_name:=controller_manager",
+        "arm_controller_name:=lite6_traj_controller",
+        "reset_position_controller_name:=manyforge_reset_position_"
+        "7cd19fc8af9572e5d017fbbaa8e34494dcbcb34809afa943ff45c46541ad931e"}});
+}
+
+} // namespace
+
+namespace {
+
+// CP8 step 2a / R7 package 1: a Real Lite 6 on Mock's start-up path.
+[[nodiscard]] HostComponent real_component(const std::filesystem::path &root,
+                                           const std::string &component,
+                                           const std::string &robot_ip) {
+  auto motion = arm_binding(component, kUFactoryArm);
+  ComponentControllerLaunchInput input;
+  input.artifacts_root = root;
+  input.real_profile = "lite6_real";
+  input.robot_ip = robot_ip;
+  input.model_urdf = read_repository_file(offline_profiles().front().model_path);
+  input.controlled_stop_max_deceleration_rad_s2 = resource_limits(motion, 9.5);
+  return HostComponent{std::move(motion), std::move(input)};
+}
+
+TEST(ControllerLaunchArtifactsReal, ProfileFactsCarryTheMeasuredFreshnessBudgetAsData) {
+  EXPECT_EQ(real_controller_profile_ids(), std::vector<std::string>{"lite6_real"});
+  const auto facts = real_controller_profile_facts("lite6_real");
+  EXPECT_EQ(facts.profile_id, "lite6_real");
+  EXPECT_EQ(facts.hardware_component_name, "RealLite6System");
+  EXPECT_EQ(facts.arm_controller_name, "lite6_traj_controller");
+  EXPECT_DOUBLE_EQ(facts.hard_stop_completion_timeout_s, 1.5);
+  // R7 D3: joints 0.25 s, per robot.
+  EXPECT_DOUBLE_EQ(facts.joint_state_freshness_s, 0.25);
+  // `main`'s measured start/terminal state checks.
+  EXPECT_DOUBLE_EQ(facts.start_tolerance_rad, 0.02);
+  EXPECT_DOUBLE_EQ(facts.final_tolerance_rad, 0.02);
+  EXPECT_DOUBLE_EQ(facts.completion_state_timeout_s, 1.0);
+  // D7: ManyMove's vendor cadence (the vendor lite6_controllers.yaml): the
+  // same manager and state rates as Mock, the vendor 10 Hz action monitor.
+  const auto real = real_controller_lane_rates("lite6_real");
+  const auto mock = mock_controller_lane_rates("lite6_lite_gripper");
+  EXPECT_DOUBLE_EQ(real.controller_update_rate_hz, mock.controller_update_rate_hz);
+  EXPECT_DOUBLE_EQ(real.state_publish_rate_hz, mock.state_publish_rate_hz);
+  EXPECT_DOUBLE_EQ(real.action_monitor_rate_hz, 10.0);
+  EXPECT_THROW(static_cast<void>(real_controller_profile_facts("lite6_lite_gripper")),
+               ControllerLaunchArtifactError);
+  EXPECT_THROW(static_cast<void>(real_controller_lane_rates("lite6")),
+               ControllerLaunchArtifactError);
+}
+
+TEST(ControllerLaunchArtifactsReal, DescriptionCarriesTheVendorPluginWithExactParameters) {
+  const TemporaryRoot root;
+  const auto written =
+      write_host(real_component(root.path(), "real_lite6", "192.168.1.31"));
+  EXPECT_EQ(written.lane, ControllerLaunchLane::kMock);
+  EXPECT_EQ(written.controller_profile, "lite6_real");
+  // R7 package 3: the xArm adapter observes this component's own driver;
+  // package 4: with the Enable gate's per-robot joint agreement tolerance.
+  EXPECT_EQ(written.vendor_adapter,
+            (VendorAdapterSelection{"xarm", "/manyforge/real_lite6/xarm", 6,
+                                    0.02}));
+  const auto description = read_file(written.robot_description_file);
+  EXPECT_EQ(written.robot_description_sha256,
+            manyforge::content_identity::sha256_digest(description));
+  EXPECT_EQ(count(description, "<ros2_control "), 1U);
+  std::string joints;
+  for (const auto &joint : kUFactoryArm) {
+    joints += "    <joint name=\"" + joint + "\">\n"
+              "      <command_interface name=\"position\"/>\n"
+              "      <command_interface name=\"velocity\"/>\n"
+              "      <state_interface name=\"position\"/>\n"
+              "      <state_interface name=\"velocity\"/>\n"
+              "    </joint>\n";
+  }
+  // The vendor lite6.ros2_control.xacro's parameters, in order and format.
+  EXPECT_NE(description.find(
+                "  <ros2_control name=\"RealLite6System\" type=\"system\">\n"
+                "    <hardware>\n"
+                "      <plugin>uf_robot_hardware/UFRobotSystemHardware</plugin>\n"
+                "      <param name=\"hw_ns\">xarm</param>\n"
+                "      <param name=\"velocity_control\">false</param>\n"
+                "      <param name=\"prefix\">P</param>\n"
+                "      <param name=\"robot_ip\">R192.168.1.31</param>\n"
+                "      <param name=\"report_type\">rich</param>\n"
+                "      <param name=\"dof\">6</param>\n"
+                "      <param name=\"baud_checkset\">true</param>\n"
+                "      <param name=\"default_gripper_baud\">2000000</param>\n"
+                "      <param name=\"robot_type\">lite</param>\n"
+                "      <param name=\"add_gripper\">false</param>\n"
+                "    </hardware>\n" +
+                joints + "  </ros2_control>\n"),
+            std::string::npos);
+  EXPECT_EQ(description.find("initial_value"), std::string::npos);
+  EXPECT_EQ(description.find("right_finger_joint\">\n      <command"),
+            std::string::npos);
+}
+
+TEST(ControllerLaunchArtifactsReal, ControllersStartTheHardwareInactiveWithManyMoveValues) {
+  const TemporaryRoot root;
+  const auto written =
+      write_host(real_component(root.path(), "real_lite6", "192.168.1.31"));
+  const auto controllers = read_file(written.controllers_file);
+  EXPECT_EQ(controllers, written.controllers_yaml);
+  EXPECT_EQ(written.controllers_sha256,
+            manyforge::content_identity::sha256_digest(controllers));
+  // Mock Lite 6's arm-only controllers with D7's ManyMove (vendor) values:
+  // position+velocity command interfaces and the 10 Hz action monitor; the
+  // same cancel bounds plus the initial-inactive hardware entry; no
+  // reset-position writer and no gripper controller.
+  auto expected = generate_mock_controllers_yaml(
+      mock_controller_profile_facts("lite6_lite_gripper"), "real_lite6",
+      kUFactoryArm, cancel_limits(kUFactoryArm, 9.5),
+      std::string("right_finger_joint"), core::GripperOutputMode::kNone);
+  const auto replace_once = [&](const std::string &from, const std::string &to) {
+    ASSERT_EQ(count(expected, from), 1U) << from;
+    expected.replace(expected.find(from), from.size(), to);
+  };
+  replace_once("# Track 2's UFactory mock arm template.\n",
+               "# Track 2's UFactory real arm template.\n");
+  replace_once("    command_interfaces: [position]\n",
+               "    command_interfaces: [position, velocity]\n");
+  replace_once("    action_monitor_rate: 20.0\n", "    action_monitor_rate: 10.0\n");
+  const std::string block = "    hardware_components_initial_state:\n";
+  ASSERT_EQ(count(expected, block), 1U);
+  expected.insert(expected.find(block) + block.size(),
+                  "      inactive: [RealLite6System]\n");
+  EXPECT_EQ(controllers, expected);
+  EXPECT_NE(controllers.find("/manyforge/real_lite6/controller_manager:\n"
+                             "  ros__parameters:\n"
+                             "    update_rate: 150\n"),
+            std::string::npos);
+  EXPECT_NE(controllers.find(block + "      inactive: [RealLite6System]\n"
+                                     "      shutdown_on_initial_state_failure: true\n"),
+            std::string::npos);
+  EXPECT_EQ(count(controllers, "goal: 0.01, max_deceleration_on_cancel: 9.5}"), 6U);
+  EXPECT_EQ(controllers.find("manyforge_reset_position_"), std::string::npos);
+  EXPECT_EQ(controllers.find("GripperActionController"), std::string::npos);
+  EXPECT_EQ(written.arm_controller_name, "lite6_traj_controller");
+  EXPECT_FALSE(written.gripper_controller_name.has_value());
+  EXPECT_FALSE(written.mock_reset_position.has_value());
+}
+
+TEST(ControllerLaunchArtifactsReal, DriverParametersEnableTheIoServicesUnderTheComponentNamespace) {
+  const TemporaryRoot root;
+  const auto written =
+      write_host(real_component(root.path(), "real_lite6", "192.168.1.31"));
+  ASSERT_EQ(written.driver_parameters_file,
+            root.path() / "real_lite6" / "driver_parameters.yaml");
+  const auto driver = read_file(written.driver_parameters_file);
+  EXPECT_EQ(written.driver_parameters_sha256,
+            manyforge::content_identity::sha256_digest(driver));
+  EXPECT_NE(driver.find("\n/manyforge/real_lite6/ufactory_driver:\n"
+                        "  ros__parameters:\n"
+                        "    services:\n"),
+            std::string::npos);
+  for (const auto *service :
+       {"clean_error", "clean_warn", "get_tgpio_digital", "get_cgpio_digital",
+        "set_tgpio_digital", "set_cgpio_digital", "set_tcp_load"}) {
+    EXPECT_NE(driver.find("\n      " + std::string(service) + ": true\n"),
+              std::string::npos)
+        << service;
+  }
+  EXPECT_EQ(count(driver, ": true\n"), 8U);
+  EXPECT_EQ(driver.find(": false"), std::string::npos);
+  // ManyForge is the only motion authority: the vendor's default-on motion and
+  // mode services stay off (the driver serves only services set true).
+  for (const auto *service :
+       {"set_mode", "set_state", "motion_enable", "set_position", "set_servo_angle",
+        "set_servo_angle_j", "move_gohome", "vc_set_joint_velocity",
+        "vc_set_cartesian_velocity"}) {
+    EXPECT_EQ(driver.find(std::string(service) + ":"), std::string::npos) << service;
+  }
+  const auto evidence = controller_launch_artifacts_evidence(written);
+  EXPECT_NE(evidence.find(written.driver_parameters_sha256), std::string::npos);
+}
+
+TEST(ControllerLaunchArtifactsReal, LaunchArgumentsCarryPluginDriverFileAndRemaps) {
+  const TemporaryRoot root;
+  auto component = real_component(root.path(), "real_lite6", "192.168.1.31");
+  component.input.frame_prefix = "cell/";
+  const auto written = write_host(component);
+  EXPECT_EQ(written.launch_arguments,
+            (std::vector<std::string>{
+                "robot_description_file:=" + written.robot_description_file.string(),
+                "controllers_file:=" + written.controllers_file.string(),
+                "runtime_namespace:=/manyforge/real_lite6",
+                "controller_manager_name:=controller_manager",
+                "arm_controller_name:=lite6_traj_controller",
+                "frame_prefix:=cell/",
+                "hardware_plugin:=uf_robot_hardware/UFRobotSystemHardware",
+                "driver_parameters_file:=" + written.driver_parameters_file.string(),
+                "hardware_remappings:="
+                "/controller_manager/list_controllers="
+                "/manyforge/real_lite6/controller_manager/list_controllers;"
+                "/controller_manager/switch_controller="
+                "/manyforge/real_lite6/controller_manager/switch_controller;"
+                "/rviz/moveit/update_goal_state=/manyforge/real_lite6/update_goal_state"}));
+  // The frame prefix is a TF matter; the hardware's vendor prefix stays empty.
+  EXPECT_NE(read_file(written.robot_description_file)
+                .find("<param name=\"prefix\">P</param>"),
+            std::string::npos);
+}
+
+TEST(ControllerLaunchArtifactsReal, PneumaticNoneKeepsOnlyRealArmControlInterfaces) {
+  const TemporaryRoot root;
+  auto component = real_component(root.path(), "real_lite6", "192.168.1.31");
+  component.input.gripper_binding =
+      gripper_binding("real_lite6", std::string("right_finger_joint"));
+  component.input.gripper_output_mode = core::GripperOutputMode::kNone;
+  component.input.gripper_actuation_kind = core::GripperActuationKind::kPneumatic;
+  const auto written = write_host(component);
+  EXPECT_FALSE(written.gripper_controller_name.has_value());
+  const auto description = read_file(written.robot_description_file);
+  const auto section = description.find("  <ros2_control");
+  ASSERT_NE(section, std::string::npos);
+  const auto hardware = description.substr(section);
+  EXPECT_EQ(count(hardware, "<joint name="), kUFactoryArm.size());
+  EXPECT_EQ(hardware.find("right_finger_joint"), std::string::npos);
+  const auto controllers = read_file(written.controllers_file);
+  EXPECT_EQ(controllers.find("GripperActionController"), std::string::npos);
+  EXPECT_EQ(controllers.find("right_finger_joint"), std::string::npos);
+
+  auto invalid = component.input;
+  invalid.gripper_actuation_kind = core::GripperActuationKind::kPositionCommanded;
+  EXPECT_THROW(static_cast<void>(write_component_controller_launch_artifacts(component.motion, invalid)),
+               ControllerLaunchArtifactError);
+  invalid = component.input;
+  invalid.gripper_actuation_kind.reset();
+  EXPECT_THROW(static_cast<void>(write_component_controller_launch_artifacts(component.motion, invalid)),
+               ControllerLaunchArtifactError);
+  invalid = component.input;
+  invalid.gripper_binding = gripper_binding("real_lite6", "joint1");
+  EXPECT_THROW(static_cast<void>(write_component_controller_launch_artifacts(component.motion, invalid)),
+               ControllerLaunchArtifactError);
+}
+
+TEST(ControllerLaunchArtifactsReal, RealInputsFailClosed) {
+  const TemporaryRoot root;
+  for (const std::string address : {"", "192.168.1.31 ", "host;rm", "a/b"}) {
+    EXPECT_THROW(static_cast<void>(write_host(
+                     real_component(root.path(), "real_lite6", address))),
+                 ControllerLaunchArtifactError)
+        << address;
+  }
+  auto unknown = real_component(root.path(), "real_lite6", "192.168.1.31");
+  unknown.input.real_profile = "lite6_lite_gripper";
+  EXPECT_THROW(static_cast<void>(write_host(unknown)), ControllerLaunchArtifactError);
+  auto two = real_component(root.path(), "real_lite6", "192.168.1.31");
+  two.input.mock_profile = "lite6_lite_gripper";
+  EXPECT_THROW(static_cast<void>(write_host(two)), ControllerLaunchArtifactError);
+  auto seeded = real_component(root.path(), "real_lite6", "192.168.1.31");
+  seeded.input.initial_joint_positions_rad = {0.0, 0.0, 0.0, 0.0, 0.0, 0.0};
+  EXPECT_THROW(static_cast<void>(write_host(seeded)), ControllerLaunchArtifactError);
+  auto gripper = real_component(root.path(), "real_lite6", "192.168.1.31");
+  gripper.input.gripper_binding =
+      gripper_binding("real_lite6", std::string("right_finger_joint"));
+  EXPECT_THROW(static_cast<void>(write_host(gripper)), ControllerLaunchArtifactError);
+  auto missing_limit = real_component(root.path(), "real_lite6", "192.168.1.31");
+  missing_limit.input.controlled_stop_max_deceleration_rad_s2.pop_back();
+  EXPECT_THROW(static_cast<void>(write_host(missing_limit)),
+               ControllerLaunchArtifactError);
+  // A component without motion is a Mock gripper only.
+  auto no_motion = real_component(root.path(), "real_lite6", "192.168.1.31");
+  no_motion.input.controlled_stop_max_deceleration_rad_s2.clear();
+  no_motion.input.gripper_binding =
+      gripper_binding("real_lite6", std::string("right_finger_joint"));
+  no_motion.input.gripper_projected_position = 0.0042;
+  EXPECT_THROW(static_cast<void>(write_component_controller_launch_artifacts(
+                   std::optional<core::RuntimeParticipantBinding>{}, no_motion.input)),
                ControllerLaunchArtifactError);
 }
 

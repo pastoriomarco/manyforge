@@ -76,6 +76,19 @@ class FileBrowserEntryResponse(BaseModel):
         return self
 
 
+class ProjectRootMappingResponse(BaseModel):
+    """Display-only mapping from a configured host folder to its mount."""
+
+    model_config = _BROWSE_DTO_CONFIG
+
+    host_path: str = Field(
+        alias="hostPath", min_length=1, max_length=_MAX_BROWSE_PATH_BYTES
+    )
+    container_path: str = Field(
+        alias="containerPath", min_length=1, max_length=_MAX_BROWSE_PATH_BYTES
+    )
+
+
 class FileBrowserResponse(BaseModel):
     """Current structural filesystem-browser response contract."""
 
@@ -96,6 +109,9 @@ class FileBrowserResponse(BaseModel):
     entries: list[FileBrowserEntryResponse] = Field(
         default_factory=list,
         max_length=_MAX_RETURNED_DIRECTORY_ENTRIES,
+    )
+    project_roots: list[ProjectRootMappingResponse] | None = Field(
+        default=None, alias="projectRoots", max_length=_MAX_BROWSE_ROOTS
     )
 
 
@@ -152,7 +168,9 @@ def _validate_path_text(
     )
 
 
-def _normalize_browse_path(raw_path: str, allowed_roots: list[str]) -> Path:
+def _normalize_browse_path(
+    raw_path: str, allowed_roots: list[str], *, folders_only: bool = False,
+) -> Path:
     _validate_path_text(raw_path)
     try:
         candidate = Path(raw_path).expanduser()
@@ -181,6 +199,8 @@ def _normalize_browse_path(raw_path: str, allowed_roots: list[str]) -> Path:
         raise HTTPException(status_code=500, detail="Filesystem error") from exc
 
     if stat.S_ISREG(metadata.st_mode):
+        if folders_only:
+            raise HTTPException(status_code=400, detail="Not a folder or Scenario project")
         resolved = resolved.parent
         if not _is_within_normalized_roots(resolved, allowed_roots):
             raise HTTPException(status_code=403, detail="Path is outside allowed roots")
@@ -189,7 +209,7 @@ def _normalize_browse_path(raw_path: str, allowed_roots: list[str]) -> Path:
     return resolved
 
 
-def _root_shortcuts(allowed_roots: list[str]) -> list[str]:
+def _root_shortcuts(allowed_roots: list[str], *, configured_only: bool = False) -> list[str]:
     roots: list[str] = []
 
     def add_candidate(path: Path) -> None:
@@ -212,15 +232,16 @@ def _root_shortcuts(allowed_roots: list[str]) -> list[str]:
         if as_str not in roots:
             roots.append(as_str)
 
-    add_candidate(Path.cwd())
-    add_candidate(Path("/workspace"))
+    if not configured_only:
+        add_candidate(Path.cwd())
+        add_candidate(Path("/workspace"))
 
-    try:
-        home = Path.home().resolve()
-    except Exception:
-        home = None
-    if home is not None and str(home) != "/root":
-        add_candidate(home)
+        try:
+            home = Path.home().resolve()
+        except Exception:
+            home = None
+        if home is not None and str(home) != "/root":
+            add_candidate(home)
 
     # Only add allowed roots as shortcuts (not the filesystem root)
     for root in allowed_roots:
@@ -445,6 +466,40 @@ def _bounded_browse_payload(payload: dict[str, Any]) -> dict[str, Any]:
     return payload
 
 
+def _project_root_mappings(roots: list[str]) -> list[dict[str, str]]:
+    """Read presentation metadata only for already-allowed container roots."""
+
+    raw = os.environ.get("MANYFORGE_PROJECT_ROOT_MAPPINGS", "")
+    if not raw or len(raw.encode("utf-8")) > _MAX_BROWSE_OUTPUT_BYTES:
+        return []
+    try:
+        mappings = json.loads(raw)
+    except (TypeError, ValueError):
+        return []
+    if not isinstance(mappings, list):
+        return []
+    result: list[dict[str, str]] = []
+    for mapping in mappings[:_MAX_BROWSE_ROOTS]:
+        if not isinstance(mapping, dict):
+            continue
+        host = mapping.get("hostPath")
+        container = mapping.get("containerPath")
+        if (
+            not isinstance(host, str) or not isinstance(container, str)
+            or not os.path.isabs(host) or not os.path.isabs(container)
+        ):
+            continue
+        try:
+            _validate_path_text(host, label="Host project folder")
+            _validate_path_text(container, label="Project mount")
+            if str(Path(container).resolve()) not in roots:
+                continue
+        except (HTTPException, OSError, ValueError):
+            continue
+        result.append({"hostPath": host, "containerPath": container})
+    return result
+
+
 def create_filesystem_router(allowed_roots: list[str] | None = None) -> APIRouter:
     if allowed_roots is not None:
         if type(allowed_roots) is not list:
@@ -473,11 +528,13 @@ def create_filesystem_router(allowed_roots: list[str] | None = None) -> APIRoute
         except HTTPException as exc:
             raise ValueError("filesystem browser allowed root is invalid") from exc
     router = APIRouter()
+    project_roots = _project_root_mappings(roots)
 
     @router.get(
         "/browse",
         response_model=FileBrowserResponse,
         response_model_by_alias=True,
+        response_model_exclude_unset=True,
     )
     def browse_filesystem(
         # The byte-exact check stays inside the handler so an oversized value
@@ -487,7 +544,23 @@ def create_filesystem_router(allowed_roots: list[str] | None = None) -> APIRoute
         kind: str = Query(
             default="program", pattern="^(program|deployment|mesh|scenario)$"
         ),
+        roots_only: bool = Query(default=False),
     ) -> dict:
+        if roots_only:
+            # The initial location chooser needs no directory entries. Open
+            # one configured root to preserve the existing availability check,
+            # but do not scan it: it may exceed the directory-entry limit.
+            current_dir, descriptor, _ = _open_default_browse_root(roots)
+            os.close(descriptor)
+            payload: dict[str, Any] = {
+                "currentPath": str(current_dir),
+                "parentPath": None,
+                "roots": _root_shortcuts(roots, configured_only=True),
+                "entries": [],
+            }
+            if kind == "scenario" and project_roots:
+                payload["projectRoots"] = project_roots
+            return _bounded_browse_payload(payload)
         if path is None:
             current_dir, descriptor, initial_metadata = _open_default_browse_root(
                 roots
@@ -498,7 +571,7 @@ def create_filesystem_router(allowed_roots: list[str] | None = None) -> APIRoute
                 roots
             )
         else:
-            current_dir = _normalize_browse_path(path, roots)
+            current_dir = _normalize_browse_path(path, roots, folders_only=kind == "scenario")
             descriptor, initial_metadata = _open_directory(current_dir, roots)
         try:
             entries = _scan_directory(descriptor, current_dir, kind)
@@ -518,13 +591,14 @@ def create_filesystem_router(allowed_roots: list[str] | None = None) -> APIRoute
         ):
             parent_path = str(parent_dir)
 
-        return _bounded_browse_payload(
-            {
-                "currentPath": str(current_dir),
-                "parentPath": parent_path,
-                "roots": _root_shortcuts(roots),
-                "entries": entries,
-            }
-        )
+        payload = {
+            "currentPath": str(current_dir),
+            "parentPath": parent_path,
+            "roots": _root_shortcuts(roots),
+            "entries": entries,
+        }
+        if kind == "scenario" and project_roots:
+            payload["projectRoots"] = project_roots
+        return _bounded_browse_payload(payload)
 
     return router

@@ -393,6 +393,20 @@ def create_scenario_document_router(state: ComposerState) -> APIRouter:
                 and isinstance(deployment, dict)
                 and isinstance(assignment, dict)
             )
+            # Ready only when the saved content is exactly what is Applied:
+            # both Applied views read at this captured identity, both Drafts
+            # match an applied counterpart.
+            ready = False
+            if complete:
+                program_view = program_workspace(state)
+                deployment_view = deployment_workspace(state)
+                ready = (
+                    program_view["authoringWorkspace"] == snapshot.identity.as_dict()
+                    and deployment_view["authoringWorkspace"] == snapshot.identity.as_dict()
+                    and program_view.get("hasUnappliedChanges") is False
+                    and deployment_view["managerApplied"]["deploymentRevision"] is not None
+                    and not _deployment_unapplied(deployment_view)
+                )
             target = scenario_project_path(body.directory, body.name)
             document = build_scenario_document(
                 scenario_id=body.name,
@@ -402,7 +416,9 @@ def create_scenario_document_router(state: ComposerState) -> APIRouter:
                 deployment_draft=deployment,
                 program_role_assignment=assignment,
                 manyforge_version=_version(),
-                last_known_status="unknown" if complete else "incomplete",
+                last_known_status=(
+                    "ready" if ready else "unknown" if complete else "incomplete"
+                ),
             )
             current_target = project["document_path"]
             source_project_root = (

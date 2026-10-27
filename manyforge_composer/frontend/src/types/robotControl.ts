@@ -123,6 +123,13 @@ export interface ManualControlGripperDescriptor {
   openStateRef: string | null;
   closedStateRef: string | null;
   commandDurationS: number | null;
+  /** Mapped physical outputs from the Applied gripper Binding; absent for legacy/unmapped tools. */
+  pneumaticOutputs?: Array<{
+    controllableComponentId: string;
+    signalName: string;
+    openValue: boolean;
+    closeValue: boolean;
+  }>;
   touchLinks: string[];
   mountFrame: string | null;
   attachFrame: string | null;

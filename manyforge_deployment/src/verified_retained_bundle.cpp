@@ -1661,8 +1661,7 @@ verify_current_retained_bundle_projection(const CanonicalValue &root) {
       retained_assistant != nullptr) {
     try {
       const QualifiedAssistantSettings qualified_assistant =
-          verify_retained_assistant_projection(
-              *retained_assistant, applicability.value().external_resources);
+          verify_retained_assistant_projection(*retained_assistant);
       assistant = qualified_assistant.retained_projection();
     } catch (const AssistantSettingsCodecError &error) {
       detail::fail_retained_bundle(

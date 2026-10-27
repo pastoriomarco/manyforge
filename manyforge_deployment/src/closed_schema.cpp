@@ -1995,7 +1995,7 @@ BuildQualifiedClosedSchemaRegistry::BuildQualifiedClosedSchemaRegistry() {
        detail::kEmbeddedRos2ControlExecutionRuntimeConfigurationSchema},
       {"value/manyforge.value_schema.runtime.io_provider_execution.v1.yaml",
        detail::kEmbeddedIoProviderComponentConfigurationSchema},
-      {"value/manyforge.value_schema.runtime.pose_source_execution.v1.yaml",
+      {"value/manyforge.value_schema.runtime.pose_source.v2.yaml",
        detail::kEmbeddedPoseSourceComponentConfigurationSchema},
   }};
 

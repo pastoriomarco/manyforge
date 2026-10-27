@@ -997,6 +997,14 @@ public:
     else
       goal->abort(result);
   }
+  void canceled(std::size_t index) {
+    std::shared_ptr<ServerGoal> goal;
+    {
+      std::lock_guard<std::mutex> lock(mutex_);
+      goal = goals_.at(index);
+    }
+    goal->canceled(std::make_shared<Action::Result>());
+  }
   std::atomic<bool> reject{false};
   std::atomic<bool> accept_cancel{true};
   std::atomic<bool> finite_result{false};
@@ -1886,9 +1894,13 @@ TEST(Ros2GripperCommandBackendTest,
     // Explicit existing recovery reopens the shared backend. In a real active
     // position session its existing Stop settlement may perform this reset;
     // this isolated transport proof intentionally has no position Engine.
+    // A cancelled position goal must reach its terminal before Reset can
+    // re-authorize (lifecycle-disable settlement).
+    if (position_was_active) position.canceled(0);
     backend.invalidate_gripper_commands(
         core::GripperInvalidationReason::kReset);
-    backend.authorize_gripper_commands();
+    ASSERT_TRUE(wait_for_gripper_fact(
+        [&] { return backend.try_authorize_gripper_commands().ok(); }));
     const auto recovered = backend.command_gripper(position_request);
     ASSERT_TRUE(recovered.accepted);
     EXPECT_FALSE(backend.get_gripper_status("position").admission_closed);
@@ -1908,6 +1920,27 @@ Ros2GripperActionConfig pneumatic_none_config() {
   return config;
 }
 
+TEST(Ros2GripperCommandBackendTest, PneumaticNoneNeedsNoBudgetWithoutFeedback) {
+  auto sink = std::make_shared<RecordingExecutionStateSink>();
+  core::FakeClock clock;
+  core::ManualScheduler scheduler;
+  auto resources = test_transport_resources(sink, clock, "arm");
+  Ros2GripperCommandBackend backend(*resources, sink, clock, scheduler, false);
+
+  auto no_feedback = pneumatic_none_config();
+  no_feedback.state_freshness_timeout_s = 0.0;
+  EXPECT_NO_THROW(backend.configure_gripper_action("no_feedback", no_feedback));
+
+  auto with_feedback = no_feedback;
+  with_feedback.state_topic = "/gripper/state";
+  with_feedback.state_joint_name = "finger_joint";
+  EXPECT_THROW(backend.configure_gripper_action("with_feedback", with_feedback),
+               std::invalid_argument);
+  no_feedback.state_freshness_timeout_s = -1.0;
+  EXPECT_THROW(backend.configure_gripper_action("invalid_budget", no_feedback),
+               std::invalid_argument);
+}
+
 core::GripperCommandRequestDTO pneumatic_none_request(double dwell) {
   auto request =
       make_gripper_request(0.0, dwell, 0.0, "resolved_binding", "no_output");
@@ -1915,7 +1948,8 @@ core::GripperCommandRequestDTO pneumatic_none_request(double dwell) {
   return request;
 }
 
-void expect_no_pneumatic_delivery(const core::GripperCommandStatusDTO &status) {
+void expect_no_pneumatic_delivery(const core::GripperCommandStatusDTO &status,
+                                  bool projected = true) {
   EXPECT_TRUE(has_gripper_fact(status, "pneumatic_no_output"));
   EXPECT_FALSE(has_gripper_fact(status, "pneumatic_output_delivery_confirmed"));
   EXPECT_FALSE(
@@ -1926,7 +1960,8 @@ void expect_no_pneumatic_delivery(const core::GripperCommandStatusDTO &status) {
   EXPECT_FALSE(status.observed_position.has_value());
   EXPECT_EQ(status.transport_kind, "");
   EXPECT_EQ(status.projection_state,
-            core::GripperProjectionState::kNotRequired);
+            projected ? core::GripperProjectionState::kApplied
+                      : core::GripperProjectionState::kNotRequired);
 }
 
 TEST(Ros2GripperCommandBackendTest,
@@ -1968,7 +2003,8 @@ TEST(Ros2GripperCommandBackendTest,
             0U);
   expect_no_pneumatic_delivery(completed);
   EXPECT_TRUE(sink->reads().empty());
-  EXPECT_TRUE(sink->single_updates().empty());
+  ASSERT_EQ(sink->single_updates().size(), 1U);
+  EXPECT_DOUBLE_EQ(sink->single_updates().front().position_rad, 0.0);
   // A genuinely configured owner disappears on shutdown, not as a fake CM row.
   lifetime.close();
   EXPECT_FALSE(backend.gripper_transport_readiness("tool").logical_owner_ready);
@@ -2000,7 +2036,7 @@ TEST(Ros2GripperCommandBackendTest,
   EXPECT_TRUE(backend.command_gripper(pneumatic_none_request(0.0)).accepted);
   EXPECT_FALSE(completed.error.has_value());
   expect_no_pneumatic_delivery(completed);
-  EXPECT_TRUE(sink->single_updates().empty());
+  EXPECT_EQ(sink->single_updates().size(), 2U);
 }
 
 TEST(Ros2GripperCommandBackendTest,
@@ -2107,6 +2143,66 @@ TEST(Ros2GripperCommandBackendTest,
       has_gripper_fact(completed, "gripper_lifecycle_schedule_failed"));
   expect_no_pneumatic_delivery(completed);
   EXPECT_FALSE(completed.error.has_value());
+}
+
+TEST(Ros2GripperCommandBackendTest,
+     PneumaticNoneResetCanRetireAnInFlightCommandedProjection) {
+  auto sink = std::make_shared<RecordingExecutionStateSink>();
+  sink->set_joint_position("gripper", "finger_joint", 0.7);
+  sink->block_single_update();
+  core::FakeClock clock;
+  core::ManualScheduler scheduler;
+  auto resources = test_transport_resources(sink, clock, "arm");
+  Ros2GripperCommandBackend backend(*resources, sink, clock, scheduler, false);
+  TestTransportLifetime lifetime(*resources, backend);
+  backend.configure_gripper_action("tool", pneumatic_none_config());
+
+  auto command = std::async(std::launch::async, [&] {
+    return backend.command_gripper(pneumatic_none_request(0.0));
+  });
+  ASSERT_TRUE(sink->wait_for_single_update());
+  const auto pending = backend.get_gripper_status("tool");
+  EXPECT_EQ(pending.state, core::GripperCommandState::kExecuting);
+  EXPECT_FALSE(pending.observed_position.has_value());
+  EXPECT_EQ(command.wait_for(50ms), std::future_status::timeout);
+  backend.invalidate_gripper_commands(core::GripperInvalidationReason::kReset);
+  EXPECT_EQ(backend.get_gripper_status("tool").state,
+            core::GripperCommandState::kIdle);
+  EXPECT_TRUE(backend.try_authorize_gripper_commands().ok());
+
+  sink->release_single_update();
+  ASSERT_TRUE(command.get().accepted);
+  const auto retired = backend.get_gripper_status("tool");
+  EXPECT_EQ(retired.state, core::GripperCommandState::kIdle);
+  EXPECT_FALSE(retired.observed_position.has_value());
+  ASSERT_EQ(sink->single_updates().size(), 1U);
+  EXPECT_DOUBLE_EQ(sink->single_updates().front().position_rad, 0.0);
+  EXPECT_DOUBLE_EQ(*sink->group_joint_position("gripper", "finger_joint"), 0.0);
+  auto next = pneumatic_none_request(0.0);
+  next.target_position = 0.7;
+  ASSERT_TRUE(backend.command_gripper(next).accepted);
+  EXPECT_DOUBLE_EQ(*sink->group_joint_position("gripper", "finger_joint"), 0.7);
+}
+
+TEST(Ros2GripperCommandBackendTest,
+     PneumaticNoneProjectionFailureIsReportedAsCommandFailure) {
+  auto sink = std::make_shared<RecordingExecutionStateSink>();
+  sink->fail_next_single_updates(1);
+  core::FakeClock clock;
+  core::ManualScheduler scheduler;
+  auto resources = test_transport_resources(sink, clock, "arm");
+  Ros2GripperCommandBackend backend(*resources, sink, clock, scheduler, false);
+  TestTransportLifetime lifetime(*resources, backend);
+  backend.configure_gripper_action("tool", pneumatic_none_config());
+
+  const auto command = backend.command_gripper(pneumatic_none_request(0.0));
+  ASSERT_TRUE(command.accepted);
+  const auto failed = backend.get_gripper_status("tool");
+  EXPECT_EQ(failed.state, core::GripperCommandState::kFailed);
+  EXPECT_EQ(failed.projection_state, core::GripperProjectionState::kFailed);
+  ASSERT_TRUE(failed.error.has_value());
+  EXPECT_EQ(failed.error->code, "gripper_projection_failed");
+  EXPECT_FALSE(failed.observed_position.has_value());
 }
 
 TEST(
@@ -2388,18 +2484,15 @@ TEST(Ros2GripperCommandBackendTest,
       request.target_position = dwell == 0.0 ? 0.7 : 0.0;
       const auto command = backend.command_gripper(request);
       ASSERT_TRUE(command.accepted);
-      EXPECT_TRUE(callback_read_owner.load());
+      EXPECT_EQ(callback_read_owner.load(), named_feedback);
       {
         std::lock_guard<std::mutex> lock(display_mutex);
-        ASSERT_FALSE(display_positions.empty());
-        EXPECT_DOUBLE_EQ(display_positions.back(),
-                         named_feedback ? 0.4 : request.target_position);
-        if (!named_feedback) {
-          EXPECT_EQ(display_positions.size(), 1U);
-        }
+        if (named_feedback)
+          ASSERT_FALSE(display_positions.empty());
+        else
+          EXPECT_TRUE(display_positions.empty());
         for (double value : display_positions)
-          EXPECT_DOUBLE_EQ(value,
-                           named_feedback ? 0.4 : request.target_position);
+          EXPECT_DOUBLE_EQ(value, 0.4);
       }
       auto status = backend.get_gripper_status("tool");
       EXPECT_EQ(status.state, core::GripperCommandState::kCompleted);
@@ -2410,16 +2503,16 @@ TEST(Ros2GripperCommandBackendTest,
       EXPECT_EQ(status.state, core::GripperCommandState::kCompleted);
       EXPECT_EQ(status.command_id, command.command_id);
       EXPECT_EQ(status.generation, command.generation);
-      expect_no_pneumatic_delivery(status);
+      expect_no_pneumatic_delivery(status, !named_feedback);
       const auto ready = backend.gripper_transport_readiness("tool");
       EXPECT_TRUE(ready.logical_owner_ready);
       EXPECT_FALSE(ready.command_path_ready);
       EXPECT_FALSE(ready.feedback_path_ready);
       EXPECT_TRUE(sink->reads().empty());
-      EXPECT_TRUE(sink->single_updates().empty());
+      EXPECT_EQ(sink->single_updates().size(), named_feedback ? 0U : 1U);
       if (!named_feedback) {
-        std::lock_guard<std::mutex> lock(display_mutex);
-        EXPECT_EQ(display_positions.size(), 1U); // No dwell-driven visual ramp.
+        EXPECT_DOUBLE_EQ(sink->single_updates().front().position_rad,
+                         request.target_position);
       }
     }
   }

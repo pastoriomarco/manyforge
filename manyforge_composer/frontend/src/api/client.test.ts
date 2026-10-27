@@ -728,6 +728,7 @@ describe('structural API client', () => {
         graph_revision: 'graph.1',
         assistant_projection_digest: `sha256:${'1'.repeat(64)}`,
         instrument_registry_digest: `sha256:${'2'.repeat(64)}`,
+        ai_model_component_id: 'assistant_model',
         node_environment: {
           catalog_digest: `sha256:${'5'.repeat(64)}`,
           catalog_id: 'manyforge',
@@ -761,7 +762,7 @@ describe('structural API client', () => {
         sourceLabel: 'composer_ui',
         correlationId: null,
         conversationId: 'conversation.1',
-        assistantMode: 'query',
+        assistantMode: 'composer-assistant',
         state: 'running',
         response: null,
         error: null,
@@ -816,6 +817,27 @@ describe('structural API client', () => {
       expect.objectContaining({ method: 'GET' }),
     );
     expect(result.currentPath).toBe('/configured/artifacts');
+  });
+
+  it('requests the configured roots without scanning their entries', async () => {
+    const fetchMock = vi.fn().mockResolvedValue(response({
+      currentPath: '/workspace/examples',
+      parentPath: null,
+      roots: ['/workspace/examples', '/projects/cells'],
+      projectRoots: [{ hostPath: '/home/user/cells', containerPath: '/projects/cells' }],
+      entries: [],
+    }));
+    vi.stubGlobal('fetch', fetchMock);
+
+    const result = await api.files.browse('scenario', undefined, undefined, true);
+
+    expect(fetchMock).toHaveBeenCalledWith(
+      '/api/files/browse?kind=scenario&roots_only=true',
+      expect.objectContaining({ method: 'GET' }),
+    );
+    expect(result.roots).toEqual(['/workspace/examples', '/projects/cells']);
+    expect(result.projectRoots).toEqual([{ hostPath: '/home/user/cells', containerPath: '/projects/cells' }]);
+    expect(result.entries).toEqual([]);
   });
 
   it('resolves a Program Draft mesh against one exact Draft revision', async () => {

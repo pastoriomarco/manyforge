@@ -1,4 +1,4 @@
-"""CP9 component stream health: Python twin and sample sink (hermetic, no ROS graph)."""
+"""CP9 component stream health: sample sink (hermetic, no ROS graph)."""
 
 from __future__ import annotations
 
@@ -10,8 +10,6 @@ from manyforge_ros import component_stream_health as csh
 from manyforge_ros.component_stream_health import (
     COMPONENT_STREAM_SAMPLES_TOPIC,
     ComponentStreamSink,
-    StreamDeclaration,
-    StreamLiveness,
 )
 
 
@@ -63,64 +61,6 @@ def _stamps(node: _Node) -> list[str]:
     return [dict(m.values)["stamp_ns"] for m in node.publisher.messages]
 
 
-# --- declaration --------------------------------------------------------------
-
-
-def test_declaration_mirrors_cpp_validation() -> None:
-    declaration = StreamDeclaration("poses/bin_1", 250_000_000)
-    assert (declaration.severity, declaration.recovery, declaration.timestamp_source) == (
-        "fault",
-        "ack",
-        "message_stamp",
-    )
-    StreamDeclaration("a" * 64, 1, "warning", "auto", "arrival")
-    for stream_id in ("", "a" * 65, "Joints", "joints state", 7):
-        with pytest.raises(ValueError):
-            StreamDeclaration(stream_id, 1)
-    for budget in (0, -1, 1.5, True):
-        with pytest.raises(ValueError):
-            StreamDeclaration("joints", budget)
-    with pytest.raises(ValueError):
-        StreamDeclaration("joints", 1, severity="critical")
-    with pytest.raises(ValueError):
-        StreamDeclaration("joints", 1, recovery="never")
-    with pytest.raises(ValueError):
-        StreamDeclaration("joints", 1, timestamp_source="header")
-
-
-# --- liveness rule ------------------------------------------------------------
-
-
-def test_liveness_absent_until_first_sample() -> None:
-    liveness = StreamLiveness(100)
-    assert liveness.state(10_000) == "absent"
-    assert liveness.age_ns(10_000) is None
-
-
-def test_liveness_advances_only_on_increasing_stamp() -> None:
-    liveness = StreamLiveness(100)
-    assert liveness.record(5, 1_000)
-    assert liveness.state(1_100) == "live"
-    assert liveness.age_ns(1_100) == 100
-    assert not liveness.record(5, 1_050)  # frozen stamp (paused simulator)
-    assert not liveness.record(4, 1_060)
-    assert liveness.state(1_101) == "stale"
-    assert liveness.record(6, 1_200)
-    assert liveness.state(1_250) == "live"
-
-
-def test_liveness_arrival_and_missing_stamp_always_advance() -> None:
-    arrival = StreamLiveness(100, "arrival")
-    assert arrival.record(5, 1_000)
-    assert arrival.record(5, 1_050)
-    assert arrival.age_ns(1_060) == 10
-    stamped = StreamLiveness(100)
-    assert stamped.record(5, 1_000)
-    assert stamped.record(None, 1_050)
-    assert not stamped.record(5, 1_060)
-    assert stamped.age_ns(1_060) == 10
-
-
 # --- sink ---------------------------------------------------------------------
 
 
@@ -142,7 +82,7 @@ def test_sink_throttles_and_flushes_newest_advancing_stamp(sink_env) -> None:
     clock.now += 50
     sink.record(11)
     sink.record(12)
-    sink.record(9)  # not advancing
+    sink.record(12)  # equal stamp: not advancing
     assert _stamps(node) == ["10"]
     clock.now += 50
     sink.record(12)  # not advancing, but flushes the pending sample
@@ -152,6 +92,17 @@ def test_sink_throttles_and_flushes_newest_advancing_stamp(sink_env) -> None:
     assert _stamps(node) == ["10", "12"]
     sink.record(13)
     assert _stamps(node) == ["10", "12", "13"]
+
+
+def test_sink_forwards_a_stamp_reset(sink_env) -> None:
+    sink, node, clock = sink_env
+    sink.record(5_000)
+    clock.now += 200
+    sink.record(5)  # simulator time reset: a different stamp advances
+    assert _stamps(node) == ["5000", "5"]
+    clock.now += 200
+    sink.record(5)  # paused: equal stamp is not re-sent
+    assert _stamps(node) == ["5000", "5"]
 
 
 def test_sink_arrival_samples_send_zero_stamp(sink_env) -> None:

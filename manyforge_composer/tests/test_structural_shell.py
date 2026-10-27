@@ -2,11 +2,14 @@
 
 from __future__ import annotations
 
+import json
 import os
 from pathlib import Path
 
 import pytest
 from fastapi.testclient import TestClient
+from manyforge_behavior.catalog import NodeCatalog
+from manyforge_behavior.node_environment import BUILTIN_CATALOG_PATH
 
 from manyforge_composer.backend import routes_filesystem
 from manyforge_composer.backend.app import _find_static_dir, create_app
@@ -52,7 +55,7 @@ def test_health_and_catalog_report_structural_only_state() -> None:
     payload = catalog.json()
     assert len(payload["entries"]) == 49
     assert payload["apiVersion"] == "manyforge.node_catalog.v2"
-    assert payload["contentVersion"] == "2.6.0"
+    assert payload["contentVersion"] == NodeCatalog(BUILTIN_CATALOG_PATH).content_version
     assert payload["catalogId"] == "manyforge_builtin"
     assert payload["catalogDigest"].startswith("sha256:")
     assert payload["environmentDigest"].startswith("sha256:")
@@ -825,6 +828,105 @@ def test_scenario_folder_browser_lists_folders_and_marks_projects(
     assert response.json()["roots"] == [str(allowed.resolve())]
 
 
+def test_scenario_folder_browser_displays_only_configured_mount_mappings(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    examples = tmp_path / "examples"
+    projects = tmp_path / "user projects"
+    outside = tmp_path / "outside"
+    examples.mkdir()
+    projects.mkdir()
+    outside.mkdir()
+    host_directory = tmp_path / "host project"
+    host_directory.mkdir()
+    host_path = str(host_directory)
+    monkeypatch.setenv("MANYFORGE_PROJECT_ROOT_MAPPINGS", json.dumps([
+        {"hostPath": host_path, "containerPath": str(projects)},
+        {"hostPath": "/home/operator/outside", "containerPath": str(outside)},
+    ]))
+    client = _client(allowed_fs_roots=[str(examples), str(projects)])
+
+    initial = client.get("/api/files/browse", params={"kind": "scenario", "roots_only": "true"})
+    assert initial.status_code == 200, initial.text
+    assert initial.json()["projectRoots"] == [
+        {"hostPath": host_path, "containerPath": str(projects)}
+    ]
+    opened = client.get("/api/files/browse", params={"kind": "scenario", "path": str(projects)})
+    assert opened.status_code == 200, opened.text
+    assert opened.json()["projectRoots"] == initial.json()["projectRoots"]
+    # A displayed host path is metadata, not another filesystem authority.
+    refused = client.get("/api/files/browse", params={"kind": "scenario", "path": host_path})
+    assert refused.status_code == 403
+    program = client.get("/api/files/browse", params={"kind": "program", "roots_only": "true"})
+    assert program.status_code == 200 and "projectRoots" not in program.json()
+
+
+def test_scenario_folder_browser_lists_each_allowed_project_root(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    examples = tmp_path / "examples"
+    projects = tmp_path / "user projects"
+    outside = tmp_path / "outside"
+    examples.mkdir()
+    projects.mkdir()
+    outside.mkdir()
+    (projects / "cell.scenario").mkdir()
+    (outside / "private.scenario").mkdir()
+    (projects / "escape").symlink_to(outside, target_is_directory=True)
+    monkeypatch.chdir(outside)
+    client = _client(allowed_fs_roots=[str(examples), str(projects)])
+
+    initial = client.get("/api/files/browse", params={"kind": "scenario"})
+    assert initial.status_code == 200, initial.text
+    assert initial.json()["roots"] == [str(examples.resolve()), str(projects.resolve())]
+    listing = client.get(
+        "/api/files/browse", params={"path": str(projects), "kind": "scenario"},
+    )
+    assert listing.status_code == 200, listing.text
+    assert [(entry["name"], entry["scenarioProject"]) for entry in listing.json()["entries"]] == [
+        ("cell.scenario", True),
+    ]
+    assert listing.json()["parentPath"] is None
+    assert client.get(
+        "/api/files/browse", params={"path": str(outside), "kind": "scenario"},
+    ).status_code == 403
+    assert client.get(
+        "/api/files/browse", params={"path": str(projects / "escape"), "kind": "scenario"},
+    ).status_code == 403
+
+
+def test_scenario_root_list_does_not_scan_a_large_first_root(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    examples = tmp_path / "examples"
+    projects = tmp_path / "projects"
+    examples.mkdir()
+    projects.mkdir()
+    for index in range(1025):
+        (examples / f"folder_{index}").mkdir()
+    (projects / "cell.scenario").mkdir()
+    # A child of an allowed root is an existing navigation shortcut, but it
+    # must not be presented as a configured root on the initial chooser.
+    monkeypatch.chdir(examples / "folder_0")
+    client = _client(allowed_fs_roots=[str(examples), str(projects)])
+
+    initial = client.get(
+        "/api/files/browse", params={"kind": "scenario", "roots_only": "true"},
+    )
+    assert initial.status_code == 200, initial.text
+    assert initial.json()["roots"] == [str(examples.resolve()), str(projects.resolve())]
+    assert initial.json()["entries"] == []
+    assert client.get(
+        "/api/files/browse", params={"kind": "scenario", "path": str(examples)},
+    ).status_code == 413
+    opened = client.get(
+        "/api/files/browse", params={"kind": "scenario", "path": str(projects)},
+    )
+    assert opened.status_code == 200, opened.text
+    assert [entry["name"] for entry in opened.json()["entries"]] == ["cell.scenario"]
+    assert str((examples / "folder_0").resolve()) in opened.json()["roots"]
+
+
 def test_scenario_folder_browser_stays_inside_the_roots(tmp_path: Path) -> None:
     allowed = tmp_path / "allowed"
     outside = tmp_path / "outside"
@@ -851,6 +953,26 @@ def test_scenario_folder_browser_stays_inside_the_roots(tmp_path: Path) -> None:
         rejected = browse(path)
         assert rejected.status_code == 403, (path, rejected.text)
         assert "secret" not in rejected.text
+
+
+def test_scenario_folder_browser_rejects_a_regular_file_path(tmp_path: Path) -> None:
+    allowed = tmp_path / "allowed"
+    allowed.mkdir()
+    file_path = allowed / "not-a-project.yaml"
+    file_path.write_text("x: 1\n", encoding="utf-8")
+    client = _client(allowed_fs_roots=[str(allowed)])
+
+    scenario = client.get(
+        "/api/files/browse", params={"kind": "scenario", "path": str(file_path)},
+    )
+    assert scenario.status_code == 400
+    assert scenario.json()["detail"] == "Not a folder or Scenario project"
+    # Other artifact pickers retain their existing file-to-parent behavior.
+    deployment = client.get(
+        "/api/files/browse", params={"kind": "deployment", "path": str(file_path)},
+    )
+    assert deployment.status_code == 200, deployment.text
+    assert deployment.json()["currentPath"] == str(allowed.resolve())
 
 
 def test_scenario_folder_browser_is_bounded(

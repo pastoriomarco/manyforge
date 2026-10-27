@@ -87,6 +87,20 @@ class IKernelCellAdmissionPort {
                  "Kernel component-incident containment is unsupported",
                  {{"reason", "incident_containment_unsupported"}}});
   }
+  /// CP9 `fault` + `auto`: the incident closed by itself once its stream was
+  /// live again. Recovers the cell Stop fault latch of exactly that
+  /// incident's containment (as the operator's Recover cell would); never
+  /// resumes motion. True when nothing is left to recover automatically (no
+  /// latch, or the latch is not that containment's alone: the operator's);
+  /// false while the recovery is not ready yet (retry later).
+  [[nodiscard]] virtual Result<bool> RecoverComponentIncidentContainment(
+      const std::string& incident_id) {
+    static_cast<void>(incident_id);
+    return Result<bool>::Err(
+        ErrorDTO{"cell_admission_incident_containment_unsupported",
+                 "Kernel component-incident containment is unsupported",
+                 {{"reason", "incident_containment_unsupported"}}});
+  }
   /// CP9 stream health: while `hold` is set, new commands of the component
   /// are refused with it (a `fault`/`blocking` stream is not live). With
   /// `cell_wide` (a component without motion of its own, e.g. a pose source)

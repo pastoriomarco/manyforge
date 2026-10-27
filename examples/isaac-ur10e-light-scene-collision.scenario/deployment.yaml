@@ -21,74 +21,41 @@
       "component_profile_id": "pose_source_v0",
       "configuration": {
         "runtime_configuration": {
-          "pose_sources": [
-            {
-              "controllable_component_id": "isaac_scene_objects",
-              "detection3d_sources": [],
-              "joint_state": {
-                "eligible": false,
-                "lifetime_ns": 1000000000,
-                "object_id": "isaac_ur10e_collision_robot",
-                "policy_id": "viewer.measured_robot",
-                "required_joint_names": [
-                  "shoulder_pan_joint",
-                  "shoulder_lift_joint",
-                  "elbow_joint",
-                  "wrist_1_joint",
-                  "wrist_2_joint",
-                  "wrist_3_joint"
-                ],
-                "topic": "/isaac_joint_states"
-              },
-              "simulation_entities": [
-                {
-                  "eligible": false,
-                  "entity": "/World/ur10e_robotiq2f_140_ROS/ur10e_robotiq2f_140/ee_link/robotiq_arg2f_base_link",
-                  "frame_kind": "cell_frame",
-                  "lifetime_ns": 1000000000,
-                  "local_orientation_xyzw": [
-                    0,
-                    0,
-                    0,
-                    1
-                  ],
-                  "local_position_xyz": [
-                    0,
-                    0,
-                    0.2
-                  ],
-                  "object_id": "isaac_ur10e_collision_robot",
-                  "policy_id": "viewer.measured_tcp",
-                  "source_coordinate_frame_id": "universe",
-                  "source_header_frame_id": "robotiq_arg2f_base_link",
-                  "target_frame_id": "universe"
-                },
-                {
-                  "eligible": true,
-                  "entity": "/mac_n_cheese_centered",
-                  "frame_kind": "cell_frame",
-                  "lifetime_ns": 2000000000,
-                  "local_orientation_xyzw": [
-                    0,
-                    0,
-                    0,
-                    1
-                  ],
-                  "local_position_xyz": [
-                    0,
-                    0,
-                    0
-                  ],
-                  "object_id": "isaac_cheese_box",
-                  "policy_id": "continuous_unattached",
-                  "source_coordinate_frame_id": "universe",
-                  "source_header_frame_id": "mac_n_cheese_centered",
-                  "target_frame_id": "universe"
-                }
+          "robot_overlay": {
+            "joint_state": {
+              "required_joint_names": [
+                "shoulder_pan_joint",
+                "shoulder_lift_joint",
+                "elbow_joint",
+                "wrist_1_joint",
+                "wrist_2_joint",
+                "wrist_3_joint"
               ],
-              "simulation_poll_period_ms": 250
+              "topic": "/isaac_joint_states"
+            },
+            "robot_component_id": "isaac_ur10e_collision_robot",
+            "tcp_entity": {
+              "entity": "/World/ur10e_robotiq2f_140_ROS/ur10e_robotiq2f_140/ee_link/robotiq_arg2f_base_link",
+              "local_orientation_xyzw": [
+                0,
+                0,
+                0,
+                1
+              ],
+              "local_position_xyz": [
+                0,
+                0,
+                0.2
+              ],
+              "source_header_frame_id": "robotiq_arg2f_base_link"
             }
-          ]
+          },
+          "simulation": {
+            "poll_period_ms": 250,
+            "source_coordinate_frame_id": "universe",
+            "target_frame_id": "universe"
+          },
+          "stream_budget_ns": 1000000000
         },
         "runtime_kind": "pose_source"
       },
@@ -114,6 +81,22 @@
         },
         "runtime_configuration": {
           "collision_monitor_period_ms": 100.0,
+          "component_streams": [
+            {
+              "budget_ns": 1000000000,
+              "controllable_component_id": "isaac_ur10e_collision_robot",
+              "recovery": "auto",
+              "severity": "warning",
+              "stream_id": "gripper_feedback"
+            },
+            {
+              "budget_ns": 250000000,
+              "controllable_component_id": "isaac_ur10e_collision_robot",
+              "recovery": "auto",
+              "severity": "warning",
+              "stream_id": "measured_joints"
+            }
+          ],
           "execution_tick_hz": 100,
           "gripper_target_configurations": [
             {
@@ -130,7 +113,6 @@
               "mount_frame": "tool0",
               "open_state_ref": "open",
               "output_mode": "commanded",
-              "state_freshness_timeout_s": 1.0,
               "tcp_frame": "grasp_frame",
               "touch_links": [
                 "left_inner_finger",
@@ -156,7 +138,6 @@
             -2.038544566
           ],
           "isaac_profile": "ur10e",
-          "mode": "commanded_sim",
           "planner_rng_seed": 12345,
           "runtime_collision_immediate_query_budget_ms": 75.0,
           "runtime_collision_lookahead_cycle_budget_ms": 350.0,
@@ -245,11 +226,75 @@
   "description": "Retained Isaac UR10e light-scene collision scenario using commanded ROS 2 control execution, the authoritative runtime collision projection, and Kernel-owned Stop evidence.",
   "name": "isaac_manipulator_scene_light_ros2_control_collision",
   "policies": {
+    "component_streams": [
+      {
+        "budget_ns": 2000000000,
+        "controllable_component_id": "isaac_scene_objects",
+        "stream_id": "poses/isaac_cheese_box"
+      }
+    ],
     "interrupt_config": {
       "cancel_validation_timeout_ns": 1000,
       "motion_scope_arm_timeout_ns": 1000,
       "queue_depth": 8,
       "supervisory_poll_rate_hz": 10
-    }
+    },
+    "scene_pose_sources": [
+      {
+        "apply_policy": "continuous_unattached",
+        "scene_resource_id": "isaac_cheese_box",
+        "source_id": "isaac_scene_objects",
+        "source_key": {
+          "simulation_entity": {
+            "entity": "/mac_n_cheese_centered",
+            "source_header_frame_id": "mac_n_cheese_centered"
+          }
+        }
+      },
+      {
+        "apply_policy": "observe_only",
+        "scene_resource_id": "isaac_small_klt",
+        "source_id": "isaac_scene_objects",
+        "source_key": {
+          "simulation_entity": {
+            "entity": "/World/small_KLT",
+            "source_header_frame_id": "small_KLT"
+          }
+        }
+      },
+      {
+        "apply_policy": "observe_only",
+        "scene_resource_id": "isaac_small_klt_01",
+        "source_id": "isaac_scene_objects",
+        "source_key": {
+          "simulation_entity": {
+            "entity": "/World/small_KLT_01",
+            "source_header_frame_id": "small_KLT_01"
+          }
+        }
+      },
+      {
+        "apply_policy": "observe_only",
+        "scene_resource_id": "isaac_soup_can",
+        "source_id": "isaac_scene_objects",
+        "source_key": {
+          "simulation_entity": {
+            "entity": "/World/soup_can",
+            "source_header_frame_id": "soup_can"
+          }
+        }
+      },
+      {
+        "apply_policy": "observe_only",
+        "scene_resource_id": "isaac_table_low_327",
+        "source_id": "isaac_scene_objects",
+        "source_key": {
+          "simulation_entity": {
+            "entity": "/background/table_low_327",
+            "source_header_frame_id": "table_low_327"
+          }
+        }
+      }
+    ]
   }
 }

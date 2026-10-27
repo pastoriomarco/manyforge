@@ -162,6 +162,32 @@ void ExpectHistorianError(Callback &&callback,
   }
 }
 
+// Capture the next SQLite connection on this test thread, so a test can set
+// a small page limit without adding a production-only configuration hook.
+thread_local sqlite3 *captured_test_database = nullptr;
+
+int CaptureTestDatabase(sqlite3 *database, char **, const sqlite3_api_routines *) {
+  captured_test_database = database;
+  return SQLITE_OK;
+}
+
+class ScopedTestDatabaseCapture final {
+public:
+  ScopedTestDatabaseCapture()
+      : entry_(reinterpret_cast<void (*)()>(&CaptureTestDatabase)),
+        result_(sqlite3_auto_extension(entry_)) {
+    captured_test_database = nullptr;
+  }
+  ~ScopedTestDatabaseCapture() {
+    if (result_ == SQLITE_OK) sqlite3_cancel_auto_extension(entry_);
+    captured_test_database = nullptr;
+  }
+  [[nodiscard]] int result() const { return result_; }
+private:
+  void (*entry_)();
+  int result_;
+};
+
 class ControllableStore final : public IEventHistoryStore {
 public:
   AppendStatus Append(const HistorianEvent &event) override {
@@ -170,7 +196,7 @@ public:
     condition_.notify_all();
     condition_.wait(lock, [this]() { return !blocked_; });
     if (failing_) {
-      throw EventHistorianError("injected_storage_failure",
+      throw EventHistorianError(failure_code_,
                                 "injected historian failure");
     }
     const auto encoded =
@@ -209,9 +235,10 @@ public:
     condition_.notify_all();
   }
 
-  void SetFailing(const bool failing) {
+  void SetFailing(const bool failing, std::string code = "injected_storage_failure") {
     std::lock_guard lock(mutex_);
     failing_ = failing;
+    failure_code_ = std::move(code);
     condition_.notify_all();
   }
 
@@ -238,6 +265,7 @@ private:
   std::condition_variable condition_;
   bool blocked_{};
   bool failing_{};
+  std::string failure_code_{"injected_storage_failure"};
   std::size_t append_calls_{};
   std::vector<std::size_t> batch_sizes_;
   std::map<std::string, std::string> events_;
@@ -555,6 +583,36 @@ TEST(EventHistorian, PayloadByteRetentionIsBoundedIndependentlyOfRowCapacity) {
   EXPECT_NE(retention.find("\"retained_count\":\"67\""), std::string::npos);
 }
 
+TEST(EventHistorian, IndexedSearchReflectsPruningAfterRestart) {
+  TemporaryDirectory directory;
+  const auto path = directory.path() / "search-retention.sqlite3";
+  const auto event = [](std::int64_t index, const std::string &tag) {
+    return MakeHistorianEvent(
+        "manyforge.runtime", "operation_progressed", "INFO", index,
+        "2026-09-05T00:00:00Z",
+        CanonicalValue(CanonicalValue::Object{{"tag", CanonicalValue(tag)}}));
+  };
+  const auto check_search = [](SqliteEventHistoryStore &store) {
+    HistorianQuery query;
+    query.search = "retiredneedle";
+    EXPECT_TRUE(store.Query(query).events.empty());
+    query.search = "retainedneedle";
+    const auto page = store.Query(query);
+    ASSERT_EQ(page.events.size(), 1U);
+    EXPECT_EQ(page.events.front().sequence, 3U);
+  };
+  {
+    SqliteEventHistoryStore store(path, 2U);
+    ASSERT_EQ(store.Append(event(1, "retiredneedle")), IEventHistoryStore::AppendStatus::kStored);
+    ASSERT_EQ(store.Append(event(2, "other")), IEventHistoryStore::AppendStatus::kStored);
+    ASSERT_EQ(store.Append(event(3, "retainedneedle")), IEventHistoryStore::AppendStatus::kStored);
+    EXPECT_FALSE(store.Read(1U));
+    check_search(store);
+  }
+  SqliteEventHistoryStore reopened(path, 2U);
+  check_search(reopened);
+}
+
 TEST(EventHistorian, DerivedIndexTamperIsNotPresentedAsAnIntactRecord) {
   TemporaryDirectory directory;
   const auto path = directory.path() / "index-tamper.sqlite3";
@@ -699,6 +757,10 @@ TEST(EventHistorian, NearCapacityLegacyMigrationReusesPrunedPagesBeforeIndexing)
   const auto text = content_identity::canonical_json(page.retention);
   EXPECT_NE(text.find("\"pruned_count\":\"1933\""), std::string::npos);
   EXPECT_NE(text.find("\"prior_pruning_known\":false"), std::string::npos);
+  query.search = "run.legacy";
+  const auto searched = upgraded.Query(query);
+  ASSERT_EQ(searched.events.size(), 1U);
+  EXPECT_EQ(searched.events.front().event.event_id, last_identity);
   EXPECT_LE(std::filesystem::file_size(path), 512U * 1024U * 1024U);
   // The migration's write-ahead log is reclaimed before the store is used.
   const auto wal = std::filesystem::path(path.string() + "-wal");
@@ -789,6 +851,32 @@ TEST(EventHistorian, BusyAndReadonlyStorageNeverClaimsSuccessfulPersistence) {
   std::filesystem::permissions(path, std::filesystem::perms::owner_read | std::filesystem::perms::owner_write);
   SqliteEventHistoryStore recovered(path, 2U);
   EXPECT_TRUE(recovered.Read(1U));
+}
+
+TEST(EventHistorian, SqlitePageLimitReportsStorageFullAndKeepsCommittedEvents) {
+  TemporaryDirectory directory;
+  ScopedTestDatabaseCapture capture;
+  ASSERT_EQ(capture.result(), SQLITE_OK);
+  SqliteEventHistoryStore store(directory.path() / "full.sqlite3", 100U);
+  ASSERT_NE(captured_test_database, nullptr);
+  ASSERT_EQ(store.Append(Event(1U)), IEventHistoryStore::AppendStatus::kStored);
+
+  // SQLite clamps the requested limit to the current page count. The large
+  // second event must allocate more pages and returns SQLite's real FULL.
+  ASSERT_EQ(sqlite3_exec(captured_test_database, "PRAGMA max_page_count=1", nullptr,
+                         nullptr, nullptr), SQLITE_OK);
+  const auto second = MakeHistorianEvent(
+      "manyforge.runtime", "observation", "INFO", 2, "2026-09-06T12:00:00Z",
+      CanonicalValue(CanonicalValue::Object{{"blob", CanonicalValue(std::string(250000U, 'x'))}}));
+  ExpectHistorianError([&] { static_cast<void>(store.Append(second)); },
+                       "historian_storage_full");
+  EXPECT_TRUE(store.Read(1U));
+  EXPECT_FALSE(store.Read(2U));
+
+  ASSERT_EQ(sqlite3_exec(captured_test_database, "PRAGMA max_page_count=131072", nullptr,
+                         nullptr, nullptr), SQLITE_OK);
+  EXPECT_EQ(store.Append(second), IEventHistoryStore::AppendStatus::kStored);
+  EXPECT_TRUE(store.Read(2U));
 }
 
 TEST(EventHistorian, BatchCommitsTheEventsBeforeAFailureAndRollsBackOnlyTheFailingEvent) {
@@ -1291,7 +1379,7 @@ TEST(EventHistorian,
 TEST(EventHistorian,
      FailedWriteIsRetriedWithoutLosingFactAndCannotSelfReconcile) {
   auto store = std::make_shared<ControllableStore>();
-  store->SetFailing(true);
+  store->SetFailing(true, "historian_storage_full");
   AsyncEventHistorian historian(store, 4U);
   EXPECT_TRUE(historian.TryEnqueue(Event(1U)));
   ASSERT_TRUE(store->WaitForAppendCalls(1U, 2s));
@@ -1303,6 +1391,7 @@ TEST(EventHistorian,
     std::this_thread::yield();
   } while (failed.available && std::chrono::steady_clock::now() < deadline);
   ASSERT_FALSE(failed.available);
+  EXPECT_EQ(failed.error_code, "historian_storage_full");
   EXPECT_FALSE(failed.recovery_ready);
   EXPECT_FALSE(historian.ReconcileHealth(failed.health_generation));
 

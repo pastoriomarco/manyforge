@@ -8,12 +8,12 @@
   "description": "R5 trial (c): per-group failure hold. An unreachable move (1 automatic retry) holds for intervention in arm_group (intervention_stop_scope own_groups). Retry re-runs it; Continue fails the node so the Fallback takes the reachable alternative.",
   "members": {
     "assignment.yaml": "sha256:f4dd3bfffcc14e0cb446f820e79e2405f4477ecbc470ca9fdc127dce17086e06",
-    "deployment.yaml": "sha256:180af7bcc7be010bc3fbd5e8c2d56b8e4bd3464b5f05eee574010c52071db1c4",
+    "deployment.yaml": "sha256:9ae56dbfa802dc1b621278710f99a6c69a2cb9382355a7a7521ffba9da93fe92",
     "program.yaml": "sha256:597cbee2f6c7c116f0510ebc096f27eff3deffb862b05463b471133ec3589ad5"
   },
   "name": "r5_trial_c_hold",
   "saved_status": {
-    "checked_content_digest": "sha256:c347b5113799d172d05688f9525cb4da2f92b0157edee290c4241c8244446d9c",
+    "checked_content_digest": "sha256:b66a8bdb2acbee0af9f44b3e63fa0a2ea8ff510d4b802dc56b6f706436fb3664",
     "last_known_status": "unknown",
     "manyforge_version": "0.1.0"
   },
@@ -97,7 +97,7 @@
         "source_id": "component:lite6_robot:srdf"
       },
       {
-        "content_digest": "sha256:448485049362a14643f3a6418cee4a9e2119bc86509f0a127607aad54803b641",
+        "content_digest": "sha256:c205aea7474737989e1195fbbff16cb9d3f287fee3cefcd550c7ad2e4e606e90",
         "source_id": "component:lite6_robot:urdf"
       }
     ],

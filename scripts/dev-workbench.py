@@ -41,6 +41,7 @@ WORKSPACE = Path("/workspace")
 CACHE_ROOT = Path("/runner")
 BUILD_ROOT = CACHE_ROOT / "build"
 STATE_ROOT = Path(os.environ.get("MANYFORGE_DEV_STATE_ROOT", "/tmp/manyforge-state"))
+ASSISTANT_BRIDGE_PORT = 8100
 HEADLESS_BUILD = BUILD_ROOT / "headless"
 DEPLOYMENT_AUTHORING_BUILD = BUILD_ROOT / "deployment-authoring"
 BOOTSTRAP_ROOT = CACHE_ROOT / "repository-bootstrap-package"
@@ -115,6 +116,13 @@ def _project_scenario_id(raw_path: str, *, allowed_root: Path) -> str:
 
 def _json(value: Any) -> str:
     return json.dumps(value, allow_nan=False, indent=2, sort_keys=True)
+
+
+def _composer_filesystem_roots(artifact_root: Path) -> str:
+    """Keep examples available alongside folders mounted by the launcher."""
+
+    extra_roots = os.environ.get("MANYFORGE_DEV_PROJECT_ROOTS", "")
+    return f"{artifact_root},{extra_roots}" if extra_roots else str(artifact_root)
 
 
 def _run(
@@ -663,6 +671,7 @@ class Workbench:
         composer_static_dir: Path | None = None,
         composer_bind_host: str = "127.0.0.1",
         simulation_control_config: Path | None = None,
+        site_settings: Path | None = None,
         package_aggregate_digest: str | None = None,
         operator_instance_id: str | None = None,
         node_catalog_path: Path | None = None,
@@ -683,6 +692,7 @@ class Workbench:
         self.composer_static_dir = composer_static_dir
         self.composer_bind_host = composer_bind_host
         self.simulation_control_config = simulation_control_config
+        self.site_settings = site_settings
         self.package_aggregate_digest = package_aggregate_digest
         self.operator_instance_id = operator_instance_id
         self.node_catalog_path = node_catalog_path or NODE_CATALOG
@@ -742,12 +752,32 @@ class Workbench:
             base_url,
             "--headless-api-timeout-s",
             "20",
+            "--assistant-bridge-url",
+            f"http://127.0.0.1:{ASSISTANT_BRIDGE_PORT}",
         ]
         if self.composer_static_dir is not None:
             command.extend(("--static-dir", str(self.composer_static_dir)))
         if self.project_path is not None:
             command.extend(("--startup-scenario-document", self.project_path))
         return command
+
+    def _assistant_bridge_environment(self, base_url: str) -> dict[str, str]:
+        # The bridge always runs; it serves only when the active Deployment has
+        # an AI model component, whose endpoint it reads per request.
+        environment = os.environ.copy()
+        environment.update(
+            {
+                "MANYFORGE_HEADLESS_API_URL": base_url,
+                "MANYFORGE_COMPOSER_URL": f"http://127.0.0.1:{self.composer_port}",
+                "MANYFORGE_ASSISTANT_BRIDGE_HOST": "127.0.0.1",
+                "MANYFORGE_ASSISTANT_BRIDGE_PORT": str(ASSISTANT_BRIDGE_PORT),
+                # Rotated by the bridge at 10 MB x 3 files.
+                "MANYFORGE_ASSISTANT_AUDIT_LOG": str(
+                    self.runtime_root / "assistant-bridge" / "audit.jsonl"
+                ),
+            }
+        )
+        return environment
 
     def _runtime_targets(self) -> tuple[Path, ...]:
         return _ensure_current_ros_backend()
@@ -766,6 +796,12 @@ class Workbench:
             timeout_seconds = max(0.0, self._readiness_deadline - time.monotonic())
         return _wait_until(description, predicate, processes, timeout_seconds=timeout_seconds)
 
+    def _site_manager_arguments(self) -> tuple[str, ...]:
+        # Machine facts only (manyforge.site.v1); the Manager validates the file.
+        if self.site_settings is None:
+            return ()
+        _regular_file(self.site_settings, "site settings")
+        return ("--site-settings", str(self.site_settings))
     def start(self) -> None:
         if not self.ros2_control:
             raise WorkbenchError("workbench requires ROS control; native execution is unavailable")
@@ -801,6 +837,7 @@ class Workbench:
             self.headless_port,
             self.runner_port,
             self.composer_port,
+            ASSISTANT_BRIDGE_PORT,
             *((self.frontend_port,) if not operator_mode else ()),
         ):
             if not _port_available(port):
@@ -999,7 +1036,7 @@ class Workbench:
                 # as examples/<name>/meshes/*.obj resolve below the checkout.
                 "--scene-asset-root",
                 str(WORKSPACE),
-            ),
+            ) + self._site_manager_arguments(),
         )
         self._wait_until(
             "Manager command socket",
@@ -1050,6 +1087,13 @@ class Workbench:
                 timeout_seconds=None,
             )
 
+        print("starting Assistant bridge", flush=True)
+        bridge = subprocess.Popen(
+            [sys.executable, "-m", "manyforge_assistant_bridge.bridge"],
+            env=self._assistant_bridge_environment(base_url),
+        )
+        self.processes.append(("Assistant bridge", bridge))
+
         composer_environment = os.environ.copy()
         previous_report = self._previous_session_report()
         if previous_report is not None:
@@ -1060,11 +1104,10 @@ class Workbench:
             f"http://localhost:{self.frontend_port},"
             f"http://127.0.0.1:{self.frontend_port}"
         )
-        composer_environment["MANYFORGE_FS_ROOTS"] = str(self.artifact_root)
-        composer_environment["MANYFORGE_PROGRAM_WRITE_ROOTS"] = str(self.artifact_root)
-        composer_environment["MANYFORGE_DEPLOYMENT_WRITE_ROOTS"] = str(
-            self.artifact_root
-        )
+        composer_roots = _composer_filesystem_roots(self.artifact_root)
+        composer_environment["MANYFORGE_FS_ROOTS"] = composer_roots
+        composer_environment["MANYFORGE_PROGRAM_WRITE_ROOTS"] = composer_roots
+        composer_environment["MANYFORGE_DEPLOYMENT_WRITE_ROOTS"] = composer_roots
         print("starting Composer backend", flush=True)
         # Composer owns only process-lifetime Draft state. Runtime transitions
         # are durable Manager operations and need no Composer state root.
@@ -1265,13 +1308,17 @@ class Workbench:
             for process_name, process in reversed(self.processes):
                 if process_name == name:
                     verified = self._terminate(process) and verified
+        # Stop the alarm owner before the providers it evaluates. Headless
+        # treats Manager sources going stale after a complete baseline as an
+        # unexplained provider loss; stopping Manager first raised one
+        # provider_unavailable alarm on every workbench stop.
+        for process_name, process in reversed(self.processes):
+            if process_name == "Headless API":
+                verified = self._terminate(process) and verified
         verified = self._stop_manager() and verified
         verified = self._wait_for_program_runner_manager_expiry() and verified
         for process_name, process in reversed(self.processes):
             if process_name == "Program runner":
-                verified = self._terminate(process) and verified
-        for process_name, process in reversed(self.processes):
-            if process_name == "Headless API":
                 verified = self._terminate(process) and verified
         for name, process in reversed(self.processes):
             if name not in {
@@ -1339,6 +1386,7 @@ def _parser() -> argparse.ArgumentParser:
             command.add_argument("--composer-static-dir", type=Path)
             command.add_argument("--composer-bind-host", default="127.0.0.1")
             command.add_argument("--simulation-control-config", type=Path)
+            command.add_argument("--site-settings", type=Path)
             command.add_argument("--package-aggregate-sha256")
     return parser
 
@@ -1383,6 +1431,7 @@ def main(argv: Sequence[str] | None = None) -> int:
             composer_static_dir=args.composer_static_dir,
             composer_bind_host=args.composer_bind_host,
             simulation_control_config=args.simulation_control_config,
+            site_settings=args.site_settings,
             package_aggregate_digest=args.package_aggregate_sha256,
             operator_instance_id=args.operator_instance_id,
             node_catalog_path=args.node_catalog_path,

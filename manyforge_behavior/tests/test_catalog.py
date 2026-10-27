@@ -23,7 +23,7 @@ from manyforge_behavior.node_registry import build_node_registry
 
 
 CATALOG_PATH = Path(__file__).parent.parent / "resources" / "node_catalog.yaml"
-EXPECTED_CATALOG_DIGEST = "sha256:29eaa1447b105a20b4582b508938ac0ba97d77b9fcdc26cd97467b42b628dc93"
+EXPECTED_CATALOG_DIGEST = "sha256:b9d90f6ec180af69c9f342b4d7c995668693ef16854e7ab8df177381c5db9806"
 
 
 def _catalog_data() -> dict[str, object]:
@@ -365,6 +365,24 @@ def test_attach_node_grasp_lost_bound_parameters_have_defaults() -> None:
         assert parameter.required is False
         assert parameter.has_default is True
         assert parameter.default == default
+
+
+@pytest.mark.parametrize("parameter_id", [
+    "grasp_lost_translation_m",
+    "grasp_lost_rotation_rad",
+])
+@pytest.mark.parametrize("value,valid", [
+    (-0.01, False),
+    (0.0, False),
+    (0.01, True),
+])
+def test_attach_node_grasp_lost_bounds_require_positive_values(
+    parameter_id, value, valid,
+) -> None:
+    catalog = NodeCatalog(CATALOG_PATH)
+    attach = catalog.get("scene.attach_carried_object")
+    parameter = next(row for row in attach.parameters if row.id == parameter_id)
+    assert (not validate_value(parameter.schema, value, registry=catalog.schema_registry)) is valid
 
 
 def test_recomputed_catalog_rejects_unknown_semantic_scope_parameter(

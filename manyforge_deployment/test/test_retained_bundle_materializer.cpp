@@ -1867,6 +1867,40 @@ TEST(RetainedBundleMaterializer,
                RetainedBundleError);
 }
 
+// D11: a controller profile row's tool payload decodes exactly or refuses.
+TEST(RetainedBundleMaterializer, Ros2ControlToolPayloadDecodesExactlyOrRefuses) {
+  using Json = core::JsonValueDTO;
+  const auto payload = [](Json mass, Json::Array center) {
+    return Json{core::JsonObjectDTO{{"mass_kg", std::move(mass)},
+                                    {"center_of_mass_m", Json{std::move(center)}}}};
+  };
+  const auto decoded = detail::decode_ros2_control_tool_payload(
+      payload(Json{0.3}, {Json{0.0}, Json{0.01}, Json{0.05}}));
+  EXPECT_DOUBLE_EQ(decoded.mass_kg, 0.3);
+  EXPECT_EQ(decoded.center_of_mass_m, (std::array<double, 3>{0.0, 0.01, 0.05}));
+  EXPECT_DOUBLE_EQ(detail::decode_ros2_control_tool_payload(
+                       payload(Json{0.0}, {Json{0.0}, Json{0.0}, Json{0.0}}))
+                       .mass_kg,
+                   0.0);
+  auto extra = payload(Json{0.3}, {Json{0.0}, Json{0.0}, Json{0.0}});
+  std::get<core::JsonObjectDTO>(extra.value).emplace("unit", Json{std::string("kg")});
+  for (const auto &invalid : {
+           payload(Json{-0.1}, {Json{0.0}, Json{0.0}, Json{0.0}}),
+           payload(Json{std::numeric_limits<double>::quiet_NaN()},
+                   {Json{0.0}, Json{0.0}, Json{0.0}}),
+           payload(Json{std::string("0.3")}, {Json{0.0}, Json{0.0}, Json{0.0}}),
+           payload(Json{0.3}, {Json{0.0}, Json{0.0}}),
+           payload(Json{0.3}, {Json{0.0}, Json{0.0}, Json{std::string("z")}}),
+           payload(Json{0.3},
+                   {Json{0.0}, Json{0.0}, Json{std::numeric_limits<double>::infinity()}}),
+           extra,
+           Json{0.3},
+       }) {
+    EXPECT_THROW(static_cast<void>(detail::decode_ros2_control_tool_payload(invalid)),
+                 RetainedBundleError);
+  }
+}
+
 TEST(RetainedBundleMaterializer,
      Ros2ControlConfigurationRejectsSchemaValidLimitForAnUnhostedTarget) {
   const auto fixture = test::make_lite6_ros2_control_motion_retention_fixture(
@@ -2882,21 +2916,9 @@ TEST(RetainedBundleMaterializer,
                    canonical_json(changed_root))),
                RetainedBundleError);
 
-  CanonicalValue::Array resources =
-      array_member(bundle->normalized_root(), "external_resources");
-  ASSERT_EQ(resources.size(), 2U);
-  ASSERT_EQ(string_member(resources.front(), "external_resource_alias"),
-            "assistant_bridge");
-  resources.front() = replace_object_member(resources.front(), "resource_kind",
-                                            CanonicalValue("model_endpoint"));
-  CanonicalValue changed_resources_root =
-      replace_root_member(bundle->normalized_root(), "external_resources",
-                          CanonicalValue(std::move(resources)));
-  changed_resources_root =
-      reidentify_retained_bundle(std::move(changed_resources_root));
-  EXPECT_THROW(static_cast<void>(detail::RetainedBundleReloadAuthority::reload(
-                   canonical_json(changed_resources_root))),
-               RetainedBundleError);
+  // Assistant aliases no longer resolve against external_resources (batch I:
+  // models are served by the AI model component), so an external resource
+  // kind change is not an assistant requalification failure.
 }
 
 TEST(RetainedBundleMaterializer,
@@ -3738,7 +3760,9 @@ TEST(RetainedBundleMaterializer,
 TEST(RetainedBundleMaterializer, ScenePosePolicySelectionSurvivesSealedReload) {
   test::InMemoryRawArtifactStoreFixture store;
   const std::vector<core::ScenePoseSourcePolicyDTO> policies{
-      {"camera", "part", "continuous_unattached"}};
+      {"camera", "part",
+       core::ScenePoseDetection3dKeyDTO{"part", "", 0.5, 0.0025, "first"},
+       "continuous_unattached"}};
   const auto ordinary = materialize_empty("i3_pose_policy_cell", store, 1.0);
   const auto selected = materialize_empty("i3_pose_policy_cell", store, 1.0,
                                           std::nullopt, policies);
@@ -3750,7 +3774,10 @@ TEST(RetainedBundleMaterializer, ScenePosePolicySelectionSurvivesSealedReload) {
   EXPECT_EQ(reloaded->value(), selected->value());
   const auto tampered = replace_root_member(
       selected->normalized_root(), "scene_pose_sources",
-      EncodeScenePoseSources({{"camera", "part", "continuous"}}));
+      EncodeScenePoseSources(
+          {{"camera", "part",
+            core::ScenePoseDetection3dKeyDTO{"part", "", 0.5, 0.0025, "first"},
+            "continuous"}}));
   EXPECT_THROW(static_cast<void>(detail::RetainedBundleReloadAuthority::reload(
                    canonical_json(tampered))),
                RetainedBundleError);

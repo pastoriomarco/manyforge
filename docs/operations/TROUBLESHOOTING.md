@@ -27,7 +27,7 @@ the existing operations docs cross-linked below.
 | Retry/Resume/Reset only works on the second press                              | Stale recovery offer/presentation or a lifecycle command still pending; this is not expected UX                     | Save cycle status, alarm snapshot, and execution history; see [§Alarm and recovery behavior](#alarm-and-recovery-behavior)              |
 | "Collision validation rejected trajectory"                                     | Stale pose source, scene drift, or genuine collision                                                                | See [§Collision rejection](#collision-rejection) below                                                                                  |
 | "Motion execution ended in interrupted"                                        | Kernel-native interrupt latched (collision fault, signal source)                                                    | See [§Motion ended interrupted](#motion-ended-interrupted) below                                                                        |
-| Assistant chat answers in canned/mock voice                                    | Required fields missing on `POST /api/assistant/chat`                                                               | See [§Assistant fell back to mock](#assistant-fell-back-to-mock) below                                                                  |
+| AI tab disabled or chat request fails | No `ai_model` component / assistant profile, model server down, token variable unset | See [§AI assistant](#ai-assistant) below |
 | Isaac lane: never out of "waiting for FJT action / `/joint_states`"            | Isaac not running, controller config not spawned, DDS isolation                                                     | See [§ros2_control discovery failing](#ros2_control-discovery-failing) below                                                            |
 | Floating / disconnected URDF mesh pieces                                       | Compound `<origin rpy=…>` on `<visual>` block                                                                       | See [`ADDING_A_ROBOT.md`](ADDING_A_ROBOT.md) §Troubleshooting "Floating / disconnected mesh pieces"                                     |
 | Mesh 404 in browser network tab                                                | OBJ missing or `trimesh.load` failed                                                                                | See [`ADDING_A_ROBOT.md`](ADDING_A_ROBOT.md) §"404 on a mesh URL"                                                                       |
@@ -99,7 +99,8 @@ ids, and collision-world revision when available.
 **Common causes**:
 
 - Stale pose source after a scene edit (Isaac lane especially).
-  Confirm `pose_sources.<id>.apply_policy` in the deployment — Isaac
+  Confirm the object's `policies.scene_pose_sources` row `apply_policy`
+  in the deployment — Isaac
   scenes typically use `continuous_unattached` or `before_planning`
   (see [`DEVELOPMENT_WORKBENCH.md`](DEVELOPMENT_WORKBENCH.md)).
 - Genuine collision the operator did not anticipate. Use
@@ -151,44 +152,19 @@ the cause.
 **Adjacent reference**: use the generated REST contract and execution-history
 event payloads; source locations are implementation detail and may move.
 
-### Assistant fell back to mock
+### AI assistant
 
-**Symptom**: `POST /api/assistant/chat` returns a request that, when
-polled via `GET /api/assistant/requests/{requestId}`, has
-`providerId: "mock"` instead of the configured provider (e.g.
-`"openclaw"`). The chat response carries a canned warning. Composer
-logs do **not** flag this as an error — the fallback is silent.
+**Symptom**: the AI tab says "No AI model component in this Deployment", or a
+chat request fails with a typed code.
 
-**Cause**: the request body omitted `mode: "provider"` and/or
-`assistantMode: "composer-assistant"`. Without `mode`, dispatch routes
-to the built-in scaffold provider regardless of
-`configuredProviderId`. Without `assistantMode`, the contract layer
-rejects because deployments expose multiple bounded-autonomy modes.
-
-**Diagnostic**:
-
-```bash
-# Correct invocation
-curl -s http://127.0.0.1:9000/api/assistant/chat \
-  -H 'content-type: application/json' \
-  -d '{"message":"reply with just OK","mode":"provider","assistantMode":"composer-assistant"}' \
-  | jq -r .requestId
-
-# Verify provider id (replace <id>)
-curl -s http://127.0.0.1:9000/api/assistant/requests/<id> | jq .providerId
-# Expected: "openclaw" (or the configured provider). "mock" means a missing field.
-```
-
-**Independent verification of the provider wiring**:
-
-- `GET /api/infra/model-endpoints` — shows configured endpoints + a
-  live `/v1/models` probe.
-- `GET /api/assistant/providers` — lists registered providers.
-- `GET /api/runtime/status` — merged provider state.
-
-**Adjacent reference**: full wire-contract details in
-[`ASSISTANT_E2E_COOKBOOK.md`](ASSISTANT_E2E_COOKBOOK.md) §"Composer
-chat HTTP contract — required fields".
+**Cause and step**: the tab needs an assistant profile and an `ai_model`
+component for its chat alias in the active Deployment; requests need the model
+server to serve the component's `model` and, when `api_key_env` is set, that
+`MANYFORGE_AI_*` variable exported before starting the workbench. Check `GET /api/health`
+(`assistant_bridge: configured`), `GET /api/assistant/modes`
+(`ai_model_component_id`), the `endpoint` component stream, and
+`curl {base_url}/models`. Codes are listed in
+[`ASSISTANT_E2E_COOKBOOK.md`](ASSISTANT_E2E_COOKBOOK.md) §"Failure codes".
 
 ### ros2_control discovery failing
 
@@ -311,9 +287,8 @@ remediations stay in the workflow docs:
 - [`ADDING_A_ROBOT.md`](ADDING_A_ROBOT.md) §"Troubleshooting"
   (lines 312-381) — URDF/mesh rendering, mimic chains,
   Robot Control joint-limit errors, frame visibility.
-- [`ASSISTANT_E2E_COOKBOOK.md`](ASSISTANT_E2E_COOKBOOK.md) §"Composer
-  chat HTTP contract — required fields" (lines 474-517) — the canonical
-  source for the mock-fallback gotcha.
+- [`ASSISTANT_E2E_COOKBOOK.md`](ASSISTANT_E2E_COOKBOOK.md) — AI assistant
+  setup, checks and failure codes.
 
 ## Capturing a failure for later analysis
 

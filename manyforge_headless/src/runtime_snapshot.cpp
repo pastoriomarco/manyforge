@@ -67,6 +67,27 @@ bool RequiredBool(const CanonicalValue &root, const std::string_view name) {
   return *value;
 }
 
+// CP8 step 1: one closed `{controllable_component_id, simulator}` row per
+// ROS-hosted component. Optional so older Manager publications stay readable.
+void ValidateComponentSimulatorDependencies(const CanonicalValue &rows) {
+  Require(rows.is_array(),
+          "Manager component_simulator_dependencies must be an array");
+  std::vector<std::string> components;
+  components.reserve(rows.as_array().size());
+  for (const auto &row : rows.as_array()) {
+    Require(row.is_object() && row.as_object().size() == 2U,
+            "Manager component simulator dependency is not the closed v1 shape");
+    const auto simulator = RequiredString(row, "simulator");
+    Require(simulator == "none" || simulator == "isaac",
+            "Manager component simulator dependency is unsupported");
+    components.push_back(RequiredString(row, "controllable_component_id"));
+  }
+  std::sort(components.begin(), components.end());
+  Require(std::adjacent_find(components.begin(), components.end()) ==
+              components.end(),
+          "Manager component simulator dependencies repeat a component");
+}
+
 void ValidateManagerPayload(const CanonicalValue &payload,
                             const std::string &cell_id) {
   Require(payload.is_object() && payload.as_object().size() == 6U,
@@ -77,7 +98,11 @@ void ValidateManagerPayload(const CanonicalValue &payload,
   Require(RequiredString(payload, "cell_id") == cell_id,
           "Manager source payload belongs to a different cell");
   const auto &active = RequiredMember(payload, "active");
-  Require(active.is_object() && active.as_object().size() == 5U,
+  Require(active.is_object(),
+          "Manager active payload is not the closed v1 shape");
+  const auto *dependencies =
+      active.find_object_member("component_simulator_dependencies");
+  Require(active.as_object().size() == (dependencies == nullptr ? 5U : 6U),
           "Manager active payload is not the closed v1 shape");
   static_cast<void>(RequiredBool(active, "canonical_empty"));
   static_cast<void>(RequiredString(active, "graph_revision"));
@@ -86,6 +111,9 @@ void ValidateManagerPayload(const CanonicalValue &payload,
           "Manager active cell_graph must be an object");
   Require(RequiredMember(active, "publication").is_object(),
           "Manager active publication must be an object");
+  if (dependencies != nullptr) {
+    ValidateComponentSimulatorDependencies(*dependencies);
+  }
   const auto manager_ready = RequiredBool(payload, "manager_ready");
   const auto &runtime = RequiredMember(payload, "runtime");
   Require(RequiredMember(payload, "apply").is_object() && runtime.is_object(),

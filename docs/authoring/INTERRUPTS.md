@@ -3,8 +3,58 @@
 # Interrupts
 
 An interrupt stops a robot's motion when a condition becomes true, for
-example "a part was detected" or "the light curtain opened". ManyForge has
-two kinds of interrupt rules, and they are fully separate:
+example "a part was detected" or "the light curtain opened". The
+[Concepts](#concepts) section below explains the model: what a rule can read,
+the two kinds of rules, and how fast they react. Sections 1 to 7 are the
+reference for writing conditions and rules.
+
+## Concepts
+
+### Signals
+
+A **signal** is a named value that a component publishes, for example
+`part_present` on an I/O box or `curtain_clear` on a station. Each signal has
+a source (the component that publishes it), a publishing rate and a freshness
+budget: the time within which a new reading must arrive for the value to
+count as current. Signal values are `true` or `false`.
+
+You can use a signal in several places:
+
+- a Program reads it (Get input, Check input) or waits for it;
+- the GUI shows its current value (Tool & I/O panel);
+- interrupt rules watch it.
+
+**I/O** is the physical part of the signals: the digital inputs and outputs
+of devices. Not every signal is I/O. For example, the geometric contact
+detector publishes a contact signal computed from the Scene, with no
+physical input behind it. In the code, the part that holds all signals is
+still called the "I/O signal subsystem".
+
+Interrupt rules only **read** signals. Writing an output (Set output) is a
+Program action, never the effect of a rule.
+
+### Blackboard keys as rule inputs
+
+The second kind of input is a **blackboard key** that the Program writes
+(see [Blackboard keys](BLACKBOARD_KEYS.md)). A rule can compare signals and
+keys together, with `==`, `!=`, `<`, `<=`, `>`, `>=` combined by AND, OR and
+NOT (section 2).
+
+- A key that a rule reads must declare `initial:`, so that the rule has a
+  value from the start.
+- Every write to such a key is sent to the rule evaluation at once; the rule
+  does not wait for a periodic check.
+- A formula key (`expression:`) cannot be read by a rule: it has no
+  `initial:` and is never written. Compute the value with a **Set value**
+  node into a normal key instead.
+
+The usual pattern: a part of the Program tree computes a value and writes it
+to a key; a rule reacts to that key.
+
+### Interrupt rules
+
+An **interrupt rule** is a condition plus a reaction. There are two kinds,
+and they are fully separate:
 
 | | Node rule | Global rule |
 | --- | --- | --- |
@@ -13,16 +63,114 @@ two kinds of interrupt rules, and they are fully separate:
 | What it stops | That move | Every motion in its scope |
 | What it decides | The node's result (success or failure) | Nothing in the Program directly; it publishes its state in `interrupt_state.<rule_id>` |
 
+A global rule reacts in one of two ways (`on_trip`, section 4):
+
+- `gate` (default): while the condition is true, new motion in the scope is
+  not started, and a motion that is moving gets its Stop. When the condition
+  clears, motion is allowed again with no acknowledgement. A motion node of a
+  running Program that is held back this way does not fail: it **waits**
+  ("Motion waits"), within its `execution_timeout_s`, and starts when the
+  rule clears.
+- `full_stop`: a moving robot in the scope triggers a cell Full Stop, and the
+  rule latches until the operator releases it in the GUI. The
+  `idle_behaviour` setting exists only for this reaction.
+
+### How rules are evaluated
+
+- Sources publish readings to the rule evaluator. Each new reading, and
+  each write to a key a rule reads, starts a new evaluation of the rules that
+  read it.
+- Reaction time depends on the source's publishing interval and on system
+  scheduling. The publishing rate alone is not a response-time guarantee.
+- Each global rule's state is copied periodically to the Program as
+  `interrupt_state.<rule_id>`, for checks, waits and conditions. The rule
+  does not wait for that copy before acting. A gated motion node uses the
+  copy, so its release can be observed later than the rule clears.
+
+### Which input to use
+
+| | Component signal | Key written by the Program |
+| --- | --- | --- |
+| When it is active | Always, with or without a Program or Run | Only while a Program that declares the key is applied |
+| Freshness | Checked: a source that stops reporting is detected | Not checked: the key keeps its last value |
+| If it fails | A lost or stale source guarding motion gives that motion its configured Stop; the motion never resumes by itself | Nothing detects it; the value is only as current as the part of the tree that writes it |
+| How current | The source's publishing rate | The loop of the part of the tree that writes it |
+| Use it for | Protection that must always act (light curtain, door, part sensor) | Program-phase logic (counts, modes, "this step is done") |
+
+A rule that reads both kinds does not act while no Program is applied
+(section 4). If part of it must always act, write that part as a separate
+rule that reads signals only.
+
+### Worked example: a counted tray gates the loader
+
+A loader robot places parts into a tray of 12 slots. When the tray is full,
+the loader must not start another place move until the operator has swapped
+the tray. The Program counts the parts; a global rule reacts to the count.
+
+1. The Program declares the counter, with `initial:` so a rule can read it:
+
+   ```yaml
+   blackboard:
+     keys:
+       - key: tray.count
+         type: int64
+         access: read_write
+         persistence: run
+         initial: 0
+         description: Parts placed in the current tray
+   ```
+
+1. After each place move, a **Set value** node writes `tray.count` from the
+   formula `key.tray.count + 1`.
+1. A parallel branch of the tree waits for the input `tray_swapped` (**Wait
+   for input**), then sets `tray.count` back to `0`.
+1. The Deployment adds a global rule that gates the loader's execution group:
+
+   ```yaml
+   policies:
+     interrupt_rules:
+       - rule_id: tray_full
+         condition: {compare: {operand: {key: tray.count}, op: ">=", value: 12}}
+         scope: {execution_groups: [loader]}
+         on_trip: gate
+   ```
+
+What happens: the 12th Set value write reaches the rule at once and the rule
+trips. The next place move of the loader is not started; the node shows
+"Motion waits". When the operator swaps the tray, the branch resets the
+counter, the rule clears, and the waiting node starts its move. If the swap
+takes longer than the node's `execution_timeout_s`, the node fails as if it
+had been refused at once.
+
+The tray counter is Program logic, so a key is the right input. A light
+curtain in the same cell would use a signal in its own signal-only rule, so it
+also protects motion when no Program is applied.
+
+### What is not an interrupt rule
+
+These checks also stop motion, but through their own owners. They are not
+configured as interrupt rules and do not appear in `interrupt_state.*`:
+
+- **Grasp lost:** when a carried object leaves its bound, the robot gets its
+  Stop, the object is detached, and the alarm `scene.carried_object_lost` is
+  raised.
+- **Runtime collision monitor:** a collision it finds stops the motion
+  through the normal Stop path.
+- **Component stream faults:** when a required stream of a component stops
+  reporting, the component is shown as faulted and motion is stopped and
+  blocked.
+
+### Interrupts are operational
+
 Interrupts are operational stops, not safety functions. Real emergency stops
 belong to the cell's safety controller.
-
-Blackboard keys are described in [Blackboard keys](BLACKBOARD_KEYS.md).
 
 ## 1. What a condition can read
 
 A condition compares values. Each comparison reads one of these:
 
-- **A signal**: a digital or analog input.
+- **A signal**: a true/false signal of a component (see
+  [Signals](#signals)).
   - In a node rule, choose an input of the node's robot, written
     `{signal: {target_role: arm, resource_role: part_present}}`.
   - In a global rule, choose an input of a Deployment component, written
@@ -130,8 +278,7 @@ policies:
       condition: {compare: {operand: {signal: {controllable_component_id: station, signal_name: curtain_clear}}, op: "==", value: false}}
       scope: all_motion
       priority: 0
-      idle_behaviour: latch           # optional
-      latch_release: operator         # optional
+      on_trip: gate                   # optional: gate | full_stop
       stop_entry_stage_id: software_hard   # optional
 ```
 
@@ -141,8 +288,8 @@ policies:
 | `condition` | The condition (section 2) | required |
 | `scope` | What it stops (below) | required |
 | `priority` | 0 to 100 | 0 |
-| `idle_behaviour` | `latch` or `ignore` (below) | see below |
-| `latch_release` | `operator` or `auto_on_clear` (below) | `operator` |
+| `on_trip` | `gate` or `full_stop` (below) | `gate` |
+| `idle_behaviour` | `latch` or `ignore`, only with `on_trip: full_stop` (below) | see below |
 | `stop_entry_stage_id` | The Stop stage to start from (section 5) | the robot's first stage |
 
 A global rule has no `on_signal`, `on_no_signal` or
@@ -158,15 +305,36 @@ A global rule has no `on_signal`, `on_no_signal` or
 - `everything`: the existing Full Stop. All motion and all other commands
   stop, including outputs and grippers.
 
-**When it trips:**
+**What a trip does (`on_trip`):**
 
-1. The motion in scope stops, starting from the chosen stage.
-1. The rule latches. A latched rule blocks new motion in its own scope only.
-1. Its state key `interrupt_state.<rule_id>` changes to `tripped`, then
-   `latched`.
+- `gate` (default): while the condition is true, new motion in the scope is
+  refused before it starts (`global_interrupt_gated`, naming the rule; the
+  GUI shows it as "Motion waits", not as a fault). A motion in the scope
+  that is moving gets its Stop, starting from the chosen stage (scope
+  `everything`: the Full Stop). When the condition is no longer true, motion
+  is allowed again with no acknowledgement. This holds whether or not
+  anything moves or a Run is in progress.
+  A motion node of a running Program that the gate refuses does not fail: it
+  waits (RUNNING, shown as "Motion waits") and starts once the rule is read
+  `clear` again. Its `execution_timeout_s` (Program time) bounds the wait;
+  on expiry the node fails with the gate refusal, as it would have at once.
+  Halt pauses the wait and its time; Stop and Reset end it like any running
+  node, and no motion starts by itself after them. A motion that
+  was already moving is stopped, not waited: its normal failure handling
+  applies.
+- `full_stop`: a motion in the scope that is moving trips a cell Full Stop:
+  all motion and all other commands stop, also outside the scope. The rule
+  latches; new motion in its scope is refused (`global_interrupt_latched`)
+  until the operator clears the latch in the GUI with the cell recovery
+  action, once the condition is no longer true.
+- Its state key `interrupt_state.<rule_id>` changes to `tripped`, then
+  `latched`, and back to `clear` when released.
+- A lost source of the rule always latches it until the operator clears it,
+  also for `gate`.
+- A Program Reset never clears a global rule's latch.
 
-**Idle behaviour**, when the condition trips while nothing in the scope
-moves:
+**Idle behaviour** (`full_stop` only), when the condition trips while
+nothing in the scope moves:
 
 - A moving robot is always stopped, whatever the setting.
 - Omitted: the rule latches while a Program Run is in progress, and is
@@ -174,14 +342,6 @@ moves:
 - `latch`: the rule always latches.
 - `ignore`: the rule never latches while nothing moves. It records one
   information row in the history.
-
-**Clearing a latch:**
-
-- `latch_release: operator` (default): the operator clears the latch in the
-  GUI with the cell recovery action, once the condition is no longer true.
-- `latch_release: auto_on_clear`: the latch clears by itself when the
-  condition is no longer true.
-- A Program Reset never clears a global rule's latch.
 
 **Reading user keys.** A global rule may compare keys of the Program:
 
@@ -262,8 +422,8 @@ One per global rule.
   halted, and when no Run exists. Every change is kept in the history.
 - It has no value until the rule's sources have reported for the first time.
   After that it always follows the rule.
-- Reset does not change it. Only the operator, or `auto_on_clear`, clears a
-  latch.
+- Reset does not change it. Only the operator (`full_stop`), or the
+  condition clearing (`gate`), clears a latch.
 
 ### Writing "not completed" correctly
 
@@ -323,6 +483,7 @@ stop arriving in time):
 - The rule latches, also when nothing in its scope moves.
 - Motion in scope that is running is stopped.
 - Only the operator can clear this latch, once the source reports again and
-  the condition is false. `auto_on_clear` does not apply to a loss latch.
+  the condition is false. A `gate` rule does not release a loss latch by
+  itself.
 
 For a node rule, losing its source fails the node.

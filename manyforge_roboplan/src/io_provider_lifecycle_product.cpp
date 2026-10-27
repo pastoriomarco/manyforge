@@ -2,6 +2,7 @@
 #include <manyforge_core/types/component_incident.hpp>
 #include <manyforge_core/types/lifecycle_cause.hpp>
 #include <manyforge_roboplan/ros_mapped_boolean_input_provider.hpp>
+#include "xarm_digital_address.hpp"
 
 #include <algorithm>
 #include <limits>
@@ -79,7 +80,8 @@ struct IoProviderDriverRecord::State final {
     std::variant<std::unique_ptr<MockBooleanInputProvider>,
                  std::unique_ptr<RosBooleanInputProvider>,
                  std::unique_ptr<RosMappedBooleanInputProvider>,
-                 std::unique_ptr<GeometricContactInputProvider>>
+                 std::unique_ptr<GeometricContactInputProvider>,
+                 std::unique_ptr<XArmDigitalInputProvider>>
         leaf;
   };
   core::ResolvedLifecycleControlDomainScopeDTO domain;
@@ -102,7 +104,7 @@ struct IoProviderDriverRecord::State final {
   bool retired{};
   std::optional<core::ErrorDTO> fault;
   std::function<std::optional<core::ErrorDTO>()> process_fault_source;
-  std::vector<std::unique_ptr<core::StreamRecorder>> pose_streams;
+  std::vector<std::unique_ptr<core::StreamRecorder>> observer_streams;
   std::vector<core::LifecycleFactDTO> last_facts;
   std::optional<std::vector<IoProviderInputSourceInstallation>> last_rebind;
   std::optional<core::ErrorDTO> last_rebind_error;
@@ -209,6 +211,15 @@ struct IoProviderDriverRecord::State final {
       if (ready)
         continue;
       const auto *row = output.rows.empty() ? nullptr : &output.rows.front();
+      if (row && row->provider.profile == "xarm_digital" &&
+          row->provider.robot_component_id && row->provider.bank) {
+        const auto bank = *row->provider.bank == "tool"
+                              ? XArmDigitalBank::kTool
+                              : XArmDigitalBank::kController;
+        const auto service = XArmDigitalServiceName(
+            row->provider.robot_component_id->value(), bank, true);
+        return missing(output.rows, "service", service);
+      }
       const bool service = row && row->provider.service;
       return missing(output.rows, service ? "service" : "topic",
                      !row       ? std::nullopt
@@ -258,7 +269,9 @@ struct IoProviderDriverRecord::State final {
       return false;
     for (std::size_t i = 0; i < a.size(); ++i)
       if (!same_rows(a[i].rows, b[i].rows) || a[i].node != b[i].node ||
-          a[i].ingress != b[i].ingress || a[i].incarnation != b[i].incarnation)
+          a[i].ingress != b[i].ingress || a[i].incarnation != b[i].incarnation ||
+          (!a[i].rows.empty() && a[i].rows.front().provider.profile == "xarm_digital" &&
+           a[i].scheduler != b[i].scheduler))
         return false;
     return true;
   }
@@ -416,6 +429,7 @@ core::Result<void> IoProviderDriverRecord::InstallResourcesLocked(
                      output.provider)
            : (row.provider.profile == "ros_set_bool" ||
               row.provider.profile == "ur_set_io" ||
+              row.provider.profile == "xarm_digital" ||
               row.provider.profile == "ros2_control_gpio")
                ? !std::holds_alternative<
                      std::shared_ptr<RosBooleanOutputProvider>>(output.provider)
@@ -471,6 +485,30 @@ core::Result<void> IoProviderDriverRecord::InstallResourcesLocked(
       auto leaf = GeometricContactInputProvider::Create(
           input.ingress, *state_->clock, *scheduler, std::move(binding),
           state_->generation);
+      if (!leaf.ok())
+        return Reply::Err(leaf.error());
+      prepared_inputs.push_back({std::move(input), std::move(leaf.value())});
+    } else if (first.provider.profile == "xarm_digital") {
+      if (!input.node || !input.scheduler || !first.provider.robot_component_id ||
+          !first.provider.bank)
+        return Reply::Err(error("driver_xarm_input_source_invalid"));
+      const auto bank = *first.provider.bank == "tool"
+                            ? XArmDigitalBank::kTool
+                            : XArmDigitalBank::kController;
+      std::vector<XArmDigitalInputSignal> signals;
+      for (const auto &row : input.rows) {
+        if (!row.provider.pin || row.provider.bank != first.provider.bank ||
+            row.provider.robot_component_id != first.provider.robot_component_id)
+          return Reply::Err(error("driver_xarm_input_source_invalid"));
+        signals.push_back({row.descriptor,
+                           static_cast<std::uint8_t>(*row.provider.pin)});
+      }
+      const auto service = XArmDigitalServiceName(
+          first.provider.robot_component_id->value(), bank, false);
+      auto leaf = XArmDigitalInputProvider::Create(
+          input.node, input.ingress, state_->clock, input.scheduler,
+          {first.descriptor.source_id, input.incarnation, service, bank,
+           std::move(signals)}, state_->generation);
       if (!leaf.ok())
         return Reply::Err(leaf.error());
       prepared_inputs.push_back({std::move(input), std::move(leaf.value())});
@@ -553,7 +591,9 @@ core::Result<void> IoProviderDriverRecord::RebindInputsLocked(
   for (std::size_t i = 0; i < inputs.size(); ++i) {
     const auto &current = state_->inputs[i].installation;
     if (!same_rows(inputs[i].rows, current.rows) ||
-        inputs[i].node != current.node || !inputs[i].ingress ||
+        inputs[i].node != current.node ||
+        (!current.rows.empty() && current.rows.front().provider.profile == "xarm_digital" &&
+         inputs[i].scheduler != current.scheduler) || !inputs[i].ingress ||
         inputs[i].incarnation.empty())
       return Reply::Err(error("driver_rebind_membership_changed"));
     changed = changed || inputs[i].incarnation != current.incarnation;
@@ -793,15 +833,16 @@ void IoProviderDriverRecord::SetSupervisedProcessFaultSource(
   state_->process_fault_source = std::move(source);
 }
 
-bool IoProviderDriverRecord::pose_source() const noexcept {
-  return state_->manifest.provider_manifest_id.value() ==
-         core::kPoseSourceLifecycleManifestId;
+bool IoProviderDriverRecord::stream_observer() const noexcept {
+  const auto &id = state_->manifest.provider_manifest_id.value();
+  return id == core::kPoseSourceLifecycleManifestId ||
+         id == core::kAiModelLifecycleManifestId;
 }
 
-core::Result<void> IoProviderDriverRecord::InstallPoseSourceLocked(
+core::Result<void> IoProviderDriverRecord::InstallObserverStreamsLocked(
     std::vector<std::unique_ptr<core::StreamRecorder>> streams) {
   using Reply = core::Result<void>;
-  if (!pose_source() || state_->installed || state_->retired)
+  if (!stream_observer() || state_->installed || state_->retired)
     return Reply::Err(error("driver_pose_source_install_invalid"));
   std::vector<std::string> ids;
   for (const auto &stream : streams) {
@@ -814,7 +855,7 @@ core::Result<void> IoProviderDriverRecord::InstallPoseSourceLocked(
     return Reply::Err(error("driver_resource_closure_not_exact"));
   if (!state_->Advance())
     return Reply::Err(error("driver_generation_exhausted"));
-  state_->pose_streams = std::move(streams);
+  state_->observer_streams = std::move(streams);
   state_->installed = true;
   state_->CommitFacts();
   return Reply::Ok();
@@ -849,7 +890,7 @@ void IoProviderDriverRecord::Shutdown() {
     if (!fenced.ok())
       state_->fault = fenced.error();
   }
-  state_->pose_streams.clear();
+  state_->observer_streams.clear();
   state_->enabled = false;
   state_->state = core::ComponentLifecycleStateDTO::kDisabled;
   state_->CommitFacts();

@@ -2674,6 +2674,7 @@ def test_manual_motion_malformed_stop_recovers_with_durable_evidence(
             operation_id,
             restart_before_recovery if restart_with_fault else None,
         )
+        assert headless.stop_fault()["stop_fault"] is None
         if restart_with_fault:
             assert cclc_recovery_footprint() == retained_cclc_footprint
         assert CellAdmissionClient(run_root).get()["authoring_allowed"] is True
@@ -2775,6 +2776,7 @@ def test_native_manual_preview_control_and_restart_contracts(tmp_path: Path) -> 
             first_status, presentation="motion"
         )
         direct = motion_target["command"]
+        assert direct["target_role_id"] == manifest["target_role_id"]
         direct_manual_control = direct["manual_control"]
         motion_observed = _status_observation(
             first_status, presentation="motion"
@@ -2783,9 +2785,11 @@ def test_native_manual_preview_control_and_restart_contracts(tmp_path: Path) -> 
             first_status, presentation="gripper"
         )
         direct_gripper = gripper_target["command"]
+        assert direct_gripper["target_role_id"] == manifest["gripper_target_role_id"]
         gripper_observed = _status_observation(
             first_status, presentation="gripper"
         )
+        assert len(first_status["control_state"]["observed_targets"]) == 2
         assert motion_observed["kind"] == "joint_positions"
         assert len(motion_observed["positions_rad"]) == len(
             motion_observed["source_joint_names"]
@@ -2896,6 +2900,9 @@ def test_native_manual_preview_control_and_restart_contracts(tmp_path: Path) -> 
         )
         assert (
             direct_gripper["command_schema_id"] == manifest["gripper_command_schema_id"]
+        )
+        assert direct_gripper["command_schema_revision"] == (
+            manifest["gripper_command_schema_revision"]
         )
         assert direct_gripper["resource"]["coordinate_kind"] == "linear_m"
         assert direct_gripper["resource"]["source_coordinate_name"]
@@ -3210,6 +3217,9 @@ def test_native_manual_preview_control_and_restart_contracts(tmp_path: Path) -> 
         assert direct_gripper_terminal["program_binding_id"] == (
             direct_gripper["manual_control"]["program_binding_id"]
         )
+        assert direct_terminal["participants"][0]["resources"] != (
+            direct_gripper_terminal["participants"][0]["resources"]
+        )
         _wait_retired(native, direct_gripper_operation_id)
 
         # Public callers cannot impersonate a captured Program effect. Keep
@@ -3324,6 +3334,22 @@ def test_native_manual_preview_control_and_restart_contracts(tmp_path: Path) -> 
         current_projection = headless.operation(operation_id)
         assert composer_projection == current_projection
         assert composer_projection["operation"]["state"] == "completed"
+        assert composer_projection["operation"]["operation_revision"] >= (
+            terminal["operation"]["operation_revision"]
+        )
+        assert composer_projection["operation"]["updated_at_ns"] >= (
+            terminal["operation"]["updated_at_ns"]
+        )
+        bookkeeping_fields = {"operation_revision", "updated_at_ns"}
+        assert {
+            key: value
+            for key, value in composer_projection["operation"].items()
+            if key not in bookkeeping_fields
+        } == {
+            key: value
+            for key, value in terminal["operation"].items()
+            if key not in bookkeeping_fields
+        }
         assert composer.execution_diagnostics()["status"]["identity"]["owner_epoch"] == (
             identity["owner_epoch"]
         )
@@ -3364,6 +3390,8 @@ def test_native_manual_preview_control_and_restart_contracts(tmp_path: Path) -> 
             "capability_command"
         )
         durable_gripper = composer.operation(gripper_id)["operation"]
+        assert durable_gripper["operation_revision"] >= gripper_terminal["operation_revision"]
+        assert durable_gripper["updated_at_ns"] >= gripper_terminal["updated_at_ns"]
         for bookkeeping_field in ("operation_revision", "updated_at_ns"):
             durable_gripper.pop(bookkeeping_field)
             gripper_terminal.pop(bookkeeping_field)
@@ -3436,9 +3464,9 @@ def test_native_manual_preview_control_and_restart_contracts(tmp_path: Path) -> 
         ]
         scale_selector = projected_scale_control["selector"]
         assert scale_selector == {
-            "program_binding_id": manifest["program_binding_id"],
-            "component_role_id": "robot",
-            "target_role_id": "arm",
+            "program_binding_id": direct_manual_control["program_binding_id"],
+            "component_role_id": direct["component_role_id"],
+            "target_role_id": direct["target_role_id"],
         }
         initial_scale_control = composer.runtime_scale_control(scale_selector)[
             "runtime_scale_control"

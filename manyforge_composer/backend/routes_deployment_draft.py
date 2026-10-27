@@ -607,8 +607,36 @@ def discard_deployment_draft(state: ComposerState, body: Any) -> None:
     )
 
 
+_ASSISTANT_PROFILES = (
+    Path(__file__).resolve().parents[2]
+    / "manyforge_deployment/resources/maintained/maintained_assistant_profiles.v1.json"
+)
+
+
+def assistant_profile_aliases() -> dict[str, Any]:
+    """The model aliases of each maintained assistant profile (read-only)."""
+
+    profiles = json.loads(_ASSISTANT_PROFILES.read_text(encoding="utf-8"))["profiles"]
+    return {
+        "schemaVersion": "manyforge.composer_assistant_profile_aliases.v1",
+        "profiles": [
+            {
+                "profileId": row["profile_id"],
+                "modelEndpointAliases": sorted(
+                    endpoint["model_endpoint_alias"] for endpoint in row["model_endpoints"]
+                ),
+            }
+            for row in sorted(profiles, key=lambda row: row["profile_id"])
+        ],
+    }
+
+
 def create_deployment_draft_router(state: ComposerState) -> APIRouter:
     router = APIRouter()
+
+    @router.get("/api/deployment/assistant-profiles")
+    def read_assistant_profiles() -> dict[str, Any]:
+        return assistant_profile_aliases()
 
     def execute(
         body: _Fence,

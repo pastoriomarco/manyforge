@@ -219,6 +219,7 @@ add_library(manyforge_component_manager
   src/runtime_unit_adapter_router.cpp
   src/selected_bundle_transition.cpp
   src/selected_runtime_composition_rpc_internal.cpp
+  src/site_settings.cpp
   src/sqlite_store_startup_internal.cpp
   src/manager_state_marker_internal.cpp
 )
@@ -301,6 +302,12 @@ if(BUILD_TESTING)
   add_custom_target(
     manyforge_manager_test_canonical_empty_package
     DEPENDS "${MANYFORGE_MANAGER_TEST_CANONICAL_EMPTY_PACKAGE_MARKER}")
+
+  add_executable(test_site_settings test/test_site_settings.cpp)
+  target_link_libraries(test_site_settings PRIVATE
+    manyforge_component_manager GTest::gtest_main)
+  gtest_discover_tests(test_site_settings
+    PROPERTIES TIMEOUT ${MANYFORGE_GTEST_TIMEOUT_SECONDS})
 
   add_executable(test_runtime_observation
     test/test_runtime_observation.cpp)

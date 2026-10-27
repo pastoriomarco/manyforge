@@ -17,6 +17,7 @@
 #include <manyforge_core/ports/iio_output_provider.hpp>
 #include <manyforge_core/time/iclock.hpp>
 #include <manyforge_roboplan/io_output_alias_identity.hpp>
+#include <manyforge_roboplan/xarm_digital_bank.hpp>
 #include <memory>
 #include <rclcpp/node.hpp>
 #include <variant>
@@ -38,6 +39,11 @@ struct UrSetIoOutputAddress final {
   std::string service;
   std::uint8_t pin;
 };
+struct XArmSetDigitalOutputAddress final {
+  std::string service;
+  std::uint8_t pin;
+  XArmDigitalBank bank;
+};
 struct RosGpioOutputAddress final {
   std::string topic;
   std::string group;
@@ -45,7 +51,7 @@ struct RosGpioOutputAddress final {
 };
 using RosBooleanOutputAddress =
     std::variant<RosSetBoolOutputAddress, UrSetIoOutputAddress,
-                 RosGpioOutputAddress>;
+                 RosGpioOutputAddress, XArmSetDigitalOutputAddress>;
 
 struct RosBooleanOutputChannel final {
   core::ResourceId resource_id;
@@ -54,7 +60,7 @@ struct RosBooleanOutputChannel final {
   core::ActiveBundlePublicationGeneration active_publication_generation;
 };
 
-/// One resolved SetBool/UR SetIO service or GPIO command topic on the existing
+/// One resolved SetBool/UR/xArm service or GPIO command topic on the existing
 /// host ROS context. Composition
 /// groups every channel alias into one provider; per-occurrence driver gates
 /// remain separate. There is no owned node, executor, thread, timer, resend,
@@ -64,6 +70,8 @@ struct RosBooleanOutputChannel final {
 ///
 /// Kernel/session retains admission, CCLC generation, deadline/unknown outcome
 /// and post-retirement replay authority. This leaf has one bounded correlation.
+/// For xArm, return 0 is accepted delivery, not physical output readback;
+/// a nonzero return leaves the effect unknown.
 /// A service send requires an unexpired owner-issued absolute deadline; GPIO
 /// submission requires no deadline and never waits for acknowledgement.
 /// Retire removes local correlation only, never undoes a possible remote

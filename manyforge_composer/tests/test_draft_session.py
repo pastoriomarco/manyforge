@@ -719,39 +719,6 @@ def test_support_contact_replacement_is_one_validated_draft_change() -> None:
     assert "metadata" not in resource
 
 
-def test_assistant_proposal_batch_has_no_partial_failure() -> None:
-    session = ComposerDraftSession(_pick_program())
-    before = session.retained_state()
-
-    with pytest.raises(DraftSessionError):
-        _mutate(
-            session,
-            "assistant_draft_materialize_proposal",
-            {
-                "proposal_tool_id": "propose_scene_object_nodes",
-                "operations": [
-                    {
-                        "mutation": "scene_draft_upsert_objects",
-                        "arguments": {"scene_resources": [_box_resource("new-object")]},
-                    },
-                    {
-                        "mutation": "tree_draft_insert_node",
-                        "arguments": {
-                            "node": {
-                                "node_id": "missing.node",
-                                "instance_id": "bad",
-                                "parameters": {},
-                                "children": [],
-                            }
-                        },
-                    },
-                ],
-            },
-        )
-
-    assert session.retained_state() == before
-
-
 def test_session_is_an_unsaved_unapplied_in_memory_draft() -> None:
     session = ComposerDraftSession(_program())
 

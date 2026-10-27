@@ -1938,10 +1938,11 @@ void qualify_capability_provider_target(
         fail("direct provider target has a stale component-type revision");
       const auto& target_type = require_type_target(composition, component, direct->command_target_id);
       require_target_capability(target_type, binding.capability_id, binding.capability_definition_revision);
-      if (binding.capability_id.value() == "scene.pose.observe") {
-        // CP9 pose-source target: observation only, no resource roles.
+      if (binding.capability_id.value() == "scene.pose.observe" ||
+          binding.capability_id.value() == kAiModelCapabilityId) {
+        // CP9 pose-source and AI model targets: no resource roles.
         if (!target_type.resource_roles.empty())
-          fail("pose-source target declares resource roles");
+          fail("model-free target declares resource roles");
         const auto bound = ValidateNonCoordinateProviderTarget(graph, binding);
         if (!bound.ok()) fail(bound.error().details.at("reason"));
         break;
@@ -3235,8 +3236,7 @@ ApplicabilityQualifiedCellIr qualify_cell_applicability(
         fail("legacy_interrupt_policy_runtime_unsupported");
   }
   const QualifiedAssistantSettings assistant_settings =
-      qualify_assistant_settings(deployment_inputs.assistant_settings(),
-                                 deployment_inputs.value().external_resources);
+      qualify_assistant_settings(deployment_inputs.assistant_settings());
   const auto indexes = build_qualified_indexes(
       composition, deployment_inputs, runtime_profiles, contact_policies,
       command_schemas, capability_definitions,

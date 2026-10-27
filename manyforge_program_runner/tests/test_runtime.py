@@ -6053,6 +6053,25 @@ class _SimulationLaneHeadless(_Headless):
         return deepcopy(self.graph)
 
 
+_SIMULATION_LANE_PROFILES = {
+    "mock": {"mock_profile": "lite6_lite_gripper"},
+    "isaac": {"isaac_profile": "lite6"},
+    "real": {"real_profile": "lite6_real", "device_address_ref": "lite6.address"},
+}
+
+
+def _set_simulation_lane(graph, component, lane):
+    """Mirror one compiled profile and its Manager-derived simulator row."""
+    profile = next(row for row in graph["cell_graph"]["runtime_units"][0]["configuration"]["controller_profiles"]
+                   if row["controllable_component_id"] == component)
+    for key in ("mock_profile", "isaac_profile", "real_profile", "device_address_ref"):
+        profile.pop(key, None)
+    profile.update(_SIMULATION_LANE_PROFILES[lane])
+    dependency = next(row for row in graph["component_simulator_dependencies"]
+                      if row["controllable_component_id"] == component)
+    dependency["simulator"] = "isaac" if lane == "isaac" else "none"
+
+
 def _simulation_lane_fixture(*, lanes=("mock", "isaac"), simulation=None, admission=None, journal=None):
     """Use real retained binding row shapes and the actual runtime catalog.
 
@@ -6096,11 +6115,13 @@ def _simulation_lane_fixture(*, lanes=("mock", "isaac"), simulation=None, admiss
             "control_bindings": [],
             "runtime_units": [{"runtime_unit_id": "cell.ros",
                 "runtime_profile_id": "manyforge.ros2_control_execution_runtime",
-                "configuration": {"mode": "commanded_sim", "controller_profiles": [
-                    {"controllable_component_id": name,
-                     "mock_profile" if lane == "mock" else "isaac_profile":
-                         "lite6_lite_gripper" if lane == "mock" else "lite6"}
+                "configuration": {"controller_profiles": [
+                    {"controllable_component_id": name, **_SIMULATION_LANE_PROFILES[lane]}
                     for name, lane in zip(("lite6_arm", "robot.other"), lanes, strict=True)]}}]},
+        # Deployment-derived and sorted by component; Mock and Real need none.
+        "component_simulator_dependencies": [
+            {"controllable_component_id": name, "simulator": "isaac" if lane == "isaac" else "none"}
+            for name, lane in zip(("lite6_arm", "robot.other"), lanes, strict=True)],
     }
     headless = _SimulationLaneHeadless(graph)
     runtime = ProgramRuntime(ProgramRunnerConfig(headless_url="http://headless.test", owner_epoch="program-runner.test"),
@@ -6149,6 +6170,10 @@ def _simulation_lane_required(runtime, binding, program):
     (("mock", "isaac"), ("other_arm",), True),
     (("mock", "isaac"), ("arm", "other_arm"), True),
     (("isaac", "mock"), ("other_arm",), False),
+    (("real", "mock"), ("arm",), False),
+    (("real", "isaac"), ("arm",), False),
+    (("real", "isaac"), ("other_arm",), True),
+    (("real", "real"), ("arm", "other_arm"), False),
 ])
 def test_simulation_dependency_follows_only_actual_used_target_components(lanes, used_roles, required):
     runtime, headless, binding = _simulation_lane_fixture(lanes=lanes)
@@ -6306,6 +6331,7 @@ def test_pure_timer_program_has_no_simulator_dependency_or_manager_read():
                                      "simulation.set_entity_pose"])
 @pytest.mark.parametrize(("lanes", "eligible"), [
     (("mock", "mock"), False), (("isaac", "isaac"), True), (("mock", "isaac"), True),
+    (("real", "real"), False), (("real", "mock"), False), (("real", "isaac"), True),
 ])
 def test_actual_cell_global_simulator_capability_has_typed_cell_eligibility(node_id, lanes, eligible):
     runtime, headless, binding = _simulation_lane_fixture(lanes=lanes, simulation=_SimulationControl())
@@ -6323,7 +6349,7 @@ def test_actual_cell_global_simulator_capability_has_typed_cell_eligibility(node
 
 
 @pytest.mark.parametrize("case", ["stale", "unavailable", "gap", "bundle", "graph", "nested_graph",
-                                  "duplicate_profile", "foreign_profile", "both_profiles", "missing_profile",
+                                  "duplicate_profile", "foreign_profile",
                                   "foreign_component_role", "duplicate_component_role", "duplicate_target_role",
                                   "duplicate_graph_component", "foreign_graph_component", "duplicate_runtime",
                                   "foreign_runtime", "missing_runtime_profile", "duplicate_runtime_owner"])
@@ -6342,16 +6368,12 @@ def test_simulation_dependency_refuses_inexact_source_or_used_component_join(cas
         graph["graph_revision"] = _DIGEST_A
     elif case == "nested_graph":
         graph["cell_graph"]["graph_revision"] = _DIGEST_A
-    elif case in {"duplicate_profile", "foreign_profile", "both_profiles", "missing_profile"}:
+    elif case in {"duplicate_profile", "foreign_profile"}:
         rows = graph["cell_graph"]["runtime_units"][0]["configuration"]["controller_profiles"]
         if case == "duplicate_profile":
             rows.append(deepcopy(rows[0]))
-        elif case == "foreign_profile":
-            rows[0]["controllable_component_id"] = "foreign.component"
-        elif case == "both_profiles":
-            rows[0]["isaac_profile"] = "lite6"
         else:
-            del rows[0]["mock_profile"]
+            rows[0]["controllable_component_id"] = "foreign.component"
     elif case == "foreign_component_role":
         binding["target_role_bindings"][0]["component_role_id"] = "foreign.role"
     elif case == "duplicate_component_role":
@@ -6411,7 +6433,7 @@ def test_simulation_dependency_respects_conditional_and_defaulted_target_require
         runtime.shutdown()
 
 
-def _simulation_lane_context(runtime, binding, *, scenario="not-in-isaac-site", role="arm", program=None):
+def _simulation_lane_context(runtime, binding, *, scenario="isaac-cell", role="arm", program=None):
     from manyforge_behavior.orchestration_ports import ProgramRunPortContext
 
     program = _simulation_lane_program(role) if program is None else deepcopy(program)
@@ -6425,16 +6447,14 @@ def _simulation_lane_context(runtime, binding, *, scenario="not-in-isaac-site", 
         program=program, program_binding=binding)
 
 
-@pytest.mark.parametrize(("lane", "scenario", "mapped"), [
-    ("mock", "not-in-isaac-site", False),
-    ("isaac", "not-in-isaac-site", False),
-    ("isaac", "mapped-isaac-cell", True),
-])
+@pytest.mark.parametrize("lane", ["mock", "isaac"])
 @pytest.mark.parametrize("program_kind", ["target", "entity"])
-def test_selected_context_keeps_real_isaac_site_mapping_strict_and_mock_independent(lane, scenario, mapped, program_kind):
+def test_selected_context_binds_real_isaac_owner_and_keeps_mock_independent(lane, program_kind):
+    # The simulator entity mapping comes from the Deployment links in the
+    # context; binding never depends on a per-scenario site mapping.
     from manyforge_program_runner.runtime import _SelectedSimulationContextPort
     from manyforge_ros.program_simulation_port import (
-        SimulationProgramSiteConfig, SimulationProgramTaskPort, SimulationScenarioSiteConfig,
+        SimulationProgramSiteConfig, SimulationProgramTaskPort,
     )
 
     def unexpected(*_args, **_kwargs):
@@ -6443,13 +6463,10 @@ def test_selected_context_keeps_real_isaac_site_mapping_strict_and_mock_independ
     control = SimpleNamespace(reset=unexpected, set_simulation_state=unexpected,
                               step=unexpected, set_entity_state=unexpected)
     raw = SimulationProgramTaskPort(control, SimulationProgramSiteConfig(
-        service_prefix="/isaacsim", service_timeout_s=1.0,
-        scenarios=(SimulationScenarioSiteConfig(scenario_id="mapped-isaac-cell",
-                                               cell_frame_id="world", scene_entities=(
-                                                   {"part": "/World/part"} if program_kind == "entity" else {})),)))
+        service_prefix="/isaacsim", service_timeout_s=1.0))
     runtime, headless, binding = _simulation_lane_fixture(
         lanes=(lane, "isaac" if program_kind == "target" else "mock"), simulation=raw)
-    context = _simulation_lane_context(runtime, binding, scenario=scenario,
+    context = _simulation_lane_context(runtime, binding,
         program=_simulation_node_program("simulation.set_entity_pose") if program_kind == "entity" else None)
     selected = _SelectedSimulationContextPort(raw, lambda captured:
         runtime._simulation_context_requirement(program=captured.program, program_binding=captured.program_binding,
@@ -6457,9 +6474,6 @@ def test_selected_context_keeps_real_isaac_site_mapping_strict_and_mock_independ
     try:
         if lane == "mock" and program_kind == "entity":
             with pytest.raises(ProgramRunOwnerError, match="simulator"):
-                selected.bind(context)
-        elif lane == "isaac" and not mapped:
-            with pytest.raises(ValueError, match="has no exact simulator site mapping"):
                 selected.bind(context)
         else:
             selected.bind(context)
@@ -6475,20 +6489,17 @@ def test_one_runtime_rechecks_used_lane_after_each_current_graph_change():
     runtime, headless, binding = _simulation_lane_fixture(lanes=("mock", "mock"), simulation=simulation)
     applied = {"program": _simulation_lane_program("arm"), "program_binding": binding,
                "retained_bundle_id": _DIGEST_A, "graph_revision": _DIGEST_B}
-    profile = headless.graph["cell_graph"]["runtime_units"][0]["configuration"]["controller_profiles"][0]
     try:
         assert runtime._simulation_context_requirement(program=applied["program"],
             program_binding=binding, retained_bundle_id=_DIGEST_A, graph_revision=applied["graph_revision"]) == (
                 False, AvailabilityFact(False, ("program_runtime_owner_unavailable",)))
-        del profile["mock_profile"]
-        profile["isaac_profile"] = "lite6"
+        _set_simulation_lane(headless.graph, "lite6_arm", "isaac")
         applied["graph_revision"] = binding["graph_revision"] = "sha256:" + "c" * 64
         headless.graph["graph_revision"] = headless.graph["cell_graph"]["graph_revision"] = applied["graph_revision"]
         assert runtime._simulation_context_requirement(program=applied["program"],
             program_binding=binding, retained_bundle_id=_DIGEST_A, graph_revision=applied["graph_revision"]) == (
                 True, AvailabilityFact(True))
-        del profile["isaac_profile"]
-        profile["mock_profile"] = "lite6_lite_gripper"
+        _set_simulation_lane(headless.graph, "lite6_arm", "real")
         applied["graph_revision"] = binding["graph_revision"] = "sha256:" + "d" * 64
         headless.graph["graph_revision"] = headless.graph["cell_graph"]["graph_revision"] = applied["graph_revision"]
         assert runtime._simulation_context_requirement(program=applied["program"],
@@ -6604,6 +6615,8 @@ def test_mixed_provider_and_controller_component_keeps_controller_profile_check(
     if profile is not None:
         graph["runtime_units"][0]["configuration"]["controller_profiles"].append(
             {"controllable_component_id": "station_io", "mock_profile": "station_mock"})
+        headless.graph["component_simulator_dependencies"].append(
+            {"controllable_component_id": "station_io", "simulator": "none"})
     try:
         if profile is None:
             with pytest.raises(ProgramRunOwnerError, match="no unique ROS controller profile"):
@@ -6627,15 +6640,19 @@ def test_motion_target_without_profile_still_refused_with_controller_profile_rea
 
 @pytest.mark.parametrize(("program_kind", "reason"), [
     ("io_only", "reached Applied Program run admission"),
+    ("real_motion", "reached Applied Program run admission"),
     ("motion_without_profile", "no unique ROS controller profile"),
 ])
 def test_run_start_admits_io_only_program_past_simulation_dependency(monkeypatch, tmp_path, program_kind, reason):
     admission = _Admission()
     journal = ProgramCycleJournal(tmp_path / "io-only.sqlite3", owner_epoch="program-runner.test")
-    runtime, headless, binding = _simulation_lane_fixture(lanes=("mock", "mock"),
+    runtime, headless, binding = _simulation_lane_fixture(
+        lanes=("real", "real") if program_kind == "real_motion" else ("mock", "mock"),
         simulation=_SimulationControl(), admission=admission, journal=journal)
     if program_kind == "io_only":
         program = _io_station_program()
+    elif program_kind == "real_motion":
+        program = _simulation_lane_program("arm", "other_arm")
     else:
         program = _simulation_lane_program("arm")
         del headless.graph["cell_graph"]["runtime_units"][0]["configuration"]["controller_profiles"][0]
@@ -6661,7 +6678,7 @@ def test_run_start_admits_io_only_program_past_simulation_dependency(monkeypatch
         assert refused.value.code == "program_run_admission_failed"
         assert reason in str(refused.value)
         assert reached == ([AvailabilityFact(False, ("program_runtime_owner_unavailable",))]
-                           if program_kind == "io_only" else [])
+                           if program_kind != "motion_without_profile" else [])
         assert journal.read().state == "idle_after_reset" and admission.claims == []
     finally:
         runtime.shutdown()
@@ -6828,16 +6845,58 @@ def test_public_node_availability_projects_real_simulator_eligibility_without_ta
 
 
 @pytest.mark.parametrize("program_kind", ["target", "simulator"])
-def test_non_simulated_ros_configuration_is_explicitly_unsupported_for_m1(program_kind):
+def test_real_ros_configuration_is_admitted_without_simulator_dependency(program_kind):
+    # CP8 step 1: a unit hosting only real robots has no `mode`; the Manager
+    # row, not the lane selector, decides that no simulator is needed.
+    runtime, headless, binding = _simulation_lane_fixture(lanes=("real", "real"),
+                                                         simulation=_SimulationControl())
+    configuration = headless.graph["cell_graph"]["runtime_units"][0]["configuration"]
+    assert "mode" not in configuration
+    assert all("real_profile" in row for row in configuration["controller_profiles"])
+    program = (_simulation_lane_program("arm", "other_arm") if program_kind == "target" else
+               _simulation_node_program("simulation.reset"))
+    try:
+        # The target needs no simulator; a simulator node stays required but
+        # is ineligible because no hosted component depends on Isaac.
+        assert _simulation_lane_requirement(runtime, binding, program) == (
+            program_kind == "simulator", AvailabilityFact(False, ("program_runtime_owner_unavailable",)))
+        assert headless.graph_reads == 1
+    finally:
+        runtime.shutdown()
+
+
+@pytest.mark.parametrize("program_kind", ["target", "simulator"])
+@pytest.mark.parametrize("case", ["absent", "not_rows", "not_row", "missing_row", "extra_row", "duplicate_row",
+                                  "unknown_simulator", "open_row", "empty_component", "lane_mismatch"])
+def test_component_simulator_dependency_rows_must_match_ros_controller_profiles(program_kind, case):
     runtime, headless, binding = _simulation_lane_fixture(lanes=("isaac", "mock"),
                                                          simulation=_SimulationControl())
-    # No future hardware mode is invented here: this explicit unit fixture
-    # exercises the M1 refusal for any non-commanded_sim ROS configuration.
-    headless.graph["cell_graph"]["runtime_units"][0]["configuration"]["mode"] = "non_simulated_unit_fixture"
+    dependencies = headless.graph["component_simulator_dependencies"]
+    if case == "absent":
+        del headless.graph["component_simulator_dependencies"]
+    elif case == "not_rows":
+        headless.graph["component_simulator_dependencies"] = {"lite6_arm": "isaac"}
+    elif case == "not_row":
+        dependencies[0] = "lite6_arm"
+    elif case == "missing_row":
+        del dependencies[1]
+    elif case == "extra_row":
+        dependencies.append({"controllable_component_id": "station_io", "simulator": "none"})
+    elif case == "duplicate_row":
+        dependencies.append(deepcopy(dependencies[0]))
+    elif case == "unknown_simulator":
+        dependencies[0]["simulator"] = "mock"
+    elif case == "open_row":
+        dependencies[0]["isaac_profile"] = "lite6"
+    elif case == "empty_component":
+        dependencies[0]["controllable_component_id"] = ""
+    else:
+        # A row for a component the ROS profiles do not host.
+        dependencies[0]["controllable_component_id"] = "foreign.component"
     program = (_simulation_lane_program("arm") if program_kind == "target" else
                _simulation_node_program("simulation.reset"))
     try:
-        with pytest.raises(ProgramRunOwnerError, match="does not support non-simulated ROS modes"):
+        with pytest.raises(ProgramRunOwnerError, match="component simulator rows|do not match"):
             _simulation_lane_requirement(runtime, binding, program)
         assert headless.graph_reads == 1
     finally:

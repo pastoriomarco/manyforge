@@ -16,6 +16,19 @@
   },
   "components": [
     {
+      "component_id": "assistant_model",
+      "component_profile_id": "ai_model_v0",
+      "configuration": {
+        "runtime_configuration": {
+          "api_key_env": null,
+          "base_url": "http://127.0.0.1:8000/v1",
+          "model": "gemma4-12b-it-gguf"
+        },
+        "runtime_kind": "ai_model"
+      },
+      "target_settings": {}
+    },
+    {
       "component_id": "ur10e_robot",
       "component_profile_id": "ur10e_robotiq_assistant_mock_commanded_v0",
       "configuration": {
@@ -34,6 +47,22 @@
         },
         "runtime_configuration": {
           "collision_monitor_period_ms": 50.0,
+          "component_streams": [
+            {
+              "budget_ns": 1000000000,
+              "controllable_component_id": "ur10e_robot",
+              "recovery": "ack",
+              "severity": "fault",
+              "stream_id": "gripper_feedback"
+            },
+            {
+              "budget_ns": 250000000,
+              "controllable_component_id": "ur10e_robot",
+              "recovery": "ack",
+              "severity": "fault",
+              "stream_id": "measured_joints"
+            }
+          ],
           "execution_tick_hz": 100,
           "gripper_target_configurations": [
             {
@@ -50,7 +79,6 @@
               "mount_frame": "tool0",
               "open_state_ref": "open",
               "output_mode": "commanded",
-              "state_freshness_timeout_s": 1.0,
               "tcp_frame": "grasp_frame",
               "touch_links": [
                 "left_inner_finger",
@@ -76,7 +104,6 @@
             0.0
           ],
           "mock_profile": "ur10e_robotiq_2f_140",
-          "mode": "commanded_sim",
           "planner_rng_seed": 12345
         },
         "runtime_kind": "ros2_control"
@@ -154,7 +181,7 @@
     }
   ],
   "deployment_artifact_id": "ur10e_robotiq_assistant_modes_scene_authoring",
-  "description": "Local deployment fixture for assistant-mode catalog plumbing on the UR10e + Robotiq 2F-140 preview stack. It keeps the deterministic scene-authoring provider enabled while declaring the finite tools visible to query and composer-assistant requests.",
+  "description": "Local deployment fixture for assistant-mode catalog plumbing on the UR10e + Robotiq 2F-140 preview stack. It keeps the deterministic scene-authoring provider enabled while declaring the finite tools visible to composer-assistant requests.",
   "name": "ur10e_robotiq_assistant_modes_scene_authoring",
   "policies": {
     "interrupt_config": {

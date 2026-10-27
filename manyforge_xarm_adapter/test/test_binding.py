@@ -24,22 +24,8 @@ def test_default_binding_matches_xarm_single_robot_convention() -> None:
         binding.follow_joint_trajectory_action
         == '/lite6_traj_controller/follow_joint_trajectory'
     )
-    assert (
-        binding.supervised_state_topic
-        == '/ufactory/supervised_lifecycle/state'
-    )
-    assert (
-        binding.supervised_execute_service
-        == '/ufactory/supervised_lifecycle/execute'
-    )
-    assert (
-        binding.supervised_command_gate_service
-        == '/ufactory/supervised_lifecycle/set_command_gate'
-    )
-    assert (
-        binding.supervised_shutdown_controller_service
-        == '/ufactory/supervised_lifecycle/shutdown_controller'
-    )
+    # R7 package 5: the supervised mode is gone; no supervised endpoint.
+    assert not any('supervised' in key for key in binding.to_dict())
     assert binding.arm_joint_names == tuple(f'joint{i}' for i in range(1, 7))
 
 
@@ -64,10 +50,6 @@ def test_prefixed_namespaced_binding_is_deterministic_and_isolated() -> None:
     )
     assert first.diagnostics_topic == '/cell/a/manyforge/xarm/diagnostics'
     assert first.trajectory_controller == '/cell/a/L_lite6_traj_controller'
-    assert (
-        first.supervised_state_topic
-        == '/cell/a/L_ufactory/supervised_lifecycle/state'
-    )
     assert first.arm_joint_names == tuple(f'L_joint{i}' for i in range(1, 7))
 
 

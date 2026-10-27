@@ -213,7 +213,8 @@ Use a conservative `frameSkipCount` while commissioning over a shared LAN. See
 [`ISAAC_LITE6_TROCAR_FOUNDATIONPOSE.md`](ISAAC_LITE6_TROCAR_FOUNDATIONPOSE.md)
 for the full multi-machine DDS/QoS/perception runbook.
 
-Pick the apply policy per object:
+Pick the apply policy per object on the Object panel (the object's
+`policies.scene_pose_sources` row in the Deployment):
 
 - `observe_only` shows freshness and observed pose without changing
   ManyForge's planning scene.
@@ -234,9 +235,9 @@ Pick the apply policy per object:
 - `continuous_relative_to_attached` behaves like `continuous_unattached`
   while the object is detached. While it is attached, the source must also
   report the object relative to a gripper reference measured at the same
-  source instant (`relative_reference` on the observer's simulation entity:
-  the reference `entity`, its `source_header_frame_id`, and the model `link`
-  it shows). The Scene owner sets the attachment offset from that relative
+  source instant (`simulation.relative_reference` on the pose-source
+  component: the reference `entity`, its `source_header_frame_id`, and the
+  model `link` it shows). The Scene owner sets the attachment offset from that relative
   pose and the fixed model transform from the link to the carrier frame; no
   commanded or measured robot pose is used. The Isaac observer reads both
   through one `GetEntitiesStates` call; an observation that is not from one

@@ -65,7 +65,7 @@ ______________________________________________________________________
 | `manyforge_behavior`                      | Python           | Node catalog/environment plus Program validation, tree, admission, scheduling, and focused client mechanisms hosted by the independent runner; it does not own robot effects.                                               |
 | `manyforge_composer`                      | FastAPI + React  | Structural/operator shell, revision-fenced Program authoring, transparent control/viewer proxies, and backend-state presentation. It owns no execution lifecycle and performs no Program/control polling.                    |
 | `manyforge_ros` / `manyforge_ros_bringup` | C++/Python       | ROS utility and deployment wiring: simulator inspection, standard controller/gripper surfaces, readiness supervision, and real/sim bring-up.                                                                                |
-| `manyforge_assistant_bridge`              | Python           | Bounded direct/`nemoclaw` model mediation, strict active-mode enforcement, Draft/read callback routing, cancellation/reconciliation, conversation history, and redacted audit. It owns no runtime effects or catalog truth. |
+| `manyforge_assistant_bridge`              | Python           | AI tab model loop against the Deployment's `ai_model` endpoint, strict active-mode enforcement, Draft/read callback routing, cancellation/reconciliation, conversation history, and redacted audit. It owns no runtime effects or catalog truth. |
 
 ### Layers
 
@@ -195,22 +195,6 @@ Presentation rates and quality are observer concerns, not Program execution
 rates or deployment pose-source sampling authority. Faster rendering cannot
 create newer observed facts. Historical layer negotiation and a supervised
 visual-worker process are not current native protocol requirements.
-
-### Runtime resource isolation
-
-The optional strict Linux profile assigns named C++ workers and the
-controller-manager update thread explicit scheduler/CPU reservations. The
-required priority order is controller/JTC, controller-command callbacks,
-runtime collision, stop follow-up, then all planning, validation, Python, DDS,
-recording, and viewer work. Composer and the visual worker stay non-real-time;
-Python is never promoted into the qualified callback path.
-
-Requested scheduler settings are not evidence. Startup validates declared CPU
-sets/priorities and fails when a required request is rejected; live `/proc`
-probes verify what Linux applied. PREEMPT_RT, IRQ isolation, hardware
-deadlines, and physical stop distance require separate target qualification.
-Configure and verify the profile with
-[`../operations/REALTIME_RESOURCE_PROFILE.md`](../operations/REALTIME_RESOURCE_PROFILE.md).
 
 ______________________________________________________________________
 
@@ -488,20 +472,11 @@ freshness checks run on every read. Changing the composition discards the slot;
 concurrent queries pin their own selected value. This avoids repeatedly
 re-verifying unchanged product bytes without adding an observation owner.
 
-Assistant-provider selection is a separate axis and never changes an execution
-lane's command or state authority:
-
-| Selection                   | Provider path                                              | Operational boundary                                                             |
-| --------------------------- | ---------------------------------------------------------- | -------------------------------------------------------------------------------- |
-| off                         | Composer without a live model provider                     | No assistant dependency                                                          |
-| `direct` (`nemoclaw` alias) | In-tree bridge on `:8100` to an OpenAI-compatible endpoint | Standard launcher uses a host-peer bridge; deployments may sandbox it explicitly |
-| `openclaw`                  | NemoClaw-Thor adapter on `:8200` to an OpenClaw gateway    | Sandboxed agent/tool-routing lane; current Thor demo default                     |
-| `hermes`                    | NemoClaw-Thor adapter on `:8300` to Hermes sessions        | Sandboxed, opt-in lane with separate provisioning                                |
-
-All engine-backed providers use the same Composer envelope, mode/catalog
-checks, callback authority, and review boundary. Provider catalog metadata is
-declarative, not live process-placement attestation; verify the selected lane
-with [`../operations/LANE_BRINGUP.md`](../operations/LANE_BRINGUP.md).
+The AI assistant is a separate axis and never changes an execution lane's
+command or state authority. The Deployment names the model server with one
+`ai_model` component; the always-started bridge (`:8100`) runs the model loop,
+and assistant edits land only in the Program Draft. See
+[`ASSISTANT_PROVIDER_CONTRACT.md`](ASSISTANT_PROVIDER_CONTRACT.md).
 
 ______________________________________________________________________
 
@@ -658,8 +633,6 @@ The following files are pinned historical reimplementation inputs. Their
 product surfaces are unavailable on the current cutover branch; they are not
 generated from, or evidence for, a running current product:
 
-- [`ASSISTANT_PROVIDER_CONTRACT.md`](ASSISTANT_PROVIDER_CONTRACT.md) —
-  historical assistant-provider HTTP contract.
 - [`VIEWER_DATA_PLANE_V1.schema.json`](VIEWER_DATA_PLANE_V1.schema.json) —
   historical manifest, transform-frame, diagnostics, and lease/control wire
   contracts.

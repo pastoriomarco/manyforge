@@ -2,8 +2,12 @@ import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import type { DirectControlMotionStatus } from './types/robotControl';
 import type { CSSProperties } from 'react';
 
-import { ApiError, api } from './api/client';
-import { AssistantOverlay } from './components/AssistantOverlay';
+import { ApiError, api, apiErrorCode } from './api/client';
+import {
+  AssistantOverlay,
+  NO_AI_MODEL_COMPONENT,
+  assistantAvailability,
+} from './components/AssistantOverlay';
 import { DeploymentCompositionPanel } from './components/DeploymentCompositionPanel';
 import { deploymentDocumentHeader } from './components/DeploymentDocumentControls';
 import {
@@ -99,6 +103,10 @@ import {
 
 function isNotFound(error: unknown): boolean {
   return error instanceof ApiError && error.status === 404;
+}
+
+function isAssistantProfileAbsent(error: unknown): boolean {
+  return apiErrorCode(error) === 'assistant_mode_projection_unavailable';
 }
 
 const INSPECTOR_SECTION_MIN_HEIGHT = 140;
@@ -259,7 +267,15 @@ export default function App() {
     disabledMessage: 'Source-model facts require a connected headless owner.',
     failureMessage: 'Could not read the verified active source-model projection.',
   });
-  const assistantEnabled = headlessEnabled && assistantConfigured;
+  const [assistantModes, retryAssistantModes] = useStructuralResource(api.assistant.modes, {
+    enabled: headlessEnabled && assistantConfigured,
+    disabledMessage: 'The assistant bridge is unavailable.',
+    absentWhen: isAssistantProfileAbsent,
+    // Without assistant settings the Deployment has no AI model component either.
+    absentMessage: NO_AI_MODEL_COMPONENT,
+    failureMessage: 'Could not read the assistant modes.',
+  });
+  const assistant = assistantAvailability(assistantModes);
   const headlessStateSource = useHeadlessStateSource(headlessEnabled);
   const headlessState = useShellHeadlessState(headlessStateSource);
   const headlessSnapshot = headlessState.snapshot;
@@ -290,7 +306,8 @@ export default function App() {
     if (nodeEnvironmentWakeKey.current === key) return;
     nodeEnvironmentWakeKey.current = key;
     retryNodeEnvironment();
-  }, [headlessEnabled, headlessSnapshot, retryNodeEnvironment]);
+    retryAssistantModes();
+  }, [headlessEnabled, headlessSnapshot, retryAssistantModes, retryNodeEnvironment]);
   // The catalog and the Deployment workspace (its Applied/runAdmission half)
   // depend on the active applied selection, which settles after an accepted
   // Load/Apply from any client. Re-read both once when it settles.
@@ -344,6 +361,9 @@ export default function App() {
   const globalRuleProgramKeys = useMemo(() => (programDraftAuthoring === null ? null
     : programBlackboardKeys(programDraftAuthoring, globalRuleIds(deploymentDraftDocument))),
   [deploymentDraftDocument, programDraftAuthoring]);
+  const programSceneIds = useMemo(() => (programDraftAuthoring === null ? null
+    : (programDraftAuthoring.scene ?? []).map((resource) => resource.scene_resource_id)),
+  [programDraftAuthoring]);
   const deploymentStates = deploymentDocumentStates(deploymentController.workspace);
   const configuredComponentIds = useMemo(() => (
     deploymentController.workspace?.managerApplied.activationOrder?.componentIds ?? []
@@ -1213,8 +1233,8 @@ export default function App() {
             type="button"
             aria-haspopup="dialog"
             aria-expanded={globalPanel === 'assistant'}
-            disabled={!assistantEnabled}
-            title={assistantEnabled ? 'Open the AI assistant.' : 'The assistant bridge is unavailable.'}
+            disabled={assistant.unavailableReason !== null}
+            title={assistant.unavailableReason ?? 'Open the AI assistant.'}
             onClick={() => setGlobalPanel('assistant')}
           >AI</button>
         </div>
@@ -1279,6 +1299,7 @@ export default function App() {
                   (target) => target.targetDescriptor,
                 )}
                 programKeys={globalRuleProgramKeys}
+                programSceneIds={programSceneIds}
                 executionGroupIds={appliedExecutionGroupIds}
                 maintenanceStatus={activation}
                 componentOverview={{
@@ -1379,6 +1400,7 @@ export default function App() {
                 onRetryManifest={retryManifest}
                 onRetrySourceModel={retrySourceModel}
                 programController={programController}
+                deploymentController={deploymentController}
                 programRuntime={programRuntime}
                 robotControl={robotControl}
                 correctionGhost={heldNodePreview.ghost}
@@ -1433,8 +1455,10 @@ export default function App() {
         returnFocusRef={assistantButton}
       >
         <AssistantOverlay
-          enabled={assistantEnabled}
-          headlessConnected={headlessEnabled}
+          unavailableReason={assistant.unavailableReason}
+          modeIndex={assistant.modeIndex}
+          modeError={assistant.modeError}
+          onRetryModes={retryAssistantModes}
           programController={programController}
         />
       </OverlayPanel>

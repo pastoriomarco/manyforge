@@ -1,12 +1,16 @@
 #pragma once
 
+#include <array>
 #include <cstdint>
 #include <manyforge_deployment/canonical_value.hpp>
 #include <manyforge_deployment/execution_runtime_contract.hpp>
+#include <manyforge_core/component_stream_health.hpp>
 #include <manyforge_core/types/motion_interrupt.hpp>
 #include <manyforge_core/types/gripper.hpp>
+#include <manyforge_core/types/io_signal.hpp>
 #include <manyforge_core/types/strong_id.hpp>
 #include <manyforge_deployment/native_execution_runtime_contract.hpp>
+#include <map>
 #include <optional>
 #include <string>
 #include <string_view>
@@ -69,6 +73,14 @@ inline constexpr std::string_view kInstalledTargetId =
 inline constexpr std::string_view kCandidateWorkerInstalledTargetId =
     execution_runtime_contract::kCandidateWorkerInstalledTargetId;
 
+/// CP9: the streams a ROS component declares (`component_streams` rows):
+/// every hosted component its measured joints, a gripper component also its
+/// gripper feedback.
+inline constexpr std::string_view kMeasuredJointsStreamId = "measured_joints";
+inline constexpr std::string_view kGripperFeedbackStreamId = "gripper_feedback";
+/// The one stream of an AI model component: its endpoint reachability.
+inline constexpr std::string_view kAiModelStreamId = "endpoint";
+
 struct Configuration final {
   /// Deployment-authored fault Stop profile of one motion target, read
   /// directly as `main` did (design Q37): no derivation from the operator
@@ -84,6 +96,16 @@ struct Configuration final {
                            const FaultStopProfile &) = default;
   };
 
+  /// D11: the payload of a component's tool: mass and centre of mass in the
+  /// robot flange frame. Only a Real component's vendor adapter applies it
+  /// (at Enable); Mock and Isaac carry it unchanged and ignore it.
+  struct ToolPayload final {
+    double mass_kg{};
+    std::array<double, 3> center_of_mass_m{};
+
+    friend bool operator==(const ToolPayload &, const ToolPayload &) = default;
+  };
+
   /// Q68: the controller profile each hosted controllable component selects
   /// inside the one ROS runtime unit (one controller manager per component,
   /// Q66). Exactly one of the lane selectors is present.
@@ -95,6 +117,12 @@ struct Configuration final {
     std::optional<std::string> mock_profile;
     /// Q82 authored literal TF prefix; empty preserves unprefixed frames.
     std::string frame_prefix{};
+    /// CP8 step 1 (temporary; package IDs replace all three selectors in CP8
+    /// step 3): a real robot profile, with the site-settings name of the
+    /// robot's address. The address itself is a site fact, never compiled.
+    std::optional<std::string> real_profile{};
+    std::optional<std::string> device_address_ref{};
+    std::optional<ToolPayload> tool_payload{};
 
     friend bool operator==(const ControllerProfile &,
                            const ControllerProfile &) = default;
@@ -113,6 +141,19 @@ struct Configuration final {
   /// DX791: active ROS rows require an explicit output choice. The unchanged
   /// neutral base is also used by pure archival Native decoding; no absent
   /// authored ROS field is interpreted as commanded output.
+  struct PneumaticOutput final {
+    core::IoSignalId signal;
+    bool open_value{};
+    bool close_value{};
+
+    friend bool operator==(const PneumaticOutput &, const PneumaticOutput &) = default;
+  };
+  struct PneumaticIo final {
+    std::vector<PneumaticOutput> outputs;
+    std::map<std::string, core::IoSignalId, std::less<>> inputs;
+
+    friend bool operator==(const PneumaticIo &, const PneumaticIo &) = default;
+  };
   struct GripperTargetConfiguration final
       : execution_runtime_contract::Configuration::GripperTargetConfiguration {
     core::GripperOutputMode output_mode;
@@ -121,18 +162,18 @@ struct Configuration final {
     /// reject this field. None retains positive metadata but has no delivery
     /// deadline or transport.
     std::optional<double> delivery_result_timeout_s;
-    /// Required gripper feedback staleness threshold [s]; also the default
-    /// budget of the CP9 `gripper_feedback` stream.
-    double state_freshness_timeout_s;
+    /// Signal identities and output levels; the Program selects which inputs
+    /// are required for a particular open or close command.
+    std::optional<PneumaticIo> pneumatic_io;
 
     GripperTargetConfiguration(
         execution_runtime_contract::Configuration::GripperTargetConfiguration value,
-        core::GripperOutputMode mode, double freshness_timeout_s,
-        std::optional<double> delivery_timeout = std::nullopt)
+        core::GripperOutputMode mode,
+        std::optional<double> delivery_timeout = std::nullopt,
+        std::optional<PneumaticIo> io = std::nullopt)
         : execution_runtime_contract::Configuration::GripperTargetConfiguration(
               std::move(value)), output_mode(mode),
-          delivery_result_timeout_s(delivery_timeout),
-          state_freshness_timeout_s(freshness_timeout_s) {}
+          delivery_result_timeout_s(delivery_timeout), pneumatic_io(std::move(io)) {}
 
     friend bool operator==(const GripperTargetConfiguration &,
                            const GripperTargetConfiguration &) = default;
@@ -184,6 +225,35 @@ struct Configuration final {
   };
   std::vector<PoseSource> pose_sources;
 
+  /// One row per model-free AI model component (runtime kind `ai_model`,
+  /// profile `ai_model_v0`), sorted by component: an external
+  /// OpenAI-compatible endpoint. `api_key_env` names the environment variable
+  /// holding the bearer token; the token itself is never compiled.
+  struct AiModel final {
+    core::ControllableComponentId controllable_component_id;
+    std::string base_url;
+    std::string model;
+    std::optional<std::string> api_key_env;
+
+    friend bool operator==(const AiModel &, const AiModel &) = default;
+  };
+  std::vector<AiModel> ai_models;
+
+  /// CP9: each hosted component's declared streams with their defaults
+  /// (`component_streams`), sorted by (component, stream). Deployment
+  /// `policies.component_streams` rows override them at runtime.
+  struct ComponentStream final {
+    core::ControllableComponentId controllable_component_id;
+    std::string stream_id;
+    std::int64_t budget_ns{};
+    core::StreamSeverityDTO severity{};
+    core::StreamRecoveryDTO recovery{};
+
+    friend bool operator==(const ComponentStream &,
+                           const ComponentStream &) = default;
+  };
+  std::vector<ComponentStream> component_streams;
+
   friend bool operator==(const Configuration &,
                          const Configuration &) = default;
 };
@@ -218,10 +288,41 @@ pose_source_stream_id(const Configuration::PoseSource::Binding &binding);
 find_pose_source(const Configuration &configuration,
                  const core::ControllableComponentId &component_id);
 
+/// The AI model row of one hosted component, or none.
+[[nodiscard]] const Configuration::AiModel *
+find_ai_model(const Configuration &configuration,
+              const core::ControllableComponentId &component_id);
+
+/// The default row of one declared component stream, or none when the
+/// component does not list the stream.
+[[nodiscard]] const Configuration::ComponentStream *
+find_component_stream(const Configuration &configuration,
+                      const core::ControllableComponentId &component,
+                      std::string_view stream_id);
+
 /// The controller profile row of one hosted component, or none.
 [[nodiscard]] const Configuration::ControllerProfile *
 find_controller_profile(const Configuration &configuration,
                         const core::ControllableComponentId &component_id);
+
+/// CP8 step 1: the simulator that feeds one hosted component, resolved once
+/// from its compiled controller profile (Isaac profiles depend on Isaac; Mock
+/// and Real profiles on none). Consumers read this instead of the lane keys.
+enum class ControllerSimulatorDependency : std::uint8_t { kNone, kIsaac };
+
+[[nodiscard]] ControllerSimulatorDependency
+controller_simulator_dependency(const Configuration::ControllerProfile &profile);
+
+/// `none` or `isaac`.
+[[nodiscard]] std::string_view
+to_string(ControllerSimulatorDependency dependency) noexcept;
+
+/// One `{controllable_component_id, simulator}` row per component hosted by a
+/// ROS runtime unit of the verified bundle, sorted by component. Derived from
+/// the compiled controller profiles; it is not part of any compiled
+/// projection or identity.
+[[nodiscard]] CanonicalValue
+component_simulator_dependencies(const RetainedBundle &bundle);
 
 [[nodiscard]] std::string implementation_revision();
 

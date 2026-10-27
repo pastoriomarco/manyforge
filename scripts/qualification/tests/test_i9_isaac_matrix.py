@@ -209,9 +209,7 @@ def test_package_preflight_binds_projects_program_pose_and_site(
     package.mkdir()
     config = source / "manyforge_ros_bringup/config"
     config.mkdir(parents=True)
-    site_rows = []
     for row in runner.SCENARIOS:
-        site_rows.append({"scenario_id": row.scenario_id})
         project = source / "examples" / f"{row.scenario_id}.scenario"
         project.mkdir(parents=True)
         (project / "scenario.yaml").write_text(
@@ -232,7 +230,14 @@ def test_package_preflight_binds_projects_program_pose_and_site(
             json.dumps({"cell_id": row.cell_id}), encoding="utf-8"
         )
     (config / "isaac_program_simulation_site.json").write_text(
-        json.dumps({"scenarios": site_rows}), encoding="utf-8"
+        json.dumps(
+            {
+                "api_version": "manyforge.simulation_program_site_config.v2",
+                "service_prefix": "auto",
+                "service_timeout_s": 10.0,
+            }
+        ),
+        encoding="utf-8",
     )
 
     mesh_uri = "examples/isaac_manipulator_scene_light/meshes/fixture.obj"

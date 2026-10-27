@@ -17,6 +17,7 @@ import type {
 import { cartesianMoveOffsetsFromTarget, computeCartesianMoveDraft, DEFAULT_MOVE_TO_OPTIONS } from '../utils/moveTo';
 import type { CartesianMoveDraftOptions, MoveToDraft, MoveToDraftSource } from '../utils/moveTo';
 import { poseTupleFromValue, poseValueFromTuple, samePose } from '../utils/poseTransforms';
+import { manualPneumaticEndpoint } from './pneumaticManual';
 
 export const ROBOT_CONTROL_AUTHOR_DEBOUNCE_MS = 150;
 
@@ -1472,7 +1473,10 @@ export function hasPneumaticGripperDescriptor(status: ExecutionOwnerStatus): boo
     && descriptor.commandKind === 'gripper_position'
     && descriptor.actuationKind === 'pneumatic'
     && descriptor.graspConfirmationPolicy === 'not_required'
-    && ((descriptor.outputMode === 'commanded' && descriptor.completionPolicy === 'output_delivery')
+    && ((descriptor.outputMode === 'commanded' && (
+      (descriptor.pneumaticOutputs === undefined && descriptor.completionPolicy === 'output_delivery')
+      || (descriptor.pneumaticOutputs !== undefined && descriptor.pneumaticOutputs.length > 0
+        && descriptor.completionPolicy === 'no_output')))
       || (descriptor.outputMode === 'none' && descriptor.completionPolicy === 'no_output'))
     && descriptor.controllableComponentId === gripper.controllableComponentId
     && descriptor.commandTargetId === gripper.commandTargetId
@@ -1517,9 +1521,13 @@ export function buildGripperCommandIntent(
   if (descriptor.commandDurationS === null) {
     throw new Error('The addressed gripper command duration is not configured.');
   }
+  // The valve has only two positions. Preview and submit the selected endpoint,
+  // so the logical gripper and the physical outputs describe the same state.
+  const selectedPosition = descriptor.pneumaticOutputs === undefined
+    ? position : manualPneumaticEndpoint(status, position).position;
   const coordinate = descriptor.coordinateKind === 'angular_rad'
-    ? { kind: 'angular_rad' as const, value_rad: position }
-    : { kind: 'linear_m' as const, value_m: position };
+    ? { kind: 'angular_rad' as const, value_rad: selectedPosition }
+    : { kind: 'linear_m' as const, value_m: selectedPosition };
   return {
     request_context: {
       request_id: requestId,

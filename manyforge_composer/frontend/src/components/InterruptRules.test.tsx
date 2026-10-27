@@ -186,15 +186,14 @@ describe('Deployment interrupt rules and output acknowledgement', () => {
       rule_id: 'part_lost', condition: { compare: { operand, op: '==', value: false } }, scope: 'all_motion', priority: 5,
     }] }, ['right', 'left']);
     try {
-      await edited.type('part_lost idle behaviour', 'ignore');
+      // Gate is the default and omitted; only Full Stop shows an idle behaviour.
+      expect(edited.control('part_lost on trip').value).toBe('');
+      expect(edited.all((props) => props['aria-label'] === 'part_lost idle behaviour')).toHaveLength(0);
+      await edited.type('part_lost on trip', 'full_stop');
       expect(edited.controller.mutate).toHaveBeenLastCalledWith(['policies', 'interrupt_rules'], 'set', [{
         rule_id: 'part_lost', condition: { compare: { operand, op: '==', value: false } }, scope: 'all_motion', priority: 5,
-        idle_behaviour: 'ignore',
+        on_trip: 'full_stop',
       }]);
-      // Contract 78: auto-clear is written; the operator default is omitted.
-      await edited.type('part_lost latch release', 'auto_on_clear');
-      expect((edited.controller.mutate as ReturnType<typeof vi.fn>).mock.lastCall?.[2][0].latch_release)
-        .toBe('auto_on_clear');
       // Contract 73: execution groups come from the Applied Program; Full Stop is `everything`.
       await edited.type('part_lost scope', 'execution_groups');
       expect((edited.controller.mutate as ReturnType<typeof vi.fn>).mock.lastCall?.[2][0].scope)
@@ -208,9 +207,25 @@ describe('Deployment interrupt rules and output acknowledgement', () => {
     } finally { await edited.unmount(); }
   });
 
-  it('loads the frozen-schema rule (all_motion, latch, operator, priority 0) without flags', async () => {
+  it('edits the idle behaviour of a Full Stop rule and drops it when switching back to gate', async () => {
+    const full = await mountDeployment({ interrupt_rules: [{
+      rule_id: 'part_lost', condition: { compare: { operand, op: '==', value: false } }, scope: 'all_motion', priority: 5,
+      on_trip: 'full_stop', idle_behaviour: 'latch',
+    }] });
+    try {
+      expect(full.control('part_lost on trip').value).toBe('full_stop');
+      await full.type('part_lost idle behaviour', 'ignore');
+      expect((full.controller.mutate as ReturnType<typeof vi.fn>).mock.lastCall?.[2][0].idle_behaviour).toBe('ignore');
+      await full.type('part_lost on trip', '');
+      expect(full.controller.mutate).toHaveBeenLastCalledWith(['policies', 'interrupt_rules'], 'set', [{
+        rule_id: 'part_lost', condition: { compare: { operand, op: '==', value: false } }, scope: 'all_motion', priority: 5,
+      }]);
+    } finally { await full.unmount(); }
+  });
+
+  it('loads the trial rule (all_motion, full_stop, latch, priority 0) without flags', async () => {
     const trial = { rule_id: 'light_curtain', condition: { compare: { operand, op: '==', value: true } },
-      scope: 'all_motion', priority: 0, idle_behaviour: 'latch', latch_release: 'operator' };
+      scope: 'all_motion', priority: 0, on_trip: 'full_stop', idle_behaviour: 'latch' };
     const mounted = await mountDeployment({ interrupt_rules: [trial] });
     try {
       expect(mounted.control('light_curtain scope').value).toBe('all_motion');

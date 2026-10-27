@@ -510,6 +510,59 @@ def test_signal_binding_shape_and_coordinate_exclusivity_fail_closed(mutation: C
         validate_program_binding(document)
 
 
+def _pneumatic_binding_fixture() -> dict[str, Any]:
+    document = _native_fixture()
+    gripper = next(row for row in document["target_role_bindings"]
+                   if any(cap["capability_id"] == "tool.gripper.command"
+                          for cap in row["capability_bindings"]))
+    for kind in ("input", "output"):
+        role = f"pneumatic.{kind}"
+        target = copy.deepcopy(gripper)
+        target["target_role_id"] = role
+        target["command_target_id"] = "io"
+        target["frame_role_bindings"] = []
+        target["resource_role_bindings"] = []
+        target["collision_body_role_bindings"] = []
+        target["capability_bindings"][0]["capability_id"] = (
+            "io.gpio.get_input" if kind == "input" else "io.gpio.set_output"
+        )
+        target["signal_role_bindings"] = [{
+            "resource_role_id": kind, "signal_name": kind, "value_type": "bool",
+            "direction": kind, "transition_capability": "sampled_only",
+            "signal_descriptor_digest": "sha256:" + "a" * 64,
+        }]
+        document["target_role_bindings"].append(target)
+    gripper["pneumatic_io"] = {
+        "outputs": [{"target_role_id": "pneumatic.output", "resource_role_id": "output",
+                     "open_value": True, "close_value": False}],
+        "inputs": [{"input": "workpiece_grasped", "target_role_id": "pneumatic.input",
+                    "resource_role_id": "input"}],
+    }
+    document["target_role_bindings"].sort(key=lambda row: row["target_role_id"])
+    _rehash(document)
+    return document
+
+
+def test_pneumatic_binding_routes_exact_bound_signals() -> None:
+    document = _pneumatic_binding_fixture()
+    assert validate_program_binding(document) is document
+
+
+@pytest.mark.parametrize("mutation", [
+    lambda route: route["outputs"][0].__setitem__("target_role_id", "pneumatic.input"),
+    lambda route: route["outputs"][0].__setitem__("open_value", 1),
+    lambda route: route["inputs"][0].__setitem__("input", "unknown"),
+    lambda route: route["inputs"].append(copy.deepcopy(route["inputs"][0])),
+])
+def test_pneumatic_binding_rejects_wrong_signal_values_or_duplicate_inputs(mutation) -> None:
+    document = _pneumatic_binding_fixture()
+    gripper = next(row for row in document["target_role_bindings"] if "pneumatic_io" in row)
+    mutation(gripper["pneumatic_io"])
+    _rehash(document)
+    with pytest.raises(ProgramBindingTransportError):
+        validate_program_binding(document)
+
+
 def _endpoint_fixture() -> dict[str, Any]:
     value = _fixture()
     target = value["target_role_bindings"][0]

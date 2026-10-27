@@ -52,6 +52,7 @@ def _arguments() -> argparse.Namespace:
     parser.add_argument("--takeover-budget", action="store_true")
     parser.add_argument("--no-program", action="store_true")
     parser.add_argument("--ros2-control", action="store_true")
+    parser.add_argument("--real-measured", action="store_true")
     parser.add_argument("--manager-ros-apply-fixture-root", type=Path)
     parser.add_argument("--manager-isaac-apply-fixture-root", type=Path)
     return parser.parse_args()
@@ -253,7 +254,11 @@ def _require_canonical_empty_configuration(
     ):
         raise AssertionError("native runtime configuration is not an object")
     if candidate_host["runtime_profile_id"] == "manyforge.ros2_control_execution_runtime":
-        assert empty_host == candidate_host
+        # The retained host keeps its identity and launch product; its
+        # configuration is component data and differs by design (R7-2).
+        assert {key: value for key, value in empty_host.items() if key != "configuration"} == {
+            key: value for key, value in candidate_host.items() if key != "configuration"
+        }
         return
     for field in (
         "mode",
@@ -710,9 +715,9 @@ def _require_gripper_delivery_timeout_semantics(
 
     pneumatic = target(request, "lite6_robot")
     position = target(request, "ur5e_robot")
-    assert pneumatic["actuation_kind"] == "pneumatic" and len(pneumatic) == 15
+    assert pneumatic["actuation_kind"] == "pneumatic" and len(pneumatic) == 14
     assert pneumatic["delivery_result_timeout_s"] == 1.0
-    assert position["actuation_kind"] == "position_commanded" and len(position) == 14
+    assert position["actuation_kind"] == "position_commanded" and len(position) == 13
     assert "delivery_result_timeout_s" not in position
 
     for name, timeout in (("authored", 1.0), ("absent", None), ("override", 2.5)):
@@ -801,15 +806,29 @@ def _check_two_ros_robots(
         for row in configuration["default_fault_stop_profiles"]
     ] == components
     assert "direct_control_joint_limits" not in configuration
-    assert "gripper_target_configurations" not in configuration
+    # Q68: each component keeps its own authored gripper target rows.
+    assert configuration["gripper_target_configurations"] == sorted(
+        (row for component in authored
+         for row in component["gripper_target_configurations"]),
+        key=lambda row: (row["controllable_component_id"], row["command_target_id"]),
+    )
+    # CP9: each component keeps its own stream defaults.
+    assert configuration["component_streams"] == sorted(
+        (row for component in authored for row in component["component_streams"]),
+        key=lambda row: (row["controllable_component_id"], row["stream_id"]),
+    )
 
 
 def _without_pose_sources(value: dict[str, object], key: str) -> dict[str, object]:
+    """Drop the pose-source components with their object links and streams."""
     result = copy.deepcopy(value)
     result[key]["components"] = [
         component for component in result[key]["components"]
         if component["configuration"]["runtime_kind"] != "pose_source"
     ]
+    policies = result[key].get("policies", {})
+    policies.pop("scene_pose_sources", None)
+    policies.pop("component_streams", None)
     return result
 
 
@@ -826,8 +845,38 @@ def _check_pose_source_preparation(
     assert prepared is not None
     graph = prepared["activation_payload"]["retained_bundle"]["cell_graph"]
     configuration = graph["runtime_units"][0]["configuration"]
-    assert configuration["pose_sources"] == sources[0]["configuration"][
-        "runtime_configuration"]["pose_sources"]
+    # The authored component + its object links expand into today's row:
+    # one simulation_entities row per linked entity (policy "scene", header
+    # copied verbatim) plus the
+    # overlay TCP row; lifetimes are the stream budgets.
+    authored = sources[0]["configuration"]["runtime_configuration"]
+    links = request["deployment"]["policies"]["scene_pose_sources"]
+    budgets = {
+        row["stream_id"]: row["budget_ns"]
+        for row in request["deployment"]["policies"].get("component_streams", [])
+    }
+    [row] = configuration["pose_sources"]
+    assert row["controllable_component_id"] == "isaac_scene_objects"
+    assert row["simulation_poll_period_ms"] == authored["simulation"]["poll_period_ms"]
+    objects = {
+        entity["object_id"]: entity for entity in row["simulation_entities"]
+        if entity["eligible"]
+    }
+    assert sorted(objects) == sorted(link["scene_resource_id"] for link in links)
+    for link in links:
+        entity = objects[link["scene_resource_id"]]
+        assert entity["policy_id"] == "scene"
+        key = link["source_key"]["simulation_entity"]
+        assert entity["entity"] == key["entity"]
+        assert entity["source_header_frame_id"] == key["source_header_frame_id"]
+        assert entity["lifetime_ns"] == budgets.get(
+            f"poses/{link['scene_resource_id']}", authored["stream_budget_ns"])
+    overlay = authored["robot_overlay"]
+    assert row["joint_state"]["object_id"] == overlay["robot_component_id"]
+    assert [
+        entity["policy_id"] for entity in row["simulation_entities"]
+        if not entity["eligible"]
+    ] == ["viewer.measured_tcp"]
     domains = [row for row in graph["control_domains"] if row.get("kind") == "provider"]
     assert [row["provider"]["provider_manifest_id"] for row in domains] == [
         "manyforge.provider.pose_source"]
@@ -906,7 +955,8 @@ def _check_ros_preparation(
         **authored_fault,
     }]
     assert runtime["configuration"] == expected_configuration
-    assert runtime["configuration"]["mode"] == "commanded_sim"
+    # CP8 step 1: the cell-wide `mode` lane flag is deleted.
+    assert "mode" not in runtime["configuration"]
     assert graph["controllable_components"][0]["component_type_id"] == (
         "ur10e_robotiq_2f_140.fixed_scale.component"
     )
@@ -1103,6 +1153,12 @@ def _check_ros_preparation(
     two_robots = copy.deepcopy(document)
     second_robot = copy.deepcopy(two_robots["deployment_draft"]["components"][0])
     second_robot["component_id"] = "isaac_ur10e_second_robot"
+    # CP9: the copy owns its gripper target, so it declares the same
+    # measured_joints + gripper_feedback stream rows as the maintained profile.
+    second_runtime = second_robot["configuration"]["runtime_configuration"]
+    for field in ("component_streams", "gripper_target_configurations"):
+        for row in second_runtime[field]:
+            row["controllable_component_id"] = "isaac_ur10e_second_robot"
     second_robot["frame_prefix"] = "second/"
     second_robot["root_pose_in_cell"]["position_m"] = [1.5, 0.0, 0.0]
     two_robots["deployment_draft"]["components"].append(second_robot)
@@ -1508,6 +1564,162 @@ def main() -> int:
             return 0
         if args.ros2_control:
             _check_ros_preparation(args, request, scenario_path, document, temporary)
+            return 0
+        if args.real_measured:
+            # The maintained Real scenario carries Mock's pneumatic gripper row
+            # with no output (display only). Without that row, passive model
+            # geometry alone keeps the arm-only component.
+            scenario_request = request
+            request = copy.deepcopy(scenario_request)
+            (scenario_gripper,) = request["deployment"]["components"][0]["configuration"][
+                "runtime_configuration"
+            ].pop("gripper_target_configurations")
+            _rehash_request(request)
+            # CP8 step 1: a Real component compiles to measured authority with
+            # its own authority ID, an arm-only type, its site-settings address
+            # reference and no cell-wide `mode`.
+            prepared = _run(args, request, temporary / "real")
+            assert prepared is not None
+            graph = prepared["activation_payload"]["retained_bundle"]["cell_graph"]
+            bindings = graph["control_bindings"]
+            assert bindings and {row["command_target_id"] for row in bindings} == {"arm"}
+            for row in bindings:
+                component = row["controllable_component_id"]
+                assert row["state_authority_class"] == "measured"
+                assert row["state_authority_id"] == f"{component}.arm.measured_state"
+                # R7 package 4: the Real provider carries the Real catalog.
+                assert row["provider_manifest_id"] == (
+                    "manyforge.provider.ros2_control.xarm"
+                )
+            bundle = prepared["activation_payload"]["retained_bundle"]
+            assert {
+                row["provider_manifest_id"]
+                for row in bundle["capability_provider_bindings"]
+                if row["scope"] == "target_binding"
+            } == {"manyforge.provider.ros2_control.xarm"}
+            (component,) = graph["controllable_components"]
+            assert component["component_type_id"].endswith(".fixed_scale.arm_only.component")
+            (unit,) = graph["runtime_units"]
+            configuration = unit["configuration"]
+            assert "mode" not in configuration
+            assert "gripper_target_configurations" not in configuration
+            assert configuration["controller_profiles"] == [{
+                "controllable_component_id": component["controllable_component_id"],
+                "device_address_ref": "lite6_main",
+                "frame_prefix": "",
+                "real_profile": "lite6_real",
+            }]
+            # A Real pneumatic gripper is explicit: the scenario's row is the
+            # genuine Mock model's gripper row with no output, and declares no
+            # nonexistent feedback.
+            mock_deployment = load_strict_json_yaml(
+                args.workspace / "examples/lite6_pick_and_place.scenario/deployment.yaml"
+            )
+            (mock_component,) = mock_deployment["components"]
+            (pneumatic,) = mock_component["configuration"]["runtime_configuration"][
+                "gripper_target_configurations"
+            ]
+            assert scenario_gripper["output_mode"] == "none"
+            assert {
+                key: value for key, value in scenario_gripper.items()
+                if key not in {"description", "output_mode"}
+            } == {
+                key: value for key, value in pneumatic.items()
+                if key not in {"description", "output_mode"}
+            }
+            with_gripper = scenario_request
+            accepted = _run(args, with_gripper, temporary / "real-pneumatic-none")
+            assert accepted is not None
+            new_graph = accepted["activation_payload"]["retained_bundle"]["cell_graph"]
+            (new_component,) = new_graph["controllable_components"]
+            assert new_component["component_type_id"].endswith(".fixed_scale.component")
+            gripper_bindings = [
+                row for row in new_graph["control_bindings"]
+                if row["command_target_id"] == "gripper"
+            ]
+            assert gripper_bindings and all(
+                row["state_authority_class"] == "commanded" for row in gripper_bindings
+            )
+            assert all(
+                row["state_authority_class"] == "measured"
+                for row in new_graph["control_bindings"]
+                if row["command_target_id"] == "arm"
+            )
+            (new_unit,) = new_graph["runtime_units"]
+            assert [row["stream_id"] for row in new_unit["configuration"]["component_streams"]] == [
+                "measured_joints"
+            ]
+            false_feedback = copy.deepcopy(with_gripper)
+            false_feedback["deployment"]["components"][0]["configuration"][
+                "runtime_configuration"
+            ]["component_streams"].insert(0, {
+                "budget_ns": 1000000000,
+                "controllable_component_id": component["controllable_component_id"],
+                "recovery": "ack",
+                "severity": "fault",
+                "stream_id": "gripper_feedback",
+            })
+            _rehash_request(false_feedback)
+            _run(args, false_feedback, temporary / "real-pneumatic-false-feedback",
+                 expect_error="component_streams must declare exactly measured_joints")
+            commanded = copy.deepcopy(with_gripper)
+            commanded["deployment"]["components"][0]["configuration"]["runtime_configuration"][
+                "gripper_target_configurations"
+            ][0]["output_mode"] = "commanded"
+            _rehash_request(commanded)
+            _run(args, commanded, temporary / "real-pneumatic-commanded",
+                 expect_error="real_pneumatic_io_not_wired")
+            wrong_kind = copy.deepcopy(with_gripper)
+            wrong_kind["deployment"]["components"][0]["configuration"]["runtime_configuration"][
+                "gripper_target_configurations"
+            ][0]["actuation_kind"] = "position_commanded"
+            _rehash_request(wrong_kind)
+            _run(args, wrong_kind, temporary / "real-gripper-wrong-kind",
+                 expect_error="Real gripper must be pneumatic")
+            # D11: the component's tool payload rides its controller profile
+            # row (only the Real vendor adapter applies it, at Enable).
+            with_payload = copy.deepcopy(request)
+            payload = {"mass_kg": 0.3, "center_of_mass_m": [0.0, 0.01, 0.05]}
+            with_payload["deployment"]["components"][0]["configuration"][
+                "runtime_configuration"
+            ]["tool_payload"] = payload
+            _rehash_request(with_payload)
+            carried = _run(args, with_payload, temporary / "real-tool-payload")
+            assert carried is not None
+            (payload_unit,) = carried["activation_payload"]["retained_bundle"][
+                "cell_graph"
+            ]["runtime_units"]
+            assert "tool_payload" not in payload_unit["configuration"]
+            (payload_row,) = payload_unit["configuration"]["controller_profiles"]
+            assert payload_row["tool_payload"] == payload
+            invalid_payload = copy.deepcopy(with_payload)
+            invalid_payload["deployment"]["components"][0]["configuration"][
+                "runtime_configuration"
+            ]["tool_payload"] = {"mass_kg": 0.3, "center_of_mass_m": [0.0, 0.0]}
+            _rehash_request(invalid_payload)
+            _run(args, invalid_payload, temporary / "real-tool-payload-invalid",
+                 expect_error="tool_payload")
+            # One robot is driven by one component: a second Real component
+            # naming the same site device reference is refused at compile.
+            twin_id = component["controllable_component_id"] + "_twin"
+            duplicate = copy.deepcopy(request)
+            for key in ("deployment", "model_source_closure", "prepared_model_closure"):
+                rows = duplicate[key]["components"]
+                twin = copy.deepcopy(rows[0])
+                twin["component_id"] = twin_id
+                if key == "deployment":
+                    twin["frame_prefix"] = "twin/"
+                    runtime = twin["configuration"]["runtime_configuration"]
+                    for row in runtime.get("component_streams", []):
+                        row["controllable_component_id"] = twin_id
+                rows.append(twin)
+            _rehash_request(duplicate)
+            _run(
+                args,
+                duplicate,
+                temporary / "real-duplicate-address",
+                expect_error="real_device_address_duplicate",
+            )
             return 0
         if args.no_program:
             request["program"] = None

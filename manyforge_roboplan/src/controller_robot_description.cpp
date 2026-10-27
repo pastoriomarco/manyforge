@@ -245,16 +245,24 @@ void validate_gripper_model_binding(
 
 struct GeneratedJoint final {
   std::string name;
-  double initial_value{};
+  /// Absent for hardware that reports measured state.
+  std::optional<double> initial_value;
 };
 
-void append_joint(std::string &out, const GeneratedJoint &joint) {
+void append_joint(std::string &out, const GeneratedJoint &joint,
+                  const std::vector<std::string> &command_interfaces) {
   out += "    <joint name=\"" + escaped(joint.name) + "\">\n";
-  out += "      <command_interface name=\"position\"/>\n";
-  out += "      <state_interface name=\"position\">\n";
-  out += "        <param name=\"initial_value\">" +
-         number_text(joint.initial_value) + "</param>\n";
-  out += "      </state_interface>\n";
+  for (const auto &interface : command_interfaces) {
+    out += "      <command_interface name=\"" + escaped(interface) + "\"/>\n";
+  }
+  if (joint.initial_value.has_value()) {
+    out += "      <state_interface name=\"position\">\n";
+    out += "        <param name=\"initial_value\">" +
+           number_text(*joint.initial_value) + "</param>\n";
+    out += "      </state_interface>\n";
+  } else {
+    out += "      <state_interface name=\"position\"/>\n";
+  }
   out += "      <state_interface name=\"velocity\"/>\n";
   out += "    </joint>\n";
 }
@@ -263,7 +271,8 @@ void append_joint(std::string &out, const GeneratedJoint &joint) {
 hardware_section(const std::string &component_name,
                  const std::string_view plugin,
                  const std::vector<std::pair<std::string, std::string>> &params,
-                 const std::vector<GeneratedJoint> &joints) {
+                 const std::vector<GeneratedJoint> &joints,
+                 const std::vector<std::string> &command_interfaces) {
   std::string out;
   out += "  <ros2_control name=\"" + escaped(component_name) +
          "\" type=\"system\">\n";
@@ -274,20 +283,34 @@ hardware_section(const std::string &component_name,
            "</param>\n";
   }
   out += "    </hardware>\n";
-  for (const auto &joint : joints) append_joint(out, joint);
+  for (const auto &joint : joints) append_joint(out, joint, command_interfaces);
   out += "  </ros2_control>\n";
   return out;
 }
 
+/// The arm joints paired with their initial values by order; a hardware that
+/// does not seed its state (`seeded` false) takes none.
 [[nodiscard]] std::vector<GeneratedJoint>
 paired_arm_joints(const ModelScan &model,
                   const std::vector<std::string> &arm_joint_names,
                   const std::vector<double> &initial_values,
-                  const std::string_view lane) {
+                  const std::string_view lane, const bool seeded = true) {
   if (arm_joint_names.empty()) fail("the retained binding names no arm joint");
   if (std::set<std::string>(arm_joint_names.begin(), arm_joint_names.end())
           .size() != arm_joint_names.size()) {
     fail("the retained binding names an arm joint more than once");
+  }
+  if (!seeded) {
+    if (!initial_values.empty()) {
+      fail(std::string(lane) + " seeds initial joint positions for hardware "
+           "that reports measured state");
+    }
+    std::vector<GeneratedJoint> joints;
+    for (const auto &name : arm_joint_names) {
+      require_commandable_joint(model, name, "arm");
+      joints.push_back(GeneratedJoint{name, std::nullopt});
+    }
+    return joints;
   }
   if (initial_values.size() != arm_joint_names.size()) {
     fail(std::string(lane) + " has " + std::to_string(initial_values.size()) +
@@ -312,6 +335,11 @@ mock_section(const ModelScan &model,
   if (lane.hardware_component_name.empty()) {
     fail("the mock lane has no hardware component name");
   }
+  const auto &hardware = lane.hardware;
+  if (hardware.plugin.empty() || hardware.joint_command_interfaces.empty()) {
+    fail("the component hardware has no plugin or joint command interface");
+  }
+  const bool seeded = hardware.seeds_initial_positions;
   const bool model_backed_gripper =
       lane.gripper.has_value() && lane.gripper->source_joint_name.has_value();
   if (lane.gripper_output_mode != core::GripperOutputMode::kCommanded &&
@@ -331,19 +359,20 @@ mock_section(const ModelScan &model,
   } else {
     joints = paired_arm_joints(model, arm_joint_names,
                               lane.initial_joint_positions_rad,
-                              "the deployment");
+                              "the deployment", seeded);
   }
   if (model_backed_gripper) {
     const auto &gripper_joint = *lane.gripper->source_joint_name;
     validate_gripper_model_binding(model, arm_joint_names, *lane.gripper);
     if (!lane.gripper->projected_initial_position.has_value() &&
-        !no_gripper_output) {
+        !no_gripper_output && seeded) {
       fail("gripper joint '" + gripper_joint +
            "' has no retained model projection for its initial value");
     }
     if (!no_gripper_output) {
       joints.push_back(GeneratedJoint{
-          gripper_joint, *lane.gripper->projected_initial_position});
+          gripper_joint, seeded ? lane.gripper->projected_initial_position
+                                : std::nullopt});
     }
   } else if (lane.gripper_required) {
     fail(lane.gripper.has_value()
@@ -352,9 +381,9 @@ mock_section(const ModelScan &model,
              : "the mock profile requires a gripper, but the deployment has "
                "no gripper binding");
   }
-  return hardware_section(lane.hardware_component_name,
-                          "mock_components/GenericSystem",
-                          {{"calculate_dynamics", "true"}}, joints);
+  return hardware_section(lane.hardware_component_name, hardware.plugin,
+                          hardware.parameters, joints,
+                          hardware.joint_command_interfaces);
 }
 
 [[nodiscard]] std::string
@@ -374,7 +403,7 @@ isaac_section(const ModelScan &model,
                            {"joint_states_topic", lane.joint_states_topic},
                            {"trigger_joint_command_threshold", number_text(-1.0)},
                            {"sum_wrapped_joint_states", "false"}},
-                          joints);
+                          joints, {"position"});
 }
 
 [[nodiscard]] bool horizontal_space(const char character) noexcept {
@@ -395,6 +424,15 @@ isaac_section(const ModelScan &model,
 }
 
 } // namespace
+
+Ros2ControlHardwareSpec mock_generic_system_hardware() {
+  Ros2ControlHardwareSpec hardware;
+  hardware.plugin = "mock_components/GenericSystem";
+  hardware.parameters = {{"calculate_dynamics", "true"}};
+  hardware.joint_command_interfaces = {"position"};
+  hardware.seeds_initial_positions = true;
+  return hardware;
+}
 
 std::string generate_controller_robot_description(
     const ControllerRobotDescriptionRequest &request) {

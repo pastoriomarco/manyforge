@@ -24,6 +24,7 @@ import type {
 } from '../../types/api';
 import type { JsonObject } from './shared';
 import {
+  allowedKeysAt,
   booleanAt,
   boundedArrayAt,
   digestAt,
@@ -115,9 +116,11 @@ function parseManagerActiveProjection(
   path: string,
 ): ManagerActiveProjection {
   const record = objectAt(value, path);
-  exactKeysAt(
+  // The Manager's per-component simulator rows are runner-only; the GUI ignores them.
+  allowedKeysAt(
     record,
     ['canonical_empty', 'cell_graph', 'graph_revision', 'publication', 'retained_bundle_id'],
+    ['component_simulator_dependencies'],
     path,
   );
   return {
@@ -422,9 +425,10 @@ export function parseManagerGraphProjection(
   value: unknown,
 ): ManagerGraphProjection {
   const record = objectAt(value, 'managerGraph');
-  exactKeysAt(
+  allowedKeysAt(
     record,
     ['cell_graph', 'graph_revision', 'retained_bundle_id', 'schema_version', 'source'],
+    ['component_simulator_dependencies'],
     'managerGraph',
   );
   const schemaVersion = stringAt(

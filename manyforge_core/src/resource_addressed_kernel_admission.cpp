@@ -2204,6 +2204,51 @@ ResourceAddressedExecutionKernel::RequestComponentIncidentContainment(
   return Result<ComponentIncidentContainmentReceiptDTO>::Ok(std::move(receipt));
 }
 
+Result<bool> ResourceAddressedExecutionKernel::RecoverComponentIncidentContainment(
+    const std::string& incident_id) {
+  std::optional<ComponentIncidentContainmentReceiptDTO> receipt;
+  {
+    std::lock_guard state_lock(state_mutex_);
+    const auto remembered = std::find_if(
+        incident_containments_.begin(), incident_containments_.end(),
+        [&](const auto& row) { return row.incident_id == incident_id; });
+    if (remembered != incident_containments_.end()) receipt = remembered->receipt;
+  }
+  // Unknown here (another owner, or never accepted): the operator's.
+  if (!receipt) return Result<bool>::Ok(true);
+  const auto offer = get_stop_fault_recovery_offer();
+  if (!offer.ok()) return Result<bool>::Err(offer.error());
+  if (!offer.value()) return Result<bool>::Ok(true);
+  const auto& latch = offer.value()->latch;
+  // Only a latch this containment alone caused (no joined operator Stop).
+  if (latch.stop_id != receipt->stop_id || latch.stop_generation != receipt->stop_generation ||
+      get_stop_fault_latch_origin(latch) != StopFaultLatchOriginDTO::kComponentIncident)
+    return Result<bool>::Ok(true);
+  if (!latch.stop_certificate) return Result<bool>::Ok(false);
+  if (offer.value()->configuration_expectations.empty()) return Result<bool>::Ok(true);
+  const auto material = config_.request_owner_epoch.value() + "\ncomponent-incident-recovery\n" +
+                        incident_id + "\n" + latch.latch_id.value() + "\n" +
+                        std::to_string(latch.latch_generation.value()) + "\n" +
+                        std::to_string(latch.recovery_assessment_revision);
+  const StopFaultRecoveryIntentDTO intent{
+      PublicRequestContextDTO{RequestId(content_identity::sha256_digest(material)),
+                              config_.request_owner_epoch, "cclc.component_incident",
+                              incident_id},
+      latch.latch_id,
+      latch.latch_generation,
+      latch.recovery_assessment_revision,
+      latch.stop_certificate->stop_certificate_id,
+      latch.stop_certificate->stop_certificate_revision,
+      latch.cell_id,
+      latch.retained_bundle_id,
+      latch.graph_revision,
+      offer.value()->configuration_expectations,
+      std::string("component stream live again")};
+  const auto recovered = recover_stop_fault(intent);
+  if (!recovered.ok()) return Result<bool>::Err(recovered.error());
+  return Result<bool>::Ok(recovered.value().accepted);
+}
+
 Result<AuthoringAdmissionDTO> ResourceAddressedExecutionKernel::ReplaceManagerLivenessRequiredSet(
     const ManagerLivenessRequiredSetDTO& required_set) {
   std::shared_ptr<IIoSignalService> affected_service;

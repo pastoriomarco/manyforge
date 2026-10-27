@@ -23,6 +23,7 @@ from manyforge_behavior.orchestration_ports import (
     NodeAttemptSource,
     OwnerInvocationPort,
     OwnerInvocationPendingError,
+    OwnerInvocationGatedError,
     OwnerInvocationHeldError,
     OwnerInvocationRefusedByPriorityError,
     OwnerNodeInputs,
@@ -415,6 +416,7 @@ class _TaskPhase(Enum):
     HOLDING = "holding"  # An authored pause holds the task for the operator.
     CLOSING = "closing"  # The failed task is being closed before its result.
     BACKOFF = "backoff"  # Motion: closed; the automatic retry waits.
+    GATED = "gated"  # Motion: a gate rule refused admission; waits for it to clear.
     DONE = "done"  # The result was returned to the tree.
 
 
@@ -932,6 +934,12 @@ class OwnerTaskAdapter(_OwnerAdapter):
         self._record_owner_error("owner_request_failed", error)
         return py_trees.common.Status.FAILURE
 
+    def _on_gated_refusal(self, error: OwnerInvocationGatedError) -> py_trees.common.Status:
+        """Only a motion node waits for a gate rule; any other fails as before."""
+
+        self._record_owner_error("owner_request_failed", error.refusal)
+        return py_trees.common.Status.FAILURE
+
     def _finish(self, status: py_trees.common.Status) -> py_trees.common.Status:
         """Hook on every status this node returns (motion writes its outcome)."""
 
@@ -939,6 +947,10 @@ class OwnerTaskAdapter(_OwnerAdapter):
 
     def update(self) -> py_trees.common.Status:
         return self._finish(self._update())
+
+    def _start_task(self) -> OwnerTaskSnapshot:
+        assert self._identity is not None and self._owner_inputs is not None
+        return self._port.start(self._node_id, self._identity, self._owner_inputs)
 
     def _update(self) -> py_trees.common.Status:
         if self._drain is not None and not self.drain_invalidated():
@@ -955,11 +967,7 @@ class OwnerTaskAdapter(_OwnerAdapter):
                 return gate
         try:
             if self._phase is _TaskPhase.SUBMIT:
-                self._task = self._port.start(
-                    self._node_id,
-                    self._identity,
-                    self._owner_inputs,
-                )
+                self._task = self._start_task()
                 self._phase = _TaskPhase.OBSERVE
                 if self._require_initial_running:
                     return py_trees.common.Status.RUNNING
@@ -989,6 +997,9 @@ class OwnerTaskAdapter(_OwnerAdapter):
             self._task = None
             self._phase = _TaskPhase.DONE
             return self._on_priority_refusal(error)
+        except OwnerInvocationGatedError as error:
+            self._task = None
+            return self._on_gated_refusal(error)
         except PoseSourceLatchError as error:
             self._record_pose_source_latch_failure(error)
             return py_trees.common.Status.FAILURE
@@ -1203,6 +1214,11 @@ class MotionTaskAdapter(OwnerTaskAdapter):
     Program clock, passes the owner's motion-attention check and submits a
     fresh Execute; otherwise the failure is held or closed as for any owner
     task. Any operator release of a hold over the node restarts the budget.
+    A gate rule's refusal (`global_interrupt_gated`) is a wait, not a failure
+    (Rule 2): the node stays RUNNING and evaluates its admission once more on
+    each newer reading of that rule that is `clear`, bounded by its
+    `execution_timeout_s` in Program time; expiry fails it with the Kernel's
+    refusal, exactly as an immediate refusal failed it before.
     A logically preempted (or priority-refused) node ends with its literal
     `preempted_result`; every end writes the outcome to the node's
     system-owned key `node_outcome.<instance_id>` (contract item 42).
@@ -1229,6 +1245,16 @@ class MotionTaskAdapter(OwnerTaskAdapter):
         )
         self._retries_used = 0
         self._retry: _PendingRetry | None = None
+        # The gate wait: its refusal and the rule reading it was refused at.
+        self._gate: tuple[OwnerInvocationGatedError, int] | None = None
+        self._gate_waiting = False  # `_gate_time` runs for the current wait.
+        self._gate_time = AttemptTime(
+            program_clock,
+            operator_stop_state=(
+                self._operator_stop_state if operator_stop_hold_scope is not None else None
+            ),
+            operator_stop_hold_scope=operator_stop_hold_scope,
+        )
         self._outcome: str | None = None
         self._outcome_written = False
         self._preempted = False
@@ -1246,6 +1272,8 @@ class MotionTaskAdapter(OwnerTaskAdapter):
         if restart_series:
             self._retries_used = 0
         self._retry = None
+        self._gate = None
+        self._gate_waiting = False
         self._outcome = None
         self._outcome_written = False
         self._preempted = False
@@ -1258,6 +1286,8 @@ class MotionTaskAdapter(OwnerTaskAdapter):
         self._retries_used = 0
 
     def _update(self) -> py_trees.common.Status:
+        if self._phase is _TaskPhase.GATED:
+            return self._await_gate()
         if self._phase is not _TaskPhase.BACKOFF:
             return super()._update()
         retry = self._retry
@@ -1286,8 +1316,62 @@ class MotionTaskAdapter(OwnerTaskAdapter):
 
     def observe_while_operator_stop_held(self) -> None:
         # A held node waits: no fresh attempt starts under a Stop.
-        if self._phase is not _TaskPhase.BACKOFF:
+        if self._phase not in {_TaskPhase.BACKOFF, _TaskPhase.GATED}:
             super().observe_while_operator_stop_held()
+
+    def _audit_gate(self, rule_id: str, *, waiting: bool) -> None:
+        if self._audit_sink is not None and self._identity is not None:
+            self._audit_sink(
+                {
+                    "kind": (
+                        "program_node_motion_gated" if waiting
+                        else "program_node_motion_gate_released"
+                    ),
+                    "node_instance_id": self._node_instance_id,
+                    "node_attempt_id": self._identity.node_attempt_id,
+                    "rule_id": rule_id,
+                }
+            )
+
+    def _on_gated_refusal(self, error: OwnerInvocationGatedError) -> py_trees.common.Status:
+        """Wait for the gate: nothing was admitted, nothing stays resident."""
+
+        if not self._gate_waiting:
+            self._gate_waiting = True
+            self._gate_time.start(exclude_held=True)
+            self._audit_gate(error.rule_id, waiting=True)
+        readings, _state = self._input_resolver.value_store.interrupt_state_reading(
+            error.rule_id
+        )
+        self._gate = (error, readings)
+        self._phase = _TaskPhase.GATED
+        self.feedback_message = f"Motion waits: global interrupt rule {error.rule_id} is active"
+        return self._await_gate()
+
+    def _await_gate(self) -> py_trees.common.Status:
+        gate = self._gate
+        assert gate is not None and self._inputs is not None  # Set with GATED.
+        error, refused_at = gate
+        if self._gate_time.elapsed() >= float(self._inputs["execution_timeout_s"]):
+            # The node's own timeout: it fails as an immediate refusal did.
+            self._phase = _TaskPhase.DONE
+            self._record_owner_error("owner_request_failed", error.refusal)
+            return py_trees.common.Status.FAILURE
+        readings, state = self._input_resolver.value_store.interrupt_state_reading(
+            error.rule_id
+        )
+        if readings <= refused_at or state != "clear":
+            return py_trees.common.Status.RUNNING
+        # A newer reading shows the rule clear: evaluate admission once more,
+        # as a fresh attempt of this series. A new refusal keeps waiting on
+        # the same timeout.
+        self._begin_attempt(restart_series=False)
+        self._gate_waiting = True
+        status = super()._update()
+        if self._phase is not _TaskPhase.GATED:
+            self._gate_waiting = False
+            self._audit_gate(error.rule_id, waiting=False)
+        return status
 
     def _note_takeover_fallback(self, task: OwnerTaskSnapshot) -> None:
         """History only: this newcomer's takeover took a fallback path (not a
@@ -1708,6 +1792,8 @@ class GripperCommandAdapter(OwnerTaskAdapter):
         program_clock: ProgramClock,
         operator_stop_state: OperatorMotionStopState | None = None,
         operator_stop_hold_scope: str | None = None,
+        io_watches: OwnerTaskPort | None = None,
+        io_signals: OwnerInvocationPort | None = None,
         **kwargs: Any,
     ) -> None:
         super().__init__(operator_stop_state=operator_stop_state, **kwargs)
@@ -1720,14 +1806,175 @@ class GripperCommandAdapter(OwnerTaskAdapter):
         self._timing_captured = False
         self._dwell_started = False
         self._draining_dwell = False
+        self._io_watches = io_watches
+        self._io_signals = io_signals
+        self._pneumatic_route: Mapping[str, Any] | None = None
+        self._pneumatic_checked = False
+        self._pneumatic_stage = "outputs"
+        self._pneumatic_output_index = 0
+        self._pneumatic_input_index = 0
+        self._pneumatic_watch: OwnerTaskSnapshot | None = None
+        self._pneumatic_drain_id: str | None = None
+        self._acceptance_unconfirmed = False
 
     def _begin_attempt(self, *, restart_series: bool) -> None:
+        self._release_pneumatic_watch()
         super()._begin_attempt(restart_series=restart_series)
         self._dwell_s = None
         self._timing_captured = False
         self._dwell_started = False
+        self._pneumatic_route = None
+        self._pneumatic_checked = False
+        self._pneumatic_stage = "outputs"
+        self._pneumatic_output_index = 0
+        self._pneumatic_input_index = 0
+        self._acceptance_unconfirmed = False
+
+    def _release_pneumatic_watch(self) -> bool:
+        task, identity = self._pneumatic_watch, self._identity
+        if task is None or identity is None or self._io_watches is None:
+            return task is None
+        try:
+            if task.state is OwnerTaskState.SUCCEEDED:
+                self._io_watches.acknowledge(task.task_id, identity)
+            else:
+                self._io_watches.cancel(task.task_id, identity)
+        except Exception:
+            # The port retains an unconfirmed token for run teardown.
+            return False
+        self._pneumatic_watch = None
+        return True
+
+    def _close_request_id(self, identity: NodeAttemptIdentity) -> str:
+        task = self._drain[0] if self._drain is not None else self._task
+        if task is not None and (
+            self._pneumatic_route is not None or task.task_id == self._pneumatic_drain_id
+        ):
+            return request_identity("program-pneumatic-close", identity.program_run_id,
+                                    identity.node_attempt_id, task.task_id)
+        return super()._close_request_id(identity)
+
+    def _start_task(self) -> OwnerTaskSnapshot:
+        if self._pneumatic_route is not None and self._pneumatic_stage == "outputs":
+            assert self._identity is not None
+            outputs = self._pneumatic_route["outputs"]
+            return self._port.start_pneumatic_output(  # type: ignore[attr-defined]
+                self._identity, OwnerNodeInputs(outputs[self._pneumatic_output_index]),
+                self._pneumatic_output_index,
+            )
+        if self._pneumatic_route is not None:
+            assert self._identity is not None
+            return self._port.start(self._node_id, self._identity, self._pneumatic_route["logical"])
+        return super()._start_task()
+
+    def update(self) -> py_trees.common.Status:
+        if self._wait_for_admission_release():
+            return py_trees.common.Status.RUNNING
+        if not self._pneumatic_checked and self._identity is not None and self._owner_inputs is not None:
+            planner = getattr(self._port, "pneumatic_plan", None)
+            try:
+                self._pneumatic_route = planner(self._identity, self._owner_inputs) if callable(planner) else None
+                if (self._pneumatic_route is not None and self._pneumatic_route["inputs"]
+                    and (self._io_watches is None or self._io_signals is None)):
+                    raise ValueError("pneumatic route requires the existing I/O watch and read ports")
+                self._pneumatic_checked = True
+            except OwnerInvocationHeldError as error:
+                self._hold_before_admission(error)
+                return py_trees.common.Status.RUNNING
+            except Exception as exc:
+                self._record_owner_error("owner_request_failed", exc)
+                return py_trees.common.Status.FAILURE
+        if self._pneumatic_route is None or self._pneumatic_stage in {"outputs", "logical"}:
+            return super().update()
+        return self._update_pneumatic_inputs()
+
+    def _update_pneumatic_inputs(self) -> py_trees.common.Status:
+        assert self._pneumatic_route is not None and self._identity is not None
+        required = self._pneumatic_route["inputs"]
+        duration = self._pneumatic_route["dwell_s"]
+        if not required:
+            if self._dwell_time.elapsed() < duration:
+                return py_trees.common.Status.RUNNING
+            self._pneumatic_stage = "logical"
+            return py_trees.common.Status.RUNNING
+        if duration > 0 and self._dwell_time.elapsed() >= duration:
+            self._release_pneumatic_watch()
+            self._record_node_failure("io_wait_timeout", "Pneumatic input confirmation exceeded command_duration_s.")
+            return py_trees.common.Status.FAILURE
+        assert self._io_watches is not None and self._io_signals is not None
+        try:
+            row = required[self._pneumatic_input_index]
+            if self._pneumatic_stage == "watch":
+                if self._pneumatic_watch is None:
+                    self._pneumatic_watch = self._io_watches.start(
+                        "io.wait_for_input", self._identity, OwnerNodeInputs(row))
+                else:
+                    observed = self._io_watches.observe(self._pneumatic_watch.task_id)
+                    if observed.task_id != self._pneumatic_watch.task_id:
+                        raise ValueError("pneumatic input watch identity changed")
+                    self._pneumatic_watch = observed
+                task = self._pneumatic_watch
+                if task.state is OwnerTaskState.ACTIVE:
+                    return py_trees.common.Status.RUNNING
+                if not self._release_pneumatic_watch():
+                    raise ValueError("pneumatic input watch release was not confirmed")
+                if task.state is not OwnerTaskState.SUCCEEDED:
+                    self._record_owner_failure(task.reason_code, task.message, task.details)
+                    return py_trees.common.Status.FAILURE
+                self._pneumatic_input_index += 1
+                if self._pneumatic_input_index == len(required):
+                    self._pneumatic_input_index = 0
+                    self._pneumatic_stage = "confirm"
+            else:
+                result = self._io_signals.invoke("io.check_input", self._identity, OwnerNodeInputs(row))
+                if not result.succeeded:
+                    if result.reason_code not in {"io_input_not_matched", "io_input_unavailable"}:
+                        self._record_owner_failure(result.reason_code, result.message, result.details)
+                        return py_trees.common.Status.FAILURE
+                    self._pneumatic_stage = "watch"
+                else:
+                    self._pneumatic_input_index += 1
+                    if self._pneumatic_input_index == len(required):
+                        self._pneumatic_stage = "logical"
+        except OwnerTaskObservationUnavailableError:
+            return py_trees.common.Status.RUNNING
+        except Exception as exc:
+            self._release_pneumatic_watch()
+            self._record_owner_error(_io_reason(exc), exc)
+            return py_trees.common.Status.FAILURE
+        if duration > 0 and self._dwell_time.elapsed() >= duration:
+            self._release_pneumatic_watch()
+            self._record_node_failure("io_wait_timeout", "Pneumatic input confirmation exceeded command_duration_s.")
+            return py_trees.common.Status.FAILURE
+        return py_trees.common.Status.RUNNING
 
     def _settle(self, task: OwnerTaskSnapshot) -> py_trees.common.Status:
+        if self._pneumatic_route is not None:
+            if self._pneumatic_stage == "outputs":
+                if self._acceptance_unconfirmed:
+                    return py_trees.common.Status.FAILURE
+                if (task.state is OwnerTaskState.SUCCEEDED and self._phase is not _TaskPhase.DONE
+                    and task.metadata.get("output_evidence") not in _OUTPUT_COMPLETION_EVIDENCE):
+                    self._acceptance_unconfirmed = True
+                    self._record_owner_failure(
+                        "io_output_acceptance_unconfirmed",
+                        "output completed without correlated source acceptance "
+                        f"(evidence {task.metadata.get('output_evidence')!r})",
+                    )
+                    return py_trees.common.Status.FAILURE
+                result = OwnerTaskAdapter._settle(self, task)
+                if result is py_trees.common.Status.SUCCESS:
+                    self._task = None
+                    self._phase = _TaskPhase.SUBMIT
+                    self._pneumatic_output_index += 1
+                    if self._pneumatic_output_index == len(self._pneumatic_route["outputs"]):
+                        self._dwell_time.start(
+                            exclude_held=(self._inputs or {}).get("dwell_while_held", "pause") == "pause")
+                        self._pneumatic_stage = "watch" if self._pneumatic_route["inputs"] else "dwell"
+                    return py_trees.common.Status.RUNNING
+                return result
+            # The mapped route already spent the dwell/confirmation interval.
+            return OwnerTaskAdapter._settle(self, task)
         if not self._timing_captured:
             # Production captures these facts from the exact retained descriptor
             # before submit. Neither policy names nor missing metadata select IO.
@@ -1761,6 +2008,10 @@ class GripperCommandAdapter(OwnerTaskAdapter):
             self._draining_dwell = False
 
     def terminate(self, new_status: py_trees.common.Status) -> None:
+        self._release_pneumatic_watch()
+        if (new_status is py_trees.common.Status.INVALID and self._pneumatic_route is not None
+            and self._task is not None):
+            self._pneumatic_drain_id = self._task.task_id
         super().terminate(new_status)
         if new_status is py_trees.common.Status.INVALID:
             self._dwell_s = None

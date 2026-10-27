@@ -370,6 +370,36 @@ void SetNonBlocking(const int fd) {
   return result;
 }
 
+/// Writes the Manager-validated site document (`manyforge.site.v1`) into one
+/// fresh private run-root snapshot. It is retained with the run's evidence and
+/// never rewritten, so a launched child always reads the bytes it was given.
+[[nodiscard]] std::filesystem::path
+CaptureSiteSettings(const std::filesystem::path &run_root,
+                    const std::string_view document) {
+  const auto path = run_root / ("site-settings-" + RandomHex() + ".json");
+  UniqueFd file(::open(path.c_str(),
+                       O_WRONLY | O_CREAT | O_EXCL | O_CLOEXEC | O_NOFOLLOW,
+                       S_IRUSR | S_IWUSR));
+  if (!file) {
+    Fail(ErrnoDetail("could not create site settings snapshot " + path.string(),
+                     errno));
+  }
+  std::size_t offset = 0U;
+  while (offset < document.size()) {
+    const auto count = ::write(file.get(), document.data() + offset,
+                               document.size() - offset);
+    if (count < 0 && errno == EINTR) {
+      continue;
+    }
+    if (count <= 0) {
+      Fail(ErrnoDetail("could not write site settings snapshot " + path.string(),
+                       count == 0 ? EIO : errno));
+    }
+    offset += static_cast<std::size_t>(count);
+  }
+  return path;
+}
+
 [[nodiscard]] bool WaitForEvent(const int fd, const short events,
                                 const std::chrono::milliseconds timeout) {
   pollfd descriptor{fd, static_cast<short>(events | POLLHUP), 0};
@@ -869,7 +899,8 @@ struct RetainedNativeRuntimeUnitAdapter::Impl final
        std::filesystem::path logical_scene_database,
        std::filesystem::path program_cycle_journal,
        std::filesystem::path activation_root,
-       std::filesystem::path scene_asset_root)
+       std::filesystem::path scene_asset_root,
+       std::optional<std::string> site_settings_document)
       : target_root_path(
             NormalizedPlainDirectory(std::move(trusted_installed_target_root),
                                      "trusted installed-target root")),
@@ -901,7 +932,12 @@ struct RetainedNativeRuntimeUnitAdapter::Impl final
         operating_system(std::move(selected_operating_system)),
         launch_environment_contracts(
             std::move(selected_launch_environment_contracts)),
+        site_settings_document(std::move(site_settings_document)),
         observer_instance_id("native-observer-" + RandomHex()) {
+    if (this->site_settings_document.has_value() &&
+        this->site_settings_document->find('\0') != std::string::npos) {
+      Fail("site settings document cannot contain NUL");
+    }
     const std::array<const std::filesystem::path *, 4U> typed_roots{
         &manager_state_root_path, &manager_run_root_path,
         &execution_state_root_path, &execution_run_root_path};
@@ -968,6 +1004,10 @@ struct RetainedNativeRuntimeUnitAdapter::Impl final
     if (::fstat(target_root_fd.get(), &status) != 0 ||
         !S_ISDIR(status.st_mode)) {
       Fail("trusted installed-target root is not a directory");
+    }
+    if (this->site_settings_document.has_value()) {
+      site_settings_snapshot = CaptureSiteSettings(
+          manager_run_root_path, *this->site_settings_document);
     }
   }
 
@@ -2110,6 +2150,10 @@ struct RetainedNativeRuntimeUnitAdapter::Impl final
       arguments.emplace_back("--manyforge-managed-scene-asset-root-fd");
       arguments.push_back(std::to_string(kChildSceneAssetRootFd));
     }
+    if (site_settings_snapshot.has_value()) {
+      arguments.emplace_back("--manyforge-managed-site-settings");
+      arguments.push_back(site_settings_snapshot->string());
+    }
     std::vector<char *> argv;
     argv.reserve(arguments.size() + 1U);
     for (auto &argument : arguments) {
@@ -2384,6 +2428,8 @@ struct RetainedNativeRuntimeUnitAdapter::Impl final
       &artifact_source;
   std::string operating_system;
   std::vector<std::string> launch_environment_contracts;
+  std::optional<std::string> site_settings_document;
+  std::optional<std::filesystem::path> site_settings_snapshot;
   std::string observer_instance_id;
   UniqueFd target_root_fd;
   std::mutex admission_mutex;
@@ -2614,7 +2660,8 @@ RetainedNativeRuntimeUnitAdapter::RetainedNativeRuntimeUnitAdapter(
     std::filesystem::path logical_scene_database,
     std::filesystem::path program_cycle_journal,
     std::filesystem::path activation_root,
-    std::filesystem::path scene_asset_root)
+    std::filesystem::path scene_asset_root,
+    std::optional<std::string> site_settings_document)
     : RetainedNativeRuntimeUnitAdapter(
           std::move(trusted_installed_target_root),
           std::move(trusted_package_root), std::move(manager_state_root),
@@ -2623,7 +2670,8 @@ RetainedNativeRuntimeUnitAdapter::RetainedNativeRuntimeUnitAdapter(
           std::move(operating_system),
           std::vector<std::string>{std::move(launch_environment_contract)},
           std::move(logical_scene_database), std::move(program_cycle_journal),
-          std::move(activation_root), std::move(scene_asset_root)) {}
+          std::move(activation_root), std::move(scene_asset_root),
+          std::move(site_settings_document)) {}
 
 RetainedNativeRuntimeUnitAdapter::RetainedNativeRuntimeUnitAdapter(
     std::filesystem::path trusted_installed_target_root,
@@ -2640,7 +2688,8 @@ RetainedNativeRuntimeUnitAdapter::RetainedNativeRuntimeUnitAdapter(
     std::filesystem::path logical_scene_database,
     std::filesystem::path program_cycle_journal,
     std::filesystem::path activation_root,
-    std::filesystem::path scene_asset_root)
+    std::filesystem::path scene_asset_root,
+    std::optional<std::string> site_settings_document)
     : impl_(std::make_shared<Impl>(
           std::move(trusted_installed_target_root),
           std::move(trusted_package_root), std::move(manager_state_root),
@@ -2648,7 +2697,8 @@ RetainedNativeRuntimeUnitAdapter::RetainedNativeRuntimeUnitAdapter(
           std::move(execution_run_root), bundle_source, artifact_source,
           std::move(operating_system), std::move(launch_environment_contracts),
           std::move(logical_scene_database), std::move(program_cycle_journal),
-          std::move(activation_root), std::move(scene_asset_root))) {}
+          std::move(activation_root), std::move(scene_asset_root),
+          std::move(site_settings_document))) {}
 
 RetainedNativeRuntimeUnitAdapter::~RetainedNativeRuntimeUnitAdapter() = default;
 

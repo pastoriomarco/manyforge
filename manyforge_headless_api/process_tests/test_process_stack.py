@@ -1540,6 +1540,12 @@ def test_manager_robotiq_position_cell_has_no_motion_target_and_refuses_disabled
     assert authored_target["command_target_id"] == command_binding["command_target_id"]
     assert authored_target["actuation_kind"] == "position_commanded"
     assert authored_target["output_mode"] == "commanded"
+    assert [(row["stream_id"], row["budget_ns"], row["severity"], row["recovery"])
+            for row in configuration["component_streams"]
+            if row["controllable_component_id"] == component_id] == [
+        ("gripper_feedback", 1000000000, "fault", "ack"),
+        ("measured_joints", 1000000000, "fault", "ack"),
+    ]
 
     def position_target(snapshot: dict[str, Any]) -> dict[str, Any]:
         assert snapshot["control_state"]["runtime_scale_control"] is None

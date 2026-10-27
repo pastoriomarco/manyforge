@@ -8,6 +8,7 @@
 #include <manyforge_core/ports/ikernel_cell_admission_port.hpp>
 #include <manyforge_core/ports/iplanner_scene_projection.hpp>
 #include <memory>
+#include <optional>
 #include <stdexcept>
 #include <string>
 #include <vector>
@@ -37,6 +38,11 @@ public:
 /// Program scene meshes. It is opened once here, kept for the adapter's
 /// lifetime, and passed to every child as an inherited directory descriptor;
 /// it is never a retained package root.
+///
+/// `site_settings_document`, when supplied, is the Manager-validated generic
+/// machine site document (`manyforge.site.v1`). It is captured once into a
+/// private run-root snapshot that is never rewritten and stays with the run's
+/// evidence; children receive only that snapshot path.
 class RetainedNativeRuntimeUnitAdapter final
     : public IRuntimeUnitProcessPort,
       public IRuntimeUnitProgressPort,
@@ -60,7 +66,8 @@ public:
       std::filesystem::path logical_scene_database = {},
       std::filesystem::path program_cycle_journal = {},
       std::filesystem::path activation_root = {},
-      std::filesystem::path scene_asset_root = {});
+      std::filesystem::path scene_asset_root = {},
+      std::optional<std::string> site_settings_document = std::nullopt);
   RetainedNativeRuntimeUnitAdapter(
       std::filesystem::path trusted_installed_target_root,
       std::filesystem::path trusted_package_root,
@@ -76,7 +83,8 @@ public:
       std::filesystem::path logical_scene_database = {},
       std::filesystem::path program_cycle_journal = {},
       std::filesystem::path activation_root = {},
-      std::filesystem::path scene_asset_root = {});
+      std::filesystem::path scene_asset_root = {},
+      std::optional<std::string> site_settings_document = std::nullopt);
   ~RetainedNativeRuntimeUnitAdapter() override;
 
   RetainedNativeRuntimeUnitAdapter(const RetainedNativeRuntimeUnitAdapter &) =

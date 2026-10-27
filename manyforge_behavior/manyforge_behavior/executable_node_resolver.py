@@ -319,6 +319,9 @@ def _owner_task_builder(
         if motion:
             timing["motion_attention"] = context.motion_attention
             timing["audit_sink"] = context.audit_sink
+        if gripper_command:
+            timing["io_watches"] = getattr(context.ports, "io_watches", None)
+            timing["io_signals"] = getattr(context.ports, "io_signals", None)
         if interrupt_motion:
             timing["mock_simulation"] = getattr(context.ports, "mock_simulation", None)
         return adapter(

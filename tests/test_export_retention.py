@@ -177,20 +177,236 @@ def test_current_session_incident_guard_does_not_read_legacy_or_archived_owner(t
     assert all(p.read_bytes() == content for p, content in originals.items())
 
 
-def test_multiple_previous_sessions_are_kept_without_a_new_count_limit(tmp_path):
+def test_previous_sessions_are_bounded_with_one_slot_reserved_for_current(tmp_path):
     root = tmp_path / 'runtime'
     journal(root / 'current')
-    protected = []
+    sources = []
     for index in range(12):
         folder = root / 'previous-sessions' / f'{index:032x}'
         folder.mkdir(parents=True)
         source = folder / 'program-cycle.sqlite3'
         source.write_bytes(f'not imported safety event {index}'.encode())
-        protected.append((source, source.read_bytes()))
+        os.utime(folder, ns=(index + 1, index + 1))
+        sources.append((source, source.read_bytes()))
     result = pressure(root)
+    assert len(result.deleted) == 8
+    assert all(not path.exists() for path, _ in sources[:8])
+    assert all(path.read_bytes() == original for path, original in sources[8:])
+
+
+def _archive(root, index, *, started=None, sealed=False):
+    folder = root / 'previous-sessions' / f'{index:032x}'
+    nested = folder / 'execution-state'
+    nested.mkdir(parents=True)
+    (nested / 'owner.sqlite3').write_text(f'journal {index}')
+    if started is not None:
+        (folder / 'session.json').write_text(json.dumps({
+            'session_id': folder.name, 'started_at_wall': started,
+        }))
+    os.utime(folder, ns=(index + 1, index + 1))
+    if sealed:
+        (nested / 'owner.sqlite3').chmod(0o400)
+        nested.chmod(0o500)
+        folder.chmod(0o500)
+    return folder
+
+
+def _quiet_count_pass(root):
+    return retention.rotate_retained_logs(
+        root, retention.SiteRetentionPolicy(100, 0),
+        disk_facts=lambda _: retention.DiskFacts(10**12, 10**12))
+
+
+def test_count_pass_removes_oldest_sealed_archive_and_its_final_report_without_pressure(tmp_path):
+    root = tmp_path / 'runtime'
+    journal(root / 'current')
+    archives = [_archive(root, index, sealed=True) for index in range(5)]
+    reports = root / 'session-reports'
+    reports.mkdir()
+    for folder in archives:
+        (reports / (folder.name + '.json')).write_text('{}')
+    result = _quiet_count_pass(root)
+    assert result.deleted == (str(archives[0].relative_to(root)),
+                              'session-reports/' + archives[0].name + '.json')
+    assert not archives[0].exists()
+    assert all(folder.exists() for folder in archives[1:])
+    assert len(list(reports.glob('*.json'))) == 4
+    for folder in archives[1:]:
+        folder.chmod(0o700)
+        (folder / 'execution-state').chmod(0o700)
+
+
+def test_session_order_uses_start_time_and_legacy_directory_mtime(tmp_path):
+    root = tmp_path / 'runtime'
+    journal(root / 'current')
+    # Legacy archive's mtime makes it newer than the marked 2020 session.
+    old = _archive(root, 0, started='2020-01-01T00:00:00+00:00')
+    legacy = _archive(root, 1)
+    os.utime(legacy, ns=(1_700_000_000_000_000_000,) * 2)
+    recent = [_archive(root, i, started=f'202{i}-01-01T00:00:00+00:00')
+              for i in range(2, 5)]
+    _quiet_count_pass(root)
+    assert not old.exists()
+    assert legacy.exists() and all(folder.exists() for folder in recent)
+
+
+@pytest.mark.parametrize('state', ['open', 'missing'])
+def test_session_count_pruning_preserves_all_while_incident_is_open_or_unknown(tmp_path, state):
+    root = tmp_path / 'runtime'
+    if state == 'open':
+        journal(root / 'current', 0)
+    else:
+        (root / 'current').mkdir(parents=True)
+    archives = [_archive(root, index) for index in range(6)]
+    result = _quiet_count_pass(root)
     assert not result.deleted
-    assert 'previous-session journals kept' in result.warning
-    assert all(path.read_bytes() == original for path, original in protected)
+    assert all(folder.exists() for folder in archives)
+    assert 'previous-session retention deferred' in result.warning
+
+
+def test_session_pruning_preserves_incomplete_selection_and_pending_report(tmp_path):
+    root = tmp_path / 'runtime'
+    journal(root / 'current')
+    archives = [_archive(root, index) for index in range(6)]
+    selection = root / '.session-selection.json'
+    selection.write_text('{}')
+    result = _quiet_count_pass(root)
+    assert not result.deleted and all(folder.exists() for folder in archives)
+    assert 'deferred during session selection' in result.warning
+    selection.unlink()
+    pending = root / 'session-reports' / 'pending'
+    pending.mkdir(parents=True)
+    (pending / (archives[0].name + '.json')).write_text('{}')
+    result = _quiet_count_pass(root)
+    assert archives[0].exists()
+    assert not archives[1].exists() and not archives[2].exists()
+    assert (pending / (archives[0].name + '.json')).exists()
+
+
+def test_session_count_pass_deletes_at_most_eight_units_per_pass(tmp_path):
+    root = tmp_path / 'runtime'
+    journal(root / 'current')
+    archives = [_archive(root, index) for index in range(15)]
+    first = _quiet_count_pass(root)
+    assert len(first.deleted) == 8
+    assert 'above its count limit' in first.warning
+    second = _quiet_count_pass(root)
+    assert len(second.deleted) == 3
+    assert all(not folder.exists() for folder in archives[:11])
+    assert all(folder.exists() for folder in archives[11:])
+
+
+def test_finalized_orphan_reports_are_bounded_and_current_notice_is_preserved(tmp_path):
+    root = tmp_path / 'runtime'
+    journal(root / 'current')
+    reports = root / 'session-reports'
+    reports.mkdir()
+    identities = [f'{index:032x}' for index in range(7)]
+    for index, identity in enumerate(identities):
+        report = reports / (identity + '.json')
+        report.write_text('{}')
+        os.utime(report, ns=(index + 1, index + 1))
+    (root / 'current' / 'session.json').write_text(json.dumps({
+        'previous_session': {'session_id': identities[0]},
+    }))
+    _quiet_count_pass(root)
+    assert (reports / (identities[0] + '.json')).exists()
+    assert all(not (reports / (identity + '.json')).exists() for identity in identities[1:4])
+    assert all((reports / (identity + '.json')).exists() for identity in identities[4:])
+
+
+def test_report_pruning_prefers_orphans_over_reports_for_retained_archives(tmp_path):
+    root = tmp_path / 'runtime'
+    journal(root / 'current')
+    archives = [_archive(root, index) for index in range(3)]
+    reports = root / 'session-reports'
+    reports.mkdir()
+    retained_reports = [reports / (folder.name + '.json') for folder in archives]
+    orphan_reports = [reports / (f'{index:032x}.json') for index in range(10, 13)]
+    for index, report in enumerate(retained_reports + orphan_reports):
+        report.write_text('{}')
+        os.utime(report, ns=(index + 1, index + 1))
+    result = _quiet_count_pass(root)
+    assert all(folder.exists() for folder in archives)
+    assert all(report.exists() for report in retained_reports)
+    assert all(not report.exists() for report in orphan_reports[:2])
+    assert orphan_reports[2].exists()
+    assert result.deleted == tuple(str(path.relative_to(root)) for path in orphan_reports[:2])
+
+
+def test_mounted_session_report_container_is_never_pruned(tmp_path, monkeypatch):
+    root = tmp_path / 'runtime'
+    journal(root / 'current')
+    reports = root / 'session-reports'
+    reports.mkdir()
+    files = [reports / (f'{index:032x}.json') for index in range(6)]
+    for report in files:
+        report.write_text('external report')
+    monkeypatch.setattr(retention, '_mounted_children', lambda _: {reports})
+    result = _quiet_count_pass(root)
+    assert not result.deleted
+    assert all(report.read_text() == 'external report' for report in files)
+    assert 'mounted session-reports' in result.warning
+
+
+def test_previous_session_symlink_does_not_delete_outside_or_any_archive(tmp_path):
+    root = tmp_path / 'runtime'
+    journal(root / 'current')
+    archives = [_archive(root, index) for index in range(5)]
+    outside = tmp_path / 'outside'
+    outside.mkdir()
+    (outside / 'keep').write_text('external data')
+    (root / 'previous-sessions' / ('f' * 32)).symlink_to(outside, target_is_directory=True)
+    result = _quiet_count_pass(root)
+    assert not result.deleted
+    assert all(folder.exists() for folder in archives)
+    assert (outside / 'keep').read_text() == 'external data'
+    assert 'symlink' in result.warning
+
+
+def test_mounted_previous_sessions_container_is_never_pruned(tmp_path, monkeypatch):
+    root = tmp_path / 'runtime'
+    journal(root / 'current')
+    archives = [_archive(root, index) for index in range(5)]
+    previous = root / 'previous-sessions'
+    monkeypatch.setattr(retention, '_mounted_children', lambda _: {previous})
+    result = _quiet_count_pass(root)
+    assert not result.deleted
+    assert all(folder.exists() for folder in archives)
+    assert 'mounted previous-sessions' in result.warning
+
+
+def test_previous_session_mounted_child_is_preserved(tmp_path, monkeypatch):
+    root = tmp_path / 'runtime'
+    journal(root / 'current')
+    archives = [_archive(root, index) for index in range(5)]
+    mount = archives[0] / 'execution-state'
+    monkeypatch.setattr(retention, '_mounted_children', lambda _: {mount})
+    result = _quiet_count_pass(root)
+    assert not result.deleted
+    assert all(folder.exists() for folder in archives)
+    assert 'mounted child' in result.warning
+
+
+def test_failed_previous_session_deletion_reseals_surviving_archive(tmp_path, monkeypatch):
+    root = tmp_path / 'runtime'
+    journal(root / 'current')
+    archives = [_archive(root, index, sealed=True) for index in range(5)]
+
+    def fail_removal(*_args, **_kwargs):
+        raise OSError('injected archive removal failure')
+
+    fail_removal.avoids_symlink_attacks = True
+    monkeypatch.setattr(retention.shutil, 'rmtree', fail_removal)
+    result = _quiet_count_pass(root)
+    assert not result.deleted
+    assert all(folder.exists() for folder in archives)
+    assert archives[0].stat().st_mode & 0o222 == 0
+    assert (archives[0] / 'execution-state').stat().st_mode & 0o222 == 0
+    assert 'injected archive removal failure' in result.warning
+    for folder in archives:
+        folder.chmod(0o700)
+        (folder / 'execution-state').chmod(0o700)
 
 
 def test_mounted_child_aborts_deletion_with_visible_warning(tmp_path,monkeypatch):

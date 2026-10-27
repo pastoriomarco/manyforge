@@ -6,6 +6,7 @@
 #include <manyforge_deployment/canonical_value.hpp>
 #include <manyforge_deployment/content_identity.hpp>
 #include <manyforge_deployment/deployment_applicability_codec.hpp>
+#include <manyforge_deployment/scene_pose_source_policy_codec.hpp>
 #include <optional>
 #include <string>
 #include <string_view>
@@ -1333,7 +1334,10 @@ TEST(DeploymentApplicabilityCodec, ScenePosePoliciesAreClosedAndRetained) {
         "between_nodes"}) {
     const auto row =
         std::string(
-            R"({"source_id":"camera","scene_resource_id":"part","apply_policy":")") +
+            R"({"source_id":"camera","scene_resource_id":"part",)"
+            R"("source_key":{"simulation_entity":{"entity":"/World/part",)"
+            R"("source_header_frame_id":"part"}},)"
+            R"("apply_policy":")") +
         policy + R"("})";
     const auto candidate = decode(document_for("[" + row + "]"));
     ASSERT_EQ(candidate.value().scene_pose_sources.size(), 1U);
@@ -1350,8 +1354,100 @@ TEST(DeploymentApplicabilityCodec, ScenePosePoliciesAreClosedAndRetained) {
   }
   EXPECT_THROW(
       decode(document_for(
-          R"([{"source_id":"camera","scene_resource_id":"part","apply_policy":"when_idle"}])")),
+          R"([{"source_id":"camera","scene_resource_id":"part",)"
+          R"("source_key":{"simulation_entity":{"entity":"/World/part",)"
+            R"("source_header_frame_id":"part"}},)"
+          R"("apply_policy":"when_idle"}])")),
       std::invalid_argument);
+}
+
+TEST(DeploymentApplicabilityCodec, ScenePoseSourceKeysRoundTripOneRowPerObject) {
+  const auto document_for = [](const std::string &rows) {
+    auto policies = interrupt_policy_envelope("", "");
+    policies.pop_back();
+    return with_policies(minimal_document(),
+                         policies + ",\"scene_pose_sources\":" + rows + "}");
+  };
+  const std::string entity =
+      R"({"source_id":"sim","scene_resource_id":"box","source_key":)"
+      R"({"simulation_entity":{"entity":"/World/box","source_header_frame_id":"box",)"
+      R"("local_position_xyz":[0,0,0.1],"local_orientation_xyzw":[0,0,0,1]}},)"
+      R"("apply_policy":"continuous"})";
+  const std::string detection =
+      R"({"source_id":"camera","scene_resource_id":"part","source_key":)"
+      R"({"detection3d":{"class_id":"part","detection_id":"",)"
+      R"("confidence_min":0.5,"max_position_variance_m2":0.0025,)"
+      R"("selection":"first"}},"apply_policy":"before_planning"})";
+  const auto candidate =
+      decode(document_for("[" + entity + "," + detection + "]"));
+  const std::vector<core::ScenePoseSourcePolicyDTO> expected{
+      {"camera", "part",
+       core::ScenePoseDetection3dKeyDTO{"part", "", 0.5, 0.0025, "first"},
+       "before_planning", 0.0, 0.0},
+      {"sim", "box",
+       core::ScenePoseSimulationEntityKeyDTO{
+           "/World/box", "box", {0.0, 0.0, 0.1}, {0.0, 0.0, 0.0, 1.0}},
+       "continuous", 0.0, 0.0},
+  };
+  EXPECT_EQ(candidate.value().scene_pose_sources, expected);
+  // Canonical: identity orientation is absent; the codec round-trips.
+  const auto *rows =
+      candidate.normalized_policies()->find_object_member("scene_pose_sources");
+  ASSERT_NE(rows, nullptr);
+  EXPECT_EQ(canonical_json(*rows).find("local_orientation_xyzw"),
+            std::string::npos);
+  EXPECT_EQ(DecodeScenePoseSources(*rows), expected);
+  EXPECT_EQ(EncodeScenePoseSources(expected), *rows);
+  const auto revisioned =
+      compute_capability_provider_binding_revisions(candidate);
+  EXPECT_EQ(revisioned.value().scene_pose_sources, expected);
+
+  const auto refused = [&](const std::string &rows, std::string_view text) {
+    try {
+      (void)decode(document_for(rows));
+      ADD_FAILURE() << "accepted " << rows;
+    } catch (const std::invalid_argument &error) {
+      EXPECT_NE(std::string(error.what()).find(text), std::string::npos)
+          << error.what();
+    }
+  };
+  // One source per object: a second row for "box", even from another
+  // source, is refused.
+  auto other_source = entity;
+  other_source.replace(other_source.find("\"sim\""), 5U, "\"cam\"");
+  refused("[" + entity + "," + other_source + "]",
+          "scene_pose_source_duplicate_object");
+  const auto keyed = [](const std::string &key) {
+    return R"([{"source_id":"sim","scene_resource_id":"box","source_key":)" +
+           key + R"(,"apply_policy":"continuous"}])";
+  };
+  refused(keyed(R"({})"), "exactly one member");
+  refused(keyed(R"({"simulation_entity":{"entity":"/a","source_header_frame_id":"a"},)"
+                R"("detection3d":{"class_id":"","detection_id":"",)"
+                R"("confidence_min":0,"max_position_variance_m2":0,)"
+                R"("selection":""}})"),
+          "exactly one member");
+  refused(keyed(R"({"camera":{}})"), "unsupported scene pose-source source_key");
+  refused(keyed(R"({"simulation_entity":{"entity":"","source_header_frame_id":"a"}})"),
+          "entity");
+  refused(keyed(R"({"simulation_entity":{"entity":"/a"}})"),
+          "source_header_frame_id");
+  refused(keyed(R"({"simulation_entity":{"entity":"/a","source_header_frame_id":"a",)"
+                R"("link":"a"}})"),
+          "unknown fields");
+  refused(keyed(R"({"simulation_entity":{"entity":"/a","source_header_frame_id":"a",)"
+                R"("local_position_xyz":[0,0]}})"),
+          "local_position_xyz");
+  refused(keyed(R"({"detection3d":{"class_id":"","detection_id":"",)"
+                R"("confidence_min":0,"max_position_variance_m2":0}})"),
+          "selection");
+  refused(keyed(R"({"detection3d":{"class_id":"","detection_id":"",)"
+                R"("confidence_min":0,"max_position_variance_m2":0,)"
+                R"("selection":"last"}})"),
+          "selection");
+  refused(R"([{"source_id":"sim","scene_resource_id":"box",)"
+          R"("apply_policy":"continuous"}])",
+          "source_key");
 }
 
 TEST(DeploymentApplicabilityCodec,
@@ -1391,6 +1487,10 @@ TEST(DeploymentApplicabilityCodec,
   EXPECT_EQ(decode(document_for("[]")).normalized_policies(),
             ordinary.normalized_policies());
 
+  // `fault` + `auto` is accepted (the user's choice of safety level).
+  EXPECT_NO_THROW(decode(document_for(
+      R"([{"controllable_component_id":"octomap_1","stream_id":"map_updates","severity":"fault","recovery":"auto"}])")));
+
   const std::string row_prefix =
       R"({"controllable_component_id":"octomap_1","stream_id":"map_updates")";
   expect_decode_error_containing(
@@ -1410,10 +1510,6 @@ TEST(DeploymentApplicabilityCodec,
       document_for("[" + row_prefix + R"(,"budget_ns":0}])"),
       "$.policies.component_streams[0].budget_ns");
   expect_decode_error_containing(
-      document_for("[" + row_prefix + R"(,"severity":"fault","recovery":"auto"}])"),
-      "$.policies.component_streams[0].recovery: severity fault requires "
-      "recovery ack");
-  expect_decode_error_containing(
       document_for("[" + row_prefix + R"(,"timestamp_source":"arrival"}])"),
       "unknown field 'timestamp_source'");
   expect_decode_error_containing(
@@ -1432,7 +1528,10 @@ TEST(DeploymentApplicabilityCodec, ScenePoseDeadbandIsOptionalNonnegative) {
     return with_policies(
         minimal_document(),
         policies +
-            R"(,"scene_pose_sources":[{"source_id":"camera","scene_resource_id":"part","apply_policy":"continuous")" +
+            R"(,"scene_pose_sources":[{"source_id":"camera","scene_resource_id":"part",)"
+            R"("source_key":{"simulation_entity":{"entity":"/World/part",)"
+            R"("source_header_frame_id":"part"}},)"
+            R"("apply_policy":"continuous")" +
             extra + "}]}");
   };
   // Default 0, and a zero deadband stays absent from the normalized form.
@@ -1577,6 +1676,46 @@ TEST(DeploymentApplicabilityCodecTest, GlobalConditionUsesOnlyExistingNodeAndDep
   EXPECT_NO_THROW(static_cast<void>(decode(document(deepest))));
   deepest = CanonicalValue(CanonicalValue::Object{{"not", deepest}});
   EXPECT_THROW(static_cast<void>(decode(document(deepest))), DeploymentApplicabilityCodecError);
+}
+
+TEST(DeploymentApplicabilityCodecTest, GlobalRuleOnTripIsGateByDefaultAndOwnsIdleBehaviour) {
+  const auto document = [&](CanonicalValue::Object extra) {
+    CanonicalValue::Object fields{
+        {"rule_id", CanonicalValue("light_curtain")},
+        {"condition", CanonicalValue(CanonicalValue::Object{{"compare", CanonicalValue(
+            CanonicalValue::Object{{"operand", CanonicalValue(CanonicalValue::Object{
+                {"signal", CanonicalValue(CanonicalValue::Object{
+                    {"controllable_component_id", CanonicalValue("device")},
+                    {"signal_name", CanonicalValue("blocked")}})}})},
+                {"op", CanonicalValue("==")}, {"value", CanonicalValue(true)}})}})},
+        {"scope", CanonicalValue("all_motion")}};
+    for (auto& field : extra) fields.push_back(std::move(field));
+    auto policies = interrupt_policy_envelope("", "");
+    policies.pop_back();
+    policies += ",\"interrupt_rules\":[" + canonical_json(CanonicalValue(std::move(fields))) + "]}";
+    return with_policies(minimal_document(), std::move(policies));
+  };
+  const auto sealed = [&](CanonicalValue::Object extra) {
+    const auto decoded = decode(document(std::move(extra)));
+    return decoded.normalized_policies()->find_object_member("interrupt_rules")
+        ->as_array().front();
+  };
+  const auto gate = sealed({});
+  ASSERT_NE(gate.find_object_member("on_trip"), nullptr);
+  EXPECT_EQ(gate.find_object_member("on_trip")->as_string(), "gate");
+  EXPECT_EQ(gate.find_object_member("idle_behaviour"), nullptr);
+  EXPECT_EQ(sealed({{"on_trip", CanonicalValue("gate")}}), gate);
+  const auto full = sealed({{"on_trip", CanonicalValue("full_stop")},
+                            {"idle_behaviour", CanonicalValue("latch")}});
+  EXPECT_EQ(full.find_object_member("on_trip")->as_string(), "full_stop");
+  EXPECT_EQ(full.find_object_member("idle_behaviour")->as_string(), "latch");
+  for (auto invalid : std::vector<CanonicalValue::Object>{
+           {{"on_trip", CanonicalValue("stop")}},
+           {{"idle_behaviour", CanonicalValue("latch")}},
+           {{"on_trip", CanonicalValue("gate")}, {"idle_behaviour", CanonicalValue("ignore")}},
+           {{"latch_release", CanonicalValue("operator")}}})
+    EXPECT_THROW(static_cast<void>(decode(document(std::move(invalid)))),
+                 DeploymentApplicabilityCodecError);
 }
 
 } // namespace manyforge::deployment

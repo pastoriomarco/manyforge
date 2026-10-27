@@ -227,6 +227,13 @@ Result<std::uint64_t> GripperParticipantEngine::stop_gripper(const std::string& 
 Result<void> GripperParticipantEngine::reset_gripper(const std::string& id,
                                                      const std::uint64_t command_id,
                                                      const std::uint64_t generation) {
+  auto closed = close_gripper_generation(id, command_id, generation);
+  if (!closed.ok()) return closed;
+  return backend_.try_authorize_gripper_commands();
+}
+Result<void> GripperParticipantEngine::close_gripper_generation(const std::string& id,
+                                                                const std::uint64_t command_id,
+                                                                const std::uint64_t generation) {
   const auto before = backend_.get_gripper_status(id);
   if (before.gripper_id != id || command_id == 0U || before.command_id != command_id ||
       before.generation < generation || before.state == GripperCommandState::kExecuting ||
@@ -235,7 +242,7 @@ Result<void> GripperParticipantEngine::reset_gripper(const std::string& id,
                                       "Gripper changed before scoped Reset",
                                       {{"reason", "stale_gripper_state"}}});
   backend_.invalidate_gripper_commands(GripperInvalidationReason::kReset);
-  return backend_.try_authorize_gripper_commands();
+  return Result<void>::Ok();
 }
 AddressedParticipantStopFenceDisposition GripperParticipantEngine::fence_addressed_participant_stop(
     const std::uint64_t execution_id) noexcept {
@@ -721,11 +728,20 @@ GripperParticipantEngine::settle_addressed_participant_stop(
 
     if (!request.effect_prevented_before_dispatch) {
       const auto& dispatched = *command_session->dispatch_result;
-      auto reset = reset_gripper(command_session->authority.gripper().command_request.gripper_id,
-                                 dispatched.command_id, dispatched.generation);
-      if (!reset.ok()) {
-        return Result<AddressedParticipantStopSettlementDTO>::Err(reset.error());
+      auto closed = close_gripper_generation(
+          command_session->authority.gripper().command_request.gripper_id,
+          dispatched.command_id, dispatched.generation);
+      if (!closed.ok()) {
+        return Result<AddressedParticipantStopSettlementDTO>::Err(closed.error());
       }
+      // Q58: the Stop's cancel is fire-and-forget, so a ROS action goal's
+      // cancel terminal normally arrives after this settlement. The command
+      // is already fenced (new idle generation), so the Stop is settled.
+      // Until that terminal the backend refuses to reopen admission; the
+      // Stop's recovery (apply_recovery_action) or the operation Reset
+      // (reset_capability_command -> reset_gripper) reopens it, or reports
+      // that typed refusal if it still applies.
+      (void)backend_.try_authorize_gripper_commands();
     }
 
     KernelRecoveryAssessmentDTO assessment;
@@ -823,6 +839,17 @@ KernelRecoveryActionResultDTO GripperParticipantEngine::apply_recovery_action(
         if (!decision.admitted) {
           rejection = recovery_action_rejection_error(request, *addressed_assessment,
                                                       decision.rejection_reason);
+        } else if (auto reopened =
+                       command_session->state !=
+                               ResolvedPreparedCapabilityCommandStateDTO::kDispatched
+                           ? Result<void>::Ok()
+                           : backend_.try_authorize_gripper_commands();
+                   !reopened.ok()) {
+          // A dispatched command's Stop settlement may not have reopened
+          // admission before its cancel terminal (Q58). Consuming that Stop
+          // (Resume/replan or close) is the next reopen point; until the
+          // terminal, refuse cleanly with the backend's typed reason.
+          rejection = reopened.error();
         } else {
           command_session->stop_recovery_consumed = true;
           KernelRecoveryAssessmentDTO next;

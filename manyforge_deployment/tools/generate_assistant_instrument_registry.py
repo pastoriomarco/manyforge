@@ -59,7 +59,8 @@ VALUE_SOURCE: dict[str, Any] = {
 }
 
 # Exact translation of the maintained pre-cutover scene-authoring allowlist.
-# The old aggregate motion node becomes the three explicit v2 motion forms.
+# The old aggregate motion node becomes the three explicit v2 motion forms;
+# the Isaac simulation nodes are the v2 forms of the old main allowlist.
 ASSISTANT_NODE_IDS = (
     "fallback",
     "gripper.command_position",
@@ -79,13 +80,11 @@ ASSISTANT_NODE_IDS = (
     "scene.update_object_pose",
     "scene.upsert_object",
     "sequence",
+    "simulation.reset",
+    "simulation.set_entity_pose",
+    "simulation.set_state",
+    "simulation.step",
     "timer",
-)
-
-QUERY_TOOL_IDS = (
-    "inspect_isaac_scene",
-    "program_read",
-    "scene_inspect",
 )
 
 COMPOSER_TOOL_IDS = (
@@ -99,8 +98,6 @@ COMPOSER_TOOL_IDS = (
     "program_draft_remove_parameters",
     "program_draft_upsert_parameters",
     "program_read",
-    "propose_scene_object_nodes",
-    "propose_scene_objects",
     "scene_draft_add_object",
     "scene_draft_remove_objects",
     "scene_draft_update_object",
@@ -714,7 +711,6 @@ def _scene_resource_schema(catalog: NodeCatalog, *, authoring_pose: bool = False
                 else _initial_scene_pose_schema()
             ),
             "resource_roles": _string_array(minimum=1),
-            "collision_policy_ids": _string_array(minimum=1),
         },
         required=("scene_resource_id", "shape", "pose"),
     )
@@ -822,25 +818,6 @@ def _blackboard_key_schema(catalog: NodeCatalog) -> dict[str, Any]:
             )
         )
     return {"oneOf": variants}
-
-
-def _inspection_report_schema(catalog: NodeCatalog) -> dict[str, Any]:
-    candidate = _object(
-        {
-            "source_root": {"type": "string", "minLength": 1, "maxLength": 4096},
-            "scene_resource": _scene_resource_schema(catalog),
-            "collider_paths": _array(
-                {"type": "string", "minLength": 1, "maxLength": 4096},
-                unique=True,
-            ),
-            "warnings": _array(copy.deepcopy(BOUNDED_TEXT)),
-        },
-        required=("source_root", "scene_resource"),
-    )
-    return _object(
-        {"objects": _array(candidate, maximum=MAX_ITEMS)},
-        required=("objects",),
-    )
 
 
 def _tool(
@@ -977,99 +954,6 @@ def _tools(catalog: NodeCatalog) -> list[dict[str, Any]]:
             "read_only",
             "Read the active headless runtime status snapshot.",
             no_args,
-        ),
-        _tool(
-            "propose_scene_object_nodes",
-            "proposal",
-            "Build reviewable v2 scene-operation node proposals from scene resources.",
-            _object(
-                {
-                    "scene_resources": _array(scene_resource, minimum=1),
-                    "operations": _array(
-                        {
-                            "type": "string",
-                            "enum": [
-                                "scene.add_object",
-                                "scene.attach_carried_object",
-                                "scene.detach_carried_object",
-                                "scene.remove_object",
-                                "scene.upsert_object",
-                            ],
-                        },
-                        minimum=1,
-                        unique=True,
-                    ),
-                    "target_role": copy.deepcopy(IDENTIFIER),
-                    "carrier_frame_role": copy.deepcopy(IDENTIFIER),
-                    "touch_body_roles": _string_array(minimum=1),
-                },
-                required=("scene_resources", "operations"),
-                all_of=[
-                    {
-                        "if": {
-                            "properties": {
-                                "operations": {"contains": {"const": "scene.attach_carried_object"}}
-                            },
-                            "required": ["operations"],
-                        },
-                        "then": {
-                            "required": [
-                                "target_role",
-                                "carrier_frame_role",
-                                "touch_body_roles",
-                            ]
-                        },
-                    },
-                    {
-                        "if": {
-                            "properties": {
-                                "operations": {"contains": {"const": "scene.detach_carried_object"}}
-                            },
-                            "required": ["operations"],
-                        },
-                        "then": {"required": ["target_role"]},
-                    },
-                ],
-            ),
-        ),
-        _tool(
-            "propose_scene_objects",
-            "proposal",
-            "Convert normalized scene-inspection candidates into reviewable Draft resources.",
-            _object(
-                {
-                    "inspection_report": _inspection_report_schema(catalog),
-                    "source_roots": _array(
-                        {"type": "string", "minLength": 1, "maxLength": 4096},
-                        unique=True,
-                    ),
-                    "scene_resource_id_prefix": {"type": "string", "maxLength": 256},
-                    "mesh_resource_overrides": _array(
-                        _object(
-                            {
-                                "source_root": {
-                                    "type": "string",
-                                    "minLength": 1,
-                                    "maxLength": 4096,
-                                },
-                                "mesh_resource_uri": {
-                                    "type": "string",
-                                    "minLength": 1,
-                                    "maxLength": 4096,
-                                },
-                            },
-                            required=("source_root", "mesh_resource_uri"),
-                        ),
-                        unique=True,
-                    ),
-                    "max_proposals": {
-                        "type": "integer",
-                        "minimum": 1,
-                        "maximum": MAX_ITEMS,
-                    },
-                },
-                required=("inspection_report",),
-            ),
         ),
         _tool(
             "scene_draft_add_object",
@@ -1252,14 +1136,12 @@ def _verify_profile(profile_path: Path, tool_ids: set[str]) -> None:
     profile = _load_json(profile_path, "maintained assistant profiles")
     try:
         modes = profile["mode_profiles"]["scene_authoring"]
-        query = modes["query"]["catalog"]
+        if set(modes) != {"composer-assistant"}:
+            raise GenerationError("maintained scene-authoring profile has other modes")
         composer = modes["composer-assistant"]["catalog"]
     except (KeyError, TypeError) as error:
         raise GenerationError("maintained scene-authoring profile is incomplete") from error
     checks = (
-        ("query.tools", query.get("tools"), list(QUERY_TOOL_IDS)),
-        ("query.skills", query.get("skills"), []),
-        ("query.nodes", query.get("nodes"), []),
         ("composer-assistant.tools", composer.get("tools"), list(COMPOSER_TOOL_IDS)),
         ("composer-assistant.skills", composer.get("skills"), []),
         ("composer-assistant.nodes", composer.get("nodes"), list(ASSISTANT_NODE_IDS)),
@@ -1269,7 +1151,7 @@ def _verify_profile(profile_path: Path, tool_ids: set[str]) -> None:
             raise GenerationError(
                 f"maintained assistant {label} is stale: {actual!r} != {expected!r}"
             )
-    unresolved = (set(QUERY_TOOL_IDS) | set(COMPOSER_TOOL_IDS)) - tool_ids
+    unresolved = set(COMPOSER_TOOL_IDS) - tool_ids
     if unresolved:
         raise GenerationError(f"maintained mode references unresolved tools: {sorted(unresolved)}")
 

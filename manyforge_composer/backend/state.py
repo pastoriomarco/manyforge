@@ -276,7 +276,7 @@ def _controllable_composition_change_kinds(
                             "model_source" not in row
                             and isinstance(row.get("configuration"), dict)
                             and row["configuration"].get("runtime_kind")
-                            in ("io_provider", "pose_source")
+                            in ("io_provider", "pose_source", "ai_model")
                         )
                     )
                     or row["component_id"] in indexed

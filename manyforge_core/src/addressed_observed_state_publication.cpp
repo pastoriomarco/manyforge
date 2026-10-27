@@ -165,8 +165,7 @@ Result<void> AddressedObservedStatePublication::rebind_route_context(
         query_context, config_.source_precedence, config_.authority_generation,
         config_.maximum_source_resource_count};
     validate_config(candidate_config);
-    if (transition_time_ns < 0 ||
-        query_context.state_authority_class == StateAuthorityClass::kMeasured) {
+    if (transition_time_ns < 0) {
       return Result<void>::Err(state_error("observed_state_route_rebind_not_permitted"));
     }
     std::lock_guard lock(route_context_mutex_);
@@ -175,6 +174,13 @@ Result<void> AddressedObservedStatePublication::rebind_route_context(
     }
     if (!same_physical_query_context(current_query_context_, query_context)) {
       return Result<void>::Err(state_error("observed_state_route_rebind_identity_mismatch"));
+    }
+    if (query_context.state_authority_class == StateAuthorityClass::kMeasured) {
+      // A measurement is never re-stamped: only samples published after this
+      // fence are current under the new route/configuration identity.
+      context_first_sequence_ = publication_.next_sequence();
+      current_query_context_ = std::move(query_context);
+      return Result<void>::Ok();
     }
     auto latest = publication_.acquire_latest();
     if (!latest || !latest.complete() || !latest.velocities_complete()) {

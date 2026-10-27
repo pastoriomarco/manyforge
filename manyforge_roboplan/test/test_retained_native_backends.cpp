@@ -552,6 +552,50 @@ TEST(RetainedObservedStateChannelTest,
 }
 
 TEST(RetainedObservedStateChannelTest,
+     MeasuredRouteRebindNeverRestampsAndWaitsForAFreshMeasurement) {
+  // CP8 step 1: a Real arm's addressed state is measured. A route change keeps
+  // the physical source but no earlier measurement becomes current under it.
+  const auto measured = [](const RuntimeParticipantBinding &binding) {
+    auto value = binding.value();
+    value.control_path->state_authority_class = StateAuthorityClass::kMeasured;
+    auto sealed = verify_runtime_participant_binding(std::move(value));
+    if (!sealed.ok()) throw std::logic_error(sealed.error().message);
+    return std::move(sealed.value());
+  };
+  const auto binding = measured(make_binding(
+      CoordinateKind::kLinear, "gripper.target", true, "route.native"));
+  const auto rebound = measured(make_binding(
+      CoordinateKind::kLinear, "gripper.target", true, "route.successor"));
+  RetainedObservedStateChannel channel(
+      binding, nullptr,
+      RetainedObservedStateChannelConfig{
+          ObservedStateSourceKind::kJointState, "measured.joint_state", 100, 1U});
+  const std::array<double, 1U> first{0.01};
+  const std::array<double, 1U> second{0.02};
+  const std::array<double, 1U> velocity{0.0};
+  EXPECT_FALSE(channel.current_state(100).ok());
+  ASSERT_TRUE(channel.publish_state(first, velocity, 100, 100).applied());
+  ASSERT_TRUE(channel.current_state(100).ok());
+  // The same identity is a no-op and stays readable.
+  ASSERT_TRUE(channel.RebindRoute(binding, 101).ok());
+  EXPECT_TRUE(channel.current_state(101).ok());
+  ASSERT_TRUE(channel.RebindRoute(rebound, 102).ok());
+  EXPECT_EQ(channel.binding().value(), rebound.value());
+  EXPECT_FALSE(channel.current_state(102).ok());
+  EXPECT_FALSE(channel.wait_for_fresh_state(0ns));
+  ASSERT_TRUE(channel.publish_state(second, velocity, 103, 103).applied());
+  const auto current = channel.current_state(103);
+  ASSERT_TRUE(current.ok()) << current.error().message;
+  EXPECT_EQ(current.value().control_route_id, ControlRouteId("route.successor"));
+  EXPECT_EQ(current.value().state_authority_class, StateAuthorityClass::kMeasured);
+  EXPECT_DOUBLE_EQ(
+      std::get<LinearPositionDTO>(current.value().positions.front()).value_m, 0.02);
+  EXPECT_TRUE(channel.wait_for_fresh_state(0ns));
+  // Stale beyond the measured budget.
+  EXPECT_FALSE(channel.current_state(204).ok());
+}
+
+TEST(RetainedObservedStateChannelTest,
      BoundStatePairsBindingAndSampleUnderOneRouteFence) {
   const auto binding = make_binding(CoordinateKind::kLinear, "gripper.target",
                                     true, "route.native");

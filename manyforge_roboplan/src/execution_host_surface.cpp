@@ -173,6 +173,7 @@ ExecutionCommandSurface::ExecutionCommandSurface(
                                        owner_epoch_.value()),
         direct_control_gripper_program_run_id_("direct-control-gripper-" +
                                                owner_epoch_.value()),
+        direct_control_io_program_run_id_("direct-control-io-" + owner_epoch_.value()),
         composition_access_(composition_access),
         manager_liveness_admission_(manager_liveness_admission),
         host_lock_(run_root), command_socket_(run_root, kSocketFileName),
@@ -1486,6 +1487,44 @@ CanonicalValue ExecutionCommandSurface::IoWatchResponse(
     const auto &source_coordinate_name = model_backed
                                              ? *resource.source_joint_name
                                              : resource.compiled_resource_name;
+    auto descriptor = composition.direct_control_gripper_descriptor.as_object();
+    if (composition.direct_control_gripper_program_binding) {
+      const auto &product = composition.direct_control_gripper_program_binding->value();
+      Require(product.program_binding_id == binding.program_binding_id,
+              "manual gripper descriptor differs from its Program Binding");
+      const auto target = std::find_if(product.target_role_bindings.begin(),
+          product.target_role_bindings.end(), [&](const auto &row) {
+            return row.target_role_id == binding.target_role_id;
+          });
+      Require(target != product.target_role_bindings.end(),
+              "manual gripper target is absent from its Program Binding");
+      if (target->pneumatic_io) {
+        CanonicalValue::Array outputs;
+        for (const auto &output : target->pneumatic_io->outputs) {
+          const auto io_target = std::find_if(product.target_role_bindings.begin(),
+              product.target_role_bindings.end(), [&](const auto &row) {
+                return row.target_role_id == output.target_role_id;
+              });
+          Require(io_target != product.target_role_bindings.end(),
+                  "manual pneumatic output has no bound I/O target");
+          const auto signal = std::find_if(io_target->signal_role_bindings.begin(),
+              io_target->signal_role_bindings.end(), [&](const auto &row) {
+                return row.resource_role_id == output.resource_role_id;
+              });
+          Require(signal != io_target->signal_role_bindings.end() &&
+                      signal->direction == core::IoSignalDirection::kOutput,
+                  "manual pneumatic output has no bound output signal");
+          outputs.emplace_back(CanonicalValue::Object{
+              {"controllable_component_id", CanonicalValue(io_target->controllable_component_id.value())},
+              {"signal_name", CanonicalValue(signal->signal_name)},
+              {"open_value", CanonicalValue(output.open_value)},
+              {"close_value", CanonicalValue(output.close_value)}});
+        }
+        Require(!outputs.empty() && outputs.size() <= 2U,
+                "manual pneumatic output count is invalid");
+        descriptor.emplace_back("pneumatic_outputs", CanonicalValue(std::move(outputs)));
+      }
+    }
     return CanonicalValue(CanonicalValue::Object{
         {"command_schema_id",
          CanonicalValue(binding.command_schema->command_schema_id.value())},
@@ -1520,7 +1559,7 @@ CanonicalValue ExecutionCommandSurface::IoWatchResponse(
               CanonicalValue(model_backed ? "model_role" : "component_local")},
          })},
         {"target_role_id", CanonicalValue(binding.target_role_id.value())},
-        {"target_descriptor", composition.direct_control_gripper_descriptor},
+        {"target_descriptor", CanonicalValue(std::move(descriptor))},
     });
   }
 
@@ -2023,7 +2062,7 @@ CanonicalValue ExecutionCommandSurface::IoWatchResponse(
               {"resource_role_id", Member(signal, "resource_role_id")},
               {"source_kind", CanonicalValue(source->provider.profile)}});
         }
-        io_bindings.emplace_back(CanonicalValue::Object{
+        CanonicalValue::Object projected{
             {"program_binding_id",
              CanonicalValue(binding->program_binding_id().value())},
             {"target_role_id", Member(target, "target_role_id")},
@@ -2031,7 +2070,30 @@ CanonicalValue ExecutionCommandSurface::IoWatchResponse(
              Member(target, "controllable_component_id")},
             {"command_target_id", Member(target, "command_target_id")},
             {"signal_role_bindings", *signals},
-            {"signal_sources", CanonicalValue(std::move(sources))}});
+            {"signal_sources", CanonicalValue(std::move(sources))}};
+        const auto typed_target = std::find_if(binding->value().target_role_bindings.begin(),
+            binding->value().target_role_bindings.end(), [&](const auto &row) {
+              return row.target_role_id.value() == Text(target, "target_role_id");
+            });
+        Require(typed_target != binding->value().target_role_bindings.end(),
+                "direct I/O projection has no exact typed target");
+        const auto output = std::find_if(typed_target->capability_bindings.begin(),
+            typed_target->capability_bindings.end(), [](const auto &row) {
+              return row.capability_id.value() == "io.gpio.set_output";
+            });
+        if (output != typed_target->capability_bindings.end()) {
+          Require(output->command_schema.has_value(),
+                  "direct I/O output has no sealed command schema");
+          projected.emplace_back("output_command", CanonicalValue(CanonicalValue::Object{
+              {"program_id", CanonicalValue(binding->value().program_id.value())},
+              {"program_revision", CanonicalValue(binding->value().program_revision.value())},
+              {"program_run_id", CanonicalValue(direct_control_io_program_run_id_.value())},
+              {"component_role_id", CanonicalValue(typed_target->component_role_id.value())},
+              {"capability_id", CanonicalValue(output->capability_id.value())},
+              {"command_schema_id", CanonicalValue(output->command_schema->command_schema_id.value())},
+              {"command_schema_revision", CanonicalValue(output->command_schema->command_schema_revision.value())}}));
+        }
+        io_bindings.emplace_back(std::move(projected));
       }
     }
     std::sort(io_bindings.begin(), io_bindings.end(),
@@ -2084,7 +2146,7 @@ CanonicalValue ExecutionCommandSurface::IoWatchResponse(
   const auto manual_operations =
       composition.active_addressed_kernel()->get_latest_run_operations(
           {direct_control_program_run_id_,
-           direct_control_gripper_program_run_id_});
+           direct_control_gripper_program_run_id_, direct_control_io_program_run_id_});
   CanonicalValue::Array manual_operation_values;
   manual_operation_values.reserve(manual_operations.size());
   for (const auto &projection : manual_operations) {
@@ -2888,7 +2950,8 @@ ExecutionCommandSurface::EventsResponse(const Command &command) const {
     // Progress remains presentation-only on this same existing read.
     CanonicalValue::Array operation_progress;
     for (const auto &operation : owner.get_resident_operations(
-             {direct_control_program_run_id_, direct_control_gripper_program_run_id_})) {
+             {direct_control_program_run_id_, direct_control_gripper_program_run_id_,
+              direct_control_io_program_run_id_})) {
       if (operation.state != core::OperationStateKind::kExecuting ||
           operation.participants.size() != 1U)
         continue;
@@ -3046,7 +3109,8 @@ CanonicalValue ExecutionCommandSurface::ExecuteLogicalProduct(
       {"schema_version", CanonicalValue("manyforge.execution_targets.v3")}});
   CanonicalValue::Array manual_operations;
   for (const auto &actual : StableKernel().get_latest_run_operations(
-           {direct_control_program_run_id_, direct_control_gripper_program_run_id_}))
+           {direct_control_program_run_id_, direct_control_gripper_program_run_id_,
+            direct_control_io_program_run_id_}))
     manual_operations.emplace_back(CanonicalValue::Object{
         {"operation", OperationStateValue(actual.operation)},
         {"resident", CanonicalValue(actual.resident)}});

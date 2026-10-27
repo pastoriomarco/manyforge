@@ -66,10 +66,6 @@ class ResolvedLite6Binding:
     controller_manager: str
     trajectory_controller: str
     follow_joint_trajectory_action: str
-    supervised_state_topic: str
-    supervised_execute_service: str
-    supervised_command_gate_service: str
-    supervised_shutdown_controller_service: str
     arm_joint_names: tuple[str, ...]
 
     def to_dict(self) -> dict[str, object]:
@@ -142,30 +138,6 @@ def compile_lite6_binding(inputs: Lite6BindingInputs) -> ResolvedLite6Binding:
             namespace,
             resolved_controller,
             'follow_joint_trajectory',
-        ),
-        supervised_state_topic=_absolute_name(
-            namespace,
-            resolved_hardware_namespace,
-            'supervised_lifecycle',
-            'state',
-        ),
-        supervised_execute_service=_absolute_name(
-            namespace,
-            resolved_hardware_namespace,
-            'supervised_lifecycle',
-            'execute',
-        ),
-        supervised_command_gate_service=_absolute_name(
-            namespace,
-            resolved_hardware_namespace,
-            'supervised_lifecycle',
-            'set_command_gate',
-        ),
-        supervised_shutdown_controller_service=_absolute_name(
-            namespace,
-            resolved_hardware_namespace,
-            'supervised_lifecycle',
-            'shutdown_controller',
         ),
         arm_joint_names=joints,
     )

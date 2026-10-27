@@ -79,7 +79,8 @@
       "resource_role_bindings",
       "collision_body_role_bindings",
       "capability_bindings",
-      "signal_role_bindings"
+      "signal_role_bindings",
+      "pneumatic_io"
     ],
     "frame": [
       "frame_role_id",
@@ -167,6 +168,9 @@
       "transition_capability",
       "signal_descriptor_digest"
     ],
+    "pneumatic_io": ["outputs", "inputs"],
+    "pneumatic_output": ["target_role_id", "resource_role_id", "open_value", "close_value"],
+    "pneumatic_input": ["input", "target_role_id", "resource_role_id"],
     "contact_release": [
       "contact_policy_id",
       "contact_policy_revision",
@@ -189,7 +193,8 @@
       "intervention_stop_scope"
     ],
     "target": [
-      "signal_role_bindings"
+      "signal_role_bindings",
+      "pneumatic_io"
     ],
     "frame": [
       "contact_body_role_ids"

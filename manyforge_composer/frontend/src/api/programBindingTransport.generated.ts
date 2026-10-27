@@ -16,7 +16,7 @@ const FIELDS = {
   node_environment: ['catalog_id', 'content_version', 'catalog_digest', 'environment_digest'],
   component: ['component_role_id', 'controllable_component_id', 'component_type_id', 'component_type_revision', 'model_role_bindings'],
   model: ['model_role_id', 'model_instance_id', 'model_revision'],
-  target: ['target_role_id', 'component_role_id', 'controllable_component_id', 'command_target_id', 'frame_role_bindings', 'resource_role_bindings', 'collision_body_role_bindings', 'capability_bindings', 'signal_role_bindings'],
+  target: ['target_role_id', 'component_role_id', 'controllable_component_id', 'command_target_id', 'frame_role_bindings', 'resource_role_bindings', 'collision_body_role_bindings', 'capability_bindings', 'signal_role_bindings', 'pneumatic_io'],
   frame: ['frame_role_id', 'model_instance_id', 'model_revision', 'compiled_frame_name', 'contact_body_role_ids'],
   resource: ['resource_role_id', 'resource_ids', 'compiled_resource_names'],
   collision: ['collision_body_role_id', 'model_instance_id', 'model_revision', 'compiled_collision_body_names'],
@@ -31,9 +31,12 @@ const FIELDS = {
   provenance: ['binding_compiler_contract_digest', 'role_assignment_digest', 'source_records', 'resolved_output_records'],
   provenance_record: ['record_kind', 'record_id', 'revision'],
   signal: ['resource_role_id', 'signal_name', 'value_type', 'direction', 'transition_capability', 'signal_descriptor_digest'],
+  pneumatic_io: ['outputs', 'inputs'],
+  pneumatic_output: ['target_role_id', 'resource_role_id', 'open_value', 'close_value'],
+  pneumatic_input: ['input', 'target_role_id', 'resource_role_id'],
   contact_release: ['contact_policy_id', 'contact_policy_revision', 'runtime_object_id', 'allowed_body_bindings', 'mode', 'release_evidence_mode', 'enforce_max_start_penetration', 'max_start_penetration_m', 'min_release_progress_m', 'release_tolerance_m', 'require_strictly_decreasing_penetration', 'require_separation_by_end', 'allow_recontact', 'bodies_from_motion_endpoint'],
 } as const;
-const OPTIONAL_FIELDS = {'recovery_policy': ['intervention_stop_scope'], 'target': ['signal_role_bindings'], 'frame': ['contact_body_role_ids'], 'contact': ['bodies_from_motion_endpoint'], 'contact_release': ['bodies_from_motion_endpoint']} as const;
+const OPTIONAL_FIELDS = {'recovery_policy': ['intervention_stop_scope'], 'target': ['signal_role_bindings', 'pneumatic_io'], 'frame': ['contact_body_role_ids'], 'contact': ['bodies_from_motion_endpoint'], 'contact_release': ['bodies_from_motion_endpoint']} as const;
 const STOP_POLICIES = new Set(['inherit', 'hold', 'continue']);
 const INTERVENTION_STOP_SCOPES = new Set(['all', 'own_groups']);
 const COLLISION_BODY_ID = 'component/{controllable_component_id}/model/{model_instance_id}/body/{collision_body_role_id}/collision/{index}';
@@ -276,6 +279,45 @@ export function parseProgramBindingTransport(value: unknown, path: string): Prog
   );
   sorted(targets, (row) => row.target_role_id as string, `${path}.target_role_bindings`);
   const targetByRole = new Map(targets.map((row) => [row.target_role_id, row]));
+
+  targets.forEach((target, index) => {
+    if (!('pneumatic_io' in target)) return;
+    const pp = `${path}.target_role_bindings[${index}].pneumatic_io`;
+    const route = record(target.pneumatic_io, FIELDS.pneumatic_io, pp);
+    const capabilities = target.capability_bindings as Row[];
+    if (!capabilities.some((item) => item.capability_id === 'tool.gripper.command')) {
+      bad(pp, 'gripper command target');
+    }
+    const outputs = array(route.outputs, `${pp}.outputs`, 1, 2).map((item, i) => (
+      record(item, FIELDS.pneumatic_output, `${pp}.outputs[${i}]`)
+    ));
+    const inputs = array(route.inputs, `${pp}.inputs`, 0, 4).map((item, i) => (
+      record(item, FIELDS.pneumatic_input, `${pp}.inputs[${i}]`)
+    ));
+    for (const [rows, kind] of [[outputs, 'output'], [inputs, 'input']] as const) {
+      rows.forEach((row, i) => {
+        const rp = `${pp}.${kind}s[${i}]`;
+        identity(row.target_role_id, `${rp}.target_role_id`);
+        identity(row.resource_role_id, `${rp}.resource_role_id`);
+        if (kind === 'output') {
+          if (typeof row.open_value !== 'boolean' || typeof row.close_value !== 'boolean') bad(rp, 'boolean output levels');
+        } else if (!['open', 'closed', 'pressure', 'workpiece_grasped'].includes(row.input as string)) {
+          bad(rp, 'known pneumatic input');
+        }
+        const selected = targetByRole.get(row.target_role_id);
+        const signals = selected?.signal_role_bindings as Row[] | undefined;
+        const signal = signals?.find((item) => item.resource_role_id === row.resource_role_id);
+        const required = kind === 'output' ? 'io.gpio.set_output' : 'io.gpio.get_input';
+        const selectedCapabilities = selected?.capability_bindings as Row[] | undefined;
+        if (!selected || !signal || signal.direction !== kind
+          || !selectedCapabilities?.some((item) => item.capability_id === required)) {
+          bad(rp, 'exact bound I/O signal and capability');
+        }
+      });
+    }
+    sorted(outputs, (row) => `${row.target_role_id as string}\0${row.resource_role_id as string}`, `${pp}.outputs`);
+    sorted(inputs, (row) => row.input as string, `${pp}.inputs`);
+  });
 
   const nodePolicies = array(root.node_policies, `${path}.node_policies`, 0, NODE_POLICY_MAX_ROWS)
     .map((item, i) => nodePolicy(item, `${path}.node_policies[${i}]`));

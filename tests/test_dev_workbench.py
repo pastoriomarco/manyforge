@@ -648,6 +648,7 @@ def test_ros_build_stages_current_products_and_imports_overlay_before_spawn(
     monkeypatch.setattr(dev_workbench, "BUILD_ROOT", build_root)
     monkeypatch.setattr(dev_workbench, "WORKSPACE", REPOSITORY_ROOT)
     monkeypatch.setenv("MANYFORGE_DEV_BUILD_JOBS", "2")
+    monkeypatch.delenv("MANYFORGE_ROS_DEPENDENCY_SETUP_SCRIPTS", raising=False)
     monkeypatch.delenv("MANYFORGE_ROS2_CONTROL_BUILD_TESTING", raising=False)
     if build_testing is not None:
         monkeypatch.setenv("MANYFORGE_ROS2_CONTROL_BUILD_TESTING", build_testing)
@@ -722,6 +723,21 @@ def test_project_status_reads_only_the_bounded_manifest_identity(tmp_path: Path)
     assert dev_workbench._project_scenario_id(
         str(project), allowed_root=tmp_path
     ) == "My_Cell-2"
+
+
+def test_composer_roots_include_launcher_mounted_folders(
+    monkeypatch: Any, tmp_path: Path
+) -> None:
+    examples = tmp_path / "examples"
+    monkeypatch.delenv("MANYFORGE_DEV_PROJECT_ROOTS", raising=False)
+    assert dev_workbench._composer_filesystem_roots(examples) == str(examples)
+    monkeypatch.setenv(
+        "MANYFORGE_DEV_PROJECT_ROOTS",
+        "/projects/first,/projects/second",
+    )
+    assert dev_workbench._composer_filesystem_roots(examples) == (
+        f"{examples},/projects/first,/projects/second"
+    )
 
 
 @pytest.mark.parametrize(
@@ -828,6 +844,23 @@ def test_g_static_composer_preserves_endpoint(tmp_path):
     assert command[command.index("--static-dir") + 1] == str(static)
 
 
+def test_site_settings_forward_only_when_configured(tmp_path):
+    site = tmp_path / "manyforge.site.json"
+    site.write_text('{"schema":"manyforge.site.v1","device_addresses":{}}')
+    workbench = dev_workbench.Workbench(project_path=None, ros2_control=True,
+        headless_port=9010, runner_port=9011, composer_port=9020, frontend_port=3000,
+        site_settings=site)
+    assert workbench._site_manager_arguments() == ("--site-settings", str(site))
+    site.unlink()
+    with pytest.raises(dev_workbench.WorkbenchError, match="site settings"):
+        workbench._site_manager_arguments()
+    workbench.site_settings = None
+    assert workbench._site_manager_arguments() == ()
+    args = dev_workbench._parser().parse_args(["serve", "--site-settings", str(site)])
+    assert args.site_settings == site
+    assert dev_workbench._parser().parse_args(["serve"]).site_settings is None
+
+
 @pytest.mark.parametrize("fresh,manager_ready,expected", [(True, True, True), (False, True, False), (True, False, False)])
 def test_g_status_uses_fresh_manager_health_without_cccl_apply_permission(tmp_path, monkeypatch, fresh, manager_ready, expected):
     manager = {"source": {"available": True, "freshness": "fresh" if fresh else "stale", "known_gaps": []},
@@ -909,6 +942,7 @@ def test_g_owner_start(tmp_path, monkeypatch):
         composer_bind_host="0.0.0.0")
     monkeypatch.setattr(workbench, "_simulation_control_arguments", lambda: ())
     commands = []
+    bridge_environments: list[dict[str, str]] = []
     socket_owner = socket.socket(socket.AF_UNIX)
     def spawn(name, command):
         logs = tmp_path / "state/current/execution-run/ros" / f"1-{session_started_ns}"
@@ -922,7 +956,14 @@ def test_g_owner_start(tmp_path, monkeypatch):
             socket_owner.bind(str(Path(command[index + 1]) / "manager-command.sock"))
     monkeypatch.setattr(workbench, "_spawn", spawn)
     def popen(command, **kwargs):
-        commands.append(("Composer backend", tuple(command)))
+        name = (
+            "Assistant bridge"
+            if "manyforge_assistant_bridge.bridge" in command
+            else "Composer backend"
+        )
+        commands.append((name, tuple(command)))
+        if name == "Assistant bridge":
+            bridge_environments.append(kwargs["env"])
         return SimpleNamespace(poll=lambda: None)
     monkeypatch.setattr(dev_workbench.subprocess, "Popen", popen)
     class Client:
@@ -952,7 +993,21 @@ def test_g_owner_start(tmp_path, monkeypatch):
         workbench.start()
     finally:
         socket_owner.close()
-    assert [name for name, _ in commands] == ["Program runner", "Headless API", "Manager", "Composer backend"]
+    assert [name for name, _ in commands] == [
+        "Program runner", "Headless API", "Manager", "Assistant bridge", "Composer backend",
+    ]
+    composer_command = dict(commands)["Composer backend"]
+    assert composer_command[composer_command.index("--assistant-bridge-url") + 1] == (
+        "http://127.0.0.1:8100"
+    )
+    (bridge_environment,) = bridge_environments
+    assert bridge_environment["MANYFORGE_HEADLESS_API_URL"] == "http://127.0.0.1:9010"
+    assert bridge_environment["MANYFORGE_COMPOSER_URL"] == "http://127.0.0.1:9000"
+    assert bridge_environment["MANYFORGE_ASSISTANT_BRIDGE_PORT"] == "8100"
+    assert bridge_environment["MANYFORGE_ASSISTANT_AUDIT_LOG"] == str(
+        tmp_path / "state/current/assistant-bridge/audit.jsonl"
+    )
+    assert not any(key.startswith("MANYFORGE_ASSISTANT_UPSTREAM") for key in bridge_environment)
     assert workbench._readiness_deadline == 125.0  # Build duration is outside readiness budget.
     timing = json.loads((tmp_path / "state/current/workbench-startup-timing.json").read_text())
     assert timing == {"build_elapsed_seconds": 120.0, "readiness_elapsed_seconds": 0.0}
@@ -995,7 +1050,11 @@ def test_restored_terminal_cycle_starts_vite_without_reset_or_authoring_admissio
         workbench.processes.append((name, SimpleNamespace(poll=lambda: None)))
     monkeypatch.setattr(workbench, "_spawn", spawn)
     def popen(command, **_kwargs):
-        spawned.append("Vite HMR" if command[0] == "node" else "Composer backend")
+        spawned.append(
+            "Vite HMR" if command[0] == "node"
+            else "Assistant bridge" if "manyforge_assistant_bridge.bridge" in command
+            else "Composer backend"
+        )
         return SimpleNamespace(poll=lambda: None)
     monkeypatch.setattr(dev_workbench.subprocess, "Popen", popen)
     cycle = {"state": "terminal_awaiting_reset"}
@@ -1040,7 +1099,9 @@ def test_restored_terminal_cycle_starts_vite_without_reset_or_authoring_admissio
 
     workbench.start()
 
-    assert spawned == ["Program runner", "Headless API", "Manager", "Composer backend", "Vite HMR"]
+    assert spawned == [
+        "Program runner", "Headless API", "Manager", "Assistant bridge", "Composer backend", "Vite HMR",
+    ]
     assert waits == ["Program Runner and Headless reconciliation services", "Manager command socket",
                      "contained Program-cycle startup reconciliation", "Composer backend", "Vite HMR"]
     assert requests == [("GET", "/api/program/health")]

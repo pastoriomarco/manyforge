@@ -74,6 +74,51 @@ plan_pose_source(const std::string_view cell_id, std::string component_id,
   return plan;
 }
 
+std::string ai_model_probe_document(
+    const std::string_view cell_id, const std::string_view component_id,
+    const std::string_view stream_id, const std::string_view base_url,
+    const std::string_view model,
+    const std::optional<std::string> &api_key_env,
+    const std::int64_t probe_period_ms) {
+  if (cell_id.empty() || component_id.empty() || stream_id.empty() ||
+      base_url.empty() || model.empty() || probe_period_ms <= 0)
+    fail("the AI model probe document needs a cell, a component, a stream, "
+         "an endpoint, a model and a positive probe period");
+  CanonicalValue::Object members{
+      {"api_version", CanonicalValue(std::string(kAiModelSiteApiVersion))},
+      {"cell_id", CanonicalValue(std::string(cell_id))},
+      {"component_id", CanonicalValue(std::string(component_id))},
+      {"stream_id", CanonicalValue(std::string(stream_id))},
+      {"base_url", CanonicalValue(std::string(base_url))},
+      {"model", CanonicalValue(std::string(model))},
+      {"api_key_env",
+       api_key_env ? CanonicalValue(*api_key_env) : CanonicalValue(nullptr)},
+      {"probe_period_ms",
+       CanonicalValue(static_cast<double>(probe_period_ms))}};
+  return content_identity::canonical_json(CanonicalValue(std::move(members)));
+}
+
+PoseSourcePlan
+plan_ai_model(const std::string_view cell_id, std::string component_id,
+              const std::string_view stream_id, const std::string_view base_url,
+              const std::string_view model,
+              const std::optional<std::string> &api_key_env,
+              const std::filesystem::path &execution_run_root) {
+  if (execution_run_root.empty())
+    fail("an AI model probe needs the execution run root");
+  PoseSourcePlan plan;
+  plan.lane = ControllerLaunchLane::kAiModel;
+  plan.document = ai_model_probe_document(
+      cell_id, component_id, stream_id, base_url, model, api_key_env,
+      kAiModelProbePeriodMs);
+  plan.artifacts_root =
+      execution_run_root / "controller-launch-artifacts" / component_id;
+  plan.site_config_path =
+      plan.artifacts_root / std::string(kAiModelSiteFileName);
+  plan.component_id = std::move(component_id);
+  return plan;
+}
+
 void write_pose_source_document(const PoseSourcePlan &plan) {
   std::filesystem::create_directories(plan.artifacts_root);
   // Replace atomically: a starting observer never reads a partial file.
@@ -91,9 +136,11 @@ void write_pose_source_document(const PoseSourcePlan &plan) {
 ControllerLaunchCommand
 pose_source_launch_command(const PoseSourcePlan &plan,
                            const std::string &source_epoch_base) {
+  const bool ai_model = plan.lane == ControllerLaunchLane::kAiModel;
   if (plan.component_id.empty() || plan.document.empty() ||
-      plan.site_config_path.empty() || plan.manager_run_root.empty() ||
-      source_epoch_base.empty())
+      plan.site_config_path.empty() ||
+      (!ai_model &&
+       (plan.manager_run_root.empty() || source_epoch_base.empty())))
     fail("plan is incomplete");
   const auto site = plan.site_config_path.string();
   const auto manager = plan.manager_run_root.string();
@@ -102,19 +149,27 @@ pose_source_launch_command(const PoseSourcePlan &plan,
       fail("launch value contains whitespace: " + *value);
   ControllerLaunchCommand command;
   command.controllable_component_id = plan.component_id;
-  command.lane = ControllerLaunchLane::kPoseSource;
-  command.argv = {"ros2",
-                  "launch",
-                  "manyforge_ros_bringup",
-                  "pose_source.launch.py",
-                  "site_config_path:=" + site,
-                  "manager_run_root:=" + manager,
-                  "source_epoch_base:=" + source_epoch_base};
+  command.lane = plan.lane;
   std::ostringstream identity;
-  identity << "pose_source\n"
-           << plan.component_id << '\n'
-           << content_identity::sha256_digest(plan.document) << '\n'
-           << manager << '\n';
+  if (ai_model) {
+    command.argv = {"ros2", "launch", "manyforge_ros_bringup",
+                    "ai_model.launch.py", "site_config_path:=" + site};
+    identity << "ai_model\n"
+             << plan.component_id << '\n'
+             << content_identity::sha256_digest(plan.document) << '\n';
+  } else {
+    command.argv = {"ros2",
+                    "launch",
+                    "manyforge_ros_bringup",
+                    "pose_source.launch.py",
+                    "site_config_path:=" + site,
+                    "manager_run_root:=" + manager,
+                    "source_epoch_base:=" + source_epoch_base};
+    identity << "pose_source\n"
+             << plan.component_id << '\n'
+             << content_identity::sha256_digest(plan.document) << '\n'
+             << manager << '\n';
+  }
   command.identity = identity.str();
   command.keep_across_apply = true;
   return command;
@@ -124,7 +179,7 @@ bool pose_source_launch_survives(
     ControllerLaunchProcess *const process,
     const std::optional<PoseSourcePlan> &candidate) {
   return process != nullptr && candidate.has_value() &&
-         process->command().lane == ControllerLaunchLane::kPoseSource &&
+         process->command().lane == candidate->lane &&
          owned_launch_live(process, false, false) &&
          process->command().identity ==
              pose_source_launch_command(*candidate, "survival").identity;
@@ -132,7 +187,9 @@ bool pose_source_launch_survives(
 
 core::ErrorDTO pose_source_exit_fault(std::string reason,
                                       const std::optional<int> exit_status,
-                                      const std::string_view output_tail) {
+                                      const std::string_view output_tail,
+                                      const ControllerLaunchLane lane) {
+  const bool ai_model = lane == ControllerLaunchLane::kAiModel;
   // `ros2 launch` itself ends normally; it reports its child's status as
   // "process has died [pid N, exit code 78, ...]".
   const bool config_invalid =
@@ -141,8 +198,11 @@ core::ErrorDTO pose_source_exit_fault(std::string reason,
                        std::to_string(kPoseSourceConfigInvalidExitStatus)) !=
           std::string_view::npos;
   if (!config_invalid)
-    return {std::string(kPoseSourceExitedCode), std::move(reason), {}};
-  core::ErrorDTO fault{std::string(kPoseSourceConfigInvalidCode),
+    return {std::string(ai_model ? kAiModelExitedCode : kPoseSourceExitedCode),
+            std::move(reason),
+            {}};
+  core::ErrorDTO fault{std::string(ai_model ? kAiModelConfigInvalidCode
+                                            : kPoseSourceConfigInvalidCode),
                        std::move(reason),
                        {}};
   if (auto detail = tail_detail(output_tail); !detail.empty())
@@ -161,7 +221,7 @@ pose_source_fault_source(std::shared_ptr<ControllerLaunchProcess> process) {
     const auto evidence = process->exit_evidence();
     return pose_source_exit_fault(
         std::move(*reason), evidence ? evidence->exit_status : std::nullopt,
-        process->output_snapshot().tail);
+        process->output_snapshot().tail, process->command().lane);
   };
 }
 

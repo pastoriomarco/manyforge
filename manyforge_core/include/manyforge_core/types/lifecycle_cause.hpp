@@ -48,6 +48,15 @@ inline constexpr std::string_view kLifecycleBlockingCauseFactId =
 /// lifecycle plan predicate inputs.
 inline constexpr std::string_view kLifecycleVendorCodeFactPrefix = "manyforge.vendor_code.";
 
+/// Vendor-neutral device facts a real robot's vendor adapter reports from its
+/// fresh status (R7 D9); unknown while that status is stale or missing. They
+/// are lifecycle plan predicate inputs; the vendor adapter defines each one
+/// for its robot.
+inline constexpr std::string_view kDeviceErrorPresentFactId = "device.error_present";
+inline constexpr std::string_view kDeviceWarningPresentFactId = "device.warning_present";
+inline constexpr std::string_view kDeviceMotionEnabledFactId = "device.motion_enabled";
+inline constexpr std::string_view kDeviceAcceptsCommandsFactId = "device.accepts_commands";
+
 [[nodiscard]] constexpr std::string_view to_string(
     const LifecycleBlockingCauseClassDTO value) noexcept {
   switch (value) {

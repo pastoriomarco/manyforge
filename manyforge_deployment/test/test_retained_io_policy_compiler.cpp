@@ -18,6 +18,7 @@
 #include "io_retained_fixture.hpp"
 #include "maintained_activation_fixture.hpp"
 #include "maintained_interrupt_program_fixture.hpp"
+#include "pneumatic_program_fixture.hpp"
 #include "verified_retained_bundle_internal.hpp"
 
 namespace {
@@ -161,6 +162,150 @@ Selected select(const std::filesystem::path &root,
   return {std::move(program), std::move(binding), std::move(*map)};
 }
 
+void coincident_gripper_presets(V::Object &document) {
+  auto components = std::find_if(document.begin(), document.end(),
+      [](const auto &entry) { return entry.first == "components"; });
+  auto rows = components->second.as_array();
+  for (auto &component : rows) {
+    if (!component.find_object_member("model_source")) continue;
+    auto configuration = *component.find_object_member("configuration");
+    auto runtime = *configuration.find_object_member("runtime_configuration");
+    auto grippers = runtime.find_object_member("gripper_target_configurations")->as_array();
+    grippers.front() = replace(grippers.front(), "open_state_ref", V("closed"));
+    runtime = replace(runtime, "gripper_target_configurations", V(std::move(grippers)));
+    configuration = replace(configuration, "runtime_configuration", std::move(runtime));
+    component = replace(component, "configuration", std::move(configuration));
+  }
+  components->second = V(std::move(rows));
+}
+
+void add_second_pneumatic_valve(V::Object &document) {
+  auto components = std::find_if(document.begin(), document.end(),
+      [](const auto &entry) { return entry.first == "components"; });
+  auto rows = components->second.as_array();
+  for (auto &component : rows) {
+    const auto id = component.find_object_member("component_id")->as_string();
+    auto configuration = *component.find_object_member("configuration");
+    auto runtime = *configuration.find_object_member("runtime_configuration");
+    if (id == "lite6_robot") {
+      auto grippers = runtime.find_object_member("gripper_target_configurations")->as_array();
+      auto mapping = *grippers.front().find_object_member("pneumatic_io");
+      auto outputs = mapping.find_object_member("outputs")->as_array();
+      outputs.push_back(parse(R"({"signal":{"controllable_component_id":"gripper_io",
+          "signal_name":"valve_other"},"open_value":true,"close_value":false})"));
+      mapping = replace(mapping, "outputs", V(std::move(outputs)));
+      grippers.front() = replace(grippers.front(), "pneumatic_io", std::move(mapping));
+      runtime = replace(runtime, "gripper_target_configurations", V(std::move(grippers)));
+    } else if (id == "gripper_io") {
+      auto signals = runtime.find_object_member("io_signals")->as_array();
+      signals.push_back(parse(R"({"command_target_id":"io","controllable_component_id":"gripper_io",
+          "direction":"output","provider":{"channel":"pneumatic_valve_other","profile":"mock_output"},
+          "resource_role_id":"valve_other","signal_name":"valve_other",
+          "source_id":"gripper_io.valve_other","value_type":"bool"})"));
+      runtime = replace(runtime, "io_signals", V(std::move(signals)));
+    } else continue;
+    configuration = replace(configuration, "runtime_configuration", std::move(runtime));
+    component = replace(component, "configuration", std::move(configuration));
+  }
+  components->second = V(std::move(rows));
+}
+
+TEST(RetainedIoPolicyCompilerTest, PneumaticMappedSignalsCompileAndReloadAcrossComponents) {
+  Root root;
+  const auto product = d::test::MaterializeMaintainedInterruptDeployment(
+      root.path, parse(R"({"interrupt_rules":[]})"), "examples/lite6_pneumatic_mock.scenario");
+  ASSERT_TRUE(product.model_map);
+  const auto fixture = d::test::compile_pneumatic_program_fixture(root.path, product, 2U);
+  const auto &targets = fixture.binding->value().target_role_bindings;
+  const auto find = [&](std::string_view role) -> const c::ProgramTargetRoleBindingDTO & {
+    const auto row = std::find_if(targets.begin(), targets.end(),
+                                  [&](const auto &item) { return item.target_role_id.value() == role; });
+    if (row == targets.end()) throw std::logic_error("pneumatic target missing");
+    return *row;
+  };
+  const auto &first = find("gripper_0");
+  const auto &second = find("gripper_1");
+  ASSERT_TRUE(first.pneumatic_io);
+  ASSERT_TRUE(second.pneumatic_io);
+  ASSERT_EQ(first.pneumatic_io->outputs.size(), 1U);
+  ASSERT_EQ(first.pneumatic_io->inputs.size(), 1U);
+  EXPECT_EQ(first.pneumatic_io->outputs.front().target_role_id,
+            second.pneumatic_io->outputs.front().target_role_id);
+  EXPECT_EQ(first.pneumatic_io->inputs.front().target_role_id,
+            second.pneumatic_io->inputs.front().target_role_id);
+  const auto &valve = find(first.pneumatic_io->outputs.front().target_role_id.value());
+  const auto &sensor = find(first.pneumatic_io->inputs.front().target_role_id.value());
+  EXPECT_EQ(valve.controllable_component_id.value(), "gripper_io");
+  EXPECT_EQ(sensor.controllable_component_id.value(), "gripper_io");
+  EXPECT_EQ(valve.signal_role_bindings.front().signal_name, "valve");
+  EXPECT_EQ(sensor.signal_role_bindings.front().signal_name, "workpiece_grasped");
+  EXPECT_EQ(d::reload_verified_program_binding(fixture.binding->canonical_bytes(),
+                                               *product.bundle, *product.model_map)->value(),
+            fixture.binding->value());
+}
+
+TEST(RetainedIoPolicyCompilerTest, PneumaticOutputReusesOneAuthoredTargetAndRefusesAmbiguity) {
+  Root root;
+  const auto product = d::test::MaterializeMaintainedInterruptDeployment(
+      root.path, parse(R"({"interrupt_rules":[]})"), "examples/lite6_pneumatic_mock.scenario");
+  const auto fixture = d::test::compile_pneumatic_program_fixture(root.path, product, 1U, 1U);
+  const auto &targets = fixture.binding->value().target_role_bindings;
+  const auto gripper = std::find_if(targets.begin(), targets.end(),
+      [](const auto &row) { return row.target_role_id.value() == "gripper_0"; });
+  ASSERT_NE(gripper, targets.end());
+  ASSERT_TRUE(gripper->pneumatic_io);
+  EXPECT_EQ(gripper->pneumatic_io->outputs.front().target_role_id.value(), "valve_0");
+  try {
+    (void)d::test::compile_pneumatic_program_fixture(root.path, product, 1U, 2U);
+    FAIL() << "ambiguous output aliases must be refused";
+  } catch (const d::ProgramBindingCompilerError &error) {
+    const std::string message = error.what();
+    EXPECT_NE(message.find("pneumatic_io_signal_ambiguous_target"), std::string::npos);
+    EXPECT_NE(message.find("valve_0"), std::string::npos);
+    EXPECT_NE(message.find("valve_1"), std::string::npos);
+  }
+}
+
+TEST(RetainedIoPolicyCompilerTest, PneumaticMappedCoincidentPresetsFailAtActivationCompilation) {
+  Root root;
+  try {
+    (void)d::test::MaterializeMaintainedInterruptDeployment(
+        root.path, parse(R"({"interrupt_rules":[]})"), "examples/lite6_pneumatic_mock.scenario",
+        coincident_gripper_presets);
+    FAIL() << "coincident mapped presets must be refused";
+  } catch (const std::exception &error) {
+    EXPECT_NE(std::string(error.what()).find("pneumatic_io_presets_coincident"), std::string::npos);
+  }
+}
+
+TEST(RetainedIoPolicyCompilerTest, PneumaticReloadRejectsTwoAliasesForOnePhysicalValve) {
+  Root root;
+  const auto product = d::test::MaterializeMaintainedInterruptDeployment(
+      root.path, parse(R"({"interrupt_rules":[]})"), "examples/lite6_pneumatic_mock.scenario",
+      add_second_pneumatic_valve);
+  const auto fixture = d::test::compile_pneumatic_program_fixture(root.path, product);
+  auto forged = fixture.binding->value();
+  const auto gripper_index = static_cast<std::size_t>(std::find_if(
+      forged.target_role_bindings.begin(), forged.target_role_bindings.end(),
+      [](const auto &row) { return row.target_role_id.value() == "gripper_0"; }) -
+      forged.target_role_bindings.begin());
+  ASSERT_LT(gripper_index, forged.target_role_bindings.size());
+  auto &route = *forged.target_role_bindings[gripper_index].pneumatic_io;
+  ASSERT_EQ(route.outputs.size(), 2U);
+  const auto first = route.outputs.front();
+  const auto physical = std::find_if(forged.target_role_bindings.begin(), forged.target_role_bindings.end(),
+      [&](const auto &row) { return row.target_role_id == first.target_role_id; });
+  ASSERT_NE(physical, forged.target_role_bindings.end());
+  auto alias = *physical;
+  alias.target_role_id = c::TargetRoleId("forged_valve_alias");
+  route.outputs.back() = first;
+  route.outputs.back().target_role_id = alias.target_role_id;
+  forged.target_role_bindings.push_back(std::move(alias));
+  const auto resealed = d::detail::ProgramBindingConstructionAuthority::seal(std::move(forged));
+  EXPECT_THROW((void)d::reload_verified_program_binding(resealed->canonical_bytes(),
+                  *product.bundle, *product.model_map), d::ProgramBindingError);
+}
+
 TEST(RetainedIoPolicyCompilerTest,
      SignalOnlyGlobalsHaveNoProgramOrRunRequirement) {
   Root root;
@@ -186,27 +331,24 @@ TEST(RetainedIoPolicyCompilerTest,
       std::vector<c::InterruptSourceId>{c::InterruptSourceId("source.io")});
 }
 
-TEST(
-    RetainedIoPolicyCompilerTest,
-    GlobalLatchReleaseDefaultsToOperatorAndSealsExplicitAutoOnClearWithoutRun) {
-  Root default_root, operator_root, auto_root;
-  auto default_rules = V(V::Array{rule(V("everything"), true)});
-  auto operator_rules = V(V::Array{
-      replace(rule(V("everything"), true), "latch_release", V("operator"))});
-  auto auto_rules = V(V::Array{replace(rule(V("everything"), true),
-                                       "latch_release", V("auto_on_clear"))});
+TEST(RetainedIoPolicyCompilerTest,
+     GlobalOnTripDefaultsToGateAndSealsExplicitFullStopWithoutRun) {
+  Root default_root, gate_root, full_root;
+  auto default_rules = V(V::Array{rule(V("all_motion"), true)});
+  auto gate_rules = V(V::Array{
+      replace(rule(V("all_motion"), true), "on_trip", V("gate"))});
+  auto full_rules = V(V::Array{replace(
+      replace(rule(V("all_motion"), true), "on_trip", V("full_stop")),
+      "idle_behaviour", V("ignore"))});
   const auto defaults = d::test::materialize_boolean_io_retained_fixture(
       default_root.path, true, false, false, false, false, &default_rules);
-  const auto explicit_operator =
-      d::test::materialize_boolean_io_retained_fixture(operator_root.path, true,
-                                                       false, false, false,
-                                                       false, &operator_rules);
-  const auto automatic = d::test::materialize_boolean_io_retained_fixture(
-      auto_root.path, true, false, false, false, false, &auto_rules);
+  const auto explicit_gate = d::test::materialize_boolean_io_retained_fixture(
+      gate_root.path, true, false, false, false, false, &gate_rules);
+  const auto full = d::test::materialize_boolean_io_retained_fixture(
+      full_root.path, true, false, false, false, false, &full_rules);
   EXPECT_EQ(defaults.bundle->canonical_bytes(),
-            explicit_operator.bundle->canonical_bytes());
-  EXPECT_NE(defaults.bundle->canonical_bytes(),
-            automatic.bundle->canonical_bytes());
+            explicit_gate.bundle->canonical_bytes());
+  EXPECT_NE(defaults.bundle->canonical_bytes(), full.bundle->canonical_bytes());
   const auto *configuration =
       defaults.bundle->normalized_root().find_object_member(
           "interrupt_policy_configuration");
@@ -215,28 +357,33 @@ TEST(
       configuration->find_object_member("interrupt_rules");
   ASSERT_NE(sealed_rules, nullptr);
   ASSERT_EQ(sealed_rules->as_array().size(), 1U);
-  const auto *release =
-      sealed_rules->as_array().front().find_object_member("latch_release");
-  ASSERT_NE(release, nullptr);
-  EXPECT_EQ(release->as_string(), "operator");
+  const auto *on_trip =
+      sealed_rules->as_array().front().find_object_member("on_trip");
+  ASSERT_NE(on_trip, nullptr);
+  EXPECT_EQ(on_trip->as_string(), "gate");
   const auto reloaded = d::detail::RetainedBundleReloadAuthority::reload(
-      automatic.bundle->canonical_bytes());
+      full.bundle->canonical_bytes());
   ASSERT_NE(reloaded, nullptr);
-  const auto default_compiled =
+  const auto gate_compiled =
       d::compile_retained_io_policies(nullptr, nullptr, *defaults.bundle);
-  const auto auto_compiled =
+  const auto full_compiled =
       d::compile_retained_io_policies(nullptr, nullptr, *reloaded);
-  ASSERT_TRUE(default_compiled.ok()) << default_compiled.error().message;
-  ASSERT_TRUE(auto_compiled.ok()) << auto_compiled.error().message;
-  ASSERT_EQ(default_compiled.value().activation_policies.size(), 1U);
-  ASSERT_EQ(auto_compiled.value().activation_policies.size(), 1U);
-  EXPECT_EQ(default_compiled.value()
-                .activation_policies.front()
-                .post_latch_disposition,
+  ASSERT_TRUE(gate_compiled.ok()) << gate_compiled.error().message;
+  ASSERT_TRUE(full_compiled.ok()) << full_compiled.error().message;
+  ASSERT_EQ(gate_compiled.value().activation_policies.size(), 1U);
+  ASSERT_EQ(full_compiled.value().activation_policies.size(), 1U);
+  // gate: scoped Stop, always latched while true, released when it clears.
+  const auto &gate = gate_compiled.value().activation_policies.front();
+  EXPECT_FALSE(gate.full_stop_on_trip);
+  EXPECT_EQ(gate.idle_behaviour, c::IoRuleIdleBehaviourDTO::kLatch);
+  EXPECT_EQ(gate.post_latch_disposition,
+            c::InterruptPostLatchDisposition::kAutoClearOnSignalRelease);
+  // full_stop: cell Full Stop, authored idle behaviour, operator release.
+  const auto &full_stop = full_compiled.value().activation_policies.front();
+  EXPECT_TRUE(full_stop.full_stop_on_trip);
+  EXPECT_EQ(full_stop.idle_behaviour, c::IoRuleIdleBehaviourDTO::kIgnore);
+  EXPECT_EQ(full_stop.post_latch_disposition,
             c::InterruptPostLatchDisposition::kAwaitOperatorAck);
-  EXPECT_EQ(
-      auto_compiled.value().activation_policies.front().post_latch_disposition,
-      c::InterruptPostLatchDisposition::kAutoClearOnSignalRelease);
 }
 
 TEST(RetainedIoPolicyCompilerTest,
@@ -494,10 +641,15 @@ TEST(RetainedIoPolicyCompilerTest,
                 V("fail_node")),
         replace(rule(V("all_motion"), true), "success_through_stage_id",
                 V("software_hard")),
-        replace(rule(V("all_motion"), true), "latch_release",
-                V("program_reset")),
-        replace(rule(V("all_motion"), true), "latch_release", V(true)),
-        replace(rule(V("all_motion"), true), "latch_release", V(nullptr)),
+        replace(rule(V("all_motion"), true), "on_trip", V("program_reset")),
+        replace(rule(V("all_motion"), true), "on_trip", V(true)),
+        replace(rule(V("all_motion"), true), "on_trip", V(nullptr)),
+        // latch_release is folded into on_trip and no longer accepted.
+        replace(rule(V("all_motion"), true), "latch_release", V("operator")),
+        // Only full_stop has an idle behaviour (gate always gates).
+        replace(rule(V("all_motion"), true), "idle_behaviour", V("latch")),
+        replace(replace(rule(V("all_motion"), true), "on_trip", V("gate")),
+                "idle_behaviour", V("ignore")),
         replace(rule(V("all_motion"), true), "post_latch_disposition",
                 V("await_recovery_handler")),
         replace(rule(V("all_motion"), true), "scope",

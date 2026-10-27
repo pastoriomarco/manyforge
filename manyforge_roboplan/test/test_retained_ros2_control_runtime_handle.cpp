@@ -9,6 +9,8 @@
 #include <pal_statistics_msgs/msg/statistics.hpp>
 #include <sensor_msgs/msg/joint_state.hpp>
 
+#include <manyforge_core/component_lifecycle_plan_catalog_codec.hpp>
+#include <manyforge_core/component_lifecycle_plan_evaluator.hpp>
 #include <manyforge_core/execution_port_participant.hpp>
 #include <manyforge_core/observed_robot_state_publication.hpp>
 #include <manyforge_core/time/fake_clock.hpp>
@@ -17,8 +19,10 @@
 #include <manyforge_roboplan/host_component_stream_health.hpp>
 #include <manyforge_roboplan/native_runtime_support.hpp>
 #include <manyforge_roboplan/retained_isaac_ros2_control_profile.hpp>
+#include <manyforge_roboplan/retained_ros2_control_lifecycle_product.hpp>
 #include <manyforge_roboplan/retained_ros2_control_runtime_handle.hpp>
 #include <manyforge_roboplan/retained_ros2_control_statistics_monitor.hpp>
+#include <manyforge_xarm_control/lifecycle_profile.hpp>
 
 #include <atomic>
 #include <condition_variable>
@@ -169,7 +173,8 @@ struct ArmWorld final {
       bool mock_reset_position = false,
       std::function<std::optional<std::string>()> process_fault = {},
       ros2_control_execution::Ros2TransportResources::ContextProvider context_provider = {},
-      std::size_t executor_threads = 3U)
+      std::size_t executor_threads = 3U,
+      core::Duration measured_freshness_ns = 100)
       : owning_clock(receiver_clock ? std::move(receiver_clock)
                                     : std::make_shared<WallClock>()),
         clock(*owning_clock), binding(std::move(initial_binding)),
@@ -198,9 +203,10 @@ struct ArmWorld final {
                                   {0.125},
                                   "test-target-digest"};
     arm.measured_joint_state_lane = RetainedMeasuredJointStateLane{
-        prefix + "/joint_states", 100,
+        prefix + "/joint_states", measured_freshness_ns,
         core::StateAuthorityId(std::string(kMeasuredJointStateAuthorityId)),
-        std::string(kMeasuredJointStateProfileId)};
+        std::string(kMeasuredJointStateProfileId),
+        core::StreamSeverityDTO::kFault, core::StreamRecoveryDTO::kAck, std::nullopt};
     const auto bound = handle->Bind(
         std::make_unique<ros2_control_execution::Ros2TransportResources>(
             "manyforge_handle_test_" + fake::unique_suffix(), "/", executor_threads,
@@ -422,7 +428,9 @@ core::RuntimeParticipantBinding GripperBinding() {
 struct GripperWorld final {
   explicit GripperWorld(bool expose_action = true,
                         std::shared_ptr<core::IClock> receiver_clock = {},
-                        bool controller_manager_gripper = true)
+                        bool controller_manager_gripper = true,
+                        std::optional<core::StreamDeclarationDTO>
+                            gripper_feedback_stream = std::nullopt)
       : owning_clock(receiver_clock ? std::move(receiver_clock)
                                     : std::make_shared<WallClock>()),
         clock(*owning_clock),
@@ -458,7 +466,9 @@ struct GripperWorld final {
     arm.measured_joint_state_lane = RetainedMeasuredJointStateLane{
         prefix + "/joint_states", 100,
         core::StateAuthorityId(std::string(kMeasuredJointStateAuthorityId)),
-        std::string(kMeasuredJointStateProfileId)};
+        std::string(kMeasuredJointStateProfileId),
+        core::StreamSeverityDTO::kFault, core::StreamRecoveryDTO::kAck,
+        std::move(gripper_feedback_stream)};
     arm.controller = {prefix + "/controller_manager", "arm_controller",
                       "TestSystem"};
     if (controller_manager_gripper) {
@@ -2579,7 +2589,8 @@ MeasuredSourceDescriptor(const core::RuntimeParticipantBinding &binding,
       RetainedMeasuredJointStateLane{
           prefix + "/joint_states", 100,
           core::StateAuthorityId(std::string(kMeasuredJointStateAuthorityId)),
-          std::string(kMeasuredJointStateProfileId)});
+          std::string(kMeasuredJointStateProfileId),
+          core::StreamSeverityDTO::kFault, core::StreamRecoveryDTO::kAck, std::nullopt});
   if (!descriptor.ok())
     throw std::logic_error(descriptor.error().message);
   return descriptor.value();
@@ -2712,6 +2723,67 @@ TEST(RetainedRos2ControlRuntimeHandle,
   EXPECT_TRUE(world.handle->OwnsBinding(world.motion));
   EXPECT_TRUE(world.handle->OwnsBinding(world.tool));
   EXPECT_TRUE(world.manager.Requests().empty());
+}
+
+TEST(RetainedRos2ControlRuntimeHandle,
+     MockGripperFeedbackStreamRidesTheMeasuredLane) {
+  // CP9: a Mock gripper's `gripper_feedback` stream is declared with the
+  // measured lane (its row defaults) and recorded by every JointState that
+  // carries the gripper joint.
+  auto clock = std::make_shared<core::FakeClock>();
+  clock->set(1000);
+  GripperWorld world(true, clock, true,
+                     core::StreamDeclarationDTO{
+                         "gripper_feedback", 1'500'000'000,
+                         core::StreamSeverityDTO::kBlocking,
+                         core::StreamRecoveryDTO::kAuto,
+                         core::StreamTimestampSourceDTO::kMessageStamp});
+  const auto motion = MeasuredSourceDescriptor(world.motion, world.prefix);
+  const auto tool = MeasuredSourceDescriptor(world.tool, world.prefix);
+  const auto staged = world.handle->StageMeasuredStateSources(
+      {motion, tool}, clock, world.motion, world.tool);
+  ASSERT_TRUE(staged.ok()) << staged.error().message;
+  const auto arm_reader = staged.value()->readers()[0];
+  const auto tool_reader = staged.value()->readers()[1];
+  staged.value()->EnablePublication();
+  const auto gripper_stream = [&]() -> std::optional<core::StreamHealthDTO> {
+    for (const auto &stream : host_component_stream_health()->Read(
+             world.tool.value().controllable_component_id))
+      if (stream.stream_id == "gripper_feedback") return stream;
+    return std::nullopt;
+  };
+  const auto declared = gripper_stream();
+  ASSERT_TRUE(declared.has_value());
+  EXPECT_EQ(declared->budget_ns, 1'500'000'000);
+  EXPECT_EQ(declared->severity, core::StreamSeverityDTO::kBlocking);
+  EXPECT_EQ(declared->recovery, core::StreamRecoveryDTO::kAuto);
+  EXPECT_EQ(declared->timestamp_source,
+            core::StreamTimestampSourceDTO::kMessageStamp);
+  EXPECT_FALSE(declared->age_ns.has_value());
+  auto publisher =
+      world.handle->node()->create_publisher<sensor_msgs::msg::JointState>(
+          world.prefix + "/joint_states", rclcpp::QoS(1));
+  world.handle->StartBackend();
+  ASSERT_TRUE(fake::WaitUntil(
+      [&] { return publisher->get_subscription_count() == 1U; }));
+  const auto &arm_query = motion.publication.query_context;
+  const auto &tool_query = tool.publication.query_context;
+  // A sample without the gripper joint is no gripper feedback.
+  sensor_msgs::msg::JointState message;
+  message.header.stamp.sec = 1;
+  message.name = {"source_joint_1"};
+  message.position = {0.25};
+  publisher->publish(message);
+  ASSERT_TRUE(fake::WaitUntil(
+      [&] { return arm_reader->current_state(arm_query, 1000).ok(); }));
+  EXPECT_FALSE(gripper_stream()->age_ns.has_value());
+  message.header.stamp.sec = 2;
+  message.name = {"source_gripper_joint", "source_joint_1"};
+  message.position = {0.025, 0.25};
+  publisher->publish(message);
+  ASSERT_TRUE(fake::WaitUntil(
+      [&] { return tool_reader->current_state(tool_query, 1000).ok(); }));
+  EXPECT_TRUE(gripper_stream()->age_ns.has_value());
 }
 
 TEST(RetainedRos2ControlRuntimeHandle, InactiveJointStateSamplesAreMeasuredAndReadsNeverRefresh) {
@@ -3286,7 +3358,8 @@ TEST(RetainedRos2ControlRuntimeHandleTest,
       {}, clock, RetainedMeasuredJointStateLane{
           prefix + "/joint_states", 100,
           core::StateAuthorityId(std::string(kMeasuredJointStateAuthorityId)),
-          std::string(kMeasuredJointStateProfileId)}).ok());
+          std::string(kMeasuredJointStateProfileId),
+          core::StreamSeverityDTO::kFault, core::StreamRecoveryDTO::kAck, std::nullopt}).ok());
   // Early facts ownership must not change the unstarted health classification.
   ASSERT_TRUE(handle->ReadLifecycleHealth(domain, clock->now()).ok());
   const auto descriptor = MeasuredSourceDescriptor(tool, prefix);
@@ -3708,6 +3781,658 @@ TEST(RetainedRos2ControlRuntimeHandleTest,
   }
 }
 
+
+// R7 package 3: a deterministic vendor adapter in place of the xArm
+// `robot_states` subscription.
+class FakeDeviceStatusAdapter final : public IRetainedDeviceStatusAdapter {
+public:
+  void Start(rclcpp::Node &, core::IClock &) override { ++starts; }
+  [[nodiscard]] RetainedDeviceStatus Observe(core::TimePoint) override {
+    std::lock_guard lock(mutex);
+    ++observe_calls;
+    return status;
+  }
+  [[nodiscard]] RetainedDeviceStatus ReadHealth(core::TimePoint) const override {
+    std::lock_guard lock(mutex);
+    ++health_calls;
+    return status;
+  }
+  void Set(RetainedDeviceStatus value) {
+    std::lock_guard lock(mutex);
+    status = std::move(value);
+  }
+  // R7 package 4: the vendor's own effects, gate and primitives.
+  void BeginHardwareTransition(bool activate) override {
+    std::lock_guard lock(mutex);
+    events.push_back(activate ? "begin:arm" : "begin:disarm");
+  }
+  void SettleHardwareTransition(bool activate, bool effect_possible,
+                                core::TimePoint) override {
+    std::lock_guard lock(mutex);
+    events.push_back(std::string(activate ? "settle:arm:" : "settle:disarm:") +
+                     (effect_possible ? "effect" : "none"));
+  }
+  [[nodiscard]] core::Result<void>
+  CheckActivation(core::TimePoint,
+                  const std::vector<double> &measured) const override {
+    std::lock_guard lock(mutex);
+    gate_inputs.push_back(measured);
+    return gate;
+  }
+  [[nodiscard]] RetainedRos2ControlSwitchResult
+  Dispatch(const core::LifecyclePrimitiveId &primitive, std::stop_token) override {
+    std::lock_guard lock(mutex);
+    dispatched.push_back(primitive.value());
+    return dispatch_result;
+  }
+  // D11: the tool payload call at Enable.
+  [[nodiscard]] RetainedRos2ControlSwitchResult
+  ApplyToolPayload(std::stop_token) override {
+    std::lock_guard lock(mutex);
+    ++payload_calls;
+    return payload_result;
+  }
+  void SetGate(core::Result<void> value) {
+    std::lock_guard lock(mutex);
+    gate = std::move(value);
+  }
+  void SetPayloadResult(RetainedRos2ControlSwitchResult value) {
+    std::lock_guard lock(mutex);
+    payload_result = std::move(value);
+  }
+  [[nodiscard]] std::vector<std::string> Events() const {
+    std::lock_guard lock(mutex);
+    return events;
+  }
+  [[nodiscard]] std::vector<std::string> Dispatched() const {
+    std::lock_guard lock(mutex);
+    return dispatched;
+  }
+  [[nodiscard]] std::vector<std::vector<double>> GateInputs() const {
+    std::lock_guard lock(mutex);
+    return gate_inputs;
+  }
+
+  std::atomic<int> starts{0};
+  mutable std::mutex mutex;
+  mutable int observe_calls{0};
+  mutable int health_calls{0};
+  RetainedDeviceStatus status;
+  std::vector<std::string> events;
+  mutable std::vector<std::vector<double>> gate_inputs;
+  core::Result<void> gate = core::Result<void>::Ok();
+  std::vector<std::string> dispatched;
+  RetainedRos2ControlSwitchResult dispatch_result{
+      RetainedRos2ControlSwitchOutcome::kSucceeded, std::nullopt};
+  RetainedRos2ControlSwitchResult payload_result{
+      RetainedRos2ControlSwitchOutcome::kSucceeded, std::nullopt};
+  std::atomic<int> payload_calls{0};
+};
+
+[[nodiscard]] core::LifecycleFactDTO DeviceBoolean(std::string_view id, bool value) {
+  return {core::LifecycleFactId(std::string(id)),
+          {core::LifecycleFactValueKindDTO::kBoolean, value, std::nullopt, std::nullopt}};
+}
+
+[[nodiscard]] RetainedDeviceStatus DeviceStatus(core::LifecycleBlockingCauseClassDTO cause,
+                                                bool error) {
+  RetainedDeviceStatus result{
+      cause,
+      {DeviceBoolean(core::kDeviceAcceptsCommandsFactId, false),
+       DeviceBoolean(core::kDeviceErrorPresentFactId, error),
+       DeviceBoolean(core::kDeviceMotionEnabledFactId, false),
+       DeviceBoolean(core::kDeviceWarningPresentFactId, false)}};
+  if (error)
+    result.facts.push_back({core::LifecycleFactId("manyforge.vendor_code.error"),
+                            {core::LifecycleFactValueKindDTO::kToken, std::nullopt,
+                             std::nullopt, std::string("C2")}});
+  return result;
+}
+
+[[nodiscard]] std::optional<std::string> TokenFact(
+    const std::vector<core::LifecycleFactDTO> &facts, std::string_view id) {
+  for (const auto &fact : facts)
+    if (fact.lifecycle_fact_id.value() == id) return fact.value.token_value;
+  return std::nullopt;
+}
+
+// The plan predicate holds for this fresh state and these facts.
+[[nodiscard]] bool Holds(const core::LifecyclePredicateDTO &predicate, State state,
+                         const std::vector<core::LifecycleFactDTO> &facts) {
+  if (std::find(predicate.allowed_states.begin(), predicate.allowed_states.end(), state) ==
+      predicate.allowed_states.end())
+    return false;
+  return std::all_of(predicate.fact_predicates.begin(), predicate.fact_predicates.end(),
+                     [&](const auto &expected) {
+                       return std::any_of(facts.begin(), facts.end(), [&](const auto &fact) {
+                         return fact.lifecycle_fact_id == expected.lifecycle_fact_id &&
+                                fact.value == expected.expected_value;
+                       });
+                     });
+}
+
+TEST(RetainedRos2ControlRuntimeHandleTest,
+     RealArmVendorStatusBecomesTheMotionDomainsCauseAndFacts) {
+  using Cause = core::LifecycleBlockingCauseClassDTO;
+  ArmWorld world;
+  auto device = std::make_shared<FakeDeviceStatusAdapter>();
+  device->Set(DeviceStatus(Cause::kNone, false));
+  world.handle->InstallDeviceStatusAdapter(device);
+  EXPECT_THROW(world.handle->InstallDeviceStatusAdapter(device), std::logic_error);
+  // A Real component's hardware starts inactive (R7 D1): connected, not armed.
+  world.manager.SetHardwareActive(false);
+  world.handle->StartBackend();
+  EXPECT_EQ(device->starts.load(), 1);
+  EXPECT_THROW(world.handle->InstallDeviceStatusAdapter(
+                   std::make_shared<FakeDeviceStatusAdapter>()),
+               std::logic_error);
+  ASSERT_TRUE(fake::WaitUntil([&] {
+    const auto activity = world.handle->arm_activity();
+    (void)world.Snapshot();
+    return activity.observed && activity.controller_loaded && !activity.hardware_active &&
+           world.handle->ReadLifecycleHealth(core::ControlDomainId("domain.arm"),
+                                             world.clock.now()).ok();
+  }));
+
+  // Clean vendor status: the generic Declared state, the device facts joined.
+  const auto clean = world.Snapshot();
+  EXPECT_TRUE(clean.locally_valid());
+  EXPECT_EQ(clean.component_state, State::kDeclared);
+  EXPECT_EQ(ArmWorld::Cause(clean), "none");
+  EXPECT_EQ(ArmWorld::Fact(clean, std::string(core::kDeviceErrorPresentFactId)), false);
+  EXPECT_EQ(ArmWorld::Fact(clean, "external.controller_loaded"), false);
+  // Prepare is never eligible on inactive hardware: it waits without a request.
+  for (const auto &plan : retained_ros2_control_lifecycle_plans()) {
+    if (plan.intent != core::ComponentLifecycleIntentKindDTO::kPrepare) continue;
+    for (const auto &transition : plan.transitions)
+      EXPECT_FALSE(Holds(transition.eligibility_predicate, clean.component_state, clean.facts));
+  }
+
+  // An emergency stop (C2) faults the domain with that cause and its code.
+  device->Set(DeviceStatus(Cause::kEmergencyStop, true));
+  const auto stopped = world.Snapshot();
+  EXPECT_TRUE(stopped.locally_valid());
+  EXPECT_GT(stopped.source_generation, clean.source_generation);
+  EXPECT_EQ(stopped.component_state, State::kFaulted);
+  EXPECT_EQ(ArmWorld::Cause(stopped), "emergency_stop");
+  EXPECT_EQ(ArmWorld::Fact(stopped, "external.fault_present"), true);
+  EXPECT_EQ(ArmWorld::Fact(stopped, std::string(core::kDeviceErrorPresentFactId)), true);
+  EXPECT_EQ(TokenFact(stopped.facts, "manyforge.vendor_code.error"), "C2");
+  EXPECT_FALSE(stopped.exact_controller_configuration_active);
+
+  // Pure health reads the adapter's pure projection and commits nothing.
+  const auto observe_calls = device->observe_calls;
+  const auto before = RetainedRos2ControlRuntimeHandleTestAccess::Capture(*world.handle);
+  const auto health =
+      world.handle->ReadLifecycleHealth(core::ControlDomainId("domain.arm"), world.clock.now());
+  ASSERT_TRUE(health.ok()) << health.error().message;
+  EXPECT_EQ(health.value().observed_state, State::kFaulted);
+  EXPECT_EQ(TokenFact(health.value().facts, core::kLifecycleBlockingCauseFactId),
+            "emergency_stop");
+  EXPECT_EQ(health.value().facts, stopped.facts);
+  EXPECT_EQ(device->observe_calls, observe_calls);
+  EXPECT_GE(device->health_calls, 1);
+  EXPECT_EQ(RetainedRos2ControlRuntimeHandleTestAccess::Capture(*world.handle), before);
+
+  // Stale vendor status cannot clear the reported intervention (existing rule).
+  device->Set(DeviceStatus(Cause::kAvailability, false));
+  const auto stale = world.Snapshot();
+  EXPECT_EQ(stale.component_state, State::kDegraded);
+  EXPECT_EQ(ArmWorld::Cause(stale), "emergency_stop");
+
+  // Fresh clean status clears it; stale clean status is availability.
+  device->Set(DeviceStatus(Cause::kNone, false));
+  EXPECT_EQ(ArmWorld::Cause(world.Snapshot()), "none");
+  EXPECT_EQ(world.Snapshot().component_state, State::kDeclared);
+  device->Set(DeviceStatus(Cause::kAvailability, false));
+  EXPECT_EQ(ArmWorld::Cause(world.Snapshot()), "availability");
+  EXPECT_EQ(world.Snapshot().component_state, State::kDegraded);
+  // External control and collisions are vendor intervention causes too.
+  device->Set(DeviceStatus(Cause::kExternalControl, false));
+  EXPECT_EQ(ArmWorld::Cause(world.Snapshot()), "external_control");
+  EXPECT_EQ(world.Snapshot().component_state, State::kFaulted);
+  EXPECT_EQ(world.manager.switch_requests(), 0U);
+}
+
+// --- R7 package 4: the Real arm's actions --------------------------------
+
+[[nodiscard]] core::LifecycleFactDTO DeviceUnknown(std::string_view id) {
+  return {core::LifecycleFactId(std::string(id)),
+          {core::LifecycleFactValueKindDTO::kUnknown, std::nullopt, std::nullopt,
+           std::nullopt}};
+}
+
+// Armed, ready and error-free (mode 1, state 1/2, every axis enabled).
+[[nodiscard]] RetainedDeviceStatus ReadyDeviceStatus(bool warning = false) {
+  return {core::LifecycleBlockingCauseClassDTO::kNone,
+          {DeviceBoolean(core::kDeviceAcceptsCommandsFactId, true),
+           DeviceBoolean(core::kDeviceErrorPresentFactId, false),
+           DeviceBoolean(core::kDeviceMotionEnabledFactId, true),
+           DeviceBoolean(core::kDeviceWarningPresentFactId, warning)}};
+}
+
+// The adapter's stale or missing report: availability, facts unknown.
+[[nodiscard]] RetainedDeviceStatus StaleDeviceStatus() {
+  return {core::LifecycleBlockingCauseClassDTO::kAvailability,
+          {DeviceUnknown(core::kDeviceAcceptsCommandsFactId),
+           DeviceUnknown(core::kDeviceErrorPresentFactId),
+           DeviceUnknown(core::kDeviceMotionEnabledFactId),
+           DeviceUnknown(core::kDeviceWarningPresentFactId)}};
+}
+
+/// The joint state broadcaster's `<ns>/joint_states` at 100 Hz, as a peer.
+class FakeJointStates final : public fake::PeerNode {
+public:
+  explicit FakeJointStates(const std::string &topic)
+      : PeerNode("manyforge_fake_joint_states") {
+    publisher_ = node()->create_publisher<sensor_msgs::msg::JointState>(
+        topic, rclcpp::SensorDataQoS());
+    timer_ = node()->create_wall_timer(10ms, [this] {
+      if (!publishing_.load()) return;
+      sensor_msgs::msg::JointState message;
+      message.name = {"source_joint_1"};
+      message.position = {position_.load()};
+      publisher_->publish(message);
+    });
+    Start();
+  }
+  ~FakeJointStates() override { Stop(); }
+  void Publish(double position) {
+    position_ = position;
+    publishing_ = true;
+  }
+  void Pause() { publishing_ = false; }
+
+private:
+  std::atomic<double> position_{0.0};
+  std::atomic<bool> publishing_{false};
+  rclcpp::Publisher<sensor_msgs::msg::JointState>::SharedPtr publisher_;
+  rclcpp::TimerBase::SharedPtr timer_;
+};
+
+/// A Real arm on the fake controller manager: the vendor adapter installed,
+/// the broadcaster listed, measured joints with a 1 s budget, and the Real
+/// xArm catalog evaluated by Core's own plan evaluator on pure health.
+struct RealArmWorld final {
+  [[nodiscard]] static core::BrandLifecyclePlanCatalogDTO RealCatalog() {
+    auto made = core::MakeBrandLifecyclePlanCatalog(
+        core::ProviderManifestId(
+            std::string(xarm_control::kXArmRos2ControlLifecycleProviderManifestId)),
+        // Core requires a sha256-shaped manifest revision.
+        core::ProviderManifestRevision(
+            "sha256:1111111111111111111111111111111111111111111111111111111111111111"),
+        xarm_control::make_xarm_ros2_control_lifecycle_plans());
+    if (!made.ok()) throw std::logic_error(made.error().message);
+    return made.value();
+  }
+
+  explicit RealArmWorld(bool hardware_active = false)
+      : world("arm_controller", std::nullopt, nullptr, ArmBinding(), {}, false,
+              {}, {}, 3U, 1'000'000'000),
+        catalog(RealCatalog()),
+        occurrence{core::ControlDomainId("domain.arm"),
+                   core::ControlDomainRevision("domain-revision"),
+                   core::ProviderInstanceId("provider.ros2_control"),
+                   catalog.provider_manifest_id,
+                   catalog.provider_manifest_revision,
+                   core::RuntimeUnitId("runtime.ros2_control"),
+                   core::RuntimeEpoch("runtime-epoch.1"),
+                   catalog.catalog_digest} {
+    device->Set(ReadyDeviceStatus());
+    world.handle->InstallDeviceStatusAdapter(device);
+    world.manager.SetHardwareActive(hardware_active);
+    world.manager.SetBroadcasterActive(true);
+    world.handle->StartBackend();
+    if (!WaitForActivity(hardware_active, false, true))
+      throw std::logic_error("no controller-manager activity");
+    // The handle's own clients share its node's graph.
+    const auto node = world.handle->node();
+    if (!node->create_client<controller_manager_msgs::srv::SetHardwareComponentState>(
+                 world.prefix + "/controller_manager/set_hardware_component_state")
+             ->wait_for_service(10s) ||
+        !node->create_client<controller_manager_msgs::srv::SwitchController>(
+                 world.prefix + "/controller_manager/switch_controller")
+             ->wait_for_service(10s))
+      throw std::logic_error("no controller-manager services");
+  }
+
+  [[nodiscard]] bool WaitForActivity(bool hardware, bool controller,
+                                     bool broadcaster) {
+    return fake::WaitUntil([&] {
+      const auto activity = world.handle->arm_activity();
+      return activity.observed && activity.controller_loaded &&
+             activity.hardware_active == hardware &&
+             activity.controller_active == controller &&
+             activity.broadcaster_active == broadcaster;
+    });
+  }
+
+  /// Keep the broadcaster publishing until the handle reports valid joints.
+  [[nodiscard]] bool PublishJoints(double position) {
+    return fake::WaitUntil([&] {
+      joints.Publish(position);
+      return ArmWorld::Fact(world.Snapshot(), "external.measured_joints_valid") ==
+             true;
+    });
+  }
+
+  [[nodiscard]] core::LifecycleDomainHealthDTO Health() {
+    const auto health = world.handle->ReadLifecycleHealth(
+        core::ControlDomainId("domain.arm"), world.clock.now());
+    if (!health.ok()) throw std::logic_error(health.error().message);
+    return health.value();
+  }
+
+  /// Core's decision for the fresh pure health: the primitive to dispatch,
+  /// "satisfied", or the refusal's reason.
+  [[nodiscard]] std::string Decide(core::ComponentLifecycleIntentKindDTO intent,
+                                   State requested) {
+    static_cast<void>(world.Snapshot()); // the Observe checkpoint
+    const auto decision =
+        core::EvaluateLifecycleDomainPlan(intent, requested, catalog, occurrence, Health());
+    if (!decision.ok()) return "refused:" + decision.error().details.at("reason");
+    if (decision.value().kind == core::LifecycleDomainPlanDecisionKind::kAlreadySatisfied)
+      return "satisfied";
+    return decision.value().selected_transition->lifecycle_primitive_id.value();
+  }
+
+  [[nodiscard]] RetainedExternallyManagedPrimitiveOutcome Dispatch(
+      std::string_view primitive) {
+    return world.handle->lifecycle_primitive_dispatcher()(
+        core::ControlDomainId("domain.arm"),
+        core::LifecyclePrimitiveId(std::string(primitive)), std::stop_token{});
+  }
+
+  ArmWorld world;
+  std::shared_ptr<FakeDeviceStatusAdapter> device =
+      std::make_shared<FakeDeviceStatusAdapter>();
+  FakeJointStates joints{world.prefix + "/joint_states"};
+  core::BrandLifecyclePlanCatalogDTO catalog;
+  core::ResolvedLifecycleProviderOccurrenceDTO occurrence;
+};
+
+using Intent = core::ComponentLifecycleIntentKindDTO;
+using Dispatch = core::LifecyclePrimitiveDispatchStateDTO;
+
+[[nodiscard]] std::string Reason(const RetainedExternallyManagedPrimitiveOutcome &outcome) {
+  return outcome.error ? outcome.error->details.at("reason") : std::string();
+}
+
+TEST(RetainedRos2ControlRuntimeHandleTest,
+     RealArmPrepareArmsTheHardwareAndAbsorbsThePluginsReactivateAll) {
+  RealArmWorld real;
+  ASSERT_TRUE(real.PublishJoints(0.25));
+  EXPECT_EQ(real.world.Snapshot().component_state, State::kDeclared);
+  EXPECT_EQ(ArmWorld::Fact(real.world.Snapshot(), "external.controller_spawned"), true);
+
+  // D1: Prepare arms through the stock hardware-state service.
+  ASSERT_EQ(real.Decide(Intent::kPrepare, State::kPrepared),
+            "ros2_control.hardware.activate");
+  const auto armed = real.Dispatch("ros2_control.hardware.activate");
+  ASSERT_EQ(armed.dispatch, Dispatch::kDispatchedKnown) << Reason(armed);
+  EXPECT_EQ(real.world.manager.hardware_history(), std::vector<bool>{true});
+  EXPECT_EQ(real.device->Events(),
+            (std::vector<std::string>{"begin:arm", "settle:arm:effect"}));
+  ASSERT_TRUE(real.WaitForActivity(true, false, true));
+  // Armed, still unarmed in lifecycle terms until ManyForge marks it.
+  EXPECT_EQ(real.world.Snapshot().component_state, State::kDeclared);
+
+  // §3.3: the plugin's not-ready cycle deactivates every controller (the
+  // broadcaster too); nothing is eligible until it reactivates them all.
+  real.world.manager.SetAllControllersActive(false);
+  ASSERT_TRUE(real.WaitForActivity(true, false, false));
+  EXPECT_EQ(real.Decide(Intent::kPrepare, State::kPrepared),
+            "refused:no_transition_satisfied");
+  real.world.manager.SetAllControllersActive(true);
+  ASSERT_TRUE(real.WaitForActivity(true, true, true));
+  // The controller the plugin turned on is switched off again...
+  ASSERT_EQ(real.Decide(Intent::kPrepare, State::kPrepared),
+            "ros2_control.controller.deactivate");
+  const auto absorbed = real.Dispatch("ros2_control.controller.deactivate");
+  ASSERT_EQ(absorbed.dispatch, Dispatch::kDispatchedKnown) << Reason(absorbed);
+  ASSERT_TRUE(real.WaitForActivity(true, false, true));
+  // ...and only then is the arm marked prepared.
+  ASSERT_EQ(real.Decide(Intent::kPrepare, State::kPrepared),
+            "ros2_control.controller.prepare");
+  const auto prepared = real.Dispatch("ros2_control.controller.prepare");
+  ASSERT_EQ(prepared.dispatch, Dispatch::kDispatchedKnown) << Reason(prepared);
+  EXPECT_EQ(real.Decide(Intent::kPrepare, State::kPrepared), "satisfied");
+  EXPECT_EQ(real.world.Snapshot().component_state, State::kPrepared);
+  // ManyForge never activated the trajectory controller during Prepare.
+  for (const auto &[activate, deactivate] : real.world.manager.switch_history())
+    EXPECT_TRUE(activate.empty());
+  EXPECT_EQ(real.world.manager.hardware_history(), std::vector<bool>{true});
+  // Enable is now the next step, behind its gate.
+  EXPECT_EQ(real.Decide(Intent::kEnable, State::kActive),
+            "ros2_control.controller.activate");
+}
+
+TEST(RetainedRos2ControlRuntimeHandleTest,
+     RealArmPrepareRefusesWithVendorErrorOrStaleStatusBeforeAnyEffect) {
+  RealArmWorld real;
+  ASSERT_TRUE(real.PublishJoints(0.25));
+  // C2 under a pressed emergency stop: Faulted, nothing eligible.
+  real.device->Set(DeviceStatus(core::LifecycleBlockingCauseClassDTO::kEmergencyStop, true));
+  EXPECT_EQ(real.world.Snapshot().component_state, State::kFaulted);
+  EXPECT_EQ(real.Decide(Intent::kPrepare, State::kPrepared),
+            "refused:no_transition_satisfied");
+  // A direct request fails before effect too.
+  const auto direct = real.Dispatch("ros2_control.hardware.activate");
+  EXPECT_EQ(direct.dispatch, Dispatch::kNotDispatched);
+  EXPECT_EQ(Reason(direct), "ros2_control_device_not_armable");
+
+  // Stale or missing status: the device facts are unknown.
+  real.device->Set(StaleDeviceStatus());
+  EXPECT_NE(real.Decide(Intent::kPrepare, State::kPrepared).rfind("refused:", 0),
+            std::string::npos);
+  EXPECT_EQ(Reason(real.Dispatch("ros2_control.hardware.activate")),
+            "ros2_control_device_not_armable");
+
+  // An error the operator has not acknowledged, with otherwise clean status.
+  auto error = ReadyDeviceStatus();
+  error.facts[1] = DeviceBoolean(core::kDeviceErrorPresentFactId, true);
+  real.device->Set(error);
+  EXPECT_EQ(Reason(real.Dispatch("ros2_control.hardware.activate")),
+            "ros2_control_device_not_armable");
+
+  EXPECT_TRUE(real.world.manager.hardware_history().empty());
+  EXPECT_EQ(real.world.manager.switch_requests(), 0U);
+  EXPECT_TRUE(real.device->Events().empty());
+  EXPECT_FALSE(real.world.handle->arm_activity().hardware_active);
+}
+
+TEST(RetainedRos2ControlRuntimeHandleTest,
+     RealArmEnableGateRefusesNaNStaleAndDisagreementBeforeAnySwitch) {
+  RealArmWorld real(true);
+  // An observed setup refusal (kNotSent, e.g. the endpoint graph still
+  // settling) sends nothing; retry only that.
+  ASSERT_TRUE(fake::WaitUntil([&] {
+    return real.world.handle->PrepareArmController().outcome == Outcome::kSucceeded;
+  }));
+  const auto activate = [&] {
+    return real.world.handle->ActivateArmController(std::stop_token{});
+  };
+  const auto reason = [](const RetainedRos2ControlSwitchResult &result) {
+    return result.error ? result.error->details.at("reason") : std::string();
+  };
+
+  // No measured sample yet.
+  auto refused = activate();
+  EXPECT_EQ(refused.outcome, Outcome::kNotSent);
+  EXPECT_EQ(reason(refused), "ros2_control_measured_joints_stale");
+  // NaN (no valid hardware read) is never a zero.
+  ASSERT_TRUE(fake::WaitUntil([&] {
+    real.joints.Publish(std::numeric_limits<double>::quiet_NaN());
+    return reason(activate()) == "ros2_control_measured_joints_invalid";
+  }));
+  EXPECT_EQ(ArmWorld::Fact(real.world.Snapshot(), "external.measured_joints_valid"),
+            false);
+  EXPECT_EQ(real.Decide(Intent::kEnable, State::kActive),
+            "refused:no_transition_satisfied");
+  // A stale sample.
+  ASSERT_TRUE(real.PublishJoints(0.25));
+  real.joints.Pause();
+  std::this_thread::sleep_for(1200ms);
+  EXPECT_EQ(reason(activate()), "ros2_control_measured_joints_stale");
+  EXPECT_TRUE(real.device->GateInputs().empty());
+
+  // Fresh finite joints the vendor finds in disagreement with its angles.
+  ASSERT_TRUE(real.PublishJoints(0.25));
+  real.device->SetGate(core::Result<void>::Err(core::ErrorDTO{
+      "execution_rejected", "disagree", {{"reason", "xarm_measured_joints_disagree"}}}));
+  EXPECT_EQ(reason(activate()), "xarm_measured_joints_disagree");
+  ASSERT_FALSE(real.device->GateInputs().empty());
+  EXPECT_EQ(real.device->GateInputs().back(), std::vector<double>{0.25});
+  EXPECT_EQ(real.world.manager.switch_requests(), 0U);
+
+  // Ready and agreeing: the existing activation follows.
+  real.device->SetGate(core::Result<void>::Ok());
+  ASSERT_TRUE(real.PublishJoints(0.25));
+  const auto activated = activate();
+  ASSERT_EQ(activated.outcome, Outcome::kSucceeded) << SwitchFailureText(activated);
+  EXPECT_EQ(real.world.manager.switch_requests(), 1U);
+}
+
+// D11: the tool payload is applied after the Enable gate and before the
+// switch; any failure refuses the Enable with nothing switched.
+TEST(RetainedRos2ControlRuntimeHandleTest,
+     RealArmEnableAppliesTheToolPayloadBeforeTheSwitchAndRefusesOnFailure) {
+  RealArmWorld real(true);
+  ASSERT_TRUE(fake::WaitUntil([&] {
+    return real.world.handle->PrepareArmController().outcome == Outcome::kSucceeded;
+  }));
+  ASSERT_TRUE(real.PublishJoints(0.25));
+  real.device->SetPayloadResult({Outcome::kUncertain,
+      core::ErrorDTO{"execution_rejected", "no answer",
+                     {{"reason", "xarm_service_timeout"}}}});
+  const auto refused = real.world.handle->ActivateArmController(std::stop_token{});
+  EXPECT_EQ(refused.outcome, Outcome::kNotSent);
+  ASSERT_TRUE(refused.error.has_value());
+  EXPECT_EQ(refused.error->details.at("reason"), "xarm_service_timeout");
+  EXPECT_EQ(real.world.manager.switch_requests(), 0U);
+  EXPECT_EQ(real.device->payload_calls.load(), 1);
+
+  real.device->SetPayloadResult({Outcome::kSucceeded, std::nullopt});
+  ASSERT_TRUE(real.PublishJoints(0.25));
+  const auto activated = real.world.handle->ActivateArmController(std::stop_token{});
+  ASSERT_EQ(activated.outcome, Outcome::kSucceeded) << SwitchFailureText(activated);
+  EXPECT_EQ(real.world.manager.switch_requests(), 1U);
+  EXPECT_EQ(real.device->payload_calls.load(), 2);
+}
+
+TEST(RetainedRos2ControlRuntimeHandleTest,
+     RealArmDisableSwitchesOffTheControllerThenTheHardware) {
+  RealArmWorld real(true);
+  ASSERT_TRUE(real.PublishJoints(0.25));
+  ASSERT_EQ(real.world.handle->PrepareArmController().outcome, Outcome::kSucceeded);
+  ASSERT_EQ(real.world.handle->ActivateArmController(std::stop_token{}).outcome,
+            Outcome::kSucceeded);
+  ASSERT_TRUE(real.WaitForActivity(true, true, true));
+  // The hardware is never disarmed under an active controller.
+  const auto early = real.Dispatch("ros2_control.hardware.deactivate");
+  EXPECT_EQ(early.dispatch, Dispatch::kNotDispatched);
+  EXPECT_EQ(Reason(early), "ros2_control_controller_still_active");
+  EXPECT_TRUE(real.world.manager.hardware_history().empty());
+
+  // D4 option B: the controller first...
+  ASSERT_EQ(real.Decide(Intent::kDisable, State::kDisabled),
+            "ros2_control.controller.deactivate");
+  ASSERT_EQ(real.Dispatch("ros2_control.controller.deactivate").dispatch,
+            Dispatch::kDispatchedKnown);
+  ASSERT_TRUE(real.WaitForActivity(true, false, true));
+  EXPECT_EQ(real.world.Snapshot().component_state, State::kDisabled);
+  EXPECT_TRUE(real.world.manager.hardware_history().empty());
+  // ...then the hardware: Disabled is not armed.
+  ASSERT_EQ(real.Decide(Intent::kDisable, State::kDisabled),
+            "ros2_control.hardware.deactivate");
+  const auto disarmed = real.Dispatch("ros2_control.hardware.deactivate");
+  ASSERT_EQ(disarmed.dispatch, Dispatch::kDispatchedKnown) << Reason(disarmed);
+  EXPECT_EQ(real.world.manager.hardware_history(), std::vector<bool>{false});
+  EXPECT_EQ(real.device->Events(),
+            (std::vector<std::string>{"begin:disarm", "settle:disarm:effect"}));
+  ASSERT_TRUE(real.WaitForActivity(false, false, true));
+  EXPECT_EQ(real.world.Snapshot().component_state, State::kDisabled);
+  EXPECT_EQ(ArmWorld::Cause(real.world.Snapshot()), "none");
+  EXPECT_EQ(real.Decide(Intent::kDisable, State::kDisabled), "satisfied");
+  // The next Prepare re-arms from Disabled.
+  EXPECT_EQ(real.Decide(Intent::kPrepare, State::kPrepared),
+            "ros2_control.hardware.activate");
+}
+
+TEST(RetainedRos2ControlRuntimeHandleTest,
+     RealArmRecoverDisarmsThenClearsTheErrorAndWarningOnceEach) {
+  RealArmWorld real(true);
+  ASSERT_TRUE(real.PublishJoints(0.25));
+  ASSERT_EQ(real.world.handle->PrepareArmController().outcome, Outcome::kSucceeded);
+  // An emergency stop while prepared (the plugin keeps the hardware active).
+  real.device->Set(DeviceStatus(core::LifecycleBlockingCauseClassDTO::kEmergencyStop, true));
+  EXPECT_EQ(real.world.Snapshot().component_state, State::kFaulted);
+
+  // Each step only while its precondition holds: hardware, error, warning.
+  ASSERT_EQ(real.Decide(Intent::kRecover, State::kDisabled),
+            "ros2_control.hardware.deactivate");
+  ASSERT_EQ(real.Dispatch("ros2_control.hardware.deactivate").dispatch,
+            Dispatch::kDispatchedKnown);
+  ASSERT_TRUE(real.WaitForActivity(false, false, true));
+  ASSERT_EQ(real.Decide(Intent::kRecover, State::kDisabled), "xarm.clear_error");
+  ASSERT_EQ(real.Dispatch("xarm.clear_error").dispatch, Dispatch::kDispatchedKnown);
+  real.device->Set(ReadyDeviceStatus(true));
+  ASSERT_EQ(real.Decide(Intent::kRecover, State::kDisabled), "xarm.clear_warning");
+  // A vendor outcome without an answer is uncertain, reconciled by Observe.
+  real.device->dispatch_result = {RetainedRos2ControlSwitchOutcome::kUncertain,
+                                  core::ErrorDTO{"execution_rejected", "timeout",
+                                                 {{"reason", "xarm_service_timeout"}}}};
+  const auto warned = real.Dispatch("xarm.clear_warning");
+  EXPECT_EQ(warned.dispatch, Dispatch::kDispatchedUncertain);
+  EXPECT_EQ(Reason(warned), "xarm_service_timeout");
+  real.device->Set(ReadyDeviceStatus(false));
+  EXPECT_EQ(real.Decide(Intent::kRecover, State::kDisabled), "satisfied");
+  EXPECT_EQ(real.world.Snapshot().component_state, State::kDisabled);
+  // One call each, in order; the controller was never switched.
+  EXPECT_EQ(real.device->Dispatched(),
+            (std::vector<std::string>{"xarm.clear_error", "xarm.clear_warning"}));
+  EXPECT_EQ(real.world.manager.switch_requests(), 0U);
+  // The target driver then re-drives Prepare (D10).
+  EXPECT_EQ(real.Decide(Intent::kPrepare, State::kPrepared),
+            "ros2_control.hardware.activate");
+}
+
+TEST(RetainedRos2ControlRuntimeHandleTest,
+     MockArmWithoutVendorAdapterKeepsItsExactFacts) {
+  ArmWorld world;
+  // A listed broadcaster changes nothing for Mock (R7 package 4).
+  world.manager.SetBroadcasterActive(true);
+  world.handle->StartBackend();
+  ASSERT_TRUE(fake::WaitUntil([&] {
+    const auto activity = world.handle->arm_activity();
+    (void)world.Snapshot();
+    return activity.observed && activity.controller_loaded && activity.hardware_active &&
+           world.handle->ReadLifecycleHealth(core::ControlDomainId("domain.arm"),
+                                             world.clock.now()).ok();
+  }));
+  const auto snapshot = world.Snapshot();
+  std::vector<std::string> ids;
+  for (const auto &fact : snapshot.facts) ids.push_back(fact.lifecycle_fact_id.value());
+  EXPECT_EQ(ids, (std::vector<std::string>{
+                     "external.controller_configuration_ready",
+                     "external.controller_inactive_unrequested",
+                     "external.controller_loaded", "external.fault_present",
+                     "external.transport_ready", "manyforge.blocking_cause_class"}));
+  // Without a vendor adapter the Real primitives stay unknown, as before.
+  for (const auto *primitive :
+       {"ros2_control.hardware.activate", "ros2_control.hardware.deactivate",
+        "xarm.clear_error"}) {
+    const auto outcome = world.handle->lifecycle_primitive_dispatcher()(
+        core::ControlDomainId("domain.arm"), core::LifecyclePrimitiveId(primitive),
+        std::stop_token{});
+    EXPECT_EQ(outcome.dispatch, core::LifecyclePrimitiveDispatchStateDTO::kNotDispatched);
+    ASSERT_TRUE(outcome.error.has_value());
+    EXPECT_EQ(outcome.error->details.at("reason"),
+              "ros2_control_lifecycle_primitive_unknown");
+  }
+  EXPECT_TRUE(world.manager.hardware_history().empty());
+  EXPECT_EQ(world.handle->PrepareArmController().outcome, Outcome::kSucceeded);
+}
 
 } // namespace
 } // namespace manyforge::roboplan_backend

@@ -198,7 +198,7 @@ def build_deployment(root: Path) -> dict[str, Any]:
         ]
         for component in sorted(candidates_by_component)
     ]
-    for field in ("execution_tick_hz", "collision_monitor_period_ms", "mode"):
+    for field in ("execution_tick_hz", "collision_monitor_period_ms"):
         if configurations[0][field] != configurations[1][field]:
             raise GenerationError(f"dual runtimes disagree on {field}")
     # Q63-Q68: both robots run on the offline mock lane in one ROS runtime
@@ -225,6 +225,7 @@ def build_deployment(root: Path) -> dict[str, Any]:
             "default_fault_stop_profiles",
             "gripper_target_configurations",
             "controller_profiles",
+            "component_streams",
         )
         if ros2_control
         else (
@@ -244,6 +245,7 @@ def build_deployment(root: Path) -> dict[str, Any]:
                 item["controllable_component_id"],
                 item.get("command_target_id", ""),
                 item.get("source_joint_name", ""),
+                item.get("stream_id", ""),
             ),
         )
     graph["runtime_units"] = [

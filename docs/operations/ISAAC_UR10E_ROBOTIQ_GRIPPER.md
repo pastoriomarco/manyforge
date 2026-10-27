@@ -101,25 +101,32 @@ prove that the fingers are open or closed.
 
 Scene object poses, the measured TCP and the viewer joint state come from a
 pose-source component in the Deployment (runtime kind `pose_source`, profile
-`pose_source_v0`). Its `runtime_configuration.pose_sources` row carries the
-observer bindings, and the component id is the observer `source_id` named by
-`policies.scene_pose_sources`. Composer Check validates it, and the execution
-host supervises the observer process like any other component; there is no
-Manager site-settings file.
+`pose_source_v0`, schema `manyforge.value_schema.runtime.pose_source.v2`). The
+component carries only its own settings: the default stream budget
+`stream_budget_ns`, the `simulation` polling block (`poll_period_ms`, frames,
+and the gripper `relative_reference`) and the viewer-only `robot_overlay`
+(joint state and measured TCP). Each scene object is linked to it by one
+`policies.scene_pose_sources` row (`scene_resource_id`, `source_id` = the
+component id, `source_key.simulation_entity` {`entity`,
+`source_header_frame_id`}, `apply_policy`), edited on
+the Object panel. The object's stream is `poses/<object_id>`; its lifetime is
+the stream budget, overridable per stream in `policies.component_streams`.
+These links are also the simulator entity map used by `simulation.set_entity_pose`
+(objects that are only moved there use `observe_only`). Composer Check
+validates both, and the execution host supervises the observer process like any
+other component; there is no Manager site-settings file.
 
 The USD `ee_link` Xform is not a live rigid-body feedback source. The light
 deployments query the rigid `robotiq_arg2f_base_link` through
 `simulation_interfaces` and compose the fixed entity-to-`grasp_frame`
-transform declared in deployment YAML:
+transform declared on the pose-source component (`robot_overlay.tcp_entity`):
 
 ```yaml
-measured_tcp:
+tcp_entity:
   entity: /World/ur10e_robotiq2f_140_ROS/ur10e_robotiq2f_140/ee_link/robotiq_arg2f_base_link
-  tcp_frame_id: grasp_frame
-  frame_id: universe
-  entity_to_tcp:
-    position_xyz: [0.0, 0.0, 0.2]
-    orientation_xyzw: [0.0, 0.0, 0.0, 1.0]
+  source_header_frame_id: robotiq_arg2f_base_link
+  local_position_xyz: [0.0, 0.0, 0.2]
+  local_orientation_xyzw: [0.0, 0.0, 0.0, 1.0]
 ```
 
 The offset is rotated by the observed entity orientation before translation.
@@ -130,9 +137,10 @@ change the commanded-simulation authority rules for arm execution.
 Isaac Sim 5.1's `simulation_interfaces/GetEntityState` implementation reports
 these poses in the retained stage/cell coordinates while its header contains
 the entity basename.  The retained world uses the launch's exact identity
-`universe` to `world` mapping, so each UR pose-observer binding declares both
-the exact expected `source_header_frame_id` and
-`source_coordinate_frame_id: universe`.  The adapter rejects a changed header
+`universe` to `world` mapping, so the pose source declares
+`source_coordinate_frame_id: universe` and every authored entity (object link,
+`relative_reference`, `tcp_entity`) declares the exact expected
+`source_header_frame_id` (for example `mac_n_cheese_centered`).  The adapter rejects a changed header
 before assigning that explicit coordinate contract.  A scene with a non-
 identity stage-to-cell transform must declare its real source coordinate frame
 and provide the corresponding TF.  This keeps the historical scene behavior

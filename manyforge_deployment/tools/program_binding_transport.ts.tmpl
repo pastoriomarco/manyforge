@@ -236,6 +236,45 @@ export function parseProgramBindingTransport(value: unknown, path: string): Prog
   sorted(targets, (row) => row.target_role_id as string, `${path}.target_role_bindings`);
   const targetByRole = new Map(targets.map((row) => [row.target_role_id, row]));
 
+  targets.forEach((target, index) => {
+    if (!('pneumatic_io' in target)) return;
+    const pp = `${path}.target_role_bindings[${index}].pneumatic_io`;
+    const route = record(target.pneumatic_io, FIELDS.pneumatic_io, pp);
+    const capabilities = target.capability_bindings as Row[];
+    if (!capabilities.some((item) => item.capability_id === 'tool.gripper.command')) {
+      bad(pp, 'gripper command target');
+    }
+    const outputs = array(route.outputs, `${pp}.outputs`, 1, 2).map((item, i) => (
+      record(item, FIELDS.pneumatic_output, `${pp}.outputs[${i}]`)
+    ));
+    const inputs = array(route.inputs, `${pp}.inputs`, 0, 4).map((item, i) => (
+      record(item, FIELDS.pneumatic_input, `${pp}.inputs[${i}]`)
+    ));
+    for (const [rows, kind] of [[outputs, 'output'], [inputs, 'input']] as const) {
+      rows.forEach((row, i) => {
+        const rp = `${pp}.${kind}s[${i}]`;
+        identity(row.target_role_id, `${rp}.target_role_id`);
+        identity(row.resource_role_id, `${rp}.resource_role_id`);
+        if (kind === 'output') {
+          if (typeof row.open_value !== 'boolean' || typeof row.close_value !== 'boolean') bad(rp, 'boolean output levels');
+        } else if (!['open', 'closed', 'pressure', 'workpiece_grasped'].includes(row.input as string)) {
+          bad(rp, 'known pneumatic input');
+        }
+        const selected = targetByRole.get(row.target_role_id);
+        const signals = selected?.signal_role_bindings as Row[] | undefined;
+        const signal = signals?.find((item) => item.resource_role_id === row.resource_role_id);
+        const required = kind === 'output' ? 'io.gpio.set_output' : 'io.gpio.get_input';
+        const selectedCapabilities = selected?.capability_bindings as Row[] | undefined;
+        if (!selected || !signal || signal.direction !== kind
+          || !selectedCapabilities?.some((item) => item.capability_id === required)) {
+          bad(rp, 'exact bound I/O signal and capability');
+        }
+      });
+    }
+    sorted(outputs, (row) => `${row.target_role_id as string}\0${row.resource_role_id as string}`, `${pp}.outputs`);
+    sorted(inputs, (row) => row.input as string, `${pp}.inputs`);
+  });
+
   const nodePolicies = array(root.node_policies, `${path}.node_policies`, 0, NODE_POLICY_MAX_ROWS)
     .map((item, i) => nodePolicy(item, `${path}.node_policies[${i}]`));
   sorted(nodePolicies, (row) => row.instance_id as string, `${path}.node_policies`);

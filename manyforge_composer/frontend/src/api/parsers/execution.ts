@@ -402,7 +402,7 @@ function manualControlGripperDescriptorAt(
   path: string,
 ): ManualControlGripperDescriptor {
   const record = objectAt(value, path);
-  exactKeysAt(record, [
+  allowedKeysAt(record, [
     'actuation_kind', 'attach_frame', 'auxiliary_frames', 'closed_state_ref',
     'command_duration_s', 'command_kind', 'command_target_id',
     'component_role_id', 'completion_policy', 'contracts',
@@ -413,7 +413,7 @@ function manualControlGripperDescriptorAt(
     'source_coordinate_name', 'source_group_name', 'source_kind',
     'state_authority_class', 'state_authority_id', 'target_role_id',
     'tcp_frame', 'touch_links', 'transport_kind', 'unit',
-  ], path);
+  ], ['pneumatic_outputs'], path);
   const schemaVersion = stringAt(record.schema_version, `${path}.schema_version`);
   if (schemaVersion !== 'manyforge.manual_control_gripper_descriptor.v3') {
     return fail(`${path}.schema_version`, 'the supported gripper descriptor');
@@ -499,9 +499,27 @@ function manualControlGripperDescriptorAt(
     record.grasp_confirmation_policy,
     `${path}.grasp_confirmation_policy`,
   );
+  const pneumaticOutputs = record.pneumatic_outputs === undefined ? undefined
+    : boundedArrayAt(record.pneumatic_outputs, `${path}.pneumatic_outputs`, 2).map((value, index) => {
+      const at = `${path}.pneumatic_outputs[${index}]`;
+      const output = objectAt(value, at);
+      exactKeysAt(output, ['controllable_component_id', 'signal_name', 'open_value', 'close_value'], at);
+      return {
+        controllableComponentId: nonEmptyStringAt(output.controllable_component_id, `${at}.controllable_component_id`),
+        signalName: nonEmptyStringAt(output.signal_name, `${at}.signal_name`),
+        openValue: booleanAt(output.open_value, `${at}.open_value`),
+        closeValue: booleanAt(output.close_value, `${at}.close_value`),
+      };
+    });
+  if (pneumaticOutputs !== undefined && (pneumaticOutputs.length === 0
+      || new Set(pneumaticOutputs.map((row) => JSON.stringify([row.controllableComponentId, row.signalName]))).size !== pneumaticOutputs.length
+      || actuationKind !== 'pneumatic' || outputMode !== 'commanded')) {
+    return fail(`${path}.pneumatic_outputs`, 'one or two unique outputs for a commanded pneumatic gripper');
+  }
   const qualifiedPolicies = actuationKind === 'pneumatic'
     ? graspConfirmationPolicy === 'not_required'
-      && ((outputMode === 'commanded' && completionPolicy === 'output_delivery')
+      && ((outputMode === 'commanded' && ((pneumaticOutputs === undefined && completionPolicy === 'output_delivery')
+        || (pneumaticOutputs !== undefined && completionPolicy === 'no_output')))
         || (outputMode === 'none' && completionPolicy === 'no_output'))
     : completionPolicy === 'goal_fenced_target_reached'
       && graspConfirmationPolicy === 'binding_feedback_required'
@@ -608,6 +626,7 @@ function manualControlGripperDescriptorAt(
     openStateRef,
     closedStateRef,
     commandDurationS,
+    ...(pneumaticOutputs === undefined ? {} : { pneumaticOutputs }),
     touchLinks,
     mountFrame,
     attachFrame,
@@ -922,6 +941,13 @@ export function parseExecutionControlStatus(
     row.program_run_id,
     `executionTargets.targets.program_run_id[${index}]`,
   )));
+  const ioRuns = new Set((ioSignalBindings ?? []).flatMap((row) => (
+    row.outputCommand === undefined ? [] : [row.outputCommand.programRunId]
+  )));
+  if (ioRuns.size > 1 || [...ioRuns].some((run) => allowedProgramRuns.has(run))) {
+    return fail('executionTargets.targets.io_signal_bindings', 'one distinct direct I/O Program run');
+  }
+  for (const run of ioRuns) allowedProgramRuns.add(run);
   const manualRows = arrayAt(
     control.manual_operations,
     'executionControlState.control_state.manual_operations',
@@ -948,12 +974,25 @@ export function parseExecutionControlStatus(
         'one of the exact direct-control Program runs',
       );
     }
+    const outputRows = (ioSignalBindings ?? []).filter((row) => row.outputCommand?.programRunId === programRunId);
+    if (outputRows.length > 0 && !outputRows.some((row) => row.programBindingId === operation.program_binding_id)) {
+      return fail(`executionControlState.control_state.manual_operations[${index}].program_binding_id`,
+        'one of the current direct I/O bindings');
+    }
     const observed = parseOperationObservation({
       command: 'read',
       ok: true,
       operation,
       resident: projection.resident,
     });
+    if (outputRows.length > 0 && !outputRows.some((row) => (
+      row.programBindingId === operation.program_binding_id
+      && row.controllableComponentId === observed.controllableComponentId
+      && row.commandTargetId === observed.commandTargetId
+    ))) {
+      return fail(`executionControlState.control_state.manual_operations[${index}].operation`,
+        'the exact direct I/O binding and physical target');
+    }
     if (!observed.resident && ![
       'completed', 'stopped', 'failed', 'interrupted', 'intervention_required', 'cancelled_pre_dispatch',
     ].includes(observed.state)) {

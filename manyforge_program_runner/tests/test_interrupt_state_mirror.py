@@ -718,6 +718,37 @@ def test_known_to_unknown_catalog_makes_declared_keys_unavailable() -> None:
             store.read(key)
 
 
+def test_every_scheduled_read_is_a_reading_for_a_gate_wait_even_unchanged() -> None:
+    # Rule 2: a gated motion node re-evaluates only on a newer reading; an
+    # unchanged state still counts, so a short trip seen by no change is not
+    # waited out to the timeout.
+    from types import SimpleNamespace
+    import threading
+
+    kernel = _Kernel()
+    kernel.catalog = _CATALOG_A
+    kernel.baseline = _ready(0, {"door": "clear"})
+    program = _store()._program.with_interrupt_state_keys(("door",))  # noqa: SLF001
+    store = _store(program)
+    runtime: Any = None
+    mirror = InterruptRuleStateMirror(
+        owner_epoch=lambda: kernel.owner, read_events=kernel,
+        on_change=lambda states: runtime._apply_interrupt_states(states),  # noqa: SLF001
+    )
+    runtime = _state_runtime(mirror, store)
+    runtime._started, runtime._closed = True, False  # noqa: SLF001
+    runtime._host = SimpleNamespace(submit_run_work=lambda work: work())  # noqa: SLF001
+    runtime._interrupt_state_poll_lock = threading.Lock()  # noqa: SLF001
+    runtime._interrupt_state_polling = False  # noqa: SLF001
+    readings = []
+    for _poll in range(2):
+        runtime._interrupt_state_poll_due_ns = 0  # noqa: SLF001
+        runtime._schedule_interrupt_state_poll()  # noqa: SLF001
+        readings.append(store.interrupt_state_reading("door"))
+    assert readings[0][1] == readings[1][1] == "clear"
+    assert readings[1][0] > readings[0][0] > 0
+
+
 def test_pending_source_keeps_its_original_deadline(monkeypatch) -> None:
     # SX-2209: watchdog retries never extend the same source's budget.
     import manyforge_program_runner.runtime as runtime_module

@@ -388,6 +388,29 @@ TEST(RuntimeCollisionQuerySessionTest,
 }
 
 TEST(RuntimeCollisionQuerySessionTest,
+     RuntimeTickKeepsNonArmFingerFromPreparedCollisionTrajectory) {
+  const TrajectoryDTO arm{{}, {"j1"}, {{0.0, {0.0}, {}, {}}}};
+  const TrajectoryDTO expanded{
+      {}, {"j1", "j2"}, {{0.0, {0.0, 0.004}, {}, {}}}};
+  auto projection = build_runtime_collision_state_projection(arm, expanded);
+  ASSERT_TRUE(projection.ok()) << projection.error().message;
+  CollisionPolicySnapshot policy;
+  policy.revision = {1, "runtime-policy"};
+  StaticRuntimePublisher publisher;
+  publisher.bundle = make_bundle(std::move(policy));
+  auto engine = std::make_shared<FixedRuntimeEngine>();
+  RuntimeCollisionQuerySession session(std::move(projection.value()), publisher,
+                                       engine, {}, 10'000'000);
+  ASSERT_FALSE(session.prepare(publisher.bundle).has_value());
+
+  const std::array<double, 1> arm_position{0.25};
+  EXPECT_EQ(session.tick(publisher.bundle, arm_position, 1).status,
+            RuntimeCollisionTickStatus::kClear);
+  EXPECT_DOUBLE_EQ(engine->last_positions_[0], 0.25);
+  EXPECT_DOUBLE_EQ(engine->last_positions_[1], 0.004);
+}
+
+TEST(RuntimeCollisionQuerySessionTest,
      WarmSignedReleaseTickHasZeroFrameworkAllocations) {
   const CollisionPairId pair{"component/robot1/model/robot1_model/body/finger_left/collision/0", "scene/part/shape/0"};
   CollisionPolicySnapshot policy;

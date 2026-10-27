@@ -16,7 +16,9 @@
 
 #include <manyforge_core/ports/iio_output_provider.hpp>
 #include <manyforge_roboplan/io_output_alias_identity.hpp>
+#include <functional>
 #include <memory>
+#include <mutex>
 #include <vector>
 
 namespace manyforge::roboplan_backend {
@@ -42,8 +44,9 @@ struct MockBooleanOutputChannel final {
 /// never instantiate independent models with equal resource IDs. Occurrence
 /// gates remain separate so one domain's Enable cannot enable another alias.
 ///
-/// Model acceptance is synthetic output acceptance only. There is no ingress,
-/// readback, input-follow, auto-answer, timer or thread. Preserve this provider
+/// Model acceptance is synthetic output acceptance only. A host observer may
+/// use it for configured Mock input echo; the leaf owns no ingress, readback,
+/// timer or thread. Preserve this provider
 /// across Disable/Enable. Each actual new Apply resets the model unwritten
 /// under the channel mutex; replay of that publication cannot reset it again.
 /// Immediate model acceptance requires no deadline. The existing Kernel/session
@@ -95,6 +98,15 @@ public:
       const std::vector<MockBooleanOutputAlias> &candidate_aliases,
       core::ActiveBundlePublicationGeneration active_publication_generation);
   void Shutdown();
+
+  /// Host-owned synthetic echo hook. Called once for each newly accepted
+  /// write, in channel order. It must not reenter this provider.
+  void SetModelObserver(std::function<void(bool, core::TimePoint)> observer);
+
+  /// Serialize an echo publication with output acceptance. The host first
+  /// acquires its provider-delivery barriers and must not call back into this
+  /// output provider while holding the returned lock.
+  [[nodiscard]] std::unique_lock<std::mutex> AcquireModelDelivery() const;
 
   /// Actual local synthetic model, initially unwritten. This is not a signal
   /// observation or physical readback and is never published to input ingress.

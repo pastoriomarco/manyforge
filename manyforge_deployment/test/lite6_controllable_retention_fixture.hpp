@@ -183,11 +183,32 @@ provider_contract_role_id(const CanonicalValue &declaration) {
                             CanonicalValue("lite_gripper_left_finger"),
                             CanonicalValue("lite_gripper_right_finger")})},
     };
-  if (ros2_control_execution) {
+  if (ros2_control_execution)
     gripper_configuration.emplace_back("output_mode", CanonicalValue("commanded"));
-    gripper_configuration.emplace_back("state_freshness_timeout_s", CanonicalValue(1.0));
-  }
   return CanonicalValue(std::move(gripper_configuration));
+}
+
+/// CP9 stream defaults of one ROS component: the Isaac arm's measured joints
+/// (or a gripper-only component's, at the gripper feedback budget) and, with a
+/// gripper target, its gripper feedback.
+[[nodiscard]] inline CanonicalValue component_stream_rows(
+    std::string_view component_id, bool include_gripper, bool motion) {
+  const auto row = [&](std::string_view stream, double budget_ns,
+                       std::string_view severity, std::string_view recovery) {
+    return CanonicalValue(CanonicalValue::Object{
+        {"budget_ns", CanonicalValue(budget_ns)},
+        {"controllable_component_id", CanonicalValue(std::string(component_id))},
+        {"recovery", CanonicalValue(std::string(recovery))},
+        {"severity", CanonicalValue(std::string(severity))},
+        {"stream_id", CanonicalValue(std::string(stream))},
+    });
+  };
+  CanonicalValue::Array rows;
+  if (include_gripper)
+    rows.push_back(row("gripper_feedback", 1e9, "fault", "ack"));
+  rows.push_back(motion ? row("measured_joints", 2.5e8, "warning", "auto")
+                        : row("measured_joints", 1e9, "fault", "ack"));
+  return CanonicalValue(std::move(rows));
 }
 
 [[nodiscard]] inline CanonicalValue
@@ -259,7 +280,6 @@ native_execution_configuration(std::string_view controllable_component_id,
     std::optional<double> initial_joint1_position_rad = std::nullopt,
     bool include_gripper = false, bool motion = true) {
   CanonicalValue::Object configuration{
-      {"mode", CanonicalValue("commanded_sim")},
       {"controller_profiles",
        CanonicalValue(
            CanonicalValue::Array{CanonicalValue(CanonicalValue::Object{
@@ -316,6 +336,9 @@ native_execution_configuration(std::string_view controllable_component_id,
         CanonicalValue(CanonicalValue::Array{
             gripper_target_configuration(component_id, true)}));
   }
+  configuration.emplace_back(
+      "component_streams",
+      component_stream_rows(component_id, include_gripper, motion));
   return CanonicalValue(std::move(configuration));
 }
 
@@ -2547,7 +2570,7 @@ assistant_source(const bool composer_draft_enabled = false) {
     for (auto &[name, value] : configuration) {
       if (name != "initial_joint_positions_rad" && name != "controller_profiles" &&
           name != "motion_target_limits" && name != "default_fault_stop_profiles" &&
-          name != "gripper_target_configurations") continue;
+          name != "gripper_target_configurations" && name != "component_streams") continue;
       CanonicalValue::Array rows;
       for (const auto &unit : runtime_units) {
         const auto *items = unit.find_object_member("configuration")->find_object_member(name);

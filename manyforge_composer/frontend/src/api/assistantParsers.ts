@@ -1,6 +1,5 @@
 import type {
   AssistantModeIndex,
-  AssistantProposal,
   AssistantProviderResponse,
   AssistantProviderStatus,
   AssistantRequestState,
@@ -99,6 +98,7 @@ function jsonValue(value: unknown, path: string, depth = 0): JsonValue {
 export function parseAssistantModeIndex(value: unknown): AssistantModeIndex {
   const root = objectAt(value, 'assistantModes');
   exact(root, [
+    'ai_model_component_id',
     'assistant_projection_digest',
     'graph_revision',
     'instrument_registry_digest',
@@ -182,6 +182,9 @@ export function parseAssistantModeIndex(value: unknown): AssistantModeIndex {
     graphRevision: text(root.graph_revision, 'assistantModes.graph_revision', 256),
     assistantProjectionDigest: root.assistant_projection_digest as string,
     instrumentRegistryDigest: root.instrument_registry_digest as string,
+    aiModelComponentId: root.ai_model_component_id === null
+      ? null
+      : text(root.ai_model_component_id, 'assistantModes.ai_model_component_id', 256),
     modes,
   };
 }
@@ -195,10 +198,10 @@ function parseToolCall(value: unknown, path: string): AssistantToolCallResult {
   }
   const status = text(row.status, `${path}.status`, 64);
   const effect = text(row.effect, `${path}.effect`, 64);
-  if (!['completed', 'failed', 'proposed'].includes(status)) {
+  if (!['completed', 'failed'].includes(status)) {
     fail(`${path}.status`, 'a supported tool-call status');
   }
-  if (!['read_only', 'proposal', 'composer_draft_mutating', 'runtime_mutating'].includes(effect)) {
+  if (!['read_only', 'composer_draft_mutating'].includes(effect)) {
     fail(`${path}.effect`, 'a supported tool effect');
   }
   return {
@@ -211,37 +214,11 @@ function parseToolCall(value: unknown, path: string): AssistantToolCallResult {
   };
 }
 
-function parseProposal(value: unknown, path: string): AssistantProposal {
-  const row = objectAt(value, path);
-  exact(row, [
-    'toolId', 'effect', 'arguments', 'inputSchemaHash', 'status', 'requiresReview',
-  ], path);
-  const argumentsValue = jsonValue(row.arguments, `${path}.arguments`);
-  if (argumentsValue === null || typeof argumentsValue !== 'object' || Array.isArray(argumentsValue)) {
-    fail(`${path}.arguments`, 'an object');
-  }
-  const effect = text(row.effect, `${path}.effect`, 64);
-  if (effect !== 'proposal' && effect !== 'runtime_mutating') {
-    fail(`${path}.effect`, 'a proposal or runtime-mutating descriptor');
-  }
-  if (row.status !== 'draft' || bool(row.requiresReview, `${path}.requiresReview`) !== true) {
-    fail(path, 'a review-only Draft proposal');
-  }
-  return {
-    toolId: text(row.toolId, `${path}.toolId`, 256),
-    effect,
-    arguments: argumentsValue,
-    inputSchemaHash: digest(row.inputSchemaHash, `${path}.inputSchemaHash`),
-    status: 'draft' as const,
-    requiresReview: true as const,
-  };
-}
-
 function parseResponse(value: unknown): AssistantProviderResponse {
   const root = objectAt(value, 'assistantResponse');
   exact(root, [
     'schemaVersion', 'requestId', 'requestOwnerEpoch', 'sourceLabel', 'correlationId',
-    'conversationId', 'assistantMode', 'catalogHash', 'message', 'proposals',
+    'conversationId', 'assistantMode', 'catalogHash', 'message',
     'toolCalls', 'warnings', 'requiresReview', 'mutated', 'draftMutated',
     'needsClarification', 'exitReason', 'turnCount',
   ], 'assistantResponse');
@@ -264,8 +241,6 @@ function parseResponse(value: unknown): AssistantProviderResponse {
       && UTF8_ENCODER.encode(root.message).byteLength <= 65_536
       ? root.message
       : fail('assistantResponse.message', 'bounded text'),
-    proposals: array(root.proposals, 'assistantResponse.proposals')
-      .map((item, index) => parseProposal(item, `assistantResponse.proposals[${index}]`)),
     toolCalls: array(root.toolCalls, 'assistantResponse.toolCalls').map((item, index) => parseToolCall(item, `assistantResponse.toolCalls[${index}]`)),
     warnings: array(root.warnings, 'assistantResponse.warnings').map((item, index) => text(item, `assistantResponse.warnings[${index}]`)),
     requiresReview: true,

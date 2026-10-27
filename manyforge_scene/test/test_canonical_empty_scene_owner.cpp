@@ -6752,9 +6752,8 @@ TEST(CanonicalEmptySceneOwnerProviderFreshness,
   ASSERT_TRUE(row.grasp_lost_check.has_value());
   EXPECT_EQ(row.grasp_lost_check->bound,
             (core::CarriedObjectGraspLostBoundDTO{0.03, 0.26}));
-  EXPECT_EQ(row.grasp_lost_check->attach_pose_in_carrier_frame, attach_offset);
 
-  // A measured update moves the offset; the attach-time offset stays.
+  // A measured update moves the offset; the bound stays.
   const auto expected = owner.CurrentProjectionRevision();
   const auto updated = owner.Commit(core::SceneTransactionRequestDTO{
       SceneRequestContext("grasp-bound-update", expected),

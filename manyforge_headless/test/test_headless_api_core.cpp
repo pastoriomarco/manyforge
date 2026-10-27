@@ -942,6 +942,55 @@ TEST(HeadlessApiCore,
   EXPECT_FALSE(std::get<bool>(Member(alarms, "reconciled").storage()));
 }
 
+TEST(HeadlessApiCore, AppliedSelectionAiModelsListEveryComponentInIdOrder) {
+  using Json = core::JsonValueDTO;
+  const auto configurations = LoadRegistryConfigurations();
+  // A bundle without AI model components projects an empty array.
+  const auto none =
+      AssistantAiModels(configurations.single->value().cell_graph);
+  EXPECT_TRUE(std::get<CanonicalValue::Array>(none.storage()).empty());
+
+  // Two model-free components hosted by the first runtime unit, retained
+  // sorted by id.
+  auto graph = configurations.single->value().cell_graph;
+  ASSERT_FALSE(graph.runtime_units.empty());
+  ASSERT_FALSE(graph.controllable_components.empty());
+  auto &unit = graph.runtime_units.front();
+  for (const auto *id : {"chat_model", "selection_model"}) {
+    auto component = graph.controllable_components.front();
+    component.controllable_component_id = core::ControllableComponentId(id);
+    component.runtime_unit_ids = {unit.runtime_unit_id};
+    graph.controllable_components.push_back(std::move(component));
+  }
+  // Activation omits a null api_key_env from the retained row.
+  const auto row = [](std::string id, std::string base_url, Json api_key_env) {
+    Json::Object value{
+        {"base_url", Json{std::move(base_url)}},
+        {"controllable_component_id", Json{std::move(id)}},
+        {"model", Json{std::string("served-model")}},
+    };
+    if (!std::holds_alternative<std::nullptr_t>(api_key_env.value))
+      value.emplace("api_key_env", std::move(api_key_env));
+    return Json{std::move(value)};
+  };
+  unit.configuration["ai_models"] = Json{Json::Array{
+      row("chat_model", "http://127.0.0.1:8200/v1", Json{nullptr}),
+      row("selection_model", "http://127.0.0.1:8000/v1",
+          Json{std::string("MANYFORGE_AI_SELECTION_TOKEN")}),
+  }};
+
+  const auto projected = AssistantAiModels(graph);
+  const auto &rows = std::get<CanonicalValue::Array>(projected.storage());
+  ASSERT_EQ(rows.size(), 2U);
+  EXPECT_EQ(Text(rows[0], "controllable_component_id"), "chat_model");
+  EXPECT_EQ(Text(rows[0], "base_url"), "http://127.0.0.1:8200/v1");
+  EXPECT_EQ(Text(rows[0], "model"), "served-model");
+  EXPECT_TRUE(Member(rows[0], "api_key_env").is_null());
+  EXPECT_EQ(Text(rows[1], "controllable_component_id"), "selection_model");
+  EXPECT_EQ(Text(rows[1], "base_url"), "http://127.0.0.1:8000/v1");
+  EXPECT_EQ(Text(rows[1], "api_key_env"), "MANYFORGE_AI_SELECTION_TOKEN");
+}
+
 TEST(HeadlessApiCore,
      SharedPreparedProgramOutcomePreservesSelectionAndIngressErrors) {
   const auto no_program = CanonicalValue(CanonicalValue::Object{

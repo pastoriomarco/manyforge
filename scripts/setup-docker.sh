@@ -10,6 +10,10 @@
 # is explicitly non-qualifying.
 
 set -euo pipefail
+# The source-identity ledger records file modes as checked out with umask 0002
+# (files 0664/0775). Use the same umask whatever the caller's, or a host with
+# umask 0022 fails the identity preflight on a fresh checkout.
+umask 0002
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 REPO_DIR="$(cd "$SCRIPT_DIR/.." && pwd)"

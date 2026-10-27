@@ -177,9 +177,9 @@ def test_lite6_lite_gripper_model_bundle_is_self_contained() -> None:
     assert manifest["source"]["repository"] == (
         "https://github.com/pastoriomarco/xarm_ros2"
     )
-    assert manifest["source"]["branch"] == "jazzy_no_gazebo"
+    assert manifest["source"]["branch"] == "lyrical-no-gazebo"
     assert manifest["source"]["commit"] == (
-        "012731afb9ef1d4289ec45112e8d083ab59a5c1e"
+        "ef7351f90e451a37ef73de69c643b7e85040401a"
     )
     assert manifest["source"]["moveit_joint_limits"] == {
         "owned_snapshot_path": (
@@ -395,7 +395,7 @@ def test_lite6_runtime_capture_metadata_is_enforced(tmp_path: Path) -> None:
     )
     report = yaml.safe_load(completed.stdout)
     assert report["passed"] is True
-    assert report["facts"]["runtime_capture_xarm_branch"] == "jazzy_no_gazebo"
+    assert report["facts"]["runtime_capture_xarm_branch"] == "lyrical-no-gazebo"
 
     bad_capture = tmp_path / "bad_capture.json"
     payload = json.loads(_RUNTIME_CAPTURE_JSON_PATH.read_text(encoding="utf-8"))

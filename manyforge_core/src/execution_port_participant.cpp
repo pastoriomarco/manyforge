@@ -740,6 +740,11 @@ PreparedMotionReplacementDispatchDTO ExecutionPortParticipant::DispatchReplaceme
            check(sample && sample->binding_epoch == source.binding_epoch &&
                      std::isfinite(sample->cursor_s),
                  "sample") &&
+           // D8: a cursor behind the captured source cursor is a controller that
+           // already restarted (end hold); a join from it would move back.
+           check(original_path_cursor(execution_->delivery_clock, sample->cursor_s) >=
+                     pending.source_cursor_s,
+                 "cursor_restart") &&
            check(sample->local_receipt_stamp_ns <= now, "sample_future_stamp") &&
            check(
                config_.stop.controller_state_max_age_ns == 0 ||

@@ -226,23 +226,20 @@ covariance. This is a bootstrap allowance, not a production perception gate.
 
 Observed Isaac ROS FoundationPose output is in `camera_color_optical_frame`.
 ManyForge needs the trocar object in the Lite6 planning frame `link_base`.
-The deployment sets:
+The deployment's pose-source component `foundationpose_trocar` sets
+`detection3d: {topic: /output, target_frame_id: link_base, fallback_frame_id:
+link_base}`, and the object link in `policies.scene_pose_sources` is:
 
 ```yaml
-pose_sources:
-- id: foundationpose_trocar
-  kind: detection3d_array_topic
-  topic: /output
-  frame_id: link_base
-  stale_after_s: 5.0
-  objects:
-    graspable:
-      apply_policy: before_planning
-      confidence_min: 0.0
-      metadata:
-        selection: first
-        max_position_variance_m2: 0.0025
+scene_resource_id: graspable
+source_id: foundationpose_trocar
+source_key:
+  detection3d: {class_id: "", detection_id: "", confidence_min: 0,
+                max_position_variance_m2: 0.0025, selection: first}
+apply_policy: before_planning
 ```
+
+The `poses/graspable` stream budget (5 s) is a `policies.component_streams` row.
 
 The ROS sidecar performs a TF lookup from `link_base` to the message frame and
 transforms the pose before publishing the snapshot to Composer.

@@ -220,6 +220,63 @@ def test_scenario_save_adopts_both_baselines_and_member_saves_preserve_other_dra
     assert state.current_drafts_match_remembered_scenario()
 
 
+@pytest.mark.parametrize(
+    ("program_unapplied", "deployment_applied", "deployment_matches", "expected"),
+    [
+        (False, 7, True, "ready"),
+        (True, 7, True, "unknown"),
+        (None, 7, True, "unknown"),
+        (False, 7, False, "unknown"),
+        (False, None, True, "unknown"),
+    ],
+)
+def test_scenario_save_records_ready_only_for_the_applied_content(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    program_unapplied: bool | None,
+    deployment_applied: int | None,
+    deployment_matches: bool,
+    expected: str,
+) -> None:
+    state = ComposerState(allowed_fs_roots=[str(tmp_path)])
+    state.authoring_admission = _PassThroughAdmission()  # type: ignore[assignment]
+    authoring = deepcopy(_PROGRAM_FIXTURE)
+    program, diagnostics = derive_candidate(authoring, state.node_catalog)
+    post = routes_scenario_documents._workspace_post_state(
+        state, authoring, program, diagnostics, _deployment_intent()
+    )
+    state.draft_session.install_prepared_replacement(
+        state.draft_session.prepare_load_replacement(post["program"], state.node_catalog)
+    )
+    state.deployment_draft_session.install_prepared_replacement(
+        state.deployment_draft_session.prepare_load_replacement(post["deployment"])
+    )
+    # A role assignment makes the saved Scenario complete.
+    state.authoring_workspace.remember_project(document=_document())
+    # The Applied views at the current identity: Program Draft vs Applied and
+    # Deployment Draft vs Manager Applied, decided by run admission.
+    monkeypatch.setattr(routes_scenario_documents, "program_workspace", lambda s: {
+        "hasUnappliedChanges": program_unapplied,
+        "authoringWorkspace": s.authoring_workspace.identity().as_dict(),
+    })
+    monkeypatch.setattr(routes_scenario_documents, "deployment_workspace", lambda s: {
+        "draft": {"document": s.authoring_workspace.snapshot().as_dict()["deployment"]["document"],
+                  "deploymentRevision": None},
+        "managerApplied": {"deploymentRevision": deployment_applied},
+        "runAdmission": {"ready": deployment_matches},
+        "authoringWorkspace": s.authoring_workspace.identity().as_dict(),
+    })
+    target = tmp_path / "saved_cell.scenario"
+    response = _scenario_client(state).post("/api/scenario-documents/save", json={
+        **_fence(state), **_save_target(target),
+        "description": "", "confirmOverwrite": False,
+    })
+    assert response.status_code == 200, response.text
+    assert response.json()["last_known_status"] == expected
+    disk, _ = load_scenario_artifact(str(target), allowed_roots=[str(tmp_path)])
+    assert disk["saved_status"]["last_known_status"] == expected
+
+
 @pytest.fixture(autouse=True)
 def _fixture_model_source(tmp_path: Path) -> None:
     (tmp_path / "model.urdf").write_text(
@@ -1680,6 +1737,39 @@ def test_source_changes_are_advisory_and_export_is_self_contained(
     ]["project_path"]
     assert (exported / reference).read_text(encoding="utf-8") == (
         '<robot name="fixture_changed"/>\n'
+    )
+
+
+def test_export_can_be_loaded_from_a_separate_allowed_project_root(
+    tmp_path: Path,
+) -> None:
+    examples = tmp_path / "examples"
+    projects = tmp_path / "user projects"
+    examples.mkdir()
+    projects.mkdir()
+    (examples / "model.urdf").write_text('<robot name="fixture"/>\n', encoding="utf-8")
+    roots = [str(examples), str(projects)]
+    original = Path(save_scenario_artifact(
+        _document("original"), str(examples / "original.scenario"),
+        allowed_roots=roots, overwrite=False,
+    ))
+    document, _ = load_scenario_artifact(str(original), allowed_roots=roots)
+
+    exported = Path(export_scenario_artifact(
+        document, str(projects / "original.scenario"),
+        source_project_path=str(original), allowed_roots=roots,
+    ))
+    shutil.rmtree(original)
+    (examples / "model.urdf").unlink()
+
+    reopened, reopened_path = load_scenario_artifact(
+        str(exported), allowed_roots=[str(projects)],
+    )
+    assert reopened_path == str(exported.resolve())
+    assert reopened["scenario_id"] == "original"
+    model = reopened["deployment_draft"]["components"][0]["model_source"]["urdf"]
+    assert (exported / model["project_path"]).read_text(encoding="utf-8") == (
+        '<robot name="fixture"/>\n'
     )
 
 

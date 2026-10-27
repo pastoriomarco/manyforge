@@ -13,6 +13,7 @@
 #include <manyforge_core/component_lifecycle_value_codec.hpp>
 #include <manyforge_core/controller_lifecycle_evaluator.hpp>
 #include <manyforge_core/runtime_participant_binding.hpp>
+#include <manyforge_core/time/stuck_drain_wait.hpp>
 #include <mutex>
 #include <stdexcept>
 #include <stop_token>
@@ -6931,15 +6932,14 @@ class ComponentLifecycleCoordinator::Impl final {
       }
     }
     if (scheduler_lane_used) {
-      bool drained = false;
+      // Returning would leave callbacks that capture this owner alive, so a
+      // stuck Lifecycle lane keeps shutdown waiting for the operator.
       try {
-        drained = scheduler_.drain_for(SchedulerPriority::Lifecycle, std::chrono::seconds(5));
+        WaitForDrain("lifecycle_coordinator.scheduler_lifecycle_lane", std::chrono::seconds(5),
+                     [&](std::chrono::nanoseconds bound) {
+                       return scheduler_.drain_for(SchedulerPriority::Lifecycle, bound);
+                     });
       } catch (...) {
-        std::terminate();
-      }
-      if (!drained) {
-        // Returning would leave callbacks that capture this owner alive. A
-        // failed lifetime proof is a process-fatal shutdown invariant.
         std::terminate();
       }
     }

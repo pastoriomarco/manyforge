@@ -1114,18 +1114,11 @@ void register_deployment_candidate_bindings(py::module_& module) {
 
   module.def(
       "qualify_assistant_settings",
-      [](const deployment::TypedAssistantSettingsCandidate& candidate,
-         const py::iterable& external_resources) {
-        auto bounded_resources =
-            bounded_values_from_python<ExternalResourceDTO,
-                                       deployment::AssistantSettingsCodecError>(
-                external_resources, kMaxDeploymentApplicabilityRows, "external_resources",
-                "ExternalResourceDTO");
+      [](const deployment::TypedAssistantSettingsCandidate& candidate) {
         py::gil_scoped_release release;
-        return deployment::qualify_assistant_settings(
-            candidate, std::span<const ExternalResourceDTO>{bounded_resources});
+        return deployment::qualify_assistant_settings(candidate);
       },
-      py::arg("candidate"), py::arg("external_resources"));
+      py::arg("candidate"));
 
   py::class_<ParsedArtifactCandidate>(module, "ParsedArtifactCandidate", py::is_final())
       .def_property_readonly("canonical_json", [](const ParsedArtifactCandidate& candidate) {

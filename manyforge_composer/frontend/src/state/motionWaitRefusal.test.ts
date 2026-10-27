@@ -3,6 +3,7 @@ import { readFileSync } from 'node:fs';
 import { describe, expect, it } from 'vitest';
 
 import {
+  GLOBAL_INTERRUPT_GATED,
   GLOBAL_INTERRUPT_SOURCE_NOT_READY,
   isMotionWaitRefusal,
   motionWaitRefusalMessage,
@@ -17,6 +18,18 @@ describe('global interrupt source not ready (contract 75)', () => {
     expect(isMotionWaitRefusal(message)).toBe(true);
     expect(motionWaitRefusalMessage(GLOBAL_INTERRUPT_SOURCE_NOT_READY, {}))
       .toContain('a global interrupt rule is waiting');
+  });
+
+  it('presents an active gate rule as a wait, by code or by details.reason', () => {
+    const expected = 'Motion waits: global interrupt rule light_curtain is active. Motion is allowed again when its condition clears.';
+    expect(motionWaitRefusalMessage(GLOBAL_INTERRUPT_GATED, { rule_id: 'light_curtain' })).toBe(expected);
+    const owner = motionWaitRefusalMessage('invalid_state_transition',
+      { reason: 'global_interrupt_gated', rule_id: 'light_curtain' });
+    expect(owner).toBe(expected);
+    expect(isMotionWaitRefusal(owner)).toBe(true);
+    // A Full Stop latch needs the operator: not a wait.
+    expect(motionWaitRefusalMessage('invalid_state_transition',
+      { reason: 'global_interrupt_latched', rule_id: 'light_curtain' })).toBeNull();
   });
 
   it('leaves every other refusal to the existing presentation', () => {

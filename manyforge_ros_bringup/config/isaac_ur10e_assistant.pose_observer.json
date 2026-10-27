@@ -39,7 +39,7 @@
       "local_orientation_xyzw": [0, 0, 0, 1],
       "local_position_xyz": [0, 0, 0],
       "object_id": "isaac_cheese_box",
-      "policy_id": "continuous_unattached",
+      "policy_id": "scene",
       "source_coordinate_frame_id": "universe",
       "source_header_frame_id": "mac_n_cheese_centered",
       "target_frame_id": "universe"

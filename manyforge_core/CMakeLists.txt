@@ -35,6 +35,7 @@ endif()
 
 # Core library
 add_library(manyforge_core
+  src/stuck_drain_wait.cpp
   src/addressed_observed_state_publication.cpp
   src/configured_robot_measured_state.cpp
   src/build_owned_lifecycle_plan_catalog_source.cpp

@@ -27,6 +27,7 @@
 #include <type_traits>
 #include <ur_msgs/srv/set_io.hpp>
 #include <utility>
+#include <xarm_msgs/srv/set_digital_io.hpp>
 
 namespace manyforge::roboplan_backend {
 namespace {
@@ -34,6 +35,8 @@ using Service = std_srvs::srv::SetBool;
 using Client = rclcpp::Client<Service>;
 using UrService = ur_msgs::srv::SetIO;
 using UrClient = rclcpp::Client<UrService>;
+using XArmService = xarm_msgs::srv::SetDigitalIO;
+using XArmClient = rclcpp::Client<XArmService>;
 using GpioMessage = control_msgs::msg::DynamicInterfaceGroupValues;
 using GpioPublisher = rclcpp::Publisher<GpioMessage>;
 
@@ -211,10 +214,20 @@ struct RosBooleanOutputProvider::State final {
     if (!record)
       return;
     std::optional<bool> accepted;
+    std::optional<std::int32_t> vendor_return;
     try {
       const auto response = future.get();
-      if (response)
-        accepted = response->success;
+      if (response) {
+        if constexpr (requires { response->ret; }) {
+          // The vendor contract does not prove nonzero returns had no effect.
+          if (response->ret == 0)
+            accepted = true;
+          else
+            vendor_return = response->ret;
+        } else {
+          accepted = response->success;
+        }
+      }
     } catch (const std::exception &) {
     }
     std::lock_guard lock(state->mutex);
@@ -228,6 +241,12 @@ struct RosBooleanOutputProvider::State final {
       record->observation.evidence = core::IoOutputEvidence::kAcceptanceUnknown;
       if (!record->observation.error)
         record->observation.error = std::move(record->unknown_error);
+      if (vendor_return) {
+        record->observation.error->details["reason"] =
+            "xarm_service_returned_nonzero";
+        record->observation.error->details["vendor_return"] =
+            std::to_string(*vendor_return);
+      }
     } else if (*accepted) {
       record->observation.evidence = core::IoOutputEvidence::kSourceAccepted;
       record->observation.error.reset();
@@ -242,8 +261,8 @@ struct RosBooleanOutputProvider::State final {
   const RosBooleanOutputAddress address;
   const core::ResourceId resource;
   std::shared_ptr<GpioTopic> topic;
-  std::variant<Client::SharedPtr, UrClient::SharedPtr, GpioPublisher::SharedPtr>
-      transport;
+  std::variant<Client::SharedPtr, UrClient::SharedPtr, GpioPublisher::SharedPtr,
+               XArmClient::SharedPtr> transport;
   std::vector<Gate> gates;
   std::vector<Alias> aliases;
   std::shared_ptr<Record> record;
@@ -297,6 +316,11 @@ RosBooleanOutputProvider::Create(rclcpp::Node::SharedPtr node,
                  selector_valid(address.interface_name);
         } else if constexpr (std::is_same_v<Address, UrSetIoOutputAddress>)
           return absolute_service(address.service) && address.pin <= 17U;
+        else if constexpr (std::is_same_v<Address, XArmSetDigitalOutputAddress>)
+          return absolute_service(address.service) &&
+                 ((address.bank == XArmDigitalBank::kTool && address.pin <= 4U) ||
+                  (address.bank == XArmDigitalBank::kController &&
+                   address.pin <= 15U));
         else
           return absolute_service(address.service);
       },
@@ -347,6 +371,12 @@ RosBooleanOutputProvider::Create(rclcpp::Node::SharedPtr node,
             auto client = entities->node->create_client<UrService>(
                 address.service, rclcpp::ServicesQoS(),
                 entities->callback_group);
+            const bool exact = address.service == client->get_service_name();
+            state->transport = std::move(client);
+            return exact;
+          } else if constexpr (std::is_same_v<Address, XArmSetDigitalOutputAddress>) {
+            auto client = entities->node->create_client<XArmService>(
+                address.service, rclcpp::ServicesQoS(), entities->callback_group);
             const bool exact = address.service == client->get_service_name();
             state->transport = std::move(client);
             return exact;
@@ -446,6 +476,9 @@ RosBooleanOutputProvider::SubmitOutput(
   auto record = std::make_shared<State::Record>(State::Record{
       request,
       {request.identity, core::IoOutputEvidence::kNotSubmitted, 0, {}}});
+  if (std::holds_alternative<XArmSetDigitalOutputAddress>(state_->address))
+    record->unknown_error.message =
+        "An xArm digital output send has no confirmed delivery result";
   state_->record = record;
   const auto now = state_->clock.now();
   record->observation.trusted_received_at_ns = now;
@@ -471,14 +504,18 @@ RosBooleanOutputProvider::SubmitOutput(
   if (!reason.empty()) {
     record->observation.error =
         core::ErrorDTO{"io_output_not_submitted",
-                       "SetBool was refused before any send",
+                       std::holds_alternative<XArmSetDigitalOutputAddress>(
+                           state_->address)
+                           ? "xArm digital output was refused before any send"
+                           : "SetBool was refused before any send",
                        {{"reason", std::move(reason)}}};
     return Reply::Ok(record->observation);
   }
   // Complete the typed wire value before the final deadline/effect fence.
   // A failure here proves no send and must not become an unknown acceptance.
   using Wire = std::variant<std::shared_ptr<Service::Request>,
-                            std::shared_ptr<UrService::Request>, GpioMessage>;
+                            std::shared_ptr<UrService::Request>, GpioMessage,
+                            std::shared_ptr<XArmService::Request>>;
   Wire wire;
   std::optional<State::Written> committed_model;
   try {
@@ -488,6 +525,13 @@ RosBooleanOutputProvider::SubmitOutput(
       message->fun = UrService::Request::FUN_SET_DIGITAL_OUT;
       message->pin = static_cast<std::int8_t>(address->pin);
       message->state = request.value ? 1.0F : 0.0F;
+      wire = std::move(message);
+    } else if (const auto *address =
+                   std::get_if<XArmSetDigitalOutputAddress>(&state_->address)) {
+      auto message = std::make_shared<XArmService::Request>();
+      message->ionum = static_cast<std::int16_t>(address->pin);
+      message->value = request.value ? 1 : 0;
+      message->delay_sec = 0.0F;
       wire = std::move(message);
     } else if (state_->topic) {
       std::map<std::string, std::map<std::string, bool>> groups;
@@ -600,6 +644,16 @@ RosBooleanOutputProvider::SubmitOutput(
                 ->async_send_request(
                     message,
                     [weak_state, weak_record](UrClient::SharedFuture future) {
+                      State::ReceiveResponse(weak_state, weak_record,
+                                             std::move(future));
+                    });
+          } else if constexpr (std::is_same_v<
+                                   Message,
+                                   std::shared_ptr<XArmService::Request>>) {
+            (void)std::get<XArmClient::SharedPtr>(state_->transport)
+                ->async_send_request(
+                    message,
+                    [weak_state, weak_record](XArmClient::SharedFuture future) {
                       State::ReceiveResponse(weak_state, weak_record,
                                              std::move(future));
                     });

@@ -1,9 +1,6 @@
-"""CP9 component stream health: Python twin and adapter-side sample sink.
+"""CP9 component stream health: adapter-side sample sink.
 
-``StreamDeclaration`` and ``StreamLiveness`` mirror
-``manyforge_core/component_stream_health.hpp`` (names, validation and the
-liveness rule) and need no ROS. ``ComponentStreamSink`` forwards samples and
-fault events of one stream from an adapter process to the execution host,
+``ComponentStreamSink`` forwards samples and fault events of one stream from an adapter process to the execution host,
 which records them into the stream the host-side adapter declared.
 
 Transport: ``diagnostic_msgs/msg/DiagnosticStatus`` on
@@ -18,26 +15,8 @@ from __future__ import annotations
 import re
 import time
 from collections.abc import Callable
-from dataclasses import dataclass
-from typing import Any, Final, Literal
+from typing import Any, Final
 
-StreamSeverity = Literal["fault", "blocking", "warning"]
-StreamRecovery = Literal["ack", "auto"]
-StreamTimestampSource = Literal["message_stamp", "arrival"]
-StreamLivenessState = Literal["live", "stale", "absent"]
-
-STREAM_SEVERITIES: Final = ("fault", "blocking", "warning")
-STREAM_RECOVERIES: Final = ("ack", "auto")
-STREAM_TIMESTAMP_SOURCES: Final = ("message_stamp", "arrival")
-
-COMPONENT_STREAM_STALE_CODE: Final = "component_stream_stale"
-COMPONENT_STREAM_ABSENT_CODE: Final = "component_stream_absent"
-COMPONENT_STREAM_ACKNOWLEDGEMENT_REQUIRED_CODE: Final = (
-    "component_stream_acknowledgement_required"
-)
-
-MAX_STREAM_ID_BYTES: Final = 64
-MAX_STREAM_FAULT_CODE_BYTES: Final = 64
 MAX_STREAM_FAULT_DETAIL_BYTES: Final = 256
 
 COMPONENT_STREAM_SAMPLES_TOPIC: Final = "/manyforge/component_stream_samples"
@@ -68,74 +47,6 @@ def _require_int(value: object, label: str, *, minimum: int) -> int:
     if type(value) is not int or not minimum <= value <= _MAX_INT64:
         raise ValueError(f"{label} must be an int64 >= {minimum}")
     return value
-
-
-def _require_member(value: object, allowed: tuple[str, ...], label: str) -> None:
-    if value not in allowed or type(value) is not str:
-        raise ValueError(f"{label} must be one of {allowed}")
-
-
-@dataclass(frozen=True)
-class StreamDeclaration:
-    """One declared stream with its adapter-kind defaults."""
-
-    stream_id: str
-    budget_ns: int
-    severity: StreamSeverity = "fault"
-    recovery: StreamRecovery = "ack"
-    timestamp_source: StreamTimestampSource = "message_stamp"
-
-    def __post_init__(self) -> None:
-        if not valid_stream_id(self.stream_id):
-            raise ValueError("stream_id must be 1..64 bytes of [a-z0-9_./-]")
-        _require_int(self.budget_ns, "budget_ns", minimum=1)
-        _require_member(self.severity, STREAM_SEVERITIES, "severity")
-        _require_member(self.recovery, STREAM_RECOVERIES, "recovery")
-        _require_member(
-            self.timestamp_source, STREAM_TIMESTAMP_SOURCES, "timestamp_source"
-        )
-
-
-class StreamLiveness:
-    """Pure twin of the C++ liveness rule for one stream.
-
-    A sample advances when its stamp is strictly greater than the last
-    advancing stamp (``message_stamp``), always for ``arrival`` or when it
-    carries no stamp. ``live`` while ``now - last_advance_arrival <= budget``,
-    ``stale`` after that, ``absent`` before the first advancing sample.
-    Arrival and ``now`` use one host clock; stamps are only compared with
-    each other.
-    """
-
-    def __init__(
-        self,
-        budget_ns: int,
-        timestamp_source: StreamTimestampSource = "message_stamp",
-    ) -> None:
-        self._budget_ns = _require_int(budget_ns, "budget_ns", minimum=1)
-        _require_member(timestamp_source, STREAM_TIMESTAMP_SOURCES, "timestamp_source")
-        self._by_stamp = timestamp_source == "message_stamp"
-        self._last_stamp_ns: int | None = None
-        self._last_advance_arrival_ns: int | None = None
-
-    def record(self, stamp_ns: int | None, arrival_ns: int) -> bool:
-        if self._by_stamp and stamp_ns is not None:
-            if self._last_stamp_ns is not None and stamp_ns <= self._last_stamp_ns:
-                return False
-            self._last_stamp_ns = stamp_ns
-        self._last_advance_arrival_ns = arrival_ns
-        return True
-
-    def age_ns(self, now_ns: int) -> int | None:
-        if self._last_advance_arrival_ns is None:
-            return None
-        return now_ns - self._last_advance_arrival_ns
-
-    def state(self, now_ns: int) -> StreamLivenessState:
-        age = self.age_ns(now_ns)
-        if age is None:
-            return "absent"
-        return "live" if age <= self._budget_ns else "stale"
 
 
 def _truncate_utf8(text: str, limit: int) -> str:
@@ -202,7 +113,8 @@ class ComponentStreamSink:
             self._pending_stamp_ns = 0
         else:
             _require_int(stamp_ns, "stamp_ns", minimum=0)
-            if self._last_stamp_ns is None or stamp_ns > self._last_stamp_ns:
+            # Any change advances (a simulator reset steps back); equal = paused.
+            if stamp_ns != self._last_stamp_ns:
                 self._last_stamp_ns = stamp_ns
                 self._pending_stamp_ns = stamp_ns
         if self._pending_stamp_ns is None:

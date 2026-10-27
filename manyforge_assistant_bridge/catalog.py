@@ -19,6 +19,7 @@ CONTENT_IDENTITY_PREFIX: Final = b"manyforge.content-identity.v1"
 MAXIMUM_ROWS: Final = 4_096
 MAXIMUM_TEXT_BYTES: Final = 16_384
 TOOL_ID_PATTERN: Final = re.compile(r"^[a-z][a-z0-9_]*$")
+ENV_NAME_PATTERN: Final = re.compile(r"^[A-Za-z_][A-Za-z0-9_]{0,127}$")
 ORIENTATION_FIELDS: Final = frozenset(
     {
         "xyzw",
@@ -183,12 +184,7 @@ def _validate_projection_rows(projection: dict[str, Any]) -> None:
             )
         previous = tool_id
         _text(tool["description"], f"{path}.description")
-        if tool["effect"] not in {
-            "read_only",
-            "proposal",
-            "composer_draft_mutating",
-            "runtime_mutating",
-        }:
+        if tool["effect"] not in {"read_only", "composer_draft_mutating"}:
             _fail("assistant_projection_invalid", f"{path}.effect is unsupported")
         schema = _object(tool["input_schema"], f"{path}.input_schema")
         if _digest(tool["input_schema_hash"], f"{path}.input_schema_hash") != raw_digest(schema):
@@ -332,11 +328,27 @@ def verify_active_mode_projection(payload: Any, *, expected_mode: str) -> dict[s
     model = _object(projection["model_endpoint"], "model_endpoint")
     _closed(
         model,
-        {"model_endpoint_alias", "model_id", "request_contract"},
+        {
+            "ai_model_component_id",
+            "api_key_env",
+            "base_url",
+            "model_endpoint_alias",
+            "model_id",
+            "request_contract",
+        },
         "model_endpoint",
     )
     _text(model["model_endpoint_alias"], "model_endpoint.model_endpoint_alias", maximum_bytes=256)
     _text(model["model_id"], "model_endpoint.model_id", maximum_bytes=1024)
+    _text(model["ai_model_component_id"], "model_endpoint.ai_model_component_id", maximum_bytes=256)
+    base_url = _text(model["base_url"], "model_endpoint.base_url", maximum_bytes=4_096)
+    if not base_url.startswith(("http://", "https://")):
+        _fail("assistant_projection_invalid", "model_endpoint.base_url must be an http(s) URL")
+    if model["api_key_env"] is not None and (
+        type(model["api_key_env"]) is not str
+        or ENV_NAME_PATTERN.fullmatch(model["api_key_env"]) is None
+    ):
+        _fail("assistant_projection_invalid", "model_endpoint.api_key_env must be an env var name")
     request_contract = _validate_model_request_contract(model["request_contract"])
     if request_contract["tool_call_family"] != "openai_chat_tools":
         _fail(

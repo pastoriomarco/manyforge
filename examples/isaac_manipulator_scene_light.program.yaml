@@ -1,6 +1,6 @@
 api_version: manyforge.program.v2
 program_id: isaac_manipulator_scene_light
-program_revision: sha256:52a72192e6ca356f32f6e3f50609ab18a4ce9f5e28b6972dd15cf1d316a38dfd
+program_revision: sha256:d3ab63cb61855d0869c0f2666bb593bdfe4da6016e01fa200e74c473ad397bb4
 program_profile: composable-cell-v1
 name: isaac_manipulator_scene_light
 description: >-
@@ -191,10 +191,10 @@ tree:
         target_reference: {type: scene_resource, scene_resource_id: isaac_cheese_box}
         offset_reference: {type: frame_role, frame_role_id: base}
         goal:
-          position_m: [0.0, 0.0, 0.08]
-          orientation: {rpy_deg: [180.0, 0.0, -180.0]}
-        planning_timeout_s: 10.0
-        execution_timeout_s: 30.0
+          position_m: [0, 0, 0.06]
+          orientation: {rpy_deg: [180, 0, -180]}
+        planning_timeout_s: 10
+        execution_timeout_s: 30
       value_sources:
         velocity_scale: {kind: program_parameter, reference: velocity_scale}
       children: []
@@ -206,7 +206,7 @@ tree:
           instance_id: close_gripper
           parameters:
             target_role: gripper
-            position: {kind: angular_rad, value_rad: 0.6}
+            position: {kind: angular_rad, value_rad: 0.55}
             max_effort: {kind: angular_newton_meter, value_nm: 40}
             command_duration_s: 1
           children: []

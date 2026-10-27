@@ -114,4 +114,70 @@ TEST(PoseSourceLaunch, ExitStatus78IsATypedConfigErrorWithTheOutputTail) {
             std::string::npos);
 }
 
+TEST(PoseSourceLaunch, AiModelPlanWritesTheProbeDocumentAndLaunchesTheProbe) {
+  EXPECT_EQ(ai_model_probe_document("cell", "assistant_model", "endpoint",
+                                    "http://127.0.0.1:8000/v1", "gemma",
+                                    std::nullopt, 2000),
+            "{\"api_key_env\":null,"
+            "\"api_version\":\"manyforge.ai_model_probe_site.v1\","
+            "\"base_url\":\"http://127.0.0.1:8000/v1\","
+            "\"cell_id\":\"cell\",\"component_id\":\"assistant_model\","
+            "\"model\":\"gemma\",\"probe_period_ms\":2000,"
+            "\"stream_id\":\"endpoint\"}");
+
+  const auto root = std::filesystem::temp_directory_path() /
+                    ("manyforge-ai-model-" + std::to_string(::getpid()));
+  std::filesystem::remove_all(root);
+  const auto plan =
+      plan_ai_model("cell", "assistant_model", "endpoint",
+                    "http://127.0.0.1:8000/v1", "gemma",
+                    std::string("MODEL_TOKEN"), root / "run");
+  EXPECT_EQ(plan.lane, ControllerLaunchLane::kAiModel);
+  EXPECT_EQ(plan.site_config_path,
+            root / "run/controller-launch-artifacts/assistant_model/"
+                   "ai_model.json");
+  EXPECT_NE(plan.document.find("\"api_key_env\":\"MODEL_TOKEN\""),
+            std::string::npos);
+  EXPECT_NE(plan.document.find("\"probe_period_ms\":2000"), std::string::npos);
+  write_pose_source_document(plan);
+  std::ifstream in(plan.site_config_path, std::ios::binary);
+  EXPECT_EQ(std::string(std::istreambuf_iterator<char>(in), {}),
+            plan.document);
+
+  const auto command = pose_source_launch_command(plan, "assistant_model.abc");
+  EXPECT_EQ(command.controllable_component_id, "assistant_model");
+  EXPECT_EQ(command.lane, ControllerLaunchLane::kAiModel);
+  EXPECT_TRUE(command.keep_across_apply);
+  EXPECT_EQ(command.argv,
+            (std::vector<std::string>{
+                "ros2", "launch", "manyforge_ros_bringup",
+                "ai_model.launch.py",
+                "site_config_path:=" + plan.site_config_path.string()}));
+  EXPECT_EQ(pose_source_launch_command(plan, "assistant_model.xyz").identity,
+            command.identity);
+  const auto changed =
+      plan_ai_model("cell", "assistant_model", "endpoint",
+                    "http://127.0.0.1:8000/v1", "other", std::nullopt,
+                    root / "run");
+  EXPECT_NE(pose_source_launch_command(changed, "assistant_model.abc").identity,
+            command.identity);
+  EXPECT_FALSE(pose_source_launch_survives(nullptr, plan));
+  std::filesystem::remove_all(root);
+}
+
+TEST(PoseSourceLaunch, AiModelExitCodesAreTyped) {
+  EXPECT_EQ(pose_source_exit_fault("exited with status 1", 1, "",
+                                   ControllerLaunchLane::kAiModel)
+                .code,
+            "ai_model_exited");
+  const auto invalid = pose_source_exit_fault(
+      "exited with status 0", 0,
+      "[ERROR] [ai_model_probe-1]: process has died [pid 7, exit code 78, "
+      "cmd '...'].\n",
+      ControllerLaunchLane::kAiModel);
+  EXPECT_EQ(invalid.code, "ai_model_config_invalid");
+  EXPECT_NE(invalid.details.at("output_tail").find("exit code 78"),
+            std::string::npos);
+}
+
 } // namespace

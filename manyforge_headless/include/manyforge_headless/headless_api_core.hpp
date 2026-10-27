@@ -615,5 +615,10 @@ private:
 
 [[nodiscard]] HeadlessApiCoreClocks ProductionHeadlessApiClocks();
 [[nodiscard]] std::string MintHeadlessOwnerEpoch(std::string_view prefix);
+/// The Applied Program selection's `assistant_projection.ai_models`: every AI
+/// model component row of `graph` (`controllable_component_id`, `base_url`,
+/// `model`, `api_key_env` or null) in retained (id) order; empty when none.
+[[nodiscard]] manyforge::content_identity::CanonicalValue
+AssistantAiModels(const manyforge::core::CellGraphDTO &graph);
 
 } // namespace manyforge::headless

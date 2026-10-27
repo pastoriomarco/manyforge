@@ -206,8 +206,23 @@ compile_retained_io_policies(const ProgramBindingContract *program,
             binding->program_binding_id(), groups,
             group_subjects(groups, *program, *binding, retained_bundle, rule_id)};
       }
+      // on_trip (sealed by the codec, default gate) selects the existing
+      // mechanisms: gate = scoped Stop, always latch while the condition is
+      // true (upfront refusal), auto release on clear; full_stop = cell Full
+      // Stop, idle per idle_behaviour, operator release.
+      bool full_stop = false;
+      if (const auto *value = rule.find_object_member("on_trip")) {
+        if (value->as_string() == "full_stop")
+          full_stop = true;
+        else if (value->as_string() != "gate")
+          throw std::invalid_argument("global_interrupt_on_trip_invalid");
+      }
       std::optional<core::IoRuleIdleBehaviourDTO> idle;
+      if (!full_stop)
+        idle = core::IoRuleIdleBehaviourDTO::kLatch;
       if (const auto *value = rule.find_object_member("idle_behaviour")) {
+        if (!full_stop)
+          throw std::invalid_argument("global_interrupt_idle_requires_full_stop");
         if (value->as_string() == "latch")
           idle = core::IoRuleIdleBehaviourDTO::kLatch;
         else if (value->as_string() == "ignore")
@@ -218,15 +233,9 @@ compile_retained_io_policies(const ProgramBindingContract *program,
       std::optional<core::StopEscalationStageId> entry;
       if (const auto *value = rule.find_object_member("stop_entry_stage_id"))
         entry.emplace(value->as_string());
-      auto latch_release =
-          core::InterruptPostLatchDisposition::kAwaitOperatorAck;
-      if (const auto *value = rule.find_object_member("latch_release")) {
-        if (value->as_string() == "auto_on_clear")
-          latch_release =
-              core::InterruptPostLatchDisposition::kAutoClearOnSignalRelease;
-        else if (value->as_string() != "operator")
-          throw std::invalid_argument("global_interrupt_latch_release_invalid");
-      }
+      const auto latch_release =
+          full_stop ? core::InterruptPostLatchDisposition::kAwaitOperatorAck
+                    : core::InterruptPostLatchDisposition::kAutoClearOnSignalRelease;
       projection.activation_policies.push_back(
           {core::InterruptPolicyId(member(rule, "rule_id").as_string()),
            std::move(condition.value().condition),
@@ -234,7 +243,7 @@ compile_retained_io_policies(const ProgramBindingContract *program,
            std::move(selection), idle,
            static_cast<int>(member(rule, "priority").as_number()), entry,
            latch_release,
-           std::move(condition.value().waiting_for_program_keys)});
+           std::move(condition.value().waiting_for_program_keys), full_stop});
     }
     for (const auto &[name, kind] : referenced)
       projection.referenced_deployment_blackboard_keys.push_back({name, kind});

@@ -7,6 +7,7 @@
 #include <manyforge_core/runtime_contract_manifest_codec.hpp>
 #include <manyforge_content_identity/canonical_value.hpp>
 #include <manyforge_deployment/canonical_empty_admission.hpp>
+#include <manyforge_deployment/ros2_control_execution_runtime_contract.hpp>
 #include <memory>
 #include <optional>
 #include <stdexcept>
@@ -319,6 +320,11 @@ TEST(ManagerSourcePublication,
   ASSERT_NE(canonical_empty, nullptr);
   ASSERT_TRUE(canonical_empty->is_bool());
   EXPECT_TRUE(canonical_empty->as_bool());
+  const auto *const dependencies =
+      active->find_object_member("component_simulator_dependencies");
+  ASSERT_NE(dependencies, nullptr);
+  ASSERT_TRUE(dependencies->is_array());
+  EXPECT_TRUE(dependencies->as_array().empty());
   EXPECT_NE(bytes.find("\"manager_ready\":true"), std::string::npos);
   EXPECT_NE(bytes.find("\"mutation_available\":false"), std::string::npos);
   EXPECT_NE(
@@ -387,6 +393,26 @@ TEST(ManagerSourcePublication, VerifiedNonemptyProductIsNotCanonicalEmpty) {
   ASSERT_NE(canonical_empty, nullptr);
   ASSERT_TRUE(canonical_empty->is_bool());
   EXPECT_FALSE(canonical_empty->as_bool());
+  // CP8 step 1: the deployment-derived simulator row of each ROS-hosted
+  // component travels with the active graph without changing its identity.
+  const auto *const dependencies = payload.find_object_member("active")->find_object_member(
+      "component_simulator_dependencies");
+  ASSERT_NE(dependencies, nullptr);
+  ASSERT_TRUE(dependencies->is_array());
+  ASSERT_FALSE(dependencies->as_array().empty());
+  EXPECT_EQ(*dependencies, deployment::ros2_control_execution_runtime_contract::
+                               component_simulator_dependencies(*bundle));
+  for (const auto &row : dependencies->as_array()) {
+    ASSERT_TRUE(row.is_object());
+    EXPECT_EQ(row.as_object().size(), 2U);
+    ASSERT_NE(row.find_object_member("controllable_component_id"), nullptr);
+    const auto *const simulator = row.find_object_member("simulator");
+    ASSERT_NE(simulator, nullptr);
+    EXPECT_TRUE(*simulator == content_identity::CanonicalValue("none") ||
+                *simulator == content_identity::CanonicalValue("isaac"));
+  }
+  EXPECT_EQ(*payload.find_object_member("active")->find_object_member("cell_graph"),
+            *graph);
 }
 
 TEST(ManagerSourcePublication,

@@ -1,36 +1,46 @@
 # manyforge_assistant_bridge
 
-This package provides the current bounded direct/`nemoclaw` assistant-provider
-bridge. It mediates between Composer's strict v1 provider envelope, the active
-headless assistant-mode projection, Composer Draft callbacks, owner-neutral
-headless reads, and one configured OpenAI-compatible model endpoint.
+The bridge behind the Composer AI tab. It runs the bounded model loop between
+Composer, the active headless assistant mode projection, and the model server
+named by the Deployment's `ai_model` component.
 
 The bridge:
 
-- independently verifies the active retained mode and request narrowing before
-  every model turn;
-- exposes only the exact owner-issued tool schemas;
-- executes read-only owner routes and revision-fenced Composer Draft callbacks;
-- returns proposal/runtime descriptors for review without executing them;
-- owns bounded request reconciliation, conversation history, cancellation,
-  stuck-loop handling, and redacted rotating audit records; and
-- never owns runtime state, catalog meaning, saved artifacts, Apply, or robot
-  effects.
+- re-reads and verifies the active mode projection before every model turn;
+- takes the model endpoint from that projection (`model_endpoint.base_url`,
+  `model_id`, `api_key_env`) and calls `POST {base_url}/chat/completions`,
+  sending `Authorization: Bearer $<api_key_env>` when `api_key_env` is set
+  (unset variable: `ai_model_token_unavailable`, nothing sent);
+- exposes only the exact owner-issued tool schemas of mode
+  `composer-assistant`;
+- runs read tools against headless and Draft-edit tools through the
+  revision-fenced Composer callback, so edits land in the Program Draft;
+- owns bounded request records, conversation history, cancellation,
+  stuck-loop handling and a redacted rotating audit log; and
+- never saves, Applies, mutates runtime state or commands a robot.
 
-Run `python -m manyforge_assistant_bridge.bridge`. The service reads
-`MANYFORGE_ASSISTANT_UPSTREAM_URL`, `MANYFORGE_HEADLESS_API_URL`,
-`MANYFORGE_COMPOSER_URL`, and optional
-`MANYFORGE_ASSISTANT_UPSTREAM_TOKEN`/`MANYFORGE_ASSISTANT_AUDIT_LOG` settings.
-Composer must be started with `--headless-api-url` and
-`--assistant-bridge-url` to expose the operator conversation surface.
+When the active Deployment has no AI model component, requests fail with
+`assistant_ai_model_absent` (no assistant profile:
+`assistant_mode_projection_unavailable`).
 
-`protocol.py` exports the strict current wire and independent projection
-verification helpers. `headless.py` retains the closed owner-neutral H0 read
-client. `supervisor.py` retains only a pure availability reducer: its former
-fixed launcher/publication loop stays fenced because the Component Manager is
-the sole process-convergence owner.
+Run `python -m manyforge_assistant_bridge.bridge`. The launchers start it
+automatically and pass `--assistant-bridge-url http://127.0.0.1:8100` to
+Composer. Environment:
 
-The complete pre-relocation interaction reference remains pinned at ManyForge
-commit `08222188293df8e12f90dc72e204c21f22f92ea1` (tree
-`bc749b9879d3c8f36fe7bf3036f9cc1f2ef1e60f`). It is acceptance input, not a
-runnable compatibility fallback.
+| Variable | Default |
+|---|---|
+| `MANYFORGE_HEADLESS_API_URL` | `http://127.0.0.1:9010` |
+| `MANYFORGE_COMPOSER_URL` | `http://127.0.0.1:9000` |
+| `MANYFORGE_ASSISTANT_BRIDGE_HOST` | `127.0.0.1` |
+| `MANYFORGE_ASSISTANT_BRIDGE_PORT` | `8100` |
+| `MANYFORGE_ASSISTANT_AUDIT_LOG` | `$XDG_STATE_HOME/manyforge/assistant-bridge-audit.jsonl` (10 MB x 3 files) |
+
+The model URL, model name and token variable come only from the Deployment;
+there is no environment override.
+
+`protocol.py` exports the strict wire and projection verification helpers.
+`headless.py` is the closed headless read client. `supervisor.py` holds a pure
+availability reducer.
+
+See [`docs/operations/ASSISTANT_E2E_COOKBOOK.md`](../docs/operations/ASSISTANT_E2E_COOKBOOK.md)
+and [`docs/reference/ASSISTANT_PROVIDER_CONTRACT.md`](../docs/reference/ASSISTANT_PROVIDER_CONTRACT.md).

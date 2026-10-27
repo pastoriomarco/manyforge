@@ -227,7 +227,8 @@ ActivationDeploymentIntent parse_activation_deployment_intent(
       value,
       {"api_version", "attachments", "components", "deployment_artifact_id",
        "name", "policies"},
-      {"assistant_profile_id", "compatibility", "description"},
+      {"assistant_model_components", "assistant_profile_id", "compatibility",
+       "description"},
       "root");
   if (text(member(value, "api_version", "root"), "api_version") !=
       kApiVersion) {
@@ -239,7 +240,8 @@ ActivationDeploymentIntent parse_activation_deployment_intent(
   if (components.size() > kMaximumComponents) {
     fail("has an invalid component count");
   }
-  // Model-free components (I/O devices, pose sources) own no model source.
+  // Model-free components (I/O devices, pose sources, AI models) own no model
+  // source.
   const auto model_free_profile =
       [](const CanonicalValue &component) -> std::optional<std::string_view> {
     const auto *configuration = component.find_object_member("configuration");
@@ -249,6 +251,7 @@ ActivationDeploymentIntent parse_activation_deployment_intent(
     if (kind == nullptr || !kind->is_string()) return std::nullopt;
     if (kind->as_string() == "io_provider") return "io_device_v0";
     if (kind->as_string() == "pose_source") return "pose_source_v0";
+    if (kind->as_string() == "ai_model") return "ai_model_v0";
     return std::nullopt;
   };
   const bool has_model_free = std::any_of(
@@ -345,14 +348,28 @@ ActivationDeploymentIntent parse_activation_deployment_intent(
   const auto &name = text(member(value, "name", "root"), "name");
   if (name.size() > 256U) fail("name exceeds its byte bound");
 
+  const auto assistant_profile_id = optional_portable_identifier(
+      value.find_object_member("assistant_profile_id"), "assistant_profile_id");
+  std::map<std::string, std::string, std::less<>> assistant_model_components;
+  if (const auto *mapping = value.find_object_member("assistant_model_components");
+      mapping != nullptr) {
+    if (!assistant_profile_id.has_value())
+      fail("assistant_model_components requires assistant_profile_id");
+    for (const auto &[alias, component] :
+         object(*mapping, "assistant_model_components")) {
+      if (!portable_id(alias))
+        fail("assistant_model_components has an invalid alias");
+      assistant_model_components.emplace(
+          alias, portable_identifier(component,
+                                     "assistant_model_components." + alias));
+    }
+  }
   return ActivationDeploymentIntent{
       deployment_id,
       name,
       optional_text(value.find_object_member("description"), "description",
                     4096U),
-      optional_portable_identifier(
-          value.find_object_member("assistant_profile_id"),
-          "assistant_profile_id"),
+      assistant_profile_id,
       member(value, "attachments", "root"),
       member(value, "policies", "root"),
       value.find_object_member("compatibility") == nullptr
@@ -361,6 +378,7 @@ ActivationDeploymentIntent parse_activation_deployment_intent(
                 *value.find_object_member("compatibility")),
       std::move(parsed_components),
       value,
+      std::move(assistant_model_components),
   };
 }
 

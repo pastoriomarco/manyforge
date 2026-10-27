@@ -17,8 +17,8 @@ from typing import Any, Sequence
 
 
 EXPECTED_SCHEMA = "manyforge.lite6_static_model_manifest.v1"
-EXPECTED_BRANCH = "jazzy_no_gazebo"
-EXPECTED_COMMIT = "012731afb9ef1d4289ec45112e8d083ab59a5c1e"
+EXPECTED_BRANCH = "lyrical-no-gazebo"
+EXPECTED_COMMIT = "ef7351f90e451a37ef73de69c643b7e85040401a"
 MANIFEST_NAME = "STATIC_MANIFEST.json"
 IGNORED_DIRS = {"manymove_runtime_capture"}
 

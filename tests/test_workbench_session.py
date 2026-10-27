@@ -1,10 +1,11 @@
 from __future__ import annotations
 
-from contextlib import contextmanager
+from contextlib import closing, contextmanager
 import fcntl
 import json
 import os
 from pathlib import Path
+import sqlite3
 import stat
 
 import pytest
@@ -85,7 +86,41 @@ def test_fresh_selection_contains_only_marker_and_history_is_stable(tmp_path):
     assert successor["previous_session"] == report
     assert report["archive_relative_path"] == "previous-sessions/" + FIRST
     assert report["history_coverage"] == "not_imported"
+    assert "Up to five previous sessions are normally kept" in report["message"]
     assert set(report["journal_families"]) == {"program_cycle", "scene", "manager", "cclc", "kernel_operation"}
+
+
+def test_old_report_text_keeps_an_interrupted_session_selection_recoverable(tmp_path, monkeypatch):
+    root = tmp_path / "runtime"
+    select(root, FIRST)
+    original = evidence(root / "current")
+    write = sessions._write
+
+    def interrupted(path, value):
+        if path == root / "current/session.json":
+            raise OSError("injected interruption before current marker")
+        return write(path, value)
+
+    monkeypatch.setattr(sessions, "_write", interrupted)
+    with pytest.raises(OSError, match="injected interruption"):
+        select(root, SECOND)
+    monkeypatch.setattr(sessions, "_write", write)
+
+    selection_path = root / ".session-selection.json"
+    selection = json.loads(selection_path.read_text())
+    previous = selection["marker"]["previous_session"]
+    previous["message"] = previous["message"].replace(
+        " Up to five previous sessions are normally kept; copy any journals you want to retain.",
+        " All previous journals are kept for investigation.")
+    pending = root / "session-reports/pending" / (FIRST + ".json")
+    pending.write_text(json.dumps(previous))
+    selection_path.write_text(json.dumps(selection))
+
+    marker = select(root, THIRD)
+    assert marker["session_id"] == THIRD
+    assert json.loads(pending.read_text()) == previous
+    assert_evidence(root / "previous-sessions" / FIRST, original)
+    assert not selection_path.exists()
 
 
 def test_motion_trace_files_remain_stable_across_cold_sessions(tmp_path):
@@ -335,7 +370,8 @@ def test_mounted_current_is_not_archived(tmp_path, monkeypatch):
 
 
 @pytest.mark.parametrize("condition,expected", [
-    ("idle", "unknown"), ("pending_acquire", "unresolved"), ("uncertain_storage", "unresolved"),
+    ("idle", "unknown"), ("pending_acquire", "unresolved"),
+    ("uncertain_storage", "unresolved"), ("reset_effect", "unresolved"),
 ])
 def test_classifier_observes_actual_program_journal_without_instantiating_old_owner(tmp_path, condition, expected):
     from manyforge_program_runner.cycle_journal import ProgramCycleJournal
@@ -350,10 +386,48 @@ def test_classifier_observes_actual_program_journal_without_instantiating_old_ow
         owner.record_request(owner_epoch="composer.1", request_id="persist.1", kind="persistent_value_set",
             intent={"request_id": "persist.1"}, cycle_generation=1)
         owner.complete_persistent_value_request(owner_epoch="composer.1", request_id="persist.1", outcome="storage_uncertain")
+    if condition == "reset_effect":
+        owner.begin_idle_resetting(expected_generation=1, owner_epoch="fixture.old", correlation_id="reset.1",
+            session_id=None, client_sequence=None, phase="restoring_position")
+        owner.remember_reset_effect_claim(expected_generation=1, expected=None,
+            retained={"intent": {"expected_admission_generation": 41}, "claim": None, "release_intent": None})
     owner.close()
     original = {p.name: (p.read_bytes(), p.stat().st_ino) for p in tmp_path.iterdir() if p.is_file()}
     assert sessions.classify_effects(tmp_path) == expected
     assert {p.name: (p.read_bytes(), p.stat().st_ino) for p in tmp_path.iterdir() if p.is_file()} == original
+
+
+@pytest.mark.parametrize("schema,expected", [(7, "unresolved"), (9, "unknown")])
+def test_classifier_accepts_old_program_journal_but_not_unknown_future_schema(tmp_path, schema, expected):
+    path = tmp_path / "program-cycle.sqlite3"
+    # These are the schema-7 owner columns and two request tables read by the
+    # cold-session classifier (85893f0c^). Schema 8 only added the Reset claim.
+    with closing(sqlite3.connect(path)) as database, database:
+        database.executescript("""
+            CREATE TABLE program_cycle_metadata(singleton INTEGER PRIMARY KEY, schema_version INTEGER NOT NULL);
+            CREATE TABLE program_cycle(singleton INTEGER PRIMARY KEY, cycle_generation INTEGER NOT NULL,
+              state TEXT NOT NULL, owner_epoch TEXT NOT NULL, program_run_id TEXT, claim_json TEXT,
+              capture_identities_json TEXT, terminal_reference TEXT, start_settlement_json TEXT,
+              release_intent_json TEXT, reset_result_json TEXT, reconciliation_required INTEGER NOT NULL,
+              acquisition_pending_json TEXT, reconciliation_evidence_digest TEXT,
+              execution_control_revision INTEGER NOT NULL, causal_correlation_id TEXT, causal_session_id TEXT,
+              causal_client_sequence TEXT, current_command_kind TEXT, failure_json TEXT, reset_phase TEXT,
+              runtime_controls_json TEXT);
+            CREATE TABLE program_cycle_inflight_commands(request_owner_epoch TEXT NOT NULL, request_id TEXT NOT NULL,
+              request_kind TEXT NOT NULL, intent_json TEXT NOT NULL, cycle_generation INTEGER NOT NULL,
+              PRIMARY KEY(request_owner_epoch, request_id));
+            CREATE TABLE program_persistent_value_requests(request_owner_epoch TEXT NOT NULL, request_id TEXT NOT NULL,
+              action TEXT NOT NULL, outcome TEXT NOT NULL, position INTEGER NOT NULL,
+              PRIMARY KEY(request_owner_epoch, request_id));
+        """)
+        database.execute("INSERT INTO program_cycle_metadata VALUES(1, ?)", (schema,))
+        database.execute("""INSERT INTO program_cycle
+            (singleton,cycle_generation,state,owner_epoch,program_run_id,reconciliation_required,
+             acquisition_pending_json,execution_control_revision)
+            VALUES(1,1,'starting','fixture.old','run.1',0,'{}',1)""")
+    original = path.read_bytes()
+    assert sessions.classify_effects(tmp_path) == expected
+    assert path.read_bytes() == original
 
 
 def test_classifier_never_mistakes_uncheckpointed_wal_for_closed_owner_facts(tmp_path):

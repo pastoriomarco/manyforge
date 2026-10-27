@@ -1235,16 +1235,6 @@ template <typename DTO, typename Key>
                                                               : nullptr;
 }
 
-[[nodiscard]] const core::ExternalResourceDTO* find_external_resource(
-    std::span<const core::ExternalResourceDTO> resources,
-    const core::ExternalResourceAlias& alias) {
-  const auto iterator = std::find_if(
-      resources.begin(), resources.end(), [&alias](const auto& resource) {
-        return resource.external_resource_alias == alias;
-      });
-  return iterator == resources.end() ? nullptr : &*iterator;
-}
-
 void require_disjoint_registry(
     const core::AssistantInstrumentRegistryDTO& registry) {
   std::set<std::string> ids;
@@ -1331,17 +1321,6 @@ void require_mode_semantics(
         }
       };
 
-  if (mode.mode_id == "query") {
-    require_exact_grant(std::nullopt, std::nullopt,
-                        core::AssistantReviewPolicy::kNotRequired);
-    if (!mode.catalog.skill_ids.empty() || !mode.catalog.node_ids.empty() ||
-        std::any_of(effects.begin(), effects.end(), [](auto effect) {
-          return effect != core::AssistantToolEffect::kReadOnly;
-        })) {
-      fail(path, "query mode must contain read-only tools and no skills/nodes");
-    }
-    return;
-  }
   if (mode.mode_id == "composer-assistant") {
     require_exact_grant(std::nullopt, std::nullopt,
                         core::AssistantReviewPolicy::kRequired);
@@ -1694,8 +1673,7 @@ TypedAssistantSettingsCandidate decode_assistant_settings_candidate(
 }
 
 QualifiedAssistantSettings qualify_assistant_settings(
-    const TypedAssistantSettingsCandidate& candidate,
-    std::span<const core::ExternalResourceDTO> external_resources) {
+    const TypedAssistantSettingsCandidate& candidate) {
   const auto& registry = build_qualified_assistant_instrument_registry();
   require_disjoint_registry(registry.value());
 
@@ -1707,34 +1685,8 @@ QualifiedAssistantSettings qualify_assistant_settings(
             core::ContentDigest(std::string(kZeroDigest))));
   }
 
-  for (const auto& alias : candidate.value().model_endpoint_aliases) {
-    const auto* resource =
-        find_external_resource(external_resources, alias.external_resource_alias);
-    if (resource == nullptr) {
-      fail("$.assistant.model_endpoint_aliases." +
-               alias.model_endpoint_alias,
-           "external_resource_alias does not resolve");
-    }
-    if (resource->resource_kind != core::ExternalResourceKind::kModelEndpoint) {
-      fail("$.assistant.model_endpoint_aliases." +
-               alias.model_endpoint_alias,
-           "external resource is not a model_endpoint");
-    }
-  }
-  for (const auto& alias : candidate.value().provider_aliases) {
-    const auto* resource = find_external_resource(
-        external_resources, alias.bridge_external_resource_alias);
-    if (resource == nullptr) {
-      fail("$.assistant.provider_aliases." + alias.provider_alias,
-           "bridge_external_resource_alias does not resolve");
-    }
-    if (resource->resource_kind !=
-        core::ExternalResourceKind::kServiceEndpoint) {
-      fail("$.assistant.provider_aliases." + alias.provider_alias,
-           "bridge external resource is not a service_endpoint");
-    }
-  }
-
+  // Model aliases are served by the Deployment's AI model component; they
+  // resolve to no external resource.
   for (const auto& mode : candidate.value().modes) {
     if (find_by_key(
             candidate.value().provider_aliases, mode.provider_alias,
@@ -1769,8 +1721,7 @@ QualifiedAssistantSettings qualify_assistant_settings(
 }
 
 QualifiedAssistantSettings verify_retained_assistant_projection(
-    const CanonicalValue& projection,
-    std::span<const core::ExternalResourceDTO> external_resources) {
+    const CanonicalValue& projection) {
   const CanonicalValue source = projection_to_source(projection);
   const CanonicalValue deployment(CanonicalValue::Object{
       {"assistant", source},
@@ -1778,7 +1729,7 @@ QualifiedAssistantSettings verify_retained_assistant_projection(
   const auto candidate = decode_assistant_settings_candidate(
       parse_strict_json_model_yaml(canonical_json(deployment)));
   QualifiedAssistantSettings qualified =
-      qualify_assistant_settings(candidate, external_resources);
+      qualify_assistant_settings(candidate);
   if (!qualified.enabled() ||
       qualified.normalized_projection() != projection) {
     fail("$.assistant",

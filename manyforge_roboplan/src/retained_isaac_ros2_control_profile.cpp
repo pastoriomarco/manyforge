@@ -12,6 +12,7 @@
 #include <stdexcept>
 #include <string>
 #include <string_view>
+#include <utility>
 #include <vector>
 
 
@@ -46,7 +47,6 @@ constexpr std::string_view kArmControllerName = "isaac_arm_controller";
 constexpr std::string_view kArmJointCommandsTopic = "/isaac_joint_commands";
 constexpr std::string_view kIsaacJointStatesTopic = "/isaac_joint_states";
 /// `main`'s Isaac lane values (retained profile before the cutover).
-constexpr double kJointStateMaxAgeS = 0.25;
 constexpr double kStopTrajDeltaS = 0.1;
 constexpr double kStopSamplePeriodS = 0.01;
 constexpr double kTrackingErrorToleranceRad = 0.05;
@@ -208,7 +208,8 @@ make_simulation_jtc_config(const std::string &runtime_namespace,
                            const std::string_view hardware_component_name,
                            const std::vector<std::string> &transport_joints,
                            const MockControllerLaneRates &rates,
-                           const double stop_completion_timeout_s) {
+                           const double stop_completion_timeout_s,
+                           const core::Duration controller_state_max_age_ns) {
   RetainedRos2ControlBackendConfig config;
   config.node_name = "manyforge_ros2_control_execution_backend";
   config.node_namespace = runtime_namespace;
@@ -240,9 +241,9 @@ make_simulation_jtc_config(const std::string &runtime_namespace,
   participant.stop.hard_stop_completion_timeout_ns =
       static_cast<core::Duration>(stop_completion_timeout_s * 1e9);
   // Q59 (`main`'s `joint_state_max_age_s`): stale controller state during a
-  // motion or a Stop is a fault on this lane.
-  participant.stop.controller_state_max_age_ns =
-      static_cast<core::Duration>(kJointStateMaxAgeS * 1e9);
+  // motion or a Stop is a fault on this lane. The age is the component's
+  // effective `measured_joints` budget (measured_joints_budget_ns).
+  participant.stop.controller_state_max_age_ns = controller_state_max_age_ns;
   // Q55: decided simulation-lane allowance and two actual CM periods;
   // live lanes still require measurement. Q54 keeps ROS timing monitor-only.
   participant.stop.replacement_start_allowance_s = 0.020;
@@ -254,7 +255,71 @@ make_simulation_jtc_config(const std::string &runtime_namespace,
   return config;
 }
 
+// CP9: one value. The component's effective `measured_joints` budget (its
+// row, or the Deployment override the stream registry applies on top of the
+// declared row) is also the participant's in-motion staleness check.
+[[nodiscard]] core::Duration measured_joints_budget_ns(
+    const RetainedMeasuredJointStateLane &lane,
+    const core::ControllableComponentId &component,
+    const std::span<const core::StreamParameterOverrideDTO> stream_overrides) {
+  for (const auto &row : stream_overrides) {
+    if (row.controllable_component_id == component &&
+        row.stream_id == deployment::ros2_control_execution_runtime_contract::
+                             kMeasuredJointsStreamId &&
+        row.budget_ns.has_value()) {
+      return *row.budget_ns;
+    }
+  }
+  return lane.freshness_budget_ns;
+}
+
 } // namespace
+
+const deployment::ros2_control_execution_runtime_contract::Configuration::
+    ComponentStream &
+retained_component_stream(
+    const deployment::ros2_control_execution_runtime_contract::Configuration
+        &configuration,
+    const core::ControllableComponentId &component,
+    const std::string_view stream_id) {
+  const auto *row = deployment::ros2_control_execution_runtime_contract::
+      find_component_stream(configuration, component, stream_id);
+  if (row == nullptr) {
+    throw std::invalid_argument("retained ROS component does not declare its " +
+                                std::string(stream_id) + " stream");
+  }
+  return *row;
+}
+
+RetainedMeasuredJointStateLane retained_measured_joint_state_lane(
+    const deployment::ros2_control_execution_runtime_contract::Configuration
+        &configuration,
+    const core::ControllableComponentId &component,
+    std::string absolute_topic) {
+  const auto &row = retained_component_stream(
+      configuration, component,
+      deployment::ros2_control_execution_runtime_contract::kMeasuredJointsStreamId);
+  return RetainedMeasuredJointStateLane{
+      std::move(absolute_topic), row.budget_ns,
+      core::StateAuthorityId(std::string(kMeasuredJointStateAuthorityId)),
+      std::string(kMeasuredJointStateProfileId), row.severity, row.recovery, std::nullopt};
+}
+
+core::Duration retained_ros2_control_motion_state_budget_ns(
+    const deployment::ros2_control_execution_runtime_contract::Configuration
+        &configuration,
+    const core::RuntimeParticipantBinding &motion_binding) {
+  const auto &path = motion_binding.value().control_path;
+  if (!path.has_value() ||
+      path->state_authority_class != core::StateAuthorityClass::kMeasured) {
+    return 0;
+  }
+  return retained_component_stream(
+             configuration, motion_binding.value().controllable_component_id,
+             deployment::ros2_control_execution_runtime_contract::
+                 kMeasuredJointsStreamId)
+      .budget_ns;
+}
 
 core::Result<core::MeasuredStateSourceDescriptor>
 make_retained_ros2_control_measured_state_descriptor(
@@ -383,7 +448,8 @@ make_retained_isaac_ros2_control_backend_config(
     const deployment::ros2_control_execution_runtime_contract::Configuration
         &runtime_configuration,
     const core::RuntimeParticipantBinding &motion_binding,
-    const std::optional<core::RuntimeParticipantBinding> &gripper_binding) {
+    const std::optional<core::RuntimeParticipantBinding> &gripper_binding,
+    const std::span<const core::StreamParameterOverrideDTO> stream_overrides) {
   // Q68: the component's own controller profile inside the one ROS unit.
   const auto *selected = deployment::ros2_control_execution_runtime_contract::
       find_controller_profile(runtime_configuration,
@@ -437,22 +503,22 @@ make_retained_isaac_ros2_control_backend_config(
   }
 
   const auto rates = isaac_controller_lane_rates(*selected->isaac_profile);
+  // CP9: the stream row decides how a paused simulator shows (Isaac data:
+  // warning/auto); the in-motion staleness check still stops a moving arm.
+  auto measured_lane = retained_measured_joint_state_lane(
+      runtime_configuration, motion_binding.value().controllable_component_id,
+      std::string(kIsaacJointStatesTopic));
   auto config = make_simulation_jtc_config(
       runtime_namespace, kArmControllerName, profile.hardware_component_name,
-      transport_joints, rates, profile.stop_completion_timeout_s);
+      transport_joints, rates, profile.stop_completion_timeout_s,
+      measured_joints_budget_ns(measured_lane,
+          motion_binding.value().controllable_component_id, stream_overrides));
+  config.arm.measured_joint_state_lane = std::move(measured_lane);
   auto &participant = config.participant;
   for (const auto &joint : compiled_joints) {
     participant.stop.max_deceleration_on_cancel_rad_s2.emplace(
         joint, profile.cancel_deceleration_rad_s2);
   }
-  // CP9: a paused simulator is shown (warning), with no hold, incident or
-  // Recover; the in-motion staleness check still stops a moving arm.
-  config.arm.measured_joint_state_lane = RetainedMeasuredJointStateLane{
-      std::string(kIsaacJointStatesTopic),
-      config.participant.stop.controller_state_max_age_ns,
-      core::StateAuthorityId(std::string(kMeasuredJointStateAuthorityId)),
-      std::string(kMeasuredJointStateProfileId), core::StreamSeverityDTO::kWarning,
-      core::StreamRecoveryDTO::kAuto};
 
   const auto &gripper = *gripper_binding;
   if (gripper.value().resources.size() != 1U ||
@@ -524,19 +590,37 @@ void configure_retained_gripper_output_mode(
           configuration.gripper_target_configurations.end(), matches) != 1)
     throw std::invalid_argument("retained ROS gripper requires one exact authored output row");
   config.gripper->actuation_kind = retained_ros2_control_gripper_actuation_kind(configuration, binding);
-  config.gripper->output_mode = found->output_mode;
-  config.gripper->state_freshness_timeout_s = found->state_freshness_timeout_s;
+  // A mapped gripper's physical writes are separate admitted I/O operations.
+  // Its own operation uses the existing no-output logical state semantics.
+  config.gripper->output_mode = found->pneumatic_io
+                                    ? core::GripperOutputMode::kNone
+                                    : found->output_mode;
+  const auto *profile = deployment::ros2_control_execution_runtime_contract::
+      find_controller_profile(configuration, binding.value().controllable_component_id);
+  if (profile && profile->isaac_profile && found->pneumatic_io)
+    throw std::invalid_argument("pneumatic_io_unsupported_on_isaac: Isaac uses its existing gripper transport");
+  const bool streamless_real_pneumatic = profile != nullptr && profile->real_profile &&
+      config.gripper->actuation_kind == core::GripperActuationKind::kPneumatic;
+  if (!streamless_real_pneumatic) {
+    const auto &feedback = retained_component_stream(
+        configuration, binding.value().controllable_component_id,
+        deployment::ros2_control_execution_runtime_contract::kGripperFeedbackStreamId);
+    config.gripper->state_freshness_timeout_s =
+        static_cast<double>(feedback.budget_ns) / 1e9;
+    config.gripper->feedback_stream_severity = feedback.severity;
+    config.gripper->feedback_stream_recovery = feedback.recovery;
+  }
   if (config.gripper->actuation_kind ==
       core::GripperActuationKind::kPneumatic) {
     config.gripper->result_timeout_s =
         found->delivery_result_timeout_s.value_or(1.0);
     config.gripper->completion_policy =
-        found->output_mode == core::GripperOutputMode::kNone
+        config.gripper->output_mode == core::GripperOutputMode::kNone
             ? "no_output"
             : "output_delivery";
   }
-  if (found->output_mode == core::GripperOutputMode::kCommanded) return;
-  if (found->output_mode != core::GripperOutputMode::kNone ||
+  if (config.gripper->output_mode == core::GripperOutputMode::kCommanded) return;
+  if (config.gripper->output_mode != core::GripperOutputMode::kNone ||
       config.gripper->actuation_kind != core::GripperActuationKind::kPneumatic)
     throw std::invalid_argument("retained ROS no output requires its strict pneumatic target");
   config.gripper->transport_kind.clear();
@@ -594,7 +678,8 @@ make_retained_mock_ros2_control_backend_config(
     const core::RuntimeParticipantBinding &motion_binding,
     const std::optional<core::RuntimeParticipantBinding> &gripper_binding,
     const std::map<std::string, double, std::less<>>
-        &max_deceleration_on_cancel_by_source_joint) {
+        &max_deceleration_on_cancel_by_source_joint,
+    const std::span<const core::StreamParameterOverrideDTO> stream_overrides) {
   const auto *selected = deployment::ros2_control_execution_runtime_contract::
       find_controller_profile(runtime_configuration,
                               motion_binding.value().controllable_component_id);
@@ -655,10 +740,16 @@ make_retained_mock_ros2_control_backend_config(
         "arm joints");
   }
 
+  auto measured_lane = retained_measured_joint_state_lane(
+      runtime_configuration, motion_binding.value().controllable_component_id,
+      runtime_namespace + "/joint_states");
   auto config = make_simulation_jtc_config(
       runtime_namespace, profile.arm_controller_name,
       profile.hardware_component_name, transport_joints, rates,
-      profile.hard_stop_completion_timeout_s);
+      profile.hard_stop_completion_timeout_s,
+      measured_joints_budget_ns(measured_lane,
+          motion_binding.value().controllable_component_id, stream_overrides));
+  config.arm.measured_joint_state_lane = std::move(measured_lane);
   // Only the generated Mock controllers enable stock JTC scheduled replacement.
   config.arm.adapter.lane_facts.supports_scheduled_replacement = true;
   config.arm.adapter.lane_facts.experiment = experimental_replacement_flags();
@@ -678,11 +769,6 @@ make_retained_mock_ros2_control_backend_config(
         "manyforge_replacement_start_allowance component=%.160s allowance_ms=%.17g\n",
         motion_binding.value().controllable_component_id.value().c_str(), milliseconds));
   }
-  config.arm.measured_joint_state_lane = RetainedMeasuredJointStateLane{
-      runtime_namespace + "/joint_states",
-      config.participant.stop.controller_state_max_age_ns,
-      core::StateAuthorityId(std::string(kMeasuredJointStateAuthorityId)),
-      std::string(kMeasuredJointStateProfileId)};
   auto &participant = config.participant;
   for (std::size_t index = 0; index < compiled_joints.size(); ++index) {
     const auto found =
@@ -700,6 +786,115 @@ make_retained_mock_ros2_control_backend_config(
     configure_retained_mock_gripper_action(config, *gripper_binding, profile,
         runtime_namespace, config.arm.controller.controller_manager);
     configure_retained_gripper_output_mode(config, runtime_configuration, *gripper_binding);
+  }
+  return config;
+}
+
+RetainedRos2ControlBackendConfig
+make_retained_real_ros2_control_backend_config(
+    const deployment::ros2_control_execution_runtime_contract::Configuration
+        &runtime_configuration,
+    const core::RuntimeParticipantBinding &motion_binding,
+    const std::optional<core::RuntimeParticipantBinding> &gripper_binding,
+    const std::map<std::string, double, std::less<>>
+        &max_deceleration_on_cancel_by_source_joint,
+    const std::span<const core::StreamParameterOverrideDTO> stream_overrides) {
+  const auto *selected = deployment::ros2_control_execution_runtime_contract::
+      find_controller_profile(runtime_configuration,
+                              motion_binding.value().controllable_component_id);
+  if (selected == nullptr || !selected->real_profile.has_value()) {
+    throw std::invalid_argument(
+        "retained ROS component does not select a real profile");
+  }
+  if (!motion_binding.value().control_path.has_value() ||
+      motion_binding.value().control_path->state_authority_class !=
+          core::StateAuthorityClass::kMeasured) {
+    throw std::invalid_argument(
+        "retained real ROS profile requires a measured motion control path");
+  }
+  const auto profile = real_controller_profile_facts(*selected->real_profile);
+  const auto rates = real_controller_lane_rates(*selected->real_profile);
+  const auto runtime_namespace = retained_isaac_ros_namespace(motion_binding);
+  const auto compiled_joints = compiled_resources(motion_binding);
+  const auto transport_joints = transport_resources(motion_binding);
+  if (compiled_joints.empty() ||
+      compiled_joints.size() != transport_joints.size() ||
+      std::set<std::string>(transport_joints.begin(), transport_joints.end())
+              .size() != transport_joints.size()) {
+    throw std::invalid_argument(
+        "retained real ROS transport joints differ from its motion resources");
+  }
+  if (max_deceleration_on_cancel_by_source_joint.size() !=
+      transport_joints.size()) {
+    throw std::invalid_argument(
+        "retained real ROS cancel deceleration does not cover exactly the "
+        "arm joints");
+  }
+  if (!std::isfinite(profile.joint_state_freshness_s) ||
+      !(profile.joint_state_freshness_s > 0.0)) {
+    throw std::invalid_argument(
+        "retained real ROS profile has no positive joint freshness budget");
+  }
+
+  // CP9: the measured lane is the component's `measured_joints` stream row,
+  // exactly as on Mock and Isaac; for Real it is also the authority's source.
+  auto measured_lane = retained_measured_joint_state_lane(
+      runtime_configuration, motion_binding.value().controllable_component_id,
+      runtime_namespace + "/joint_states");
+  auto config = make_simulation_jtc_config(
+      runtime_namespace, profile.arm_controller_name,
+      profile.hardware_component_name, transport_joints, rates,
+      profile.hard_stop_completion_timeout_s,
+      measured_joints_budget_ns(measured_lane,
+          motion_binding.value().controllable_component_id, stream_overrides));
+  config.participant.stop.trip_authority = core::StateAuthorityClass::kMeasured;
+  // The measured authority's start and terminal state gates and its progress
+  // cursor freshness, from the profile's data row.
+  config.participant.progress_freshness_budget_ns =
+      static_cast<core::Duration>(profile.joint_state_freshness_s * 1e9);
+  config.participant.start_tolerance_rad = profile.start_tolerance_rad;
+  config.participant.final_tolerance_rad = profile.final_tolerance_rad;
+  config.participant.completion_state_timeout_ns =
+      static_cast<core::Duration>(profile.completion_state_timeout_s * 1e9);
+  config.observed_state_authority_profile_id =
+      std::string(kMeasuredJointStateProfileId);
+  config.arm.measured_joint_state_lane = std::move(measured_lane);
+  auto &participant = config.participant;
+  for (std::size_t index = 0; index < compiled_joints.size(); ++index) {
+    const auto found =
+        max_deceleration_on_cancel_by_source_joint.find(transport_joints[index]);
+    if (found == max_deceleration_on_cancel_by_source_joint.end() ||
+        !std::isfinite(found->second) || !(found->second > 0.0)) {
+      throw std::invalid_argument(
+          "retained real ROS arm joint '" + transport_joints[index] +
+          "' has no positive cancel deceleration");
+    }
+    participant.stop.max_deceleration_on_cancel_rad_s2.emplace(
+        compiled_joints[index], found->second);
+  }
+  if (gripper_binding.has_value()) {
+    const auto &gripper = gripper_binding->value();
+    if (!gripper.control_path ||
+        gripper.control_path->state_authority_class != core::StateAuthorityClass::kCommanded ||
+        gripper.controllable_component_id != motion_binding.value().controllable_component_id ||
+        gripper.resources.size() != 1U ||
+        !gripper.resources.front().source_joint_name ||
+        gripper.resources.front().source_joint_name->empty() ||
+        gripper.resources.front().compiled_resource_name.empty() ||
+        retained_ros2_control_gripper_actuation_kind(runtime_configuration, *gripper_binding) !=
+            core::GripperActuationKind::kPneumatic) {
+      throw std::invalid_argument("retained real ROS gripper must be the exact commanded "
+                                  "pneumatic target of the same component");
+    }
+    ros2_control_execution::Ros2GripperActionConfig local;
+    local.group_id = sole_compiled_group(*gripper_binding, "retained real ROS gripper binding");
+    local.joint_name = gripper.resources.front().compiled_resource_name;
+    local.state_joint_name = *gripper.resources.front().source_joint_name;
+    config.gripper = std::move(local);
+    configure_retained_gripper_output_mode(config, runtime_configuration, *gripper_binding);
+    if (config.gripper->output_mode != core::GripperOutputMode::kNone)
+      throw std::invalid_argument("real_pneumatic_io_not_wired: Real commanded pneumatic I/O "
+                                  "is not yet wired");
   }
   return config;
 }

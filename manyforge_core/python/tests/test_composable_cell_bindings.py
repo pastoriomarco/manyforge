@@ -885,10 +885,10 @@ def test_capability_definition_registry_and_qualified_referent_are_exact():
     )
     registry = core.BUILTIN_CAPABILITY_DEFINITION_REGISTRY
     assert isinstance(registry, tuple)
-    assert len(registry) == 68
-    assert len({row.capability_id for row in registry}) == 68
+    assert len(registry) == 69
+    assert len({row.capability_id for row in registry}) == 69
     assert (
-        sum(row.scope == core.CapabilityScope.kTargetBinding for row in registry) == 32
+        sum(row.scope == core.CapabilityScope.kTargetBinding for row in registry) == 33
     )
     assert sum(row.scope == core.CapabilityScope.kCellGlobal for row in registry) == 28
     assert (
@@ -900,7 +900,7 @@ def test_capability_definition_registry_and_qualified_referent_are_exact():
             == core.CapabilityProviderBindingKind.kCapabilityProviderBinding
             for row in registry
         )
-        == 51
+        == 52
     )
     assert (
         sum(
@@ -912,7 +912,7 @@ def test_capability_definition_registry_and_qualified_referent_are_exact():
     )
     assert all(row.requirement_parameters_schema_ref is None for row in registry)
     assert core.BUILTIN_CAPABILITY_DEFINITION_REGISTRY_DIGEST == (
-        "sha256:55fed7ca63f9fe8617e4bc18d23180964bf4cdac5b7ea1cce20aa4c6557110ec"
+        "sha256:713a06c46c5f5100fd4ee1a729ae06be5db753ed84cdff5bdf4d4ac5a77565e0"
     )
     assert core.find_builtin_capability_definition("context.state.current") is None
 
@@ -1852,15 +1852,15 @@ target: 0.5
         ),
         (
             "manyforge.value_schema.runtime.ros2_control_execution.v1",
-            "sha256:eb4a5f93825a6aede99963d3910f981c5159bdadcb7d48e1c8df1b2356fe2173",
+            "sha256:725d71567d7d2a0d9645cd71e657ed123d6ce8829d71cb2ea20b6eb8b392c4e4",
         ),
         (
             "manyforge.value_schema.runtime.io_provider_execution.v1",
-            "sha256:94036272387dd8c604e9b2f54485fb87fb3ed904e1364024e10e526b37dd0776",
+            "sha256:6595d61d1abe73bb9a8ffc0d7b9dcbea74c05ccbf7251c339be67b79436a90d4",
         ),
         (
-            "manyforge.value_schema.runtime.pose_source_execution.v1",
-            "sha256:215719ac12d81134cf371e1c7675775cddb11f3c62e49ada02b4ed2ff59a4706",
+            "manyforge.value_schema.runtime.pose_source.v2",
+            "sha256:f386502468c61bdd672f69069327ef013642ce1b30338ecb1a536655c3833e1d",
         ),
     }
     assert (
@@ -2007,7 +2007,7 @@ def test_assistant_compiler_projection_is_exact_read_only_and_bounded():
             }
         },
         "modes": {
-            "query": {
+            "inspect": {
                 "catalog": {
                     "nodes": [],
                     "skills": [],
@@ -2070,9 +2070,7 @@ def test_assistant_compiler_projection_is_exact_read_only_and_bounded():
     assert assistant_candidate.enabled
     assert json.loads(assistant_candidate.normalized_source_canonical_json) == assistant
 
-    qualified = core.qualify_assistant_settings(
-        assistant_candidate, candidate.value.external_resources
-    )
+    qualified = core.qualify_assistant_settings(assistant_candidate)
     projection = json.loads(qualified.normalized_projection_canonical_json)
     registry = core.build_qualified_assistant_instrument_registry()
     registry_projection = json.loads(registry.normalized_projection_canonical_json)
@@ -2090,7 +2088,7 @@ def test_assistant_compiler_projection_is_exact_read_only_and_bounded():
         "supports_response_tools": True,
         "tool_call_family": "openai_chat_tools",
     }
-    assert [mode["mode_id"] for mode in projection["modes"]] == ["query"]
+    assert [mode["mode_id"] for mode in projection["modes"]] == ["inspect"]
     assert projection["modes"][0]["catalog"]["tools"] == [
         "scene_inspect",
         "status_read",
@@ -2109,8 +2107,6 @@ def test_assistant_compiler_projection_is_exact_read_only_and_bounded():
         "program_draft_upsert_parameters",
         "program_read",
         "program_validate",
-        "propose_scene_object_nodes",
-        "propose_scene_objects",
         "scene_draft_add_object",
         "scene_draft_remove_objects",
         "scene_draft_update_object",
@@ -2145,22 +2141,6 @@ def test_assistant_compiler_projection_is_exact_read_only_and_bounded():
     ):
         with pytest.raises(TypeError):
             value_type()
-
-    wrong_resources = list(candidate.value.external_resources)
-    wrong_resources[0] = core.ExternalResourceDTO(
-        external_resource_alias=core.ExternalResourceAlias("assistant_bridge"),
-        resource_kind=core.ExternalResourceKind.kModelEndpoint,
-        provider_instance_id=core.ProviderInstanceId("assistant_provider_instance"),
-        provider_manifest_id=core.ProviderManifestId("assistant_provider_manifest"),
-        provider_manifest_revision=core.ProviderManifestRevision(ZERO_DIGEST),
-        endpoint_role_id=core.EndpointRoleId("state"),
-        site_overlay_value_ref=core.SiteOverlayValueRef("resources.assistant_bridge"),
-    )
-    with pytest.raises(
-        core.AssistantSettingsCodecError,
-        match="bridge external resource is not a service_endpoint",
-    ):
-        core.qualify_assistant_settings(assistant_candidate, wrong_resources)
 
 
 def test_direct_component_provider_target_has_no_fabricated_control_identity():

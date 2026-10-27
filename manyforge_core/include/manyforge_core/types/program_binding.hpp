@@ -122,6 +122,33 @@ struct ProgramSignalRoleBindingDTO final {
                          const ProgramSignalRoleBindingDTO&) = default;
 };
 
+/// Compiler-owned references to the ordinary I/O roles of a pneumatic tool.
+/// The output effects remain ordinary I/O operations; these rows do not prove
+/// that a valve was delivered or that a grasp occurred.
+struct ProgramPneumaticOutputBindingDTO final {
+  TargetRoleId target_role_id;
+  ResourceRoleId resource_role_id;
+  bool open_value{};
+  bool close_value{};
+  friend bool operator==(const ProgramPneumaticOutputBindingDTO&,
+                         const ProgramPneumaticOutputBindingDTO&) = default;
+};
+
+struct ProgramPneumaticInputBindingDTO final {
+  std::string input;
+  TargetRoleId target_role_id;
+  ResourceRoleId resource_role_id;
+  friend bool operator==(const ProgramPneumaticInputBindingDTO&,
+                         const ProgramPneumaticInputBindingDTO&) = default;
+};
+
+struct ProgramPneumaticIoBindingDTO final {
+  std::vector<ProgramPneumaticOutputBindingDTO> outputs;
+  std::vector<ProgramPneumaticInputBindingDTO> inputs;
+  friend bool operator==(const ProgramPneumaticIoBindingDTO&,
+                         const ProgramPneumaticIoBindingDTO&) = default;
+};
+
 struct ProgramTargetRoleBindingDTO final {
   TargetRoleId target_role_id;
   ComponentRoleId component_role_id;
@@ -134,6 +161,8 @@ struct ProgramTargetRoleBindingDTO final {
   std::vector<ProgramCapabilityBindingDTO> capability_bindings;
   // Omitted from canonical binding bytes when empty.
   std::vector<ProgramSignalRoleBindingDTO> signal_role_bindings{};
+  // Omitted for all targets without an authored pneumatic I/O mapping.
+  std::optional<ProgramPneumaticIoBindingDTO> pneumatic_io{};
 
   friend bool operator==(const ProgramTargetRoleBindingDTO&,
                          const ProgramTargetRoleBindingDTO&) = default;

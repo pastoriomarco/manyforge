@@ -28,7 +28,7 @@ static_assert(!std::is_default_constructible_v<QualifiedAssistantSettings>);
 static_assert(!std::is_aggregate_v<BuildQualifiedAssistantInstrumentRegistry>);
 
 [[nodiscard]] std::string
-mode(std::string_view mode_id = "query",
+mode(std::string_view mode_id = "inspect",
      std::string_view tools = "\"status_read\",\"scene_inspect\"",
      std::string_view skills = "", std::string_view nodes = "",
      std::string_view session_kind = "null",
@@ -118,28 +118,6 @@ model_query_document(std::string_view prompt_templates =
          "}," + "\"modes\":{}}}";
 }
 
-[[nodiscard]] core::ExternalResourceDTO
-external_resource(std::string alias, core::ExternalResourceKind kind) {
-  return {
-      core::ExternalResourceAlias(std::move(alias)),
-      kind,
-      core::ProviderInstanceId("provider"),
-      core::ProviderManifestId("provider_manifest"),
-      core::ProviderManifestRevision(std::string(kZeroDigest)),
-      core::EndpointRoleId("endpoint"),
-      core::SiteOverlayValueRef("resources.endpoint"),
-  };
-}
-
-[[nodiscard]] std::vector<core::ExternalResourceDTO> resources() {
-  return {
-      external_resource("assistant_bridge",
-                        core::ExternalResourceKind::kServiceEndpoint),
-      external_resource("local_model",
-                        core::ExternalResourceKind::kModelEndpoint),
-  };
-}
-
 [[nodiscard]] TypedAssistantSettingsCandidate
 decode(std::string_view document) {
   return decode_assistant_settings_candidate(
@@ -159,10 +137,9 @@ void expect_decode_error(std::string document,
 }
 
 void expect_qualification_error(std::string document,
-                                std::span<const core::ExternalResourceDTO> ext,
                                 std::string_view expected_fragment) {
   try {
-    (void)qualify_assistant_settings(decode(document), ext);
+    (void)qualify_assistant_settings(decode(document));
     FAIL() << "expected AssistantSettingsCodecError";
   } catch (const AssistantSettingsCodecError &error) {
     EXPECT_NE(std::string_view(error.what()).find(expected_fragment),
@@ -198,25 +175,21 @@ TEST(AssistantSettingsCodec,
   EXPECT_EQ(absent.value(), empty.value());
   EXPECT_EQ(absent.normalized_source(), empty.normalized_source());
 
-  const auto ext = resources();
-  const auto qualified = qualify_assistant_settings(empty, ext);
+  const auto qualified = qualify_assistant_settings(empty);
   EXPECT_FALSE(qualified.enabled());
   EXPECT_THROW((void)qualified.retained_projection(),
                AssistantSettingsCodecError);
 }
 
 TEST(AssistantSettingsCodec,
-     QueryModeResolvesAliasesAndProducesDeterministicRetainedProjection) {
-  const auto ext = resources();
+     ReadOnlyModeProducesDeterministicRetainedProjection) {
   const auto left = qualify_assistant_settings(
       decode(assistant_document(
-          mode("query", "\"status_read\",\"scene_inspect\",\"alarms_read\""))),
-      ext);
+          mode("inspect", "\"status_read\",\"scene_inspect\",\"alarms_read\""))));
   const auto right = qualify_assistant_settings(
       decode(assistant_document(
-          mode("query", "\"alarms_read\",\"scene_inspect\",\"status_read\""),
-          "nemoclaw")),
-      ext);
+          mode("inspect", "\"alarms_read\",\"scene_inspect\",\"status_read\""),
+          "nemoclaw")));
 
   ASSERT_TRUE(left.enabled());
   ASSERT_EQ(left.value().prompt_templates.size(), 1U);
@@ -235,17 +208,16 @@ TEST(AssistantSettingsCodec,
       << "provider kind is retained semantic configuration";
 
   const auto verified =
-      verify_retained_assistant_projection(left.normalized_projection(), ext);
+      verify_retained_assistant_projection(left.normalized_projection());
   EXPECT_EQ(verified.value(), left.value());
   EXPECT_EQ(verified.projection_digest(), left.projection_digest());
 }
 
 TEST(AssistantSettingsCodec,
      ModelQueryOnlySettingsAreEnabledAndRetainedWithoutInteractiveModes) {
-  const auto ext = resources();
-  const auto qualified = qualify_assistant_settings(
-      decode(model_query_document()),
-      std::span<const core::ExternalResourceDTO>(ext).subspan(1U));
+  // Model aliases resolve to no external resource (the AI model component).
+  const auto qualified =
+      qualify_assistant_settings(decode(model_query_document()));
 
   ASSERT_TRUE(qualified.enabled());
   EXPECT_TRUE(qualified.value().modes.empty());
@@ -271,9 +243,8 @@ TEST(AssistantSettingsCodec,
   EXPECT_TRUE(qualified.value().provider_aliases.empty());
   EXPECT_TRUE(is_sha256_digest(qualified.projection_digest().value()));
 
-  const auto verified = verify_retained_assistant_projection(
-      qualified.normalized_projection(),
-      std::span<const core::ExternalResourceDTO>(ext).subspan(1U));
+  const auto verified =
+      verify_retained_assistant_projection(qualified.normalized_projection());
   EXPECT_TRUE(verified.enabled());
   EXPECT_EQ(verified.value(), qualified.value());
   EXPECT_EQ(verified.projection_digest(), qualified.projection_digest());
@@ -281,19 +252,18 @@ TEST(AssistantSettingsCodec,
 
 TEST(AssistantSettingsCodec,
      ReorderedSourceMappingsAndListsHaveOneProjectionIdentity) {
-  const auto ext = resources();
   const std::string left_modes =
-      mode("query", "\"status_read\",\"scene_inspect\"") + "," +
+      mode("inspect", "\"status_read\",\"scene_inspect\"") + "," +
       mode("composer-assistant", "\"program_read\",\"catalog_read\"", "", "",
            "null", "null", "required");
   const std::string right_modes =
       mode("composer-assistant", "\"catalog_read\",\"program_read\"", "", "",
            "null", "null", "required") +
-      "," + mode("query", "\"scene_inspect\",\"status_read\"");
+      "," + mode("inspect", "\"scene_inspect\",\"status_read\"");
   const auto left =
-      qualify_assistant_settings(decode(assistant_document(left_modes)), ext);
+      qualify_assistant_settings(decode(assistant_document(left_modes)));
   const auto right =
-      qualify_assistant_settings(decode(assistant_document(right_modes)), ext);
+      qualify_assistant_settings(decode(assistant_document(right_modes)));
   EXPECT_EQ(left.value(), right.value());
   EXPECT_EQ(left.normalized_projection(), right.normalized_projection());
   EXPECT_EQ(left.projection_digest(), right.projection_digest());
@@ -354,8 +324,6 @@ TEST(AssistantSettingsCodec,
                                            "program_draft_upsert_parameters",
                                            "program_read",
                                            "program_validate",
-                                           "propose_scene_object_nodes",
-                                           "propose_scene_objects",
                                            "scene_draft_add_object",
                                            "scene_draft_remove_objects",
                                            "scene_draft_update_object",
@@ -377,8 +345,8 @@ TEST(AssistantSettingsCodec,
           "alarms_read", "catalog_read", "deployment_capabilities_read",
           "history_read", "inspect_isaac_scene", "program_read",
           "program_validate", "scene_inspect", "skills_read", "status_read"}));
-  EXPECT_EQ(proposals, (std::vector<std::string>{"propose_scene_object_nodes",
-                                                 "propose_scene_objects"}));
+  // Assistant edits land in the Draft through the tool callback only.
+  EXPECT_TRUE(proposals.empty());
   EXPECT_EQ(draft_mutations.size(), 18U);
 
   std::vector<std::string> node_ids;
@@ -394,7 +362,8 @@ TEST(AssistantSettingsCodec,
           "repeat", "retry", "scene.add_object", "scene.attach_carried_object",
           "scene.detach_carried_object", "scene.remove_object",
           "scene.update_object_pose", "scene.upsert_object", "sequence",
-          "timer"}));
+          "simulation.reset", "simulation.set_entity_pose",
+          "simulation.set_state", "simulation.step", "timer"}));
 
   const auto catalog = std::find_if(
       registry.value().tools.begin(), registry.value().tools.end(),
@@ -411,9 +380,9 @@ TEST(AssistantSettingsCodec, RejectsOpenShapesAndNonCanonicalInstrumentIds) {
       assistant_document(mode(), "direct", ",\"unexpected\":true"),
       "unknown field 'unexpected'");
   expect_decode_error(
-      assistant_document(mode("query", "\"status_read\",\"status_read\"")),
+      assistant_document(mode("inspect", "\"status_read\",\"status_read\"")),
       "duplicate instrument ID");
-  expect_decode_error(assistant_document(mode("query", "\"status.read\"")),
+  expect_decode_error(assistant_document(mode("inspect", "\"status.read\"")),
                       "canonical lowercase underscore tool ID");
   expect_decode_error(model_query_document("", ""),
                       "must configure an interactive mode or a bounded "
@@ -465,70 +434,64 @@ TEST(AssistantSettingsCodec, RejectsOpenShapesAndNonCanonicalInstrumentIds) {
       "is outside the closed template variable types");
 }
 
-TEST(AssistantSettingsCodec, RejectsUnresolvedOrWrongKindExternalAliases) {
-  const auto ext = resources();
-  expect_qualification_error(assistant_document(),
-                             std::span<const core::ExternalResourceDTO>{},
-                             "external_resource_alias does not resolve");
-
-  auto wrong_model = ext;
-  wrong_model[1] = external_resource(
-      "local_model", core::ExternalResourceKind::kServiceEndpoint);
-  expect_qualification_error(assistant_document(), wrong_model,
-                             "is not a model_endpoint");
-
-  auto wrong_bridge = ext;
-  wrong_bridge[0] = external_resource(
-      "assistant_bridge", core::ExternalResourceKind::kModelEndpoint);
-  expect_qualification_error(assistant_document(), wrong_bridge,
-                             "is not a service_endpoint");
+TEST(AssistantSettingsCodec, QualifiesWithoutExternalResources) {
+  // The AI model component serves every model alias; nothing resolves to an
+  // external resource or site overlay.
+  const auto qualified = qualify_assistant_settings(decode(assistant_document(
+      mode("composer-assistant", "\"program_read\"", "", "", "null", "null",
+           "required"))));
+  ASSERT_TRUE(qualified.enabled());
+  ASSERT_EQ(qualified.value().model_endpoint_aliases.size(), 1U);
+  EXPECT_EQ(qualified.value()
+                .model_endpoint_aliases.front()
+                .external_resource_alias.value(),
+            "local_model");
+  EXPECT_EQ(
+      verify_retained_assistant_projection(qualified.normalized_projection())
+          .projection_digest(),
+      qualified.projection_digest());
 }
 
 TEST(AssistantSettingsCodec, EnforcesExactReservedModePolicies) {
-  const auto ext = resources();
   expect_qualification_error(
-      assistant_document(
-          mode("query", "\"status_read\"", "", "", "null", "null", "required")),
-      ext, "reserved mode grant/review policy is not exact");
+      assistant_document(mode("composer-assistant", "\"status_read\"")),
+      "reserved mode grant/review policy is not exact");
   expect_qualification_error(
-      assistant_document(mode("query", "\"unknown_read\"")), ext,
+      assistant_document(mode("inspect", "\"unknown_read\"")),
       "unresolved tool ID");
 
   const auto composer = qualify_assistant_settings(
       decode(assistant_document(
           mode("composer-assistant", "\"program_read\",\"catalog_read\"", "",
-               "\"scene.add_object\"", "null", "null", "required"))),
-      ext);
+               "\"scene.add_object\"", "null", "null", "required"))));
   EXPECT_TRUE(composer.enabled());
   expect_qualification_error(
       assistant_document(mode("composer-assistant", "\"program_read\"", "",
                               "\"add_collision_object\"", "null", "null",
                               "required")),
-      ext, "unresolved node ID 'add_collision_object'");
+      "unresolved node ID 'add_collision_object'");
 
   const auto recovery = qualify_assistant_settings(
       decode(assistant_document(mode(
           "error-recovery", "\"status_read\"", "", "", "\"delegated_recovery\"",
-          "\"policy_granted\"", "bounded_by_recovery_profile"))),
-      ext);
+          "\"policy_granted\"", "bounded_by_recovery_profile"))));
   EXPECT_TRUE(recovery.enabled());
 }
 
 TEST(AssistantSettingsCodec, RetainedProjectionRejectsAnyTampering) {
-  const auto ext = resources();
   const auto qualified =
-      qualify_assistant_settings(decode(assistant_document()), ext);
+      qualify_assistant_settings(decode(assistant_document()));
 
   const CanonicalValue bad_digest =
       replace_member(qualified.normalized_projection(), "projection_digest",
                      CanonicalValue(std::string(kZeroDigest)));
-  EXPECT_THROW((void)verify_retained_assistant_projection(bad_digest, ext),
+  EXPECT_THROW((void)verify_retained_assistant_projection(bad_digest),
                AssistantSettingsCodecError);
 
   const CanonicalValue bad_registry =
       replace_member(qualified.normalized_projection(), "instruments",
                      CanonicalValue(CanonicalValue::Object{}));
-  EXPECT_THROW((void)verify_retained_assistant_projection(bad_registry, ext),
+  EXPECT_THROW((void)verify_retained_assistant_projection(bad_registry),
                AssistantSettingsCodecError);
 }
 

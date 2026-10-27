@@ -348,6 +348,7 @@ private:
   core::RequestOwnerEpoch owner_epoch_;
   core::ProgramRunId direct_control_program_run_id_;
   core::ProgramRunId direct_control_gripper_program_run_id_;
+  core::ProgramRunId direct_control_io_program_run_id_;
   ExecutionCompositionAccess &composition_access_;
   component_manager::detail::ManagerLivenessCommandAdmission
       &manager_liveness_admission_;

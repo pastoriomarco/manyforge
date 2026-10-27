@@ -1014,7 +1014,7 @@ TEST(ClosedSchema, IoComponentWrapperUsesSharedRowsAndMaterializesDeviceLimit) {
       core::SchemaId("manyforge.value_schema.runtime.io_provider_execution.v1"),
       core::SchemaRevision(
           "sha256:"
-          "94036272387dd8c604e9b2f54485fb87fb3ed904e1364024e10e526b37dd0776"));
+          "6595d61d1abe73bb9a8ffc0d7b9dcbea74c05ccbf7251c339be67b79436a90d4"));
   ASSERT_NE(schema, nullptr);
   const auto source = parse_strict_json_model_yaml(R"({
     "io_signals":[
@@ -1069,7 +1069,7 @@ TEST(ClosedSchema, IoComponentWrapperRefusesEmptySignalsMultipleDevicesAndMotion
       core::SchemaId("manyforge.value_schema.runtime.io_provider_execution.v1"),
       core::SchemaRevision(
           "sha256:"
-          "94036272387dd8c604e9b2f54485fb87fb3ed904e1364024e10e526b37dd0776"));
+          "6595d61d1abe73bb9a8ffc0d7b9dcbea74c05ccbf7251c339be67b79436a90d4"));
   ASSERT_NE(schema, nullptr);
   const std::string signal = R"({"controllable_component_id":"device.io",
     "command_target_id":"gpio","resource_role_id":"lamp","signal_name":"lamp",
@@ -1093,65 +1093,52 @@ TEST(ClosedSchema, IoComponentWrapperRefusesEmptySignalsMultipleDevicesAndMotion
       ClosedSchemaError);
 }
 
-TEST(ClosedSchema, PoseSourceWrapperMirrorsTheObserverSiteConfiguration) {
+TEST(ClosedSchema, PoseSourceComponentSchemaIsClosedAndBuildQualified) {
   const auto &registry = build_qualified_closed_schema_registry();
   const auto *schema = registry.find_qualified_value_schema(
-      core::SchemaId("manyforge.value_schema.runtime.pose_source_execution.v1"),
+      core::SchemaId("manyforge.value_schema.runtime.pose_source.v2"),
       core::SchemaRevision(
           "sha256:"
-          "215719ac12d81134cf371e1c7675775cddb11f3c62e49ada02b4ed2ff59a4706"));
+          "f386502468c61bdd672f69069327ef013642ce1b30338ecb1a536655c3833e1d"));
   ASSERT_NE(schema, nullptr);
-  const std::string joint = R"({"eligible":false,"lifetime_ns":1000000000,
-    "object_id":"robot","policy_id":"viewer.measured_robot",
-    "required_joint_names":["joint2","joint1"],"topic":"/isaac_joint_states"})";
-  const std::string entity = R"({"eligible":true,"entity":"/World/box",
-    "frame_kind":"cell_frame","lifetime_ns":2000000000,
-    "local_orientation_xyzw":[0,0,0,1],"local_position_xyz":[0,0,0],
-    "object_id":"box","policy_id":"continuous_unattached",
+  const std::string simulation = R"("simulation":{"poll_period_ms":250,
+    "source_coordinate_frame_id":"universe","target_frame_id":"universe",
     "relative_reference":{"entity":"/World/tool","link":"tool_link",
-      "source_header_frame_id":"tool"},
-    "source_coordinate_frame_id":"universe","source_header_frame_id":"box",
-    "target_frame_id":"universe"})";
-  const std::string detection = R"({"eligible":true,"fallback_frame_id":"",
-    "frame_kind":"cell_frame","lifetime_ns":5000000000,"object_id":"part",
-    "policy_id":"before_planning","selector":{"class_id":"","confidence_min":0,
-      "detection_id":"","max_position_variance_m2":0.0025,"selection":"first"},
-    "target_frame_id":"link_base","topic":"/output"})";
-  const auto row = [&](const std::string &extra) {
-    return R"({"controllable_component_id":"scene_objects",
-      "simulation_poll_period_ms":250,"simulation_entities":[)" + entity +
-           R"(],"detection3d_sources":[)" + detection + "]" + extra + "}";
-  };
-  const auto normalize = [&](const std::string &rows) {
+      "source_header_frame_id":"tool"}})";
+  const std::string detection = R"("detection3d":{"topic":"/output",
+    "target_frame_id":"link_base","fallback_frame_id":""})";
+  const std::string overlay = R"("robot_overlay":{"robot_component_id":"robot",
+    "joint_state":{"topic":"/isaac_joint_states",
+      "required_joint_names":["joint2","joint1"]},
+    "tcp_entity":{"entity":"/World/tool","source_header_frame_id":"tool",
+      "local_position_xyz":[0,0,0.2]}})";
+  const auto normalize = [&](const std::string &fields) {
     return validate_and_normalize_build_qualified_value(
-        *schema,
-        parse_strict_json_model_yaml("{\"pose_sources\":" + rows + "}").root());
+        *schema, parse_strict_json_model_yaml("{" + fields + "}").root());
   };
-  const auto normalized =
-      normalize("[" + row(",\"joint_state\":" + joint) + "]");
-  const auto &pose = normalized.normalized_value()
-                         .find_object_member("pose_sources")
-                         ->as_array()
-                         .front();
+  const auto budget = std::string(R"("stream_budget_ns":1000000000)");
+  const auto normalized = normalize(budget + "," + simulation + "," +
+                                    detection + "," + overlay);
   // Joint order is authored observer order, not a set.
-  EXPECT_EQ(canonical_json(*pose.find_object_member("joint_state")
+  EXPECT_EQ(canonical_json(*normalized.normalized_value()
+                                .find_object_member("robot_overlay")
+                                ->find_object_member("joint_state")
                                 ->find_object_member("required_joint_names")),
             R"(["joint2","joint1"])");
-  EXPECT_NO_THROW((void)normalize("[" + row("") + "]"));
-  EXPECT_THROW((void)normalize("[]"), ClosedSchemaError);
-  EXPECT_THROW((void)normalize("[" + row("") + "," + row("") + "]"),
+  EXPECT_NO_THROW((void)normalize(budget));
+  EXPECT_THROW((void)normalize(simulation), ClosedSchemaError);
+  EXPECT_THROW((void)normalize(budget + R"(,"pose_sources":[])"),
                ClosedSchemaError);
-  EXPECT_THROW((void)normalize("[" + row(",\"source_id\":\"x\"") + "]"),
-               ClosedSchemaError);
-  auto bad_poll = row("");
+  EXPECT_THROW((void)normalize(R"("stream_budget_ns":0)"), ClosedSchemaError);
+  auto bad_poll = simulation;
   bad_poll.replace(bad_poll.find("250"), 3U, "10");
-  EXPECT_THROW((void)normalize("[" + bad_poll + "]"), ClosedSchemaError);
-  auto bad_frame = row("");
-  bad_frame.replace(bad_frame.find("cell_frame"), 10U, "base_frame");
-  EXPECT_THROW((void)normalize("[" + bad_frame + "]"), ClosedSchemaError);
-  auto bad_lifetime = row("");
-  bad_lifetime.replace(bad_lifetime.find("2000000000"), 10U, "0");
-  EXPECT_THROW((void)normalize("[" + bad_lifetime + "]"), ClosedSchemaError);
+  EXPECT_THROW((void)normalize(budget + "," + bad_poll), ClosedSchemaError);
+  // The header frame is an explicit authored field of every entity.
+  const std::string header_field = R"(,
+      "source_header_frame_id":"tool")";
+  auto header = simulation;
+  header.replace(header.find(header_field), header_field.size(), "");
+  EXPECT_THROW((void)normalize(budget + "," + header), ClosedSchemaError);
 }
 
 TEST(ClosedSchema,
@@ -1264,7 +1251,7 @@ TEST(ClosedSchema,
 }
 
 TEST(ClosedSchema, QualifiesEveryAndOnlyTheExactBuiltinCapabilityDefinition) {
-  ASSERT_EQ(core::kBuiltinCapabilityDefinitionRegistry.size(), 68U);
+  ASSERT_EQ(core::kBuiltinCapabilityDefinitionRegistry.size(), 69U);
   CanonicalValue::Array registry_projection;
   registry_projection.reserve(
       core::kBuiltinCapabilityDefinitionRegistry.size());
@@ -1733,7 +1720,7 @@ TEST(ClosedSchema,
       "value/manyforge.value_schema.runtime.native_execution.v1.yaml",
       "value/manyforge.value_schema.runtime.ros2_control_execution.v1.yaml",
       "value/manyforge.value_schema.runtime.io_provider_execution.v1.yaml",
-      "value/manyforge.value_schema.runtime.pose_source_execution.v1.yaml",
+      "value/manyforge.value_schema.runtime.pose_source.v2.yaml",
   };
   EXPECT_EQ(source_tree_yaml, expected_source_tree_yaml);
 }
@@ -2011,7 +1998,7 @@ TEST(ClosedSchema, RosDeliveryTimeoutPreservesAbsenceAndColdDecodedSource) {
     const auto &rows = std::get<core::JsonValueDTO::Array>(
         unit.configuration.at("gripper_target_configurations").value);
     ASSERT_EQ(rows.size(), 1U);
-    EXPECT_EQ(std::get<core::JsonObjectDTO>(rows.front().value).size(), 14U);
+    EXPECT_EQ(std::get<core::JsonObjectDTO>(rows.front().value).size(), 13U);
     const auto decoded =
         detail::decode_ros2_control_execution_gripper_target_configurations(rows);
     ASSERT_EQ(decoded.size(), 1U);
@@ -2024,7 +2011,6 @@ TEST(ClosedSchema, RosDeliveryTimeoutPreservesAbsenceAndColdDecodedSource) {
 
     auto common = std::get<core::JsonObjectDTO>(rows.front().value);
     common.erase("output_mode");
-    common.erase("state_freshness_timeout_s");
     ASSERT_EQ(common.size(), 12U);
     const auto archival = detail::decode_execution_gripper_target_configurations(
         {core::JsonValueDTO{common}}, "archival Native configuration");
@@ -2050,7 +2036,7 @@ TEST(ClosedSchema, RosDeliveryTimeoutPreservesAbsenceAndColdDecodedSource) {
       const auto &cold_rows = std::get<core::JsonValueDTO::Array>(
           cold_unit.configuration.at("gripper_target_configurations").value);
       const auto &raw = std::get<core::JsonObjectDTO>(cold_rows.front().value);
-      EXPECT_EQ(raw.size(), 15U);
+      EXPECT_EQ(raw.size(), 14U);
       EXPECT_DOUBLE_EQ(std::get<double>(raw.at("delivery_result_timeout_s").value),
                        seconds);
       const auto typed =
@@ -2164,25 +2150,64 @@ TEST(ClosedSchema, MaintainedPneumaticSourcesExplicitlyAuthorDeliveryTimeoutOnly
     if (runtime == nullptr) continue;
     const auto *rows = runtime->find_object_member("gripper_target_configurations");
     if (rows == nullptr) continue;
+    // Real carries a no-output (display-only) pneumatic gripper.
+    const bool real = runtime->find_object_member("real_profile") != nullptr;
     for (const auto &row : rows->as_array()) {
       const auto *timeout = row.find_object_member("delivery_result_timeout_s");
       if (member(row, "actuation_kind").as_string() == "pneumatic") {
         ++pneumatic;
         ASSERT_NE(timeout, nullptr);
         EXPECT_DOUBLE_EQ(std::get<double>(timeout->storage()), 1.0);
-        EXPECT_EQ(row.as_object().size(), 15U);
+        EXPECT_EQ(row.as_object().size(), 14U);
       } else {
         ++position;
         EXPECT_EQ(timeout, nullptr);
-        EXPECT_EQ(row.as_object().size(), 14U);
+        EXPECT_EQ(row.as_object().size(), 13U);
       }
-      EXPECT_EQ(member(row, "output_mode").as_string(), "commanded");
-      // One data source of the gripper feedback staleness default.
-      EXPECT_DOUBLE_EQ(member(row, "state_freshness_timeout_s").as_number(), 1.0);
+      EXPECT_EQ(member(row, "output_mode").as_string(), real ? "none" : "commanded");
     }
   }
-  EXPECT_EQ(pneumatic, 2U);
+  EXPECT_EQ(pneumatic, 3U);
   EXPECT_EQ(position, 5U);
+}
+
+// CP9: every maintained ROS profile declares its streams with their defaults:
+// Isaac arm measured joints and gripper feedback warning/auto, Mock arm and
+// gripper fault/ack, gripper feedback 1 s. A Real no-output pneumatic gripper
+// declares no gripper feedback. One data source; no code default.
+TEST(ClosedSchema, MaintainedRosProfilesDeclareComponentStreamDefaults) {
+  const auto source = parse_strict_json_model_yaml(
+      read_resource("../maintained/maintained_deployment_sources.v1.json"));
+  std::size_t profiles = 0U;
+  for (const auto &profile : member(source.root(), "runtime_restoration_profiles").as_array()) {
+    const auto *runtime = profile.find_object_member("ros2_control_runtime");
+    if (runtime == nullptr) continue;
+    ++profiles;
+    const bool isaac = runtime->find_object_member("isaac_profile") != nullptr;
+    const bool real = runtime->find_object_member("real_profile") != nullptr;
+    const bool gripper = runtime->find_object_member("gripper_target_configurations") != nullptr;
+    if (real) {
+      const auto &grippers = member(*runtime, "gripper_target_configurations").as_array();
+      ASSERT_EQ(grippers.size(), 1U);
+      EXPECT_EQ(member(grippers.front(), "actuation_kind").as_string(), "pneumatic");
+      EXPECT_EQ(member(grippers.front(), "output_mode").as_string(), "none");
+    }
+    const bool feedback_stream = gripper && !real;
+    const auto &rows = member(*runtime, "component_streams").as_array();
+    ASSERT_EQ(rows.size(), feedback_stream ? 2U : 1U);
+    const auto &measured = rows.back();
+    EXPECT_EQ(member(measured, "stream_id").as_string(), "measured_joints");
+    EXPECT_DOUBLE_EQ(member(measured, "budget_ns").as_number(), 250000000.0);
+    EXPECT_EQ(member(measured, "severity").as_string(), isaac ? "warning" : "fault");
+    EXPECT_EQ(member(measured, "recovery").as_string(), isaac ? "auto" : "ack");
+    if (!feedback_stream) continue;
+    const auto &feedback = rows.front();
+    EXPECT_EQ(member(feedback, "stream_id").as_string(), "gripper_feedback");
+    EXPECT_DOUBLE_EQ(member(feedback, "budget_ns").as_number(), 1000000000.0);
+    EXPECT_EQ(member(feedback, "severity").as_string(), isaac ? "warning" : "fault");
+    EXPECT_EQ(member(feedback, "recovery").as_string(), isaac ? "auto" : "ack");
+  }
+  EXPECT_EQ(profiles, 9U);
 }
 
 } // namespace

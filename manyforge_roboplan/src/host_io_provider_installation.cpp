@@ -433,6 +433,28 @@ core::Result<void> PrepareCompositionIoProviderResources(
       if (old != existing.end())
         channels.emplace(resource, old->second.entry);
     }
+    for (const auto &row : catalog.value()) {
+      if (!row.provider.echo_output_signal_name)
+        continue;
+      const core::IoSignalId output{
+          row.descriptor.signal_id.controllable_component_id,
+          *row.provider.echo_output_signal_name};
+      const auto match = std::find_if(catalog.value().begin(), catalog.value().end(),
+          [&](const auto &candidate_row) {
+            return candidate_row.descriptor.signal_id == output &&
+                   candidate_row.descriptor.direction == core::IoSignalDirection::kOutput;
+          });
+      require(runtime && match != catalog.value().end() &&
+                  match->descriptor.output_resource && row.provider.echo_delay_ns,
+              "Mock echo has no qualified input/output");
+      const auto channel = channels.find(*match->descriptor.output_resource);
+      require(channel != channels.end(), "Mock echo output channel is missing");
+      const auto *provider = std::get_if<std::shared_ptr<MockBooleanOutputProvider>>(
+          &channel->second->provider);
+      require(provider && *provider, "Mock echo output is not synthetic");
+      runtime->AddMockEcho(*provider, row.descriptor.signal_id,
+                           *row.provider.echo_delay_ns);
+    }
     std::vector<std::shared_ptr<HostIoOutputChannelEntry>> candidate_channels;
     candidate_channels.reserve(channels.size());
     for (const auto &[resource, entry] : channels) {
@@ -465,6 +487,7 @@ core::Result<void> PrepareCompositionIoProviderResources(
               require(mock ? profile == "mock_output"
                            : (profile == "ros_set_bool" ||
                               profile == "ur_set_io" ||
+                              profile == "xarm_digital" ||
                               profile == "ros2_control_gpio"),
                       "retained output channel changed its immutable profile");
               installed.push_back({row.row.descriptor.signal_id, row.provider,

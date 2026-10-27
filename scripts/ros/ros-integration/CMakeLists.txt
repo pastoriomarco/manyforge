@@ -30,10 +30,11 @@ if(MANYFORGE_BUILD_CORE_PYTHON_BINDINGS)
     core-python EXCLUDE_FROM_ALL)
 endif()
 add_subdirectory("${MANYFORGE_INTEGRATION_SOURCE_DIR}/manyforge_ros2_control_execution" adapter)
-add_subdirectory("${MANYFORGE_INTEGRATION_SOURCE_DIR}/manyforge_roboplan" roboplan)
-# Register the existing package targets while keeping unrelated lifecycle targets out of the build.
+# The xArm vendor adapter (with its package tests) precedes RoboPlan, whose ROS
+# runtime links it; unrelated targets stay out of the default build.
 add_subdirectory("${MANYFORGE_INTEGRATION_SOURCE_DIR}/manyforge_xarm_control"
   xarm_control EXCLUDE_FROM_ALL)
+add_subdirectory("${MANYFORGE_INTEGRATION_SOURCE_DIR}/manyforge_roboplan" roboplan)
 # Preserve the runtime helper's established host/worker artifact locations.
 set_target_properties(manyforge_ros2_control_execution_host
   manyforge_roboplan_candidate_worker

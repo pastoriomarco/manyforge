@@ -887,7 +887,7 @@ ResolveSceneCandidate(const SceneTransactionRequestDTO &request,
               std::move(touch_roles),
               operation.grasp_lost_bound
                   ? std::optional(core::CarriedObjectGraspLostCheckDTO{
-                        *operation.grasp_lost_bound, pose_in_carrier})
+                        *operation.grasp_lost_bound})
                   : std::nullopt};
           attachment.carried_object_attachment_revision =
               core::logical_scene_identity::

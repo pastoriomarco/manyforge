@@ -2,8 +2,8 @@
   "files": [
     {
       "path": "README.md",
-      "sha256": "88ed752af50dd058eddf643759f45614a020d4c7bc336c179a69e633b10cfe59",
-      "size_bytes": 2988
+      "sha256": "e94f3acc70569b84e8aff52beed3818380538975526a6316d83114ba357dd23d",
+      "size_bytes": 3002
     },
     {
       "path": "licenses/xarm_ros2.LICENSE",
@@ -17,8 +17,8 @@
     },
     {
       "path": "lite6_lite_gripper.urdf",
-      "sha256": "448485049362a14643f3a6418cee4a9e2119bc86509f0a127607aad54803b641",
-      "size_bytes": 19738
+      "sha256": "c205aea7474737989e1195fbbff16cb9d3f287fee3cefcd550c7ad2e4e606e90",
+      "size_bytes": 19750
     },
     {
       "path": "meshes/gripper/lite/collision/gripper_lite_body.stl",
@@ -116,7 +116,7 @@
       "size_bytes": 1075
     }
   ],
-  "generated_at_utc": "2026-08-30T16:20:59+00:00",
+  "generated_at_utc": "2026-10-25T18:24:15+00:00",
   "schema": "manyforge.lite6_static_model_manifest.v1",
   "source": {
     "arguments": {
@@ -127,8 +127,8 @@
       "robot_type": "lite",
       "ros2_control_plugin": "isaac"
     },
-    "branch": "jazzy_no_gazebo",
-    "commit": "012731afb9ef1d4289ec45112e8d083ab59a5c1e",
+    "branch": "lyrical-no-gazebo",
+    "commit": "ef7351f90e451a37ef73de69c643b7e85040401a",
     "moveit_joint_limits": {
       "owned_snapshot_path": "upstream_source/xarm_moveit_config/config/lite6/joint_limits.yaml",
       "sha256": "73368cad488a238ba6c4bc72e679a2ae7e39cef3c7aecb83e50d6037255d927c",

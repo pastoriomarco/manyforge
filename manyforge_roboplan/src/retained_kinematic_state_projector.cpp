@@ -153,8 +153,21 @@ RetainedKinematicStateProjector::create(
     std::shared_ptr<std::mutex> scene_mutex,
     RetainedKinematicModelMapInput model_map,
     std::vector<core::RuntimeParticipantBinding> bindings,
-    std::int64_t freshness_budget_ns) {
+    const std::int64_t freshness_budget_ns) {
+  std::vector<std::int64_t> budgets(bindings.size(), freshness_budget_ns);
+  return create(std::move(scene), std::move(scene_mutex), std::move(model_map),
+                std::move(bindings), std::move(budgets));
+}
+
+RetainedKinematicStateProjector
+RetainedKinematicStateProjector::create(
+    std::shared_ptr<roboplan::Scene> scene,
+    std::shared_ptr<std::mutex> scene_mutex,
+    RetainedKinematicModelMapInput model_map,
+    std::vector<core::RuntimeParticipantBinding> bindings,
+    std::vector<std::int64_t> freshness_budgets_ns) {
   if (!scene || !scene_mutex || bindings.empty() ||
+      freshness_budgets_ns.size() != bindings.size() ||
       model_map.retained_bundle_id.empty() || model_map.graph_revision.empty() ||
       model_map.control_bindings.empty()) {
     construction_fail(
@@ -198,7 +211,9 @@ RetainedKinematicStateProjector::create(
   }
   std::set<std::pair<core::ControlBindingId, core::ControlBindingRevision>>
       control_bindings;
-  for (const auto& binding : bindings) {
+  for (std::size_t binding_index = 0U; binding_index < bindings.size();
+       ++binding_index) {
+    const auto& binding = bindings[binding_index];
     const auto& value = binding.value();
     if (value.retained_bundle_id != model_map.retained_bundle_id ||
         value.graph_revision != model_map.graph_revision ||
@@ -207,7 +222,7 @@ RetainedKinematicStateProjector::create(
           "runtime state binding crosses its retained bundle or graph");
     }
     auto context_result = core::make_observed_state_query_context(
-        binding, freshness_budget_ns);
+        binding, freshness_budgets_ns[binding_index]);
     if (!context_result.ok()) {
       construction_fail(context_result.error().message);
     }

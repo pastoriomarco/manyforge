@@ -12,6 +12,7 @@
 #include <set>
 #include <string>
 #include <string_view>
+#include <tuple>
 #include <type_traits>
 #include <utility>
 
@@ -488,10 +489,6 @@ bool ros_gripper_delivery_result_timeout_is_valid(
          timeout_s > 0.0;
 }
 
-bool ros_gripper_state_freshness_timeout_is_valid(const double timeout_s) noexcept {
-  return std::isfinite(timeout_s) && timeout_s >= 0.01 && timeout_s <= 60.0;
-}
-
 namespace {
 
 // Shared by strict retained extraction and the pre-Draft required-row hook.
@@ -500,7 +497,8 @@ std::optional<double> require_ros_gripper_delivery_result_timeout(
     const core::JsonObjectDTO &fields, const std::string_view actuation_kind) {
   const auto timeout = fields.find("delivery_result_timeout_s");
   const bool present = timeout != fields.end();
-  if (fields.size() != (present ? 15U : 14U)) {
+  if (fields.size() != 13U + static_cast<std::size_t>(present) +
+                           static_cast<std::size_t>(fields.contains("pneumatic_io"))) {
     fail_retained_bundle(
         "ros2_control runtime has an invalid gripper target configuration");
   }
@@ -516,16 +514,67 @@ std::optional<double> require_ros_gripper_delivery_result_timeout(
   return *seconds;
 }
 
-double require_ros_gripper_state_freshness_timeout(const core::JsonObjectDTO &fields) {
-  const auto timeout = fields.find("state_freshness_timeout_s");
-  const auto *seconds = timeout == fields.end()
-                            ? nullptr
-                            : std::get_if<double>(&timeout->second.value);
-  if (seconds == nullptr || !ros_gripper_state_freshness_timeout_is_valid(*seconds)) {
-    fail_retained_bundle(
-        "ros2_control runtime has invalid gripper state freshness timeout");
+using PneumaticIo = ros2_control_execution_runtime_contract::Configuration::PneumaticIo;
+
+[[nodiscard]] core::IoSignalId decode_pneumatic_signal(const core::JsonValueDTO &value) {
+  const auto *fields = std::get_if<core::JsonObjectDTO>(&value.value);
+  if (fields == nullptr || fields->size() != 2U ||
+      !fields->contains("controllable_component_id") || !fields->contains("signal_name"))
+    fail_retained_bundle("ros2_control runtime has an invalid pneumatic signal reference");
+  const auto *component = std::get_if<std::string>(&fields->at("controllable_component_id").value);
+  const auto *name = std::get_if<std::string>(&fields->at("signal_name").value);
+  if (component == nullptr || component->empty() || name == nullptr || name->empty())
+    fail_retained_bundle("ros2_control runtime has an invalid pneumatic signal reference");
+  return {core::ControllableComponentId(*component), *name};
+}
+
+[[nodiscard]] std::optional<PneumaticIo> decode_pneumatic_io(
+    const core::JsonObjectDTO &fields, std::string_view actuation, std::string_view output) {
+  const auto found = fields.find("pneumatic_io");
+  if (found == fields.end()) return std::nullopt;
+  const auto *io = std::get_if<core::JsonObjectDTO>(&found->second.value);
+  if (actuation != "pneumatic" || output != "commanded" || io == nullptr ||
+      (io->size() != 1U && io->size() != 2U) || !io->contains("outputs") ||
+      (io->size() == 2U && !io->contains("inputs")))
+    fail_retained_bundle("pneumatic_io requires a commanded pneumatic gripper");
+  const auto *outputs = std::get_if<core::JsonValueDTO::Array>(&io->at("outputs").value);
+  if (outputs == nullptr || outputs->empty() || outputs->size() > 2U)
+    fail_retained_bundle("pneumatic_io requires one or two valve outputs");
+  PneumaticIo result;
+  for (const auto &row : *outputs) {
+    const auto *entry = std::get_if<core::JsonObjectDTO>(&row.value);
+    if (entry == nullptr || entry->size() != 3U || !entry->contains("signal") ||
+        !entry->contains("open_value") || !entry->contains("close_value"))
+      fail_retained_bundle("pneumatic_io has an invalid valve output");
+    const auto *open = std::get_if<bool>(&entry->at("open_value").value);
+    const auto *close = std::get_if<bool>(&entry->at("close_value").value);
+    if (open == nullptr || close == nullptr)
+      fail_retained_bundle("pneumatic_io has invalid valve output levels");
+    result.outputs.push_back({decode_pneumatic_signal(entry->at("signal")), *open, *close});
   }
-  return *seconds;
+  std::sort(result.outputs.begin(), result.outputs.end(), [](const auto &left, const auto &right) {
+    return left.signal < right.signal;
+  });
+  if (std::adjacent_find(result.outputs.begin(), result.outputs.end(),
+                         [](const auto &left, const auto &right) {
+                           return left.signal == right.signal;
+                         }) != result.outputs.end())
+    fail_retained_bundle("pneumatic_io repeats a valve output");
+  if (const auto inputs = io->find("inputs"); inputs != io->end()) {
+    const auto *input_rows = std::get_if<core::JsonObjectDTO>(&inputs->second.value);
+    if (input_rows == nullptr || input_rows->size() > 4U)
+      fail_retained_bundle("pneumatic_io has invalid inputs");
+    for (const auto &[name, value] : *input_rows) {
+      if (name != "open" && name != "closed" && name != "pressure" &&
+          name != "workpiece_grasped")
+        fail_retained_bundle("pneumatic_io has an unknown input");
+      const auto *entry = std::get_if<core::JsonObjectDTO>(&value.value);
+      if (entry == nullptr || entry->size() != 1U || !entry->contains("signal"))
+        fail_retained_bundle("pneumatic_io has an invalid input reference");
+      result.inputs.emplace(name, decode_pneumatic_signal(entry->at("signal")));
+    }
+  }
+  return result;
 }
 
 } // namespace
@@ -552,18 +601,18 @@ decode_ros2_control_execution_gripper_target_configurations(
     }
     const auto delivery_timeout =
         require_ros_gripper_delivery_result_timeout(*fields, *kind);
-    const auto freshness_timeout = require_ros_gripper_state_freshness_timeout(*fields);
+    auto pneumatic_io = decode_pneumatic_io(*fields, *kind, *mode);
     auto common = *fields;
     common.erase("output_mode");
     common.erase("delivery_result_timeout_s");
-    common.erase("state_freshness_timeout_s");
+    common.erase("pneumatic_io");
     auto decoded = decode_execution_gripper_target_configurations(
         core::JsonValueDTO::Array{core::JsonValueDTO{std::move(common)}},
         "ros2_control runtime configuration");
     result.push_back(Typed{std::move(decoded.front()), *mode == "none"
                             ? core::GripperOutputMode::kNone
-                            : core::GripperOutputMode::kCommanded,
-                            freshness_timeout, delivery_timeout});
+                            : core::GripperOutputMode::kCommanded, delivery_timeout,
+                            std::move(pneumatic_io)});
   }
   std::sort(result.begin(), result.end(), [](const auto &left, const auto &right) {
     return std::tie(left.controllable_component_id, left.command_target_id) <
@@ -575,6 +624,93 @@ decode_ros2_control_execution_gripper_target_configurations(
       }) != result.end()) {
     fail_retained_bundle("ros2_control runtime repeats a gripper target configuration");
   }
+  return result;
+}
+
+std::vector<ros2_control_execution_runtime_contract::Configuration::ComponentStream>
+decode_ros2_control_execution_component_streams(
+    const core::JsonObjectDTO &configuration) {
+  namespace contract = ros2_control_execution_runtime_contract;
+  using Key = std::pair<std::string, std::string>;
+  static const core::JsonValueDTO::Array kNoRows;
+  const auto rows = [&](const std::string_view name) -> const core::JsonValueDTO::Array & {
+    const auto found = configuration.find(name);
+    const auto *array = found == configuration.end()
+                            ? nullptr
+                            : std::get_if<core::JsonValueDTO::Array>(&found->second.value);
+    return array == nullptr ? kNoRows : *array;
+  };
+  const auto member = [](const core::JsonValueDTO &row,
+                         const std::string_view name) -> const core::JsonValueDTO * {
+    const auto *object = std::get_if<core::JsonObjectDTO>(&row.value);
+    const auto found = object == nullptr ? core::JsonObjectDTO::const_iterator{}
+                                         : object->find(name);
+    return object == nullptr || found == object->end() ? nullptr : &found->second;
+  };
+  const auto text = [&](const core::JsonValueDTO &row, const std::string_view name) {
+    const auto *value = member(row, name);
+    const auto *result = value == nullptr ? nullptr : std::get_if<std::string>(&value->value);
+    if (result == nullptr) {
+      fail_retained_bundle("ros2_control runtime has an invalid component stream row");
+    }
+    return *result;
+  };
+  // Every hosted component declares its measured joints. A Real pneumatic
+  // gripper has no gripper-feedback stream; other grippers keep theirs.
+  std::set<Key> required;
+  std::set<std::string> real_components;
+  for (const auto &row : rows("controller_profiles")) {
+    const auto component = text(row, "controllable_component_id");
+    required.emplace(component,
+                     std::string(contract::kMeasuredJointsStreamId));
+    if (member(row, "real_profile") != nullptr)
+      real_components.insert(component);
+  }
+  for (const auto &row : rows("gripper_target_configurations")) {
+    const auto component = text(row, "controllable_component_id");
+    if (!real_components.contains(component) || text(row, "actuation_kind") != "pneumatic")
+      required.emplace(component, std::string(contract::kGripperFeedbackStreamId));
+  }
+  std::vector<contract::Configuration::ComponentStream> result;
+  std::set<Key> declared;
+  for (const auto &row : rows("component_streams")) {
+    const auto *object = std::get_if<core::JsonObjectDTO>(&row.value);
+    const auto *budget_value = member(row, "budget_ns");
+    const auto *budget =
+        budget_value == nullptr ? nullptr : std::get_if<double>(&budget_value->value);
+    // Local parse: the deployment authoring targets do not link the Core
+    // stream registry (same as the override codec).
+    const auto severity_text = text(row, "severity");
+    const auto recovery_text = text(row, "recovery");
+    const auto severity = severity_text == "fault"      ? core::StreamSeverityDTO::kFault
+                          : severity_text == "blocking" ? core::StreamSeverityDTO::kBlocking
+                                                        : core::StreamSeverityDTO::kWarning;
+    const auto recovery = recovery_text == "ack" ? core::StreamRecoveryDTO::kAck
+                                                 : core::StreamRecoveryDTO::kAuto;
+    if (object == nullptr || object->size() != 5U || budget == nullptr ||
+        std::trunc(*budget) != *budget || *budget < 1e7 || *budget > 6e10 ||
+        (severity_text != "fault" && severity_text != "blocking" &&
+         severity_text != "warning") ||
+        (recovery_text != "ack" && recovery_text != "auto")) {
+      fail_retained_bundle("ros2_control runtime has an invalid component stream row");
+    }
+    Key key{text(row, "controllable_component_id"), text(row, "stream_id")};
+    if (!declared.insert(key).second) {
+      fail_retained_bundle("ros2_control runtime repeats a component stream");
+    }
+    result.push_back({core::ControllableComponentId(key.first), key.second,
+                      static_cast<std::int64_t>(*budget), severity, recovery});
+  }
+  if (declared != required) {
+    fail_retained_bundle(
+        "ros2_control runtime must declare exactly the measured_joints stream of "
+        "every hosted component and the gripper_feedback stream of every "
+        "gripper component except a Real pneumatic gripper");
+  }
+  std::sort(result.begin(), result.end(), [](const auto &left, const auto &right) {
+    return std::tie(left.controllable_component_id, left.stream_id) <
+           std::tie(right.controllable_component_id, right.stream_id);
+  });
   return result;
 }
 
@@ -750,6 +886,7 @@ bool require_ros2_control_execution_runtime_required_rows(
   // schema normalization. Keep position-positive validation at that boundary
   // while allowing DX777's zero pneumatic dwell, without imposing unrelated
   // retained-decoder requirements on authoring.
+  std::vector<PneumaticIo> pneumatic_configs;
   if (const auto found = unit.configuration.find("gripper_target_configurations");
       found != unit.configuration.end()) {
     const auto *rows = std::get_if<core::JsonValueDTO::Array>(&found->second.value);
@@ -781,15 +918,47 @@ bool require_ros2_control_execution_runtime_required_rows(
             "ros2_control runtime configuration has invalid gripper target semantics");
       }
       (void)require_ros_gripper_delivery_result_timeout(*fields, *kind);
-      (void)require_ros_gripper_state_freshness_timeout(*fields);
+      if (auto io = decode_pneumatic_io(*fields, *kind, *mode))
+        pneumatic_configs.push_back(std::move(*io));
     }
   }
+  (void)decode_ros2_control_execution_component_streams(unit.configuration);
   const auto io_catalog =
       ResolveRetainedIoSignalCatalog(graph, unit.runtime_unit_id);
   if (!io_catalog.ok()) {
     fail_retained_bundle(
         "ros2_control runtime has invalid retained I/O signals: " +
         io_catalog.error().details.at("reason"));
+  }
+  if (!pneumatic_configs.empty()) {
+    // A gripper may reference signals on any I/O component in the retained
+    // cell, including one hosted by a different runtime unit.
+    const auto cell_catalog = ResolveRetainedIoSignalCatalog(graph);
+    if (!cell_catalog.ok())
+      fail_retained_bundle("pneumatic_io cannot resolve the retained I/O catalog");
+    const auto require_signal = [&](const core::IoSignalId &id,
+                                    const core::IoSignalDirection direction) {
+      const auto &signals = cell_catalog.value();
+      const auto match = std::find_if(signals.begin(), signals.end(), [&](const auto &row) {
+        return row.descriptor.signal_id == id;
+      });
+      if (match == signals.end() ||
+          std::count_if(signals.begin(), signals.end(), [&](const auto &row) {
+            return row.descriptor.signal_id == id;
+          }) != 1 || match->descriptor.direction != direction ||
+          match->descriptor.value_type != core::IoSignalValueType::kBoolean) {
+        fail_retained_bundle("pneumatic_io references a missing or incompatible signal: " +
+                             id.controllable_component_id.value() + "/" + id.name);
+      }
+    };
+    for (const auto &configuration : pneumatic_configs) {
+      for (const auto &output : configuration.outputs)
+        require_signal(output.signal, core::IoSignalDirection::kOutput);
+      for (const auto &[unused, input] : configuration.inputs) {
+        static_cast<void>(unused);
+        require_signal(input, core::IoSignalDirection::kInput);
+      }
+    }
   }
   const auto io_devices =
       ResolveRetainedIoProviderDevices(graph, unit.runtime_unit_id);
@@ -804,6 +973,12 @@ bool require_ros2_control_execution_runtime_required_rows(
     fail_retained_bundle(
         "ros2_control runtime has invalid retained pose sources: " +
         pose_sources.error().details.at("reason"));
+  }
+  const auto ai_models = ResolveRetainedAiModels(graph, unit.runtime_unit_id);
+  if (!ai_models.ok()) {
+    fail_retained_bundle(
+        "ros2_control runtime has invalid retained AI models: " +
+        ai_models.error().details.at("reason"));
   }
   const bool has_actuator = std::any_of(
       graph.control_bindings.begin(), graph.control_bindings.end(),
@@ -822,7 +997,7 @@ bool require_ros2_control_execution_runtime_required_rows(
                                           component.runtime_unit_ids.end(),
                                           unit.runtime_unit_id) !=
                                 component.runtime_unit_ids.end();
-            // Model-free components: I/O devices and pose sources.
+            // Model-free components: I/O devices, pose sources, AI models.
             return !hosted ||
                    std::any_of(
                        io_catalog.value().begin(), io_catalog.value().end(),
@@ -836,6 +1011,12 @@ bool require_ros2_control_execution_runtime_required_rows(
                        pose_sources.value().begin(), pose_sources.value().end(),
                        [&](const auto &source) {
                          return source.controllable_component_id ==
+                                component.controllable_component_id;
+                       }) ||
+                   std::any_of(
+                       ai_models.value().begin(), ai_models.value().end(),
+                       [&](const auto &model) {
+                         return model.controllable_component_id ==
                                 component.controllable_component_id;
                        });
           });
@@ -891,7 +1072,7 @@ std::string ros2_control_execution_runtime_implementation_revision() {
   return contract_revision(
       "runtime-implementation",
       "ros2-control-execution-host;retained-addressed-kernel;external-"
-      "controller-observation-only;commanded-simulation-authority;"
+      "controller-observation-only;per-component-state-authority;"
       "jtc-follow-joint-trajectory;topic-gripper-transport;"
       "authored-target-tcp-linear-speed-maximum;"
       "planner-scene-projection-v1;logical-scene-services-v1;"
@@ -1125,6 +1306,30 @@ canonical_from_json(const core::JsonValueDTO &value) {
   return json_value_to_canonical(value);
 }
 
+ros2_control_execution_runtime_contract::Configuration::ToolPayload
+decode_ros2_control_tool_payload(const core::JsonValueDTO &value) {
+  const RetainedBundleError invalid(
+      "ros2_control controller profile has an invalid tool_payload");
+  const auto *payload = std::get_if<core::JsonObjectDTO>(&value.value);
+  if (payload == nullptr || payload->size() != 2U) throw invalid;
+  const auto mass = payload->find("mass_kg");
+  const auto center = payload->find("center_of_mass_m");
+  if (mass == payload->end() || center == payload->end()) throw invalid;
+  const auto *kg = std::get_if<double>(&mass->second.value);
+  const auto *xyz = std::get_if<core::JsonValueDTO::Array>(&center->second.value);
+  if (kg == nullptr || !std::isfinite(*kg) || *kg < 0.0 || xyz == nullptr ||
+      xyz->size() != 3U)
+    throw invalid;
+  ros2_control_execution_runtime_contract::Configuration::ToolPayload result{
+      *kg, {}};
+  for (std::size_t axis = 0U; axis < 3U; ++axis) {
+    const auto *metres = std::get_if<double>(&(*xyz)[axis].value);
+    if (metres == nullptr || !std::isfinite(*metres)) throw invalid;
+    result.center_of_mass_m[axis] = *metres;
+  }
+  return result;
+}
+
 } // namespace manyforge::deployment::detail
 
 namespace manyforge::deployment::ros2_control_execution_runtime_contract {
@@ -1287,7 +1492,6 @@ decode_fault_stop_profile(const core::JsonValueDTO &encoded) {
 
 CanonicalValue empty_host_configuration() {
   CanonicalValue::Object configuration{
-      {"mode", CanonicalValue("commanded_sim")},
       {"planner_rng_seed", CanonicalValue(12345.0)},
       {"execution_tick_hz", CanonicalValue(100.0)},
       {"collision_monitor_period_ms", CanonicalValue(50.0)},
@@ -1419,13 +1623,11 @@ require_configuration(const RetainedBundle &retained_bundle,
       detail::require_ros2_control_execution_runtime_required_rows(
           retained_bundle.value().cell_graph, unit);
 
-  const auto *mode = std::get_if<std::string>(&require_member("mode").value);
   const auto *profiles = std::get_if<core::JsonValueDTO::Array>(
       &require_member("controller_profiles").value);
   const auto *positions = std::get_if<core::JsonValueDTO::Array>(
       &require_member("initial_joint_positions_rad").value);
-  if (mode == nullptr || *mode != "commanded_sim" || profiles == nullptr ||
-      positions == nullptr ||
+  if (profiles == nullptr || positions == nullptr ||
       (empty_host && (!profiles->empty() || !positions->empty()))) {
     throw RetainedBundleError("ros2_control runtime configuration has an "
                               "unsupported mode, profile, or initial state");
@@ -1466,18 +1668,38 @@ require_configuration(const RetainedBundle &retained_bundle,
     const auto component = text("controllable_component_id");
     auto isaac = text("isaac_profile");
     auto mock = text("mock_profile");
-    if (!component.has_value() || isaac.has_value() == mock.has_value() ||
-        object->size() != (object->contains("frame_prefix") ? 3U : 2U) ||
+    // CP8 step 1 (temporary): the third selector, with its address reference.
+    auto real = text("real_profile");
+    auto device_address_ref = text("device_address_ref");
+    // D11: the optional tool payload.
+    std::optional<Configuration::ToolPayload> tool_payload;
+    if (object != nullptr) {
+      if (const auto found = object->find("tool_payload"); found != object->end())
+        tool_payload = detail::decode_ros2_control_tool_payload(found->second);
+    }
+    const std::size_t selectors = static_cast<std::size_t>(isaac.has_value()) +
+                                  static_cast<std::size_t>(mock.has_value()) +
+                                  static_cast<std::size_t>(real.has_value());
+    if (!component.has_value() || selectors != 1U ||
+        real.has_value() != device_address_ref.has_value() ||
+        object->size() != (object->contains("frame_prefix") ? 3U : 2U) +
+                              (real.has_value() ? 1U : 0U) +
+                              (tool_payload.has_value() ? 1U : 0U) ||
         (isaac.has_value() && *isaac != "lite6" && *isaac != "ur10e") ||
         (mock.has_value() && *mock != "lite6_lite_gripper" &&
          *mock != "ur10e_robotiq_2f_140" && *mock != "ur5_roboplan" &&
-         *mock != "ur5e_robotiq_2f_85")) {
+         *mock != "ur5e_robotiq_2f_85") ||
+        (real.has_value() && *real != "lite6_real")) {
       throw RetainedBundleError("ros2_control runtime configuration has an "
                                 "unsupported mode, profile, or initial state");
     }
-    result.controller_profiles.push_back(Configuration::ControllerProfile{
+    Configuration::ControllerProfile profile{
         core::ControllableComponentId(*component), std::move(isaac),
-        std::move(mock), std::move(frame_prefix)});
+        std::move(mock), std::move(frame_prefix)};
+    profile.real_profile = std::move(real);
+    profile.device_address_ref = std::move(device_address_ref);
+    profile.tool_payload = tool_payload;
+    result.controller_profiles.push_back(std::move(profile));
   }
   std::sort(result.controller_profiles.begin(), result.controller_profiles.end(),
             [](const auto &left, const auto &right) {
@@ -1612,6 +1834,19 @@ require_configuration(const RetainedBundle &retained_bundle,
   }
   for (const auto &source : pose_sources.value())
     result.pose_sources.push_back(decode_pose_source(source));
+  const auto ai_models = ResolveRetainedAiModels(
+      retained_bundle.value().cell_graph, runtime_unit_id);
+  if (!ai_models.ok()) {
+    throw RetainedBundleError(
+        "ros2_control runtime has invalid AI models: " +
+        ai_models.error().details.at("reason"));
+  }
+  for (const auto &model : ai_models.value())
+    result.ai_models.push_back({model.controllable_component_id,
+                                model.base_url, model.model,
+                                model.api_key_env});
+  result.component_streams =
+      detail::decode_ros2_control_execution_component_streams(unit.configuration);
   result.planner_rng_seed = require_uint32("planner_rng_seed");
   result.execution_tick_hz = require_uint32("execution_tick_hz");
   result.collision_monitor_period_ms =
@@ -1680,7 +1915,9 @@ Configuration require_component_configuration(
   };
   std::erase_if(result.controller_profiles, unrelated);
   std::erase_if(result.pose_sources, unrelated);
+  std::erase_if(result.ai_models, unrelated);
   std::erase_if(result.default_fault_stop_profiles, unrelated);
+  std::erase_if(result.component_streams, unrelated);
   return result;
 }
 
@@ -1711,7 +1948,8 @@ CanonicalValue component_configuration_projection(
                  name == "default_fault_stop_profiles" ||
                  name == "gripper_target_configurations" ||
                  name == "io_signals" || name == "io_provider_devices" ||
-                 name == "pose_sources") {
+                 name == "pose_sources" || name == "ai_models" ||
+                 name == "component_streams") {
         CanonicalValue::Array rows;
         for (const auto &row : value.as_array()) {
           const auto *owner = row.find_object_member("controllable_component_id");
@@ -1744,6 +1982,30 @@ find_pose_source(const Configuration &configuration,
   return found == configuration.pose_sources.end() ? nullptr : &*found;
 }
 
+const Configuration::AiModel *
+find_ai_model(const Configuration &configuration,
+              const core::ControllableComponentId &component_id) {
+  const auto found = std::find_if(
+      configuration.ai_models.begin(), configuration.ai_models.end(),
+      [&](const auto &model) {
+        return model.controllable_component_id == component_id;
+      });
+  return found == configuration.ai_models.end() ? nullptr : &*found;
+}
+
+const Configuration::ComponentStream *
+find_component_stream(const Configuration &configuration,
+                      const core::ControllableComponentId &component,
+                      const std::string_view stream_id) {
+  const auto found = std::find_if(
+      configuration.component_streams.begin(),
+      configuration.component_streams.end(), [&](const auto &stream) {
+        return stream.controllable_component_id == component &&
+               stream.stream_id == stream_id;
+      });
+  return found == configuration.component_streams.end() ? nullptr : &*found;
+}
+
 const Configuration::ControllerProfile *
 find_controller_profile(const Configuration &configuration,
                         const core::ControllableComponentId &component_id) {
@@ -1753,6 +2015,43 @@ find_controller_profile(const Configuration &configuration,
         return profile.controllable_component_id == component_id;
       });
   return found == configuration.controller_profiles.end() ? nullptr : &*found;
+}
+
+ControllerSimulatorDependency
+controller_simulator_dependency(const Configuration::ControllerProfile &profile) {
+  return profile.isaac_profile.has_value() ? ControllerSimulatorDependency::kIsaac
+                                           : ControllerSimulatorDependency::kNone;
+}
+
+std::string_view to_string(const ControllerSimulatorDependency dependency) noexcept {
+  return dependency == ControllerSimulatorDependency::kIsaac ? "isaac" : "none";
+}
+
+CanonicalValue component_simulator_dependencies(const RetainedBundle &bundle) {
+  std::vector<std::pair<std::string, std::string_view>> rows;
+  for (const auto &unit : bundle.value().cell_graph.runtime_units) {
+    if (unit.runtime_profile_id.value() != kRuntimeProfileId) continue;
+    for (const auto &profile :
+         require_configuration(bundle, unit.runtime_unit_id).controller_profiles) {
+      rows.emplace_back(profile.controllable_component_id.value(),
+                        to_string(controller_simulator_dependency(profile)));
+    }
+  }
+  std::sort(rows.begin(), rows.end());
+  if (std::adjacent_find(rows.begin(), rows.end(), [](const auto &left, const auto &right) {
+        return left.first == right.first;
+      }) != rows.end()) {
+    throw RetainedBundleError("ROS controller profiles repeat a component");
+  }
+  CanonicalValue::Array result;
+  result.reserve(rows.size());
+  for (const auto &[component, simulator] : rows) {
+    result.emplace_back(CanonicalValue::Object{
+        {"controllable_component_id", CanonicalValue(component)},
+        {"simulator", CanonicalValue(std::string(simulator))},
+    });
+  }
+  return CanonicalValue(std::move(result));
 }
 
 std::string implementation_revision() {

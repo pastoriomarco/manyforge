@@ -249,6 +249,15 @@ export interface IoSignalBinding {
   targetRoleId: string;
   controllableComponentId: string;
   commandTargetId: string;
+  outputCommand?: {
+    programId: string;
+    programRevision: string;
+    programRunId: string;
+    componentRoleId: string;
+    capabilityId: string;
+    commandSchemaId: string;
+    commandSchemaRevision: string;
+  };
   signalRoleBindings: Array<{
     resourceRoleId: string;
     signalName: string;
@@ -274,7 +283,7 @@ export function ioSignalBindingsAt(value: unknown, path: string): IoSignalBindin
     const at = `${path}[${index}]`;
     const row = objectAt(entry, at);
     allowedKeysAt(row, ['program_binding_id', 'target_role_id', 'controllable_component_id',
-      'command_target_id', 'signal_role_bindings'], ['signal_sources'], at);
+      'command_target_id', 'signal_role_bindings'], ['signal_sources', 'output_command'], at);
     // Host-owned provider projection (SX/DX-1494): validated for shape, not consumed.
     const sources = row.signal_sources === undefined ? [] : row.signal_sources;
     if (!Array.isArray(sources)) return fail(`${at}.signal_sources`, 'an array');
@@ -315,12 +324,32 @@ export function ioSignalBindingsAt(value: unknown, path: string): IoSignalBindin
     });
     const programBindingId = stringAt(row.program_binding_id, `${at}.program_binding_id`);
     if (!/^sha256:[0-9a-f]{64}$/.test(programBindingId)) return fail(`${at}.program_binding_id`, 'a sha256 digest');
+    const output = row.output_command === undefined ? undefined : objectAt(row.output_command, `${at}.output_command`);
+    let outputCommand: IoSignalBinding['outputCommand'];
+    if (output !== undefined) {
+      const outputPath = `${at}.output_command`;
+      exactKeysAt(output, ['program_id', 'program_revision', 'program_run_id', 'component_role_id', 'capability_id',
+        'command_schema_id', 'command_schema_revision'], outputPath);
+      const nonempty = (key: string) => {
+        const value = stringAt(output[key], `${outputPath}.${key}`);
+        if (value === '') return fail(`${outputPath}.${key}`, 'a non-empty string');
+        return value;
+      };
+      outputCommand = { programId: nonempty('program_id'), programRevision: nonempty('program_revision'),
+        programRunId: nonempty('program_run_id'),
+        componentRoleId: nonempty('component_role_id'), capabilityId: nonempty('capability_id'),
+        commandSchemaId: nonempty('command_schema_id'), commandSchemaRevision: nonempty('command_schema_revision') };
+      if (outputCommand.capabilityId !== 'io.gpio.set_output' || !signalRoleBindings.some((signal) => signal.direction === 'output')) {
+        return fail(outputPath, 'an output capability on a target with an output signal');
+      }
+    }
     return {
       programBindingId,
       targetRoleId: stringAt(row.target_role_id, `${at}.target_role_id`),
       controllableComponentId: stringAt(row.controllable_component_id, `${at}.controllable_component_id`),
       commandTargetId: stringAt(row.command_target_id, `${at}.command_target_id`),
       signalRoleBindings,
+      ...(outputCommand === undefined ? {} : { outputCommand }),
     };
   });
   const order = (row: IoSignalBinding) => [row.controllableComponentId, row.commandTargetId,

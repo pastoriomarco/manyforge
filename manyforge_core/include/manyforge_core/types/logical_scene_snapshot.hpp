@@ -153,8 +153,8 @@ struct SceneObjectSnapshotDTO final {
 };
 
 /// Grasp-lost bound of a carried object whose offset is measured: a measured
-/// offset farther than either bound from the attach-time offset means the
-/// object is no longer held (`carried_object_lost`).
+/// offset farther than either bound from the first measured offset of the
+/// attachment means the object is no longer held (`carried_object_lost`).
 struct CarriedObjectGraspLostBoundDTO final {
   double translation_m{};
   double rotation_rad{};
@@ -167,10 +167,9 @@ struct CarriedObjectGraspLostBoundDTO final {
                          const CarriedObjectGraspLostBoundDTO&) = default;
 };
 
-/// The attach node's bound with the offset the attachment started from.
+/// The attach node's grasp-lost bound.
 struct CarriedObjectGraspLostCheckDTO final {
   CarriedObjectGraspLostBoundDTO bound;
-  Pose3DTO attach_pose_in_carrier_frame;
   friend bool operator==(const CarriedObjectGraspLostCheckDTO&,
                          const CarriedObjectGraspLostCheckDTO&) = default;
 };
@@ -445,10 +444,7 @@ inline bool CarriedObjectAttachmentDTO::locally_valid() const noexcept {
       controllable_component_id.empty() || command_target_id.empty() ||
       !logical_scene_detail::ValidFrameRef(carrier_frame_ref) ||
       !logical_scene_detail::FinitePose(pose_in_carrier_frame) ||
-      (grasp_lost_check &&
-       (!grasp_lost_check->bound.valid() ||
-        !logical_scene_detail::FinitePose(
-            grasp_lost_check->attach_pose_in_carrier_frame))) ||
+      (grasp_lost_check && !grasp_lost_check->bound.valid()) ||
       !logical_scene_detail::StrictlyIncreasing(
           touch_body_roles,
           [](const CollisionBodyRoleId& role) -> const std::string& {

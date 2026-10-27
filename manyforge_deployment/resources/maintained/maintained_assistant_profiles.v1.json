@@ -2,27 +2,9 @@
   "api_version": "manyforge.maintained_assistant_profiles.v1",
   "mode_profiles": {
     "scene_authoring": {
-      "query": {
-        "enabled": true,
-        "description": "Read-only inspection mode for assistant questions.",
-        "grant_policy": {
-          "session_kind": null,
-          "approval_mode": null,
-          "review_policy": "not_required"
-        },
-        "catalog": {
-          "skills": [],
-          "tools": [
-            "inspect_isaac_scene",
-            "program_read",
-            "scene_inspect"
-          ],
-          "nodes": []
-        }
-      },
       "composer-assistant": {
         "enabled": true,
-        "description": "Scene-authoring proposal mode for Composer.",
+        "description": "Scene and Program authoring mode for Composer: edits land in the Program Draft.",
         "grant_policy": {
           "session_kind": null,
           "approval_mode": null,
@@ -41,8 +23,6 @@
             "program_draft_remove_parameters",
             "program_draft_upsert_parameters",
             "program_read",
-            "propose_scene_object_nodes",
-            "propose_scene_objects",
             "scene_draft_add_object",
             "scene_draft_remove_objects",
             "scene_draft_update_object",
@@ -77,6 +57,10 @@
             "scene.update_object_pose",
             "scene.upsert_object",
             "sequence",
+            "simulation.reset",
+            "simulation.set_entity_pose",
+            "simulation.set_state",
+            "simulation.step",
             "timer"
           ]
         }

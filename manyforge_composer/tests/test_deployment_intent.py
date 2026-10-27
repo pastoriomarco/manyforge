@@ -483,14 +483,12 @@ def _pose_source() -> dict:
         "configuration": {
             "runtime_kind": "pose_source",
             "runtime_configuration": {
-                "pose_sources": [
-                    {
-                        "controllable_component_id": "isaac_scene_objects",
-                        "simulation_poll_period_ms": 250,
-                        "simulation_entities": [],
-                        "detection3d_sources": [],
-                    }
-                ]
+                "stream_budget_ns": 1_000_000_000,
+                "simulation": {
+                    "poll_period_ms": 250,
+                    "source_coordinate_frame_id": "universe",
+                    "target_frame_id": "universe",
+                },
             },
         },
     }
@@ -527,11 +525,77 @@ def test_pose_source_component_refuses_physical_fields(mutate, message: str) -> 
         validate_deployment_intent(intent, source="test")
 
 
+def _ai_model() -> dict:
+    return {
+        "component_id": "assistant_model",
+        "component_profile_id": "ai_model_v0",
+        "target_settings": {},
+        "configuration": {
+            "runtime_kind": "ai_model",
+            "runtime_configuration": {
+                "base_url": "http://127.0.0.1:8000/v1",
+                "model": "gemma4-12b-it-gguf",
+                "api_key_env": None,
+            },
+        },
+    }
+
+
+def test_ai_model_component_is_model_free_and_preserved() -> None:
+    intent = _intent()
+    intent["components"].append(_ai_model())
+    normalized = validate_deployment_intent(intent, source="test")
+    rows = {row["component_id"]: row for row in normalized["components"]}
+    assert rows["assistant_model"] == _ai_model()
+    assert [ref for _, ref, _ in iter_source_references(intent)] == [
+        ref for _, ref, _ in iter_source_references(_intent())
+    ]
+
+
+def test_ai_model_component_refuses_model_source() -> None:
+    intent = _intent()
+    ai_model = _ai_model()
+    ai_model["model_source"] = {}
+    intent["components"].append(ai_model)
+    with pytest.raises(DeploymentIntentError, match="model_source"):
+        validate_deployment_intent(intent, source="test")
+
+
+def test_assistant_model_components_round_trip_sorted() -> None:
+    intent = _intent()
+    intent["assistant_profile_id"] = "semantic_shape_selection"
+    intent["assistant_model_components"] = {
+        "selection_model": "selection_model",
+        "assistant_model": "chat_model",
+    }
+    normalized = validate_deployment_intent(intent, source="test")
+    assert list(normalized["assistant_model_components"].items()) == [
+        ("assistant_model", "chat_model"),
+        ("selection_model", "selection_model"),
+    ]
+    intent["assistant_model_components"] = {"assistant_model": "Not An Id"}
+    with pytest.raises(DeploymentIntentError, match="assistant_model_components"):
+        validate_deployment_intent(intent, source="test")
+
+
+def test_assistant_profile_aliases_come_from_the_maintained_profiles() -> None:
+    from manyforge_composer.backend.routes_deployment_draft import (
+        assistant_profile_aliases,
+    )
+
+    profiles = {
+        row["profileId"]: row["modelEndpointAliases"]
+        for row in assistant_profile_aliases()["profiles"]
+    }
+    assert profiles["assistant_scene_authoring"] == ["assistant_model"]
+    assert profiles["semantic_shape_selection"] == ["assistant_model", "selection_model"]
+
+
 def test_appending_model_free_components_is_a_composition_change() -> None:
     from manyforge_composer.backend.state import _controllable_composition_change_kinds
     before = validate_deployment_intent(_intent(), source="test")
     after = validate_deployment_intent(_intent(), source="test")
-    after["components"] += [_io_device(), _pose_source()]
+    after["components"] += [_io_device(), _pose_source(), _ai_model()]
     assert _controllable_composition_change_kinds(before, after) == (
         "controllable_components",
     )

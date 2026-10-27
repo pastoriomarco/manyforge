@@ -12,6 +12,7 @@
 
 #include <manyforge_core/component_lifecycle_plan_catalog_codec.hpp>
 #include <manyforge_roboplan/retained_externally_managed_lifecycle_ports.hpp>
+#include <manyforge_xarm_control/lifecycle_profile.hpp>
 
 namespace manyforge::roboplan_backend {
 namespace {
@@ -23,7 +24,22 @@ namespace {
           {{"reason", std::move(reason)}}};
 }
 
+// R7 package 4: a Real xArm-family arm's provider has its own catalog (data);
+// every other physical ROS provider uses the shared ros2_control catalog.
+[[nodiscard]] bool real_xarm_provider(const core::ProviderManifestId &id) {
+  return id.value() ==
+         xarm_control::kXArmRos2ControlLifecycleProviderManifestId;
+}
+
 } // namespace
+
+core::Result<core::BrandLifecyclePlanCatalogDTO>
+make_retained_physical_ros2_control_lifecycle_catalog(
+    const core::ProviderManifestDTO &manifest) {
+  if (real_xarm_provider(manifest.provider_manifest_id))
+    return xarm_control::make_xarm_ros2_control_lifecycle_catalog(manifest);
+  return make_retained_ros2_control_lifecycle_catalog(manifest);
+}
 
 std::vector<core::LifecycleIntentPlanDTO>
 retained_ros2_control_lifecycle_plans() {
@@ -258,7 +274,8 @@ RetainedHostLifecycleProduct::Create(
     // A generic catalog already occupying this key cannot bypass the original
     // physical factory's fixed provider requirement.
     if (selected_path->provider_manifest_id.value() !=
-        kRos2ControlLifecycleProviderManifestId)
+            kRos2ControlLifecycleProviderManifestId &&
+        !real_xarm_provider(selected_path->provider_manifest_id))
       return core::Result<std::unique_ptr<RetainedHostLifecycleProduct>>::Err(
           product_error(
               "ros2_control_lifecycle_product_unsupported",
@@ -279,7 +296,7 @@ RetainedHostLifecycleProduct::Create(
                           "provider_manifest_not_found"));
       }
       auto catalog =
-          make_retained_ros2_control_lifecycle_catalog(manifest->value());
+          make_retained_physical_ros2_control_lifecycle_catalog(manifest->value());
       if (!catalog.ok()) {
         return core::Result<std::unique_ptr<RetainedHostLifecycleProduct>>::Err(
             catalog.error());

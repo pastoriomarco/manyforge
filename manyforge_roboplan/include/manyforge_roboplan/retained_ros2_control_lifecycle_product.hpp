@@ -33,9 +33,18 @@ retained_ros2_control_lifecycle_plans();
 make_retained_ros2_control_lifecycle_catalog(
     const core::ProviderManifestDTO &manifest);
 
+/// The catalog of one physical ROS provider (R7 package 4): a Real xArm-family
+/// arm's provider (`manyforge.provider.ros2_control.xarm`) has its own plans
+/// (`manyforge_xarm_control`); every other physical provider uses the shared
+/// ros2_control catalog above. Both are anchored by the exact manifest.
+[[nodiscard]] core::Result<core::BrandLifecyclePlanCatalogDTO>
+make_retained_physical_ros2_control_lifecycle_catalog(
+    const core::ProviderManifestDTO &manifest);
+
 /// Existing immutable host catalog/brand-port collection. The historical
 /// source/CMake path stays fixed while actual generic driver records join the
-/// same collection as the physical ROS controller providers.
+/// same collection as the physical ROS controller providers, each with
+/// `make_retained_physical_ros2_control_lifecycle_catalog`.
 class RetainedHostLifecycleProduct final {
 public:
   [[nodiscard]] static core::Result<

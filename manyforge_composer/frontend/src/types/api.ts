@@ -154,6 +154,7 @@ export interface FileBrowserResponse {
   currentPath: string;
   parentPath: string | null;
   roots: string[];
+  projectRoots?: Array<{ hostPath: string; containerPath: string }>;
   entries: FileBrowserEntry[];
 }
 
@@ -202,7 +203,6 @@ export interface ProgramSceneResource {
   pose: ProgramScenePose;
   resource_roles?: string[];
   metadata?: Record<string, JsonValue>;
-  collision_policy_ids?: string[];
 }
 
 export interface ProgramViewerMetadata {

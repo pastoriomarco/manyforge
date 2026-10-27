@@ -1,6 +1,6 @@
 import { describe, expect, it } from 'vitest';
 
-import { componentStreamHealthPresentation, streamCodeLabel } from './componentStreamHealthPresentation';
+import { componentStreamHealthPresentation, streamCodeLabel, streamLabel } from './componentStreamHealthPresentation';
 import type { CCLCComponentSnapshot, CCLCStreamHealth } from '../types/cclc';
 
 function stream(overrides: Partial<CCLCStreamHealth>): CCLCStreamHealth {
@@ -73,5 +73,12 @@ describe('componentStreamHealthPresentation', () => {
     expect(streamCodeLabel('component_stream_stale')).toBe('stale');
     expect(streamCodeLabel('isaac_simulation_stopped')).toBe('simulation stopped');
     expect(streamCodeLabel('vendor_x')).toBe('vendor_x');
+  });
+
+  it('labels declared stream ids and keeps unknown ids', () => {
+    expect(streamLabel('measured_joints')).toBe('Measured joints');
+    expect(streamLabel('gripper_feedback')).toBe('Gripper feedback');
+    expect(streamLabel('poses/part/before_planning')).toBe('Pose part / before_planning');
+    expect(streamLabel('sim_clock')).toBe('sim_clock');
   });
 });

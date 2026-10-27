@@ -2,6 +2,9 @@
 
 #include <algorithm>
 #include <chrono>
+#include <cmath>
+#include <iterator>
+#include <span>
 #include <mutex>
 #include <stdexcept>
 #include <thread>
@@ -13,24 +16,37 @@
 namespace manyforge::roboplan_backend {
 namespace {
 
-/// CP9: the gripper's `gripper_feedback` stream where the backend subscribes
-/// to raw feedback (Isaac effort transport): `fault` + `ack` (a stale gripper
-/// after the target was reached is a lost provider, as before), arrival
-/// liveness, budget = the gripper's `state_freshness_timeout_s`.
-void declare_gripper_feedback_stream(ros2_control_execution::Ros2GripperActionConfig &config,
+/// CP9: the gripper's `gripper_feedback` stream with the component's row
+/// budget/severity/recovery (carried in the gripper config). A gripper
+/// without output declares none.
+/// - Isaac effort transport: declared here; the backend records the arrival
+///   of every matched raw feedback sample.
+/// - Mock (stock GripperCommand): its sample is the gripper joint in the
+///   controller manager's measured JointState, so the declaration rides the
+///   measured lane; the runtime handle declares it with that lane and records
+///   the stamp of every message carrying the joint.
+void declare_gripper_feedback_stream(RetainedRos2ControlBackendConfig &config,
                                      const core::RuntimeParticipantBinding &binding) {
-  if (config.output_mode == core::GripperOutputMode::kNone ||
-      config.transport_kind != "isaac_joint_state_effort" || config.state_topic.empty())
+  auto &gripper = *config.gripper;
+  if (gripper.output_mode == core::GripperOutputMode::kNone) return;
+  core::StreamDeclarationDTO defaults{
+      "gripper_feedback",
+      static_cast<core::Duration>(gripper.state_freshness_timeout_s * 1e9),
+      gripper.feedback_stream_severity, gripper.feedback_stream_recovery,
+      core::StreamTimestampSourceDTO::kArrival};
+  if (gripper.transport_kind == "ros_gripper_command") {
+    if (config.arm.measured_joint_state_lane) {
+      defaults.timestamp_source = core::StreamTimestampSourceDTO::kMessageStamp;
+      config.arm.measured_joint_state_lane->gripper_feedback_stream = std::move(defaults);
+    }
+    return;
+  }
+  if (gripper.transport_kind != "isaac_joint_state_effort" || gripper.state_topic.empty())
     return;
   auto declared = host_component_stream_health()->Declare(
-      binding.value().controllable_component_id,
-      core::StreamDeclarationDTO{
-          "gripper_feedback",
-          static_cast<core::Duration>(config.state_freshness_timeout_s * 1e9),
-          core::StreamSeverityDTO::kFault, core::StreamRecoveryDTO::kAck,
-          core::StreamTimestampSourceDTO::kArrival});
+      binding.value().controllable_component_id, std::move(defaults));
   if (!declared.ok()) throw std::invalid_argument(declared.error().message);
-  config.feedback_stream = std::move(declared.value());
+  gripper.feedback_stream = std::move(declared.value());
 }
 
 class SingleUseRos2ControlBackendConfig final {
@@ -132,10 +148,36 @@ void require_decided_lane_inputs(const core::ExecutionPortParticipantConfig &con
 
 RetainedObservedStateChannelConfig retained_ros2_control_motion_state_config(
     const RetainedRos2ControlBackendConfig &config) {
+  if (config.participant.stop.trip_authority == core::StateAuthorityClass::kMeasured) {
+    // CP8 step 1: a measured authority's addressed arm state is the bound
+    // lane's measured JointState, with the lane's freshness budget. There is
+    // no commanded or seeded fallback: an absent, incomplete (NaN) or stale
+    // sample leaves the state unavailable.
+    const auto &lane = config.arm.measured_joint_state_lane;
+    if (!lane.has_value() || lane->absolute_topic.empty() ||
+        lane->absolute_topic.front() != '/' || lane->freshness_budget_ns <= 0 ||
+        lane->measured_source_profile_id.empty() ||
+        config.observed_state_authority_profile_id !=
+            lane->measured_source_profile_id) {
+      throw std::invalid_argument(
+          "ros2_control measured arm state requires its qualified measured "
+          "joint-state lane");
+    }
+    return RetainedObservedStateChannelConfig{
+        core::ObservedStateSourceKind::kJointState,
+        lane->absolute_topic,
+        lane->freshness_budget_ns,
+        1U,
+        {core::ObservedRobotStateSourceConfig{
+            core::ObservedRobotStateSourceKind::kJointState, lane->absolute_topic,
+            core::ObservedRobotStateAuthorityProfile::kMeasured,
+            lane->freshness_budget_ns, lane->measured_source_profile_id}}};
+  }
   if (config.participant.stop.trip_authority != core::StateAuthorityClass::kCommanded ||
       config.observed_state_authority_profile_id.empty()) {
     throw std::invalid_argument(
-        "ros2_control runtime composes commanded-simulation arm state only");
+        "ros2_control runtime composes commanded-simulation or measured arm "
+        "state only");
   }
   // Non-expiring commanded source (item 20): the controller's own reference.
   const std::string source_id = "commanded_state";
@@ -240,8 +282,8 @@ RetainedRuntimeBackendFactory make_retained_ros2_control_backend_factory(
                 "ros2_control gripper config differs from retained resources");
           }
           sink_bindings.push_back({gripper_group, gripper_channel, true});
-          // The pneumatic backend never calls this authoritative sink; its
-          // concrete display callback below uses the separate render cache.
+          // No-feedback pneumatic output uses the commanded-state sink; the
+          // display callback remains for pneumatic feedback paths.
           if (selected.gripper->actuation_kind == core::GripperActuationKind::kPneumatic) {
             // Gripper callbacks run on the handle's executor: internal lease.
             const std::weak_ptr<RetainedRos2ControlRuntimeHandle> owner =
@@ -271,7 +313,7 @@ RetainedRuntimeBackendFactory make_retained_ros2_control_backend_factory(
           gripper = std::make_unique<
               ros2_control_execution::Ros2GripperCommandBackend>(
               *resources, sink, clock, scheduler, true);
-          declare_gripper_feedback_stream(*selected.gripper, *gripper_binding);
+          declare_gripper_feedback_stream(selected, *gripper_binding);
           gripper->configure_gripper_action(
               gripper_binding->value().command_target_id.value(),
               *selected.gripper);
@@ -309,32 +351,83 @@ RetainedRuntimeBackendFactory make_retained_ros2_control_backend_factory(
           if (!display.ok()) throw std::invalid_argument(display.error().message);
         }
 
-        // Item 20: the commanded state is the controller's own reference,
-        // published for every new sample (velocities at the applied factor).
         const std::weak_ptr<RetainedObservedStateChannel> weak_channel =
             motion_channel;
-        runtime_handle->InstallSampleObserver(
-            [weak_channel, sink, motion_group, compiled,
-             &clock](const core::ExecutionControllerSampleDTO &sample) {
-              const auto channel = weak_channel.lock();
-              if (!channel ||
-                  sample.reference_positions_rad.size() != compiled.size()) {
-                return;
-              }
-              std::vector<double> velocities;
-              if (sample.reference_velocities_rad_s.size() == compiled.size()) {
-                velocities = sample.reference_velocities_rad_s;
-                const double factor = sample.applied_factor.value_or(1.0);
-                for (auto &velocity : velocities) velocity *= factor;
-              }
-              (void)channel->publish_adapter_state(
-                  core::ObservedRobotStateSourceKind::kCommandedState, compiled,
-                  sample.reference_positions_rad, velocities,
-                  sample.local_receipt_stamp_ns, clock.now());
-              (void)sink->apply_group_joint_positions(
-                  motion_group, sample.reference_positions_rad,
-                  core::ExecutionStateUpdateMode::kBestEffort);
-            });
+        if (selected.participant.stop.trip_authority ==
+            core::StateAuthorityClass::kMeasured) {
+          // CP8 step 1: the measured lane's JointState is the addressed arm
+          // state. Samples are reordered by the controller's (source) joint
+          // names; a missing, duplicated or non-finite joint publishes an
+          // incomplete sample, which replaces the prior one (never a fill).
+          runtime_handle->InstallMeasuredStateObserver(
+              [weak_channel, sink, motion_group, compiled,
+               source = source_resources(motion_binding), &clock,
+               positions = std::vector<double>(compiled.size()),
+               velocities = std::vector<double>(compiled.size())](
+                  const sensor_msgs::msg::JointState &message) mutable {
+                const auto channel = weak_channel.lock();
+                if (!channel) return;
+                bool complete = message.name.size() == message.position.size();
+                const bool with_velocities =
+                    message.velocity.size() == message.name.size();
+                for (std::size_t index = 0; complete && index < source.size();
+                     ++index) {
+                  const auto found = std::find(message.name.begin(),
+                                               message.name.end(), source[index]);
+                  complete = found != message.name.end() &&
+                             std::find(std::next(found), message.name.end(),
+                                       source[index]) == message.name.end();
+                  if (!complete) break;
+                  const auto at =
+                      static_cast<std::size_t>(found - message.name.begin());
+                  positions[index] = message.position[at];
+                  complete = std::isfinite(positions[index]);
+                  if (with_velocities) velocities[index] = message.velocity[at];
+                }
+                const auto source_time =
+                    static_cast<std::int64_t>(message.header.stamp.sec) *
+                        1'000'000'000LL +
+                    message.header.stamp.nanosec;
+                const auto published = channel->publish_adapter_state(
+                    core::ObservedRobotStateSourceKind::kJointState, compiled,
+                    complete ? std::span<const double>(positions)
+                             : std::span<const double>{},
+                    complete && with_velocities
+                        ? std::span<const double>(velocities)
+                        : std::span<const double>{},
+                    source_time, clock.now());
+                if (published.published && published.complete) {
+                  (void)sink->apply_group_joint_positions(
+                      motion_group, positions,
+                      core::ExecutionStateUpdateMode::kBestEffort);
+                }
+              });
+        } else {
+          // Item 20: the commanded state is the controller's own reference,
+          // published for every new sample (velocities at the applied factor).
+          runtime_handle->InstallSampleObserver(
+              [weak_channel, sink, motion_group, compiled,
+               &clock](const core::ExecutionControllerSampleDTO &sample) {
+                const auto channel = weak_channel.lock();
+                if (!channel ||
+                    sample.reference_positions_rad.size() != compiled.size()) {
+                  return;
+                }
+                std::vector<double> velocities;
+                if (sample.reference_velocities_rad_s.size() == compiled.size()) {
+                  velocities = sample.reference_velocities_rad_s;
+                  const double factor = sample.applied_factor.value_or(1.0);
+                  for (auto &velocity : velocities) velocity *= factor;
+                }
+                (void)channel->publish_adapter_state(
+                    core::ObservedRobotStateSourceKind::kCommandedState, compiled,
+                    sample.reference_positions_rad, velocities,
+                    sample.local_receipt_stamp_ns, clock.now());
+                (void)sink->apply_group_joint_positions(
+                    motion_group, sample.reference_positions_rad,
+                    core::ExecutionStateUpdateMode::kBestEffort);
+              });
+        }
         if (!selected.defer_ros_start) {
           runtime_handle->StartBackend();
         }
@@ -381,7 +474,8 @@ make_retained_ros2_control_gripper_backend(
     const std::shared_ptr<RetainedRos2ControlRuntimeHandle>& handle) {
   const bool no_output = config.gripper && config.gripper->output_mode == core::GripperOutputMode::kNone &&
       config.gripper->actuation_kind == core::GripperActuationKind::kPneumatic;
-  if (!handle || !channel || !config.gripper || (!no_output && !config.arm.gripper_controller) ||
+  if (!handle || !channel || !config.gripper ||
+      (!no_output && (!config.arm.gripper_controller || !config.arm.measured_joint_state_lane)) ||
       (no_output && config.arm.gripper_controller) || !binding.value().control_path ||
       binding.value().control_path->state_authority_class != core::StateAuthorityClass::kCommanded ||
       channel->binding().value() != binding.value() || binding.value().resources.size() != 1U)
@@ -391,8 +485,8 @@ make_retained_ros2_control_gripper_backend(
       config.gripper->joint_name != binding.value().resources.front().compiled_resource_name)
     throw std::invalid_argument("ROS gripper-only config differs from retained resources");
   const bool pneumatic = config.gripper->actuation_kind == core::GripperActuationKind::kPneumatic;
-  // Keep the existing transport sink closure. Pneumatic command/feedback
-  // paths never publish through it; they use the display callback only.
+  // The same sink publishes no-feedback pneumatic commanded positions;
+  // feedback paths retain their display-only callback.
   std::vector<RetainedExecutionStateSinkBinding> sinks{{group, channel, true}};
   if (pneumatic) {
     // Gripper callbacks run on the handle's executor: internal lease.
@@ -411,17 +505,14 @@ make_retained_ros2_control_gripper_backend(
       config.ros_context_provider);
   auto gripper = std::make_unique<ros2_control_execution::Ros2GripperCommandBackend>(
       *resources, sink, clock, scheduler, true);
-  declare_gripper_feedback_stream(*config.gripper, binding);
+  declare_gripper_feedback_stream(config, binding);
   gripper->configure_gripper_action(binding.value().command_target_id.value(), *config.gripper);
   auto* const backend = gripper.get();
   const auto bound = handle->BindGripperOnly(
       std::move(resources), clock, std::move(gripper), binding,
       config.arm.gripper_controller.value_or(RetainedRos2ControlArmController{}),
       config.successor_occurrence, std::move(config.measured_receiver_clock),
-      no_output ? std::nullopt : std::optional(RetainedMeasuredJointStateLane{config.node_namespace + "/joint_states",
-          static_cast<core::Duration>(config.gripper->state_freshness_timeout_s * 1e9),
-          core::StateAuthorityId(std::string(kMeasuredJointStateAuthorityId)),
-          std::string(kMeasuredJointStateProfileId)}));
+      no_output ? std::nullopt : config.arm.measured_joint_state_lane);
   if (!bound.ok()) throw std::invalid_argument(bound.error().message);
   if (pneumatic) {
     const auto display = handle->BindGripperDisplayChannel(channel);

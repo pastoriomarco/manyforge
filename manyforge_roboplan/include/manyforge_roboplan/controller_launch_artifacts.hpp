@@ -2,6 +2,7 @@
 
 #include <filesystem>
 #include <map>
+#include <array>
 #include <optional>
 #include <string>
 #include <string_view>
@@ -78,6 +79,31 @@ isaac_controller_lane_rates(std::string_view isaac_profile);
 [[nodiscard]] MockControllerProfileFacts
 mock_controller_profile_facts(std::string_view mock_profile);
 
+/// The closed real controller profiles (CP8 step 2a; temporary selector).
+[[nodiscard]] std::vector<std::string> real_controller_profile_ids();
+
+/// Build-owned facts of one closed real controller profile.
+struct RealControllerProfileFacts final {
+  std::string profile_id;
+  /// The generated `<ros2_control>` element name (starts inactive).
+  std::string hardware_component_name;
+  std::string arm_controller_name;
+  double hard_stop_completion_timeout_s{};
+  /// R7 D3: the measured joint state's freshness budget, per robot.
+  double joint_state_freshness_s{};
+  /// Measured start/terminal state checks of the execution participant.
+  double start_tolerance_rad{};
+  double final_tolerance_rad{};
+  double completion_state_timeout_s{};
+};
+
+[[nodiscard]] RealControllerProfileFacts
+real_controller_profile_facts(std::string_view real_profile);
+
+/// The cadence of a real profile's generated controllers (Mock's template).
+[[nodiscard]] MockControllerLaneRates
+real_controller_lane_rates(std::string_view real_profile);
+
 /// Q66: the host's fixed controller manager of one controllable component.
 [[nodiscard]] std::string
 controller_runtime_namespace(std::string_view controllable_component_id);
@@ -98,6 +124,18 @@ struct MockControllerArtifactsInput final {
   core::GripperOutputMode gripper_output_mode{core::GripperOutputMode::kCommanded};
 };
 
+/// One Real component on Mock's ros2_control start-up path (CP8 step 2a, R7
+/// package 1): the unmodified vendor plugin, its hardware initially inactive.
+/// The robot reports measured state, so the deployment supplies no initial
+/// pose; no gripper controller in this package.
+struct RealControllerArtifactsInput final {
+  std::string real_profile;
+  /// The robot controller's address; required.
+  std::string robot_ip;
+  /// Q48: the deployment's operator Stop per-joint maximum deceleration.
+  std::map<std::string, double, std::less<>> max_deceleration_on_cancel_rad_s2;
+};
+
 /// One Isaac lane component (amended Q41: backend-commanded initial pose).
 struct IsaacControllerArtifactsInput final {
   std::string isaac_profile;
@@ -113,7 +151,8 @@ struct ControllerLaunchArtifactsRequest final {
   std::string_view model_urdf;
   /// Ordered arm joints from the retained binding.
   std::vector<std::string> arm_joint_names;
-  std::variant<MockControllerArtifactsInput, IsaacControllerArtifactsInput>
+  std::variant<MockControllerArtifactsInput, IsaacControllerArtifactsInput,
+               RealControllerArtifactsInput>
       lane;
   /// Q82: the retained deployment frame prefix, passed literally; empty
   /// passes no prefix.
@@ -125,10 +164,19 @@ struct ControllerLaunchArtifactsRequest final {
   std::string component_runtime_identity{};
 };
 
-/// kSimulatedPlc: a ManyForge-owned simulated PLC process (sim-plc design);
-/// kPoseSource: the observer process of a `pose_source` component (CP9).
-/// Neither is produced by controller artifact generation.
-enum class ControllerLaunchLane { kMock, kIsaac, kSimulatedPlc, kPoseSource };
+/// kMock is the shared ros2_control start-up path of Mock and Real components
+/// (CP8 step 2a; the lane enum goes in CP8 step 3). kSimulatedPlc: a
+/// ManyForge-owned simulated PLC process (sim-plc design); kPoseSource: the
+/// observer process of a `pose_source` component (CP9); kAiModel: the probe
+/// process of an `ai_model` component. None of these is produced by
+/// controller artifact generation.
+enum class ControllerLaunchLane {
+  kMock,
+  kIsaac,
+  kSimulatedPlc,
+  kPoseSource,
+  kAiModel
+};
 
 /// One configuration-scoped stock writer. Its topic is never reused for a
 /// different provider, ordered joint set or Deployment initial target.
@@ -142,6 +190,37 @@ struct MockResetPositionTarget final {
 
   friend bool operator==(const MockResetPositionTarget &,
                          const MockResetPositionTarget &) = default;
+};
+
+/// R7 packages 3 and 4: the vendor adapter that observes a Real component's
+/// own unmodified driver status and serves its vendor primitives and Enable
+/// gate. Absent for Mock and Isaac.
+/// D11: the payload of the component's tool (mass and centre of mass in the
+/// flange frame), applied to a Real robot at Enable; Mock and Isaac have no
+/// vendor adapter and ignore it.
+struct VendorToolPayload final {
+  double mass_kg{};
+  std::array<double, 3> center_of_mass_m{};
+
+  friend bool operator==(const VendorToolPayload &,
+                         const VendorToolPayload &) = default;
+};
+
+struct VendorAdapterSelection final {
+  /// The adapter family; "xarm" for every xArm-family robot.
+  std::string vendor;
+  /// The absolute namespace of the component's vendor driver.
+  std::string driver_namespace;
+  /// The robot's joint count.
+  int axis_count{};
+  /// R7 §3.6: the Enable gate's largest measured-versus-reported joint
+  /// difference while stopped (per robot data).
+  double joint_agreement_tolerance_rad{};
+  /// D11: set by the host from the component's controller profile row.
+  std::optional<VendorToolPayload> tool_payload{};
+
+  friend bool operator==(const VendorAdapterSelection &,
+                         const VendorAdapterSelection &) = default;
 };
 
 struct ControllerLaunchArtifacts final {
@@ -162,6 +241,11 @@ struct ControllerLaunchArtifacts final {
   std::optional<std::string> gripper_controller_name;
   std::string frame_prefix;
   std::optional<MockResetPositionTarget> mock_reset_position;
+  /// Hardware with a driver parameters file (Real): its path and the
+  /// `sha256:<hex>` of its exact bytes; empty otherwise.
+  std::filesystem::path driver_parameters_file;
+  std::string driver_parameters_sha256;
+  std::optional<VendorAdapterSelection> vendor_adapter;
   /// Mock lane: `mock_control.launch.py` arguments (`name:=value`).
   std::vector<std::string> launch_arguments;
   /// Isaac lane: `launch-isaac-topic-based-control.sh` environment.
@@ -199,6 +283,10 @@ struct ComponentControllerLaunchInput final {
   /// Exactly one: the component's catalog controller profile.
   std::optional<std::string> isaac_profile;
   std::optional<std::string> mock_profile;
+  /// CP8 step 2a: a temporary third selector for a Real profile, with the
+  /// robot's address. Package IDs replace all three in CP8 step 3.
+  std::optional<std::string> real_profile;
+  std::string robot_ip;
   /// Isaac lane facts of `isaac_profile` (retained_isaac_controller_lane).
   std::optional<IsaacControllerLane> isaac_lane;
   /// The component's model asset source URDF.
@@ -213,6 +301,9 @@ struct ComponentControllerLaunchInput final {
   /// Caller supplies the strict selected pneumatic output choice. None never
   /// follows from a missing binding and does not create physical gripper output.
   core::GripperOutputMode gripper_output_mode{core::GripperOutputMode::kCommanded};
+  /// The Real lane verifies this against the retained gripper row before
+  /// accepting a local, no-output pneumatic gripper.
+  std::optional<core::GripperActuationKind> gripper_actuation_kind;
   std::string component_runtime_identity{};
 };
 

@@ -17,12 +17,43 @@ Engine with Compose v2/BuildKit, Git and Python 3. Allow network access for pinn
 dependency downloads and enough disk/RAM for the ROS build. This is source-based
 workbench setup, not a packaged production installer.
 
-Select a source-matched full ROS image before starting, from the repository
-root:
+### Install: one build, one start
+
+From a fresh checkout, at the repository root:
 
 ```bash
-export MANYFORGE_DEV_IMAGE=<source-matched-full-ros-image>
+./scripts/compose-dev.sh build   # once, and again after Dockerfile changes
+./scripts/compose-dev.sh start   # empty authoring workspace
 ```
+
+Then open **http://localhost:3000**. The first start also compiles the
+ManyForge C++ targets into the image-keyed cache under `.manyforge-dev/`, which
+takes a while; later starts are incremental.
+
+`build` prepares the pinned RoboPlan sources under `.docker/`
+(`scripts/setup-docker.sh --prepare-only`), then builds
+`Dockerfile.ros-lyrical-full` through the `ros-jazzy-full` Compose service into
+the image `manyforge-ros-lyrical-full`. It works on x86_64 and arm64; on a
+Jetson it selects NVIDIA's `noble-jetpack` package suite automatically. Plan
+for well over half an hour on a first build: on a 14-core arm64 Jetson with
+the ROS and Python layers already cached it took about 19 minutes; the
+resulting image is about 5.4 GB.
+
+The one image serves every lane (Mock, Isaac, Real). It contains ROS 2
+Lyrical, the pinned controller overlay (stock joint_trajectory_controller
+6.10.0 with realtime_tools 5.4.0 and ros2_control_cmake 1.0.0), `ur_msgs`
+2.6.0 and the UFactory xArm driver. The driver package covers xArm 5/6/7,
+Lite 6 and UF850. Lite 6 is the supported Real model; physical execution
+is not yet qualified and requires attended robot sessions. The Real lane needs
+no extra install step.
+
+Isaac Sim is not part of this image. Start Isaac Sim yourself and open the
+scene; the workbench then attaches to it (attach-only) from this same
+container. No separate Isaac control container is used.
+
+To use another tag, set `MANYFORGE_ROS_FULL_IMAGE` for both `build` and
+`start`; `MANYFORGE_DEV_IMAGE` selects an already built image for `start`
+only.
 
 The launcher builds current C++ owners, the activation preparer and a small
 canonical-empty bootstrap from this checkout. It does not import a maintained
@@ -31,6 +62,38 @@ The setup script may recreate stale or modified dependency directories under
 `.docker/`; preserve wanted local dependency edits before running it.
 Selected projects are read through the ordinary Scenario-project loader and
 validated before activation.
+
+### Project folders
+
+To use project folders outside the repository in Composer, list existing
+absolute host directories in the JSON `manyforge.site.v1` settings file. The
+same file can also contain robot `device_addresses`; keep those settings when
+adding folders. See the [site-file example](../examples/site/manyforge.site.example.json).
+For example, replace the path below with your own directory:
+
+```json
+{
+  "schema": "manyforge.site.v1",
+  "project_folders": ["/home/USER/Projects"]
+}
+```
+
+Set `MANYFORGE_DEV_SITE_SETTINGS` to the site's absolute file path before
+starting the workbench. Put projects in one of those host folders. Composer's
+Load, Save As and Export browsers show the bundled examples and each configured
+folder under `/projects/<folder name>`. For example, a project at
+`/home/USER/Projects/cell.scenario` appears as
+`/projects/Projects/cell.scenario`. If names collide, use the path shown in
+the picker.
+
+When entering a path in the picker, use the displayed container path or a path
+relative to the current folder. Pasting a host path is not supported. The
+site-file `project_folders` setting shows which host folders are available.
+`start --project` still accepts only projects under the repository's `examples/`
+directory.
+
+After changing `project_folders`, stop the workbench and start it again. Calling
+`start` while it is already running does not update the folder mounts.
 
 The workbench owns one stable internal runtime identity, independent of which
 Scenario is selected. Portable `manyforge.deployment_intent.v2` documents do not
@@ -55,24 +118,23 @@ qualifies Isaac or physical execution, the complete Compose wrapper, or an
 observed GUI journey. The final M1 mock milestone including gripper-only remains
 pending. Earlier diagnostic receipts describe superseded development candidates.
 
-For an already prepared full ROS development image:
+For example, with the built image:
 
 ```bash
-MANYFORGE_DEV_IMAGE=<source-matched-full-ros-image> \
-  ./scripts/compose-dev.sh start \
-    --bootstrap-project examples/isaac-ur10e-light-scene.scenario
+./scripts/compose-dev.sh start \
+  --bootstrap-project examples/isaac-ur10e-light-scene.scenario
 ```
 
-The image entrypoint must supply its ROS and Python environment. Startup builds
-the mechanical ROS overlay and imports its setup into the service environment;
-Manager children inherit that environment. If this installation uses separately
-installed ROS message dependencies, persist
-`MANYFORGE_ROS_DEPENDENCY_SETUP_SCRIPTS` in its existing machine launch
-configuration as a colon-separated, ordered list of absolute setup-script paths
-inside the container. Startup sources them before the backend build and imports
-the application overlay last for services. Missing configured scripts fail
-startup with their exact path. With this variable unset, image setup remains the
-default; no dependency paths are discovered or selected automatically.
+The image entrypoint supplies the ROS and Python environment, including the
+image's xArm driver, `ur_msgs` and controller overlays. Startup builds the
+mechanical ROS overlay and imports its setup into the service environment;
+Manager children inherit that environment. Optional: to add separately
+installed ROS dependencies on top of the image, set
+`MANYFORGE_ROS_DEPENDENCY_SETUP_SCRIPTS` to a colon-separated, ordered list of
+absolute setup-script paths inside the container. Startup sources them before
+the backend build and imports the application overlay last for services.
+Missing configured scripts fail startup with their exact path. Leave it unset
+with the image built above.
 
 Explicitly exported standard DDS
 inputs, including `ROS_DOMAIN_ID`, `RMW_IMPLEMENTATION`,
@@ -97,14 +159,9 @@ Isaac object observers are pose-source components of the selected Deployment;
 the launcher needs no observer input. The operator opens the Isaac scene;
 ManyForge attaches its inactive controller infrastructure.
 
-The retained `examples/isaac-ur10e-light-scene.scenario` is an aggregate
-robot/gripper development input. Its explicit 0.25 m/s authored TCP ceiling is
-demo policy, never a default for a missing limit. Live Isaac qualification remains unavailable;
-this preparation option does not qualify Load, motion, Stop, Reset or repeated
-Runs. Arm-only profiles and installation-matched observation configuration
-remain additional integration work. The observer site's `cell_id` must match
-the workbench installation, `c1_build_authority_cell`, and its Manager run root
-must point at this workbench's runtime state.
+`examples/isaac-ur10e-light-scene.scenario` is an Isaac UR10e and gripper
+Scenario. Its explicit 0.25 m/s TCP ceiling is an example setting, not a default
+for a missing limit. Pose-source configuration is in the Deployment.
 
 Existing v1 authored Deployment files must be migrated explicitly: change their
 intent version to v2 and remove the authored `cell_id`. Do not remove cell IDs
@@ -280,7 +337,7 @@ free-space floor uses the actual filesystem. Docker's existing `50m` × 3
 console rotation is independent; this is not machine-wide accounting or
 discovery of custom roots.
 
-Only older completed console captures, superseded generated controller-launch
+For space-pressure cleanup, only older completed console captures, superseded generated controller-launch
 artifact epochs, and older owned host ROS log sessions are eligible. ROS host
 logs use `current/execution-run/ros/<sequence>-<session-start-ns>`, stamped once before
 the first workbench service starts under the session-directory lock. The
@@ -318,14 +375,11 @@ floor proves pressure, oldest observed first. Protected-only or unresolved
 pressure reports a warning and stops cleanup; it never gates motion or
 startup.
 
-Whole previous-session archives are included in pressure accounting and remain
-protected. Their coverage is `not_imported`; the current interim policy grants
-no automatic journal retirement, even after an ordinary closed shutdown. Q99
-reports remaining protected pressure. There is no new fixed session-count cap;
-offline import and any future retirement/count policy remain publication
-decisions. The separate installed operator launcher is deferred to R9; the
-development launcher, including its `--operator-runtime` mode, uses these
-session paths.
+Previous-session journals are not imported into History. The workbench
+normally keeps up to five previous sessions, subject to incident protection.
+Unimported records, including safety records, are not guaranteed to survive
+retention. See the [session note](FRESH_CHECKOUT_CHECKLIST.md) for their
+location and what to preserve.
 
 Each resolved immutable workbench image gets a separate cache under
 `.manyforge-dev/images/`; rebuilding the mutable image tag therefore cannot

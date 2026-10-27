@@ -29,6 +29,14 @@ class ExecutionObservationSourceUnavailable(RuntimeError):
     """Current presentation source failed; reconnect must recapture, not replay."""
 
 
+class ExecutionObservationOwnerRefused(ExecutionObservationProjectionError):
+    """The owner answered the observation with its own typed error."""
+
+    def __init__(self, code: str, message: str) -> None:
+        super().__init__(message)
+        self.code = code
+
+
 def _object(value: Any, path: str) -> dict[str, Any]:
     if not isinstance(value, dict):
         raise ExecutionObservationProjectionError(f"{path} must be an object")
@@ -78,6 +86,19 @@ def project_execution_observation(
 ) -> dict[str, Any]:
     """Project one exact render frame from the narrow owner observation."""
 
+    error = response.get("error")
+    if (
+        set(response) == {"api_version", "error", "ok"}
+        and response.get("api_version") == "manyforge.execution_command_response.v1"
+        and response.get("ok") is False
+        and isinstance(error, dict)
+        and isinstance(error.get("code"), str)
+        and error["code"]
+        and isinstance(error.get("message"), str)
+    ):
+        # Keep the owner's typed refusal (e.g. no valid measured sample yet);
+        # it is not a malformed envelope.
+        raise ExecutionObservationOwnerRefused(error["code"], error["message"])
     if set(response) != {"api_version", "command", "observation", "ok"} or (
         response.get("api_version") != "manyforge.execution_command_response.v1"
         or response.get("command") != "observation"
@@ -680,6 +701,7 @@ class ExecutionObservationSource:
 
 
 __all__ = [
+    "ExecutionObservationOwnerRefused",
     "ExecutionObservationProjectionError",
     "ExecutionObservationSource",
     "ExecutionObservationSourceUnavailable",

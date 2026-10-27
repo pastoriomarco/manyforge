@@ -62,6 +62,102 @@ Object &provider(Object &row) {
   return std::get<Object>(row.at("provider").value);
 }
 
+CellGraphDTO with_xarm_robot(CellGraphDTO graph) {
+  graph.controllable_components.push_back(
+      {ControllableComponentId("robot.arm"), ComponentTypeId("robot"),
+       ComponentTypeRevision("revision.robot"), {}, {RuntimeUnitId("host.io")}, {}});
+  graph.runtime_units.front().configuration["controller_profiles"] = JsonValueDTO{
+      Array{JsonValueDTO{Object{
+          {"controllable_component_id", JsonValueDTO{std::string("robot.arm")}},
+          {"real_profile", JsonValueDTO{std::string("lite6_real")}}}}}};
+  return graph;
+}
+
+Object xarm_input(std::string name, std::string source, double pin) {
+  auto row = input_row(std::move(name), std::move(source));
+  row["update_mode"] = JsonValueDTO{std::string("sampled")};
+  row["freshness"] = JsonValueDTO{Object{
+      {"mode", JsonValueDTO{std::string("sample_age")}},
+      {"maximum_age_ns", JsonValueDTO{250'000'000.0}}}};
+  provider(row) = {{"profile", JsonValueDTO{std::string("xarm_digital")}},
+                   {"robot_component_id", JsonValueDTO{std::string("robot.arm")}},
+                   {"bank", JsonValueDTO{std::string("tool")}},
+                   {"pin", JsonValueDTO{pin}}, {"ingress_depth", JsonValueDTO{4.0}}};
+  return row;
+}
+
+TEST(IoSignalCatalogTest, XArmBankRequiresOneSourceAndDriverExposedPins) {
+  const auto first = xarm_input("first", "source.bank", 0.0);
+  auto second = xarm_input("second", "source.bank", 1.0);
+  auto graph = with_xarm_robot(io_graph({JsonValueDTO{first}, JsonValueDTO{second}}));
+  auto result = ResolveRetainedIoSignalCatalog(graph);
+  ASSERT_TRUE(result.ok());
+  ASSERT_EQ(result.value().size(), 2U);
+  EXPECT_EQ(result.value().front().provider.bank, "tool");
+  second["source_id"] = JsonValueDTO{std::string("source.other")};
+  graph = with_xarm_robot(io_graph({JsonValueDTO{first}, JsonValueDTO{second}}));
+  result = ResolveRetainedIoSignalCatalog(graph);
+  ASSERT_FALSE(result.ok());
+  EXPECT_EQ(result.error().details.at("reason"), "io_xarm_bank_multiple_sources");
+  second = xarm_input("second", "source.bank", 2.0);
+  EXPECT_FALSE(ResolveRetainedIoSignalCatalog(
+      with_xarm_robot(io_graph({JsonValueDTO{second}}))).ok());
+  EXPECT_FALSE(ResolveRetainedIoSignalCatalog(io_graph({JsonValueDTO{first}})).ok());
+}
+
+TEST(IoSignalCatalogTest, MockEchoRequiresDeclaredSameDeviceMockOutput) {
+  auto sensor = input_row();
+  provider(sensor)["echo"] = JsonValueDTO{Object{
+      {"output_signal_name", JsonValueDTO{std::string("valve")}},
+      {"delay_ms", JsonValueDTO{50.0}}}};
+  auto valve = sensor;
+  valve["direction"] = JsonValueDTO{std::string("output")};
+  valve["signal_name"] = JsonValueDTO{std::string("valve")};
+  valve["resource_role_id"] = JsonValueDTO{std::string("valve")};
+  valve["source_id"] = JsonValueDTO{std::string("source.valve")};
+  valve.erase("update_mode");
+  valve.erase("transition_capability");
+  valve.erase("freshness");
+  provider(valve) = {{"profile", JsonValueDTO{std::string("mock_output")}},
+                     {"channel", JsonValueDTO{std::string("valve")}}};
+  auto result = ResolveRetainedIoSignalCatalog(
+      io_graph({JsonValueDTO{sensor}, JsonValueDTO{valve}}));
+  ASSERT_TRUE(result.ok());
+  EXPECT_EQ(result.value().front().provider.echo_delay_ns, 50'000'000);
+  result = ResolveRetainedIoSignalCatalog(io_graph({JsonValueDTO{sensor}}));
+  ASSERT_FALSE(result.ok());
+  EXPECT_EQ(result.error().details.at("reason"), "io_mock_echo_output_not_found");
+}
+
+TEST(IoSignalCatalogTest, XArmOutputAliasesShareResourceAndUseAckBudget) {
+  auto output = input_row("valve", "source.valve");
+  output["direction"] = JsonValueDTO{std::string("output")};
+  output.erase("update_mode");
+  output.erase("transition_capability");
+  output.erase("freshness");
+  provider(output) = {{"profile", JsonValueDTO{std::string("xarm_digital")}},
+                      {"robot_component_id", JsonValueDTO{std::string("robot.arm")}},
+                      {"bank", JsonValueDTO{std::string("tool")}},
+                      {"pin", JsonValueDTO{4.0}}};
+  auto alias = output;
+  alias["signal_name"] = JsonValueDTO{std::string("valve_alias")};
+  alias["resource_role_id"] = JsonValueDTO{std::string("valve_alias")};
+  auto graph = with_xarm_robot(io_graph({JsonValueDTO{output}, JsonValueDTO{alias}}));
+  ASSERT_TRUE(manyforge::deployment::MaterializeRetainedIoProviderDevices(graph).ok());
+  const auto signals = ResolveRetainedIoSignalCatalog(graph);
+  ASSERT_TRUE(signals.ok());
+  ASSERT_EQ(signals.value().size(), 2U);
+  EXPECT_EQ(signals.value()[0].descriptor.output_resource,
+            signals.value()[1].descriptor.output_resource);
+  const auto devices = manyforge::deployment::ResolveRetainedIoProviderDevices(graph);
+  ASSERT_TRUE(devices.ok());
+  ASSERT_EQ(devices.value().size(), 1U);
+  EXPECT_EQ(devices.value().front().output_source_ack_timeout_ns, 500'000'000);
+  provider(output)["pin"] = JsonValueDTO{5.0};
+  EXPECT_FALSE(ResolveRetainedIoSignalCatalog(
+      with_xarm_robot(io_graph({JsonValueDTO{output}}))).ok());
+}
+
 TEST(IoSignalCatalogTest,
      ModelFreeHostResolvesSealedSignalsWithoutCoordinateResources) {
   const auto graph = io_graph();
@@ -1205,6 +1301,13 @@ TEST(IoSignalCatalogTest,
   EXPECT_THROW((void)validate_and_normalize_build_qualified_value(
                    *schema, CanonicalValue(invalid_configuration)),
                std::exception);
+}
+
+TEST(IoSignalCatalogTest, PoseStreamIdsAreObjectLinksOrOverlays) {
+  using manyforge::deployment::PoseSourceStreamId;
+  EXPECT_EQ(PoseSourceStreamId("cheese_box", "scene"), "poses/cheese_box");
+  EXPECT_EQ(PoseSourceStreamId("robot", "viewer.measured_tcp"),
+            "poses/robot/viewer.measured_tcp");
 }
 
 } // namespace

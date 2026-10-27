@@ -9107,9 +9107,12 @@ class PortParticipantKernelTest : public ExecutionKernelTest {
       profile.deceleration_time_s = 1.0;
       profile.jerk_limits_enabled = false;
       profile.allow_natural_completion_on_short_path = true;
+      // The spring_back_hold return covers the forward braking distance in
+      // the same half-time, so it needs more acceleration than the forward
+      // braking (return peak 2.09 rad/s^2 here); 3.0 keeps it feasible.
       for (const auto& resource : authority.binding.value().resources)
         profile.per_joint_max_deceleration.emplace(*resource.source_joint_name,
-                                                   AngularAccelerationDTO{2.0});
+                                                   AngularAccelerationDTO{3.0});
       auto plan = MakePreparedParticipantStopPlan(
           authority.stop_readiness.value().resolved_stop_base_plan,
           {binding.operation_id, authority.operation_revision, binding.participant_id,
@@ -10389,6 +10392,40 @@ TEST_F(PortParticipantKernelTest, RejectedReplacementIsNoEffectAndCannotBeAdopte
   EXPECT_EQ(Calls<testing::FakeExecutionPort::SubmitCall>().size(), 1U);
 }
 
+TEST_F(PortParticipantKernelTest, RestartedControllerCursorRefusesTheTakeoverWithoutASend) {
+  // D8: between the controller's end hold (cursor back near 0) and the terminal
+  // result, a takeover joined at that cursor would command a move back toward
+  // the source start. It is refused before any send (the Kernel then runs the
+  // configured Stop fallback).
+  const auto product = DirectBackendProduct();
+  Sample(0.0, 0.0, 0.0);
+  const ExecutionGoalKey old{ControllerGoalId("restart.old"), ControllerGoalGeneration(1U)};
+  const auto handle =
+      participant->Dispatch(product, old.controller_goal_id, old.controller_goal_generation);
+  pclock.advance(10'000'000);
+  Executing(old);
+  Sample(0.5, 0.25, 0.5);
+  EXPECT_FALSE(handle.wait_for_completion(0));
+  const auto source = participant->CaptureReplacementSource(1U, handle.execution_generation, old,
+                                                            product.prepared_contract_digest);
+  ASSERT_TRUE(source.ok());
+  const auto successor = DirectSuccessor(product, source.value());
+  ASSERT_EQ(participant->PrepareReplacement(successor, 2U, source.value()).state,
+            PrepareParticipantResultStateDTO::kPrepared);
+  pclock.advance(1'000'000);
+  Sample(0.0, 0.0, 0.0);  // restarted cursor, goal not yet terminal
+  const ExecutionGoalKey next{ControllerGoalId("restart.next"), ControllerGoalGeneration(2U)};
+  const auto sent = participant->DispatchReplacement(source.value(), 2U, successor, next,
+                                                     pclock.now() + 1'000'000'000);
+  EXPECT_EQ(sent.command.dispatch, ExecutionPortDispatch::kNotDispatched);
+  ASSERT_TRUE(sent.command.error);
+  EXPECT_EQ(sent.command.error->details.at("reason"),
+            "motion_replacement_scale_or_source_unqualified");
+  EXPECT_EQ(sent.command.error->details.at("qualification_stage"), "baseline");
+  EXPECT_EQ(sent.command.error->details.at("qualification_check"), "cursor_restart");
+  EXPECT_TRUE(Calls<testing::FakeExecutionPort::ReplaceCall>().empty());
+}
+
 TEST_F(PortParticipantKernelTest,
        ScheduledMovingReplacementPairsCanonicalOriginAcrossSuccessiveGoals) {
   for (const double factor : {1.0, 0.5, 0.0}) {
@@ -11454,9 +11491,28 @@ TEST_F(PortParticipantKernelTest, TimelyAdoptionPreservesRampDeliveryClockAndQua
   pclock.advance(1);
   Sample(0.1, 0.5 * (0.5 + 0.1 + 0.96 * 0.02), 0.5, scales.back().value);
   const auto stage = StageForProduct(successor, next, 0U);
+  // The participant's waiter is this case's only passage of time (1 ms per
+  // wait), and the Stop replacement shows its own feedback once sent (the fake
+  // port never infers it). Without this the lead-in wait can neither be
+  // satisfied nor expire on the FakeClock.
+  const auto replaced = Calls<testing::FakeExecutionPort::ReplaceCall>().size();
+  {
+    std::lock_guard lock(hook_mutex);
+    tick = [&] {
+      pclock.advance(1'000'000);
+      const auto replaces = Calls<testing::FakeExecutionPort::ReplaceCall>();
+      if (replaces.size() > replaced) Executing(replaces.back().next_key);
+    };
+  }
   const auto stopped = participant->TranslateStopStageForTakeover(
       stage, BudgetFor(stage), cancel.get_token(), observer);
-  ASSERT_TRUE(observer.point) << (stopped.error ? stopped.error->message : "no Stop error");
+  {
+    std::lock_guard lock(hook_mutex);
+    tick = nullptr;
+  }
+  ASSERT_TRUE(observer.point) << (stopped.error ? stopped.error->message : "no Stop error")
+                             << (stopped.error ? ::testing::PrintToString(stopped.error->details)
+                                               : "");
   EXPECT_NEAR(observer.point->initial.command_path_time_s, 0.1, 1e-12);
   ASSERT_TRUE(observer.point->canonical_return_path_time_s);
   EXPECT_NEAR(*observer.point->canonical_return_path_time_s, 0.1 + 0.96 * 0.02, 1e-12);
@@ -12783,7 +12839,15 @@ TEST_F(ExecutionKernelTest, SpringColdProductWaitsBeyondPreparationBudgetWithout
     ASSERT_TRUE(next_started.ok()) << next_started.error().message;
     ASSERT_TRUE(backend.wait_until_execute_count(next_run ? 4 : 3));
     ASSERT_TRUE(wait_for_state(owner, ExecutionState::kExecuting));
-    const auto next_observed = owner.ObservePreparedMotion(next_started.value());
+    // Executing is published by the backend just before the worker records
+    // the dispatched product; wait for that record, not only for the state.
+    auto next_observed = owner.ObservePreparedMotion(next_started.value());
+    const auto record_deadline = std::chrono::steady_clock::now() + std::chrono::seconds(2);
+    while (next_observed.ok() && !next_observed.value().last_dispatched_participant &&
+           std::chrono::steady_clock::now() < record_deadline) {
+      std::this_thread::yield();
+      next_observed = owner.ObservePreparedMotion(next_started.value());
+    }
     ASSERT_TRUE(next_observed.ok()) << next_observed.error().message;
     ASSERT_TRUE(next_observed.value().last_dispatched_participant);
     const auto& next_binding = next_authority.execution_request.binding;

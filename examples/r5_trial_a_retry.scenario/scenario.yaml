@@ -8,12 +8,12 @@
   "description": "R5 trial (a): automatic motion retry after a planning (IK) failure. The goal key starts unreachable; after 1.5 s a parallel branch writes a reachable goal, and a later automatic attempt (automatic_retries 3, delay 1.0 s) re-reads it and succeeds.",
   "members": {
     "assignment.yaml": "sha256:f4dd3bfffcc14e0cb446f820e79e2405f4477ecbc470ca9fdc127dce17086e06",
-    "deployment.yaml": "sha256:180af7bcc7be010bc3fbd5e8c2d56b8e4bd3464b5f05eee574010c52071db1c4",
+    "deployment.yaml": "sha256:9ae56dbfa802dc1b621278710f99a6c69a2cb9382355a7a7521ffba9da93fe92",
     "program.yaml": "sha256:0109a0956947d8f8f862394a31c99521d9175da0ec1c56452f95de1922ca03d4"
   },
   "name": "r5_trial_a_retry",
   "saved_status": {
-    "checked_content_digest": "sha256:4e9b2df1cb56751aef52f00500660bcc942abe8707e004074dc0e5bdc71e336b",
+    "checked_content_digest": "sha256:d2ae9690aa2a4072e34be72ddecd82496cea3c5141c6e745b3a07b5357d14d43",
     "last_known_status": "unknown",
     "manyforge_version": "0.1.0"
   },
@@ -97,7 +97,7 @@
         "source_id": "component:lite6_robot:srdf"
       },
       {
-        "content_digest": "sha256:448485049362a14643f3a6418cee4a9e2119bc86509f0a127607aad54803b641",
+        "content_digest": "sha256:c205aea7474737989e1195fbbff16cb9d3f287fee3cefcd550c7ad2e4e606e90",
         "source_id": "component:lite6_robot:urdf"
       }
     ],

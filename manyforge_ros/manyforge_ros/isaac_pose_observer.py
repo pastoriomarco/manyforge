@@ -213,12 +213,13 @@ class _PendingObservation:
 
 
 def pose_source_stream_id(binding: ObservationBinding) -> str:
-    """CP9 stream of one binding: ``poses/<object_id>/<policy_id>``.
-
-    Same rule as the C++ ``pose_source_stream_id``; object ids repeat across
-    policies, so the policy is part of the id.
+    """CP9 stream of one binding: ``poses/<object_id>`` for an object link
+    (``policy_id == "scene"``), else ``poses/<object_id>/<policy_id>``
+    (robot overlays). Same rule as the C++ ``PoseSourceStreamId``.
     """
 
+    if binding.policy_id == "scene":
+        return f"poses/{binding.object_id}"
     return f"poses/{binding.object_id}/{binding.policy_id}"
 
 

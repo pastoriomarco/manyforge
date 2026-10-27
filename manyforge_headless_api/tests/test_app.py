@@ -191,6 +191,7 @@ def _applied_projection(
         "scenario_id": scenario_id,
         "project_path": f"/projects/{scenario_id}.scenario",
         "schema_version": "manyforge.applied_program_selection.v3",
+        "simulation_scene": None,
         "source": {
             "record_digest": record_digest,
             "semantic_content_digest": "sha256:" + "7" * 64,
@@ -216,6 +217,7 @@ def _malform_binding_frame_with_valid_identity(value: dict[str, Any]) -> None:
 def test_closed_core_invalid_request_maps_to_a_client_error() -> None:
     assert _error_status("invalid_request") == 400
     assert _error_status("full_stack_restart_required") == 409
+    assert _error_status("assistant_ai_model_absent") == 503
     assert _error_status("unacknowledged_operator_alarms") == 409
     # Preparation refuses the input before any claim or effect.
     assert _error_status("activation_preparation_failed") == 409
@@ -697,6 +699,7 @@ class FakeCore:
             "schema_version": "manyforge.assistant_mode_index.v1",
             "retained_bundle_id": "bundle.1",
             "graph_revision": "graph.1",
+            "ai_model_component_id": "assistant_model",
             "modes": [
                 {
                     "mode": "composer-assistant",
@@ -2068,6 +2071,25 @@ def test_manager_status_rejects_nonboolean_canonical_empty(
     with pytest.raises(HeadlessApiError) as error:
         _service(core, FakeManager()).manager_status()
     assert error.value.code == "manager_source_invalid"
+
+
+@pytest.mark.parametrize("published", [False, True])
+def test_manager_graph_passes_component_simulator_dependencies_through(
+    published: bool,
+) -> None:
+    core = FakeCore()
+    rows = [
+        {"controllable_component_id": "arm.isaac", "simulator": "isaac"},
+        {"controllable_component_id": "arm.real", "simulator": "none"},
+    ]
+    if published:
+        core.manager_payload["active"]["component_simulator_dependencies"] = rows
+    graph = _service(core, FakeManager()).manager_graph()
+    assert graph["graph_revision"] == "graph.1"
+    if published:
+        assert graph["component_simulator_dependencies"] == rows
+    else:
+        assert "component_simulator_dependencies" not in graph
 
 
 def test_manager_status_and_diff_preserve_offer_digest_fields() -> None:

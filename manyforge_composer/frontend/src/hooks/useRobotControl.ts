@@ -41,6 +41,7 @@ import type {
 } from '../state/robotControl';
 import type { RobotControlMode } from '../state/robotControl';
 import { acknowledgedUncertainOutputs, type UncertainOutput } from '../utils/uncertainOutputs';
+import { writeManualPneumaticValves } from '../state/pneumaticManual';
 import type { CartesianMoveDraftOptions, MoveToDraftSource } from '../utils/moveTo';
 import type {
   DirectControlOperationIntent,
@@ -330,6 +331,8 @@ export function useRobotControl(
   const [stopFaultRecoveryError, setStopFaultRecoveryError] = useState<string | null>(null);
   const stopFaultRecoveryRequest = useRef<{ ownerEpoch: string } | null>(null);
   const approveInFlight = useRef<{ ownerEpoch: string; generation: number } | null>(null);
+  const pneumaticWriteAbort = useRef<AbortController | null>(null);
+  useEffect(() => () => pneumaticWriteAbort.current?.abort(), []);
   const dragGeneration = useRef<number | null>(null);
   useLayoutEffect(() => {
     if (!state.poseDragging) dragGeneration.current = null;
@@ -389,8 +392,15 @@ export function useRobotControl(
     ? manualAvailabilityScopeFence(headlessSnapshot, state.mode, state)
     : null;
   const currentAvailability = availability?.scope === availabilityScope ? availability.result : null;
-  const manualControlAllowed = !observeProgramRun || (currentAvailability?.available === true && cleanupFailure === null);
-  const manualControlUnavailableReason = manualControlAllowed ? null : cleanupFailure
+  const mappedPneumatic = state.mode === 'gripper'
+    && selectedStatus?.directControlGripper?.targetDescriptor.pneumaticOutputs !== undefined;
+  const pneumaticNeedsIdle = mappedPneumatic
+    && (observeProgramRun || headlessSnapshot?.programCycle.state !== 'idle_after_reset');
+  const manualControlAllowed = !pneumaticNeedsIdle
+    && (!observeProgramRun || (currentAvailability?.available === true && cleanupFailure === null));
+  const manualControlUnavailableReason = manualControlAllowed ? null : pneumaticNeedsIdle
+    ? 'Mapped pneumatic manual control is available when the Program is idle after Reset.'
+    : cleanupFailure
     ?? (availability?.scope === availabilityScope ? availability.error : null)
     ?? currentAvailability?.unavailableReason?.replaceAll('_', ' ')
     ?? 'Checking backend manual-control availability.';
@@ -933,6 +943,7 @@ export function useRobotControl(
     ) return;
     const pending = { ownerEpoch: state.status.ownerEpoch, generation: state.generation };
     approveInFlight.current = pending;
+    let pneumaticAbort: AbortController | null = null;
     try {
       if (controlSource === null) {
         throw new Error('Control connection is not synchronized.');
@@ -940,6 +951,46 @@ export function useRobotControl(
       const payload = { ...state.intent } as Record<string, unknown>;
       delete payload.request_context;
       dispatch({ type: 'approve_started' });
+      const currentTarget = selectedStatusForState(state);
+      if (state.mode === 'gripper' && currentTarget?.directControlGripper?.targetDescriptor.pneumaticOutputs !== undefined) {
+        if (state.draftGripperPosition === null) throw new Error('Choose a gripper target.');
+        const start = latestSnapshot.current;
+        if (start === null || start.programCycle.state !== 'idle_after_reset') {
+          throw new Error('Mapped pneumatic manual control is available when the Program is idle after Reset.');
+        }
+        const cycleGeneration = start.programCycle.cycleGeneration;
+        const runnerEpoch = start.programCycle.programRunnerOwnerEpoch;
+        pneumaticAbort = new AbortController();
+        pneumaticWriteAbort.current = pneumaticAbort;
+        const abort = pneumaticAbort;
+        const checkCurrent = () => {
+          const snapshot = latestSnapshot.current;
+          const live = snapshot?.executionControlStatus;
+          if (abort.signal.aborted || runtimeScaleStopActive.current || snapshot == null
+            || snapshot.programCycle.state !== 'idle_after_reset'
+            || snapshot.programCycle.cycleGeneration !== cycleGeneration
+            || snapshot.programCycle.programRunnerOwnerEpoch !== runnerEpoch
+            || live == null || live.ownerEpoch !== currentTarget.ownerEpoch
+            || live.graphRevision !== currentTarget.graphRevision
+            || live.retainedBundleId !== currentTarget.retainedBundleId) {
+            throw new Error('Manual pneumatic sequence stopped because the current Program or Deployment changed.');
+          }
+        };
+        await writeManualPneumaticValves(currentTarget, state.draftGripperPosition, {
+          nextRequestId: requestId,
+          checkCurrent,
+          submit: async (intent) => {
+            const command = { ...intent } as Record<string, unknown>;
+            delete command.request_context;
+            return controlSource.sendExecutionCommand('operation_start', command, intent.request_context.request_id);
+          },
+          read: (operationId, intent, valve) => api.execution.readManualValveOperation(
+            operationId, intent, valve.componentId, valve.binding.commandTargetId, abort.signal,
+          ),
+          wait: () => new Promise<void>((resolve) => window.setTimeout(resolve, 100)),
+        });
+        checkCurrent();
+      }
       await controlSource.sendExecutionCommand(
         'operation_start',
         payload,
@@ -948,12 +999,13 @@ export function useRobotControl(
       // Receipt confirms transport handling only. The shared owner projection
       // moves this surface from Approving to Executing.
     } catch (error: unknown) {
-      if (approveInFlight.current === pending) dispatch({
+      if (approveInFlight.current === pending && !pneumaticAbort?.signal.aborted) dispatch({
         type: 'approve_rejected',
         generation: state.generation,
         error: errorMessage(error, 'Motion approval was rejected.'),
       });
     } finally {
+      if (pneumaticWriteAbort.current === pneumaticAbort) pneumaticWriteAbort.current = null;
       if (approveInFlight.current === pending) approveInFlight.current = null;
     }
   }, [controlSource, state]);

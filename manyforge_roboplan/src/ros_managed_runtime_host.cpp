@@ -44,6 +44,7 @@
 #include <type_traits>
 #include <variant>
 #include <manyforge_collision/manyforge_collision_engine.hpp>
+#include <manyforge_component_manager/site_settings.hpp>
 #include <manyforge_component_manager/manager_named_apply_coordinator.hpp>
 #include <manyforge_component_manager/active_bundle_publication_store.hpp>
 #include <manyforge_component_manager/durable_store_set.hpp>
@@ -58,6 +59,7 @@
 #include <manyforge_core/component_lifecycle_admission.hpp>
 #include <manyforge_core/component_lifecycle_value_codec.hpp>
 #include <manyforge_core/time/host_boot_identity.hpp>
+#include <manyforge_core/time/stuck_drain_wait.hpp>
 #include <manyforge_core/filesystem_resolved_stop_base_plan_repository.hpp>
 #include <manyforge_core/logical_scene_identity.hpp>
 #include <manyforge_core/manager_liveness_receiver.hpp>
@@ -104,6 +106,7 @@
 #include "managed_ros2_component_installation.hpp"
 #include <manyforge_roboplan/retained_ros2_control_lifecycle_product.hpp>
 #include <manyforge_roboplan/retained_ros2_control_runtime_handle.hpp>
+#include <manyforge_roboplan/retained_vendor_device_status.hpp>
 #include <manyforge_roboplan/retained_planner_scene_projection.hpp>
 #include <manyforge_roboplan/retained_planning_model_stage.hpp>
 #include <manyforge_roboplan/retained_scene_frame_resolver.hpp>
@@ -252,7 +255,9 @@ RoboPlanJointLimitsFromRetainedModel(
 }
 
 // One candidate RoboPlan scene and its exact state projector for the given
-// bindings, built from the staged candidate whole-cell planning model.
+// bindings, built from the staged candidate whole-cell planning model. The
+// projector registers each target with its state channel's freshness budget
+// (one per binding, same order).
 struct CandidateRetainedModelScene final {
   std::shared_ptr<roboplan::Scene> scene;
   std::shared_ptr<std::mutex> scene_mutex;
@@ -264,7 +269,8 @@ template <typename RetainedBundle, typename ModelMap, typename PlanningModel>
     std::string_view scene_name, const RetainedPlanningModelStage &stage,
     const PlanningModel &planning_model, const RetainedBundle &bundle,
     const ModelMap &model_map,
-    std::vector<core::RuntimeParticipantBinding> bindings) {
+    std::vector<core::RuntimeParticipantBinding> bindings,
+    std::vector<std::int64_t> freshness_budgets_ns) {
   const auto srdf = planning_model.srdf_bytes();
   const auto documents = deployment::parse_model_documents_for_projection(
       planning_model.urdf_bytes(),
@@ -279,7 +285,7 @@ template <typename RetainedBundle, typename ModelMap, typename PlanningModel>
   result.state_projector = std::make_shared<RetainedKinematicStateProjector>(
       RetainedKinematicStateProjector::create_verified(
           result.scene, result.scene_mutex, bundle, model_map, planning_model,
-          std::move(bindings), 0));
+          std::move(bindings), std::move(freshness_budgets_ns)));
   return result;
 }
 
@@ -946,7 +952,8 @@ CanonicalNullableText(const std::optional<std::string> &value) {
       {"command_kind", CanonicalValue("gripper_position")},
       {"component_role_id", CanonicalValue(gripper.component_role_id.value())},
       {"completion_policy", CanonicalValue(actuation_kind == "pneumatic"
-          ? (output_mode == "none" ? "no_output" : "output_delivery")
+          ? (output_mode == "none" || (has_authored_configuration && authored_configuration->pneumatic_io)
+                 ? "no_output" : "output_delivery")
           : "goal_fenced_target_reached")},
       {"control_interface_contract_id",
        CanonicalNullableText(control_interface_contract_id)},
@@ -2045,6 +2052,9 @@ struct CompositionBuildInput final {
   ros2_control_execution::Ros2TransportResources::ContextProvider ros_context_provider{};
   std::shared_ptr<ros2_control_execution::VolatileMotionTrace> motion_trace{};
   std::vector<core::RuntimeRouteConfigurationReadbackDTO> retained_routes{};
+  // CP8 step 1: the machine's site facts (`manyforge.site.v1`); a Real
+  // component resolves its robot address here at activation.
+  std::optional<component_manager::SiteSettings> site_settings{};
 };
 
 [[nodiscard]] core::CellAdmissionSettlementValidator
@@ -2653,7 +2663,7 @@ BuildRetainedProductComposition(CompositionBuildInput input) {
       auto candidate_scene = BuildCandidateRetainedModelScene(
           "manyforge_i6_native_gripper_host", *candidate_stage,
           *retained_model, *input.bundle, input.model_map,
-          {*physical.gripper});
+          {*physical.gripper}, {old_channel->query_context().freshness_budget_ns});
       const auto limits =
           predecessor->second.gripper_runtime->position_limits();
       const auto &resource = physical.gripper->value().resources.front();
@@ -2793,14 +2803,21 @@ BuildRetainedProductComposition(CompositionBuildInput input) {
         RoboPlanJointLimitsFromRetainedModel(candidate_documents.urdf));
     std::vector<core::RuntimeParticipantBinding> projected_bindings{
         physical.motion.value()};
+    std::vector<std::int64_t> projected_budgets{
+        predecessor->second.runtime->motion_state_channel->query_context()
+            .freshness_budget_ns};
     if (physical.gripper.has_value() &&
         physical.gripper->value().resources.front().source_joint_name
-            .has_value())
+            .has_value()) {
       projected_bindings.push_back(*physical.gripper);
+      projected_budgets.push_back(
+          predecessor->second.runtime->gripper_state_channel->query_context()
+              .freshness_budget_ns);
+    }
     auto candidate_scene = BuildCandidateRetainedModelScene(
         "manyforge_i6_native_execution_host", *candidate_stage,
         *retained_model, *input.bundle, input.model_map,
-        std::move(projected_bindings));
+        std::move(projected_bindings), std::move(projected_budgets));
     candidate_model_generation = make_retained_motion_model_generation(
         physical.motion.value(), std::move(candidate_scene.scene),
         std::move(candidate_scene.scene_mutex),
@@ -2956,7 +2973,7 @@ BuildGripperOnlyProductComposition(CompositionBuildInput input, NativePhysicalBi
       });
   Require(authored != configuration.gripper_target_configurations.end(),
           "ROS gripper-only component has no exact authored gripper configuration");
-  const bool no_output = authored->output_mode == core::GripperOutputMode::kNone;
+  const bool no_output = authored->output_mode == core::GripperOutputMode::kNone || authored->pneumatic_io;
   Require(!no_output || authored->actuation_kind == "pneumatic",
           "No output requires its strict pneumatic gripper target");
   Require(selected && (no_output || (selected->mock_profile && !selected->isaac_profile)),
@@ -2974,15 +2991,16 @@ BuildGripperOnlyProductComposition(CompositionBuildInput input, NativePhysicalBi
           "ROS gripper-only component has no verified cell geometry");
   auto stage = std::make_shared<const RetainedPlanningModelStage>(
       RetainedPlanningModelStage::create_verified(*model, input.execution_run_root));
+  auto state_config = retained_ros2_control_gripper_state_config(binding);
   auto projected = BuildCandidateRetainedModelScene("manyforge_ros_gripper_host", *stage,
-      *model, *input.bundle, input.model_map, {binding});
+      *model, *input.bundle, input.model_map, {binding}, {state_config.freshness_budget_ns});
   const auto joint = projected.scene->getJointInfo(value.resources.front().compiled_resource_name);
   Require(joint && joint->limits.min_position.size() == 1U && joint->limits.max_position.size() == 1U,
           "ROS gripper-only component has no exact scalar model limits");
   const RetainedGripperPositionLimits limits{value.resources.front().coordinate_kind,
       joint->limits.min_position[0], joint->limits.max_position[0]};
   auto channel = std::make_shared<RetainedObservedStateChannel>(binding, projected.state_projector,
-      retained_ros2_control_gripper_state_config(binding), input.shared_clock.get(), input.observation_wake);
+      std::move(state_config), input.shared_clock.get(), input.observation_wake);
   Require(channel->initialize_from_projection(input.shared_clock->now()).applied(),
           "ROS gripper-only component could not seed its genuine model projection");
   const auto observed = projected.state_projector->current_state(
@@ -3050,6 +3068,11 @@ BuildGripperOnlyProductComposition(CompositionBuildInput input, NativePhysicalBi
         config.node_namespace, config.node_namespace + "/controller_manager");
   }
   configure_retained_gripper_output_mode(config, configuration, binding);
+  // CP9: the gripper-only component's own `measured_joints` stream row.
+  const auto measured_lane = retained_measured_joint_state_lane(configuration,
+      value.controllable_component_id,
+      controller_runtime_namespace(value.controllable_component_id.value()) + "/joint_states");
+  config.arm.measured_joint_state_lane = measured_lane;
   config.defer_ros_start = input.managed_component_delta.has_value();
   config.measured_receiver_clock = input.shared_clock;
   config.ros_context_provider = input.ros_context_provider;
@@ -3061,10 +3084,6 @@ BuildGripperOnlyProductComposition(CompositionBuildInput input, NativePhysicalBi
       [handle](const auto& target, const auto& state, const auto&) {
         return handle->RebindGripperRoute(target, state);
       }, input.shared_scheduler, limits};
-  const RetainedMeasuredJointStateLane measured_lane{
-      controller_runtime_namespace(value.controllable_component_id.value()) + "/joint_states",
-      1'000'000'000LL, core::StateAuthorityId(std::string(kMeasuredJointStateAuthorityId)),
-      std::string(kMeasuredJointStateProfileId)};
   const bool pneumatic_gripper = retained_ros2_control_gripper_actuation_kind(configuration, binding) ==
       core::GripperActuationKind::kPneumatic;
   gripper_input.prepare_measured_sources = [handle, clock = input.shared_clock, measured_lane, pneumatic_gripper](
@@ -3346,18 +3365,30 @@ BuildSingleProductComposition(CompositionBuildInput input) {
       std::string(stage.loader_urdf_bytes()), std::string(stage.srdf_bytes()),
       stage.package_paths(), roboplan_joint_limits});
   auto scene_mutex = std::make_shared<std::mutex>();
+  // Each target registers its own channel's budget: the motion channel's
+  // (Real: measured_joints; Mock/Isaac: 0) and the commanded gripper's (0),
+  // e.g. a Real measured arm beside its no-output pneumatic gripper.
   std::vector<core::RuntimeParticipantBinding> projected_state_bindings{
       direct_control_motion_binding.value()};
+  std::vector<std::int64_t> projected_state_budgets{
+      retained_ros2_control_motion_state_budget_ns(
+          retained_runtime_configuration,
+          direct_control_motion_binding.value())};
   if (direct_control_gripper_binding.has_value() &&
       direct_control_gripper_binding->value()
           .resources.front()
           .source_joint_name.has_value()) {
     projected_state_bindings.push_back(*direct_control_gripper_binding);
+    projected_state_budgets.push_back(
+        retained_ros2_control_gripper_state_config(
+            *direct_control_gripper_binding)
+            .freshness_budget_ns);
   }
   auto state_projector = std::make_shared<RetainedKinematicStateProjector>(
       RetainedKinematicStateProjector::create_verified(
           scene, scene_mutex, *input.bundle, input.model_map, *retained_model,
-          std::move(projected_state_bindings), 0));
+          std::move(projected_state_bindings),
+          std::move(projected_state_budgets)));
 
   auto publisher = std::move(input.collision_publisher);
   auto collision_model = std::move(input.collision_shared_model);
@@ -3549,6 +3580,9 @@ BuildSingleProductComposition(CompositionBuildInput input) {
       prepared_launch(nullptr, discard_launch);
   std::map<std::string, double, std::less<>> mock_cancel_by_source_joint;
   bool mock_lane = false;
+  bool real_lane = false;
+  // R7 package 3: a Real component's vendor adapter (Mock's start-up path).
+  std::shared_ptr<IRetainedDeviceStatusAdapter> device_status_adapter;
   std::optional<MockResetPositionTarget> mock_reset_position_target;
   {
     const auto &motion_value = direct_control_motion_binding.value().value();
@@ -3601,6 +3635,26 @@ BuildSingleProductComposition(CompositionBuildInput input) {
     artifact_input.gripper_binding = direct_control_gripper_binding;
     artifact_input.isaac_profile = selected_profile->isaac_profile;
     artifact_input.mock_profile = selected_profile->mock_profile;
+    if (selected_profile->real_profile.has_value()) {
+      // CP8 step 1 (temporary selector until CP8 step 3): the robot's
+      // address is a site fact, resolved here; never a fallback.
+      real_lane = true;
+      Require(selected_profile->device_address_ref.has_value(),
+              "site_device_address_ref_unknown: real component " +
+                  motion_value.controllable_component_id.value() +
+                  " has no device_address_ref");
+      const auto address = component_manager::ResolveSiteDeviceAddress(
+          input.site_settings, *selected_profile->device_address_ref);
+      Require(address.ok(),
+              address.ok() ? std::string{}
+                           : address.error().code + ": real component " +
+                                 motion_value.controllable_component_id.value() +
+                                 ": " + address.error().message);
+      artifact_input.real_profile = selected_profile->real_profile;
+      artifact_input.robot_ip = address.value();
+      // The robot reports its own pose: no deployment initial pose seeds it.
+      selected_initial_joint_positions.clear();
+    }
     if (selected_profile->isaac_profile.has_value()) {
       artifact_input.isaac_lane =
           retained_isaac_controller_lane(*selected_profile->isaac_profile,
@@ -3643,8 +3697,19 @@ BuildSingleProductComposition(CompositionBuildInput input) {
           });
       Require(row != retained_runtime_configuration.gripper_target_configurations.end(),
               "ROS controller artifacts have no exact authored gripper output choice");
-      artifact_input.gripper_output_mode = row->output_mode;
-      gripper_state_freshness_timeout_s = row->state_freshness_timeout_s;
+      artifact_input.gripper_output_mode = row->pneumatic_io
+          ? core::GripperOutputMode::kNone : row->output_mode;
+      artifact_input.gripper_actuation_kind =
+          retained_ros2_control_gripper_actuation_kind(
+              retained_runtime_configuration, *direct_control_gripper_binding);
+      if (!(real_lane && *artifact_input.gripper_actuation_kind ==
+                            core::GripperActuationKind::kPneumatic)) {
+        gripper_state_freshness_timeout_s =
+            static_cast<double>(retained_component_stream(retained_runtime_configuration,
+                direct_control_gripper_binding->value().controllable_component_id,
+                deployment::ros2_control_execution_runtime_contract::kGripperFeedbackStreamId)
+                                    .budget_ns) / 1e9;
+      }
     }
     artifact_input.model_urdf = source_urdf->urdf_bytes;
     artifact_input.frame_prefix = selected_profile->frame_prefix;
@@ -3665,6 +3730,16 @@ BuildSingleProductComposition(CompositionBuildInput input) {
     if (written.lane == ControllerLaunchLane::kMock) {
       mock_lane = true;
       mock_reset_position_target = written.mock_reset_position;
+      if (written.vendor_adapter.has_value()) {
+        auto selection = *written.vendor_adapter;
+        // D11: the component's tool payload, applied by the vendor at Enable.
+        if (selected_profile->tool_payload.has_value())
+          selection.tool_payload = VendorToolPayload{
+              selected_profile->tool_payload->mass_kg,
+              selected_profile->tool_payload->center_of_mass_m};
+        device_status_adapter =
+            make_retained_vendor_device_status_adapter(selection);
+      }
       // Q48: the same per-joint cancel bounds the generated controllers file
       // carries, keyed by the binding's own resource-to-source-joint map.
       for (const auto &[resource_id, limit] :
@@ -3726,6 +3801,9 @@ BuildSingleProductComposition(CompositionBuildInput input) {
   }
   auto ros2_control_runtime_handle =
       RetainedRos2ControlRuntimeHandle::Create();
+  if (device_status_adapter)
+    ros2_control_runtime_handle->InstallDeviceStatusAdapter(
+        std::move(device_status_adapter));
   if (controller_process != nullptr) {
     ros2_control_runtime_handle->InstallControllerProcessFaultSource(
         ControllerLaunchSupervisor::fault_source(
@@ -3737,16 +3815,27 @@ BuildSingleProductComposition(CompositionBuildInput input) {
                   controller_process->ReadCachedFaultState()));
         });
   }
+  // CP9: the same Deployment stream overrides the registry receives
+  // (ApplyComponentStreamOverrides) set the in-motion staleness check.
+  const auto stream_overrides =
+      deployment::ComponentStreamParameterOverrides(*input.bundle);
   auto ros2_control_backend_config =
-      mock_lane
+      real_lane
+          ? make_retained_real_ros2_control_backend_config(
+                retained_runtime_configuration,
+                direct_control_motion_binding.value(),
+                direct_control_gripper_binding, mock_cancel_by_source_joint,
+                stream_overrides)
+      : mock_lane
           ? make_retained_mock_ros2_control_backend_config(
                 retained_runtime_configuration,
                 direct_control_motion_binding.value(),
-                direct_control_gripper_binding, mock_cancel_by_source_joint)
+                direct_control_gripper_binding, mock_cancel_by_source_joint,
+                stream_overrides)
           : make_retained_isaac_ros2_control_backend_config(
                 retained_runtime_configuration,
                 direct_control_motion_binding.value(),
-                direct_control_gripper_binding);
+                direct_control_gripper_binding, stream_overrides);
   ros2_control_backend_config.arm.mock_reset_position = std::move(mock_reset_position_target);
   // The addressed wrapper historically creates its own time capabilities.
   // A subordinate runtime retains the exact supplied pair, or creates both.
@@ -4036,8 +4125,8 @@ BuildSingleProductComposition(CompositionBuildInput input) {
   return composition;
 }
 
-// The simulated PLC plan `bundle` authors for `component`: its unit's mode
-// and its own I/O rows (ROS-free selection in plan_simulated_plc).
+// The simulated PLC plan `bundle` authors for `component`: whether its unit
+// is simulated, and its own I/O rows (ROS-free selection in plan_simulated_plc).
 [[nodiscard]] std::optional<SimulatedPlcPlan> SimulatedPlcPlanFor(
     const deployment::RetainedBundle &bundle,
     const std::vector<deployment::RetainedIoSignalConfiguration> &io_rows,
@@ -4053,15 +4142,24 @@ BuildSingleProductComposition(CompositionBuildInput input) {
                     row.provider.service});
   }
   if (!unit_id) return std::nullopt;
-  std::string mode;
-  for (const auto &unit : bundle.value().cell_graph.runtime_units) {
-    if (unit.runtime_unit_id != *unit_id) continue;
-    const auto found = unit.configuration.find("mode");
-    if (found == unit.configuration.end()) continue;
-    if (const auto *text = std::get_if<std::string>(&found->second.value))
-      mode = *text;
-  }
-  return plan_simulated_plc(mode, component.value(), rows,
+  // CP8 step 1 (the cell-wide `mode` is deleted): a ROS unit is simulated
+  // unless one of the components it hosts has measured (real) state authority.
+  const auto &graph = bundle.value().cell_graph;
+  const bool simulated_unit =
+      std::any_of(graph.runtime_units.begin(), graph.runtime_units.end(),
+                  [&](const auto &unit) {
+                    return unit.runtime_unit_id == *unit_id &&
+                           unit.runtime_profile_id.value() ==
+                               deployment::ros2_control_execution_runtime_contract::
+                                   kRuntimeProfileId;
+                  }) &&
+      std::none_of(graph.control_bindings.begin(), graph.control_bindings.end(),
+                   [&](const auto &binding) {
+                     return binding.provider_runtime_unit_id == *unit_id &&
+                            binding.state_authority_class ==
+                                core::StateAuthorityClass::kMeasured;
+                   });
+  return plan_simulated_plc(simulated_unit, component.value(), rows,
                             simulated_plc_config_dir_from_environment());
 }
 
@@ -4079,7 +4177,7 @@ BuildSingleProductComposition(CompositionBuildInput input) {
 }
 
 // sim-plc-peer-design-02/03 §4: a pure generic ROS I/O device in a
-// `commanded_sim` unit gets a Manager-owned simulated PLC process, started
+// simulated unit (no hosted real component) gets a Manager-owned PLC process, started
 // before Prepare by the same supervisor as the mock robot. Equal launch
 // identity keeps it (and its values); a changed one restarts it; its exit is
 // the device's component fault; removal/Close retire it via controller_process.
@@ -4131,8 +4229,8 @@ void EnsureSimulatedPlc(
             << " config_dir=" << plan->config_dir.string() << std::endl;
 }
 
-// CP9: the observer plan `bundle` authors for a `pose_source` component, or
-// none when the component has no pose-source row.
+// CP9: the observer plan `bundle` authors for a `pose_source` or `ai_model`
+// component, or none when the component has neither row.
 [[nodiscard]] std::optional<PoseSourcePlan> PoseSourcePlanFor(
     const deployment::RetainedBundle &bundle, const core::RuntimeUnitId &unit,
     const core::ControllableComponentId &component,
@@ -4140,15 +4238,20 @@ void EnsureSimulatedPlc(
     const std::filesystem::path &manager_run_root) {
   namespace contract = deployment::ros2_control_execution_runtime_contract;
   const auto configuration = contract::require_configuration(bundle, unit);
-  const auto *row = contract::find_pose_source(configuration, component);
-  if (row == nullptr) return std::nullopt;
-  return plan_pose_source(bundle.value().cell_graph.cell_id.value(),
-                          component.value(), row->observer_configuration,
-                          execution_run_root, manager_run_root);
+  const auto &cell = bundle.value().cell_graph.cell_id.value();
+  if (const auto *row = contract::find_pose_source(configuration, component))
+    return plan_pose_source(cell, component.value(), row->observer_configuration,
+                            execution_run_root, manager_run_root);
+  if (const auto *row = contract::find_ai_model(configuration, component))
+    return plan_ai_model(cell, component.value(), contract::kAiModelStreamId,
+                         row->base_url, row->model, row->api_key_env,
+                         execution_run_root);
+  return std::nullopt;
 }
 
-// As the simulated PLC: a rebuilt pose source keeps its running observer
-// when the candidate's launch identity (document, Manager root) is unchanged.
+// As the simulated PLC: a rebuilt pose source (AI model) keeps its running
+// observer when the candidate's launch identity (document, Manager root) is
+// unchanged.
 [[nodiscard]] bool PoseSourceSurvivesRebuild(
     const std::shared_ptr<ControllerLaunchProcess> &process,
     const deployment::RetainedBundle &candidate,
@@ -4156,20 +4259,24 @@ void EnsureSimulatedPlc(
     const core::ControllableComponentId &component,
     const std::filesystem::path &execution_run_root,
     const std::filesystem::path &manager_run_root) {
-  if (!process || process->command().lane != ControllerLaunchLane::kPoseSource)
+  if (!process || (process->command().lane != ControllerLaunchLane::kPoseSource &&
+                   process->command().lane != ControllerLaunchLane::kAiModel))
     return false;
   return pose_source_launch_survives(
       process.get(), PoseSourcePlanFor(candidate, unit, component,
                                        execution_run_root, manager_run_root));
 }
 
-// CP9 pose source: a model-free component whose provider driver has no I/O
-// members. A fresh driver is installed here with one declared stream per
-// binding (`warning` + `auto`, budget = binding lifetime, message stamps;
-// Deployment overrides apply). Its observer process is started or kept by the
+// CP9 pose source / AI model: a model-free component whose provider driver
+// has no I/O members. A fresh driver is installed here with its declared
+// streams (`warning` + `auto`; Deployment overrides apply): one per pose
+// binding (budget = binding lifetime, message stamps), or the AI model's one
+// `endpoint` stream (arrival). Its observer process is started or kept by the
 // supervisor like the simulated PLC, and never awaited: the Manager may be
 // waiting on this host. The process exit is the driver's fault (typed
-// `pose_source_exited` / `pose_source_config_invalid`).
+// `pose_source_exited` / `pose_source_config_invalid`, `ai_model_exited` /
+// `ai_model_config_invalid`); an unreachable model endpoint only stales the
+// stream.
 void EnsurePoseSource(
     Composition &view, const deployment::RetainedBundle &bundle,
     const std::optional<core::RuntimeUnitId> &runtime_unit,
@@ -4182,36 +4289,47 @@ void EnsurePoseSource(
     return;
   std::shared_ptr<IoProviderDriverRecord> driver;
   for (const auto &record : *view.io_provider_drivers)
-    if (record && record->pose_source()) driver = record;
+    if (record && record->stream_observer()) driver = record;
   if (!driver) return;
-  Require(runtime_unit.has_value(), "pose source has no host runtime unit");
+  Require(runtime_unit.has_value(), "stream observer has no host runtime unit");
   namespace contract = deployment::ros2_control_execution_runtime_contract;
-  const auto configuration = contract::require_configuration(bundle, *runtime_unit);
-  const auto *row =
-      contract::find_pose_source(configuration, view.controllable_component_id);
-  Require(row != nullptr, "pose source component has no Deployment row");
-  const auto plan = plan_pose_source(
-      bundle.value().cell_graph.cell_id.value(),
-      view.controllable_component_id.value(), row->observer_configuration,
-      execution_run_root, manager_run_root);
+  const auto planned = PoseSourcePlanFor(bundle, *runtime_unit,
+                                         view.controllable_component_id,
+                                         execution_run_root, manager_run_root);
+  Require(planned.has_value(), "stream observer component has no Deployment row");
+  const auto &plan = *planned;
   if (!borrowed_drivers) {
+    std::vector<core::StreamDeclarationDTO> declarations;
+    if (plan.lane == ControllerLaunchLane::kAiModel) {
+      declarations.push_back({std::string(contract::kAiModelStreamId),
+                              kAiModelStreamBudgetNs,
+                              core::StreamSeverityDTO::kWarning,
+                              core::StreamRecoveryDTO::kAuto,
+                              core::StreamTimestampSourceDTO::kArrival});
+    } else {
+      const auto configuration =
+          contract::require_configuration(bundle, *runtime_unit);
+      const auto *row = contract::find_pose_source(
+          configuration, view.controllable_component_id);
+      for (const auto &binding : row->bindings)
+        declarations.push_back({contract::pose_source_stream_id(binding),
+                                binding.lifetime_ns,
+                                core::StreamSeverityDTO::kWarning,
+                                core::StreamRecoveryDTO::kAuto,
+                                core::StreamTimestampSourceDTO::kMessageStamp});
+    }
     std::vector<std::unique_ptr<core::StreamRecorder>> streams;
-    for (const auto &binding : row->bindings) {
+    for (auto &declaration : declarations) {
       auto declared = host_component_stream_health()->Declare(
-          view.controllable_component_id,
-          core::StreamDeclarationDTO{contract::pose_source_stream_id(binding),
-                                     binding.lifetime_ns,
-                                     core::StreamSeverityDTO::kWarning,
-                                     core::StreamRecoveryDTO::kAuto,
-                                     core::StreamTimestampSourceDTO::kMessageStamp});
-      Require(declared.ok(), "pose source stream cannot be declared: " +
+          view.controllable_component_id, std::move(declaration));
+      Require(declared.ok(), "observer stream cannot be declared: " +
                                  (declared.ok() ? std::string{}
                                                 : declared.error().message));
       streams.push_back(std::move(declared.value()));
     }
     auto delivery = driver->AcquireDelivery();
-    const auto installed = driver->InstallPoseSourceLocked(std::move(streams));
-    Require(installed.ok(), "pose source driver cannot be installed: " +
+    const auto installed = driver->InstallObserverStreamsLocked(std::move(streams));
+    Require(installed.ok(), "observer driver cannot be installed: " +
                                 (installed.ok() ? std::string{}
                                                 : installed.error().message));
   }
@@ -4226,7 +4344,10 @@ void EnsurePoseSource(
     if (ensured.decision != ControllerLaunchDecision::kKeep ||
         ensured.process != installed_process) {
       static_cast<void>(supervisor.discard_candidate(ensured));
-      Fail("pose_source_not_ready: component=" + plan.component_id +
+      Fail(std::string(plan.lane == ControllerLaunchLane::kAiModel
+                           ? "ai_model_not_ready"
+                           : "pose_source_not_ready") +
+           ": component=" + plan.component_id +
            " installed process is no longer running; the retained component "
            "cannot change its observer");
     }
@@ -5272,16 +5393,19 @@ void PrepareCompositionIoResources(Composition &composition,
   const auto rows = deployment::ResolveRetainedIoSignalCatalog(composition.bundle->value().cell_graph);
   Require(rows.ok(), "retained I/O source configuration is invalid");
   const auto &domains = composition.bundle->value().cell_graph.control_domains;
-  const bool pose_source = std::any_of(domains.begin(), domains.end(), [](const auto &domain) {
-    return domain.provider() && domain.provider()->provider_manifest_id.value() ==
-                                    core::kPoseSourceLifecycleManifestId;
+  const bool stream_observer = std::any_of(domains.begin(), domains.end(), [](const auto &domain) {
+    if (!domain.provider()) return false;
+    const auto &manifest = domain.provider()->provider_manifest_id.value();
+    return manifest == core::kPoseSourceLifecycleManifestId ||
+           manifest == core::kAiModelLifecycleManifestId;
   });
-  const bool needs_ros = pose_source ||
+  const bool needs_ros = stream_observer ||
       std::any_of(rows.value().begin(), rows.value().end(), [](const auto &row) {
     return row.provider.profile == "ros_bool" ||
            row.provider.profile == "ros_set_bool" ||
            row.provider.profile == "ur_io_states" ||
            row.provider.profile == "ur_set_io" ||
+           row.provider.profile == "xarm_digital" ||
            row.provider.profile == "ros2_control_gpio";
   });
   auto transport = shared_transport;
@@ -5294,8 +5418,8 @@ void PrepareCompositionIoResources(Composition &composition,
       transport ? transport->node() : nullptr, existing);
   Require(prepared.ok(), "actual I/O resource preparation failed: " +
       (prepared.ok() ? std::string{} : prepared.error().message));
-  if (pose_source) {
-    // One bridge per host process: Python pose-source sinks push samples
+  if (stream_observer) {
+    // One bridge per host process: Python observer sinks push samples
     // into the streams their host-side driver declared.
     static std::mutex bridge_mutex;
     static std::weak_ptr<void> installed_bridge;
@@ -6969,7 +7093,8 @@ BuildManagedCandidateLifecyclePlanningClosure(
       const auto manifest = manifests.get_verified({bundle.retained_bundle_id(),
           provider->provider_manifest_id, provider->provider_manifest_revision});
       Require(manifest.has_value(), "candidate retained lifecycle manifest is absent");
-      auto catalog = make_retained_ros2_control_lifecycle_catalog(manifest->value());
+      auto catalog =
+          make_retained_physical_ros2_control_lifecycle_catalog(manifest->value());
       if (!catalog.ok()) return core::Result<Closure>::Err(catalog.error());
       std::sort(bindings.begin(), bindings.end(), [](const auto &lhs, const auto &rhs) {
         return lhs.control_binding_id < rhs.control_binding_id;
@@ -7944,6 +8069,7 @@ TryBuildCurrentManagedCompositionInput(
       }(),
   };
   input.required_projection_pins = std::move(component_projections->required_projection_pins);
+  input.site_settings = config.site_settings;
   if (const auto *named = std::get_if<core::NamedApplyPublicationTransactionDTO>(
           &receipt.request.transaction_ref)) {
     input.origin_named_apply = *named;
@@ -8227,6 +8353,7 @@ struct ManagedBootstrapStopProduct final {
           " generation=" + std::to_string(request.apply_generation.value()),
   };
   input.required_projection_pins = std::move(component_projections->required_projection_pins);
+  input.site_settings = config.site_settings;
   input.origin_named_apply = core::NamedApplyPublicationTransactionDTO{
       request.apply_id, request.apply_generation};
   const auto selected_program = detail::ReadSelectedProgramProducts(
@@ -11894,6 +12021,7 @@ RunManagedRuntimeChild(const ManagedRuntimeChildConfig &config) {
   manager_liveness_lane = std::jthread([&](const std::stop_token stop_token) {
     try {
       bool ordinary_status_available = true;
+      const char *operational_stuck_drain = nullptr;
       while (!stop_token.stop_requested()) {
         std::array<pollfd, 2> descriptors{
             {{config.manager_liveness_channel_fd, POLLIN | POLLHUP, 0},
@@ -11970,8 +12098,18 @@ RunManagedRuntimeChild(const ManagedRuntimeChildConfig &config) {
             continue;
           }
           if (component_manager::detail::IsManagerLivenessRpcPacket(*packet)) {
-            SendManagedRuntimePacket(config.manager_liveness_channel_fd,
-                                     handle_manager_liveness(*packet));
+            SendManagedRuntimePacket(
+                config.manager_liveness_channel_fd,
+                host_detail::DispatchHeartbeatForDrain(
+                    core::FirstStuckDrainName(),
+                    shutdown_status_servicing.load(std::memory_order_acquire),
+                    operational_stuck_drain,
+                    [&] { return handle_manager_liveness(*packet); },
+                    [](const char *drain) {
+                      return component_manager::detail::
+                          EncodeManagerLivenessRpcRejection(
+                              std::string("drain_stuck.") + drain);
+                    }));
             continue;
           }
           Require(

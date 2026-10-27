@@ -581,7 +581,6 @@ export function ScenarioDocumentCommands({
           <path d="M2 4.5a.5.5 0 0 1 .5-.5H6l1.5 1.5h6a.5.5 0 0 1 .5.5V7H2z" />
           <path d="M2 7h12.5l-1.6 5.6a.5.5 0 0 1-.5.4H3.3a.5.5 0 0 1-.5-.4L2 7z" />
         </ScenarioIconButton>
-        {/* Temporary for testing: remove before release once New opens an untitled Scenario (plan hardening item “Untitled New”) */}
         <ScenarioIconButton label="Close Scenario" reason={motionReason ?? closeEntryReason} disabled={motionReason !== null || closeEntryReason !== null}
           onClick={(event) => beginAction('close', event)}>
           <path d="M3 3l10 10M13 3L3 13" />
@@ -640,7 +639,6 @@ export function ScenarioDocumentCommands({
               </div>
               {newPickerOpen && (
                 <FolderPicker
-                  initialPath={newParent}
                   onCancel={() => setNewPickerOpen(false)}
                   onChoose={(path) => {
                     setNewParent(path);
@@ -723,7 +721,6 @@ export function ScenarioDocumentCommands({
                   </div>
                   {savePickerOpen && (
                     <FolderPicker
-                      initialPath={saveDirectory}
                       onCancel={() => setSavePickerOpen(false)}
                       onChoose={(path) => {
                         setSaveDirectory(path);
@@ -788,7 +785,6 @@ export function ScenarioDocumentCommands({
                   </div>
                   {exportPickerOpen && (
                     <FolderPicker
-                      initialPath={exportParent ?? (scenarioDocumentPath !== null ? parentFolder(scenarioDocumentPath) : null)}
                       onCancel={() => setExportPickerOpen(false)}
                       onChoose={(path) => {
                         setExportParent(path);
@@ -847,7 +843,6 @@ export function ScenarioDocumentCommands({
               {loadPickerOpen && (
                 <FolderPicker
                   chooseProject
-                  initialPath={scenarioDirectory || null}
                   onCancel={() => setLoadPickerOpen(false)}
                   onChoose={(path) => {
                     setLoadPickerOpen(false);

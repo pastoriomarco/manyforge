@@ -32,6 +32,15 @@
         },
         "runtime_configuration": {
           "collision_monitor_period_ms": 50.0,
+          "component_streams": [
+            {
+              "budget_ns": 250000000,
+              "controllable_component_id": "ur5_robot",
+              "recovery": "ack",
+              "severity": "fault",
+              "stream_id": "measured_joints"
+            }
+          ],
           "execution_tick_hz": 100,
           "initial_joint_positions_rad": [
             0.0,
@@ -42,7 +51,6 @@
             0.0
           ],
           "mock_profile": "ur5_roboplan",
-          "mode": "commanded_sim",
           "planner_rng_seed": 12345
         },
         "runtime_kind": "ros2_control"

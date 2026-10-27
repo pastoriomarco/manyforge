@@ -5,6 +5,7 @@
 #include <stdexcept>
 #include <string>
 #include <string_view>
+#include <utility>
 #include <variant>
 #include <vector>
 
@@ -16,8 +17,8 @@ namespace manyforge::roboplan_backend {
 /// Controller `robot_description` generation for the lanes ManyForge starts
 /// itself (design Q69; ROBOT_DESCRIPTION_GENERATION.md §1-§2). ROS-free: the
 /// input is the model bundle's ManyForge URDF text and retained binding facts,
-/// the output is URDF text. Real-robot lanes keep the vendor description and
-/// never use this.
+/// the output is URDF text. A Real component (CP8 step 2a) uses the same
+/// generator with its vendor plugin; the vendor xacro is not used.
 ///
 /// Rules: every `<ros2_control>` element of the model is removed; every other
 /// byte of the model is kept unchanged (links, joints, limits, mimic tags,
@@ -44,9 +45,41 @@ struct MockGripperBinding final {
   std::optional<double> projected_initial_position;
 };
 
-/// Offline mock lane: `mock_components/GenericSystem` with
-/// `calculate_dynamics=true`; each listed joint has a position command and
-/// position (with an explicit `initial_value`) and velocity state.
+/// CP8 step 2a: the ros2_control hardware of one Mock or Real component as
+/// data, so their shared start-up path has no per-lane branch. Isaac keeps its
+/// own section until CP8 step 2b. The description generator reads the plugin,
+/// parameters, command interfaces and seeding rule; the remaining fields are
+/// launch data carried to the shared launch.
+struct Ros2ControlHardwareSpec final {
+  /// The `<hardware><plugin>` value.
+  std::string plugin;
+  /// Ordered `<hardware><param>` entries, written verbatim.
+  std::vector<std::pair<std::string, std::string>> parameters;
+  /// Each listed joint's command interfaces, in order. Every joint has
+  /// position and velocity state interfaces.
+  std::vector<std::string> joint_command_interfaces;
+  /// True: the hardware seeds its position state from an explicit
+  /// `initial_value` (Mock). False: the hardware reports measured state, so no
+  /// initial value is written and none may be supplied (Real).
+  bool seeds_initial_positions{};
+  /// Exact bytes of a driver parameters file for `ros2_control_node`; empty
+  /// passes none.
+  std::string driver_parameters_yaml;
+  /// `ros2_control_node` remappings (from, to), in order.
+  std::vector<std::pair<std::string, std::string>> remappings;
+  /// The hardware starts `inactive` through the stock controller manager
+  /// `hardware_components_initial_state` instead of active.
+  bool initial_state_inactive{};
+};
+
+/// Mock's hardware: `mock_components/GenericSystem` with
+/// `calculate_dynamics=true`, position command, seeded from the deployment.
+[[nodiscard]] Ros2ControlHardwareSpec mock_generic_system_hardware();
+
+/// The ros2_control component lane of Mock and (CP8 step 2a) Real; the name
+/// stays until CP8 step 3. Each listed joint has the hardware's command
+/// interfaces and position (with an explicit `initial_value` when the hardware
+/// seeds it) and velocity state.
 struct MockControllerLane final {
   /// The generated element's `name` attribute.
   std::string hardware_component_name;
@@ -60,6 +93,7 @@ struct MockControllerLane final {
   /// Strict selected output choice; None keeps the real model binding while
   /// emitting no gripper control interfaces. It requires an arm in this writer.
   core::GripperOutputMode gripper_output_mode{core::GripperOutputMode::kCommanded};
+  Ros2ControlHardwareSpec hardware{mock_generic_system_hardware()};
 };
 
 /// Isaac lane: `topic_based_ros2_control/TopicBasedSystem` with the lane's

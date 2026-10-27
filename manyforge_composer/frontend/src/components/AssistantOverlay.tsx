@@ -6,7 +6,7 @@ import type {
   AssistantModeIndex,
   AssistantProviderStatus,
 } from '../types/assistant';
-import type { JsonValue } from '../types/api';
+import type { StructuralResourceState } from '../state/structuralResource';
 import {
   reconcileAssistantRequest,
   shouldReconcileAssistantRequest,
@@ -23,16 +23,43 @@ const ORIENTATION_FIELDS = [
 ] as const;
 const MAXIMUM_TRANSCRIPT_ITEMS = 200;
 const MAXIMUM_PRESENTED_TOOL_RESULTS = 128;
+/** The only chat mode: edits land in the Program Draft via the tool callback. */
+const ASSISTANT_MODE = 'composer-assistant';
+export const NO_AI_MODEL_COMPONENT = 'No AI model component in this Deployment';
+export const NO_ASSISTANT_CHAT_MODE = "This Deployment's assistant profile has no chat mode";
+
+export interface AssistantAvailability {
+  /** Why the AI tab is disabled, or null when it can be opened. */
+  unavailableReason: string | null;
+  modeIndex: AssistantModeIndex | null;
+  modeError: string | null;
+}
+
+/** The AI tab opens only for a Deployment with an assistant profile and an AI model component. */
+export function assistantAvailability(
+  modes: StructuralResourceState<AssistantModeIndex>,
+): AssistantAvailability {
+  switch (modes.status) {
+    case 'loading':
+      return { unavailableReason: 'Loading assistant modes…', modeIndex: null, modeError: null };
+    case 'absent':
+      return { unavailableReason: modes.message, modeIndex: null, modeError: null };
+    case 'error':
+      return { unavailableReason: null, modeIndex: null, modeError: modes.message };
+    case 'ready':
+      if (modes.data.aiModelComponentId === null) {
+        return { unavailableReason: NO_AI_MODEL_COMPONENT, modeIndex: null, modeError: null };
+      }
+      if (!modes.data.modes.some((mode) => mode.mode === ASSISTANT_MODE)) {
+        return { unavailableReason: NO_ASSISTANT_CHAT_MODE, modeIndex: null, modeError: null };
+      }
+      return { unavailableReason: null, modeIndex: modes.data, modeError: null };
+  }
+}
 
 interface TranscriptResponse {
   requestId: string;
   draftMutated: boolean;
-  proposals: Array<{
-    toolId: string;
-    effect: string;
-    arguments: Record<string, JsonValue>;
-    decision: 'pending' | 'materializing' | 'materialized' | 'rejected' | 'failed';
-  }>;
   toolCalls: Array<{
     toolId: string;
     status: string;
@@ -45,7 +72,6 @@ interface TranscriptResponse {
 interface TranscriptItem {
   id: string;
   role: 'user' | 'assistant';
-  mode: string;
   text: string;
   response?: TranscriptResponse;
   error?: string;
@@ -53,7 +79,6 @@ interface TranscriptItem {
 
 interface RetryIntent {
   message: string;
-  mode: string;
 }
 
 function identity(prefix: string): string {
@@ -69,6 +94,10 @@ function terminal(status: AssistantProviderStatus): boolean {
 export function assistantFailureText(status: AssistantProviderStatus): string {
   if (status.error) {
     const { code, message } = status.error;
+    if (code === 'assistant_ai_model_absent') return NO_AI_MODEL_COMPONENT;
+    if (code === 'ai_model_token_unavailable') {
+      return `AI model token unavailable: ${message} Set it in the environment of the ManyForge services.`;
+    }
     if (code.includes('timeout')) {
       return `Assistant timed out: ${message} Try a narrower request or retry when the model is ready.`;
     }
@@ -76,10 +105,10 @@ export function assistantFailureText(status: AssistantProviderStatus): string {
       return `Assistant configuration changed: ${message} Refresh mode discovery before retrying.`;
     }
     if (code.includes('provider') || code.includes('upstream')) {
-      return `Assistant provider unavailable: ${message} Check the configured bridge/model service before retrying.`;
+      return `Assistant provider unavailable: ${message} Check the AI model server of the Deployment before retrying.`;
     }
     if (code.includes('tool') || code === 'response_rejected') {
-      return `Assistant tool request rejected: ${message} Check the selected mode and its available tools.`;
+      return `Assistant tool request rejected: ${message} Check the tools available to the assistant.`;
     }
     return `${code}: ${message}`;
   }
@@ -118,14 +147,6 @@ function presentationResponse(
   return {
     requestId: status.requestId,
     draftMutated: response.draftMutated,
-    proposals: response.proposals
-      .slice(0, MAXIMUM_PRESENTED_TOOL_RESULTS)
-      .map((proposal) => ({
-        toolId: proposal.toolId,
-        effect: proposal.effect,
-        arguments: proposal.arguments,
-        decision: 'pending',
-      })),
     toolCalls: response.toolCalls
       .slice(0, MAXIMUM_PRESENTED_TOOL_RESULTS)
       .map((call) => ({
@@ -141,20 +162,20 @@ function presentationResponse(
 }
 
 export function AssistantOverlay({
-  enabled,
-  headlessConnected,
+  unavailableReason,
+  modeIndex,
+  modeError,
+  onRetryModes,
   programController,
 }: {
-  enabled: boolean;
-  headlessConnected: boolean;
+  unavailableReason: string | null;
+  modeIndex: AssistantModeIndex | null;
+  modeError: string | null;
+  onRetryModes: () => void;
   programController: ProgramWorkspaceController;
 }) {
   const ownerEpoch = useRef(identity('composer.page'));
   const recovery = useRef<AbortController | null>(null);
-  const modeDiscovery = useRef<AbortController | null>(null);
-  const [modeIndex, setModeIndex] = useState<AssistantModeIndex | null>(null);
-  const [modeError, setModeError] = useState<string | null>(null);
-  const [selectedMode, setSelectedMode] = useState('');
   const [conversationId, setConversationId] = useState(() => identity('conversation'));
   const [input, setInput] = useState('');
   const [transcript, setTranscript] = useState<TranscriptItem[]>([]);
@@ -168,55 +189,15 @@ export function AssistantOverlay({
   useOperationalErrorMirror({
     source: 'composer.assistant',
     title: 'Assistant request or response failed',
-    message: operationalError ?? modeError,
-    onDismiss: () => {
-      setOperationalError(null);
-      setModeError(null);
-    },
+    message: operationalError,
+    onDismiss: () => setOperationalError(null),
   });
-
-  const loadModes = useCallback(() => {
-    modeDiscovery.current?.abort();
-    if (!enabled) {
-      setModeIndex(null);
-      modeDiscovery.current = null;
-      return;
-    }
-    const controller = new AbortController();
-    modeDiscovery.current = controller;
-    setModeError(null);
-    void api.assistant.modes(controller.signal)
-      .then((value) => setModeIndex(value))
-      .catch((error: unknown) => {
-        if (!controller.signal.aborted) {
-          setModeError(error instanceof Error ? error.message : 'Mode discovery failed.');
-          setModeIndex(null);
-        }
-      })
-      .finally(() => {
-        if (modeDiscovery.current === controller) modeDiscovery.current = null;
-      });
-  }, [enabled]);
-
-  useEffect(() => {
-    loadModes();
-    return () => modeDiscovery.current?.abort();
-  }, [loadModes]);
-
-  useEffect(() => {
-    const modes = modeIndex?.modes ?? [];
-    if (modes.some((mode) => mode.mode === selectedMode)) return;
-    const preferred = modes.find((mode) => mode.mode === 'composer-assistant')
-      ?? modes.find((mode) => mode.mode === 'query')
-      ?? modes[0];
-    setSelectedMode(preferred?.mode ?? '');
-  }, [modeIndex, selectedMode]);
 
   useEffect(() => () => recovery.current?.abort(), []);
 
   const busy = active?.state === 'running';
-  const selected = modeIndex?.modes.find((mode) => mode.mode === selectedMode);
-  const canSend = enabled && !!selected && !busy && input.trim().length > 0;
+  const selected = modeIndex?.modes.find((mode) => mode.mode === ASSISTANT_MODE);
+  const canSend = !!selected && !busy && input.trim().length > 0;
   const orientationSet = useMemo(() => new Set(orientationFields), [orientationFields]);
 
   const finish = useCallback(async (status: AssistantProviderStatus) => {
@@ -227,14 +208,13 @@ export function AssistantOverlay({
       setTranscript((items) => appendTranscript(items, {
         id: `${status.requestId}.assistant`,
         role: 'assistant',
-        mode: status.assistantMode,
         text: response.message,
         response: presentationResponse(status),
       }));
       setRetryIntent(null);
       setNotice(
         response.draftMutated
-          ? 'Assistant changes are visible in the in-memory Draft and remain unsaved/unapplied.'
+          ? 'Assistant changes are in the Draft. Apply them, or Discard the Draft to undo them.'
           : null,
       );
       if (response.draftMutated) await programController.refresh();
@@ -245,7 +225,6 @@ export function AssistantOverlay({
     setTranscript((items) => appendTranscript(items, {
       id: `${status.requestId}.error`,
       role: 'assistant',
-      mode: status.assistantMode,
       text: '',
       error: detail,
     }));
@@ -282,8 +261,8 @@ export function AssistantOverlay({
 
   const send = useCallback(async (intent?: RetryIntent) => {
     const message = (intent?.message ?? input).trim();
-    const mode = intent?.mode ?? selectedMode;
-    if (!message || !mode || busy) return;
+    const mode = ASSISTANT_MODE;
+    if (!message || busy) return;
     const requestId = identity('assistant.request');
     const request: Parameters<typeof api.assistant.submit>[0] = {
       requestId,
@@ -299,10 +278,10 @@ export function AssistantOverlay({
     setInput('');
     setNotice(null);
     setOperationalError(null);
-    setRetryIntent({ message, mode });
+    setRetryIntent({ message });
     setTranscript((items) => appendTranscript(
       items,
-      { id: `${requestId}.user`, role: 'user', mode, text: message },
+      { id: `${requestId}.user`, role: 'user', text: message },
     ));
     setActive({
       requestId,
@@ -340,7 +319,7 @@ export function AssistantOverlay({
       };
       await finish(failed);
     }
-  }, [busy, conversationId, finish, input, orientationFields, reconcile, selectedMode]);
+  }, [busy, conversationId, finish, input, orientationFields, reconcile]);
 
   const cancel = async () => {
     if (!active || active.state !== 'running') return;
@@ -380,52 +359,6 @@ export function AssistantOverlay({
     setOrientationFields([...next].sort());
   };
 
-  const setProposalDecision = useCallback((
-    transcriptId: string,
-    proposalIndex: number,
-    decision: TranscriptResponse['proposals'][number]['decision'],
-  ) => {
-    setTranscript((items) => items.map((item) => {
-      if (item.id !== transcriptId || item.response === undefined) return item;
-      return {
-        ...item,
-        response: {
-          ...item.response,
-          proposals: item.response.proposals.map((proposal, index) => (
-            index === proposalIndex ? { ...proposal, decision } : proposal
-          )),
-        },
-      };
-    }));
-  }, []);
-
-  const materializeProposal = useCallback(async (
-    transcriptId: string,
-    requestId: string,
-    proposalIndex: number,
-  ) => {
-    if (!programController.mutationAvailable) {
-      setNotice(
-        programController.mutationUnavailableReason
-          ?? 'Program authoring is unavailable.',
-      );
-      return;
-    }
-    setProposalDecision(transcriptId, proposalIndex, 'materializing');
-    const result = await programController.mutate(
-      'assistant_draft_materialize_proposal',
-      { request_id: requestId, proposal_index: proposalIndex },
-    );
-    setProposalDecision(
-      transcriptId,
-      proposalIndex,
-      result === null ? 'failed' : 'materialized',
-    );
-    setNotice(result === null
-      ? 'The proposal was not materialized; review the Program authoring error.'
-      : 'Proposal materialized as one atomic Draft change; Saved and Applied are unchanged.');
-  }, [programController, setProposalDecision]);
-
   return (
     <section className="panel assistant-panel" aria-labelledby="assistant-heading">
       <header className="panel-header assistant-header">
@@ -438,35 +371,17 @@ export function AssistantOverlay({
         </button>
       </header>
 
-      {!headlessConnected && (
-        <p className="panel-intro">Connect the headless owner to discover enabled assistant modes.</p>
-      )}
-      {headlessConnected && !enabled && (
-        <p className="panel-intro">Configure the assistant bridge to start bounded conversations.</p>
-      )}
+      {unavailableReason && <p className="panel-intro">{unavailableReason}</p>}
       {modeError && (
         <div className="notice severity-error" role="alert">
           <span>{modeError}</span>
-          <button type="button" onClick={() => loadModes()}>Retry discovery</button>
+          <button type="button" onClick={onRetryModes}>Retry discovery</button>
         </div>
       )}
-      {enabled && !modeError && !modeIndex && <p className="panel-intro">Loading owner-issued modes…</p>}
 
-      {modeIndex && (
+      {selected && (
         <>
-          <label className="assistant-mode-select">
-            Mode
-            <select
-              value={selectedMode}
-              disabled={busy}
-              onChange={(event) => setSelectedMode(event.target.value)}
-            >
-              {modeIndex.modes.map((mode) => (
-                <option key={mode.mode} value={mode.mode}>{mode.mode}</option>
-              ))}
-            </select>
-          </label>
-          {selected && <p className="assistant-mode-description">{selected.description}</p>}
+          <p className="assistant-mode-description">{selected.description}</p>
 
           <details className="assistant-field-policy">
             <summary>Pose fields visible to this request</summary>
@@ -487,18 +402,17 @@ export function AssistantOverlay({
 
           <div className="assistant-transcript" aria-live="polite">
             {transcript.length === 0 && (
-              <p className="panel-intro">Messages stay separate from Draft, Saved, and Applied history.</p>
+              <p className="panel-intro">Assistant edits land in the Draft. Apply them, or Discard the Draft, as for your own edits.</p>
             )}
             {transcript.map((item) => (
               <article key={item.id} className={`assistant-message ${item.role}`}>
                 <header>
                   <strong>{item.role === 'user' ? 'You' : 'Assistant'}</strong>
-                  <code>{item.mode}</code>
                 </header>
                 {item.text && <p>{item.text}</p>}
                 {item.error && <p className="notice severity-error" role="alert">{item.error}</p>}
                 {item.response?.draftMutated && (
-                  <p className="assistant-draft-provenance">Draft changed by assistant; Saved and Applied were not changed.</p>
+                  <p className="assistant-draft-provenance">Draft changed by the assistant; not applied yet.</p>
                 )}
                 {item.response && item.response.toolCalls.length > 0 && (
                   <details>
@@ -509,48 +423,6 @@ export function AssistantOverlay({
                           <code>{call.toolId}</code> · {call.status}
                           {call.draftMutated ? ' (Draft changed)' : ''}
                           {call.resultSummary ? `: ${call.resultSummary}` : ''}
-                        </li>
-                      ))}
-                    </ul>
-                  </details>
-                )}
-                {item.response && item.response.proposals.length > 0 && (
-                  <details>
-                    <summary>{item.response.proposals.length} reviewable Draft proposal(s)</summary>
-                    <ul className="assistant-proposals">
-                      {item.response.proposals.map((proposal, index) => (
-                        <li key={`${proposal.toolId}.${index}`}>
-                          <div><code>{proposal.toolId}</code> · {proposal.effect}</div>
-                          <details>
-                            <summary>Review proposed Draft input</summary>
-                            <pre>{JSON.stringify(proposal.arguments, null, 2)}</pre>
-                          </details>
-                          <div className="assistant-proposal-actions">
-                            <button
-                              type="button"
-                              disabled={
-                                proposal.decision !== 'pending'
-                                || !programController.mutationAvailable
-                              }
-                              title={programController.mutationAvailable
-                                ? 'Materialize this proposal into the current Draft.'
-                                : programController.mutationUnavailableReason ?? undefined}
-                              onClick={() => void materializeProposal(
-                                item.id,
-                                item.response?.requestId ?? '',
-                                index,
-                              )}
-                            >Materialize</button>
-                            <button
-                              type="button"
-                              className="quiet-button"
-                              disabled={proposal.decision !== 'pending'}
-                              onClick={() => setProposalDecision(item.id, index, 'rejected')}
-                            >Reject</button>
-                            {proposal.decision !== 'pending' && (
-                              <span>{proposal.decision}</span>
-                            )}
-                          </div>
                         </li>
                       ))}
                     </ul>
@@ -568,7 +440,7 @@ export function AssistantOverlay({
           </div>
 
           <label className="assistant-input">
-            Message for <code>{selectedMode}</code>
+            Message
             <textarea
               value={input}
               disabled={busy}

@@ -2,6 +2,7 @@
 #include "io_provider_lifecycle_product.hpp"
 
 #include <chrono>
+#include <condition_variable>
 #include <future>
 #include <gtest/gtest.h>
 #include <limits>
@@ -17,11 +18,56 @@
 #include <set>
 #include <std_msgs/msg/bool.hpp>
 #include <stdexcept>
+#include <thread>
 
 namespace manyforge::roboplan_backend::host_detail {
 namespace {
 const core::InterruptSourceId kSource("mock.inputs");
 constexpr core::Duration kDelay = 250'000'000;
+
+// Gates only a named test thread's next clock read. This makes the real
+// echo-delivery interleaving deterministic without a production test hook.
+class GatedClock final : public core::IClock {
+public:
+  core::TimePoint now() const override {
+    {
+      std::unique_lock lock(mutex_);
+      if (armed_ && std::this_thread::get_id() == selected_thread_) {
+        armed_ = false;
+        entered_ = true;
+        condition_.notify_all();
+        condition_.wait(lock, [&] { return released_; });
+      }
+    }
+    return clock_.now();
+  }
+  void set(core::TimePoint value) { clock_.set(value); }
+  void GateNextReadOnThisThread() {
+    std::lock_guard lock(mutex_);
+    selected_thread_ = std::this_thread::get_id();
+    armed_ = true;
+    entered_ = false;
+    released_ = false;
+  }
+  bool WaitUntilGated() {
+    std::unique_lock lock(mutex_);
+    return condition_.wait_for(lock, std::chrono::seconds(2), [&] { return entered_; });
+  }
+  void Release() {
+    std::lock_guard lock(mutex_);
+    released_ = true;
+    condition_.notify_all();
+  }
+private:
+  core::FakeClock clock_;
+  mutable std::mutex mutex_;
+  mutable std::condition_variable condition_;
+  mutable std::thread::id selected_thread_;
+  mutable bool armed_{};
+  mutable bool entered_{};
+  mutable bool released_{};
+};
+
 core::IoSignalId signal() {
   return {core::ControllableComponentId("io"), "ready"};
 }
@@ -47,7 +93,8 @@ core::IoLevelWatchRequestDTO watch(std::string node, bool expected = true,
 class HostIoSignalRuntimeTest : public ::testing::Test {
 protected:
   void Build(bool initial = false, std::string occurrence = "installation.1",
-             std::shared_ptr<core::IScheduler> runtime_scheduler = {}) {
+             std::shared_ptr<core::IScheduler> runtime_scheduler = {},
+             bool with_echo = false) {
     initialized_simulation_runs.clear();
     deployment::IoSignalProviderConfiguration provider_config;
     provider_config.profile = "mock";
@@ -66,6 +113,17 @@ protected:
     runtime = HostIoSignalRuntime::Create(
         core::RequestOwnerEpoch("host"), 1, std::move(sources), clock,
         runtime_scheduler ? std::move(runtime_scheduler) : scheduler);
+    if (with_echo) {
+      auto made = MockBooleanOutputProvider::Create(
+          *clock, {core::ResourceId("output.valve"), "valve",
+                   {{{core::ControllableComponentId("io"), "valve"},
+                     driver->occurrence(), 1U, driver}},
+                   core::ActiveBundlePublicationGeneration(1U)});
+      if (!made.ok())
+        throw std::runtime_error(made.error().message);
+      echo_output = std::shared_ptr<MockBooleanOutputProvider>(std::move(made.value()));
+      runtime->AddMockEcho(echo_output, signal(), kDelay);
+    }
     for (const auto &[actual, inputs] : runtime->driver_input_installations()) {
       auto delivery = actual->AcquireDelivery();
       const auto installed = actual->InstallResourcesLocked(
@@ -82,6 +140,8 @@ protected:
       throw std::runtime_error("unenabled fixture must have no reported sample");
     Step("prepare");
     Step("enable");
+    if (echo_output && !echo_output->Resume(driver->occurrence(), 2U, driver).ok())
+      throw std::runtime_error("echo output did not enable");
     const auto drained = runtime->DrainPending();
     if (!drained.ok())
       throw std::runtime_error(drained.error().message);
@@ -98,6 +158,15 @@ protected:
       runtime->Shutdown();
     if (driver)
       driver->Shutdown();
+  }
+  core::IoOutputWriteRequestDTO EchoRequest(std::uint64_t number, bool value) {
+    return {{{core::OperationId("echo.operation." + std::to_string(number)),
+              core::OperationRevision(1U), core::OperationParticipantId("echo"),
+              core::ControllerGoalId("echo.goal." + std::to_string(number)),
+              core::ControllerGoalGeneration(1U)},
+             core::ContentDigest("sha256:" + std::string(64U, 'a')),
+             core::ComponentLifecycleGeneration(1U), driver->occurrence()},
+            {core::ControllableComponentId("io"), "valve"}, value, std::nullopt};
   }
   std::shared_ptr<IoProviderDriverRecord>
   MakeDriver(const deployment::RetainedIoSignalConfiguration &row,
@@ -315,12 +384,90 @@ protected:
     }
     return request;
   }
-  std::shared_ptr<core::FakeClock> clock = std::make_shared<core::FakeClock>();
+  std::shared_ptr<GatedClock> clock = std::make_shared<GatedClock>();
   std::shared_ptr<core::ManualScheduler> scheduler =
       std::make_shared<core::ManualScheduler>();
   std::shared_ptr<HostIoSignalRuntime> runtime;
   std::shared_ptr<IoProviderDriverRecord> driver;
+  std::shared_ptr<MockBooleanOutputProvider> echo_output;
 };
+
+TEST_F(HostIoSignalRuntimeTest, MockOutputEchoIsDelayedAndNewerWriteReplacesIt) {
+  Build(false, "installation.1", {}, true);
+  const auto first = EchoRequest(1U, true);
+  ASSERT_EQ(echo_output->SubmitOutput(first).value().evidence,
+            core::IoOutputEvidence::kSourceAccepted);
+  ASSERT_TRUE(echo_output->RetireOutput(first.identity).ok());
+  clock->set(100'000'000);
+  const auto second = EchoRequest(2U, false);
+  ASSERT_EQ(echo_output->SubmitOutput(second).value().evidence,
+            core::IoOutputEvidence::kSourceAccepted);
+  clock->set(kDelay);
+  scheduler->advance_to(clock->now(), core::SchedulerPriority::Monitoring);
+  EXPECT_EQ(Observe().latest_sample->publication.value, false);
+  EXPECT_EQ(Observe().latest_sample->publication.source_sequence, 1U);
+  clock->set(100'000'000 + kDelay);
+  scheduler->advance_to(clock->now(), core::SchedulerPriority::Monitoring);
+  EXPECT_EQ(Observe().latest_sample->publication.value, false);
+  EXPECT_EQ(Observe().latest_sample->publication.source_sequence, 2U);
+}
+
+TEST_F(HostIoSignalRuntimeTest, MockOutputEchoStopsWithItsRuntime) {
+  Build(false, "installation.1", {}, true);
+  ASSERT_TRUE(echo_output->SubmitOutput(EchoRequest(1U, true)).ok());
+  runtime->Shutdown();
+  clock->set(kDelay);
+  scheduler->advance_to(clock->now(), core::SchedulerPriority::Monitoring);
+  EXPECT_EQ(Observe().latest_sample->publication.value, false);
+}
+
+TEST_F(HostIoSignalRuntimeTest,
+       MockOutputEchoCannotPublishAfterANewerWriteIsAccepted) {
+  using namespace std::chrono_literals;
+  Build(false, "installation.1", {}, true);
+  const auto first = EchoRequest(1U, true);
+  ASSERT_EQ(echo_output->SubmitOutput(first).value().evidence,
+            core::IoOutputEvidence::kSourceAccepted);
+  ASSERT_TRUE(echo_output->RetireOutput(first.identity).ok());
+  clock->set(kDelay);
+  auto first_delivery = std::async(std::launch::async, [&] {
+    clock->GateNextReadOnThisThread();
+    scheduler->advance_to(kDelay, core::SchedulerPriority::Monitoring);
+  });
+  const bool gated = clock->WaitUntilGated();
+  if (!gated) {
+    clock->Release();
+    first_delivery.wait();
+    FAIL() << "echo did not reach the gated publication";
+  }
+
+  const auto second = EchoRequest(2U, false);
+  std::promise<void> writer_started;
+  auto started = writer_started.get_future();
+  auto newer_write = std::async(std::launch::async, [&] {
+    writer_started.set_value();
+    return echo_output->SubmitOutput(second);
+  });
+  started.wait();
+  const auto during_echo = newer_write.wait_for(100ms);
+  clock->Release();
+  ASSERT_EQ(first_delivery.wait_for(2s), std::future_status::ready);
+  first_delivery.get();
+  ASSERT_EQ(newer_write.wait_for(2s), std::future_status::ready);
+  const auto accepted = newer_write.get();
+  EXPECT_EQ(during_echo, std::future_status::timeout);
+  ASSERT_TRUE(accepted.ok());
+  EXPECT_EQ(accepted.value().evidence, core::IoOutputEvidence::kSourceAccepted);
+  EXPECT_EQ(Observe().latest_sample->publication.value, true);
+
+  // A manual input write after that actual echo remains the latest change.
+  ASSERT_TRUE(Set(false).ok());
+  EXPECT_EQ(Observe().latest_sample->publication.value, false);
+  clock->set(2 * kDelay);
+  scheduler->advance_to(clock->now(), core::SchedulerPriority::Monitoring);
+  EXPECT_EQ(Observe().latest_sample->publication.value, false);
+  EXPECT_EQ(Observe().latest_sample->publication.source_sequence, 4U);
+}
 
 TEST_F(HostIoSignalRuntimeTest,
        ActualDriverAcquisitionAndDisableDrainWakeProcessorOutsideDeliveryLock) {

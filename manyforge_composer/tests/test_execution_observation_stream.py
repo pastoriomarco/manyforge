@@ -95,6 +95,62 @@ def test_project_execution_observation_is_exact_and_compact() -> None:
         stream.project_execution_observation(inflated, received_at_monotonic_us=123_458)
 
 
+def test_owner_error_response_keeps_its_typed_code_and_message() -> None:
+    refused = {
+        "api_version": "manyforge.execution_command_response.v1",
+        "ok": False,
+        "error": {
+            "code": "execution_command_invalid",
+            "message": "selected observation crosses its retained target identity: complete",
+            "details": {},
+        },
+    }
+    with pytest.raises(stream.ExecutionObservationOwnerRefused) as raised:
+        stream.project_execution_observation(refused, received_at_monotonic_us=1)
+    assert raised.value.code == "execution_command_invalid"
+    assert str(raised.value).startswith("selected observation crosses")
+    # A malformed envelope is still the generic identity rejection.
+    with pytest.raises(
+        stream.ExecutionObservationProjectionError, match="identity is invalid"
+    ) as malformed:
+        stream.project_execution_observation(
+            {"ok": False, "error": {"code": "source_lost"}},
+            received_at_monotonic_us=2,
+        )
+    assert not isinstance(malformed.value, stream.ExecutionObservationOwnerRefused)
+
+
+def test_source_status_reports_the_owner_error_code() -> None:
+    async def exercise() -> None:
+        client = _Client()
+        source = stream.ExecutionObservationSource(client)
+        subscription = source.subscribe()
+        try:
+            source.grant_credit(subscription, None)
+            await _next_cursor(client)
+            client.responses.put(
+                {
+                    "api_version": "manyforge.execution_command_response.v1",
+                    "ok": False,
+                    "error": {
+                        "code": "execution_owner_not_ready",
+                        "message": "the managed execution owner has no active physical product",
+                        "details": {},
+                    },
+                }
+            )
+            await _wait_for_error(source)
+            assert source.status()["source"]["last_error"] == {
+                "code": "execution_owner_not_ready",
+                "message": "the managed execution owner has no active physical product",
+            }
+        finally:
+            source.unsubscribe(subscription)
+            source.close()
+
+    asyncio.run(exercise())
+
+
 def test_gripper_only_changes_are_typed_and_not_deduplicated_as_idle_arm() -> None:
     response = _status()
     target = {

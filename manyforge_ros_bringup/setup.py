@@ -30,6 +30,7 @@ setup(
             "isaac_pointcloud_observer_bridge = manyforge_ros_bringup.isaac_pointcloud_observer_bridge:main",
             "isaac_demo_supervisor = manyforge_ros_bringup.isaac_demo_supervisor:main",
             "pose_source_snapshot_publisher = manyforge_ros_bringup.pose_source_snapshot_publisher:main",
+            "ai_model_probe = manyforge_ros_bringup.ai_model_probe:main",
             "cclc_open_request = manyforge_ros_bringup.cclc_open_request_node:main",
             "sim_plc = manyforge_ros_bringup.sim_plc:main",
         ],

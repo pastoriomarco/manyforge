@@ -365,11 +365,11 @@ it('Available Scenario shows Scenario names and a refused folder by its folder n
 });
 
 const label = (p: Props) => [p.children].flat(3).filter((part) => typeof part === 'string').join('').trim();
-function browseTree(tree: Record<string, Array<[string, boolean]>>) {
+function browseTree(tree: Record<string, Array<[string, boolean]>>, roots = ['/projects']) {
   apiMock.files.browse.mockImplementation(async (_kind: string, path?: string) => {
-    const currentPath = path ?? '/projects';
-    return { currentPath, parentPath: currentPath === '/projects' ? null : currentPath.slice(0, currentPath.lastIndexOf('/')),
-      roots: ['/projects'], entries: (tree[currentPath] ?? []).map(([name, scenarioProject]) => ({
+    const currentPath = path ?? roots[0];
+    return { currentPath, parentPath: roots.includes(currentPath) ? null : currentPath.slice(0, currentPath.lastIndexOf('/')),
+      roots, entries: (tree[currentPath] ?? []).map(([name, scenarioProject]) => ({
         name, path: `${currentPath}/${name}`, entryType: 'directory', selectable: false, scenarioProject })) };
   });
 }
@@ -385,13 +385,31 @@ it('Load Browse… selects a Scenario project and loads it through Close', async
   await test.click(test.find((p) => p.children === 'Browse…'));
   expect(test.find((p) => p['aria-label'] === 'Choose a Scenario project')).toBeDefined();
   expect(() => test.find((p) => p.children === 'Use this folder')).toThrow();
+  await test.click(test.find((p) => p.title === '/projects' && typeof p.onClick === 'function'));
   await test.click(test.find((p) => p.role === 'listitem' && label(p) === 'cells'));
-  await test.click(test.find((p) => p.role === 'listitem' && label(p) === 'pick.scenario'));
+  await test.click(test.find((p) => p.role === 'listitem' && label(p).startsWith('pick.scenario')));
   expect(apiMock.scenarioDocuments.list).toHaveBeenLastCalledWith('/projects/cells');
   expect(test.find((p) => p.value === 'saved:/projects/cells/pick.scenario')).toBeDefined();
   await test.click(test.primary('Load Scenario')); await test.ack();
   expect(test.closeScenario).toHaveBeenCalledOnce();
   expect(test.controller.loadScenarioDocument).toHaveBeenCalledExactlyOnceWith('/projects/cells/pick.scenario', true);
+});
+
+it('Load Browse… selects a project from another allowed root', async () => {
+  const external = '/projects/user projects';
+  browseTree({ '/projects': [], [external]: [['pick.scenario', true]] }, ['/projects', external]);
+  apiMock.scenarioDocuments.list.mockImplementation(async (directory?: string) => directory === external
+    ? { directory: external, entries: [
+      { sourceKind: 'saved', path: `${external}/pick.scenario`, scenarioId: 'pick', name: 'pick', folderName: 'pick',
+        location: external, description: '', displayStatus: 'ready', statusDetail: '', savedManyforgeVersion: null }] }
+    : { directory: '/projects', entries: [] });
+  const test = await mount(); await test.open('Load Scenario');
+  await test.click(test.find((p) => p.children === 'Browse…'));
+  await test.click(test.find((p) => p.title === external && typeof p.onClick === 'function'));
+  await test.click(test.find((p) => p.role === 'listitem' && label(p).startsWith('pick.scenario')));
+  expect(apiMock.scenarioDocuments.list).toHaveBeenLastCalledWith(external);
+  await test.click(test.primary('Load Scenario')); await test.ack();
+  expect(test.controller.loadScenarioDocument).toHaveBeenCalledExactlyOnceWith(`${external}/pick.scenario`, true);
 });
 
 it('Export Browse… picks a parent folder and exports the project there under its name', async () => {
@@ -401,14 +419,29 @@ it('Export Browse… picks a parent folder and exports the project there under i
   await test.click(test.find((p) => p.children === 'Portable copy'));
   expect(test.primary('Export copy').disabled).toBe(true);
   await test.click(test.find((p) => p.children === 'Browse…'));
+  await test.click(test.find((p) => p.title === '/projects' && typeof p.onClick === 'function'));
   // The open project's own folder already holds it: that destination is refused.
   await test.click(test.find((p) => p.children === 'Use this folder'));
   expect(test.primary('Export copy').disabled).toBe(true);
   await test.click(test.find((p) => p.children === 'Browse…'));
+  await test.click(test.find((p) => p.title === '/projects' && typeof p.onClick === 'function'));
   expect(test.find((p) => p.role === 'listitem' && label(p) === 'Lab_Cell.scenario').disabled).toBe(true);
   await test.click(test.find((p) => p.role === 'listitem' && label(p) === 'out'));
   await test.click(test.find((p) => p.children === 'Use this folder'));
   expect(test.primary('Export copy').disabled).toBe(false);
   await test.click(test.primary('Export copy'));
   expect(test.controller.exportScenarioDocument).toHaveBeenCalledExactlyOnceWith('/projects/out/Lab_Cell.scenario');
+});
+
+it('Export Browse… can write to another allowed root', async () => {
+  const external = '/projects/user projects';
+  browseTree({ '/projects': [], [external]: [] }, ['/projects', external]);
+  const test = await mount(undefined, null, false, '/projects/Lab_Cell.scenario');
+  await test.open('Save Scenario as');
+  await test.click(test.find((p) => p.children === 'Portable copy'));
+  await test.click(test.find((p) => p.children === 'Browse…'));
+  await test.click(test.find((p) => p.title === external && typeof p.onClick === 'function'));
+  await test.click(test.find((p) => p.children === 'Use this folder'));
+  await test.click(test.primary('Export copy'));
+  expect(test.controller.exportScenarioDocument).toHaveBeenCalledExactlyOnceWith(`${external}/Lab_Cell.scenario`);
 });

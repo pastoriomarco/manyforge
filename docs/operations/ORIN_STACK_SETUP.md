@@ -1,5 +1,10 @@
 # Orin AGX — full stack install & run (master index)
 
+> **AI assistant:** the NemoClaw/OpenClaw steps below are not part of the
+> current assistant. Run any OpenAI-compatible model server and name it with
+> an `ai_model` Deployment component: see
+> [`ASSISTANT_E2E_COOKBOOK.md`](ASSISTANT_E2E_COOKBOOK.md).
+
 > **Cutover status:** retained as a restoration and behavior reference. The
 > command recipes below are not qualified on the current `dev` branch and
 > must not be executed until the required I6-I11 execution, provider,

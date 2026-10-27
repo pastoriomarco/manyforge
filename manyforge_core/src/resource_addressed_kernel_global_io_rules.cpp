@@ -580,11 +580,16 @@ std::optional<ErrorDTO> ResourceAddressedExecutionKernel::global_io_rule_command
     const auto& row = global_io_rules_[index];
     const auto& rule = global_io_rule_catalog_->rules[index];
     if (!global_io_rule_applies_locked(rule, binding)) continue;
-    if (row.state.state == IoGlobalRuleState::kLatched)
+    if (row.state.state == IoGlobalRuleState::kLatched) {
+      // on_trip gate: a condition latch that clears by itself is a wait, not a fault.
+      const bool gated = !row.source_loss_latch &&
+          rule.post_latch_disposition == InterruptPostLatchDisposition::kAutoClearOnSignalRelease;
       return ErrorDTO{std::string(to_string(ErrorCode::kInvalidStateTransition)),
-                      "Global interrupt rule " + rule.policy_id.value() + " is latched",
-                      {{"reason", "global_interrupt_latched"},
+                      "Global interrupt rule " + rule.policy_id.value() +
+                          (gated ? " is active" : " is latched"),
+                      {{"reason", gated ? "global_interrupt_gated" : "global_interrupt_latched"},
                        {"rule_id", rule.policy_id.value()}}};
+    }
     const bool reads_blackboard = std::any_of(rule.condition->inputs().begin(),
         rule.condition->inputs().end(), [](const auto& input) {
           return std::holds_alternative<IoConditionBlackboardKeyDTO>(input.source);
@@ -951,7 +956,8 @@ Result<void> ResourceAddressedExecutionKernel::process_global_io_rule_evidence_l
       continue;
     }
     GlobalInterruptStopSelection selection{*row.registration, *row.evidence,
-        std::holds_alternative<IoActivationEverythingScopeDTO>(policy.scope),
+        std::holds_alternative<IoActivationEverythingScopeDTO>(policy.scope) ||
+            policy.full_stop_on_trip,
         policy.effective_priority, {}, candidate_order.resources};
     bool scoped_motion = false;
     bool scoped_stopping = false;
@@ -1099,7 +1105,8 @@ Result<void> ResourceAddressedExecutionKernel::validate_global_io_rule_stop_lock
   if (policy == global_io_rule_catalog_->rules.end() ||
       policy->policy_id != selection.registration.policy_id ||
       policy->effective_priority != selection.priority ||
-      std::holds_alternative<IoActivationEverythingScopeDTO>(policy->scope) != selection.everything)
+      (std::holds_alternative<IoActivationEverythingScopeDTO>(policy->scope) ||
+       policy->full_stop_on_trip) != selection.everything)
     return Result<void>::Err(global_rule_error("io_global_rule_response_policy_stale"));
   const auto index = static_cast<std::size_t>(policy - global_io_rule_catalog_->rules.begin());
   const auto& row = global_io_rules_.at(index);

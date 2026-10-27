@@ -34,6 +34,7 @@
 #include <thread>
 #include <ur_msgs/srv/set_io.hpp>
 #include <vector>
+#include <xarm_msgs/srv/set_digital_io.hpp>
 
 namespace manyforge::roboplan_backend {
 namespace {
@@ -851,6 +852,61 @@ TEST_F(RosBooleanOutputProviderTest,
   auto invalid = channel();
   invalid.address = UrSetIoOutputAddress{"/test/set_io", 18U};
   EXPECT_FALSE(RosBooleanOutputProvider::Create(node, clock, invalid).ok());
+}
+
+TEST_F(RosBooleanOutputProviderTest,
+       XArmDigitalWritesUseVendorServiceAndKeepNonzeroOutcomeUnknown) {
+  using XArmService = xarm_msgs::srv::SetDigitalIO;
+  for (const auto bank : {XArmDigitalBank::kTool, XArmDigitalBank::kController}) {
+    std::vector<XArmService::Request> requests;
+    std::int16_t vendor_return = 0;
+    const std::string service_name = bank == XArmDigitalBank::kTool
+                                         ? "/test/set_tgpio_digital"
+                                         : "/test/set_cgpio_digital";
+    auto service = server_node->create_service<XArmService>(
+        service_name, [&](XArmService::Request::SharedPtr request,
+                          XArmService::Response::SharedPtr response) {
+          requests.push_back(*request);
+          response->ret = vendor_return;
+        });
+    auto configuration = channel();
+    const auto pin = bank == XArmDigitalBank::kTool ? 4U : 15U;
+    configuration.address = XArmSetDigitalOutputAddress{
+        service_name, static_cast<std::uint8_t>(pin), bank};
+    auto created = RosBooleanOutputProvider::Create(node, clock, configuration);
+    ASSERT_TRUE(created.ok());
+    provider = std::move(created.value());
+    ASSERT_TRUE(SpinUntil([&] { return provider->ServiceReady(); }));
+    ASSERT_TRUE(provider->Resume(occurrence("a"), 2U, owner("a")).ok());
+    const auto first = request(1U, true);
+    ASSERT_EQ(provider->SubmitOutput(first).value().evidence,
+              core::IoOutputEvidence::kSubmitted);
+    ASSERT_TRUE(SpinUntil([&] {
+      return Evidence(first.identity) == core::IoOutputEvidence::kSourceAccepted;
+    }));
+    ASSERT_EQ(requests.size(), 1U);
+    EXPECT_EQ(requests.front().ionum, pin);
+    EXPECT_EQ(requests.front().value, 1);
+    EXPECT_EQ(requests.front().delay_sec, 0.0F);
+    ASSERT_TRUE(provider->RetireOutput(first.identity).ok());
+    vendor_return = -1;
+    const auto second = request(2U, false);
+    ASSERT_TRUE(provider->SubmitOutput(second).ok());
+    ASSERT_TRUE(SpinUntil([&] {
+      return Evidence(second.identity) == core::IoOutputEvidence::kAcceptanceUnknown;
+    }));
+    const auto outcome = provider->ObserveOutputResult(second.identity);
+    ASSERT_TRUE(outcome.ok());
+    ASSERT_TRUE(outcome.value().error);
+    EXPECT_EQ(outcome.value().error->details.at("reason"), "xarm_service_returned_nonzero");
+    EXPECT_EQ(outcome.value().error->details.at("vendor_return"), "-1");
+    ASSERT_EQ(requests.size(), 2U);
+    EXPECT_EQ(requests.back().value, 0);
+    provider.reset();
+    configuration.address = XArmSetDigitalOutputAddress{
+        service_name, static_cast<std::uint8_t>(pin + 1U), bank};
+    EXPECT_FALSE(RosBooleanOutputProvider::Create(node, clock, configuration).ok());
+  }
 }
 
 TEST_F(RosBooleanOutputProviderTest,

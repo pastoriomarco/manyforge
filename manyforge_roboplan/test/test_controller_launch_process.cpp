@@ -152,6 +152,87 @@ TEST(ControllerLaunchCommand, MockIdentityFollowsContentNotTheActivationPaths) {
   EXPECT_NE(a.identity, mock_controller_launch_command(prefixed).identity);
 }
 
+// CP8 step 2a characterization: the exact Mock argv and launch identity,
+// pinned before Mock and Real share this builder.
+TEST(ControllerLaunchCommand, MockArgvAndIdentityArePinned) {
+  TemporaryRoot root;
+  const auto artifacts = mock_artifacts(root.path());
+  const auto command = mock_controller_launch_command(artifacts);
+  const auto directory = (root.path() / "ui6i_lite6").string();
+  EXPECT_EQ(command.argv,
+            (std::vector<std::string>{
+                "ros2", "launch", "manyforge_ros_bringup", "mock_control.launch.py",
+                "robot_description_file:=" + directory + "/robot_description.urdf",
+                "controllers_file:=" + directory + "/controllers.yaml",
+                "runtime_namespace:=/manyforge/ui6i_lite6",
+                "controller_manager_name:=controller_manager",
+                "arm_controller_name:=lite6_traj_controller",
+                "gripper_controller_name:=lite_gripper_controller",
+                "frame_prefix:=ui6i_lite6/"}));
+  EXPECT_EQ(command.identity,
+            "mock\nui6i_lite6\nlite6_lite_gripper\n/manyforge/ui6i_lite6\n"
+            "lite6_traj_controller\nlite_gripper_controller\nui6i_lite6/\n"
+            "sha256:aa\nsha256:bb\n");
+}
+
+[[nodiscard]] ControllerLaunchArtifacts
+real_artifacts(const std::filesystem::path &directory,
+               const std::string &driver_sha = "sha256:ee") {
+  ControllerLaunchArtifacts value;
+  value.lane = ControllerLaunchLane::kMock;
+  value.controllable_component_id = "real_lite6";
+  value.controller_profile = "lite6_real";
+  value.directory = directory / value.controllable_component_id;
+  value.robot_description_file = value.directory / "robot_description.urdf";
+  value.controllers_file = value.directory / "controllers.yaml";
+  value.driver_parameters_file = value.directory / "driver_parameters.yaml";
+  value.robot_description_sha256 = "sha256:aa";
+  value.controllers_sha256 = "sha256:bb";
+  value.driver_parameters_sha256 = driver_sha;
+  value.runtime_namespace = "/manyforge/real_lite6";
+  value.arm_controller_name = "lite6_traj_controller";
+  value.launch_arguments = {
+      "robot_description_file:=" + value.robot_description_file.string(),
+      "controllers_file:=" + value.controllers_file.string(),
+      "runtime_namespace:=" + value.runtime_namespace,
+      "controller_manager_name:=controller_manager",
+      "arm_controller_name:=lite6_traj_controller",
+      "hardware_plugin:=uf_robot_hardware/UFRobotSystemHardware",
+      "driver_parameters_file:=" + value.driver_parameters_file.string(),
+      "hardware_remappings:=/controller_manager/list_controllers="
+      "/manyforge/real_lite6/controller_manager/list_controllers",
+  };
+  return value;
+}
+
+// CP8 step 2a: Real uses Mock's builder and launch file; its hardware data
+// joins the launch identity, never its per-activation paths.
+TEST(ControllerLaunchCommand, RealUsesTheSharedBuilderAndItsHardwareJoinsTheIdentity) {
+  TemporaryRoot first;
+  TemporaryRoot second;
+  const auto artifacts = real_artifacts(first.path());
+  const auto command = mock_controller_launch_command(artifacts);
+  std::vector<std::string> expected{"ros2", "launch", "manyforge_ros_bringup",
+                                    "mock_control.launch.py"};
+  expected.insert(expected.end(), artifacts.launch_arguments.begin(),
+                  artifacts.launch_arguments.end());
+  EXPECT_EQ(command.argv, expected);
+  EXPECT_EQ(command.lane, ControllerLaunchLane::kMock);
+  EXPECT_TRUE(command.keep_across_apply);
+  EXPECT_EQ(command.identity,
+            "mock\nreal_lite6\nlite6_real\n/manyforge/real_lite6\n"
+            "lite6_traj_controller\n\n\nsha256:aa\nsha256:bb\n"
+            "hardware_plugin:=uf_robot_hardware/UFRobotSystemHardware\n"
+            "hardware_remappings:=/controller_manager/list_controllers="
+            "/manyforge/real_lite6/controller_manager/list_controllers\n"
+            "sha256:ee\n");
+  EXPECT_EQ(command.identity,
+            mock_controller_launch_command(real_artifacts(second.path())).identity);
+  EXPECT_NE(command.identity,
+            mock_controller_launch_command(real_artifacts(first.path(), "sha256:ff"))
+                .identity);
+}
+
 TEST(ControllerLaunchCommand, MockCommandFailsClosed) {
   TemporaryRoot root;
   auto isaac = isaac_artifacts(root.path());
@@ -471,7 +552,7 @@ void check_parent_death(const std::string &role, const std::string &selector,
     int pid = -1;
     if (host_role == "sim_plc") {
       const auto plan = plan_simulated_plc(
-          "commanded_sim", "plc_io",
+          true, "plc_io",
           {{"ros_bool", "/plc_io/ready", std::nullopt}}, root / "sim_plc");
       pid = supervisor.ensure(simulated_plc_launch_command(*plan),
                               root / "artifacts")
@@ -2614,23 +2695,20 @@ namespace {
 }
 
 [[nodiscard]] SimulatedPlcPlan plc_plan(const std::filesystem::path &dir) {
-  auto plan = plan_simulated_plc("commanded_sim", "plc_io", plc_rows(), dir);
+  auto plan = plan_simulated_plc(true, "plc_io", plc_rows(), dir);
   if (!plan) throw std::logic_error("fixture plan absent");
   return *plan;
 }
 
 } // namespace
 
-TEST(SimulatedPlcPlan, OnlyACommandedSimUnitGetsASimulatedPlc) {
-  // D6 structural Real-lane guard: no other unit mode yields a PLC.
-  for (const auto *mode :
-       {"", "real", "measured", "commanded_simulation", "Commanded_sim"}) {
-    SCOPED_TRACE(mode);
-    EXPECT_FALSE(
-        plan_simulated_plc(mode, "plc_io", plc_rows(), "/cfg").has_value());
-  }
+TEST(SimulatedPlcPlan, OnlyASimulatedUnitGetsASimulatedPlc) {
+  // D6 structural Real-lane guard: a unit hosting a real (measured)
+  // component yields no PLC (CP8 step 1: per-component authority).
+  EXPECT_FALSE(
+      plan_simulated_plc(false, "plc_io", plc_rows(), "/cfg").has_value());
   const auto plan =
-      plan_simulated_plc("commanded_sim", "plc_io", plc_rows(), "/cfg");
+      plan_simulated_plc(true, "plc_io", plc_rows(), "/cfg");
   ASSERT_TRUE(plan.has_value());
   EXPECT_EQ(plan->device_id, "plc_io");
   EXPECT_EQ(plan->config_dir, std::filesystem::path("/cfg"));
@@ -2642,11 +2720,11 @@ TEST(SimulatedPlcPlan, OnlyACommandedSimUnitGetsASimulatedPlc) {
 }
 
 TEST(SimulatedPlcPlan, OnlyGenericRosDevicesGetOne) {
-  EXPECT_FALSE(plan_simulated_plc("commanded_sim", "station_io",
+  EXPECT_FALSE(plan_simulated_plc(true, "station_io",
                                   {{"mock", std::nullopt, std::nullopt},
                                    {"mock_output", std::nullopt, std::nullopt}},
                                   "/cfg"));
-  EXPECT_FALSE(plan_simulated_plc("commanded_sim", "plc_io", {}, "/cfg"));
+  EXPECT_FALSE(plan_simulated_plc(true, "plc_io", {}, "/cfg"));
   // Robot-provided I/O is served by the robot's own peer, never a sim PLC.
   for (const auto *profile :
        {"ur_io_states", "ur_set_io", "ros2_control_gpio",
@@ -2654,10 +2732,10 @@ TEST(SimulatedPlcPlan, OnlyGenericRosDevicesGetOne) {
     SCOPED_TRACE(profile);
     auto rows = plc_rows();
     rows.push_back({profile, "/io_states", std::nullopt});
-    EXPECT_FALSE(plan_simulated_plc("commanded_sim", "plc_io", rows, "/cfg"));
+    EXPECT_FALSE(plan_simulated_plc(true, "plc_io", rows, "/cfg"));
   }
   // A generic row without its address is not a generic ROS endpoint.
-  EXPECT_FALSE(plan_simulated_plc("commanded_sim", "plc_io",
+  EXPECT_FALSE(plan_simulated_plc(true, "plc_io",
                                   {{"ros_bool", std::nullopt, std::nullopt}},
                                   "/cfg"));
 }

@@ -96,12 +96,24 @@ class RetainedKinematicStateProjector final {
       std::vector<core::RuntimeParticipantBinding> bindings,
       std::int64_t freshness_budget_ns);
 
+  /// One freshness budget per binding (same order): each target registers its
+  /// own state channel's budget (e.g. a Real measured arm beside a commanded
+  /// gripper).
+  [[nodiscard]] static RetainedKinematicStateProjector create(
+      std::shared_ptr<roboplan::Scene> scene,
+      std::shared_ptr<std::mutex> scene_mutex,
+      RetainedKinematicModelMapInput model_map,
+      std::vector<core::RuntimeParticipantBinding> bindings,
+      std::vector<std::int64_t> freshness_budgets_ns);
+
   /// Copy only the exact runtime coordinate namespace from deployment-owned,
   /// independently verified products. The unqualified identity verifier is
   /// intentionally resolved by argument-dependent lookup at instantiation so
   /// this library does not import or link the deployment compiler.
+  /// `freshness_budget_ns` is one budget for every target or one per binding,
+  /// as in create().
   template <typename RetainedBundle, typename VerifiedRetainedModelMap,
-            typename VerifiedRetainedPlanningModel>
+            typename VerifiedRetainedPlanningModel, typename FreshnessBudget>
   [[nodiscard]] static RetainedKinematicStateProjector create_verified(
       std::shared_ptr<roboplan::Scene> scene,
       std::shared_ptr<std::mutex> scene_mutex,
@@ -109,7 +121,7 @@ class RetainedKinematicStateProjector final {
       const VerifiedRetainedModelMap& retained_model_map,
       const VerifiedRetainedPlanningModel& planning_model,
       std::vector<core::RuntimeParticipantBinding> bindings,
-      std::int64_t freshness_budget_ns) {
+      FreshnessBudget freshness_budget_ns) {
     if (!verify_retained_bundle_identity(retained_bundle)) {
       throw std::invalid_argument(
           "retained state projector received an unverifiable bundle");
@@ -171,7 +183,7 @@ class RetainedKinematicStateProjector final {
       input.control_bindings.push_back(std::move(binding_input));
     }
     return create(std::move(scene), std::move(scene_mutex), std::move(input),
-                  std::move(bindings), freshness_budget_ns);
+                  std::move(bindings), std::move(freshness_budget_ns));
   }
 
   ~RetainedKinematicStateProjector();

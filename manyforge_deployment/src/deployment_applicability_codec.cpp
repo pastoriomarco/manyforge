@@ -2179,7 +2179,7 @@ parse_interrupt_rules(const CanonicalValue::Object &policies) {
     const auto &rule = require_object(rules[index], path);
     require_closed_fields(
         rule, {"rule_id", "condition", "scope"},
-        {"priority", "idle_behaviour", "stop_entry_stage_id", "latch_release"},
+        {"priority", "on_trip", "idle_behaviour", "stop_entry_stage_id"},
         path);
     const auto id = require_portable_token_string(
         require_member(rule, "rule_id", path), path);
@@ -2225,19 +2225,24 @@ parse_interrupt_rules(const CanonicalValue::Object &policies) {
                                       {"condition", condition},
                                       {"scope", std::move(normalized_scope)},
                                       {"priority", CanonicalValue(priority)}};
-    std::string latch_release = "operator";
-    if (const auto *authored = find_member(rule, "latch_release")) {
-      latch_release =
-          require_string(*authored, child_path(path, "latch_release"));
-      if (latch_release != "operator" && latch_release != "auto_on_clear")
-        fail(child_path(path, "latch_release"),
-             "global latch_release requires operator or auto_on_clear");
+    // gate (default): refuse new motion in scope while the condition is true,
+    // scoped Stop, released when it clears. full_stop: cell Full Stop and
+    // operator release; only full_stop knows an idle_behaviour.
+    std::string on_trip = "gate";
+    if (const auto *authored = find_member(rule, "on_trip")) {
+      on_trip = require_string(*authored, child_path(path, "on_trip"));
+      if (on_trip != "gate" && on_trip != "full_stop")
+        fail(child_path(path, "on_trip"),
+             "global on_trip requires gate or full_stop");
     }
-    normalized.emplace_back("latch_release", CanonicalValue(latch_release));
+    normalized.emplace_back("on_trip", CanonicalValue(on_trip));
     if (const auto *idle = find_member(rule, "idle_behaviour")) {
       const auto &token = require_string(*idle, path);
       if (token != "latch" && token != "ignore")
         fail(path, "invalid global idle_behaviour");
+      if (on_trip != "full_stop")
+        fail(child_path(path, "idle_behaviour"),
+             "global idle_behaviour requires on_trip full_stop");
       normalized.emplace_back("idle_behaviour", *idle);
     }
     if (const auto *entry = find_member(rule, "stop_entry_stage_id")) {
@@ -2696,13 +2701,6 @@ decode_component_stream_overrides(const CanonicalValue &value) {
     }
     if (!row.budget_ns && !row.severity && !row.recovery) {
       fail(path, "expected at least one of budget_ns, severity, or recovery");
-    }
-    // A `fault` stream opens an incident, which only the operator's Recover
-    // closes: `auto` recovery cannot apply to it.
-    if (row.severity == core::StreamSeverityDTO::kFault &&
-        row.recovery == core::StreamRecoveryDTO::kAuto) {
-      fail(child_path(path, "recovery"),
-           "severity fault requires recovery ack (fault + auto is invalid)");
     }
     result.push_back(std::move(row));
   }

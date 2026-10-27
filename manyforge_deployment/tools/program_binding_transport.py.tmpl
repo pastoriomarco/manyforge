@@ -249,6 +249,36 @@ def validate_program_binding(value: object, *, label: str = "program_binding") -
         target_by_role[target["target_role_id"]] = target
     _sorted_unique(targets, lambda x: x["target_role_id"], f"{label}.target_role_bindings")
 
+    for index, target in enumerate(targets):
+        if "pneumatic_io" not in target:
+            continue
+        path = f"{label}.target_role_bindings[{index}].pneumatic_io"
+        route = _record(target["pneumatic_io"], _FIELDS["pneumatic_io"], path)
+        if not any(cap["capability_id"] == "tool.gripper.command" for cap in target["capability_bindings"]):
+            _fail(path, "requires a gripper command target")
+        outputs = _array(route["outputs"], f"{path}.outputs", minimum=1, maximum=2)
+        inputs = _array(route["inputs"], f"{path}.inputs", maximum=4)
+        for rows, kind in ((outputs, "output"), (inputs, "input")):
+            for ri, raw in enumerate(rows):
+                rp = f"{path}.{kind}s[{ri}]"
+                row = _record(raw, _FIELDS[f"pneumatic_{kind}"], rp)
+                _identity(row["target_role_id"], f"{rp}.target_role_id")
+                _identity(row["resource_role_id"], f"{rp}.resource_role_id")
+                if kind == "output":
+                    if type(row["open_value"]) is not bool or type(row["close_value"]) is not bool:
+                        _fail(rp, "output levels must be boolean")
+                elif row["input"] not in ("open", "closed", "pressure", "workpiece_grasped"):
+                    _fail(rp, "unknown pneumatic input")
+                selected = target_by_role.get(row["target_role_id"])
+                signal = next((item for item in selected.get("signal_role_bindings", ())
+                               if item["resource_role_id"] == row["resource_role_id"]), None) if selected else None
+                capability = "io.gpio.set_output" if kind == "output" else "io.gpio.get_input"
+                if (selected is None or signal is None or signal["direction"] != kind
+                    or not any(cap["capability_id"] == capability for cap in selected["capability_bindings"])):
+                    _fail(rp, "signal does not resolve through its exact bound I/O target")
+        _sorted_unique(outputs, lambda x: (x["target_role_id"], x["resource_role_id"]), f"{path}.outputs")
+        _sorted_unique(inputs, lambda x: x["input"], f"{path}.inputs")
+
     node_policies = _array(
         root["node_policies"], f"{label}.node_policies",
         maximum=_NODE_POLICY_MAX,

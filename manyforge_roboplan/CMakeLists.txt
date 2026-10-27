@@ -71,13 +71,6 @@ if(NOT TARGET manyforge_core)
   unset(MANYFORGE_CORE_BUILD_FILESYSTEM_RESOLVED_STOP_BASE_PLAN_REPOSITORY)
 endif()
 
-if(NOT TARGET manyforge_lite6_product)
-  add_subdirectory(
-    "${_MANYFORGE_REPOSITORY_SOURCE_ROOT}/manyforge_lite6_product"
-    "${CMAKE_CURRENT_BINARY_DIR}/manyforge_lite6_product"
-    EXCLUDE_FROM_ALL)
-endif()
-
 # The I6 native projection boundary consumes the ManyForge-owned collision
 # model directly. Build it without its package-local integration suite here;
 # cumulative collision qualification remains owned by the dedicated collision
@@ -232,6 +225,7 @@ set(_MANYFORGE_CONTROLLER_TEMPLATE_INCLUDES "")
 foreach(_entry
     "kEmbeddedMockUFactoryControllersTemplate=mock_ufactory_controllers.template.yaml"
     "kEmbeddedMockUrControllersTemplate=mock_ur_controllers.template.yaml"
+    "kEmbeddedRealUFactoryControllersTemplate=real_ufactory_controllers.template.yaml"
     "kEmbeddedMockGripperControllerTemplate=mock_gripper_controller.template.yaml"
     "kEmbeddedIsaacLite6ControllersYaml=isaac_lite6_topic_based_controllers.yaml"
     "kEmbeddedIsaacUr10eControllersYaml=isaac_ur10e_topic_based_controllers.yaml")
@@ -396,6 +390,7 @@ if(MANYFORGE_BUILD_ROS2_CONTROL_RUNTIME)
   find_package(std_srvs REQUIRED)
   find_package(ur_msgs REQUIRED)
   find_package(control_msgs REQUIRED)
+  find_package(xarm_msgs REQUIRED)
   add_library(manyforge_ros_boolean_output_provider
     src/ros_boolean_output_provider.cpp)
   target_include_directories(manyforge_ros_boolean_output_provider PUBLIC
@@ -403,20 +398,32 @@ if(MANYFORGE_BUILD_ROS2_CONTROL_RUNTIME)
     $<INSTALL_INTERFACE:include>)
   target_link_libraries(manyforge_ros_boolean_output_provider PUBLIC
     manyforge_core rclcpp::rclcpp ${std_srvs_TARGETS}
-    ${ur_msgs_TARGETS} ${control_msgs_TARGETS}
+    ${ur_msgs_TARGETS} ${control_msgs_TARGETS} ${xarm_msgs_TARGETS}
     PRIVATE Threads::Threads)
   add_library(manyforge_ros_boolean_input_provider
     src/ros_boolean_input_provider.cpp
-    src/ros_mapped_boolean_input_provider.cpp)
+    src/ros_mapped_boolean_input_provider.cpp
+    src/xarm_digital_input_provider.cpp)
   target_include_directories(manyforge_ros_boolean_input_provider PUBLIC
     $<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}/include>
     $<INSTALL_INTERFACE:include>)
   target_link_libraries(manyforge_ros_boolean_input_provider PUBLIC
     manyforge_core rclcpp::rclcpp ${std_msgs_TARGETS}
-    ${ur_msgs_TARGETS} ${control_msgs_TARGETS})
+    ${ur_msgs_TARGETS} ${control_msgs_TARGETS} ${xarm_msgs_TARGETS})
 
   find_package(pal_statistics_msgs REQUIRED)
   find_package(diagnostic_msgs REQUIRED)
+  # R7: the per-vendor adapters of Real components (xArm).
+  if(NOT TARGET manyforge_xarm_control_brand_lifecycle)
+    set(_MANYFORGE_ROBOPLAN_BUILD_TESTING "${BUILD_TESTING}")
+    set(BUILD_TESTING OFF)
+    add_subdirectory(
+      "${_MANYFORGE_REPOSITORY_SOURCE_ROOT}/manyforge_xarm_control"
+      "${CMAKE_CURRENT_BINARY_DIR}/manyforge_xarm_control"
+      EXCLUDE_FROM_ALL)
+    set(BUILD_TESTING "${_MANYFORGE_ROBOPLAN_BUILD_TESTING}")
+    unset(_MANYFORGE_ROBOPLAN_BUILD_TESTING)
+  endif()
   add_library(manyforge_roboplan_ros2_control_runtime
     src/component_stream_sample_bridge.cpp
     src/io_provider_lifecycle_product.cpp
@@ -425,7 +432,8 @@ if(MANYFORGE_BUILD_ROS2_CONTROL_RUNTIME)
     src/retained_ros2_control_backend_factory.cpp
     src/retained_ros2_control_lifecycle_product.cpp
     src/retained_ros2_control_runtime_handle.cpp
-    src/retained_ros2_control_statistics_monitor.cpp)
+    src/retained_ros2_control_statistics_monitor.cpp
+    src/retained_vendor_device_status.cpp)
   target_include_directories(manyforge_roboplan_ros2_control_runtime PUBLIC
     $<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}/include>
     $<INSTALL_INTERFACE:include>)
@@ -442,7 +450,8 @@ if(MANYFORGE_BUILD_ROS2_CONTROL_RUNTIME)
     manyforge_ros2_control_execution
     ${pal_statistics_msgs_TARGETS}
     ${diagnostic_msgs_TARGETS}
-    manyforge::content_identity)
+    manyforge::content_identity
+    PRIVATE manyforge_xarm_control_brand_lifecycle)
 endif()
 
 if(NOT TARGET manyforge_deployment_cclc_runtime_composition)
@@ -915,6 +924,13 @@ if(BUILD_TESTING)
         test/test_ros_boolean_input_provider.cpp)
       target_link_libraries(test_ros_boolean_input_provider PRIVATE
         manyforge_ros_boolean_input_provider GTest::gtest_main)
+
+      add_executable(test_xarm_digital_input_provider
+        test/test_xarm_digital_input_provider.cpp)
+      target_link_libraries(test_xarm_digital_input_provider PRIVATE
+        manyforge_ros_boolean_input_provider GTest::gtest_main)
+      gtest_discover_tests(test_xarm_digital_input_provider
+        PROPERTIES TIMEOUT ${MANYFORGE_GTEST_TIMEOUT_SECONDS})
       add_executable(test_ros_mapped_boolean_input_provider
         test/test_ros_mapped_boolean_input_provider.cpp)
       target_link_libraries(test_ros_mapped_boolean_input_provider PRIVATE
@@ -947,6 +963,7 @@ if(BUILD_TESTING)
         manyforge_roboplan_ros2_control_runtime
         manyforge_roboplan_native_runtime_support
         manyforge_deployment_canonical_package_generator
+        manyforge_xarm_control_brand_lifecycle
         GTest::gtest_main)
       gtest_discover_tests(test_retained_ros2_control_runtime_handle
         PROPERTIES TIMEOUT 120)
@@ -1005,6 +1022,12 @@ if(BUILD_TESTING)
       MANYFORGE_PROGRAM_CAPTURE_PACKAGE_ROOT="${_MANYFORGE_NATIVE_PROGRAM_CAPTURE_BINARY_DIR}/program_capture_package")
     add_dependencies(test_retained_native_cclc_runtime
       manyforge_maintained_deployment_occurrences)
+    # ActualUi6iTenAliasesUseTwoPhysicalGroups reads the generated UI6-I cell
+    # package; it exists only where the Deployment tests are configured.
+    if(TARGET manyforge_ui6i_cell_bootstrap)
+      add_dependencies(test_retained_native_cclc_runtime
+        manyforge_ui6i_cell_bootstrap)
+    endif()
     target_link_libraries(test_retained_native_cclc_runtime PRIVATE
       manyforge_deployment_program_io_condition_compiler
       manyforge_roboplan_managed_kernel_apply_fence
@@ -1047,6 +1070,7 @@ if(BUILD_TESTING)
       target_link_libraries(test_host_io_output_channels PRIVATE
         manyforge_core manyforge_mock_boolean_output_provider
         manyforge_ros_boolean_output_provider manyforge_deployment
+        manyforge_roboplan_controller_launch_artifacts
         manyforge_deployment_canonical_package_generator GTest::gtest_main)
       gtest_discover_tests(test_host_io_output_channels
         PROPERTIES TIMEOUT ${MANYFORGE_GTEST_TIMEOUT_SECONDS})
@@ -1417,7 +1441,6 @@ if(BUILD_TESTING)
       generate_lite6_native_execution_fixture_tool PRIVATE
       manyforge_deployment
       manyforge_component_manager
-      manyforge_lite6_product
       manyforge_core)
 
     set(_MANYFORGE_I6_NATIVE_EXECUTION_FIXTURE_ROOT
@@ -1850,6 +1873,10 @@ if(BUILD_TESTING)
     gtest_discover_tests(test_retained_native_cclc_runtime
       PROPERTIES
         ENVIRONMENT "LD_LIBRARY_PATH=${_LIB_PATHS}"
+        # gtest_discover_tests splits a ';' list into separate properties, so
+        # the second variable goes through its own single-item property.
+        ENVIRONMENT_MODIFICATION
+          "MANYFORGE_UI6I_CELL_BOOTSTRAP_ROOT=set:${_MANYFORGE_NATIVE_PROGRAM_CAPTURE_BINARY_DIR}/ui6i-dual-scenario-fixture/retained-package"
         TIMEOUT ${MANYFORGE_GTEST_TIMEOUT_SECONDS}
         FIXTURES_REQUIRED ProgramCapturePackage)
     gtest_discover_tests(test_native_stop_qualification_seams

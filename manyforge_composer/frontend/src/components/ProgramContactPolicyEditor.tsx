@@ -4,7 +4,6 @@ import type { ProgramWorkspaceController } from '../hooks/useProgramWorkspace';
 import type { JsonValue, ProgramAuthoringDocument } from '../types/api';
 import { groupByNamespace } from '../utils/blackboardNamespaces';
 import { NamespaceGroupOptions, useNamespaceGroups } from './common/NamespaceGroupOptions';
-import { ProgramSupportContactEditor } from './ProgramSupportContactEditor';
 
 const PORTABLE_ID = /^[a-z][a-z0-9_.-]*$/;
 const EMPTY_POLICIES: JsonValue[] = [];
@@ -367,13 +366,6 @@ export function ProgramContactPolicyEditor({
 
   return (
     <div className="scene-authoring-column dpanel" aria-label="Contact policies">
-      <ProgramSupportContactEditor
-        program={program}
-        draftRevision={draftRevision}
-        busy={busy}
-        busyReason={busyReason}
-        mutate={mutate}
-      />
       <section className="dcard">
       <header>
         <span>Robot/object contact policy</span>

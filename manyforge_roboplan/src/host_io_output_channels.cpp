@@ -1,4 +1,5 @@
 #include "host_io_output_channels.hpp"
+#include "xarm_digital_address.hpp"
 
 #include <algorithm>
 #include <manyforge_core/io_signal_descriptor.hpp>
@@ -119,6 +120,21 @@ Reply CreateHostIoOutputChannels(
         ros_address =
             UrSetIoOutputAddress{*configuration.service,
                                  static_cast<std::uint8_t>(*configuration.pin)};
+      } else if (profile == "xarm_digital" && configuration.robot_component_id &&
+                 configuration.bank && configuration.pin && node &&
+                 !configuration.channel && !configuration.service &&
+                 !configuration.topic && !configuration.group &&
+                 !configuration.interface_name &&
+                 ((*configuration.bank == "tool" && *configuration.pin <= 4U) ||
+                  (*configuration.bank == "controller" && *configuration.pin <= 15U))) {
+        const auto bank = *configuration.bank == "tool"
+                              ? XArmDigitalBank::kTool
+                              : XArmDigitalBank::kController;
+        const auto service = XArmDigitalServiceName(
+            configuration.robot_component_id->value(), bank, true);
+        address = {service, std::to_string(*configuration.pin)};
+        ros_address = XArmSetDigitalOutputAddress{
+            service, static_cast<std::uint8_t>(*configuration.pin), bank};
       } else if (profile == "ros2_control_gpio" && configuration.topic &&
                  configuration.group && configuration.interface_name && node &&
                  !configuration.channel && !configuration.service &&

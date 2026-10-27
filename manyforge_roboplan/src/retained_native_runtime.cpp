@@ -1502,22 +1502,32 @@ create_retained_native_runtime_participants(
           std::move(motion_state_config), runtime->clock.get(),
           observation_wake);
   const auto initial_timestamp_ns = runtime->clock->now();
-  const auto motion_initialized =
-      config.initial_motion_positions_rad.empty()
-          ? runtime->motion_state_channel->initialize_from_projection(
-                initial_timestamp_ns)
-          : runtime->motion_state_channel->source_kind() == core::ObservedStateSourceKind::kCommandedState
-                ? runtime->motion_state_channel->publish_commanded_initialization_and_project(
-                      config.initial_motion_positions_rad,
-                      std::vector<double>(config.initial_motion_positions_rad.size(), 0.0),
-                      initial_timestamp_ns)
-                : runtime->motion_state_channel->publish_and_project(
-                      config.initial_motion_positions_rad,
-                      std::vector<double>(config.initial_motion_positions_rad.size(), 0.0),
-                      initial_timestamp_ns, initial_timestamp_ns);
-  if (!motion_initialized.applied()) {
-    throw std::invalid_argument(
-        "native motion state could not be seeded from the retained model");
+  if (runtime->motion_state_channel->query_context().state_authority_class ==
+      core::StateAuthorityClass::kMeasured) {
+    // CP8 step 1: measured arm state is never seeded from the model or an
+    // initial pose; it stays unavailable until its measured source publishes.
+    if (!config.initial_motion_positions_rad.empty()) {
+      throw std::invalid_argument(
+          "native measured motion state accepts no initial pose");
+    }
+  } else {
+    const auto motion_initialized =
+        config.initial_motion_positions_rad.empty()
+            ? runtime->motion_state_channel->initialize_from_projection(
+                  initial_timestamp_ns)
+            : runtime->motion_state_channel->source_kind() == core::ObservedStateSourceKind::kCommandedState
+                  ? runtime->motion_state_channel->publish_commanded_initialization_and_project(
+                        config.initial_motion_positions_rad,
+                        std::vector<double>(config.initial_motion_positions_rad.size(), 0.0),
+                        initial_timestamp_ns)
+                  : runtime->motion_state_channel->publish_and_project(
+                        config.initial_motion_positions_rad,
+                        std::vector<double>(config.initial_motion_positions_rad.size(), 0.0),
+                        initial_timestamp_ns, initial_timestamp_ns);
+    if (!motion_initialized.applied()) {
+      throw std::invalid_argument(
+          "native motion state could not be seeded from the retained model");
+    }
   }
   runtime->angular_observed_state =
       std::make_unique<core::AddressedAngularObservedRobotStateAdapter>(

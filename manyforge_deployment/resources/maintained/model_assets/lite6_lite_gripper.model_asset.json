@@ -146,8 +146,8 @@
         "media_type": "application/xml"
       },
       {
-        "byte_size": 10824,
-        "content_digest": "sha256:c135c1015bba693853e491b1cb77020296f86a9436fe4551c7da9b9141e7481a",
+        "byte_size": 10836,
+        "content_digest": "sha256:d9b22062e18f2375189a7e0456a35dc578be4869501b78c6484ef7549229ef7a",
         "logical_uri": "asset://lite6_lite_gripper/model.urdf",
         "media_type": "application/xml"
       }
@@ -189,7 +189,7 @@
       "source_group_name": "lite_gripper"
     }
   ],
-  "model_revision": "sha256:b64c0b05bc23de6eb1fd5796baa6e32454c2f5514ab38c8f5b0b75f523272bf7",
+  "model_revision": "sha256:7fecf93ef1b79a9f045607bd24642c4f0b6b8009808c8aaec4075eb1d10cfc6e",
   "resource_role_bindings": [
     {
       "resource_role_id": "arm_joints",

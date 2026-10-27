@@ -271,6 +271,19 @@ export function IoSignalOutputFields({
             ? 'Absolute, fully resolved UR driver set_io service, e.g. /io_and_status_controller/set_io.'
             : 'Absolute, fully resolved ROS service name, e.g. /cell/valve/set.')}
         {draft.profile === 'ur_set_io' && text('Pin', 'pin', `UR digital output pin, 0–${IO_UR_MAXIMUM_PIN}.`)}
+        {draft.profile === 'xarm_digital' && (
+          <>
+            {text('Robot component', 'robotComponentId', 'The xArm robot whose driver serves this I/O.')}
+            <label className="deployment-focused-field">
+              <span>Bank</span>
+              <select aria-label={`${label} Bank`} value={draft.bank} disabled={disabled}
+                onChange={(event) => onChange({ bank: event.target.value as 'tool' | 'controller' })}>
+                <option value="tool">Tool</option><option value="controller">Controller</option>
+              </select>
+            </label>
+            {text('Pin', 'pin', draft.bank === 'tool' ? 'Tool output pin 0–4.' : 'Controller output pin 0–15.')}
+          </>
+        )}
         {draft.profile === 'ros2_control_gpio' && (
           <>
             {text('Topic', 'topic', 'Absolute, fully resolved GPIO command topic of the gpio command controller.')}
@@ -282,7 +295,7 @@ export function IoSignalOutputFields({
       <p className="field-help">
         {draft.profile === 'ros2_control_gpio'
           ? 'A write is submitted only: the gpio command controller gives no acknowledgement, so it has no acknowledgement timeout. Every command message carries all channels of the group ManyForge has written.'
-          : `A write completes when the source accepts it (${draft.profile === 'mock_output' ? 'the Mock acknowledges it' : draft.profile === 'ur_set_io' ? 'the set_io response' : 'the SetBool response'}), not on the physical effect.`}
+          : `A write completes when the source accepts it (${draft.profile === 'mock_output' ? 'the Mock acknowledges it' : draft.profile === 'ur_set_io' ? 'the set_io response' : draft.profile === 'xarm_digital' ? 'the xArm service response' : 'the SetBool response'}), not on the physical effect.`}
         {' '}To read the state back, declare a separate input signal.
       </p>
       {onRemove !== undefined && (
@@ -353,17 +366,31 @@ export function IoSignalInputFields({
         <label className="deployment-focused-field">
           <span>Source profile</span>
           <select aria-label={`${label} Source profile`} value={draft.profile} disabled={disabled}
-            onChange={(event) => onChange({ profile: event.target.value as IoSourceProfile })}>
+            onChange={(event) => onChange({ profile: event.target.value as IoSourceProfile,
+              ...(event.target.value === 'xarm_digital' && draft.maximumAgeMs === '' ? { maximumAgeMs: '250' } : {}) })}>
             {profiles.map((profile) => (
               <option key={profile} value={profile}>{IO_SOURCE_PROFILE_LABELS[profile]}</option>
             ))}
           </select>
         </label>
         {text('Source', 'sourceId', 'Signals sharing one source must agree on profile, topic, ingress depth and liveness.')}
-        {draft.profile !== 'mock' && draft.profile !== 'geometric_contact'
+        {draft.profile !== 'mock' && draft.profile !== 'geometric_contact' && draft.profile !== 'xarm_digital'
           && text('Topic', 'topic', draft.profile === 'ros_bool' ? undefined
           : 'Absolute, fully resolved topic, e.g. /io_and_status_controller/io_states.')}
         {draft.profile === 'ur_io_states' && number('Pin', 'pin', `0–${IO_UR_MAXIMUM_PIN}`, 'UR digital input pin.')}
+        {draft.profile === 'xarm_digital' && (
+          <>
+            {text('Robot component', 'robotComponentId', 'The xArm robot whose driver serves this I/O.')}
+            <label className="deployment-focused-field">
+              <span>Bank</span>
+              <select aria-label={`${label} Bank`} value={draft.bank} disabled={disabled}
+                onChange={(event) => onChange({ bank: event.target.value as 'tool' | 'controller' })}>
+                <option value="tool">Tool</option><option value="controller">Controller</option>
+              </select>
+            </label>
+            {number('Pin', 'pin', draft.bank === 'tool' ? '0–1' : '0–15', 'xArm digital input pin.')}
+          </>
+        )}
         {draft.profile === 'ros2_control_gpio' && text('Group', 'group', 'The exact GPIO group name.')}
         {draft.profile === 'ros2_control_gpio' && text('Interface name', 'interfaceName', 'The exact state interface name within the group.')}
         {draft.profile === 'ros_bool' && (
@@ -413,14 +440,25 @@ export function IoSignalInputFields({
           </>
         )}
         {draft.profile === 'mock' ? (
-          <label className="deployment-focused-field">
-            <span>Initial value</span>
-            <select aria-label={`${label} Initial value`} value={String(draft.initialValue)} disabled={disabled}
-              onChange={(event) => onChange({ initialValue: event.target.value === 'true' })}>
-              <option value="false">false</option>
-              <option value="true">true</option>
-            </select>
-          </label>
+          <>
+            <label className="deployment-focused-field">
+              <span>Initial value</span>
+              <select aria-label={`${label} Initial value`} value={String(draft.initialValue)} disabled={disabled}
+                onChange={(event) => onChange({ initialValue: event.target.value === 'true' })}>
+                <option value="false">false</option>
+                <option value="true">true</option>
+              </select>
+            </label>
+            <label className="deployment-focused-field">
+              <span>Echo a Mock output</span>
+              <input type="checkbox" aria-label={`${label} Echo a Mock output`} checked={draft.echoEnabled}
+                disabled={disabled} onChange={(event) => onChange({ echoEnabled: event.target.checked })} />
+            </label>
+            {draft.echoEnabled && text('Output signal name', 'echoOutputSignalName',
+              'Name of a Mock output on this I/O device.')}
+            {draft.echoEnabled && number('Echo delay', 'echoDelayMs', 'ms',
+              'The input follows the output after this delay.')}
+          </>
         ) : liveness === 'periodic'
           ? number('Maximum sample age', 'maximumAgeMs', 'ms', 'The freshness tolerance: a reading older than this is stale.')
           : null}
@@ -433,6 +471,9 @@ export function IoSignalInputFields({
             : 'provider validity only; no sample age applies.'}
         {' '}Transitions are sampled only.
       </p>
+      {draft.profile === 'xarm_digital' && (
+        <p className="field-help">The xArm driver is sampled at 20 Hz; signals on the same bank share one source.</p>
+      )}
       {draft.profile === 'geometric_contact' && (
         <p className="field-help" data-geometric-contact-note>
           Derived read-only input. Runtime resolves the selected endpoint&apos;s existing contact-body roles and the

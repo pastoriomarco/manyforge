@@ -1,4 +1,4 @@
-"""Concrete Program model transport stays bounded and site-qualified."""
+"""Concrete Program model transport calls the request's AI model component."""
 
 from __future__ import annotations
 
@@ -6,7 +6,6 @@ import base64
 from dataclasses import replace
 from hashlib import sha256
 import json
-from pathlib import Path
 from threading import Event
 
 import httpx
@@ -20,8 +19,6 @@ from manyforge_headless_api.program_model_transport import (
     HeadlessProgramModelAuditSink,
     OpenAICompatibleProgramModelTransport,
     ProgramModelAuditCommitError,
-    ProgramModelEndpointConfig,
-    load_program_model_endpoint_configs,
 )
 
 
@@ -49,22 +46,27 @@ def test_model_attempt_openapi_exposes_lossless_int64_wire_forms(mode):
     }
 
 
-def _config() -> ProgramModelEndpointConfig:
-    return ProgramModelEndpointConfig(
-        external_resource_alias="site_llm",
-        chat_completions_url="http://models.test/v1/chat/completions",
-        model_endpoint_aliases=("planning_model",),
-        model_ids=("model-a",),
-        headers={"X-Site": "cell-a"},
-        bearer_token="secret",
+_TOKEN_ENV = "MANYFORGE_AI_TEST_TOKEN"
+
+
+def _transport(handler) -> OpenAICompatibleProgramModelTransport:
+    return OpenAICompatibleProgramModelTransport(
+        client=httpx.Client(transport=httpx.MockTransport(handler))
     )
 
 
-def _request(*, tool: bool = False) -> ProgramModelRequest:
+def _request(
+    *,
+    tool: bool = False,
+    base_url: str = "http://models.test/v1",
+    api_key_env: str | None = _TOKEN_ENV,
+) -> ProgramModelRequest:
     return ProgramModelRequest(
         model_endpoint_alias="planning_model",
-        external_resource_alias="site_llm",
+        external_resource_alias="planning_model",
         model_id="model-a",
+        base_url=base_url,
+        api_key_env=api_key_env,
         prompt_template_id="select",
         prompt_template_version="1",
         prompt_template_digest=_DIGEST,
@@ -106,7 +108,10 @@ def _snapshot_attachment() -> dict[str, object]:
     }
 
 
-def test_json_request_uses_explicit_site_endpoint_and_bounded_contract() -> None:
+def test_json_request_uses_the_ai_model_component_and_bounded_contract(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setenv(_TOKEN_ENV, "secret")
     captured: list[httpx.Request] = []
 
     def handler(request: httpx.Request) -> httpx.Response:
@@ -120,11 +125,10 @@ def test_json_request_uses_explicit_site_endpoint_and_bounded_contract() -> None
             },
         )
 
-    client = httpx.Client(transport=httpx.MockTransport(handler))
-    transport = OpenAICompatibleProgramModelTransport((_config(),), client=client)
+    transport = _transport(handler)
     transport.validate_endpoint(
         model_endpoint_alias="planning_model",
-        external_resource_alias="site_llm",
+        external_resource_alias="planning_model",
         model_id="model-a",
         request_contract={"tool_call_family": "openai_chat_tools"},
     )
@@ -146,7 +150,11 @@ def test_json_request_uses_explicit_site_endpoint_and_bounded_contract() -> None
     assert "secret" not in body
 
 
-def test_tool_call_response_is_transport_neutral() -> None:
+def test_tool_call_response_is_transport_neutral(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setenv(_TOKEN_ENV, "secret")
+
     def handler(_request: httpx.Request) -> httpx.Response:
         return httpx.Response(
             200,
@@ -169,10 +177,7 @@ def test_tool_call_response_is_transport_neutral() -> None:
             },
         )
 
-    transport = OpenAICompatibleProgramModelTransport(
-        (_config(),),
-        client=httpx.Client(transport=httpx.MockTransport(handler)),
-    )
+    transport = _transport(handler)
 
     response = transport.complete(_request(tool=True), Event())
 
@@ -180,7 +185,10 @@ def test_tool_call_response_is_transport_neutral() -> None:
     assert response.tool_arguments == '{"selected_object_id":"part"}'
 
 
-def test_snapshot_request_uses_standard_multimodal_content_parts() -> None:
+def test_snapshot_request_uses_standard_multimodal_content_parts(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setenv(_TOKEN_ENV, "secret")
     captured: list[dict[str, object]] = []
 
     def handler(request: httpx.Request) -> httpx.Response:
@@ -193,10 +201,7 @@ def test_snapshot_request_uses_standard_multimodal_content_parts() -> None:
             },
         )
 
-    transport = OpenAICompatibleProgramModelTransport(
-        (_config(),),
-        client=httpx.Client(transport=httpx.MockTransport(handler)),
-    )
+    transport = _transport(handler)
     request = replace(_request(), attachment=_snapshot_attachment())
 
     assert transport.complete(request, Event()).text == '{"visible":true}'
@@ -216,7 +221,9 @@ def test_snapshot_request_uses_standard_multimodal_content_parts() -> None:
     ]
 
 
-def test_site_allowlist_and_pre_dispatch_cancellation_fail_closed() -> None:
+def test_unsupported_family_unset_token_and_cancellation_fail_closed(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
     called = False
 
     def handler(_request: httpx.Request) -> httpx.Response:
@@ -224,17 +231,18 @@ def test_site_allowlist_and_pre_dispatch_cancellation_fail_closed() -> None:
         called = True
         return httpx.Response(500)
 
-    transport = OpenAICompatibleProgramModelTransport(
-        (_config(),),
-        client=httpx.Client(transport=httpx.MockTransport(handler)),
-    )
-    with pytest.raises(ProgramModelTransportError, match="not allowed"):
+    transport = _transport(handler)
+    with pytest.raises(ProgramModelTransportError, match="openai_chat_tools only"):
         transport.validate_endpoint(
             model_endpoint_alias="planning_model",
-            external_resource_alias="site_llm",
-            model_id="other-model",
-            request_contract={"tool_call_family": "openai_chat_tools"},
+            external_resource_alias="planning_model",
+            model_id="model-a",
+            request_contract={"tool_call_family": "qwen3_xml"},
         )
+    monkeypatch.delenv(_TOKEN_ENV, raising=False)
+    with pytest.raises(ProgramModelTransportError) as unset:
+        transport.complete(_request(), Event())
+    assert unset.value.reason_code == "ai_model_token_unavailable"
     cancelled = Event()
     cancelled.set()
     with pytest.raises(ProgramModelTransportError, match="cancelled"):
@@ -242,103 +250,21 @@ def test_site_allowlist_and_pre_dispatch_cancellation_fail_closed() -> None:
     assert called is False
 
 
-def test_site_endpoint_rejects_credential_urls_and_ambiguous_headers() -> None:
-    with pytest.raises(ValueError, match="absolute HTTP"):
-        ProgramModelEndpointConfig(
-            external_resource_alias="site_llm",
-            chat_completions_url="https://secret@models.test/v1/chat/completions",
-            model_endpoint_aliases=("planning_model",),
-            model_ids=("model-a",),
-        )
-    with pytest.raises(ValueError, match="reserved"):
-        ProgramModelEndpointConfig(
-            external_resource_alias="site_llm",
-            chat_completions_url="https://models.test/v1/chat/completions",
-            model_endpoint_aliases=("planning_model",),
-            model_ids=("model-a",),
-            headers={"content-type": "text/plain"},
-        )
-    with pytest.raises(ValueError, match="Authorization"):
-        ProgramModelEndpointConfig(
-            external_resource_alias="site_llm",
-            chat_completions_url="https://models.test/v1/chat/completions",
-            model_endpoint_aliases=("planning_model",),
-            model_ids=("model-a",),
-            headers={"Authorization": "other"},
-            bearer_token="secret",
+def test_ai_model_without_token_sends_no_authorization() -> None:
+    captured: list[httpx.Request] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        captured.append(request)
+        return httpx.Response(
+            200,
+            json={"model": "model-a", "choices": [{"message": {"content": "{}"}}]},
         )
 
+    request = _request(base_url="http://models.test/v1/", api_key_env=None)
 
-def test_launcher_site_config_loads_strict_allowlist_and_indirect_secret(
-    tmp_path: Path,
-) -> None:
-    path = tmp_path / "model-site.json"
-    path.write_text(
-        json.dumps(
-            {
-                "api_version": "manyforge.program_model_site_config.v1",
-                "endpoints": [
-                    {
-                        "bearer_token_env": "MANYFORGE_TEST_MODEL_TOKEN",
-                        "chat_completions_url": (
-                            "http://127.0.0.1:8000/v1/chat/completions"
-                        ),
-                        "external_resource_alias": "selection_model",
-                        "headers": {"X-Site": "cell-a"},
-                        "model_endpoint_aliases": ["selection_model"],
-                        "model_ids": ["model-a", "model-b"],
-                        "tool_call_families": ["openai_chat_tools"],
-                    }
-                ],
-            },
-            sort_keys=True,
-        ),
-        encoding="utf-8",
-    )
-
-    loaded = load_program_model_endpoint_configs(
-        path,
-        environ={"MANYFORGE_TEST_MODEL_TOKEN": "site-secret"},
-    )
-
-    assert len(loaded) == 1
-    assert loaded[0].external_resource_alias == "selection_model"
-    assert loaded[0].model_ids == ("model-a", "model-b")
-    assert loaded[0].bearer_token == "site-secret"
-    assert "site-secret" not in path.read_text(encoding="utf-8")
-
-
-def test_launcher_site_config_rejects_unknown_fields_symlinks_and_missing_secret(
-    tmp_path: Path,
-) -> None:
-    value = {
-        "api_version": "manyforge.program_model_site_config.v1",
-        "endpoints": [
-            {
-                "bearer_token_env": "MISSING_MODEL_TOKEN",
-                "chat_completions_url": "http://models.test/v1/chat/completions",
-                "external_resource_alias": "site_llm",
-                "headers": {},
-                "model_endpoint_aliases": ["planning_model"],
-                "model_ids": ["model-a"],
-                "tool_call_families": ["openai_chat_tools"],
-            }
-        ],
-    }
-    path = tmp_path / "model-site.json"
-    path.write_text(json.dumps(value), encoding="utf-8")
-    with pytest.raises(ValueError, match="unset environment variable"):
-        load_program_model_endpoint_configs(path, environ={})
-
-    value["unexpected"] = True
-    path.write_text(json.dumps(value), encoding="utf-8")
-    with pytest.raises(ValueError, match="unknown or missing"):
-        load_program_model_endpoint_configs(path, environ={})
-
-    link = tmp_path / "model-site-link.json"
-    link.symlink_to(path)
-    with pytest.raises(ValueError, match="readable plain file"):
-        load_program_model_endpoint_configs(link, environ={})
+    assert _transport(handler).complete(request, Event()).text == "{}"
+    assert str(captured[0].url) == "http://models.test/v1/chat/completions"
+    assert "authorization" not in captured[0].headers
 
 
 def test_transport_failure_does_not_expose_the_physical_endpoint() -> None:
@@ -348,22 +274,11 @@ def test_transport_failure_does_not_expose_the_physical_endpoint() -> None:
             request=request,
         )
 
-    transport = OpenAICompatibleProgramModelTransport(
-        (
-            ProgramModelEndpointConfig(
-                external_resource_alias="site_llm",
-                chat_completions_url=(
-                    "https://models.test/v1/chat/completions?site_key=secret"
-                ),
-                model_endpoint_aliases=("planning_model",),
-                model_ids=("model-a",),
-            ),
-        ),
-        client=httpx.Client(transport=httpx.MockTransport(handler)),
-    )
+    transport = _transport(handler)
+    request = _request(base_url="https://secret@models.test/v1", api_key_env=None)
 
     with pytest.raises(ProgramModelTransportError) as captured:
-        transport.complete(_request(), Event())
+        transport.complete(request, Event())
 
     assert str(captured.value) == "model transport failed"
 

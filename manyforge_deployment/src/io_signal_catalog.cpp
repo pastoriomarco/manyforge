@@ -128,6 +128,11 @@ typed_output_resource(const IoSignalProviderConfiguration &address) {
     key.emplace_back("service", CanonicalValue(*address.service));
     key.emplace_back("function", CanonicalValue("set_digital_out"));
     key.emplace_back("pin", CanonicalValue(static_cast<double>(*address.pin)));
+  } else if (address.profile == "xarm_digital") {
+    key.emplace_back("robot_component_id",
+                     CanonicalValue(address.robot_component_id->value()));
+    key.emplace_back("bank", CanonicalValue(*address.bank));
+    key.emplace_back("pin", CanonicalValue(static_cast<double>(*address.pin)));
   } else {
     key.emplace_back("topic", CanonicalValue(*address.topic));
     key.emplace_back("group", CanonicalValue(*address.group));
@@ -137,6 +142,52 @@ typed_output_resource(const IoSignalProviderConfiguration &address) {
       "io-output-resource", "manyforge.io_output_channel.v1",
       CanonicalValue(std::move(key)));
   return core::ResourceId("io.output." + digest.substr(7U));
+}
+
+void xarm_address(const Object &provider, IoSignalProviderConfiguration &address,
+                  bool output) {
+  address.robot_component_id =
+      core::ControllableComponentId(text(provider, "robot_component_id"));
+  address.bank = text(provider, "bank");
+  if (*address.bank != "tool" && *address.bank != "controller")
+    throw InvalidConfiguration("io_xarm_bank_invalid");
+  const auto maximum = *address.bank == "tool" ? (output ? 4U : 1U) : 15U;
+  address.pin = static_cast<std::size_t>(counter(provider, "pin", maximum));
+}
+
+bool has_xarm_robot(const core::CellGraphDTO &graph,
+                    const core::ControllableComponentId &robot) {
+  const auto component = std::find_if(
+      graph.controllable_components.begin(), graph.controllable_components.end(),
+      [&](const auto &row) { return row.controllable_component_id == robot; });
+  if (component == graph.controllable_components.end())
+    return false;
+  for (const auto &unit : graph.runtime_units) {
+    if (std::find(component->runtime_unit_ids.begin(), component->runtime_unit_ids.end(),
+                  unit.runtime_unit_id) == component->runtime_unit_ids.end())
+      continue;
+    const auto profiles = unit.configuration.find("controller_profiles");
+    if (profiles == unit.configuration.end())
+      continue;
+    const auto *rows = std::get_if<Array>(&profiles->second.value);
+    if (!rows)
+      continue;
+    for (const auto &item : *rows) {
+      const auto *row = std::get_if<Object>(&item.value);
+      if (!row)
+        continue;
+      const auto id = row->find("controllable_component_id");
+      const auto profile = row->find("real_profile");
+      if (id == row->end() || profile == row->end())
+        continue;
+      const auto *selected_id = std::get_if<std::string>(&id->second.value);
+      const auto *selected_profile = std::get_if<std::string>(&profile->second.value);
+      if (selected_id && *selected_id == robot.value() && selected_profile &&
+          *selected_profile == "lite6_real")
+        return true;
+    }
+  }
+  return false;
 }
 
 } // namespace
@@ -160,8 +211,13 @@ ResolveRetainedIoSignalCatalog(
                         std::optional<core::IoSignalLivenessMode>,
                         std::optional<IoSignalProviderConfiguration::
                                           GeometricContactEndpoint>,
-                        std::optional<core::SceneResourceId>>>
+                        std::optional<core::SceneResourceId>,
+                        std::optional<core::ControllableComponentId>,
+                        std::optional<std::string>>>
         sources;
+    std::map<std::pair<core::ControllableComponentId, std::string>,
+             std::pair<core::InterruptSourceId, core::ControllableComponentId>>
+        xarm_input_banks;
     for (const auto &unit : graph.runtime_units) {
       if (runtime_unit_id && unit.runtime_unit_id != *runtime_unit_id)
         continue;
@@ -221,6 +277,11 @@ ResolveRetainedIoSignalCatalog(
             address.service = absolute_address(provider, "service");
             address.pin =
                 static_cast<std::size_t>(counter(provider, "pin", 17U));
+          } else if (address.profile == "xarm_digital") {
+            fields(provider, {"profile", "robot_component_id", "bank", "pin"});
+            xarm_address(provider, address, true);
+            if (!has_xarm_robot(graph, *address.robot_component_id))
+              throw InvalidConfiguration("io_xarm_robot_not_found");
           } else if (address.profile == "ros2_control_gpio") {
             fields(provider, {"profile", "topic", "group", "interface_name"});
             address.topic = absolute_address(provider, "topic");
@@ -238,7 +299,7 @@ ResolveRetainedIoSignalCatalog(
               core::IoSignalUpdateMode::kChangeOnly,
               core::IoTransitionCapability::kSampledOnly,
               {core::IoFreshnessMode::kProviderValidity, {}},
-              (address.profile == "ur_set_io" ||
+              (address.profile == "ur_set_io" || address.profile == "xarm_digital" ||
                address.profile == "ros2_control_gpio")
                   ? typed_output_resource(address)
                   : output_resource(address.profile, channel)};
@@ -248,7 +309,8 @@ ResolveRetainedIoSignalCatalog(
               unit.runtime_unit_id,  address.profile, address.topic,
               address.ingress_depth, address.service, address.channel,
               descriptor.liveness,  address.endpoint,
-              address.target_scene_resource_id};
+              address.target_scene_resource_id, address.robot_component_id,
+              address.bank};
           const auto [source, inserted] =
               sources.emplace(descriptor.source_id, owner);
           if ((!inserted && source->second != owner) ||
@@ -300,10 +362,18 @@ ResolveRetainedIoSignalCatalog(
         IoSignalProviderConfiguration address{
             text(provider, "profile"), {}, {}, {}, 0U};
         if (address.profile == "mock") {
-          fields(provider, {"profile", "initial_value", "ingress_depth"});
+          fields(provider, {"profile", "initial_value", "ingress_depth"},
+                 {"echo"});
           descriptor.liveness = core::IoSignalLivenessMode::kInProcess;
           address.initial_value =
               value<bool>(member(provider, "initial_value"));
+          if (const auto echo = provider.find("echo"); echo != provider.end()) {
+            const auto &rule = value<Object>(echo->second);
+            fields(rule, {"output_signal_name", "delay_ms"});
+            address.echo_output_signal_name = text(rule, "output_signal_name");
+            address.echo_delay_ns = static_cast<core::Duration>(
+                counter(rule, "delay_ms", 9'007'199'254ULL) * 1'000'000ULL);
+          }
           if (descriptor.direction != core::IoSignalDirection::kInput ||
               descriptor.freshness.mode !=
                   core::IoFreshnessMode::kProviderValidity ||
@@ -328,6 +398,20 @@ ResolveRetainedIoSignalCatalog(
           address.topic = absolute_address(provider, "topic");
           address.pin = static_cast<std::size_t>(counter(provider, "pin", 17U));
           descriptor.liveness = core::IoSignalLivenessMode::kPeriodic;
+        } else if (address.profile == "xarm_digital") {
+          fields(provider, {"profile", "robot_component_id", "bank", "pin",
+                            "ingress_depth"});
+          xarm_address(provider, address, false);
+          if (!has_xarm_robot(graph, *address.robot_component_id))
+            throw InvalidConfiguration("io_xarm_robot_not_found");
+          if (freshness_mode != "sample_age")
+            throw InvalidConfiguration("io_signal_provider_unsupported");
+          descriptor.liveness = core::IoSignalLivenessMode::kPeriodic;
+          const auto [found, inserted] = xarm_input_banks.emplace(
+              std::pair{*address.robot_component_id, *address.bank},
+              std::pair{descriptor.source_id, component_id});
+          if (!inserted && found->second != std::pair{descriptor.source_id, component_id})
+            throw InvalidConfiguration("io_xarm_bank_multiple_sources");
         } else if (address.profile == "ros2_control_gpio") {
           fields(provider, {"profile", "topic", "group", "interface_name",
                             "ingress_depth"});
@@ -384,7 +468,8 @@ ResolveRetainedIoSignalCatalog(
             unit.runtime_unit_id,  address.profile, address.topic,
             address.ingress_depth, address.service, address.channel,
             descriptor.liveness,  address.endpoint,
-            address.target_scene_resource_id};
+            address.target_scene_resource_id, address.robot_component_id,
+            address.bank};
         const auto [source, inserted] =
             sources.emplace(descriptor.source_id, owner);
         if ((!inserted && source->second != owner) ||
@@ -394,6 +479,21 @@ ResolveRetainedIoSignalCatalog(
         result.push_back({unit.runtime_unit_id, target_id, role_id,
                           std::move(descriptor), std::move(address)});
       }
+    }
+    for (const auto &row : result) {
+      if (!row.provider.echo_output_signal_name)
+        continue;
+      const core::IoSignalId output{
+          row.descriptor.signal_id.controllable_component_id,
+          *row.provider.echo_output_signal_name};
+      const auto found = std::find_if(result.begin(), result.end(),
+          [&](const auto &candidate) {
+            return candidate.descriptor.signal_id == output &&
+                   candidate.descriptor.direction == core::IoSignalDirection::kOutput &&
+                   candidate.provider.profile == "mock_output";
+          });
+      if (found == result.end())
+        throw InvalidConfiguration("io_mock_echo_output_not_found");
     }
     std::sort(result.begin(), result.end(), [](const auto &a, const auto &b) {
       return std::tie(a.descriptor.signal_id.controllable_component_id, a.command_target_id,
@@ -433,6 +533,7 @@ core::Result<void> MaterializeRetainedIoProviderDevices(
               profile != "geometric_contact" &&
               profile != "mock_output" && profile != "ros_set_bool" &&
               profile != "ur_io_states" && profile != "ur_set_io" &&
+              profile != "xarm_digital" &&
               profile != "ros2_control_gpio")
             throw InvalidConfiguration("io_signal_provider_unsupported");
           const core::ControllableComponentId component(
@@ -449,7 +550,8 @@ core::Result<void> MaterializeRetainedIoProviderDevices(
           if (owner == graph.controllable_components.end())
             throw InvalidConfiguration("io_signal_owner_mismatch");
           generic_devices.insert(component);
-          if ((profile == "ros_set_bool" || profile == "ur_set_io") &&
+          if ((profile == "ros_set_bool" || profile == "ur_set_io" ||
+               profile == "xarm_digital") &&
               text(row, "direction") == "output")
             ros_output_devices.insert(component);
         }
@@ -574,7 +676,8 @@ ResolveRetainedIoProviderDevices(
                      signal.descriptor.direction ==
                          core::IoSignalDirection::kOutput &&
                      (signal.provider.profile == "ros_set_bool" ||
-                      signal.provider.profile == "ur_set_io");
+                      signal.provider.profile == "ur_set_io" ||
+                      signal.provider.profile == "xarm_digital");
             });
         const auto output_budget = row.find("output_source_ack_timeout_s");
         if (ros_output != (output_budget != row.end()))
@@ -613,6 +716,8 @@ ResolveRetainedIoProviderDevices(
 
 std::string PoseSourceStreamId(std::string_view object_id,
                                std::string_view policy_id) {
+  if (policy_id == "scene")
+    return "poses/" + std::string(object_id);
   return "poses/" + std::string(object_id) + "/" + std::string(policy_id);
 }
 
@@ -695,6 +800,56 @@ ResolveRetainedPoseSources(
   }
 }
 
+core::Result<std::vector<RetainedAiModelConfiguration>>
+ResolveRetainedAiModels(
+    const core::CellGraphDTO &graph,
+    const std::optional<core::RuntimeUnitId> &runtime_unit_id) {
+  using Reply = core::Result<std::vector<RetainedAiModelConfiguration>>;
+  try {
+    std::vector<RetainedAiModelConfiguration> result;
+    for (const auto &unit : graph.runtime_units) {
+      if (runtime_unit_id && unit.runtime_unit_id != *runtime_unit_id)
+        continue;
+      const auto declared = unit.configuration.find("ai_models");
+      if (declared == unit.configuration.end())
+        continue;
+      for (const auto &item : value<Array>(declared->second)) {
+        const auto &row = value<Object>(item);
+        const core::ControllableComponentId component(
+            text(row, "controllable_component_id"));
+        if (std::none_of(
+                graph.controllable_components.begin(),
+                graph.controllable_components.end(), [&](const auto &owner) {
+                  return owner.controllable_component_id == component &&
+                         std::find(owner.runtime_unit_ids.begin(),
+                                   owner.runtime_unit_ids.end(),
+                                   unit.runtime_unit_id) !=
+                             owner.runtime_unit_ids.end();
+                }))
+          throw InvalidConfiguration("ai_model_owner_mismatch");
+        const auto api_key_env = row.find("api_key_env");
+        result.push_back(
+            {unit.runtime_unit_id, component,
+             value<std::string>(member(row, "base_url")),
+             value<std::string>(member(row, "model")),
+             api_key_env == row.end()
+                 ? std::nullopt
+                 : std::optional<std::string>(
+                       value<std::string>(api_key_env->second)),
+             item});
+      }
+    }
+    return Reply::Ok(std::move(result));
+  } catch (const InvalidConfiguration &error) {
+    const std::string reason = error.what();
+    return Reply::Err({"invalid_request",
+                       "Retained AI model configuration is invalid",
+                       {{"reason", reason == "io_signal_configuration_invalid"
+                                       ? std::string("ai_model_configuration_invalid")
+                                       : reason}}});
+  }
+}
+
 core::Result<void> ValidateNonCoordinateProviderTarget(
     const core::CellGraphDTO &graph,
     const core::CapabilityProviderBindingDTO &provider) {
@@ -729,6 +884,21 @@ core::Result<void> ValidateNonCoordinateProviderTarget(
                  target->controllable_component_id;
         });
     return configured && target->command_target_id.value() == "poses" &&
+                   provider.endpoint_bindings.empty()
+               ? core::Result<void>::Ok()
+               : invalid();
+  }
+  if (provider.capability_id.value() == kAiModelCapabilityId) {
+    const auto models = ResolveRetainedAiModels(graph);
+    if (!models.ok())
+      return core::Result<void>::Err(models.error());
+    const bool configured = std::any_of(
+        models.value().begin(), models.value().end(), [&](const auto &row) {
+          return row.controllable_component_id ==
+                 target->controllable_component_id;
+        });
+    return configured &&
+                   target->command_target_id.value() == kAiModelTargetId &&
                    provider.endpoint_bindings.empty()
                ? core::Result<void>::Ok()
                : invalid();

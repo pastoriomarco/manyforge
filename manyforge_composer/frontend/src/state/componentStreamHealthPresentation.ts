@@ -30,6 +30,21 @@ export function streamCodeLabel(code: string): string {
   return STREAM_CODE_LABELS[code] ?? code;
 }
 
+const STREAM_LABELS: Record<string, string> = {
+  measured_joints: 'Measured joints',
+  gripper_feedback: 'Gripper feedback',
+  endpoint: 'Model endpoint',
+};
+
+/** Short label of one declared stream id; pose-source ids are `poses/<object>/<policy>`. */
+export function streamLabel(streamId: string): string {
+  const pose = /^poses\/(.+)\/([^/]+)$/.exec(streamId);
+  if (pose) return `Pose ${pose[1]} / ${pose[2]}`;
+  const objectPose = /^poses\/([^/]+)$/.exec(streamId);
+  if (objectPose) return `Pose ${objectPose[1]}`;
+  return STREAM_LABELS[streamId] ?? streamId;
+}
+
 export function streamCondition(stream: CCLCStreamHealth): StreamCondition {
   if (stream.error !== null && !STREAM_CODES.has(stream.error.code)) return 'fault_event';
   if (stream.acknowledgementRequired) return 'acknowledgement_required';

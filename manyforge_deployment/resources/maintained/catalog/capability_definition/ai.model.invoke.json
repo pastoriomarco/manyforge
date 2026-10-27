@@ -1,0 +1,7 @@
+{
+  "api_version": "manyforge.capability_definition.v1",
+  "capability_definition_revision": "sha256:c458ea512ad5b71be1a3a9f92908d8a36b2a9a8f5cb3b31556c42e0d468c9270",
+  "capability_id": "ai.model.invoke",
+  "provider_binding_kind": "capability_provider_binding",
+  "scope": "target_binding"
+}

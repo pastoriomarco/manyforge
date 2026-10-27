@@ -347,7 +347,8 @@ core::RuntimeParticipantBindingDTO build_runtime_io_output_binding_dto(
          "seal");
 
   core::IoOutputCompletionPolicyDTO policy(core::IoOutputImmediateDTO{});
-  if (row.provider.profile == "ros_set_bool" || row.provider.profile == "ur_set_io") {
+  if (row.provider.profile == "ros_set_bool" || row.provider.profile == "ur_set_io" ||
+      row.provider.profile == "xarm_digital") {
     const auto devices = ResolveRetainedIoProviderDevices(graph);
     if (!devices.ok())
       fail("runtime output device policy is not qualified: " +

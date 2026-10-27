@@ -78,7 +78,6 @@ SUPPORTED_DRAFT_MUTATIONS = (
     "tree_draft_wrap_node",
 )
 OPERATOR_DRAFT_MUTATIONS = (
-    "assistant_draft_materialize_proposal",
     "program_draft_expand_authoring_macro",
     "program_draft_remove_contact_policies",
     "program_draft_replace_roles",
@@ -102,12 +101,6 @@ _PROGRAM_MOTION_DEFAULTS = (
 )
 _PROGRAM_MOTION_CEILINGS = frozenset(
     {"velocity_scale", "acceleration_scale"}
-)
-_ASSISTANT_PROPOSAL_MUTATIONS = frozenset(
-    {
-        "scene_draft_upsert_objects",
-        "tree_draft_insert_node",
-    }
 )
 _PORTABLE_ID_PATTERN = re.compile(r"^[a-z][a-z0-9_.-]*$")
 _PORTABLE_ID_MAX_BYTES = 128
@@ -1836,7 +1829,6 @@ class ComposerDraftSession:
             str,
             Callable[[dict[str, Any], dict[str, Any], NodeCatalog], dict[str, Any]],
         ] = {
-            "assistant_draft_materialize_proposal": self._assistant_proposal_materialize,
             "program_draft_expand_authoring_macro": self._authoring_macro_expand,
             "program_draft_remove_contact_policies": self._contact_policies_remove,
             "program_draft_store_observed_move": self._observed_move_store,
@@ -2488,50 +2480,6 @@ class ComposerDraftSession:
         return {
             "scene_resource_id": arguments["scene_resource_id"],
             "support_contact_count": len(contacts),
-        }
-
-    def _assistant_proposal_materialize(
-        self,
-        document: dict[str, Any],
-        arguments: dict[str, Any],
-        catalog: NodeCatalog,
-    ) -> dict[str, Any]:
-        if (
-            set(arguments) != {"proposal_tool_id", "operations"}
-            or type(arguments["proposal_tool_id"]) is not str
-            or type(arguments["operations"]) is not list
-            or not arguments["operations"]
-            or len(arguments["operations"]) > 8_192
-        ):
-            _error("draft_arguments_invalid", "assistant Draft proposal is invalid")
-        details: list[dict[str, Any]] = []
-        handlers = {
-            "scene_draft_upsert_objects": self._scene_upsert,
-            "tree_draft_insert_node": self._tree_insert,
-        }
-        for operation in arguments["operations"]:
-            if (
-                type(operation) is not dict
-                or set(operation) != {"mutation", "arguments"}
-                or operation["mutation"] not in _ASSISTANT_PROPOSAL_MUTATIONS
-                or type(operation["arguments"]) is not dict
-            ):
-                _error(
-                    "draft_arguments_invalid",
-                    "assistant proposal contains an unsupported Draft operation",
-                )
-            mutation = operation["mutation"]
-            details.append(
-                {
-                    "mutation": mutation,
-                    "details": handlers[mutation](
-                        document, deepcopy(operation["arguments"]), catalog
-                    ),
-                }
-            )
-        return {
-            "proposal_tool_id": arguments["proposal_tool_id"],
-            "operations": details,
         }
 
     @staticmethod

@@ -40,7 +40,6 @@ from .node_environment_client import (
     ActiveNodeEnvironmentProjectionError,
     read_active_node_environment,
 )
-from .source_model_client import ActiveSourceModelProjectionError
 from .reset_apply_log import log_reset_apply_link
 from .program_artifacts import (
     ProgramArtifactError,
@@ -78,15 +77,6 @@ from .authoring_workspace_fence import (
     commit_local_authoring,
     require_captured_workspace_identity,
 )
-from .assistant_mode_client import (
-    ActiveAssistantModeProjectionError,
-    read_active_assistant_context,
-)
-from .assistant_provider_client import AssistantProviderClientError
-from .assistant_schema_validation import (
-    CallbackSchemaValidationError,
-    validate_callback_arguments,
-)
 
 
 _AUTHORING_MUTATIONS = frozenset(
@@ -116,7 +106,6 @@ _AUTHORING_MUTATIONS = frozenset(
 )
 _SOURCE_RESOLVED_MUTATIONS = frozenset(
     {
-        "assistant_draft_materialize_proposal",
         "program_draft_store_observed_move",
         "program_draft_store_observed_scene_resource",
     }
@@ -1073,7 +1062,7 @@ def _observed_scene_arguments(
         None,
     ) if isinstance(scene, list) else None
     if isinstance(existing, dict):
-        for field in ("resource_roles", "metadata", "collision_policy_ids"):
+        for field in ("resource_roles", "metadata"):
             if field in existing:
                 resource[field] = deepcopy(existing[field])
     source_identity = {
@@ -1082,228 +1071,6 @@ def _observed_scene_arguments(
         "scene_resource_id": arguments["scene_resource_id"],
     }
     return {"scene_resource": resource}, source_identity
-
-
-def _assistant_proposal_operations(
-    state: ComposerState,
-    arguments: dict[str, Any],
-) -> tuple[dict[str, Any], dict[str, Any]]:
-    if set(arguments) != {"request_id", "proposal_index"}:
-        raise DraftSessionError(
-            "draft_arguments_invalid",
-            "proposal materialization requires request_id and proposal_index",
-        )
-    request_id = arguments["request_id"]
-    proposal_index = arguments["proposal_index"]
-    if type(request_id) is not str or type(proposal_index) is not int or proposal_index < 0:
-        raise DraftSessionError("draft_arguments_invalid", "proposal selection is invalid")
-    if state.assistant_client is None:
-        raise DraftSessionError(
-            "assistant_proposal_unavailable",
-            "assistant provider is unavailable",
-            status_code=503,
-        )
-    try:
-        status = state.assistant_client.status(request_id)
-    except AssistantProviderClientError as error:
-        raise DraftSessionError(
-            error.code, str(error), status_code=error.status_code
-        ) from error
-    response = status.get("response") if status.get("state") == "completed" else None
-    proposals = response.get("proposals") if isinstance(response, dict) else None
-    if not isinstance(proposals, list) or proposal_index >= len(proposals):
-        raise DraftSessionError(
-            "assistant_proposal_not_found",
-            "assistant proposal no longer exists",
-            status_code=404,
-        )
-    proposal = proposals[proposal_index]
-    if (
-        response.get("assistantMode") != "composer-assistant"
-        or not isinstance(proposal, dict)
-        or proposal.get("effect") != "proposal"
-        or proposal.get("status") != "draft"
-        or proposal.get("requiresReview") is not True
-    ):
-        raise DraftSessionError(
-            "assistant_proposal_rejected",
-            "assistant response is not a reviewable Composer Draft proposal",
-            status_code=409,
-        )
-    try:
-        context = read_active_assistant_context(state, mode="composer-assistant")
-    except (
-        ActiveAssistantModeProjectionError,
-        ActiveNodeEnvironmentProjectionError,
-        ActiveSourceModelProjectionError,
-    ) as error:
-        raise DraftSessionError(error.code, str(error), status_code=error.status_code) from error
-    tool = next(
-        (
-            row
-            for row in context.assistant_mode.payload.get("tools", [])
-            if row.get("tool_id") == proposal.get("toolId")
-        ),
-        None,
-    )
-    if (
-        not isinstance(tool, dict)
-        or tool.get("effect") != "proposal"
-        or response.get("catalogHash")
-        != context.assistant_mode.payload.get("catalog_hash")
-        or tool.get("input_schema_hash") != proposal.get("inputSchemaHash")
-    ):
-        raise DraftSessionError(
-            "assistant_proposal_stale",
-            "assistant proposal schema is no longer current",
-            status_code=409,
-        )
-    try:
-        validate_callback_arguments(proposal.get("arguments"), tool["input_schema"])
-    except CallbackSchemaValidationError as error:
-        raise DraftSessionError(
-            "assistant_proposal_invalid", str(error), status_code=400
-        ) from error
-    proposal_arguments = proposal["arguments"]
-    tool_id = proposal["toolId"]
-    proposal_suffix = hashlib.sha256(
-        canonical_json_bytes(
-            {
-                "request_id": request_id,
-                "proposal_index": proposal_index,
-                "tool_id": tool_id,
-                "arguments": proposal_arguments,
-            }
-        )
-    ).hexdigest()[:12]
-    resources: list[dict[str, Any]] = []
-    if tool_id == "propose_scene_objects":
-        report = proposal_arguments["inspection_report"]
-        source_roots = set(proposal_arguments.get("source_roots", []))
-        prefix = proposal_arguments.get("scene_resource_id_prefix", "")
-        mesh_overrides = {
-            row["source_root"]: row["mesh_resource_uri"]
-            for row in proposal_arguments.get("mesh_resource_overrides", [])
-        }
-        for row in report["objects"]:
-            if (
-                not isinstance(row, dict)
-                or not isinstance(row.get("scene_resource"), dict)
-                or (
-                    source_roots
-                    and row.get("source_root") not in source_roots
-                )
-            ):
-                continue
-            resource = deepcopy(row["scene_resource"])
-            resource["scene_resource_id"] = (
-                f"{prefix}{resource['scene_resource_id']}"
-            )
-            replacement = mesh_overrides.get(row.get("source_root"))
-            if (
-                replacement is not None
-                and resource.get("shape", {}).get("type") == "mesh"
-            ):
-                resource["shape"]["mesh_resource_uri"] = replacement
-            resources.append(resource)
-        maximum = proposal_arguments.get("max_proposals", len(resources))
-        resources = resources[:maximum]
-        operations = [
-            {
-                "mutation": "scene_draft_upsert_objects",
-                "arguments": {"scene_resources": resources},
-            }
-        ]
-    elif tool_id == "propose_scene_object_nodes":
-        resources = deepcopy(proposal_arguments["scene_resources"])
-        operations = [
-            {
-                "mutation": "scene_draft_upsert_objects",
-                "arguments": {"scene_resources": resources},
-            }
-        ]
-        authoring = state.draft_session.snapshot().get("authoring")
-        used = _draft_instance_ids(authoring) if isinstance(authoring, dict) else set()
-        operation_to_node = {
-            "scene.add_object": "scene.add_object",
-            "scene.upsert_object": "scene.upsert_object",
-            "scene.remove_object": "scene.remove_object",
-            "scene.attach_carried_object": "scene.attach_carried_object",
-            "scene.detach_carried_object": "scene.detach_carried_object",
-        }
-        for resource in resources:
-            resource_id = resource["scene_resource_id"]
-            resource_token = (
-                f"{resource_id[:48]}."
-                f"{hashlib.sha256(resource_id.encode('utf-8')).hexdigest()[:8]}"
-            )
-            for operation_id in proposal_arguments["operations"]:
-                node_id = operation_to_node[operation_id]
-                parameters: dict[str, Any] = {"scene_resource_id": resource_id}
-                if operation_id in {"scene.add_object", "scene.upsert_object"}:
-                    parameters.update(
-                        {"shape": deepcopy(resource["shape"]), "pose": deepcopy(resource["pose"])}
-                    )
-                elif operation_id == "scene.attach_carried_object":
-                    parameters.update(
-                        {
-                            "target_role": proposal_arguments["target_role"],
-                            "carrier_frame_role": proposal_arguments["carrier_frame_role"],
-                            "touch_body_roles": deepcopy(proposal_arguments["touch_body_roles"]),
-                        }
-                    )
-                elif operation_id == "scene.detach_carried_object":
-                    parameters["target_role"] = proposal_arguments["target_role"]
-                instance_id = (
-                    f"assistant.{operation_id.removeprefix('scene.')}."
-                    f"{resource_token}.{proposal_suffix}"
-                )
-                if instance_id in used:
-                    raise DraftSessionError(
-                        "assistant_proposal_already_materialized",
-                        "assistant proposal is already present in this Draft",
-                        status_code=409,
-                    )
-                used.add(instance_id)
-                operations.append(
-                    {
-                        "mutation": "tree_draft_insert_node",
-                        "arguments": {
-                            "node": {
-                                "node_id": node_id,
-                                "instance_id": instance_id,
-                                "parameters": parameters,
-                                "children": [],
-                            }
-                        },
-                    }
-                )
-    else:
-        raise DraftSessionError(
-            "assistant_proposal_unsupported",
-            f"assistant Draft proposal is unsupported: {tool_id}",
-            status_code=409,
-        )
-    if not operations or not resources:
-        raise DraftSessionError(
-            "assistant_proposal_empty",
-            "assistant proposal contains no materializable Draft resources",
-            status_code=409,
-        )
-    source_identity = {
-        "request_id": request_id,
-        "proposal_index": proposal_index,
-        "assistant_mode": response["assistantMode"],
-        "catalog_hash": response["catalogHash"],
-        "tool_id": tool_id,
-        "input_schema_hash": proposal["inputSchemaHash"],
-        "arguments_digest": "sha256:"
-        + hashlib.sha256(canonical_json_bytes(proposal_arguments)).hexdigest(),
-    }
-    return {
-        "proposal_tool_id": tool_id,
-        "operations": operations,
-    }, source_identity
 
 
 def _source_resolved_mutation(
@@ -1315,8 +1082,6 @@ def _source_resolved_mutation(
         return _observed_move_arguments(state, arguments)
     if mutation == "program_draft_store_observed_scene_resource":
         return _observed_scene_arguments(state, arguments)
-    if mutation == "assistant_draft_materialize_proposal":
-        return _assistant_proposal_operations(state, arguments)
     return None
 
 

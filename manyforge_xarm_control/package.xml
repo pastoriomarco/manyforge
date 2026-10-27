@@ -3,14 +3,12 @@
 <package format="3">
   <name>manyforge_xarm_control</name>
   <version>0.1.0</version>
-  <description>Build-owned Lite6 lifecycle catalog and restricted xarm_ros2 CCLC adapter.</description>
+  <description>xArm vendor adapter of the ManyForge real lane: robot_states classification into the common lifecycle causes and device facts.</description>
   <maintainer email="pastoriomarco@gmail.com">Marco Pastorio</maintainer>
   <license>Apache-2.0</license>
 
   <buildtool_depend>ament_cmake</buildtool_depend>
 
-  <depend>controller_manager_msgs</depend>
-  <depend>lifecycle_msgs</depend>
   <depend>rclcpp</depend>
   <depend>xarm_msgs</depend>
 

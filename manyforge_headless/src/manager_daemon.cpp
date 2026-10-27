@@ -21,6 +21,7 @@
 #include <manyforge_component_manager/retained_native_runtime_unit_adapter.hpp>
 #include <manyforge_component_manager/retained_posix_runtime_unit_adapter.hpp>
 #include <manyforge_component_manager/runtime_unit_adapter_router.hpp>
+#include <manyforge_component_manager/site_settings.hpp>
 #include <manyforge_core/types/cell_admission.hpp>
 #include <manyforge_content_identity/canonical_value.hpp>
 #include <manyforge_content_identity/content_identity.hpp>
@@ -412,9 +413,41 @@ struct DaemonConfig final {
   /// Optional approved root for relative Program scene meshes. The native
   /// runtime adapter opens it once; empty means relative meshes fail closed.
   std::filesystem::path scene_asset_root;
+  /// Optional generic machine site document (`manyforge.site.v1`).
+  std::optional<std::filesystem::path> site_settings_path;
   std::chrono::milliseconds reconciliation_period{500};
 };
 
+/// Reads one caller-written startup document; `label` names it in failures.
+[[nodiscard]] std::string ReadStartupDocument(const std::filesystem::path &path,
+                                              const std::string &label) {
+  FileDescriptor file(::open(path.c_str(), O_RDONLY | O_CLOEXEC | O_NONBLOCK));
+  if (file.get() < 0) FailErrno("open " + label + " " + path.string());
+  struct stat status {};
+  if (::fstat(file.get(), &status) != 0)
+    FailErrno("inspect " + label + " " + path.string());
+  Require(S_ISREG(status.st_mode), label + " must be a regular file: " + path.string());
+  std::string document;
+  std::array<char, 4096U> buffer{};
+  while (true) {
+    const auto count = ::read(file.get(), buffer.data(), buffer.size());
+    if (count < 0 && errno == EINTR) continue;
+    if (count < 0) FailErrno("read " + label + " " + path.string());
+    if (count == 0) break;
+    document.append(buffer.data(), static_cast<std::size_t>(count));
+  }
+  return document;
+}
+
+/// Reads and validates the generic site document once at startup; malformed
+/// input refuses startup. Only the exact validated bytes reach the adapter.
+[[nodiscard]] std::optional<std::string>
+LoadSiteSettingsDocument(const std::optional<std::filesystem::path> &path) {
+  if (!path.has_value()) return std::nullopt;
+  auto document = ReadStartupDocument(*path, "site settings");
+  static_cast<void>(component_manager::ParseSiteSettings(document));
+  return document;
+}
 enum class CommandKind {
   kCanonicalEmptySelection,
   kDeploymentCandidatePreview,
@@ -1323,12 +1356,9 @@ RequiredPoseObserverBindings(const CanonicalValue &value) {
                                 RequiredString(row, "policy_id"),
                                 RequiredBool(row, "eligible")};
     if (binding.eligible) {
-      Require(binding.policy_id == "continuous_unattached" ||
-                  binding.policy_id == "continuous" ||
-                  binding.policy_id == "continuous_relative_to_attached" ||
-                  binding.policy_id == "between_nodes" ||
-                  binding.policy_id == "observe_only" ||
-                  binding.policy_id == "before_planning",
+      // Object links observe as "scene"; the application policy is the
+      // Deployment link row (EffectivePosePolicy).
+      Require(binding.policy_id == "scene",
               "eligible pose observer binding uses an unsupported policy");
       Require(!writable_object_id.has_value() ||
                   *writable_object_id != binding.object_id,
@@ -3002,6 +3032,7 @@ class ManagerDaemon final {
 public:
   explicit ManagerDaemon(DaemonConfig config)
       : config_(ValidateConfig(std::move(config))),
+        site_settings_document_(LoadSiteSettingsDocument(config_.site_settings_path)),
         started_at_(std::chrono::steady_clock::now()),
         package_generation_(config_.install_root,
                             deployment::runtime_contract_declaration_registry()
@@ -3026,7 +3057,8 @@ public:
                     deployment::ros2_control_execution_runtime_contract::
                         kLaunchEnvironmentContract)},
             config_.logical_scene_database, config_.program_cycle_journal,
-            config_.activation_root, config_.scene_asset_root),
+            config_.activation_root, config_.scene_asset_root,
+            site_settings_document_),
         stores_(config_.manager_state_root, admission_),
         scene_owner_(config_.logical_scene_database, admission_,
                      stores_.active_bundle_publication_store(),
@@ -4998,6 +5030,8 @@ private:
     }
   }
 
+  // The Deployment object link is the only policy; a binding without a link
+  // row is not an object link and is never applied.
   static std::string_view
   EffectivePosePolicy(const deployment::RetainedBundle &bundle,
                       const PoseObservationKey &key) {
@@ -5008,7 +5042,7 @@ private:
                  row.scene_resource_id == key.object_id;
         });
     return selected == bindings.end()
-               ? std::string_view(key.policy_id)
+               ? std::string_view("observe_only")
                : std::string_view(selected->apply_policy);
   }
 
@@ -5142,8 +5176,13 @@ private:
           core::ErrorDTO{"scene_runtime_pose_policy_unsupported",
                          "eligible pose observation uses an unsupported "
                          "application policy",
-                         {{"policy_id", observation.key.policy_id}}});
+                         {{"policy_id", std::string(policy)}}});
     }
+    // A link to an object the Program does not declare (orphan) is ignored.
+    if (!scene_owner_
+             .GetObjectState(core::SceneResourceId(observation.key.object_id))
+             .exists)
+      return no_application(SceneRuntimePoseApplicationStatus::kNotRequested);
     const auto owner = scene_runtime_owner_.Snapshot();
     if (owner.state != SceneInitializationState::kOpen ||
         (acceptance.disposition != PoseObservationDisposition::kApplyNow &&
@@ -5361,7 +5400,8 @@ private:
                         })) {
           const auto object = scene_owner_.GetObjectState(
               core::SceneResourceId(binding.object_id));
-          if (object.attached && latch_policy == "before_planning")
+          if (!object.exists ||
+              (object.attached && latch_policy == "before_planning"))
             continue;
         }
         const PoseObservationKey key{source_id, binding.object_id,
@@ -6424,6 +6464,8 @@ private:
   }
 
   DaemonConfig config_;
+  // Own the exact validated site document before constructing child adapters.
+  std::optional<std::string> site_settings_document_;
   std::chrono::steady_clock::time_point started_at_;
   ManagerPackageGeneration package_generation_;
   DaemonLock daemon_lock_;
@@ -6535,6 +6577,7 @@ DaemonConfig ParseArguments(const int argc, char **argv) {
   bool program_runner_liveness = false;
   bool period = false;
   bool scene_asset = false;
+  bool site_settings = false;
   for (int index = 1; index < argc; index += 2) {
     Require(index + 1 < argc, "every option requires one value");
     const std::string_view option(argv[index]);
@@ -6576,6 +6619,10 @@ DaemonConfig ParseArguments(const int argc, char **argv) {
     } else if (option == "--scene-asset-root" && !scene_asset) {
       config.scene_asset_root = value;
       scene_asset = true;
+    } else if (option == "--site-settings" && !site_settings) {
+      Require(!value.empty(), "--site-settings requires one explicit path");
+      config.site_settings_path = value;
+      site_settings = true;
     } else if (option == "--reconciliation-period-ms" && !period) {
       config.reconciliation_period =
           std::chrono::milliseconds(ParsePeriod(value));

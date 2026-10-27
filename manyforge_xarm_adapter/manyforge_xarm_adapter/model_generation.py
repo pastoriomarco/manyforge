@@ -27,9 +27,6 @@ from .profile import load_profile
 MODEL_SCHEMA = 'manyforge.xarm_adapter.fixed_model.v0.experimental'
 SOURCE_SCHEMA = 'manyforge.xarm_ros2_source.v0.experimental'
 ROBOT_IP_TOKEN = '__MANYFORGE_RUNTIME_ROBOT_IP__'
-TRANSPORT_OWNER_ID_TOKEN = '__MANYFORGE_TRANSPORT_OWNER_ID__'
-REAL_OBSERVATION_LEASE_MS = 1_000
-REAL_COMMAND_GATE_MAX_LEASE_MS = REAL_OBSERVATION_LEASE_MS
 MANYFORGE_CANCEL_DECELERATION_RAD_S2 = 2.0
 _HEX_LENGTHS = {
     'commit': 40,
@@ -182,11 +179,10 @@ def supervised_runtime_urdf(
             'calculate_dynamics': 'false',
         }
     else:
+        # The unmodified vendor plugin's own parameters only (R7: no
+        # supervised mode, ManyForge adds no hardware parameter).
         parameters = {
             'robot_ip': ROBOT_IP_TOKEN,
-            'transport_owner_id': TRANSPORT_OWNER_ID_TOKEN,
-            'expected_robot_device_type': '9',
-            'access_mode': 'supervised_lifecycle',
             'report_type': profile.report_type,
             'dof': str(profile.dof),
             'robot_type': profile.robot_type,
@@ -195,24 +191,6 @@ def supervised_runtime_urdf(
             'velocity_control': 'false',
             'add_gripper': 'false',
             'add_bio_gripper': 'false',
-            'observation_lease_ms': str(REAL_OBSERVATION_LEASE_MS),
-            'joint_state_lease_ms': '100',
-            'io_period_ms': '5',
-            'transport_loss_timeout_ms': '2000',
-            'command_gate_max_lease_ms': str(
-                REAL_COMMAND_GATE_MAX_LEASE_MS
-            ),
-            'lifecycle_command_timeout_ms': '4000',
-            'source_agreement_tolerance_rad': '0.002',
-            'position_initialization_samples': '3',
-            'shutdown_stationary_tolerance_rad': '0.001',
-            'shutdown_stationary_dwell_ms': '1000',
-            'trajectory_controller_name': (
-                binding.trajectory_controller.rsplit('/', 1)[-1]
-            ),
-            'controller_manager_activity_topic': (
-                f'{binding.controller_manager}/activity'
-            ),
         }
     for name, value in parameters.items():
         parameter = ET.SubElement(hardware, 'param', {'name': name})

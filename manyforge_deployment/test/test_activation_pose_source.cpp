@@ -27,53 +27,100 @@ using Value = d::CanonicalValue;
 using Object = Value::Object;
 using Array = Value::Array;
 
-Value Binding(std::string object_id, std::string policy_id, bool eligible) {
-  return Value(Object{
-      {"eligible", Value(eligible)},
-      {"entity", Value("/World/" + object_id)},
-      {"frame_kind", Value("cell_frame")},
-      {"lifetime_ns", Value(2000000000.0)},
-      {"local_orientation_xyzw",
-       Value(Array{Value(0.0), Value(0.0), Value(0.0), Value(1.0)})},
-      {"local_position_xyz", Value(Array{Value(0.0), Value(0.0), Value(0.0)})},
-      {"object_id", Value(std::move(object_id))},
-      {"policy_id", Value(std::move(policy_id))},
-      {"source_coordinate_frame_id", Value("universe")},
-      {"source_header_frame_id", Value("box")},
-      {"target_frame_id", Value("universe")}});
+Value Numbers(std::initializer_list<double> values) {
+  Array result;
+  for (const auto value : values)
+    result.emplace_back(value);
+  return Value(std::move(result));
 }
 
-Value Joint() {
-  return Value(Object{{"eligible", Value(false)},
-                      {"lifetime_ns", Value(1000000000.0)},
-                      {"object_id", Value("robot")},
-                      {"policy_id", Value("viewer.measured_robot")},
-                      {"required_joint_names",
-                       Value(Array{Value("joint1"), Value("joint2")})},
-                      {"topic", Value("/isaac_joint_states")}});
+Value Simulation(bool relative = true) {
+  Object simulation{{"poll_period_ms", Value(250.0)},
+                    {"source_coordinate_frame_id", Value("universe")},
+                    {"target_frame_id", Value("universe")}};
+  if (relative)
+    simulation.emplace_back(
+        "relative_reference",
+        Value(Object{{"entity", Value("/World/robot/tool_base")},
+                     {"link", Value("tool_link")},
+                     {"source_header_frame_id", Value("gripper_frame")}}));
+  return Value(std::move(simulation));
 }
 
-Value PoseSource(std::string id, Array entities,
-                 std::optional<Value> joint = Joint(),
-                 std::optional<std::string> row_owner = std::nullopt) {
-  Object row{{"controllable_component_id", Value(row_owner.value_or(id))},
-             {"simulation_poll_period_ms", Value(250.0)},
-             {"simulation_entities", Value(std::move(entities))},
-             {"detection3d_sources", Value(Array{})}};
-  if (joint)
-    row.emplace_back("joint_state", std::move(*joint));
+Value Detection() {
+  return Value(Object{{"topic", Value("/output")},
+                      {"target_frame_id", Value("link_base")},
+                      {"fallback_frame_id", Value("link_base")}});
+}
+
+Value Overlay(bool tcp = true) {
+  Object overlay{
+      {"robot_component_id", Value("robot")},
+      {"joint_state",
+       Value(Object{{"topic", Value("/isaac_joint_states")},
+                    {"required_joint_names",
+                     Value(Array{Value("joint1"), Value("joint2")})}})}};
+  if (tcp)
+    overlay.emplace_back(
+        "tcp_entity",
+        Value(Object{{"entity", Value("/World/robot/tool_base")},
+                     {"source_header_frame_id", Value("tcp_frame")},
+                     {"local_position_xyz", Numbers({0.0, 0.0, 0.2})}}));
+  return Value(std::move(overlay));
+}
+
+/// Authored `pose_source.v2` component; `fields` are the optional blocks.
+Value PoseSource(std::string id, Object fields) {
+  fields.emplace_back("stream_budget_ns", Value(1000000000.0));
   return Value(Object{
       {"component_id", Value(id)},
       {"component_profile_id", Value("pose_source_v0")},
       {"target_settings", Value(Object{})},
       {"configuration",
        Value(Object{{"runtime_kind", Value("pose_source")},
-                    {"runtime_configuration",
-                     Value(Object{{"pose_sources",
-                                   Value(Array{Value(std::move(row))})}})}})}});
+                    {"runtime_configuration", Value(std::move(fields))}})}});
 }
 
-Value Intent(Array components) {
+Value EntityLink(std::string object_id, std::string policy,
+                 std::string source = "scene_objects") {
+  return Value(Object{
+      {"scene_resource_id", Value(object_id)},
+      {"source_id", Value(std::move(source))},
+      {"source_key",
+       Value(Object{{"simulation_entity",
+                     Value(Object{{"entity", Value("/World/" + object_id)},
+                                  {"source_header_frame_id",
+                                   Value(object_id + "_frame")}})}})},
+      {"apply_policy", Value(std::move(policy))}});
+}
+
+Value DetectionLink(std::string object_id, std::string policy) {
+  return Value(Object{
+      {"scene_resource_id", Value(object_id)},
+      {"source_id", Value("scene_objects")},
+      {"source_key",
+       Value(Object{{"detection3d",
+                     Value(Object{{"class_id", Value("part")},
+                                  {"detection_id", Value("")},
+                                  {"confidence_min", Value(0.5)},
+                                  {"max_position_variance_m2", Value(0.0025)},
+                                  {"selection", Value("first")}})}})},
+      {"apply_policy", Value(std::move(policy))}});
+}
+
+Value Intent(Array components, Array links = {}, Array streams = {}) {
+  Object policies;
+  if (!links.empty() || !streams.empty())
+    policies.emplace_back(
+        "interrupt_config",
+        Value(Object{{"cancel_validation_timeout_ns", Value(1000.0)},
+                     {"motion_scope_arm_timeout_ns", Value(1000.0)},
+                     {"queue_depth", Value(8.0)},
+                     {"supervisory_poll_rate_hz", Value(10.0)}}));
+  if (!links.empty())
+    policies.emplace_back("scene_pose_sources", Value(std::move(links)));
+  if (!streams.empty())
+    policies.emplace_back("component_streams", Value(std::move(streams)));
   return Value(Object{{"api_version", Value("manyforge.deployment_intent.v2")},
                       {"deployment_artifact_id", Value("authored_pose")},
                       {"name", Value("authored_pose")},
@@ -83,7 +130,7 @@ Value Intent(Array components) {
                           {"tags", Value(Array{})}})},
                       {"attachments", Value(Array{})},
                       {"components", Value(std::move(components))},
-                      {"policies", Value(Object{})}});
+                      {"policies", Value(std::move(policies))}});
 }
 
 detail::PreparedActivationMaterialization Materialize(const Value &authored) {
@@ -105,11 +152,17 @@ std::string Refusal(const Value &authored) {
 }
 
 TEST(ActivationPoseSource, ModelFreeComponentCompilesToOneProviderDomain) {
+  // A sim link, the robot overlay (joints + TCP) and a budget override of the
+  // object's stream join into today's expanded unit row.
   const auto intent = detail::parse_activation_deployment_intent(
-      Intent(Array{PoseSource(
-          "scene_objects",
-          Array{Binding("robot", "viewer.measured_tcp", false),
-                Binding("cheese_box", "continuous_unattached", true)})}),
+      Intent(Array{PoseSource("scene_objects",
+                              Object{{"simulation", Simulation()},
+                                     {"robot_overlay", Overlay()}})},
+             Array{EntityLink("cheese_box", "continuous_unattached")},
+             Array{Value(Object{
+                 {"controllable_component_id", Value("scene_objects")},
+                 {"stream_id", Value("poses/cheese_box")},
+                 {"budget_ns", Value(2000000000.0)}})}),
       {});
   ASSERT_EQ(intent.components.size(), 1U);
   EXPECT_FALSE(intent.components.front().model_source);
@@ -142,10 +195,9 @@ TEST(ActivationPoseSource, ModelFreeComponentCompilesToOneProviderDomain) {
   EXPECT_EQ(provider->controllable_component_id.value(), "scene_objects");
   EXPECT_EQ(provider->lifecycle_command_timeout_ns, 30'000'000'000LL);
   EXPECT_EQ(provider->signal_names,
-            (std::vector<std::string>{
-                "poses/cheese_box/continuous_unattached",
-                "poses/robot/viewer.measured_robot",
-                "poses/robot/viewer.measured_tcp"}));
+            (std::vector<std::string>{"poses/cheese_box",
+                                      "poses/robot/viewer.measured_robot",
+                                      "poses/robot/viewer.measured_tcp"}));
   EXPECT_TRUE(graph.control_domains.front()
                   .control_domain_id.value()
                   .starts_with("pose_source.provider."));
@@ -163,6 +215,10 @@ TEST(ActivationPoseSource, ModelFreeComponentCompilesToOneProviderDomain) {
                                    c::kPoseSourceLifecycleManifestId;
                           }),
             6);
+  // The link itself is retained as the object's policy row.
+  ASSERT_EQ(bundle.value().scene_pose_sources.size(), 1U);
+  EXPECT_EQ(bundle.value().scene_pose_sources.front().apply_policy,
+            "continuous_unattached");
 
   const auto configuration = contract::require_configuration(
       bundle, graph.runtime_units.front().runtime_unit_id);
@@ -172,21 +228,56 @@ TEST(ActivationPoseSource, ModelFreeComponentCompilesToOneProviderDomain) {
   EXPECT_EQ(source.observer_configuration.find_object_member(
                 "controllable_component_id"),
             nullptr);
-  ASSERT_NE(source.observer_configuration.find_object_member(
-                "simulation_poll_period_ms"),
-            nullptr);
+  EXPECT_EQ(source.observer_configuration
+                .find_object_member("simulation_poll_period_ms")
+                ->as_number(),
+            250.0);
   ASSERT_TRUE(source.joint_state.has_value());
   EXPECT_EQ(source.joint_state->topic, "/isaac_joint_states");
   ASSERT_EQ(source.bindings.size(), 3U);
-  // Observer order: joint_state, simulation entities, Detection3D sources.
+  // Observer order: joint_state, simulation entities (by object), Detection3D.
   EXPECT_EQ(contract::pose_source_stream_id(source.bindings[0]),
             "poses/robot/viewer.measured_robot");
   EXPECT_EQ(contract::pose_source_stream_id(source.bindings[1]),
-            "poses/robot/viewer.measured_tcp");
+            "poses/cheese_box");
   EXPECT_EQ(contract::pose_source_stream_id(source.bindings[2]),
-            "poses/cheese_box/continuous_unattached");
-  EXPECT_TRUE(source.bindings[2].eligible);
-  EXPECT_EQ(source.bindings[2].lifetime_ns, 2'000'000'000LL);
+            "poses/robot/viewer.measured_tcp");
+  EXPECT_FALSE(source.bindings[0].eligible);
+  EXPECT_TRUE(source.bindings[1].eligible);
+  EXPECT_FALSE(source.bindings[2].eligible);
+  EXPECT_EQ(source.bindings[0].lifetime_ns, 1'000'000'000LL);
+  EXPECT_EQ(source.bindings[1].lifetime_ns, 2'000'000'000LL);
+  EXPECT_EQ(source.bindings[2].lifetime_ns, 1'000'000'000LL);
+  const auto &entities = source.observer_configuration
+                             .find_object_member("simulation_entities")
+                             ->as_array();
+  ASSERT_EQ(entities.size(), 2U);
+  EXPECT_EQ(
+      d::canonical_json(entities[0]),
+      d::canonical_json(Value(Object{
+          {"eligible", Value(true)},
+          {"entity", Value("/World/cheese_box")},
+          {"frame_kind", Value("cell_frame")},
+          {"lifetime_ns", Value(2000000000.0)},
+          {"local_orientation_xyzw", Numbers({0.0, 0.0, 0.0, 1.0})},
+          {"local_position_xyz", Numbers({0.0, 0.0, 0.0})},
+          {"object_id", Value("cheese_box")},
+          {"policy_id", Value("scene")},
+          {"relative_reference",
+           Value(Object{{"entity", Value("/World/robot/tool_base")},
+                        {"link", Value("tool_link")},
+                        {"source_header_frame_id", Value("gripper_frame")}})},
+          {"source_coordinate_frame_id", Value("universe")},
+          {"source_header_frame_id", Value("cheese_box_frame")},
+          {"target_frame_id", Value("universe")}})));
+  EXPECT_EQ(d::canonical_json(
+                *entities[1].find_object_member("local_position_xyz")),
+            "[0,0,0.2]");
+  EXPECT_EQ(entities[1].find_object_member("source_header_frame_id")
+                ->as_string(),
+            "tcp_frame");
+  // Overlay rows never carry the gripper reference.
+  EXPECT_EQ(entities[1].find_object_member("relative_reference"), nullptr);
   EXPECT_EQ(contract::find_pose_source(
                 configuration, c::ControllableComponentId("scene_objects")),
             &source);
@@ -196,44 +287,120 @@ TEST(ActivationPoseSource, ModelFreeComponentCompilesToOneProviderDomain) {
 }
 
 TEST(ActivationPoseSource, AbsentJointStateDecodesAsNone) {
-  const auto materialized = Materialize(Intent(Array{PoseSource(
-      "scene_objects", Array{Binding("box", "continuous_unattached", true)},
-      std::nullopt)}));
+  const auto materialized = Materialize(
+      Intent(Array{PoseSource("scene_objects",
+                              Object{{"simulation", Simulation(false)}})},
+             Array{EntityLink("box", "observe_only")}));
   ASSERT_NE(materialized.bundle, nullptr);
   const auto &graph = materialized.bundle->value().cell_graph;
   const auto configuration = contract::require_configuration(
       *materialized.bundle, graph.runtime_units.front().runtime_unit_id);
   ASSERT_EQ(configuration.pose_sources.size(), 1U);
-  EXPECT_FALSE(configuration.pose_sources.front().joint_state.has_value());
-  EXPECT_EQ(configuration.pose_sources.front().bindings.size(), 1U);
+  const auto &source = configuration.pose_sources.front();
+  EXPECT_FALSE(source.joint_state.has_value());
+  ASSERT_EQ(source.bindings.size(), 1U);
+  EXPECT_EQ(source.bindings.front().lifetime_ns, 1'000'000'000LL);
+  // No relative reference on the component: none in the expanded row.
+  EXPECT_EQ(source.observer_configuration
+                .find_object_member("simulation_entities")
+                ->as_array()
+                .front()
+                .find_object_member("relative_reference"),
+            nullptr);
 }
 
-TEST(ActivationPoseSource, InvalidBindingsAndForeignRowsAreRefused) {
+TEST(ActivationPoseSource, Detection3dLinkExpandsWithTheComponentTopic) {
+  const auto materialized = Materialize(Intent(
+      Array{PoseSource("scene_objects",
+                       Object{{"detection3d", Detection()},
+                              {"robot_overlay", Overlay(false)}})},
+      Array{DetectionLink("part", "before_planning")},
+      Array{Value(Object{{"controllable_component_id", Value("scene_objects")},
+                         {"stream_id", Value("poses/part")},
+                         {"budget_ns", Value(5000000000.0)}})}));
+  ASSERT_NE(materialized.bundle, nullptr);
+  const auto &graph = materialized.bundle->value().cell_graph;
+  const auto configuration = contract::require_configuration(
+      *materialized.bundle, graph.runtime_units.front().runtime_unit_id);
+  const auto &source = configuration.pose_sources.front();
+  const auto &observer = source.observer_configuration;
+  // No simulation block: the poll period is the unused default.
+  EXPECT_EQ(observer.find_object_member("simulation_poll_period_ms")
+                ->as_number(),
+            250.0);
+  EXPECT_TRUE(
+      observer.find_object_member("simulation_entities")->as_array().empty());
+  const auto &detections =
+      observer.find_object_member("detection3d_sources")->as_array();
+  ASSERT_EQ(detections.size(), 1U);
+  EXPECT_EQ(
+      d::canonical_json(detections.front()),
+      d::canonical_json(Value(Object{
+          {"eligible", Value(true)},
+          {"fallback_frame_id", Value("link_base")},
+          {"frame_kind", Value("cell_frame")},
+          {"lifetime_ns", Value(5000000000.0)},
+          {"object_id", Value("part")},
+          {"policy_id", Value("scene")},
+          {"selector",
+           Value(Object{{"class_id", Value("part")},
+                        {"confidence_min", Value(0.5)},
+                        {"detection_id", Value("")},
+                        {"max_position_variance_m2", Value(0.0025)},
+                        {"selection", Value("first")}})},
+          {"target_frame_id", Value("link_base")},
+          {"topic", Value("/output")}})));
+  EXPECT_EQ(source.bindings.back().object_id, "part");
+  EXPECT_EQ(contract::pose_source_stream_id(source.bindings.back()),
+            "poses/part");
+}
+
+TEST(ActivationPoseSource, InvalidLinksAndComponentsAreRefused) {
   const auto refused = [](const Value &authored, std::string_view reason) {
     const auto message = Refusal(authored);
     EXPECT_NE(message.find(reason), std::string::npos) << message;
   };
-  refused(Intent(Array{PoseSource(
-              "scene_objects", Array{Binding("Box", "continuous", true)})}),
-          "pose_source_binding_id_invalid");
-  refused(Intent(Array{PoseSource(
-              "scene_objects",
-              Array{Binding(std::string(40, 'a'), std::string(30, 'b'),
-                            true)})}),
-          "pose_source_binding_id_invalid");
-  refused(Intent(Array{PoseSource(
-              "scene_objects", Array{Binding("box", "continuous", true),
-                                     Binding("box", "continuous", false)})}),
-          "pose_source_binding_duplicate");
-  refused(Intent(Array{PoseSource("scene_objects", Array{}, std::nullopt)}),
-          "pose_source_bindings_empty");
+  const auto simulated = [](bool relative = true) {
+    return Array{PoseSource("scene_objects",
+                            Object{{"simulation", Simulation(relative)}})};
+  };
+  const auto detected = [] {
+    return Array{
+        PoseSource("scene_objects", Object{{"detection3d", Detection()}})};
+  };
+  refused(Intent(simulated(), Array{EntityLink("box", "continuous", "other")}),
+          "scene_pose_source_unknown_component");
+  refused(Intent(detected(), Array{EntityLink("box", "continuous")}),
+          "scene_pose_source_mode_missing");
+  refused(Intent(simulated(), Array{DetectionLink("part", "continuous")}),
+          "scene_pose_source_mode_missing");
   refused(Intent(Array{PoseSource("scene_objects",
-                                  Array{Binding("box", "continuous", true)},
-                                  Joint(), "other_component")}),
-          "does not name its actual component");
+                                  Object{{"robot_overlay", Overlay()}})}),
+          "scene_pose_source_mode_missing");
+  refused(Intent(simulated(false),
+                 Array{EntityLink("box", "continuous_relative_to_attached")}),
+          "scene_pose_source_relative_reference_missing");
+  refused(Intent(detected(),
+                 Array{DetectionLink("part", "continuous_relative_to_attached")}),
+          "scene_pose_source_relative_requires_simulation");
+  refused(Intent(simulated(), Array{EntityLink("box", "continuous"),
+                                    EntityLink("box", "observe_only")}),
+          "scene_pose_source_duplicate_object");
+  // The existing expanded-row checks still apply after the join.
+  refused(Intent(simulated(), Array{EntityLink("Box", "continuous")}),
+          "pose_source_binding_id_invalid");
+  refused(Intent(simulated(),
+                 Array{EntityLink(std::string(60, 'a'), "continuous")}),
+          "pose_source_binding_id_invalid");
+  refused(Intent(simulated()), "pose_source_bindings_empty");
+  // The authored schema is closed: the old wrapper shape is refused.
+  EXPECT_FALSE(Refusal(Intent(Array{PoseSource(
+                           "scene_objects",
+                           Object{{"pose_sources", Value(Array{})}})}))
+                   .empty());
   // A pose source needs its exact model-free profile.
-  auto wrong_profile = PoseSource("scene_objects",
-                                  Array{Binding("box", "continuous", true)});
+  auto wrong_profile =
+      PoseSource("scene_objects", Object{{"simulation", Simulation()}});
   auto object = wrong_profile.as_object();
   for (auto &[name, value] : object)
     if (name == "component_profile_id")

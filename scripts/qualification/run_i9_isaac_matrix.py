@@ -531,11 +531,9 @@ def validate_package(package_root: Path, source_root: Path) -> dict[str, Any]:
         ),
         label="simulation site config",
     )
-    site_rows = _object_rows(site.get("scenarios"), label="simulation site rows")
-    if tuple(row.get("scenario_id") for row in site_rows) != tuple(
-        row.scenario_id for row in SCENARIOS
-    ):
-        raise QualificationError("simulation site row order/identity differs from I9")
+    # Machine facts only; the entity mapping comes from the Deployment links.
+    if site.get("api_version") != "manyforge.simulation_program_site_config.v2":
+        raise QualificationError("simulation site config is not the v2 machine-facts file")
 
     return {
         "projects": projects,

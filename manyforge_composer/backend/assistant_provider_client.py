@@ -37,7 +37,6 @@ _RESPONSE_FIELDS = {
     "assistantMode",
     "catalogHash",
     "message",
-    "proposals",
     "toolCalls",
     "warnings",
     "requiresReview",
@@ -49,14 +48,6 @@ _RESPONSE_FIELDS = {
 }
 _TOOL_CALL_REQUIRED_FIELDS = {"toolId", "status", "effect", "arguments"}
 _TOOL_CALL_OPTIONAL_FIELDS = {"result", "draftMutated"}
-_PROPOSAL_FIELDS = {
-    "toolId",
-    "effect",
-    "arguments",
-    "inputSchemaHash",
-    "status",
-    "requiresReview",
-}
 
 
 class AssistantProviderClientError(RuntimeError):
@@ -235,24 +226,9 @@ def _response(value: Any, *, status: Mapping[str, Any]) -> dict[str, Any]:
         raise _invalid("assistant bridge response catalogHash is invalid")
     if type(value["message"]) is not str or len(value["message"].encode("utf-8")) > 65_536:
         raise _invalid("assistant bridge response message is invalid")
-    for field in ("proposals", "toolCalls", "warnings"):
+    for field in ("toolCalls", "warnings"):
         if type(value[field]) is not list or len(value[field]) > 4_096:
             raise _invalid(f"assistant bridge response {field} is invalid")
-    for item in value["proposals"]:
-        if type(item) is not dict or set(item) != _PROPOSAL_FIELDS:
-            raise _invalid("assistant bridge response proposals are invalid")
-        _text(item["toolId"], "proposal toolId")
-        if item["effect"] not in {"proposal", "runtime_mutating"}:
-            raise _invalid("assistant bridge proposal effect is unsupported")
-        if type(item["arguments"]) is not dict:
-            raise _invalid("assistant bridge proposal arguments are invalid")
-        if (
-            type(item["inputSchemaHash"]) is not str
-            or _DIGEST_PATTERN.fullmatch(item["inputSchemaHash"]) is None
-            or item["status"] != "draft"
-            or item["requiresReview"] is not True
-        ):
-            raise _invalid("assistant bridge proposal violates the review boundary")
     for item in value["toolCalls"]:
         if (
             type(item) is not dict
@@ -262,14 +238,9 @@ def _response(value: Any, *, status: Mapping[str, Any]) -> dict[str, Any]:
             raise _invalid("assistant bridge tool-call result has an unsupported shape")
         for field in ("toolId", "status", "effect"):
             _text(item[field], f"tool-call {field}")
-        if item["status"] not in {"completed", "failed", "proposed"}:
+        if item["status"] not in {"completed", "failed"}:
             raise _invalid("assistant bridge tool-call status is unsupported")
-        if item["effect"] not in {
-            "read_only",
-            "proposal",
-            "composer_draft_mutating",
-            "runtime_mutating",
-        }:
+        if item["effect"] not in {"read_only", "composer_draft_mutating"}:
             raise _invalid("assistant bridge tool-call effect is unsupported")
         if type(item["arguments"]) is not dict:
             raise _invalid("assistant bridge tool-call arguments are invalid")

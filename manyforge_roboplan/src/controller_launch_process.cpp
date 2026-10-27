@@ -46,6 +46,7 @@ constexpr std::string_view kIsaacLaunchFile =
     "isaac_topic_based_control.launch.py";
 constexpr std::string_view kSimulatedPlcLaunchFile = "sim_plc.launch.py";
 constexpr std::string_view kPoseSourceLaunchFile = "pose_source.launch.py";
+constexpr std::string_view kAiModelLaunchFile = "ai_model.launch.py";
 
 [[nodiscard]] int parent_death_signal(const ControllerLaunchCommand &command) {
   const auto &argv = command.argv;
@@ -60,7 +61,9 @@ constexpr std::string_view kPoseSourceLaunchFile = "pose_source.launch.py";
        (command.lane == ControllerLaunchLane::kSimulatedPlc &&
         argv[3] == kSimulatedPlcLaunchFile) ||
        (command.lane == ControllerLaunchLane::kPoseSource &&
-        argv[3] == kPoseSourceLaunchFile)))
+        argv[3] == kPoseSourceLaunchFile) ||
+       (command.lane == ControllerLaunchLane::kAiModel &&
+        argv[3] == kAiModelLaunchFile)))
     return SIGINT;
   return SIGTERM;
 }
@@ -434,13 +437,21 @@ mock_controller_launch_command(const ControllerLaunchArtifacts &artifacts) {
   command.argv = {std::string(kRos2), "launch", std::string(kBringupPackage),
                   std::string(kMockLaunchFile)};
   std::set<std::string> names;
+  // The shared Mock/Real builder (CP8 step 2a): the hardware plugin and
+  // remappings, and the driver parameters' exact bytes, join the identity; a
+  // Mock component has none of them.
+  std::vector<std::string> hardware;
   for (const auto &argument : artifacts.launch_arguments) {
     if (!names.insert(argument_name(argument)).second) {
       fail("mock launch argument repeated: " + argument);
     }
+    if (argument.starts_with("hardware_")) hardware.push_back(argument);
     command.argv.push_back(argument);
   }
-  command.identity = identity_of(artifacts, {});
+  if (!artifacts.driver_parameters_sha256.empty()) {
+    hardware.push_back(artifacts.driver_parameters_sha256);
+  }
+  command.identity = identity_of(artifacts, hardware);
   command.robot_description_sha256 = artifacts.robot_description_sha256;
   command.controllers_sha256 = artifacts.controllers_sha256;
   command.controller_profile = artifacts.controller_profile;

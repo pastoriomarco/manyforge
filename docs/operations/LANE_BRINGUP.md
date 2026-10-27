@@ -1,5 +1,10 @@
 # Lane bring-up — direct / openclaw / hermes
 
+> **Superseded for the AI assistant.** The provider lanes, `ASSISTANT_PROVIDER`
+> and `MANYFORGE_ASSISTANT_*` settings below no longer exist. The current
+> assistant uses the Deployment's `ai_model` component and the always-started
+> bridge: see [`ASSISTANT_E2E_COOKBOOK.md`](ASSISTANT_E2E_COOKBOOK.md).
+
 > **Cutover status:** retained as a restoration and behavior reference. N6-c5
 > restores the bounded in-tree `direct` (`nemoclaw` alias) provider bridge and
 > strict Composer client, but not this runbook's live model, Program-operation,

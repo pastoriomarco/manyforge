@@ -8,6 +8,7 @@
 #include <manyforge_core/types/collision.hpp>
 #include <manyforge_core/types/configuration_fence.hpp>
 #include <manyforge_core/types/logical_scene_snapshot.hpp>
+#include <manyforge_deployment/ros2_control_execution_runtime_contract.hpp>
 #include <optional>
 #include <stdexcept>
 #include <string>
@@ -874,6 +875,11 @@ CanonicalValue BuildManagerSourcePayload(
        CanonicalValue(CanonicalValue::Object{
            {"canonical_empty", CanonicalValue(canonical_empty)},
            {"cell_graph", *graph},
+           // CP8 step 1: the simulator each ROS-hosted component depends on,
+           // derived from the verified bundle (never part of its identity).
+           {"component_simulator_dependencies",
+            manyforge::deployment::ros2_control_execution_runtime_contract::
+                component_simulator_dependencies(active_bundle)},
            {"graph_revision",
             CanonicalValue(active_revision.graph_revision.value())},
            {"publication", ActivePublication(publication)},

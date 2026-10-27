@@ -1,7 +1,8 @@
 # Assistant Provider Contract v1
 
-This is the current strict wire for the bounded direct/`nemoclaw` assistant
-bridge. Normative authority and mode semantics live in ManyForge specs 480 and
+This is the current strict wire between Composer and the in-tree assistant
+bridge. The model endpoint side is described in
+[`ASSISTANT_PROVIDER_CONTRACT.md`](ASSISTANT_PROVIDER_CONTRACT.md). Normative authority and mode semantics live in ManyForge specs 480 and
 485; the closed runtime models in `manyforge_assistant_bridge/contracts.py` are
 the executable field authority.
 
@@ -87,9 +88,8 @@ Only `completed` carries a response; only `failed` carries a closed
 
 A completed response is exactly
 `manyforge.assistant.provider_response.v1`. It echoes attribution and mode,
-records the narrowed `catalogHash`, text, reviewable `proposals`, completed
-`toolCalls`, warnings, Draft provenance, clarification flag, exit reason, and
-bounded turn count. Proposal/runtime descriptors are never executed in-loop.
+records the narrowed `catalogHash`, text, completed `toolCalls`, warnings,
+Draft provenance, clarification flag, exit reason, and bounded turn count.
 
 The same `requestId` and identical content is idempotent while its bounded
 record is retained. Reusing an ID with different content is a conflict. Clients
@@ -127,10 +127,3 @@ request records, session history, and audit retention are explicitly bounded.
 The rotating JSONL audit records identities, exact tool/schema/catalog hashes,
 argument hashes, outcomes, and timing. It does not retain prompt text,
 response text, or argument values.
-
-## Historical reference
-
-The pre-relocation v0/v0.1 Composer-owned provider contract remains preserved
-in `ASSISTANT_PROVIDER_CONTRACT.md` and at commit
-`08222188293df8e12f90dc72e204c21f22f92ea1`. It is continuity evidence, not a
-loader, compatibility alias, or runnable fallback.

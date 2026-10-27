@@ -49,7 +49,7 @@ def _config_value() -> dict[str, object]:
                 "frame_kind": "cell_frame",
                 "lifetime_ns": 5_000_000_000,
                 "object_id": "graspable",
-                "policy_id": "before_planning",
+                "policy_id": "scene",
                 "selector": {
                     "class_id": "",
                     "confidence_min": 0.0,
@@ -78,7 +78,7 @@ def _config_value() -> dict[str, object]:
                 "local_orientation_xyzw": [0.0, 0.0, 0.0, 1.0],
                 "local_position_xyz": [0.0, 0.0, 0.0],
                 "object_id": "isaac_cheese_box",
-                "policy_id": "continuous_unattached",
+                "policy_id": "scene",
                 "source_coordinate_frame_id": "world",
                 "source_header_frame_id": "mac_n_cheese_centered",
                 "target_frame_id": "universe",
@@ -121,14 +121,12 @@ def test_site_config_is_closed_bounded_and_preserves_exact_bindings(
     assert config.detection3d_sources[0].selector.selection == "first"
     assert config.keys == {
         ("isaac_ur10e_light_robot", "viewer.measured_robot"),
-        ("isaac_cheese_box", "continuous_unattached"),
-        ("graspable", "before_planning"),
+        ("isaac_cheese_box", "scene"),
+        ("graspable", "scene"),
     }
     assert config.observer_bindings == (
-        PoseObserverBinding("graspable", "before_planning", True),
-        PoseObserverBinding(
-            "isaac_cheese_box", "continuous_unattached", True
-        ),
+        PoseObserverBinding("graspable", "scene", True),
+        PoseObserverBinding("isaac_cheese_box", "scene", True),
         PoseObserverBinding(
             "isaac_ur10e_light_robot", "viewer.measured_robot", False
         ),
@@ -704,10 +702,11 @@ def test_each_binding_has_its_own_valid_pose_stream(tmp_path: Path) -> None:
     path.write_text(json.dumps(_config_value()), encoding="utf-8")
     config = load_isaac_pose_observer_site_config(path)
     streams = [pose_source_stream_id(binding) for binding in config.bindings]
-    # Object ids repeat across policies; the policy keeps the streams apart.
-    assert streams == [
-        f"poses/{binding.object_id}/{binding.policy_id}"
-        for binding in config.bindings
+    # Object links stream as poses/<object>; overlays keep their policy.
+    assert sorted(streams) == [
+        "poses/graspable",
+        "poses/isaac_cheese_box",
+        "poses/isaac_ur10e_light_robot/viewer.measured_robot",
     ]
     assert len(set(streams)) == len(streams)
     assert all(valid_stream_id(stream) for stream in streams)

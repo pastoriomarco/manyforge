@@ -435,5 +435,17 @@ TEST(BoundedOperationControlExecutorTest,
   EXPECT_TRUE(executor.DrainFor(1s));
 }
 
+TEST(BoundedOperationControlExecutorTest, DestructionWithoutOwnerDrainDrainsInsteadOfTerminating) {
+  // E.g. the owning Kernel's constructor throws after building its lanes.
+  Receiver receiver;
+  FakeEngine engine;
+  testing::internal::CaptureStderr();
+  {
+    BoundedOperationControlExecutor executor({&engine}, receiver);
+    EXPECT_TRUE(executor.prequalified_ready());
+  }
+  EXPECT_EQ(testing::internal::GetCapturedStderr(), "");
+}
+
 }  // namespace
 }  // namespace manyforge::core

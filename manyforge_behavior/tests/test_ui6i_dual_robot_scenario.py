@@ -54,6 +54,16 @@ def test_dual_deployment_has_exact_models_placements_and_cross_revisions() -> No
         for row in runtime["configuration"]["gripper_target_configurations"]
     }
     assert set(grippers) == {"lite6_robot", "ur5e_robot"}
+    # CP9: each Mock robot declares its measured joints and gripper feedback.
+    assert [
+        (row["controllable_component_id"], row["stream_id"], row["budget_ns"],
+         row["severity"], row["recovery"])
+        for row in runtime["configuration"]["component_streams"]
+    ] == [
+        (component, stream, budget, "fault", "ack")
+        for component in ("lite6_robot", "ur5e_robot")
+        for stream, budget in (("gripper_feedback", 1000000000), ("measured_joints", 250000000))
+    ]
     # Gripper model A1: the Lite6 lite gripper is pneumatic, the Robotiq
     # 2F-85 is position commanded.
     assert {

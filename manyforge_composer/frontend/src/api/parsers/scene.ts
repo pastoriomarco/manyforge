@@ -1563,6 +1563,16 @@ export function parseFileBrowserResponse(value: unknown): FileBrowserResponse {
     currentPath: stringAt(record.currentPath, 'files.currentPath'),
     parentPath: nullableStringAt(record.parentPath, 'files.parentPath'),
     roots: stringArrayAt(record.roots, 'files.roots'),
+    ...(record.projectRoots === undefined ? {} : {
+      projectRoots: arrayAt(record.projectRoots, 'files.projectRoots').map((entry, index) => {
+        const path = `files.projectRoots[${index}]`;
+        const mapping = objectAt(entry, path);
+        return {
+          hostPath: nonEmptyStringAt(mapping.hostPath, `${path}.hostPath`),
+          containerPath: nonEmptyStringAt(mapping.containerPath, `${path}.containerPath`),
+        };
+      }),
+    }),
     entries: arrayAt(record.entries, 'files.entries').map((entry, index) =>
       parseFileBrowserEntry(entry, `files.entries[${index}]`),
     ),

@@ -4,6 +4,7 @@
 #include <cstdlib>
 #include <limits>
 #include <manyforge_core/bounded_stop_stage_attempt_executor.hpp>
+#include <manyforge_core/time/stuck_drain_wait.hpp>
 #include <mutex>
 #include <stdexcept>
 #include <stop_token>
@@ -65,7 +66,11 @@ class BoundedStopStageAttemptExecutor::Impl final {
 
   ~Impl() {
     if (!drain_confirmed_) {
-      std::terminate();
+      // An owner that never drained (e.g. its constructor threw after this
+      // executor was built) leaves the drain to the destructor.
+      CloseIngress();
+      WaitForDrain("stop_stage_attempt_executor.unconfirmed_destruction", std::chrono::seconds(5),
+                   [this](std::chrono::nanoseconds bound) { return DrainFor(bound); });
     }
     for (auto& slot : slots_) {
       // Synchronize stop publication with the mutex protecting the wait

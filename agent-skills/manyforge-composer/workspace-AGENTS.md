@@ -61,8 +61,7 @@ so you can pick the right family quickly.
 
 - **Scene edits (compile-time, persistent across runs)** —
   `scene.draft.add_object`, `update_object`, `upsert_objects`,
-  `remove_objects`, plus `propose_scene_objects` /
-  `propose_scene_object_nodes` for batch proposals. Use for static
+  `remove_objects`. Use for static
   collision bodies (workspace fixtures, fixed obstacles, ground).
 
 - **Tree edits (runtime, what the robot does each cycle)** —

@@ -780,8 +780,6 @@ CanonicalValue Attachment(const core::CarriedObjectAttachmentDTO &value) {
     result.emplace_back(
         "grasp_lost_check",
         CanonicalValue(CanonicalValue::Object{
-            {"attach_pose_in_carrier_frame",
-             Pose(value.grasp_lost_check->attach_pose_in_carrier_frame)},
             {"bound", GraspLostBound(value.grasp_lost_check->bound)},
         }));
   }
@@ -793,10 +791,9 @@ core::CarriedObjectAttachmentDTO DecodeAttachment(const CanonicalValue &value) {
   ExactObject(value, check ? 9U : 8U, "carried attachment");
   std::optional<core::CarriedObjectGraspLostCheckDTO> grasp_lost_check;
   if (check) {
-    ExactObject(*check, 2U, "grasp-lost check");
+    ExactObject(*check, 1U, "grasp-lost check");
     grasp_lost_check = core::CarriedObjectGraspLostCheckDTO{
-        DecodeGraspLostBound(Member(*check, "bound")),
-        DecodePose(Member(*check, "attach_pose_in_carrier_frame"))};
+        DecodeGraspLostBound(Member(*check, "bound"))};
   }
   return {
       core::CarriedObjectAttachmentId(

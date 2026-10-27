@@ -30,10 +30,13 @@ commit `08222188293df8e12f90dc72e204c21f22f92ea1`; the selected xArm fork is
 - `live_evidence.py` retains command-free probe descriptions, bounded supplied
   result classification, and postcondition reduction. It does not run probes
   or write evidence; those capabilities return at I10/R.
-- `lifecycle_transient.py` and `controller_gate_evidence.py` retain
-  effect-free joint-sample and pose-deviation reducers. Lifecycle transactions
-  return at I7/L0, Kernel admission and Stop evidence at I8/P5, and attended
-  xArm evidence at I10/R.
+- `controller_gate_evidence.py` retains an effect-free pose-deviation
+  reducer. Lifecycle transactions return at I7/L0, Kernel admission and Stop
+  evidence at I8/P5, and attended xArm evidence at I10/R.
+- R7 package 5 (2026-10-25) removed the supervised mode: the supervised
+  endpoint names, the supervised hardware parameters and their refusal, and
+  the supervised lifecycle transient sampler. The real lane uses the
+  unmodified vendor driver; its xArm adapter is `manyforge_xarm_control`.
 - `supervised_runtime_binding.py` retains only literal usable-unicast IPv4
   validation from its old resolver. Retained products and addressing must pass
   I3 and I6/N, lifecycle and Kernel ownership must pass I7/L0 and I8/P5, and

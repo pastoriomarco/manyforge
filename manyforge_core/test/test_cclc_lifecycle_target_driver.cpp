@@ -243,6 +243,7 @@ class FakeStore final : public ICCLCLifecycleTargetStore {
       value.incident_recovery = std::move(recovery);
       return value;
     };
+    recover_intents.push_back(intent);
     const auto& component = intent.controllable_component_id;
     if (intent.request_context.request_owner_epoch != active_owner_epoch) {
       return Result<Value>::Ok(std::nullopt);
@@ -370,6 +371,7 @@ class FakeStore final : public ICCLCLifecycleTargetStore {
            ComponentLifecycleInterventionCauseDTO>
       causes;
   int writes{};
+  std::vector<ComponentLifecycleIntentDTO> recover_intents;
 };
 
 enum class SubmitMode { kAccept, kReject, kError };
@@ -557,6 +559,11 @@ class FakePorts final : public ICCLCLifecycleTargetDriverPorts {
          std::nullopt});
   }
 
+  Result<bool> RecoverIncidentContainment(const std::string& incident_id) override {
+    containment_recoveries.push_back(incident_id);
+    return Result<bool>::Ok(containment_recovery_done);
+  }
+
   Result<std::optional<ComponentLifecycleStatusDTO>> LoadLifecycleStatus(
       const LifecycleTransactionId& id) override {
     const auto found = statuses.find(id);
@@ -620,6 +627,8 @@ class FakePorts final : public ICCLCLifecycleTargetDriverPorts {
   std::vector<LifecycleFactDTO> vendor_facts;
   bool containment_accepts{true};
   std::vector<ComponentIncidentContainmentIntentDTO> containments;
+  bool containment_recovery_done{true};
+  std::vector<std::string> containment_recoveries;
 
   std::vector<ComponentLifecycleIntentDTO> submitted;
   std::vector<ComponentLifecycleTargetExpectationDTO> submitted_targets;
@@ -3241,9 +3250,10 @@ class StreamHealthIncidentTest : public LifecycleIncidentTest {
     config.stream_health = health_;
     driver_.emplace(config, store_, ports_, clock_, scheduler_);
   }
-  std::unique_ptr<StreamRecorder> Declare(StreamSeverityDTO severity) {
+  std::unique_ptr<StreamRecorder> Declare(StreamSeverityDTO severity,
+                                          StreamRecoveryDTO recovery = StreamRecoveryDTO::kAck) {
     auto declared = health_->Declare(
-        kComponent, {"measured_joints", 100 * kMs, severity, StreamRecoveryDTO::kAck,
+        kComponent, {"measured_joints", 100 * kMs, severity, recovery,
                      StreamTimestampSourceDTO::kMessageStamp});
     EXPECT_TRUE(declared.ok());
     return std::move(declared.value());
@@ -3280,6 +3290,91 @@ TEST_F(StreamHealthIncidentTest, FaultStreamLossAfterReachedIsProviderLostNaming
   EXPECT_EQ(ports_.containments.size(), 1U);
 }
 
+TEST_F(StreamHealthIncidentTest, FaultAutoStreamIncidentClosesByItselfWhenLiveAgain) {
+  auto recorder = Declare(StreamSeverityDTO::kFault, StreamRecoveryDTO::kAuto);
+  recorder->Record(1);
+  Settle();
+  ReachTarget();
+  clock_.advance(101 * kMs);
+  Settle();
+  Driver().RunOnce();
+  Driver().RunOnce();
+  ASSERT_TRUE(Progress().incident.has_value());
+  const auto incident_id = Progress().incident->incident_id;
+  EXPECT_EQ(ports_.containments.size(), 1U);
+  EXPECT_TRUE(ports_.containment_recoveries.empty());
+  // Still stale, across many budgets and passes: nothing closes and nothing
+  // is recorded again (one incident, one event, one containment).
+  const auto events_after_open = store_.events.size();
+  for (int pass = 0; pass < 5; ++pass) {
+    clock_.advance(250 * kMs);
+    Settle();
+    Driver().RunOnce();
+  }
+  EXPECT_TRUE(Progress().incident.has_value());
+  EXPECT_EQ(Progress().incident->incident_id, incident_id);
+  EXPECT_TRUE(store_.recover_intents.empty());
+  EXPECT_EQ(store_.incidents.size(), 1U);
+  EXPECT_EQ(store_.events.size(), events_after_open);
+  EXPECT_EQ(ports_.containments.size(), 1U);
+  // Live again: closed like a Recover (history event), attributed to the
+  // stream; its containment latch is released; nothing is resubmitted.
+  recorder->Record(2);
+  Settle();
+  ports_.containment_recovery_done = false;
+  Driver().RunOnce();
+  EXPECT_FALSE(Progress().incident.has_value());
+  ASSERT_EQ(store_.recover_intents.size(), 1U);
+  EXPECT_TRUE(store_.recover_intents.front().locally_valid());
+  EXPECT_EQ(store_.recover_intents.front().intent, ComponentLifecycleIntentKindDTO::kRecover);
+  const auto& closed = store_.incidents.at(incident_id).incident;
+  EXPECT_TRUE(closed.acknowledged);
+  EXPECT_EQ(closed.acknowledged_by, "manyforge_component_stream_auto_recovery");
+  EXPECT_EQ(store_.events.back().event_kind, kComponentIncidentAcknowledgedEventKind);
+  EXPECT_EQ(ports_.containment_recoveries, std::vector<std::string>{incident_id});
+  EXPECT_EQ(ports_.containments.size(), 1U);
+  // Not ready yet: retried on the next pass until done, then not again.
+  ports_.containment_recovery_done = true;
+  Driver().RunOnce();
+  EXPECT_EQ(ports_.containment_recoveries.size(), 2U);
+  Driver().RunOnce();
+  EXPECT_EQ(ports_.containment_recoveries.size(), 2U);
+  // The next break (after the target is reached again) is one new record.
+  ASSERT_TRUE(store_.targets.at(kComponent).reached);
+  clock_.advance(101 * kMs);
+  Settle();
+  for (int pass = 0; pass < 3; ++pass) {
+    Driver().RunOnce();
+    clock_.advance(250 * kMs);
+    Settle();
+  }
+  EXPECT_EQ(store_.incidents.size(), 2U);
+  EXPECT_EQ(ports_.containments.size(), 2U);
+  ASSERT_TRUE(Progress().incident.has_value());
+  EXPECT_NE(Progress().incident->incident_id, incident_id);
+}
+
+TEST_F(StreamHealthIncidentTest, FaultAutoDoesNotCloseAnIncidentOfAnotherCause) {
+  auto recorder = Declare(StreamSeverityDTO::kFault, StreamRecoveryDTO::kAuto);
+  recorder->Record(1);
+  Settle();
+  ReachTarget();
+  // A pushed fault event (cause `fault`) is not the stream's loss.
+  recorder->ReportFault("vendor.fault", "detail");
+  Settle();
+  Driver().RunOnce();
+  Driver().RunOnce();
+  ASSERT_TRUE(Progress().incident.has_value());
+  health_->Acknowledge(kComponent);  // clears the event only
+  Settle();
+  recorder->Record(2);
+  Settle();
+  Driver().RunOnce();
+  EXPECT_TRUE(Progress().incident.has_value());
+  EXPECT_TRUE(store_.recover_intents.empty());
+  EXPECT_TRUE(ports_.containment_recoveries.empty());
+}
+
 TEST_F(StreamHealthIncidentTest, FaultStreamLossBeforeReachedIsWaitingAndKeepsTargetUnreached) {
   auto recorder = Declare(StreamSeverityDTO::kFault);
   clock_.advance(100 * kMs);
@@ -3302,6 +3397,63 @@ TEST_F(StreamHealthIncidentTest, FaultStreamLossBeforeReachedIsWaitingAndKeepsTa
   Driver().RunOnce();
   EXPECT_TRUE(store_.targets.at(kComponent).reached);
   EXPECT_EQ(Progress().blocking_cause_class, LifecycleBlockingCauseClassDTO::kNone);
+}
+
+TEST_F(StreamHealthIncidentTest, PlannedDisableWithAStaleFaultStreamIsNoIncident) {
+  auto recorder = Declare(StreamSeverityDTO::kFault);
+  recorder->Record(1);
+  Settle();
+  ReachTarget();
+  Target(LifecycleTargetStateDTO::kDisabled, LifecycleTargetOriginDTO::kOperator);
+  ports_.observed = ComponentLifecycleStateDTO::kDisabled;
+  ports_.ready = false;
+  Driver().RunOnce();
+  ASSERT_EQ(ports_.submitted.size(), 1U);
+  ASSERT_EQ(ports_.submitted.back().intent, ComponentLifecycleIntentKindDTO::kDisable);
+  ports_.statuses.begin()->second.acceptance.accepted_at_ns = clock_.now();
+  // The adapter stops publishing while the Disable runs.
+  clock_.advance(101 * kMs);
+  Settle();
+  ASSERT_TRUE(health_->Verdict(kComponent).fault_loss);
+  Driver().RunOnce();
+  EXPECT_FALSE(Progress().incident.has_value());
+  ports_.Finish(ComponentLifecycleTerminalResultDTO::kSucceeded,
+                ComponentLifecycleTransactionPhaseDTO::kSucceeded);
+  Driver().RunOnce();
+  Driver().RunOnce();
+  EXPECT_FALSE(Progress().incident.has_value());
+  EXPECT_TRUE(ports_.containments.empty());
+  EXPECT_EQ(Progress().phase, LifecycleProgressPhaseDTO::kSatisfied);
+  EXPECT_EQ(Progress().blocking_cause_class, LifecycleBlockingCauseClassDTO::kNone);
+}
+
+TEST_F(StreamHealthIncidentTest, PreparedTargetIsReachedWithoutItsFaultStream) {
+  auto recorder = Declare(StreamSeverityDTO::kFault);
+  clock_.advance(100 * kMs);
+  Settle();
+  ASSERT_TRUE(health_->Verdict(kComponent).fault_loss);
+  Target(LifecycleTargetStateDTO::kPrepared, LifecycleTargetOriginDTO::kOperator);
+  ports_.achieved = ComponentLifecycleStateDTO::kPrepared;
+  ports_.BecomeReady();
+  Driver().RunOnce();
+  EXPECT_EQ(Progress().phase, LifecycleProgressPhaseDTO::kSatisfied);
+  EXPECT_EQ(Progress().blocking_cause_class, LifecycleBlockingCauseClassDTO::kNone);
+  EXPECT_TRUE(store_.targets.at(kComponent).reached);
+  EXPECT_FALSE(Progress().incident.has_value());
+  EXPECT_TRUE(ports_.containments.empty());
+}
+
+TEST_F(StreamHealthIncidentTest, AReportedFaultEventStillCountsForADisabledTarget) {
+  auto recorder = Declare(StreamSeverityDTO::kWarning);
+  Target(LifecycleTargetStateDTO::kDisabled, LifecycleTargetOriginDTO::kOperator);
+  ports_.achieved = ComponentLifecycleStateDTO::kDisabled;
+  Driver().RunOnce();
+  EXPECT_FALSE(Progress().incident.has_value());
+  recorder->ReportFault("vendor_fault", "reported while disabled");
+  Settle();
+  Driver().RunOnce();
+  ASSERT_TRUE(Progress().incident.has_value());
+  EXPECT_EQ(Progress().incident->cause_class, LifecycleBlockingCauseClassDTO::kFault);
 }
 
 TEST_F(StreamHealthIncidentTest, BlockingAndWarningStreamsNeverOpenAnIncident) {

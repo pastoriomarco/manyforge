@@ -135,7 +135,7 @@ public:
       auto [entry, inserted] = result->driver_inputs_.try_emplace(input.driver);
       if (inserted) result->drivers_.push_back(input.driver);
       entry->second.push_back({input.rows, input.node, wake, incarnation,
-                               input.geometric_contact});
+                               input.geometric_contact, result->scheduler_});
       for (const auto &row : input.rows) {
         const auto signal = row.descriptor.signal_id;
         Require(result->input_profiles_.emplace(signal, row.provider.profile)
@@ -167,6 +167,21 @@ public:
                std::owner_less<std::shared_ptr<IoProviderDriverRecord>>>;
   const DriverInputInstallations &driver_input_installations() const noexcept {
     return driver_inputs_;
+  }
+
+  void AddMockEcho(std::shared_ptr<MockBooleanOutputProvider> output,
+                   const core::IoSignalId &signal, core::Duration delay) {
+    Require(!started_ && output && mock_inputs_.contains(signal) && delay >= 0,
+            "Mock echo has no exact configured input/output");
+    for (const auto &channel : mock_echoes_)
+      for (const auto &target : channel.targets)
+        Require(target.signal != signal, "Mock input repeats an echo source");
+    const auto found = std::find_if(mock_echoes_.begin(), mock_echoes_.end(),
+        [&](const auto &channel) { return channel.output == output; });
+    if (found == mock_echoes_.end())
+      mock_echoes_.push_back({std::move(output), {{signal, delay, 0U, {}}}});
+    else
+      found->targets.push_back({signal, delay, 0U, {}});
   }
   std::function<void()>
   cancellation_hook(const std::shared_ptr<IoProviderDriverRecord> &driver) {
@@ -968,6 +983,12 @@ public:
       started_ = true;
       active_ = true;
     }
+    for (std::size_t i = 0; i < mock_echoes_.size(); ++i)
+      mock_echoes_[i].output->SetModelObserver(
+          [weak = weak_from_this(), i](bool value, core::TimePoint written_at) {
+            if (auto self = weak.lock())
+              self->ScheduleMockEcho(i, value, written_at);
+          });
     // Initial samples come only from actual DriverRecord Enable.
     if (ingress_) {
       const auto drained = ingress_->Drain(drain_budget_);
@@ -1086,6 +1107,12 @@ public:
         for (auto &[key, entry] : node_simulations_)
           for (auto &change : entry.changes)
             CancelChangeLocked(change);
+        for (auto &channel : mock_echoes_)
+          for (auto &target : channel.targets) {
+            if (target.handle)
+              scheduler_->cancel(*target.handle);
+            target.handle.reset();
+          }
       } catch (...) {
       } // Every future callback still observes active_ == false.
     }
@@ -1103,6 +1130,62 @@ public:
   }
 
 private:
+  struct MockEchoTarget final {
+    core::IoSignalId signal;
+    core::Duration delay;
+    std::uint64_t serial;
+    std::optional<core::ScheduleHandle> handle;
+  };
+  struct MockEchoChannel final {
+    std::shared_ptr<MockBooleanOutputProvider> output;
+    std::vector<MockEchoTarget> targets;
+  };
+  void ScheduleMockEcho(std::size_t channel, bool value,
+                        core::TimePoint written_at) {
+    std::lock_guard lock(mutex_);
+    if (!active_ || channel >= mock_echoes_.size())
+      return;
+    auto &targets = mock_echoes_[channel].targets;
+    for (std::size_t i = 0; i < targets.size(); ++i) {
+      auto &target = targets[i];
+      if (target.handle)
+        scheduler_->cancel(*target.handle);
+      target.handle.reset();
+      if (target.serial == std::numeric_limits<std::uint64_t>::max() ||
+          written_at > std::numeric_limits<core::TimePoint>::max() - target.delay)
+        continue;
+      const auto serial = ++target.serial;
+      target.handle = scheduler_->schedule(
+          written_at + target.delay,
+          [weak = weak_from_this(), channel, i, serial, value] {
+            if (auto self = weak.lock())
+              self->ApplyMockEcho(channel, i, serial, value);
+          }, core::SchedulerPriority::Monitoring);
+    }
+  }
+  void ApplyMockEcho(std::size_t channel, std::size_t index,
+                     std::uint64_t serial, bool value) {
+    auto delivery_locks = AcquireProviderDeliveries();
+    // Channels are immutable after Start. This is the same output mutex held
+    // across acceptance and ScheduleMockEcho, so a newer accepted write cannot
+    // overtake this serial check and then be overwritten by this publication.
+    if (channel >= mock_echoes_.size())
+      return;
+    auto output_delivery = mock_echoes_[channel].output->AcquireModelDelivery();
+    std::optional<core::IoSignalId> signal;
+    {
+      std::lock_guard lock(mutex_);
+      if (!active_ || channel >= mock_echoes_.size() ||
+          index >= mock_echoes_[channel].targets.size())
+        return;
+      auto &target = mock_echoes_[channel].targets[index];
+      if (target.serial != serial || !target.handle)
+        return;
+      target.handle.reset();
+      signal = target.signal;
+    }
+    static_cast<void>(PublishMockValueLocked(*signal, value));
+  }
   class IngressWake final : public core::IIoSignalIngress {
   public:
     IngressWake(std::shared_ptr<core::IoSignalIngress> ingress,
@@ -1354,6 +1437,7 @@ private:
   DriverInputInstallations driver_inputs_;
   std::vector<std::shared_ptr<IoProviderDriverRecord>> drivers_;
   std::map<core::IoSignalId, MockInput> mock_inputs_;
+  std::vector<MockEchoChannel> mock_echoes_;
   mutable std::mutex mock_delivery_mutex_;
   mutable std::mutex mutex_;
   bool active_{};

@@ -53,6 +53,9 @@ def _projection() -> dict[str, Any]:
         "instrument_registry_digest": "sha256:" + "2" * 64,
         "mode": "composer-assistant",
         "model_endpoint": {
+            "ai_model_component_id": "assistant_model",
+            "api_key_env": None,
+            "base_url": "http://upstream.test/v1",
             "model_endpoint_alias": "assistant_model",
             "model_id": "model.1",
             "request_contract": {
@@ -256,7 +259,6 @@ def _service(
     composer_handler,
 ) -> BridgeService:
     config = BridgeConfig(
-        upstream_base_url="http://upstream.test/v1",
         headless_api_url="http://headless.test",
         composer_base_url="http://composer.test",
         audit_log_path=tmp_path / "audit.jsonl",
@@ -266,7 +268,6 @@ def _service(
         config,
         headless_client=_Headless(projection),  # type: ignore[arg-type]
         upstream_client=httpx.AsyncClient(
-            base_url="http://upstream.test/v1",
             transport=httpx.MockTransport(upstream_handler),
         ),
         composer_client=httpx.AsyncClient(
@@ -296,7 +297,8 @@ def test_bridge_verifies_projection_and_runs_only_draft_callback(tmp_path: Path)
 
     async def upstream(request: httpx.Request) -> httpx.Response:
         nonlocal upstream_calls
-        assert request.url.path == "/v1/chat/completions"
+        assert str(request.url) == "http://upstream.test/v1/chat/completions"
+        assert "authorization" not in request.headers
         upstream_calls += 1
         upstream_bodies.append(json.loads(request.content))
         if upstream_calls == 1:
@@ -1052,3 +1054,86 @@ def test_lost_projection_and_malformed_model_response_fail_before_effects(
     assert result["state"] == "failed"
     assert result["error"]["code"] == "upstream_response_invalid"
     assert upstream_calls == 1
+
+
+def _with_token_env(projection: dict[str, Any], name: str) -> dict[str, Any]:
+    projection["model_endpoint"]["api_key_env"] = name
+    projection["source"]["source_content_digest"] = framed_digest(
+        "manyforge-assistant-mode-projection-semantic",
+        "manyforge.assistant_mode_projection.v1",
+        {key: value for key, value in projection.items() if key != "source"},
+    )
+    return projection
+
+
+def test_bridge_sends_the_component_token_from_its_named_env_var(
+    tmp_path: Path, monkeypatch
+) -> None:
+    projection = _with_token_env(_projection(), "MANYFORGE_TEST_AI_TOKEN")
+    monkeypatch.setenv("MANYFORGE_TEST_AI_TOKEN", "secret-value")
+    headers: list[str | None] = []
+
+    async def upstream(request: httpx.Request) -> httpx.Response:
+        headers.append(request.headers.get("authorization"))
+        return httpx.Response(
+            200, json={"choices": [{"message": {"content": "ok"}}]}, request=request
+        )
+
+    async def unused(request: httpx.Request) -> httpx.Response:
+        raise AssertionError("no tool call was requested")
+
+    service = _service(
+        tmp_path, projection, upstream_handler=upstream, composer_handler=unused
+    )
+    with TestClient(create_app(service.config, service=service)) as client:
+        assert client.post("/v1/manyforge/assistant", json=_request(projection)).status_code == 202
+        status = _terminal(client, "request.1")
+    assert status["state"] == "completed"
+    assert headers == ["Bearer secret-value"]
+    assert "secret-value" not in (tmp_path / "audit.jsonl").read_text()
+
+
+def test_bridge_refuses_an_unset_token_env_var_before_any_model_request(
+    tmp_path: Path, monkeypatch
+) -> None:
+    projection = _with_token_env(_projection(), "MANYFORGE_TEST_AI_TOKEN")
+    monkeypatch.delenv("MANYFORGE_TEST_AI_TOKEN", raising=False)
+
+    async def unused(request: httpx.Request) -> httpx.Response:
+        raise AssertionError("an unset token env var must not reach the model or Composer")
+
+    service = _service(
+        tmp_path, projection, upstream_handler=unused, composer_handler=unused
+    )
+    with TestClient(create_app(service.config, service=service)) as client:
+        assert client.post("/v1/manyforge/assistant", json=_request(projection)).status_code == 202
+        status = _terminal(client, "request.1")
+    assert status["state"] == "failed"
+    assert status["error"]["code"] == "ai_model_token_unavailable"
+
+
+def test_bridge_reports_a_missing_ai_model_component_as_a_typed_failure(
+    tmp_path: Path,
+) -> None:
+    from manyforge_headless_api.client import HeadlessClientError
+
+    projection = _projection()
+
+    async def unused(request: httpx.Request) -> httpx.Response:
+        raise AssertionError("no model request without an AI model component")
+
+    service = _service(
+        tmp_path, projection, upstream_handler=unused, composer_handler=unused
+    )
+
+    def absent(mode: str) -> dict[str, Any]:
+        raise HeadlessClientError(
+            "assistant_ai_model_absent", "no AI model component", status_code=503
+        )
+
+    service._headless.assistant_mode = absent  # type: ignore[method-assign]
+    with TestClient(create_app(service.config, service=service)) as client:
+        assert client.post("/v1/manyforge/assistant", json=_request(projection)).status_code == 202
+        status = _terminal(client, "request.1")
+    assert status["state"] == "failed"
+    assert status["error"]["code"] == "assistant_ai_model_absent"

@@ -826,13 +826,19 @@ class HeadlessService:
                 "manager_source_invalid",
                 "Manager source has no active graph",
             )
-        return {
+        projection = {
             "schema_version": "manyforge.manager_graph_projection.v1",
             "source": status["source"],
             "graph_revision": active.get("graph_revision"),
             "retained_bundle_id": active.get("retained_bundle_id"),
             "cell_graph": graph,
         }
+        # CP8 step 1: the Manager-derived simulator per ROS-hosted component.
+        if "component_simulator_dependencies" in active:
+            projection["component_simulator_dependencies"] = active[
+                "component_simulator_dependencies"
+            ]
+        return projection
 
     def manager_diff(self) -> dict[str, Any]:
         status = self.manager_status()

@@ -633,7 +633,7 @@ function parseProgramSceneResource(
   allowedKeysAt(
     record,
     ['scene_resource_id', 'shape', 'pose'],
-    ['resource_roles', 'metadata', 'collision_policy_ids'],
+    ['resource_roles', 'metadata'],
     path,
   );
   const resource: ProgramSceneResource = {
@@ -652,12 +652,6 @@ function parseProgramSceneResource(
   }
   if (record.metadata !== undefined) {
     resource.metadata = jsonRecordAt(record.metadata, `${path}.metadata`);
-  }
-  if (record.collision_policy_ids !== undefined) {
-    resource.collision_policy_ids = canonicalStringArrayAt(
-      record.collision_policy_ids,
-      `${path}.collision_policy_ids`,
-    );
   }
   return resource;
 }

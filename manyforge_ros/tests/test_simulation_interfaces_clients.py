@@ -38,7 +38,6 @@ from manyforge_behavior.orchestration_ports import (
 from manyforge_ros.program_simulation_port import (
     RosSimulationProgramTaskPort,
     SimulationProgramSiteConfig,
-    SimulationScenarioSiteConfig,
 )
 from manyforge_ros.scene_mirror_probe import SimulationSceneMirrorClient
 from manyforge_ros.simulation_control import SimulationControlClient
@@ -82,13 +81,6 @@ def test_control_and_scene_clients_share_the_typed_simulator_owner() -> None:
             SimulationProgramSiteConfig(
                 service_prefix="auto",
                 service_timeout_s=2.0,
-                scenarios=(
-                    SimulationScenarioSiteConfig(
-                        scenario_id="isaac-cell",
-                        cell_frame_id="world",
-                        scene_entities={"soup_can": "/World/soup_can"},
-                    ),
-                ),
             ),
         )
         program_port.bind(_program_context())
@@ -167,6 +159,12 @@ def _program_context() -> ProgramRunPortContext:
             "program_id": "simulation_transport",
             "program_revision": _DIGEST_B,
             "scene": [{"scene_resource_id": "soup_can"}],
+        },
+        simulation_scene={
+            "cell_frame_id": "world",
+            "scene_entities": [
+                {"entity": "/World/soup_can", "scene_resource_id": "soup_can"}
+            ],
         },
         program_binding={
             "program_binding_id": _DIGEST_C,

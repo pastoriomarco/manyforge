@@ -554,9 +554,21 @@
   background: var(--mf-bg-neutral-03-a67);
 }
 
+.folder-picker-heading {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+}
+
+.folder-picker-help {
+  white-space: pre-line;
+  overflow-wrap: anywhere;
+  font-size: var(--mf-font-size-068);
+}
+
 .folder-picker-bar {
   display: grid;
-  grid-template-columns: auto minmax(0, 1fr);
+  grid-template-columns: auto auto minmax(0, 1fr) auto;
   align-items: center;
   gap: 0.5rem;
 }
@@ -568,11 +580,10 @@
   font-size: var(--mf-font-size-068);
 }
 
-.folder-picker-bar > code {
+.folder-picker-bar > input {
   min-width: 0;
   color: var(--mf-text-neutral-86);
   font-size: var(--mf-font-size-068);
-  overflow-wrap: anywhere;
 }
 
 .folder-picker-roots {

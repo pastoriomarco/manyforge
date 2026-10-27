@@ -2324,7 +2324,6 @@ def _validate_scene(
     rows = _program_list(value, path=path)
     scene_ids: list[str] = []
     scene_resource_roles: set[str] = set()
-    collision_policy_refs: set[str] = set()
     support_contact_refs: list[tuple[str, str, str]] = []
     shape_schema = catalog.schema_registry.types["shape"]
     for index, raw in enumerate(rows):
@@ -2333,7 +2332,7 @@ def _validate_scene(
         _program_closed(
             row,
             required=frozenset({"scene_resource_id", "shape", "pose"}),
-            optional=frozenset({"resource_roles", "metadata", "collision_policy_ids"}),
+            optional=frozenset({"resource_roles", "metadata"}),
             path=row_path,
         )
         scene_id = _program_identifier(
@@ -2478,13 +2477,6 @@ def _validate_scene(
                         f"{row_path}.metadata.support_contacts",
                         "must be unique and canonical-sorted by support_object_id",
                     )
-        if "collision_policy_ids" in row:
-            collision_policy_refs.update(
-                _canonical_identifier_list(
-                    row["collision_policy_ids"],
-                    path=f"{row_path}.collision_policy_ids",
-                )
-            )
     if scene_ids != sorted(scene_ids) or len(scene_ids) != len(set(scene_ids)):
         _program_error(path, "must be unique and canonical-sorted by scene_resource_id")
     declared_scene_ids = set(scene_ids)
@@ -2516,7 +2508,7 @@ def _validate_scene(
                 "contains a cyclic support-contact dependency",
             )
         pending -= removable
-    return declared_scene_ids, scene_resource_roles, collision_policy_refs
+    return declared_scene_ids, scene_resource_roles
 
 
 def _validate_pose_frame_ref(
@@ -4486,7 +4478,7 @@ def program_value_declarations(
         path=f"{source}.target_roles",
         component_roles=component_roles,
     )
-    scene_resource_ids, _roles, _policies = _validate_scene(
+    scene_resource_ids, _roles = _validate_scene(
         root.get("scene", []),
         path=f"{source}.scene",
         catalog=catalog,
@@ -4700,11 +4692,7 @@ def _validate_program_document(
         path=f"{source}.target_roles",
         component_roles=component_roles,
     )
-    (
-        scene_resource_ids,
-        scene_resource_roles,
-        scene_collision_policy_refs,
-    ) = _validate_scene(
+    scene_resource_ids, scene_resource_roles = _validate_scene(
         root.get("scene", []),
         path=f"{source}.scene",
         catalog=catalog,
@@ -4746,13 +4734,6 @@ def _validate_program_document(
         target_roles=target_roles,
         blackboard_keys=blackboard_keys,
     )
-    unknown_scene_policies = scene_collision_policy_refs - contact_policy_modes.keys()
-    if unknown_scene_policies:
-        _program_error(
-            f"{source}.scene",
-            "references undeclared collision policies "
-            f"{sorted(unknown_scene_policies)}",
-        )
     context = _ProgramValidationContext(
         catalog=catalog,
         component_roles=component_roles,

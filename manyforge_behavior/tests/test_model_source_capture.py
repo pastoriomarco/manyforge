@@ -72,7 +72,7 @@ def test_capture_owns_exact_entrypoints_and_resource_bytes(tmp_path: Path) -> No
     ) == mesh
 
 
-@pytest.mark.parametrize("runtime_kind", ["io_provider", "pose_source"])
+@pytest.mark.parametrize("runtime_kind", ["io_provider", "pose_source", "ai_model"])
 def test_capture_skips_model_free_components(
     tmp_path: Path, runtime_kind: str
 ) -> None:

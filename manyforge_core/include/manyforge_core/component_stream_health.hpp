@@ -31,14 +31,16 @@ enum class StreamSeverityDTO : std::uint8_t {
 
 enum class StreamRecoveryDTO : std::uint8_t {
   /// A live stream that went stale holds its condition until the operator's
-  /// Recover of the component. `fault` always behaves as `ack`.
+  /// Recover of the component. For `fault` the held condition is the incident.
   kAck = 0,
-  /// The condition clears when the stream is live again.
+  /// The condition clears when the stream is live again. For `fault` the
+  /// incident closes by itself (its containment latch is released); motion
+  /// is never resumed, new motion becomes admissible again.
   kAuto,
 };
 
 enum class StreamTimestampSourceDTO : std::uint8_t {
-  /// A sample advances only when its source stamp increases.
+  /// A sample advances only when its source stamp changes (an equal stamp = paused source).
   kMessageStamp = 0,
   /// Every sample advances (no usable stamp).
   kArrival,
@@ -142,7 +144,7 @@ class StreamRecorder final {
   StreamRecorder(const StreamRecorder&) = delete;
   StreamRecorder& operator=(const StreamRecorder&) = delete;
 
-  /// One sample with its source stamp (ns, any clock that increases).
+  /// One sample with its source stamp (ns; any change advances, e.g. a sim time reset).
   /// For `arrival` streams the stamp is ignored.
   void Record(std::int64_t source_stamp_ns) noexcept;
   /// One sample without a usable stamp.

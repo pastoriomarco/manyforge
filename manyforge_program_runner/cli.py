@@ -11,7 +11,6 @@ import uvicorn
 
 from manyforge_headless_api.program_model_transport import (
     OpenAICompatibleProgramModelTransport,
-    load_program_model_endpoint_configs,
 )
 
 from .app import create_app
@@ -33,7 +32,6 @@ def _parser() -> argparse.ArgumentParser:
     parser.add_argument("--headless-timeout-s", type=float, default=30.0)
     parser.add_argument("--tick-interval-ms", type=float, default=10.0)
     parser.add_argument("--tick-workers", type=int, default=4)
-    parser.add_argument("--model-endpoint-config")
     parser.add_argument("--snapshot-url")
     parser.add_argument("--simulation-control-config")
     return parser
@@ -58,16 +56,9 @@ def main(argv: Sequence[str] | None = None) -> int:
             cell_id=args.cell_id,
             persistent_key_register_path=args.persistent_key_register_path,
         )
-        model_transport = (
-            None
-            if args.model_endpoint_config is None
-            else OpenAICompatibleProgramModelTransport(
-                load_program_model_endpoint_configs(args.model_endpoint_config)
-            )
-        )
+        # Program model calls go to the active Deployment's AI model component.
+        model_transport = OpenAICompatibleProgramModelTransport()
         if args.snapshot_url is not None:
-            if model_transport is None:
-                raise ValueError("--snapshot-url requires --model-endpoint-config")
             snapshot_source = ComposerProgramSnapshotSource(args.snapshot_url)
         if args.simulation_control_config is not None:
             try:

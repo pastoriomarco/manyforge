@@ -31,7 +31,6 @@ def _status() -> dict:
             "assistantMode": "composer-assistant",
             "catalogHash": "sha256:" + "1" * 64,
             "message": "Draft checked.",
-            "proposals": [],
             "toolCalls": [],
             "warnings": [],
             "requiresReview": True,
@@ -65,7 +64,7 @@ def test_provider_client_accepts_only_a_closed_attributed_terminal_status() -> N
 
 @pytest.mark.parametrize(
     "mutation",
-    ["outer_id", "inner_id", "runtime_mutation", "open_proposal"],
+    ["outer_id", "inner_id", "runtime_mutation", "removed_proposals"],
 )
 def test_provider_client_rejects_changed_identity_or_runtime_mutation(
     mutation: str,
@@ -75,8 +74,8 @@ def test_provider_client_rejects_changed_identity_or_runtime_mutation(
         payload["requestId"] = "request.other"
     elif mutation == "inner_id":
         payload["response"]["requestId"] = "request.other"
-    elif mutation == "open_proposal":
-        payload["response"]["proposals"] = [{"toolId": "runtime_stop"}]
+    elif mutation == "removed_proposals":
+        payload["response"]["proposals"] = []
     else:
         payload["response"]["mutated"] = True
 

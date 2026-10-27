@@ -1,4 +1,5 @@
 #include <manyforge_deployment/io_provider_domain.hpp>
+#include <manyforge_deployment/ros2_control_execution_runtime_contract.hpp>
 
 #include "content_identity_internal.hpp"
 #include <algorithm>
@@ -83,8 +84,9 @@ Array member_rows(const core::CellGraphDTO &graph,
   return selected;
 }
 
-/// CP9 pose sources have no device-configured lifecycle limit field.
-constexpr core::Duration kPoseSourceLifecycleCommandTimeoutNs = 30'000'000'000;
+/// CP9 pose sources and AI models have no device-configured lifecycle limit
+/// field.
+constexpr core::Duration kModelFreeLifecycleCommandTimeoutNs = 30'000'000'000;
 
 struct Owner final {
   core::ProviderInstanceId instance;
@@ -219,17 +221,48 @@ CanonicalValue IoProviderDomainRecord(const core::ControlDomainDTO &domain) {
                          provider->lifecycle_command_timeout_ns))}})}});
 }
 
-// CP9: one provider domain per pose-source component. Its members are the
-// stream ids of its bindings; the configuration digest covers the whole row.
-static void derive_pose_source_domains(
+namespace {
+
+/// A model-free provider family with one provider domain per component:
+/// CP9 pose sources and AI models. Members are stream ids.
+struct ModelFreeDomainKind final {
+  std::string_view capability_id;
+  std::string_view manifest_id;
+  /// Typed refusal prefix and domain id prefix.
+  std::string_view kind;
+  std::string_view configuration_domain;
+  std::string_view configuration_api;
+};
+constexpr ModelFreeDomainKind kPoseSourceDomainKind{
+    "scene.pose.observe", core::kPoseSourceLifecycleManifestId, "pose_source",
+    "pose-source-configuration", "manyforge.pose_source_configuration.v1"};
+constexpr ModelFreeDomainKind kAiModelDomainKind{
+    kAiModelCapabilityId, core::kAiModelLifecycleManifestId, "ai_model",
+    "ai-model-configuration", "manyforge.ai_model_configuration.v1"};
+
+[[noreturn]] void refuse(const ModelFreeDomainKind &kind,
+                         std::string_view reason) {
+  throw std::invalid_argument(std::string(kind.kind) + std::string(reason));
+}
+
+struct ModelFreeSource final {
+  core::RuntimeUnitId runtime_unit_id;
+  core::ControllableComponentId controllable_component_id;
+  std::vector<std::string> stream_ids;
+  core::JsonValueDTO row;
+};
+
+} // namespace
+
+// One provider domain per component, owned through its target binding; the
+// configuration digest covers the whole unit row.
+static void derive_model_free_domains(
     const core::CellGraphDTO &graph,
     std::span<const core::CapabilityProviderBindingDTO> bindings,
     std::span<const QualifiedProviderManifest> manifests, bool structural_only,
+    const ModelFreeDomainKind &kind, const std::vector<ModelFreeSource> &sources,
     IoProviderDomainDerivation &result) {
-  const auto sources = ResolveRetainedPoseSources(graph);
-  if (!sources.ok())
-    throw std::invalid_argument(sources.error().details.at("reason"));
-  for (const auto &source : sources.value()) {
+  for (const auto &source : sources) {
     std::optional<Owner> owner;
     for (const auto &binding : bindings) {
       const auto *target =
@@ -238,10 +271,10 @@ static void derive_pose_source_domains(
       if (!target ||
           target->controllable_component_id !=
               source.controllable_component_id ||
-          binding.capability_id.value() != "scene.pose.observe")
+          binding.capability_id.value() != kind.capability_id)
         continue;
       if (!ValidateNonCoordinateProviderTarget(graph, binding).ok())
-        fail("pose_source_target_unqualified");
+        refuse(kind, "_target_unqualified");
       const auto manifest = std::find_if(
           manifests.begin(), manifests.end(), [&](const auto &value) {
             return value.value().provider_manifest_id ==
@@ -249,8 +282,7 @@ static void derive_pose_source_domains(
                    value.value().provider_manifest_revision ==
                        binding.provider_manifest_revision;
           });
-      if (binding.provider_manifest_id.value() !=
-              core::kPoseSourceLifecycleManifestId ||
+      if (binding.provider_manifest_id.value() != kind.manifest_id ||
           (!structural_only &&
            (manifest == manifests.end() ||
             !std::any_of(manifest->value().offered_capabilities.begin(),
@@ -261,16 +293,16 @@ static void derive_pose_source_domains(
                                   offer.capability_definition_revision ==
                                       binding.capability_definition_revision;
                          }))))
-        fail("pose_source_manifest_offer_mismatch");
+        refuse(kind, "_manifest_offer_mismatch");
       Owner candidate{binding.provider_instance_id, binding.provider_manifest_id,
                       binding.provider_manifest_revision,
                       core::EndpointRoleId("ros2_control_execution_status")};
       if (owner && *owner != candidate)
-        fail("pose_source_ownership_ambiguous");
+        refuse(kind, "_ownership_ambiguous");
       owner = std::move(candidate);
     }
     if (!owner)
-      fail("pose_source_ownership_missing");
+      refuse(kind, "_ownership_missing");
     const auto catalog =
         [&]() -> core::Result<core::BrandLifecyclePlanCatalogDTO> {
       if (!structural_only) {
@@ -290,12 +322,12 @@ static void derive_pose_source_domains(
                                                  owner->revision, plans.value());
     }();
     if (!catalog.ok())
-      fail("pose_source_lifecycle_catalog_unqualified");
+      refuse(kind, "_lifecycle_catalog_unqualified");
     const auto identity = content_identity::sha256_digest(canonical_json(
         Value(Object{{"runtime_unit_id", Value(source.runtime_unit_id.value())},
                      {"provider_instance_id",
                       Value(owner->instance.value())}})));
-    const core::ControlDomainId id("pose_source.provider." +
+    const core::ControlDomainId id(std::string(kind.kind) + ".provider." +
                                    identity.substr(7));
     core::ProviderControlDomainDTO provider{
         source.controllable_component_id,
@@ -305,12 +337,12 @@ static void derive_pose_source_domains(
         owner->revision,
         catalog.value().catalog_digest,
         core::ContentDigest(content_identity::framed_sha256(
-            "pose-source-configuration", "manyforge.pose_source_configuration.v1",
+            kind.configuration_domain, kind.configuration_api,
             json_value(source.row))),
         source.stream_ids,
-        kPoseSourceLifecycleCommandTimeoutNs};
+        kModelFreeLifecycleCommandTimeoutNs};
     if (!provider.locally_valid())
-      fail("pose_source_domain_invalid");
+      refuse(kind, "_domain_invalid");
     core::ControlDomainDTO domain{
         id,
         core::ControlDomainRevision("sha256:" + std::string(64, '0')),
@@ -326,6 +358,36 @@ static void derive_pose_source_domains(
              detail::ContentIdentityRootShape::kNestedRecord}));
     result.provider_domains.push_back(std::move(domain));
   }
+}
+
+static void derive_pose_source_and_ai_model_domains(
+    const core::CellGraphDTO &graph,
+    std::span<const core::CapabilityProviderBindingDTO> bindings,
+    std::span<const QualifiedProviderManifest> manifests, bool structural_only,
+    IoProviderDomainDerivation &result) {
+  const auto poses = ResolveRetainedPoseSources(graph);
+  if (!poses.ok())
+    throw std::invalid_argument(poses.error().details.at("reason"));
+  std::vector<ModelFreeSource> pose_rows;
+  for (const auto &source : poses.value())
+    pose_rows.push_back({source.runtime_unit_id,
+                         source.controllable_component_id, source.stream_ids,
+                         source.row});
+  derive_model_free_domains(graph, bindings, manifests, structural_only,
+                            kPoseSourceDomainKind, pose_rows, result);
+  const auto models = ResolveRetainedAiModels(graph);
+  if (!models.ok())
+    throw std::invalid_argument(models.error().details.at("reason"));
+  std::vector<ModelFreeSource> model_rows;
+  for (const auto &model : models.value())
+    model_rows.push_back(
+        {model.runtime_unit_id,
+         model.controllable_component_id,
+         {std::string(
+             ros2_control_execution_runtime_contract::kAiModelStreamId)},
+         model.row});
+  derive_model_free_domains(graph, bindings, manifests, structural_only,
+                            kAiModelDomainKind, model_rows, result);
 }
 
 static core::Result<IoProviderDomainDerivation>
@@ -373,6 +435,7 @@ derive_domains(const core::CellGraphDTO &graph,
       const bool ros_connection =
           profile == "ros_bool" || profile == "ros_set_bool" ||
           profile == "ur_io_states" || profile == "ur_set_io" ||
+          profile == "xarm_digital" ||
           profile == "ros2_control_gpio";
       // A ROS I/O connection owns its actual component and lifecycle. A
       // separate provider domain inside a physical controller component would
@@ -433,8 +496,8 @@ derive_domains(const core::CellGraphDTO &graph,
     }
     if (groups.size() != devices.value().size())
       fail("io_provider_device_policy_coverage_mismatch");
-    derive_pose_source_domains(graph, bindings, manifests, structural_only,
-                               result);
+    derive_pose_source_and_ai_model_domains(graph, bindings, manifests,
+                                            structural_only, result);
     for (const auto &[key, group] : groups) {
       const auto device = std::find_if(
           devices.value().begin(), devices.value().end(), [&](const auto &row) {

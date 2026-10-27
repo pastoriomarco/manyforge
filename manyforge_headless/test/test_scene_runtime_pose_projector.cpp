@@ -837,9 +837,7 @@ TEST(SceneRuntimePoseProjector, FixedLinkTransformFollowsOnlyFixedJoints) {
   EXPECT_EQ(unknown.error().code, "scene_runtime_pose_reference_link_unknown");
 }
 
-core::CarriedObjectGraspLostCheckDTO GraspCheck(const core::Pose3DTO &attach) {
-  return {{0.03, 0.26}, attach};
-}
+core::CarriedObjectGraspLostCheckDTO GraspCheck() { return {{0.03, 0.26}}; }
 
 core::Pose3DTO YawPose(const double x, const double yaw) {
   return {{x, 0.0, 0.05}, {0.0, 0.0, std::sin(yaw / 2.0), std::cos(yaw / 2.0)}};
@@ -905,7 +903,7 @@ TEST(SceneRuntimePoseProjector, RelativeGraspLostComparesWithTheFirstMeasuredOff
     const core::CellId cell_id("cell.1");
     FakeSceneAuthority scene;
     const auto attach_offset = YawPose(-0.006, std::acos(-1.0));
-    AttachInSnapshot(scene, attach_offset, GraspCheck(attach_offset));
+    AttachInSnapshot(scene, attach_offset, GraspCheck());
     std::size_t calls = 0U;
     StopRecorder stops;
     SceneRuntimePoseProjector projector(scene, cell_id, TcpAboveReference(calls),
@@ -913,7 +911,7 @@ TEST(SceneRuntimePoseProjector, RelativeGraspLostComparesWithTheFirstMeasuredOff
     const auto apply = [&](const std::uint64_t sequence, const double x,
                            const double yaw) {
       // The fake's snapshot follows each committed projection revision.
-      AttachInSnapshot(scene, attach_offset, GraspCheck(attach_offset));
+      AttachInSnapshot(scene, attach_offset, GraspCheck());
       return projector.Apply(
           std::vector{Provider(cell_id)}, scene.projection.retained_bundle_id,
           scene.projection.graph_revision,
@@ -946,7 +944,7 @@ TEST(SceneRuntimePoseProjector, LostSampleReappliedForPlanningRetainsEvidence) {
   const core::CellId cell_id("cell.1");
   FakeSceneAuthority scene;
   const auto attach_offset = YawPose(0.02, 0.0);
-  AttachInSnapshot(scene, attach_offset, GraspCheck(attach_offset));
+  AttachInSnapshot(scene, attach_offset, GraspCheck());
   std::size_t calls = 0U;
   StopRecorder stops;
   SceneRuntimePoseProjector projector(scene, cell_id, TcpAboveReference(calls),
@@ -960,7 +958,7 @@ TEST(SceneRuntimePoseProjector, LostSampleReappliedForPlanningRetainsEvidence) {
   const auto baseline =
       apply(Newer(Observation(ReferencedPayload(true, true, 0.02, 0.0)), 2U));
   ASSERT_TRUE(baseline.ok()) << baseline.error().message;
-  AttachInSnapshot(scene, attach_offset, GraspCheck(attach_offset));
+  AttachInSnapshot(scene, attach_offset, GraspCheck());
   const auto lost_sample =
       Newer(Observation(ReferencedPayload(true, true, 0.08, 0.0)), 3U);
   ExpectLostStoppedThenDetached(apply(lost_sample), scene, stops,
@@ -982,7 +980,7 @@ TEST(SceneRuntimePoseProjector, ContinuousGraspLostComparesWithTheFirstMeasuredO
   const core::CellId cell_id("cell.1");
   FakeSceneAuthority scene;
   scene.pose = core::Pose3DTO{{0.25, -0.5, 0.75}, {}};
-  AttachInSnapshot(scene, {}, GraspCheck({}));
+  AttachInSnapshot(scene, {}, GraspCheck());
   StopRecorder stops;
   SceneRuntimePoseProjector projector(scene, cell_id, {}, stops.Requester(scene));
   const auto apply = [&](const std::uint64_t sequence, const double x) {
@@ -995,11 +993,11 @@ TEST(SceneRuntimePoseProjector, ContinuousGraspLostComparesWithTheFirstMeasuredO
   ASSERT_TRUE(first.ok()) << first.error().message;
   EXPECT_EQ(first.value().status, SceneRuntimePoseApplicationStatus::kCommitted);
   // As the scene owner does: the committed offset is the measured one.
-  AttachInSnapshot(scene, core::Pose3DTO{{0.05, 0.0, 0.0}, {}}, GraspCheck({}));
+  AttachInSnapshot(scene, core::Pose3DTO{{0.05, 0.0, 0.0}, {}}, GraspCheck());
   const auto within = apply(3U, 0.31);
   ASSERT_TRUE(within.ok()) << within.error().message;
   EXPECT_TRUE(stops.requests.empty());
-  AttachInSnapshot(scene, core::Pose3DTO{{0.05, 0.0, 0.0}, {}}, GraspCheck({}));
+  AttachInSnapshot(scene, core::Pose3DTO{{0.05, 0.0, 0.0}, {}}, GraspCheck());
   const auto lost = apply(4U, 0.40);
   ExpectLostStoppedThenDetached(
       lost, scene, stops, core::Pose3DTO{{0.40, -0.5, 0.75}, {0.0, 0.0, 0.0, 1.0}},
@@ -1010,7 +1008,7 @@ TEST(SceneRuntimePoseProjector, ContinuousGraspLostComparesWithTheFirstMeasuredO
   ASSERT_TRUE(world.ok()) << world.error().message;
   EXPECT_EQ(world.value().status, SceneRuntimePoseApplicationStatus::kCommitted);
   scene.pose = core::Pose3DTO{{0.25, -0.5, 0.75}, {}};
-  AttachInSnapshot(scene, {}, GraspCheck({}));
+  AttachInSnapshot(scene, {}, GraspCheck());
   const auto reattached = apply(6U, 0.40);
   ASSERT_TRUE(reattached.ok()) << reattached.error().message;
   EXPECT_EQ(stops.requests.size(), 1U);
@@ -1033,7 +1031,7 @@ TEST(SceneRuntimePoseProjector, GraspLostCheckOnlyForMeasuredOffsetPolicies) {
       const core::CellId cell_id("cell.1");
       FakeSceneAuthority scene;
       AttachInSnapshot(scene, {},
-                       checked ? std::optional(GraspCheck({})) : std::nullopt);
+                       checked ? std::optional(GraspCheck()) : std::nullopt);
       SceneRuntimePoseProjector projector(scene, cell_id);
       const auto result = projector.Apply(
           std::vector{Provider(cell_id)}, scene.projection.retained_bundle_id,

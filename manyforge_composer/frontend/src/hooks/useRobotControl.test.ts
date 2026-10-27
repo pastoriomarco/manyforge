@@ -387,6 +387,22 @@ describe('pneumatic manual availability observation', () => {
     vi.restoreAllMocks();
     vi.unstubAllGlobals();
   });
+  it('disables mapped pneumatic manual control while a Program is running or held', async () => {
+    const status = pneumaticStatus();
+    Object.assign(status.directControlGripper!.targetDescriptor, {
+      completionPolicy: 'no_output', pneumaticOutputs: [{ controllableComponentId: 'valve_io',
+        signalName: 'valve', openValue: false, closeValue: true }],
+    });
+    const snapshot = { executionControlStatus: status, authoringAdmission: { admissionGeneration: 1 },
+      programCycle: { programRunnerOwnerEpoch: 'runner.1', programRunId: 'program.1', cycleGeneration: 1,
+        state: 'running', executionControlRevision: 1,
+        runtimeControls: { executionSelections: { selectionRevision: 1, groups: [] } } },
+    } as unknown as ComposerHeadlessState;
+    await render(snapshot);
+    await act(async () => { latest.selectMode('gripper'); latest.setManualPanelVisible(true); });
+    expect(latest.manualControlAllowed).toBe(false);
+    expect(latest.manualControlUnavailableReason).toContain('idle after Reset');
+  });
   it('refuses a missing current observation when a pneumatic target becomes Position', async () => {
     const snapshot = { executionControlStatus: pneumaticStatus(), authoringAdmission: { admissionGeneration: 1 },
       programCycle: { programRunnerOwnerEpoch: 'runner.1', programRunId: 'program.1', cycleGeneration: 1,

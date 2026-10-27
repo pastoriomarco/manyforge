@@ -76,6 +76,7 @@ def _client_applied() -> dict[str, object]:
         "scenario_id": "cell-pick",
         "project_path": "/projects/cell-pick.scenario",
         "schema_version": "manyforge.applied_program_selection.v3",
+        "simulation_scene": None,
         "source": {
             "record_digest": "sha256:" + "2" * 64,
             "semantic_content_digest": "sha256:" + "3" * 64,

@@ -19,7 +19,6 @@ from manyforge_behavior.orchestration_ports import (
 from manyforge_ros.program_simulation_port import (
     SimulationProgramSiteConfig,
     SimulationProgramTaskPort,
-    SimulationScenarioSiteConfig,
     load_simulation_program_site_config,
 )
 
@@ -33,20 +32,24 @@ def _site() -> SimulationProgramSiteConfig:
     return SimulationProgramSiteConfig(
         service_prefix="/isaacsim",
         service_timeout_s=2.0,
-        scenarios=(
-            SimulationScenarioSiteConfig(
-                scenario_id="isaac-cell",
-                cell_frame_id="world",
-                scene_entities={"part": "/World/retained_part"},
-            ),
-        ),
     )
+
+
+_SIMULATION_SCENE = {
+    "cell_frame_id": "world",
+    "scene_entities": [
+        {"entity": "/World/retained_part", "scene_resource_id": "part"},
+        # An orphan link (object not declared by the Program) is ignored.
+        {"entity": "/World/elsewhere", "scene_resource_id": "zz_orphan"},
+    ],
+}
 
 
 def _context(
     *,
     program_run_id: str = "run.simulation",
     scene_resources: tuple[str, ...] = ("part",),
+    simulation_scene: dict[str, object] | None = _SIMULATION_SCENE,
 ) -> ProgramRunPortContext:
     return ProgramRunPortContext(
         program_run_id=program_run_id,
@@ -67,6 +70,7 @@ def _context(
                 for resource_id in scene_resources
             ],
         },
+        simulation_scene=simulation_scene,
         program_binding={
             "program_binding_id": _DIGEST_C,
             "program_id": "simulation_program",
@@ -146,19 +150,7 @@ def test_site_config_is_strict_canonical_and_rejects_symlinks(
     tmp_path: Path,
 ) -> None:
     value = {
-        "api_version": "manyforge.simulation_program_site_config.v1",
-        "scenarios": [
-            {
-                "cell_frame_id": "world",
-                "scenario_id": "isaac-cell",
-                "scene_entities": [
-                    {
-                        "entity": "/World/retained_part",
-                        "scene_resource_id": "part",
-                    }
-                ],
-            }
-        ],
+        "api_version": "manyforge.simulation_program_site_config.v2",
         "service_prefix": "/isaacsim",
         "service_timeout_s": 2.0,
     }
@@ -176,15 +168,13 @@ def test_site_config_is_strict_canonical_and_rejects_symlinks(
     path.write_text('{"api_version":1,"api_version":2}', encoding="utf-8")
     with pytest.raises(ValueError, match="duplicate JSON field"):
         load_simulation_program_site_config(path)
-    with pytest.raises(ValueError, match="must not alias"):
-        SimulationScenarioSiteConfig(
-            scenario_id="isaac-cell",
-            cell_frame_id="world",
-            scene_entities={
-                "first": "/World/shared",
-                "second": "/World/shared",
-            },
-        )
+    # v1 carried the per-scenario entity mapping; it is refused.
+    path.write_text(
+        json.dumps({**value, "scenarios": []}),
+        encoding="utf-8",
+    )
+    with pytest.raises(ValueError, match="unknown or missing fields"):
+        load_simulation_program_site_config(path)
 
 
 def test_program_tasks_translate_all_four_nodes_without_blocking_ticks() -> None:
@@ -297,22 +287,66 @@ def test_cancel_fences_late_results_and_context_cleanup_waits_for_settlement() -
     port.close()
 
 
+def _entity_pose(resource_id: str, frame_ref: dict[str, object]) -> OwnerNodeInputs:
+    return OwnerNodeInputs(
+        parameters={
+            "scene_resource_id": resource_id,
+            "pose": {
+                "frame_ref": frame_ref,
+                "position_m": [0.0, 0.0, 0.0],
+                "orientation": {"rpy_deg": [0.0, 0.0, 0.0]},
+            },
+        }
+    )
+
+
 def test_entity_motion_requires_declared_and_explicitly_mapped_identity() -> None:
-    port = SimulationProgramTaskPort(_ControlClient(), _site())
+    client = _ControlClient()
+    port = SimulationProgramTaskPort(client, _site())
     port.bind(_context(scene_resources=("part", "unmapped")))
     with pytest.raises(ValueError, match="no simulator entity mapping"):
         port.start(
             "simulation.set_entity_pose",
             _identity(),
-            OwnerNodeInputs(
-                parameters={
-                    "scene_resource_id": "unmapped",
-                    "pose": {
-                        "frame_ref": {"kind": "cell_frame"},
-                        "position_m": [0.0, 0.0, 0.0],
-                        "orientation": {"rpy_deg": [0.0, 0.0, 0.0]},
-                    },
-                }
+            _entity_pose("unmapped", {"kind": "cell_frame"}),
+        )
+    # The orphan link is not a declared resource of this Program.
+    with pytest.raises(ValueError, match="not declared by the Program"):
+        port.start(
+            "simulation.set_entity_pose",
+            _identity(2),
+            _entity_pose("zz_orphan", {"kind": "cell_frame"}),
+        )
+    started = port.start(
+        "simulation.set_entity_pose",
+        _identity(3),
+        _entity_pose("part", {"kind": "cell_frame"}),
+    )
+    assert _settled(port, started.task_id).state is OwnerTaskState.SUCCEEDED
+    assert client.calls[0][1][0] == "/World/retained_part"
+    assert client.calls[0][1][1]["frame_id"] == "world"
+    port.close()
+
+
+def test_cell_frame_without_simulation_links_fails_the_node_typed() -> None:
+    client = _ControlClient()
+    port = SimulationProgramTaskPort(client, _site())
+    port.bind(_context(simulation_scene=None))
+    refused = port.start(
+        "simulation.set_entity_pose",
+        _identity(),
+        _entity_pose("part", {"kind": "cell_frame"}),
+    )
+    assert refused.state is OwnerTaskState.FAILED
+    assert refused.reason_code == "simulation_cell_frame_unavailable"
+    with pytest.raises(ValueError, match="no simulator entity mapping"):
+        port.start(
+            "simulation.set_entity_pose",
+            _identity(2),
+            _entity_pose(
+                "part",
+                {"kind": "target_frame", "target_role": "arm", "frame_role": "base"},
             ),
         )
+    assert client.calls == []
     port.close()

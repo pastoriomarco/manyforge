@@ -9,7 +9,12 @@
 #   - Keep ROS Python packages apt-managed while ManyForge application deps live
 #     in a pinned venv with --system-site-packages.
 #   - Provide the production-shaped integration image for Isaac Sim, ROS drivers,
-#     and simulator/robot adapter validation.
+#     and simulator/robot adapter validation, including the pinned controller
+#     overlay (stock JTC 6.10.0) and the UFactory xArm driver.
+#
+# Build and start (see docs/operations/DEVELOPMENT_WORKBENCH.md):
+#   ./scripts/compose-dev.sh build
+#   ./scripts/compose-dev.sh start
 #
 # Runtime/product availability is defined by the selected entrypoint, not by
 # this toolchain image or a successful build.
@@ -341,8 +346,9 @@ RUN set -eux; \
     printf '%s\n' "aa9f9ef9525a60f8becea322537dd1d6d1bf9123" > /opt/manyforge/topic_based_ros2_control/install/UPSTREAM_COMMIT; \
     rm -rf /tmp/topic_based_ros2_control_ws
 
-# Vendor data only: no xarm driver, messages, launch stack or hardware process.
-# Keep the exact previously qualified description revision independently pinned.
+# Description data only, for the test lanes' data overlay (scripts/test-all.sh).
+# The xArm driver is built separately below. Keep this exact previously
+# qualified description revision independently pinned.
 ARG XARM_DESCRIPTION_REPO=https://github.com/pastoriomarco/xarm_ros2
 ARG XARM_DESCRIPTION_REF=c3172e57c1c1bb2982fc008304ad6bc886357c87
 RUN set -eux; \
@@ -363,6 +369,80 @@ RUN set -eux; \
     printf '%s\n' "c3172e57c1c1bb2982fc008304ad6bc886357c87" \
       > /opt/manyforge/xarm_description/install/VENDOR_COMMIT; \
     rm -rf /tmp/xarm_description_ws
+
+# --- ROS dependency overlays used by every lane (Mock, Isaac, Real) ---
+# The entrypoint sources them in this order: xArm driver, ur_msgs, controller
+# overlay last. Every source is pinned by commit.
+RUN apt-get update && apt-get install -y --no-install-recommends \
+        ros-${ROS_DISTRO}-launch-param-builder \
+        ros-${ROS_DISTRO}-robot-state-publisher \
+        ros-${ROS_DISTRO}-urdf \
+    && rm -rf /var/lib/apt/lists/*
+
+# Stock JTC 6.10.0 controller overlay: apt ros2_control plus source JTC 6.10.0
+# (ros2_controllers tag 6.10.0), realtime_tools 5.4.0 and ros2_control_cmake 1.0.0.
+ARG ROS2_CONTROL_CMAKE_COMMIT=10b9df0d804c2880e7dc50927f8fd82c7198bda4
+ARG REALTIME_TOOLS_COMMIT=f2f8ee08580659e0ee673a8cdbd1a83b274e9d4a
+ARG ROS2_CONTROLLERS_COMMIT=0c702e0e938f94a9cc04c45e014ffdc4667f940e
+RUN set -euo pipefail; \
+    export PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin; \
+    ws=/tmp/control_overlay_ws; mkdir -p "${ws}/src"; \
+    fetch() { \
+      git init -q "${ws}/src/$1"; \
+      git -C "${ws}/src/$1" fetch -q --depth 1 "https://github.com/ros-controls/$1" "$2"; \
+      git -C "${ws}/src/$1" checkout -q FETCH_HEAD; \
+      test "$(git -C "${ws}/src/$1" rev-parse HEAD)" = "$2"; \
+    }; \
+    fetch ros2_control_cmake "${ROS2_CONTROL_CMAKE_COMMIT}"; \
+    fetch realtime_tools "${REALTIME_TOOLS_COMMIT}"; \
+    fetch ros2_controllers "${ROS2_CONTROLLERS_COMMIT}"; \
+    set +u; source "/opt/ros/${ROS_DISTRO}/setup.bash"; set -u; \
+    cd "${ws}"; \
+    colcon build --install-base /opt/manyforge/control_overlay \
+        --packages-select ros2_control_cmake realtime_tools joint_trajectory_controller \
+        --cmake-args -DCMAKE_BUILD_TYPE=Release -DBUILD_TESTING=OFF; \
+    printf 'ros2_control_cmake %s\nrealtime_tools %s\nros2_controllers %s\n' \
+        "${ROS2_CONTROL_CMAKE_COMMIT}" "${REALTIME_TOOLS_COMMIT}" "${ROS2_CONTROLLERS_COMMIT}" \
+        > /opt/manyforge/control_overlay/UPSTREAM_COMMITS; \
+    rm -rf "${ws}"
+
+# ur_msgs 2.6.0 (I/O messages used by the ROS boolean input/output providers).
+ARG UR_MSGS_COMMIT=3c584014d9b228e0b2da819db0ca1d887c373e1d
+RUN set -euo pipefail; \
+    export PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin; \
+    ws=/tmp/ur_msgs_ws; mkdir -p "${ws}/src"; \
+    git init -q "${ws}/src/ur_msgs"; \
+    git -C "${ws}/src/ur_msgs" fetch -q --depth 1 https://github.com/ros-industrial/ur_msgs "${UR_MSGS_COMMIT}"; \
+    git -C "${ws}/src/ur_msgs" checkout -q FETCH_HEAD; \
+    test "$(git -C "${ws}/src/ur_msgs" rev-parse HEAD)" = "${UR_MSGS_COMMIT}"; \
+    set +u; source "/opt/ros/${ROS_DISTRO}/setup.bash"; set -u; \
+    cd "${ws}"; \
+    colcon build --install-base /opt/manyforge/ur_msgs/install --packages-select ur_msgs \
+        --cmake-args -DCMAKE_BUILD_TYPE=Release -DBUILD_TESTING=OFF; \
+    printf 'ur_msgs %s\n' "${UR_MSGS_COMMIT}" > /opt/manyforge/ur_msgs/install/UPSTREAM_COMMITS; \
+    rm -rf "${ws}"
+
+# UFactory xArm driver (xArm 5/6/7, Lite 6, UF850), unmodified, from the fork
+# branch `lyrical-no-gazebo`, built against the controller overlay above.
+ARG XARM_SOURCE_REPOSITORY=https://github.com/pastoriomarco/xarm_ros2
+ARG XARM_SOURCE_COMMIT=ef7351f90e451a37ef73de69c643b7e85040401a
+ARG XARM_SDK_COMMIT=f36794320a285c0b4bf1cd8ef181cbff6e3b794a
+RUN set -euo pipefail; \
+    export PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin; \
+    ws=/opt/manyforge/xarm_ws; mkdir -p "${ws}/src"; \
+    git clone -q "${XARM_SOURCE_REPOSITORY}" "${ws}/src/xarm_ros2"; \
+    cd "${ws}/src/xarm_ros2"; \
+    git checkout -q "${XARM_SOURCE_COMMIT}"; \
+    git submodule update --init --recursive -q; \
+    test "$(git -C xarm_sdk/cxx rev-parse HEAD)" = "${XARM_SDK_COMMIT}"; \
+    printf 'xarm_ros2 %s\nxarm_sdk %s\n' "$(git rev-parse HEAD)" "${XARM_SDK_COMMIT}" > "${ws}/UPSTREAM_COMMITS"; \
+    rm -rf .git xarm_sdk/cxx/.git; \
+    set +u; source "/opt/ros/${ROS_DISTRO}/setup.bash"; \
+    source /opt/manyforge/control_overlay/setup.bash; set -u; \
+    cd "${ws}"; \
+    colcon build --packages-up-to xarm_controller xarm_api uf_ros_lib \
+        --cmake-args -DCMAKE_BUILD_TYPE=Release -DBUILD_TESTING=OFF; \
+    rm -rf build log
 
 
 # The venv distributions are the sole RoboPlan runtime/CMake prefix. The

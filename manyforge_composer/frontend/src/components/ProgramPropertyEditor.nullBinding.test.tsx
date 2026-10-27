@@ -56,6 +56,30 @@ function render(
 }
 
 describe('ProgramPropertyEditor without a compiled binding', () => {
+  it('offers gripper input keys from the selected target in the Deployment Draft', () => {
+    const deployment = trialEDeployment();
+    const robot = (deployment.components as Array<Record<string, JsonValue>>)[0];
+    const configuration = (robot.configuration as Record<string, JsonValue>).runtime_configuration as Record<string, JsonValue>;
+    configuration.gripper_target_configurations = [{
+      controllable_component_id: 'lite6_robot', command_target_id: 'gripper',
+      actuation_kind: 'pneumatic', output_mode: 'commanded', pneumatic_io: {
+        outputs: [{ signal: { controllable_component_id: 'station_io', signal_name: 'clamp' }, open_value: false, close_value: true }],
+        inputs: { workpiece_grasped: { signal: { controllable_component_id: 'station_io', signal_name: 'probe_contact' } } },
+      },
+    }];
+    const catalog = entry('gripper.command_position', [param('target_role'), param('required_inputs', {
+      type: 'array', maxItems: 4, items: { type: 'object', additionalProperties: false,
+        required: ['input', 'value'], properties: { input: { type: 'string', enum: ['open', 'closed', 'pressure', 'workpiece_grasped'] }, value: { type: 'boolean' } } },
+    })]);
+    const node: ProgramTreeNode = { node_id: 'gripper.command_position', instance_id: 'close', children: [],
+      parameters: { target_role: 'gripper', required_inputs: [{ input: 'pressure', value: false }] } };
+    const html = render(node, catalog, trialEAssignment, {}, deployment);
+    expect(html).toContain('Workpiece grasped');
+    expect(html).toContain('Pressure (not declared for this gripper)');
+    expect(html).toContain('read again to confirm');
+    expect(html).not.toContain('Open expected value');
+  });
+
   it('shows the Deployment speed maximum of the resolved robot target', () => {
     const descriptor = { ...statusFixture().directControl!.targetDescriptor,
       controllableComponentId: 'lite6_robot', commandTargetId: 'arm',

@@ -451,9 +451,36 @@ TEST(AddressedObservedStatePublicationTest,
 
   auto rebound = publication.query_context();
   rebound.control_route_id = ControlRouteId("route-b");
-  const auto result = publication.rebind_route_context(std::move(rebound), 110);
-  ASSERT_FALSE(result.ok());
-  EXPECT_EQ(result.error().details.at("reason"), "observed_state_route_rebind_not_permitted");
+  // CP8 step 1: the route identity may change, but the measurement is never
+  // re-stamped; the new route has no state until a fresh measurement.
+  ASSERT_TRUE(publication.rebind_route_context(rebound, 110).ok());
+  EXPECT_EQ(publication.query_context().control_route_id, ControlRouteId("route-b"));
+  const auto stranded = publication.current_state(publication.query_context(), 110);
+  ASSERT_FALSE(stranded.ok());
+  EXPECT_EQ(stranded.error().details.at("reason"),
+            "observed_state_context_not_current_at_evaluation_time");
+  EXPECT_FALSE(publication
+                   .publication(publication.query_context().control_binding_id,
+                                publication.query_context().control_binding_revision)
+                   .ok());
+  // The same identity is a no-op; a negative transition time still refuses.
+  EXPECT_TRUE(publication.rebind_route_context(rebound, 111).ok());
+  auto other = rebound;
+  other.control_route_id = ControlRouteId("route-c");
+  const auto refused = publication.rebind_route_context(other, -1);
+  ASSERT_FALSE(refused.ok());
+  EXPECT_EQ(refused.error().details.at("reason"), "observed_state_route_rebind_not_permitted");
+
+  const std::array fresh{0.2};
+  ASSERT_TRUE(publication
+                  .publish(ObservedStateSourceKind::kJointState, names, fresh,
+                           std::span<const double>{}, 112, 112)
+                  .published);
+  const auto current = publication.current_state(publication.query_context(), 112);
+  ASSERT_TRUE(current.ok()) << current.error().message;
+  EXPECT_EQ(current.value().control_route_id, ControlRouteId("route-b"));
+  EXPECT_EQ(current.value().received_timestamp_ns, 112);
+  EXPECT_DOUBLE_EQ(std::get<AngularPositionDTO>(current.value().positions.front()).value_rad, 0.2);
 }
 
 TEST(AddressedObservedStatePublicationTest, AllowsLegacyProjectionOnlyForProvenAllAngularTarget) {

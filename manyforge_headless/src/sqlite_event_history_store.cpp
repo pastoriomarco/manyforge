@@ -208,10 +208,14 @@ std::string SqliteDetail(sqlite3 *database, const int result) {
                              : sqlite3_errmsg(database);
 }
 
+const char *SqliteCapacityCode(const int result, const char *fallback) {
+  return result == SQLITE_FULL ? "historian_storage_full" : fallback;
+}
+
 void Check(sqlite3 *database, const int result,
            const std::string_view operation) {
   if (result != SQLITE_OK) {
-    StoreFail("historian_storage_failure",
+    StoreFail(SqliteCapacityCode(result, "historian_storage_failure"),
               std::string(operation) + ": " + SqliteDetail(database, result));
   }
 }
@@ -224,7 +228,9 @@ void Exec(sqlite3 *database, const std::string &sql) {
     const std::string detail =
         error == nullptr ? SqliteDetail(database, result) : error;
     sqlite3_free(error);
-    StoreFail(result == SQLITE_BUSY || result == SQLITE_LOCKED ? "historian_storage_busy" : "historian_storage_failure",
+    StoreFail(SqliteCapacityCode(result, result == SQLITE_BUSY || result == SQLITE_LOCKED
+                                             ? "historian_storage_busy"
+                                             : "historian_storage_failure"),
               "execute SQLite statement: " + detail);
   }
 }
@@ -327,10 +333,10 @@ public:
     if (result == SQLITE_DONE) {
       return false;
     }
-    StoreFail(result == SQLITE_INTERRUPT ? "historian_query_budget_exceeded" :
+    StoreFail(SqliteCapacityCode(result, result == SQLITE_INTERRUPT ? "historian_query_budget_exceeded" :
               result == SQLITE_BUSY || result == SQLITE_LOCKED
                   ? "historian_storage_busy"
-                  : "historian_storage_failure",
+                  : "historian_storage_failure"),
               "step SQLite statement: " + SqliteDetail(database_, result));
   }
 
@@ -722,7 +728,7 @@ public:
         sqlite3_close(database_);
         database_ = nullptr;
       }
-      StoreFail("historian_storage_failure",
+      StoreFail(SqliteCapacityCode(result, "historian_storage_failure"),
                 "open historian database: " + detail);
     }
     try {
@@ -1152,6 +1158,11 @@ private:
     int log_pages = 0;
     int checkpointed = 0;
     const auto result = sqlite3_wal_checkpoint_v2(database_, "main", mode, &log_pages, &checkpointed);
+    // The passive checkpoint runs after commit, so it cannot report a
+    // committed append as failed. Required checkpoints run before writes.
+    if (result == SQLITE_FULL && mode != SQLITE_CHECKPOINT_PASSIVE) {
+      StoreFail("historian_storage_full", "checkpoint historian write-ahead log: " + SqliteDetail(database_, result));
+    }
     if (result != SQLITE_OK || log_pages != checkpointed) return false;
     if (mode != SQLITE_CHECKPOINT_PASSIVE) wal_pages_ = 0;
     return true;
@@ -1973,6 +1984,7 @@ private:
     try {
       Exec(database_, "INSERT INTO historian_search(historian_search,rank) VALUES('integrity-check',1)");
     } catch (const EventHistorianError &error) {
+      if (error.code() == "historian_storage_full") throw;
       StoreFail("historian_storage_corrupt", "historian search index differs from original records: " + std::string(error.what()));
     }
     static_cast<void>(Retention());

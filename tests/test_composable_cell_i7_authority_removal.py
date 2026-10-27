@@ -91,7 +91,9 @@ def test_production_surfaces_do_not_retain_legacy_authority_facades() -> None:
     assert offenders == []
 
 
-def test_low_level_xarm_command_gate_remains_only_at_the_i10_transport_seam() -> None:
+def test_low_level_xarm_command_gate_is_removed_with_the_supervised_mode() -> None:
+    # R7 package 5 (2026-10-25): the supervised xArm transport seam that kept
+    # the renewable command gate was removed with the supervised mode.
     xarm_roots = (
         REPO_ROOT / "manyforge_xarm_adapter/manyforge_xarm_adapter",
         REPO_ROOT / "manyforge_xarm_control/include",
@@ -105,9 +107,4 @@ def test_low_level_xarm_command_gate_remains_only_at_the_i10_transport_seam() ->
         and path.suffix in TEXT_SUFFIXES
         and "set_command_gate" in path.read_text(encoding="utf-8", errors="replace")
     }
-    assert actual == {
-        "manyforge_xarm_adapter/manyforge_xarm_adapter/binding.py",
-        "manyforge_xarm_control/include/manyforge_xarm_control/"
-        "xarm_ros_transport_session.hpp",
-        "manyforge_xarm_control/src/xarm_ros_transport_session.cpp",
-    }
+    assert actual == set()

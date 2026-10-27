@@ -1,5 +1,6 @@
 #pragma once
 
+#include <map>
 #include <optional>
 #include <string>
 #include <vector>
@@ -30,6 +31,10 @@ struct ActivationDeploymentIntent final {
   std::optional<CanonicalValue> compatibility;
   std::vector<ActivationDeploymentComponent> components;
   CanonicalValue normalized_root;
+  /// Optional `assistant_model_components`: assistant-profile model endpoint
+  /// alias -> the ai_model component serving it (only with an assistant
+  /// profile). The compiler resolves and checks every entry.
+  std::map<std::string, std::string, std::less<>> assistant_model_components{};
 };
 
 /// Parse one normalized authored Deployment intent and join it exactly to the

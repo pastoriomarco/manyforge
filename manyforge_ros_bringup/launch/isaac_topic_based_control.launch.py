@@ -119,9 +119,9 @@ def generate_launch_description() -> LaunchDescription:
                 "gripper_state_freshness_timeout_s",
                 default_value="",
                 description=(
-                    "Host-passed feedback staleness threshold [s] of the "
-                    "gripper target configuration; required when the gripper "
-                    "action adapter starts."
+                    "Host-passed feedback staleness threshold [s]: the "
+                    "budget of the component's gripper_feedback stream; "
+                    "required when the gripper action adapter starts."
                 ),
             ),
             DeclareLaunchArgument(

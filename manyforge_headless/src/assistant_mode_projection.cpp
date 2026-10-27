@@ -6,6 +6,7 @@
 #include <manyforge_core/types/assistant.hpp>
 #include <manyforge_deployment/artifact_codec.hpp>
 #include <manyforge_deployment/assistant_settings_codec.hpp>
+#include <manyforge_deployment/io_signal_catalog.hpp>
 #include <optional>
 #include <set>
 #include <string>
@@ -93,13 +94,29 @@ deployment::QualifiedAssistantSettings VerifyAssistantSettings(
          "the selected bundle has no assistant projection");
   }
   try {
-    return deployment::verify_retained_assistant_projection(*retained_assistant,
-                                                            bundle.external_resources);
+    return deployment::verify_retained_assistant_projection(*retained_assistant);
   } catch (const deployment::AssistantSettingsCodecError& error) {
     Fail("assistant_mode_projection_invalid",
          "retained assistant settings failed independent verification: " +
              std::string(error.what()));
   }
+}
+
+/// The AI model component serving one model alias: the row named by the
+/// alias's `external_resource_alias`, or none.
+std::optional<deployment::RetainedAiModelConfiguration> AiModel(
+    const deployment::RetainedBundle& active_bundle,
+    const core::AssistantModelEndpointAliasDTO& alias) {
+  const auto models = deployment::ResolveRetainedAiModels(active_bundle.value().cell_graph);
+  if (!models.ok()) {
+    Fail("assistant_mode_projection_invalid", "retained AI model rows are invalid");
+  }
+  for (const auto& row : models.value()) {
+    if (row.controllable_component_id.value() == alias.external_resource_alias.value()) {
+      return row;
+    }
+  }
+  return std::nullopt;
 }
 
 }  // namespace
@@ -128,6 +145,10 @@ CanonicalValue ProjectAssistantMode(const deployment::RetainedBundle& active_bun
   if (provider == nullptr || model == nullptr) {
     Fail("assistant_mode_projection_invalid",
          "verified mode aliases are not closed over retained settings");
+  }
+  const auto ai_model = AiModel(active_bundle, *model);
+  if (!ai_model.has_value()) {
+    Fail("assistant_ai_model_absent", "the selected bundle has no AI model component");
   }
 
   const auto& registry = qualified.instruments();
@@ -204,12 +225,18 @@ CanonicalValue ProjectAssistantMode(const deployment::RetainedBundle& active_bun
       {"graph_revision", CanonicalValue(bundle.cell_graph.graph_revision.value())},
       {"instrument_registry_digest", CanonicalValue(registry.registry_digest.value())},
       {"mode", CanonicalValue(mode->mode_id)},
-      {"model_endpoint", CanonicalValue(CanonicalValue::Object{
-                             {"model_endpoint_alias", CanonicalValue(model->model_endpoint_alias)},
-                             {"model_id", CanonicalValue(model->model_id)},
-                             {"request_contract",
-                              ModelRequestContract(model->request_contract)},
-                         })},
+      {"model_endpoint",
+       CanonicalValue(CanonicalValue::Object{
+           {"ai_model_component_id",
+            CanonicalValue(ai_model->controllable_component_id.value())},
+           {"api_key_env", ai_model->api_key_env.has_value()
+                               ? CanonicalValue(*ai_model->api_key_env)
+                               : CanonicalValue(nullptr)},
+           {"base_url", CanonicalValue(ai_model->base_url)},
+           {"model_endpoint_alias", CanonicalValue(model->model_endpoint_alias)},
+           {"model_id", CanonicalValue(model->model_id)},
+           {"request_contract", ModelRequestContract(model->request_contract)},
+       })},
       {"node_environment",
        CanonicalValue(CanonicalValue::Object{
            {"catalog_digest", CanonicalValue(environment.catalog_digest.value())},
@@ -253,7 +280,18 @@ CanonicalValue ProjectAssistantModeIndex(const deployment::RetainedBundle& activ
   }
 
   const auto& environment = bundle.catalogs.node_environment;
+  // The chat alias's component, when the bundle retains it.
+  const auto* chat = Find(settings.model_endpoint_aliases, "assistant_model",
+                          [](const auto& row) -> const std::string& {
+                            return row.model_endpoint_alias;
+                          });
+  const auto ai_model =
+      chat == nullptr ? std::optional<deployment::RetainedAiModelConfiguration>{}
+                      : AiModel(active_bundle, *chat);
   CanonicalValue result(CanonicalValue::Object{
+      {"ai_model_component_id",
+       ai_model.has_value() ? CanonicalValue(ai_model->controllable_component_id.value())
+                            : CanonicalValue(nullptr)},
       {"assistant_projection_digest", CanonicalValue(qualified.projection_digest().value())},
       {"graph_revision", CanonicalValue(bundle.cell_graph.graph_revision.value())},
       {"instrument_registry_digest",

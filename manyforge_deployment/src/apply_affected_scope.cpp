@@ -344,9 +344,12 @@ ProviderSources(const core::RetainedBundleDTO &bundle) {
     if (!provider)
       continue;
     ProviderFenceSource source{&domain, {}};
-    // CP9 pose sources: members are stream ids, no I/O signal or output.
+    // CP9 pose sources and AI models: members are stream ids, no I/O signal
+    // or output.
     if (provider->provider_manifest_id.value() ==
-        core::kPoseSourceLifecycleManifestId) {
+            core::kPoseSourceLifecycleManifestId ||
+        provider->provider_manifest_id.value() ==
+            core::kAiModelLifecycleManifestId) {
       result.emplace(domain.control_domain_id, std::move(source));
       continue;
     }

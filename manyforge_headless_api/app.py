@@ -373,6 +373,7 @@ def _error_status(code: str) -> int:
     ):
         return 409
     if "unavailable" in code or code in {
+        "assistant_ai_model_absent",
         "headless_api_closed",
         "kernel_owner_unavailable",
         "execution_owner_not_ready",

@@ -60,7 +60,7 @@ def test_cancelled_request_is_not_evicted_until_its_runner_finishes() -> None:
             source_label="test",
             correlation_id=None,
             conversation_id="conversation.1",
-            assistant_mode="query",
+            assistant_mode="composer-assistant",
         )
 
     async def scenario() -> None:

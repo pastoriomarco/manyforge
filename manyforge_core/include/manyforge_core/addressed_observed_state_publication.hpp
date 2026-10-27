@@ -48,8 +48,9 @@ class AddressedObservedStatePublication final : public IObservedStateProvider {
   /// Rebind only the route/configuration identity of a commanded or predicted
   /// source while retaining its exact physical source and numeric channel.
   /// The latest complete owner sample is republished at `transition_time_ns`
-  /// before the new context becomes visible. Measured authorities must instead
-  /// publish a fresh measurement through their owning adapter.
+  /// before the new context becomes visible. Measured authorities are never
+  /// re-stamped: their new context accepts only measurements published after
+  /// the rebind, so the owning adapter must publish a fresh measurement.
   [[nodiscard]] Result<void> rebind_route_context(ObservedStateQueryContextDTO query_context,
                                                   std::int64_t transition_time_ns);
 

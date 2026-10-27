@@ -1,93 +1,71 @@
-> **Historical reference only.** This contract describes the last committed full Composer/assistant interaction tree at `manyforge@08222188293df8e12f90dc72e204c21f22f92ea1` (tree `bc749b9879d3c8f36fe7bf3036f9cc1f2ef1e60f`). It is not a current API contract or qualification claim. The strict current wire is documented in `ASSISTANT_PROVIDER_CONTRACT_V1.md`; this file remains the frozen v0 behavioral reference. The current `scripts/regen-public-contracts.py` owns only `REST_API.md` and deliberately does not regenerate this file.
-
-<!--
-  FROZEN HISTORICAL GENERATED SNAPSHOT — DO NOT REGENERATE.
-  The metadata below records the former generator at the captured revision.
-  The current REST-only generator does not own or update this file.
-  Last regenerated: 2026-07-21 22:04:29 UTC
-  Former generator source: scripts/regen-public-contracts.py:gen_assistant_provider_contract
--->
-
 # Assistant Provider Contract
-Composer dispatches assistant requests to a *provider* HTTP service which speaks the `manyforge.assistant.provider_request.v0` envelope. Composer's lane registry is the owner of canonical provider IDs, aliases, routing, isolation, and default bridge ports.
 
-## Registered engine-backed lanes
+What ManyForge expects from the model server behind the AI tab, and how the
+pieces connect. The Composer-to-bridge wire is specified in
+[`ASSISTANT_PROVIDER_CONTRACT_V1.md`](ASSISTANT_PROVIDER_CONTRACT_V1.md).
+Setup steps: [`../operations/ASSISTANT_E2E_COOKBOOK.md`](../operations/ASSISTANT_E2E_COOKBOOK.md).
 
-| Canonical ID | Aliases | Port | Routing | Declared runtime | Declared isolation |
-|---|---|---:|---|---|---|
-| `direct` | `nemoclaw` | `8100` | `direct-vllm` | `nemoclaw` | `sandbox` |
-| `hermes` | — | `8300` | `hermes-sessions` | `nemoclaw` | `sandbox` |
-| `openclaw` | — | `8200` | `openclaw-gateway` | `nemoclaw` | `sandbox` |
+## Topology
 
-The in-tree `manyforge_assistant_bridge` implements the direct lane. NemoClaw-Thor supplies the OpenClaw and Hermes adapters. All registered lanes use the same provider envelope and remain subject to Composer's mode/catalog/authority checks. The runtime and isolation values are Composer catalog declarations, not live process-placement attestation: the standard in-tree launcher starts the direct bridge as a host peer, while a platform deployment may sandbox the same bridge. Verify the selected topology with the lane bring-up runbook and live process/health checks.
+| Part | Role |
+|---|---|
+| Model server (yours) | OpenAI-compatible HTTP server with tool calling. ManyForge never starts it. |
+| `ai_model` Deployment component | Names the server: `base_url`, `model`, optional `api_key_env` (a `MANYFORGE_AI_*` name). One or more per Deployment; `assistant_model_components` maps profile aliases to them (optional with exactly one). |
+| Assistant profile (`assistant_profile_id`) | Selects the mode (`composer-assistant`), its tools and allowed nodes, and the request limits. |
+| `manyforge_assistant_bridge` (`127.0.0.1:8100`) | Runs the bounded model loop; always started by the launcher. |
+| Composer | Serves the AI tab and the Draft tool callback (`/api/assistant/bridge/tools/{tool}`). |
+| Headless | Publishes the active assistant mode projection, including the model endpoint. |
 
-## Bridge HTTP routes (machine-introspected)
+## Model endpoint
 
-| Method | Path | Summary |
-|---|---|---|
-| `GET` | `/healthz` | Healthz |
-| `POST` | `/v1/manyforge/assistant` | Assistant |
-| `POST` | `/v1/manyforge/assistant/{request_id}/cancel` | Cancel Request |
-| `GET` | `/v1/sessions/stats` | Session Stats |
-| `POST` | `/v1/sessions/{conversation_id}/clear` | Clear Session |
+For every request the bridge reads the active mode projection. Its
+`model_endpoint` carries:
 
-## Envelope wire format
+| Field | Source |
+|---|---|
+| `ai_model_component_id` | The `ai_model` component that serves the mode's model alias |
+| `base_url` | Component `base_url` (the `/v1` root) |
+| `model_id` | Component `model` |
+| `api_key_env` | Component `api_key_env` (string or `null`) |
+| `request_contract` | Assistant profile (timeout, output tokens, tool-call family) |
 
-The request body sent by Composer to the provider on `POST /v1/manyforge/assistant`:
+The bridge then sends `POST {base_url}/chat/completions` with:
 
-```json
-{
-  "version": "manyforge.assistant.provider_request.v0",
-  "schemaVersion": "0.1.0",
-  "requestId": "<uuid>",
-  "conversationId": "<uuid>",
-  "principal": "<operator id>",
-  "assistantMode": "composer-assistant" | "query" | ...,
-  "message": "<user prompt>",
-  "tools": [ {"id": "...", "description": "...", "parameters": {...}}, ... ],
-  "constraints": { "mutatesState": bool, "requiresReview": bool, "proposalStatus": "draft", ... },
-  "context": { "catalogHash": "<sha256>", "programRevision": "...", ... },
-  "programSnapshot": { ... },
-  "sceneSnapshot": { ... },
-  "nodeCatalog": [ ... ],
-  "skillCatalog": [ ... ]
-}
-```
+- `model` = `model_id` (the served model name must match exactly);
+- `messages`, `tools` (exact owner-issued JSON schemas), `tool_choice: "auto"`,
+  `temperature: 0`, `max_tokens` from the request contract;
+- `Authorization: Bearer <value of $api_key_env>` when `api_key_env` is set.
+  An unset variable fails the request with `ai_model_token_unavailable`
+  before anything is sent.
 
-## Catalog-hash gate
+The response must be a standard non-streaming chat completion with one choice
+and OpenAI `tool_calls`. Any tool outside the active mode rejects the whole
+response (`response_rejected`).
 
-Every envelope carries a `context.catalogHash` computed by the shared protocol helper. Any provider implementation must validate the hash before executing tool calls; mismatch → HTTP 409 with `code: catalog_mismatch`. Hash function lives in:
+With the default `endpoint` stream setting (warning, auto), Prepare and Enable never refuse because of the model server. At runtime each
+`ai_model` component has one supervised stream, `endpoint` (probe every 2 s,
+budget 10 s, severity `warning`, recovery `auto`; override with a
+`policies.component_streams` row).
 
-  `manyforge_assistant_bridge/protocol.py:compute_catalog_hash`
+## Mode and tools
 
-Both the Composer manifest emitter and the bridge consumer compute the hash from the same canonical input shape, so byte-identical output is required across the wire.
+There is one mode, `composer-assistant`:
 
-## Provider response
+| Effect | Tools |
+|---|---|
+| Read | `catalog_read`, `deployment_capabilities_read`, `inspect_isaac_scene`, `program_read`, `scene_inspect`, `skills_read` |
+| Draft edit | `scene_draft_{add_object, update_object, upsert_objects, remove_objects}`, `tree_draft_{insert_node, update_node_params, delete_node, move_node, replace_subtree, change_node_kind, wrap_node, rename_node}`, `program_draft_{upsert,remove}_parameters`, `blackboard_draft_{upsert,remove}_{namespaces,keys}` |
 
-On success, the provider returns:
+- Draft edits go through Composer's Draft engine under the same revision
+  fences as manual edits. The user Applies, or Discards/Reverts, the Draft.
+  There is no proposal or accept step.
+- `tree_draft_insert_node` accepts only the profile's node allowlist (motion,
+  gripper, scene, logic, composites, timer, simulation nodes). Pick/place
+  planning nodes are not in it.
+- The model never gets the MCP operator adapter, and it cannot save, Apply,
+  run a Program or command a robot.
 
-```json
-{
-  "requestId": "<echo>",
-  "conversationId": "<echo>",
-  "providerId": "direct" | "openclaw" | "hermes" | "nemoclaw" | "...",
-  "message": "<final assistant text>",
-  "proposals": [ ... ],          // draft mutations the operator must accept
-  "toolCalls": [ ... ],          // executed callbacks (audit trail)
-  "warnings": [ ... ],
-  "draftMutated": bool,
-  "openclaw": { ... }            // optional provider-specific telemetry
-}
-```
+## Failures
 
-Errors return non-200 with:
-
-```json
-{ "requestId": "<echo>", "code": "<short_id>", "detail": "<human-readable>" }
-```
-
-## Code source
-
-- `manyforge_assistant_bridge/bridge.py` — direct lane provider (this repo).
-- `manyforge_assistant_bridge/protocol.py` — shared hashing helpers.
-- `manyforge_composer/backend/routes_assistant.py` — Composer-side   envelope assembly + tool-callback endpoints (`/api/assistant/chat`,   `/api/assistant/bridge/tools/<tool_id>`).
+Failures are typed `{code, message}` errors on the request status. See the
+cookbook's failure-code table.

@@ -81,7 +81,7 @@ function output(patch: Partial<IoSignalOutputDraft>): IoSignalRow {
     draft: {
       componentId: 'station', targetId: 'io', resourceRoleId: 'clamp', signalName: 'clamp',
       sourceId: 'clamp_service', profile: 'ros_set_bool', service: '/cell/clamp/set', channel: '',
-      pin: '0', topic: '', group: '', interfaceName: '', ...patch,
+      pin: '0', topic: '', group: '', interfaceName: '', robotComponentId: '', bank: 'tool', ...patch,
     },
   };
 }
@@ -98,6 +98,41 @@ function input(patch: Partial<IoSignalInputDraft>): IoSignalRow {
 }
 
 describe('io_signals configuration', () => {
+  it('round-trips xArm bank signals and checks their physical pin ranges', () => {
+    const selected = [
+      input({ profile: 'xarm_digital', robotComponentId: 'lite6_robot', bank: 'tool',
+        pin: '1', maximumAgeMs: '250', sourceId: 'tool_input' }),
+      output({ profile: 'xarm_digital', robotComponentId: 'lite6_robot', bank: 'tool',
+        pin: '4', sourceId: 'tool_output' }),
+    ];
+    expect(validateIoSignalRows(selected)).toBeNull();
+    const values = ioSignalRowsValue(selected);
+    expect(values[0]).toMatchObject({ freshness: { mode: 'sample_age', maximum_age_ns: 250_000_000 },
+      provider: { profile: 'xarm_digital', robot_component_id: 'lite6_robot', bank: 'tool', pin: 1 } });
+    expect(values[1]).toMatchObject({ provider: { profile: 'xarm_digital', robot_component_id: 'lite6_robot', bank: 'tool', pin: 4 } });
+    expect(ioSignalRowsValue(ioSignalRows({ io_signals: values }))).toEqual(values);
+    expect(validateIoSignalRows([input({ profile: 'xarm_digital', robotComponentId: 'lite6_robot',
+      bank: 'tool', pin: '2', maximumAgeMs: '250' })])).toContain('input pin');
+    expect(validateIoSignalRows([output({ profile: 'xarm_digital', robotComponentId: 'lite6_robot',
+      bank: 'tool', pin: '5' })])).toContain('output pin');
+    expect(ioDeviceHasAcknowledgedOutput({ io_signals: values })).toBe(true);
+  });
+
+  it('requires one xArm source per bank and validates a Mock echo output', () => {
+    const xarm = (sourceId: string, name: string) => input({ profile: 'xarm_digital',
+      robotComponentId: 'lite6_robot', bank: 'controller', maximumAgeMs: '250', sourceId,
+      signalName: name, resourceRoleId: name });
+    expect(validateIoSignalRows([xarm('first', 'a'), xarm('second', 'b')]))
+      .toContain('must share one I/O source');
+    const valve = output({ profile: 'mock_output', channel: 'valve', sourceId: 'valve_source' });
+    const echoed = input({ echoEnabled: true, echoOutputSignalName: 'clamp', echoDelayMs: '50' });
+    expect(validateIoSignalRows([echoed])).toContain('must name a Mock output');
+    expect(validateIoSignalRows([echoed, valve])).toBeNull();
+    const values = ioSignalRowsValue([echoed, valve]);
+    expect(values[0]).toMatchObject({ provider: { echo: { output_signal_name: 'clamp', delay_ms: 50 } } });
+    expect(ioSignalRowsValue(ioSignalRows({ io_signals: values }))).toEqual(values);
+  });
+
   it('round-trips authored rows exactly and keeps outputs verbatim', () => {
     const rows = ioSignalRows({ io_signals: [mockRow, rosRow, outputRow] as JsonValue[] });
     expect(rows.map((row) => row.kind)).toEqual(['input', 'input', 'preserved']);

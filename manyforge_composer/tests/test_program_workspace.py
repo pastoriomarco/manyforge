@@ -34,10 +34,7 @@ from manyforge_composer.backend.deployment_draft import (
     CompiledDeploymentDocument,
     DeploymentDraftSession,
 )
-from manyforge_composer.backend.routes_draft import (
-    _assistant_proposal_operations,
-    _observed_scene_arguments,
-)
+from manyforge_composer.backend.routes_draft import _observed_scene_arguments
 from manyforge_composer.backend.security import SecurityConfig
 from manyforge_composer.backend.state import ComposerState
 from manyforge_headless_api.client import HeadlessClientError
@@ -1030,102 +1027,6 @@ def test_observed_scene_refusal_is_marked_no_effect_and_logged_by_code(
     monkeypatch.undo()
     after = state.draft_session.workspace_snapshot()
     assert after["draft"]["draftRevision"] == workspace["draft"]["draftRevision"]
-
-
-def test_assistant_scene_proposal_honours_reviewed_filters_and_overrides(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    digest = "sha256:" + "a" * 64
-    arguments = {
-        "inspection_report": {
-            "objects": [
-                {
-                    "source_root": "/World/keep",
-                    "scene_resource": {
-                        "scene_resource_id": "part",
-                        "shape": {
-                            "type": "mesh",
-                            "mesh_resource_uri": "old.glb",
-                            "mesh_scale": [1.0, 1.0, 1.0],
-                        },
-                        "pose": {
-                            "frame_ref": {"kind": "cell_frame"},
-                            "position_m": [0.0, 0.0, 0.0],
-                            "orientation": {"xyzw": [0.0, 0.0, 0.0, 1.0]},
-                        },
-                    },
-                },
-                {
-                    "source_root": "/World/drop",
-                    "scene_resource": {
-                        "scene_resource_id": "ignored",
-                        "shape": {"type": "sphere", "sphere_radius_m": 0.1},
-                        "pose": {
-                            "frame_ref": {"kind": "cell_frame"},
-                            "position_m": [0.0, 0.0, 0.0],
-                            "orientation": {"xyzw": [0.0, 0.0, 0.0, 1.0]},
-                        },
-                    },
-                },
-            ]
-        },
-        "source_roots": ["/World/keep"],
-        "scene_resource_id_prefix": "imported_",
-        "mesh_resource_overrides": [{
-            "source_root": "/World/keep",
-            "mesh_resource_uri": "approved.glb",
-        }],
-        "max_proposals": 1,
-    }
-
-    class Assistant:
-        def status(self, _request_id: str) -> dict:
-            return {
-                "state": "completed",
-                "response": {
-                    "assistantMode": "composer-assistant",
-                    "catalogHash": digest,
-                    "proposals": [{
-                        "toolId": "propose_scene_objects",
-                        "effect": "proposal",
-                        "arguments": arguments,
-                        "inputSchemaHash": digest,
-                        "status": "draft",
-                        "requiresReview": True,
-                    }],
-                },
-            }
-
-    state = ComposerState()
-    state.assistant_client = Assistant()  # type: ignore[assignment]
-    monkeypatch.setattr(
-        routes_draft,
-        "read_active_assistant_context",
-        lambda *_args, **_kwargs: SimpleNamespace(
-            assistant_mode=SimpleNamespace(payload={
-                "catalog_hash": digest,
-                "tools": [{
-                    "tool_id": "propose_scene_objects",
-                    "effect": "proposal",
-                    "input_schema_hash": digest,
-                    "input_schema": {
-                        "type": "object",
-                        "additionalProperties": True,
-                    },
-                }]
-            })
-        ),
-    )
-
-    resolved, identity = _assistant_proposal_operations(
-        state, {"request_id": "assistant.request.1", "proposal_index": 0}
-    )
-
-    resources = resolved["operations"][0]["arguments"]["scene_resources"]
-    assert len(resources) == 1
-    assert resources[0]["scene_resource_id"] == "imported_part"
-    assert resources[0]["shape"]["mesh_resource_uri"] == "approved.glb"
-    assert identity["arguments_digest"].startswith("sha256:")
 
 
 def _assert_program_workspace_contract(workspace: dict) -> None:

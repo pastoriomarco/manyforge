@@ -38,6 +38,7 @@ from manyforge_behavior.orchestration_ports import (
     FrameTransformError,
     NodeAttemptIdentity,
     OwnerInvocationHeldError,
+    OwnerInvocationGatedError,
     OwnerInvocationRefusedByPriorityError,
     OwnerNodeInputs,
     OwnerTaskObservationUnavailableError,
@@ -5885,6 +5886,31 @@ def test_a_newcomer_refused_by_priority_names_the_winner() -> None:
     assert port._tasks == {}
 
 
+def test_a_gate_refusal_is_a_typed_wait_naming_its_rule() -> None:
+    transport = _Transport()
+    port = NativeKernelProgramPort(KernelClient(transport))
+    port.bind(_context())
+
+    def refuse(body):
+        transport.submissions.append(deepcopy(body))
+        return {
+            "ok": False,
+            "error": {
+                "code": "invalid_state_transition",
+                "message": "Global interrupt rule curtain is active",
+                "details": {"reason": "global_interrupt_gated", "rule_id": "curtain"},
+            },
+        }
+
+    transport.submit = refuse
+    with pytest.raises(OwnerInvocationGatedError) as raised:
+        port.operations.start("motion.move_to_pose", _identity("motion-gated"), _motion_inputs())
+    assert raised.value.rule_id == "curtain"
+    # The Kernel's own refusal is kept for the timeout failure.
+    assert raised.value.refusal.details == {"reason": "global_interrupt_gated", "rule_id": "curtain"}
+    assert port._tasks == {}
+
+
 def test_a_failed_operation_carries_its_own_failure_facts() -> None:
     fixture = _stopped_motion_for_recovery()
     operation = fixture.transport.operations[fixture.started.task_id]
@@ -6030,6 +6056,77 @@ def _thawed(value: Any) -> Any:
     if isinstance(value, (list, tuple)):
         return [_thawed(nested) for nested in value]
     return value
+
+
+def _pneumatic_context():
+    context = _context()
+    binding = _thawed(context.program_binding)
+    gripper = next(row for row in binding["target_role_bindings"] if row["target_role_id"] == "gripper")
+    gripper["pneumatic_io"] = {
+        "outputs": [
+            {"target_role_id": "io.a", "resource_role_id": "valve.a", "open_value": True, "close_value": False},
+            {"target_role_id": "io.b", "resource_role_id": "valve.b", "open_value": False, "close_value": True},
+        ],
+        "inputs": [{"input": "workpiece_grasped", "target_role_id": "io.c", "resource_role_id": "part"}],
+    }
+    for role, component, resource, direction in (
+        ("io.a", "io.2", "valve.a", "output"),
+        ("io.b", "io.1", "valve.b", "output"),
+        ("io.c", "io.3", "part", "input"),
+    ):
+        binding["target_role_bindings"].append({
+            "target_role_id": role, "component_role_id": f"{role}.component",
+            "controllable_component_id": component, "command_target_id": "io.command",
+            "capability_bindings": [{
+                "capability_id": "io.gpio.set_output" if direction == "output" else "io.gpio.get_input",
+                "command_schema": ({"command_schema_id": "io.signal_write", "command_schema_revision": _DIGEST_E}
+                                   if direction == "output" else None),
+            }],
+            "signal_role_bindings": [{
+                "resource_role_id": resource, "signal_name": resource, "value_type": "bool",
+                "direction": direction, "transition_capability": "sampled_only",
+                "signal_descriptor_digest": _DIGEST_E,
+            }],
+        })
+    return replace(context, program_binding=binding)
+
+
+@pytest.mark.parametrize("position_request,expected,values", [
+    ({"kind": "named_preset", "name": "open"}, 0.5, [False, True]),
+    ({"kind": "named_preset", "name": "closed"}, 0.0, [False, True]),
+    ({"kind": "linear_m", "value_m": 0.25}, 0.0, [False, True]),
+])
+def test_pneumatic_plan_uses_endpoint_and_false_before_true(position_request, expected, values):
+    transport = _preset_transport(kind="linear_m")
+    transport.preset_descriptor.update(actuation_kind="pneumatic", output_mode="commanded",
+        completion_policy="no_output", grasp_confirmation_policy="not_required")
+    transport.preset_descriptor["named_presets"][0]["master_position"] = 0.5
+    transport.preset_descriptor["named_presets"][1]["master_position"] = 0.0
+    port = NativeKernelProgramPort(KernelClient(transport))
+    port.bind(_pneumatic_context())
+    parameters = dict(_gripper_inputs().parameters)
+    parameters.update(position=position_request, required_inputs=[{"input": "workpiece_grasped", "value": True}])
+    plan = port.operations.pneumatic_plan(_identity(), OwnerNodeInputs(parameters))
+    assert plan["logical"].parameters["position"] == {"kind": "linear_m", "value_m": expected}
+    assert [row["value"] for row in plan["outputs"]] == values
+    assert plan["inputs"] == [{"target_role": "io.c", "resource_role": "part", "expected_value": True}]
+    assert transport.submissions == []
+
+
+def test_pneumatic_output_steps_have_distinct_kernel_request_ids():
+    transport = _preset_transport(kind="linear_m")
+    port = NativeKernelProgramPort(KernelClient(transport))
+    port.bind(_pneumatic_context())
+    identity = _identity()
+    for step, role in enumerate(("io.a", "io.b")):
+        port.operations.start_pneumatic_output(identity, OwnerNodeInputs({
+            "target_role": role, "resource_role": "valve.a" if step == 0 else "valve.b", "value": False,
+        }), step)
+    assert len({row["request_context"]["request_id"] for row in transport.submissions}) == 2
+    assert all(row["participants"][0]["execution_scope"]["node_attempt_id"] == identity.node_attempt_id
+               for row in transport.submissions)
+
+
 
 
 def _release_bound_context():

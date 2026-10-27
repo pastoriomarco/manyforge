@@ -15,6 +15,7 @@
 #include <manyforge_roboplan/mock_boolean_output_provider.hpp>
 
 #include <algorithm>
+#include <iostream>
 #include <manyforge_core/types/projection_common.hpp>
 #include <mutex>
 #include <set>
@@ -152,6 +153,7 @@ struct MockBooleanOutputProvider::State final {
   std::vector<Alias> aliases;
   std::optional<bool> model;
   std::optional<Record> record;
+  std::function<void(bool, core::TimePoint)> model_observer;
   bool retired = false;
 };
 
@@ -243,6 +245,15 @@ MockBooleanOutputProvider::SubmitOutput(
   state_->model = request.value;
   state_->record->observation.evidence =
       core::IoOutputEvidence::kSourceAccepted;
+  if (state_->model_observer) {
+    try {
+      state_->model_observer(request.value, now);
+    } catch (...) {
+      // Output acceptance is already settled; a failed synthetic echo must
+      // not be rewritten into a fabricated no-effect output result.
+      std::cerr << "Mock I/O echo could not be scheduled\n";
+    }
+  }
   return Reply::Ok(state_->record->observation);
 }
 
@@ -401,6 +412,17 @@ void MockBooleanOutputProvider::Shutdown() {
   state_->retired = true;
   for (auto &gate : state_->gates)
     gate.accepting = false;
+}
+
+void MockBooleanOutputProvider::SetModelObserver(
+    std::function<void(bool, core::TimePoint)> observer) {
+  std::lock_guard lock(state_->mutex);
+  state_->model_observer = std::move(observer);
+}
+
+std::unique_lock<std::mutex>
+MockBooleanOutputProvider::AcquireModelDelivery() const {
+  return std::unique_lock<std::mutex>(state_->mutex);
 }
 
 std::optional<bool> MockBooleanOutputProvider::model_value() const {

@@ -8,6 +8,7 @@
 #include <string_view>
 #include <vector>
 
+#include <manyforge_core/component_stream_health.hpp>
 #include <manyforge_core/runtime_participant_binding.hpp>
 #include <manyforge_core/types/active_control_configuration.hpp>
 #include <manyforge_deployment/ros2_control_execution_runtime_contract.hpp>
@@ -26,6 +27,33 @@ make_retained_ros2_control_measured_state_descriptor(
     const core::RuntimeParticipantBinding &physical_binding,
     const core::ActiveControlConfigurationDTO &reconciled_configuration,
     const RetainedMeasuredJointStateLane &lane);
+
+/// CP9: the component's declared `stream_id` row (budget/severity/recovery
+/// defaults); throws when the component does not declare the stream.
+[[nodiscard]] const deployment::ros2_control_execution_runtime_contract::
+    Configuration::ComponentStream &
+retained_component_stream(
+    const deployment::ros2_control_execution_runtime_contract::Configuration
+        &configuration,
+    const core::ControllableComponentId &component, std::string_view stream_id);
+
+/// The component's measured JointState lane on `absolute_topic`, with the
+/// budget/severity/recovery of its `measured_joints` stream row.
+[[nodiscard]] RetainedMeasuredJointStateLane retained_measured_joint_state_lane(
+    const deployment::ros2_control_execution_runtime_contract::Configuration
+        &configuration,
+    const core::ControllableComponentId &component, std::string absolute_topic);
+
+/// The freshness budget of `motion_binding`'s observed-state channel, as
+/// retained_ros2_control_motion_state_config() selects it: the component's
+/// `measured_joints` stream budget for a measured authority (Real), 0 for the
+/// non-expiring commanded state (Mock, Isaac). The kinematic state projector
+/// registers the motion target with this budget, because the channel requires
+/// its exact query context there.
+[[nodiscard]] core::Duration retained_ros2_control_motion_state_budget_ns(
+    const deployment::ros2_control_execution_runtime_contract::Configuration
+        &configuration,
+    const core::RuntimeParticipantBinding &motion_binding);
 
 /// Exact ROS namespace assigned to one retained Isaac controllable component.
 /// Component identities that cannot be represented as one bounded ROS token
@@ -51,12 +79,19 @@ retained_isaac_controller_lane(
 /// the guard topics and the gripper transport are build-owned profile facts.
 /// Runtime participant bindings supply the compiled/source coordinate map and
 /// are checked exactly here.
+///
+/// The participant's in-motion staleness check
+/// (`participant.stop.controller_state_max_age_ns`) is the component's
+/// effective `measured_joints` budget: its row, or the `budget_ns` of the
+/// matching Deployment override in `stream_overrides`
+/// (`policies.component_streams`, the rows the host gives the stream registry).
 [[nodiscard]] RetainedRos2ControlBackendConfig
 make_retained_isaac_ros2_control_backend_config(
     const deployment::ros2_control_execution_runtime_contract::Configuration
         &runtime_configuration,
     const core::RuntimeParticipantBinding &motion_binding,
-    const std::optional<core::RuntimeParticipantBinding> &gripper_binding);
+    const std::optional<core::RuntimeParticipantBinding> &gripper_binding,
+    std::span<const core::StreamParameterOverrideDTO> stream_overrides = {});
 
 /// Read only the strict authored row for this exact selected component/target.
 /// Coordinate kind and transport names never select actuator semantics.
@@ -84,7 +119,7 @@ void configure_retained_mock_gripper_action(
 /// Expand one closed offline mock profile (catalog `mock_profile`) into the
 /// ROS execution configuration of its component, structured as the Isaac
 /// profile is. Lane facts: Q65 (Isaac's: lead-in `stop_traj_delta_s` 0.1 s,
-/// Stop sample period 0.01 s, `joint_state_max_age_s` 0.25 s, tracking
+/// Stop sample period 0.01 s, tracking
 /// tolerance 0.05 rad with timeout 0), Q79 (hard-stop completion and gripper
 /// result timeouts per model family; completion policy `position_reached`
 /// through the stock GripperActionController's GripperCommand action), the
@@ -92,6 +127,8 @@ void configure_retained_mock_gripper_action(
 /// the per-joint cancel deceleration the generated controllers file carries
 /// (the deployment's operator Stop profile, Q48), keyed by model source joint.
 /// No Isaac guard. A profile without a gripper accepts no gripper binding.
+/// The in-motion staleness check is the effective `measured_joints` budget,
+/// as for the Isaac profile.
 [[nodiscard]] RetainedRos2ControlBackendConfig
 make_retained_mock_ros2_control_backend_config(
     const deployment::ros2_control_execution_runtime_contract::Configuration
@@ -99,6 +136,26 @@ make_retained_mock_ros2_control_backend_config(
     const core::RuntimeParticipantBinding &motion_binding,
     const std::optional<core::RuntimeParticipantBinding> &gripper_binding,
     const std::map<std::string, double, std::less<>>
-        &max_deceleration_on_cancel_by_source_joint);
+        &max_deceleration_on_cancel_by_source_joint,
+    std::span<const core::StreamParameterOverrideDTO> stream_overrides = {});
+
+/// CP8 step 1 / R7 package 2: the ROS execution configuration of a Real
+/// component (`real_profile`, CP8 step 2a start-up path). The arm's state
+/// authority is measured: the measured JointState lane on `<ns>/joint_states`
+/// with the component's `measured_joints` stream row (CP9, the same row Mock
+/// and Isaac declare; its effective budget also sets the in-motion staleness
+/// check) is the addressed arm state.
+/// Mock's shared JTC wiring, the profile's controller cadence and the
+/// deployment's per-joint cancel deceleration (Q48). No gripper binding and no
+/// scheduled replacement (not qualified on a real robot).
+[[nodiscard]] RetainedRos2ControlBackendConfig
+make_retained_real_ros2_control_backend_config(
+    const deployment::ros2_control_execution_runtime_contract::Configuration
+        &runtime_configuration,
+    const core::RuntimeParticipantBinding &motion_binding,
+    const std::optional<core::RuntimeParticipantBinding> &gripper_binding,
+    const std::map<std::string, double, std::less<>>
+        &max_deceleration_on_cancel_by_source_joint,
+    std::span<const core::StreamParameterOverrideDTO> stream_overrides = {});
 
 } // namespace manyforge::roboplan_backend

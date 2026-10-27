@@ -1,5 +1,9 @@
-import { useEffect, useMemo, useState } from 'react';
-import { ScenePoseSourcePolicySection } from './ScenePoseSourcePolicySection';
+import { useEffect, useMemo, useRef, useState } from 'react';
+import { ComponentStreamsSection } from './ComponentStreamsSection';
+import { PoseSourceComponentSection } from './PoseSourceComponentForm';
+import { AiModelComponentSection } from './AiModelComponentForm';
+import { PneumaticIoEditor, pneumaticIoProblem } from './PneumaticIoEditor';
+import { pneumaticGripperDrafts, type PneumaticGripperDraft } from '../utils/pneumaticGripperAuthoring';
 
 import type { DeploymentWorkspaceController } from '../hooks/useDeploymentWorkspace';
 import {
@@ -11,6 +15,8 @@ import {
 import {
   IO_DEVICE_MAXIMUM_LIFECYCLE_TIMEOUT_S,
   IO_DEVICE_PROVISIONAL_OUTPUT_ACK_TIMEOUT_S,
+  declaredIoInputs,
+  declaredIoOutputs,
   ioDeviceComponentValue,
   ioDeviceHasAcknowledgedOutput,
   ioDeviceHasGpioOutput,
@@ -52,7 +58,6 @@ import type {
   DeploymentControlledStopProfile,
   JsonValue,
   SourceModelProjection,
-  SceneRuntimePoseSource,
 } from '../types/api';
 import type {
   ManualControlGripperDescriptor,
@@ -70,7 +75,8 @@ interface DeploymentFocusedEditorProps {
   stopChains?: readonly TargetStopChain[];
   /** The Applied Program's execution group ids; null when no Program is applied (contract 73). */
   executionGroupIds?: readonly string[] | null;
-  poseSources?: readonly SceneRuntimePoseSource[];
+  /** The Program Draft's scene object ids; null without a Program. */
+  programSceneIds?: readonly string[] | null;
 }
 
 const NO_PROGRAM_KEYS: readonly BlackboardKeyDeclaration[] = [];
@@ -85,11 +91,14 @@ interface RuntimeConfiguration {
   framePrefix: string | null;
   /** A model-free I/O device (runtime_kind io_provider): I/O sections only. */
   ioProvider: boolean;
-  /** A model-free pose source (runtime_kind pose_source): shown read-only only. */
+  /** A model-free pose source (runtime_kind pose_source): edited in its own section. */
   poseSource: boolean;
+  /** A model-free AI model endpoint (runtime_kind ai_model): edited in its own section. */
+  aiModel: boolean;
 }
 
 const POSE_SOURCE_RUNTIME_KIND = 'pose_source';
+const AI_MODEL_RUNTIME_KIND = 'ai_model';
 
 interface MotionTargetLimit {
   runtimeIndex: number;
@@ -121,7 +130,7 @@ interface GripperTargetConfigurationDraft {
   closedStateRef: string;
   commandDurationS: number;
   deliveryResultTimeoutS?: number;
-  stateFreshnessTimeoutS: number;
+  pneumaticIo?: JsonValue;
   touchLinks: string[];
   mountFrame: string;
   attachFrame: string;
@@ -172,6 +181,7 @@ function runtimeConfigurations(
           : null,
         ioProvider: isIoProviderComponent(component ?? undefined),
         poseSource: configuration.runtime_kind === POSE_SOURCE_RUNTIME_KIND,
+        aiModel: configuration.runtime_kind === AI_MODEL_RUNTIME_KIND,
       }];
     });
   }
@@ -192,6 +202,7 @@ function runtimeConfigurations(
         framePrefix: null,
         ioProvider: false,
         poseSource: false,
+        aiModel: false,
       }]
       : [];
   });
@@ -267,7 +278,7 @@ function gripperTargetConfigurations(
       const closedStateRef = row?.closed_state_ref;
       const commandDurationS = numberValue(row?.command_duration_s);
       const deliveryResultTimeoutS = row?.delivery_result_timeout_s;
-      const stateFreshnessTimeoutS = numberValue(row?.state_freshness_timeout_s);
+      const pneumaticIo = row?.pneumatic_io;
       const touchLinks = row?.touch_links;
       const mountFrame = row?.mount_frame;
       const attachFrame = row?.attach_frame;
@@ -287,7 +298,6 @@ function gripperTargetConfigurations(
             || typeof deliveryResultTimeoutS !== 'number'
             || !Number.isFinite(deliveryResultTimeoutS)
             || deliveryResultTimeoutS <= 0))
-        || stateFreshnessTimeoutS === null
         || !Array.isArray(touchLinks)
         || touchLinks.some((item) => typeof item !== 'string')
         || typeof mountFrame !== 'string'
@@ -308,7 +318,7 @@ function gripperTargetConfigurations(
         closedStateRef,
         commandDurationS,
         ...(deliveryResultTimeoutS === undefined ? {} : { deliveryResultTimeoutS }),
-        stateFreshnessTimeoutS,
+        ...(pneumaticIo === undefined ? {} : { pneumaticIo }),
         touchLinks: touchLinks as string[],
         mountFrame,
         attachFrame,
@@ -333,7 +343,7 @@ function gripperConfigurationValue(
     command_duration_s: draft.commandDurationS,
     ...(draft.actuationKind === 'pneumatic' && draft.deliveryResultTimeoutS !== undefined
       ? { delivery_result_timeout_s: draft.deliveryResultTimeoutS } : {}),
-    state_freshness_timeout_s: draft.stateFreshnessTimeoutS,
+    ...(draft.pneumaticIo === undefined ? {} : { pneumatic_io: draft.pneumaticIo }),
     touch_links: [...draft.touchLinks].sort(),
     mount_frame: draft.mountFrame,
     attach_frame: draft.attachFrame,
@@ -1171,18 +1181,127 @@ function ModelAndTargetSection({
   );
 }
 
+/**
+ * D11: the payload of a ROS component's tool (mass and centre of mass in the
+ * robot flange frame). Only a Real robot applies it, at Enable; Mock and
+ * Isaac carry it unchanged and ignore it.
+ */
+function ToolPayloadFields({
+  controller,
+  runtime,
+  disabled,
+}: {
+  controller: DeploymentWorkspaceController;
+  runtime: RuntimeConfiguration;
+  disabled: boolean;
+}) {
+  const path = ['components', runtime.index, 'configuration', 'runtime_configuration', 'tool_payload'];
+  const payload = objectValue(objectValue(runtime.configuration.runtime_configuration)?.tool_payload);
+  if (payload === null) {
+    return (
+      <div className="deployment-focused-field">
+        <span>Tool payload</span>
+        <button type="button" disabled={disabled}
+          onClick={() => controller.mutate(path, 'set', { mass_kg: 0, center_of_mass_m: [0, 0, 0] })}>
+          Add tool payload
+        </button>
+      </div>
+    );
+  }
+  const center = Array.isArray(payload.center_of_mass_m) ? payload.center_of_mass_m : [];
+  return (
+    <fieldset className="deployment-initial-joints">
+      <legend>Tool payload (applied to a real robot at Enable)</legend>
+      <NumberDraft label="Mass" value={numberValue(payload.mass_kg) ?? 0} unit="kg" min={0} max={100}
+        disabled={disabled} onCommit={(value) => controller.mutate([...path, 'mass_kg'], 'set', value)} />
+      {['X', 'Y', 'Z'].map((axis, index) => (
+        <NumberDraft key={axis} label={`Centre of mass ${axis}`} value={numberValue(center[index]) ?? 0}
+          unit="m" min={-2} max={2} disabled={disabled}
+          onCommit={(value) => controller.mutate([...path, 'center_of_mass_m', index], 'set', value)} />
+      ))}
+      <button type="button" disabled={disabled} onClick={() => controller.mutate(path, 'remove')}>
+        Remove tool payload
+      </button>
+    </fieldset>
+  );
+}
+
+function PneumaticIoDraftFields({ controller, row, document }: {
+  controller: DeploymentWorkspaceController;
+  row: PneumaticGripperDraft;
+  document: Record<string, JsonValue>;
+}) {
+  const [draft, setDraft] = useState<JsonValue | undefined>(row.pneumaticIo);
+  const [error, setError] = useState<string | null>(null);
+  const baseline = useRef(JSON.stringify(row.pneumaticIo));
+  const sourceFingerprint = JSON.stringify(row.pneumaticIo);
+  const draftFingerprint = JSON.stringify(draft);
+  const stale = sourceFingerprint !== baseline.current && draftFingerprint !== baseline.current
+    && draftFingerprint !== sourceFingerprint;
+  useEffect(() => {
+    // Workspace responses recreate objects, even when this value is unchanged.
+    // Adopt an actual external change only when it cannot overwrite local edits.
+    if (sourceFingerprint !== baseline.current
+      && (draftFingerprint === baseline.current || draftFingerprint === sourceFingerprint)) {
+      baseline.current = sourceFingerprint;
+      setDraft(row.pneumaticIo);
+      setError(null);
+    }
+  }, [row.pneumaticIo, sourceFingerprint, draftFingerprint]);
+  const disabled = !controller.mutationAvailable || controller.busy;
+  const enabled = row.actuationKind === 'pneumatic' && row.outputMode === 'commanded';
+  const changed = draftFingerprint !== baseline.current;
+  const problem = draft !== undefined && !enabled
+    ? 'Pneumatic I/O requires a commanded pneumatic gripper. Remove the mapping or restore that mode.'
+    : pneumaticIoProblem(draft);
+  const update = async () => {
+    if (stale) return;
+    if (problem !== null) { setError(problem); return; }
+    setError(null);
+    if (draft === undefined) await controller.mutate(row.path, 'remove');
+    else await controller.mutate(row.path, 'set', draft);
+  };
+  return (
+    <div className="deployment-initial-joints">
+      <strong>{row.componentId} / {row.targetId}</strong>
+      {!enabled && row.pneumaticIo !== undefined && <p className="inline-message severity-error">Pneumatic I/O is retained but the gripper is not configured for commanded pneumatic output.</p>}
+      <PneumaticIoEditor value={draft} enabled={enabled} disabled={disabled}
+        inputs={declaredIoInputs(document)} outputs={declaredIoOutputs(document)}
+        onChange={(value) => { setDraft(value); setError(null); }} />
+      {error !== null && <p className="inline-message severity-error" role="alert">{error}</p>}
+      {stale && <p className="inline-message severity-error" role="alert">This pneumatic I/O mapping changed in the Deployment Draft. Discard your local edits to review the current mapping.</p>}
+      <div className="button-row">
+        <button type="button" disabled={disabled || !changed || stale} onClick={() => { void update(); }}>Update pneumatic I/O Draft</button>
+        <button type="button" disabled={disabled || (!changed && !stale)}
+          onClick={() => { baseline.current = sourceFingerprint; setDraft(row.pneumaticIo); setError(null); }}>Discard pneumatic I/O edits</button>
+      </div>
+    </div>
+  );
+}
+
 function NativeRuntimeSection({
   controller,
   runtimes,
+  document,
 }: {
   controller: DeploymentWorkspaceController;
   runtimes: RuntimeConfiguration[];
+  document: Record<string, JsonValue>;
 }) {
   const disabled = !controller.mutationAvailable || controller.busy;
+  const pneumaticRows = pneumaticGripperDrafts(document).filter((row) => (
+    row.actuationKind === 'pneumatic' || row.pneumaticIo !== undefined
+  ));
   return (
     <details className="dcard">
       <summary>Native runtime configuration</summary>
       <div className="deployment-focused-body">
+        {controller.error?.includes('pneumatic_io_presets_coincident') && (
+          <p className="inline-message severity-error" role="alert">The gripper's Open and Close presets have the same position. Choose distinct preset positions before using pneumatic I/O.</p>
+        )}
+        {controller.error?.includes('pneumatic_io_unsupported_on_isaac') && (
+          <p className="inline-message severity-error" role="alert">This pneumatic I/O mapping is not supported by Isaac. Use an unmapped Isaac gripper configuration.</p>
+        )}
         {runtimes.length === 0 && <p className="muted">No native runtime configuration is declared.</p>}
         {runtimes.map((runtime) => {
           const prefix = runtime.configurationPath;
@@ -1226,11 +1345,13 @@ function NativeRuntimeSection({
                     onCommit={(value) => controller.mutate([...prefix, 'planner_rng_seed'], 'set', value)}
                   />
                 )}
-                <label className="deployment-focused-field">
-                  <span>Adapter mode</span>
-                  <input value={String(runtime.configuration.mode ?? 'not declared')} readOnly />
-                </label>
               </div>
+              {runtime.framePrefix !== null && (
+                <ToolPayloadFields controller={controller} runtime={runtime} disabled={disabled} />
+              )}
+              {pneumaticRows.filter((row) => runtime.configurationPath.every((part, index) => row.path[index] === part))
+                .map((row) => <PneumaticIoDraftFields key={JSON.stringify([row.componentId, row.targetId])}
+                  controller={controller} row={row} document={document} />)}
               {Array.isArray(positions) && (
                 <fieldset className="deployment-initial-joints">
                   <legend>Initial joint state</legend>
@@ -1566,36 +1687,6 @@ function GripperSection({
     );
     setError(result === null ? 'The Deployment owner rejected this gripper configuration.' : null);
   };
-  // Feedback timeout = Deployment override of the gripper's `gripper_feedback`
-  // stream budget; blank keeps the gripper row's `state_freshness_timeout_s`
-  // (the one default the host also reads), shown as the placeholder.
-  const policies = objectValue(controller.workspace?.draft.document?.policies) ?? {};
-  const streamRows = (Array.isArray(policies.component_streams)
-    ? policies.component_streams : []) as Array<Record<string, JsonValue>>;
-  const isFeedbackRow = (row: Record<string, JsonValue>) => (
-    row.controllable_component_id === descriptor?.controllableComponentId
-    && row.stream_id === 'gripper_feedback'
-  );
-  const feedbackBudgetNs = numberValue(streamRows.find(isFeedbackRow)?.budget_ns);
-  const updateFeedbackTimeout = async (timeoutMs: number | null) => {
-    if (descriptor === null) return null;
-    const rows = streamRows.filter((row) => !isFeedbackRow(row));
-    const row = { ...(streamRows.find(isFeedbackRow) ?? {
-      controllable_component_id: descriptor.controllableComponentId, stream_id: 'gripper_feedback',
-    }) };
-    if (timeoutMs === null) delete row.budget_ns;
-    else row.budget_ns = Math.max(1, Math.round(timeoutMs * 1e6));
-    // A row needs at least one override besides its identity.
-    if (Object.keys(row).length > 2) rows.push(row);
-    rows.sort((a, b) => (
-      String(a.controllable_component_id).localeCompare(String(b.controllable_component_id))
-      || String(a.stream_id).localeCompare(String(b.stream_id))
-    ));
-    const updated = { ...policies };
-    if (rows.length) updated.component_streams = rows;
-    else delete updated.component_streams;
-    return controller.mutate(['policies'], 'set', updated);
-  };
   return (
     <details className="dcard">
       <summary>Current gripper configuration</summary>
@@ -1627,16 +1718,6 @@ function GripperSection({
               <span><small>Presets</small><strong>{descriptor.namedPresets.map((preset) => preset.name).join(', ') || 'not declared'}</strong></span>
               <span><small>Mimic followers</small><strong>{descriptor.mimicFollowers.length}</strong></span>
             </div>
-            <OptionalNumberDraft
-              label="Feedback timeout"
-              value={feedbackBudgetNs === null ? null : feedbackBudgetNs / 1e6}
-              unit="ms"
-              placeholder={source === null
-                ? 'gripper profile default'
-                : `${format(source.stateFreshnessTimeoutS * 1000)} ms (profile default)`}
-              disabled={disabled}
-              onCommit={updateFeedbackTimeout}
-            />
             {draft === null ? (
               <p className="muted">This addressed gripper has no Deployment-owned configuration row to edit.</p>
             ) : (
@@ -1775,7 +1856,7 @@ function GripperSection({
                 </div>
               </fieldset>
             )}
-            <p className="field-help">The Deployment owns tool geometry, presets, motion time, and the feedback timeout (how long gripper feedback may stay silent before the gripper is reported stale; blank uses the gripper profile default). Transport, state authority, completion, and grasp confirmation above are exact addressed-owner facts and remain read-only.</p>
+            <p className="field-help">The Deployment owns tool geometry, presets, and motion time. Transport, state authority, completion, and grasp confirmation above are exact addressed-owner facts and remain read-only.</p>
           </>
         )}
       </div>
@@ -1791,7 +1872,7 @@ export function DeploymentFocusedEditor({
   programKeys = NO_PROGRAM_KEYS,
   stopChains = NO_STOP_CHAINS,
   executionGroupIds = null,
-  poseSources = [],
+  programSceneIds = null,
 }: DeploymentFocusedEditorProps) {
   const document = controller.workspace?.draft.document ?? null;
   const geometricContactEndpoints = useMemo(() => {
@@ -1815,13 +1896,14 @@ export function DeploymentFocusedEditor({
     ])).values()];
   }, [motionDescriptors, sourceModel]);
   const runtimes = useMemo(() => runtimeConfigurations(document), [document]);
-  // Model-free components (I/O devices, pose sources) have no model, motion,
-  // gripper, frame or Stop inputs.
+  // Model-free components (I/O devices, pose sources, AI models) have no model,
+  // motion, gripper, frame or Stop inputs.
   const motionRuntimes = useMemo(
-    () => runtimes.filter((runtime) => !runtime.ioProvider && !runtime.poseSource), [runtimes]);
+    () => runtimes.filter((runtime) => !runtime.ioProvider && !runtime.poseSource && !runtime.aiModel),
+    [runtimes]);
   const limits = useMemo(() => motionTargetLimits(motionRuntimes), [motionRuntimes]);
   const controlledStop = useMemo(() => controlledStopTargets(document), [document]);
-  const ioRuntimes = useMemo(() => runtimes.filter((runtime) => !runtime.poseSource).map((runtime) => ({
+  const ioRuntimes = useMemo(() => runtimes.filter((runtime) => !runtime.poseSource && !runtime.aiModel).map((runtime) => ({
     index: runtime.index,
     runtimeUnitId: runtime.runtimeUnitId,
     configuration: runtime.configuration,
@@ -1847,8 +1929,7 @@ export function DeploymentFocusedEditor({
         limits={limits}
         runtimes={motionRuntimes}
       />
-      <NativeRuntimeSection controller={controller} runtimes={motionRuntimes} />
-      <ScenePoseSourcePolicySection controller={controller} sources={poseSources} />
+      <NativeRuntimeSection controller={controller} runtimes={motionRuntimes} document={document} />
       <ControlledStopSection controller={controller} targets={controlledStop} />
       <GripperSection controller={controller} descriptors={gripperDescriptors} runtimes={motionRuntimes} />
       {document.api_version === 'manyforge.deployment_intent.v2' && (
@@ -1857,7 +1938,9 @@ export function DeploymentFocusedEditor({
       )}
       <IoSignalConfigurationSection controller={controller} runtimes={ioRuntimes}
         geometricContactEndpoints={geometricContactEndpoints} />
-      <PoseSourceComponentSection runtimes={runtimes} />
+      <PoseSourceComponentSection controller={controller} programSceneIds={programSceneIds} />
+      <AiModelComponentSection controller={controller} />
+      <ComponentStreamsSection controller={controller} />
       {document.api_version === 'manyforge.deployment_intent.v2' && (
         <MotionTakeoverSection controller={controller} document={document} />
       )}
@@ -1930,92 +2013,6 @@ function MotionTakeoverSection({ controller, document }: {
           </p>
         )}
         {error && <p className="deployment-field-error inline-message severity-error">{error}</p>}
-      </div>
-    </details>
-  );
-}
-
-interface PoseSourceBinding {
-  source: string;
-  objectId: string;
-  policyId: string;
-  eligible: boolean | null;
-  lifetimeNs: number | null;
-}
-
-/** The bindings of one pose_sources row: joint state, simulation entities, detections. */
-function poseSourceBindings(row: Record<string, JsonValue>): PoseSourceBinding[] {
-  const binding = (source: string, value: JsonValue | undefined): PoseSourceBinding[] => {
-    const item = objectValue(value);
-    return item === null ? [] : [{
-      source,
-      objectId: String(item.object_id ?? ''),
-      policyId: String(item.policy_id ?? ''),
-      eligible: typeof item.eligible === 'boolean' ? item.eligible : null,
-      lifetimeNs: numberValue(item.lifetime_ns),
-    }];
-  };
-  const list = (value: JsonValue | undefined) => (Array.isArray(value) ? value : []);
-  return [
-    ...binding('joint state', row.joint_state),
-    ...list(row.simulation_entities).flatMap((item) => binding(
-      String(objectValue(item)?.entity ?? 'simulation entity'), item)),
-    ...list(row.detection3d_sources).flatMap((item) => binding('detection 3D', item)),
-  ];
-}
-
-/**
- * Model-free pose-source components (pose_source_v0 / runtime_kind
- * pose_source): read-only. Their configuration is authored in the Deployment
- * file and kept unchanged by every Draft edit here (Check validates it).
- */
-function PoseSourceComponentSection({ runtimes }: { runtimes: RuntimeConfiguration[] }) {
-  const sources = runtimes.filter((runtime) => runtime.poseSource);
-  if (sources.length === 0) return null;
-  return (
-    <details className="dcard">
-      <summary>Pose sources</summary>
-      <div className="deployment-focused-body">
-        {sources.map((runtime) => {
-          const runtimeConfiguration = objectValue(runtime.configuration.runtime_configuration);
-          const poseSources = runtimeConfiguration?.pose_sources;
-          const rows = Array.isArray(poseSources)
-            ? poseSources.flatMap((value) => {
-              const row = objectValue(value);
-              return row === null ? [] : [row];
-            })
-            : [];
-          return (
-            <section className="deployment-pose-source" key={runtime.runtimeUnitId}
-              aria-label={`${runtime.runtimeUnitId} pose source`}>
-              <header><strong>{runtime.runtimeUnitId}</strong><small>Read-only</small></header>
-              {rows.map((row, rowIndex) => (
-                <div key={rowIndex}>
-                  <p className="muted">Poll period: {numberValue(row.simulation_poll_period_ms) ?? 'not declared'} ms</p>
-                  <table aria-label={`${runtime.runtimeUnitId} pose bindings`}>
-                    <thead><tr><th>Object</th><th>Policy</th><th>Eligible</th><th>Lifetime</th><th>Source</th></tr></thead>
-                    <tbody>
-                      {poseSourceBindings(row).map((binding, index) => (
-                        <tr key={index}>
-                          <td>{binding.objectId}</td>
-                          <td>{binding.policyId}</td>
-                          <td>{binding.eligible === null ? '' : binding.eligible ? 'yes' : 'no'}</td>
-                          <td>{binding.lifetimeNs === null ? '' : `${format(binding.lifetimeNs / 1e9)} s`}</td>
-                          <td>{binding.source}</td>
-                        </tr>
-                      ))}
-                    </tbody>
-                  </table>
-                </div>
-              ))}
-              <details>
-                <summary>Configuration</summary>
-                <pre>{JSON.stringify(runtimeConfiguration, null, 2)}</pre>
-              </details>
-            </section>
-          );
-        })}
-        <p className="field-help">A pose source is a model-free component that publishes object poses (and optionally the measured robot joint state) from the simulator or 3D detections. Its configuration is edited in the Deployment file; it has no model, pose, frames or Stop settings.</p>
       </div>
     </details>
   );
@@ -2237,13 +2234,13 @@ function IoDeviceEditor({ controller, device, disabled }: {
   );
 }
 
-const LATCH_RELEASE_HELP = 'A latch with no operation to Reset is cleared by the operator once its condition no longer holds (default), or automatically when the condition clears. A Program Reset never clears it.';
-const IDLE_BEHAVIOUR_HELP = 'Default: latches while a Program Run is in flight and the robot is still; ignored when no Run exists. Moving motion is always stopped.';
+const ON_TRIP_HELP = 'Gate (default): while the condition holds, new motion in the scope is refused and moving motion gets its Stop; motion is allowed again when it clears, with no acknowledgement. Full Stop: the cell gets a Full Stop and the rule stays latched until the operator clears it. A Program Reset never clears it.';
+const IDLE_BEHAVIOUR_HELP = 'Full Stop only. Default: latches while a Program Run is in flight and the robot is still; ignored when no Run exists. Moving motion is always stopped.';
 
 /**
  * Global (Deployment) interrupt rules, `policies.interrupt_rules` (schema04
- * §3): each with its condition, scope, priority, idle behaviour and Stop
- * entry stage. A rule stops, latches and publishes the read-only key
+ * §3): each with its condition, scope, priority, on-trip outcome (gate or
+ * Full Stop; Full Stop also has an idle behaviour) and Stop entry stage. A rule stops, latches and publishes the read-only key
  * `interrupt_state.<rule_id>`. The whole list is committed per change.
  */
 export function GlobalInterruptRulesSection({
@@ -2307,7 +2304,7 @@ export function GlobalInterruptRulesSection({
     <details className="dcard" open={rows.length > 0}>
       <summary>Global interrupt rules</summary>
       <div className="deployment-focused-body">
-        <p className="field-help">A global rule stops the motion in its scope when its condition holds, latches, and publishes the read-only key <code>interrupt_state.&lt;rule id&gt;</code> (clear, tripped or latched), always current. Program nodes react to a rule only through that key.</p>
+        <p className="field-help">A global rule stops the motion in its scope when its condition holds and either gates new motion until it clears or trips a Full Stop that the operator clears. It publishes the read-only key <code>interrupt_state.&lt;rule id&gt;</code> (clear, tripped or latched), always current. Program nodes react to a rule only through that key.</p>
         {rows.length === 0 && <p className="muted">No global interrupt rule is declared.</p>}
         {rows.map((row, index) => {
           const rule = objectValue(row) ?? {};
@@ -2377,30 +2374,33 @@ export function GlobalInterruptRulesSection({
                     })}
                   </fieldset>
                 )}
-                <label className="deployment-focused-field" title={IDLE_BEHAVIOUR_HELP}>
-                  <span>When nothing moves</span>
-                  <select aria-label={`${ruleId} idle behaviour`} value={typeof rule.idle_behaviour === 'string' ? rule.idle_behaviour : ''}
+                <label className="deployment-focused-field" title={ON_TRIP_HELP}>
+                  <span>On trip</span>
+                  <select aria-label={`${ruleId} on trip`}
+                    value={rule.on_trip === 'full_stop' ? 'full_stop' : ''}
                     disabled={disabled}
-                    onChange={(event) => update(index, {
-                      idle_behaviour: event.target.value === '' ? undefined : event.target.value,
-                    })}>
-                    <option value="">Default (latch during a Run, else ignore)</option>
-                    <option value="latch">Latch</option>
-                    <option value="ignore">Ignore (records one info row)</option>
+                    onChange={(event) => update(index, event.target.value === 'full_stop'
+                      ? { on_trip: 'full_stop' }
+                      // Only Full Stop has an idle behaviour; a gate always gates.
+                      : { on_trip: undefined, idle_behaviour: undefined })}>
+                    <option value="">Gate: refuse motion while active (default)</option>
+                    <option value="full_stop">Full Stop, operator clears</option>
                   </select>
                 </label>
-                <label className="deployment-focused-field" title={LATCH_RELEASE_HELP}>
-                  <span>Latch release</span>
-                  <select aria-label={`${ruleId} latch release`}
-                    value={rule.latch_release === 'auto_on_clear' ? 'auto_on_clear' : ''}
-                    disabled={disabled}
-                    onChange={(event) => update(index, {
-                      latch_release: event.target.value === '' ? undefined : event.target.value,
-                    })}>
-                    <option value="">Operator clears (default)</option>
-                    <option value="auto_on_clear">Auto-clear when the condition clears</option>
-                  </select>
-                </label>
+                {rule.on_trip === 'full_stop' && (
+                  <label className="deployment-focused-field" title={IDLE_BEHAVIOUR_HELP}>
+                    <span>When nothing moves</span>
+                    <select aria-label={`${ruleId} idle behaviour`} value={typeof rule.idle_behaviour === 'string' ? rule.idle_behaviour : ''}
+                      disabled={disabled}
+                      onChange={(event) => update(index, {
+                        idle_behaviour: event.target.value === '' ? undefined : event.target.value,
+                      })}>
+                      <option value="">Default (latch during a Run, else ignore)</option>
+                      <option value="latch">Latch</option>
+                      <option value="ignore">Ignore (records one info row)</option>
+                    </select>
+                  </label>
+                )}
               </div>
               <div className="deployment-focused-field">
                 <span>Condition</span>

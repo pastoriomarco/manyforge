@@ -419,7 +419,7 @@ describe('Program authoring panels', () => {
     expect(markup).toContain('Pick subtree');
     expect(markup).toContain('Place subtree');
     expect(markup).toContain('Contact policies');
-    expect(markup).toContain('Object support contacts');
+    expect(markup).not.toContain('Support contacts');
     expect(markup).toContain('Runtime object key');
     expect(markup).toContain('Contact body source');
     expect(markup).toContain('Selected motion endpoint');

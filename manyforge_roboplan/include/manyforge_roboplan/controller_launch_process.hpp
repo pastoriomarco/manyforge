@@ -62,7 +62,8 @@ struct ControllerLaunchCommand final {
 };
 
 /// The mock lane command: Track 2's `mock_control.launch.py` with the
-/// artifact's launch arguments (phase 2a contract, DX-175).
+/// artifact's launch arguments (phase 2a contract, DX-175). Since CP8 step 2a
+/// it is the one builder of Mock and Real ros2_control components.
 [[nodiscard]] ControllerLaunchCommand
 mock_controller_launch_command(const ControllerLaunchArtifacts &artifacts);
 
@@ -72,8 +73,9 @@ mock_controller_launch_command(const ControllerLaunchArtifacts &artifacts);
 /// facts the generated URDF's hardware section was written from so the
 /// launch's readiness topics agree with it by construction). The user opens
 /// the Isaac scene; this process only attaches the ROS controller stack.
-/// `gripper_state_freshness_timeout_s` is the gripper target configuration's
-/// value, passed to the launch's gripper transport adapter (one source).
+/// `gripper_state_freshness_timeout_s` is the budget of the component's
+/// `gripper_feedback` stream row, passed to the launch's gripper transport
+/// adapter (one source).
 [[nodiscard]] ControllerLaunchCommand isaac_controller_launch_command(
     const ControllerLaunchArtifacts &artifacts, const IsaacControllerLane &lane,
     std::optional<double> gripper_state_freshness_timeout_s = std::nullopt);

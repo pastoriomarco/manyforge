@@ -54,10 +54,9 @@ class RuntimeCollisionMonitor {
   void start();
   void stop(bool drain_callbacks = false);
 
-  /// Install a best-effort evidence hook invoked immediately before the
-  /// monitor's fail-closed drain-timeout termination (e.g. the kernel's
-  /// flight-ring dump). Startup wiring only; the hook must be noexcept in
-  /// spirit — it runs on a dying process and must not block.
+  /// Install a best-effort evidence hook invoked once when a draining stop()
+  /// misses its bound and starts waiting for the stuck drain (e.g. the
+  /// kernel's flight-ring dump). Startup wiring only; the hook must not block.
   void set_fail_closed_dump_hook(std::function<void()> hook);
 
   void set_active_contact_policy_id(std::string contact_policy_id);
@@ -71,7 +70,7 @@ class RuntimeCollisionMonitor {
 
   IClock& clock_;
   IScheduler& scheduler_;
-  // Set once at startup wiring, read only on the fail-closed terminate path.
+  // Set once at startup wiring, read only when a draining stop() is stuck.
   std::function<void()> fail_closed_dump_hook_;
   Config config_;
   TickCallback tick_callback_;

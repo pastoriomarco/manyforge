@@ -4,10 +4,13 @@
 # tests, sanitizers, release packaging, or Stop-proof generation.
 
 set -euo pipefail
+# Runtime journals refuse group/other-writable directories; create every host
+# directory owner-writable only, whatever the caller's umask.
+umask 0022
 repo_root=$(cd "$(dirname "$0")/.." && pwd)
 container_name=${MANYFORGE_DEV_CONTAINER_NAME:-manyforge-development-workbench}
 [[ "$container_name" =~ ^[a-zA-Z0-9][a-zA-Z0-9_.-]*$ ]] || { echo "Invalid Docker container name" >&2; exit 64; }
-image=${MANYFORGE_DEV_IMAGE:-manyforge-dev:latest}
+image=${MANYFORGE_DEV_IMAGE:-${MANYFORGE_ROS_FULL_IMAGE:-manyforge-ros-lyrical-full}}
 cache_base=${MANYFORGE_DEV_CACHE_BASE:-"$repo_root/.manyforge-dev"}
 runtime_root=${MANYFORGE_DEV_RUNTIME_STATE_ROOT:-"$cache_base/runtime/$container_name"}
 retention_helper="$repo_root/scripts/lib/export_retention.py"
@@ -21,6 +24,63 @@ operator_instance=${MANYFORGE_DEV_LAUNCH_INSTANCE_ID:-}
 operator_digest=${MANYFORGE_DEV_LAUNCH_INPUT_DIGEST:-}
 operator_mode=false
 container_ref=${MANYFORGE_DEV_EXPECTED_CONTAINER_ID:-$container_name}
+
+# Read the host project folders from the same site file used by the Manager.
+read_project_folders() {
+  project_folders=()
+  [[ -n ${MANYFORGE_DEV_SITE_SETTINGS:-} ]] || return 0
+  local reader_fd reader_pid
+  exec {reader_fd}< <(python3 - "$MANYFORGE_DEV_SITE_SETTINGS" <<'PY'
+import json, os, sys
+
+try:
+    if not os.path.isabs(sys.argv[1]):
+        raise ValueError("site settings path must be absolute")
+    with open(sys.argv[1], encoding="utf-8") as stream:
+        site = json.load(stream)
+    if not isinstance(site, dict):
+        raise ValueError("site settings must be a JSON object")
+    if site.get("schema") != "manyforge.site.v1":
+        raise ValueError("site settings schema must be manyforge.site.v1")
+    unknown = site.keys() - {"schema", "device_addresses", "project_folders"}
+    if unknown:
+        raise ValueError(f"site settings has unknown fields: {', '.join(sorted(unknown))}")
+    folders = site.get("project_folders", [])
+    if not isinstance(folders, list):
+        raise ValueError("project_folders must be a list of absolute host paths")
+    seen = set()
+    for folder in folders:
+        if not isinstance(folder, str) or not os.path.isabs(folder) or not os.path.isdir(folder):
+            raise ValueError(f"project folder must be an existing absolute directory: {folder!r}")
+        if folder in seen:
+            raise ValueError(f"project_folders repeats {folder!r}")
+        seen.add(folder)
+        name = os.path.basename(os.path.normpath(folder)) or "/"
+        if ":" in folder or "," in name or name != name.strip():
+            raise ValueError(f"unsupported project folder {folder!r}: paths cannot contain ':', and folder names cannot contain ',' or start or end with whitespace; rename the folder")
+        sys.stdout.buffer.write(os.fsencode(folder) + b"\0")
+except json.JSONDecodeError as error:
+    print(f"project_folder_invalid: site settings file must be JSON: {error}", file=sys.stderr)
+    raise SystemExit(64)
+except (OSError, ValueError, TypeError, AttributeError) as error:
+    print(f"project_folder_invalid: {error}", file=sys.stderr)
+    raise SystemExit(64)
+PY
+  )
+  reader_pid=$!
+  mapfile -d '' -t project_folders <&"$reader_fd"
+  exec {reader_fd}<&-
+  wait "$reader_pid" || return 64
+}
+
+project_root_taken() {
+  local root
+  for root in "${project_roots[@]}"; do
+    [[ "$root" != "$1" ]] || return 0
+  done
+  return 1
+}
+
 if [[ -n "$operator_instance" ]]; then
   operator_mode=true
   [[ "$operator_instance" != . && "$operator_instance" != .. && "$operator_instance" != */* && "$operator_instance" != *\\* ]] || { echo "Invalid operator instance path" >&2; exit 64; }
@@ -112,7 +172,7 @@ cleanup_failed_start() {
 trap cleanup_failed_start EXIT
 
 usage() {
-  echo "Usage: $0 start [--project <scenario-project-folder> | --bootstrap-project <first-ros-scenario-folder>] | status | stop [--keep-evidence]" >&2
+  echo "Usage: $0 build | start [--project <scenario-project-folder> | --bootstrap-project <first-ros-scenario-folder>] | status | stop [--keep-evidence]" >&2
 }
 
 stop_with_evidence() {
@@ -287,6 +347,18 @@ if [[ -n "$command" ]]; then
   shift
 fi
 case "$command" in
+  build)
+    (($# == 0)) || { usage; exit 64; }
+    # The full ROS Lyrical image: ManyForge toolchain, pinned controller
+    # overlay and xArm driver. Jetson hosts use NVIDIA's JetPack suite.
+    suite=noble
+    [[ ! -e /etc/nv_tegra_release ]] || suite=noble-jetpack
+    "$repo_root/scripts/setup-docker.sh" --prepare-only
+    MANYFORGE_ROS_FULL_IMAGE="$image" \
+      NVIDIA_ISAAC_ROS_RELEASE_SUITE="${NVIDIA_ISAAC_ROS_RELEASE_SUITE:-$suite}" \
+      docker compose -f "$repo_root/docker-compose.yaml" --profile ros-full build ros-jazzy-full
+    echo "Built $image. Start the workbench with: $0 start"
+    ;;
   start)
     while (($#)); do
       case "$1" in
@@ -346,7 +418,7 @@ case "$command" in
     fi
     image_id=$(docker image inspect -f '{{.Id}}' "$image" 2>/dev/null) || {
       echo "Development image is unavailable: $image" >&2
-      echo "Prepare it once with: ./scripts/setup-docker.sh && docker compose build dev" >&2
+      echo "Build it once with: ./scripts/compose-dev.sh build" >&2
       exit 69
     }
     image_key=${image_id#sha256:}
@@ -390,7 +462,7 @@ case "$command" in
         --package-aggregate-sha256 "${MANYFORGE_DEV_OPERATOR_PACKAGE_SHA256:?qualified package digest required}"
         --composer-port 9000 --composer-bind-host 0.0.0.0)
       startup_mounts=(-v "$install_root:$install_root:ro")
-      for option in COMPOSER_STATIC_DIR SIMULATION_CONTROL_CONFIG OPERATOR_NODE_CATALOG OPERATOR_ALARM_CATALOG; do
+      for option in COMPOSER_STATIC_DIR SIMULATION_CONTROL_CONFIG SITE_SETTINGS OPERATOR_NODE_CATALOG OPERATOR_ALARM_CATALOG; do
         variable="MANYFORGE_DEV_$option"
         if [[ -n ${!variable:-} ]]; then
           path=${!variable}
@@ -398,6 +470,7 @@ case "$command" in
           case "$option" in
             COMPOSER_STATIC_DIR) [[ -f "$path/index.html" ]] || exit 64; option_name=--composer-static-dir; parent=$path ;;
             SIMULATION_CONTROL_CONFIG) [[ -f "$path" ]] || exit 64; option_name=--simulation-control-config; parent=$(dirname "$path") ;;
+            SITE_SETTINGS) [[ -f "$path" ]] || exit 64; option_name=--site-settings; parent=$(dirname "$path") ;;
             OPERATOR_NODE_CATALOG) [[ -f "$path" ]] || exit 64; option_name=--node-catalog-path; parent=$(dirname "$path") ;;
             OPERATOR_ALARM_CATALOG) [[ -f "$path" ]] || exit 64; option_name=--alarm-catalog-path; parent=$(dirname "$path") ;;
           esac
@@ -407,6 +480,38 @@ case "$command" in
       done
       operator_labels=(--log-driver json-file --label "manyforge.launch-instance=$operator_instance"
         --label "manyforge.launch-input-digest=$operator_digest")
+    fi
+    # Generic machine site facts (manyforge.site.v1), independent of Isaac.
+    if [[ "$operator_mode" != true && -n ${MANYFORGE_DEV_SITE_SETTINGS:-} ]]; then
+      path=$MANYFORGE_DEV_SITE_SETTINGS
+      [[ "$path" == /* ]] || { echo "Development site settings must be an absolute path" >&2; exit 64; }
+      [[ -f "$path" ]] || { echo "Development site settings file is unavailable: $path" >&2; exit 64; }
+      parent=$(dirname "$path")
+      [[ " ${startup_mounts[*]} " == *" $parent:$parent:ro "* ]] || startup_mounts+=(-v "$parent:$parent:ro")
+      serve_args+=(--site-settings "$path")
+    fi
+    # Project folders are user-selected host directories. Reordering folders
+    # with equal basenames may change their destination suffixes.
+    read_project_folders
+    project_roots=()
+    project_mapping_arguments=()
+    for folder in "${project_folders[@]}"; do
+      project_name=$(basename -- "$(realpath -s -- "$folder")")
+      project_root="/projects/$project_name"
+      project_suffix=2
+      while project_root_taken "$project_root"; do
+        project_root="/projects/$project_name-$project_suffix"
+        ((project_suffix+=1))
+      done
+      startup_mounts+=(-v "$folder:$project_root")
+      project_roots+=("$project_root")
+      project_mapping_arguments+=("$folder" "$project_root")
+    done
+    project_environment=()
+    if ((${#project_roots[@]})); then
+      project_environment=(-e "MANYFORGE_DEV_PROJECT_ROOTS=$(IFS=,; printf '%s' "${project_roots[*]}")")
+      project_mappings=$(python3 -c 'import json,sys; print(json.dumps([{"hostPath": a, "containerPath": b} for a,b in zip(sys.argv[1::2],sys.argv[2::2])], separators=(",", ":")))' "${project_mapping_arguments[@]}")
+      project_environment+=(-e "MANYFORGE_PROJECT_ROOT_MAPPINGS=$project_mappings")
     fi
     ros_environment=()
     ros_identity=()
@@ -459,6 +564,11 @@ case "$command" in
         MANYFORGE_EXPERIMENTAL_REPLACEMENT_START_ALLOWANCE_MS; do
       [[ ! -v "$variable" ]] || session_environment+=(--env "$variable")
     done
+    # AI model tokens: an ai_model component names its token variable
+    # MANYFORGE_AI_*; forward each by name only (the value never enters argv).
+    while IFS= read -r variable; do
+      [[ $variable != MANYFORGE_AI_* ]] || session_environment+=(--env "$variable")
+    done < <(compgen -e)
     container_ref=$(docker run -d \
       --name "$container_name" \
       --label "manyforge.dev.ros2-control=$ros2_control" \
@@ -474,6 +584,7 @@ case "$command" in
       "${ros_identity[@]}" \
       "${ros_environment[@]}" \
       "${startup_mounts[@]}" \
+      "${project_environment[@]}" \
       -v "$repo_root:/workspace" \
       -v "$runtime_root:/tmp/manyforge-state" \
       -v "$cache_root:/runner" \

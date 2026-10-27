@@ -93,6 +93,8 @@ import {
 } from './property/ValueSourceField';
 import { InterruptConditionEditor } from './InterruptConditionEditor';
 import { MockSimulationEditor } from './MockSimulationEditor';
+import { PneumaticRequiredInputsEditor } from './PneumaticRequiredInputsEditor';
+import { declaredPneumaticInputs } from '../utils/pneumaticGripperAuthoring';
 import { IO_LIVENESS_UNPROVEN_WARNING } from '../utils/ioSignalConfiguration';
 import { precisionContactStopWarnings } from '../utils/precisionContactStopWarnings';
 import { resolvedTargetRoles } from '../utils/targetRoleResolution';
@@ -348,6 +350,9 @@ export function ProgramPropertyEditor({
   const targetRoleRows = useMemo(() => (workspaceBinding == null
     ? resolvedTargetRoles(program, programRoleAssignment)
     : workspaceBinding.target_role_bindings), [workspaceBinding, program, programRoleAssignment]);
+  const draftTargetRoles = useMemo(() => (programRoleAssignment == null
+    ? targetRoleRows : resolvedTargetRoles(program, programRoleAssignment)),
+  [program, programRoleAssignment, targetRoleRows]);
   const stopWarnings = useMemo(() => (selected === null ? [] : precisionContactStopWarnings(
     selected, deploymentDocument as Record<string, JsonValue> | null, targetRoleRows,
   )), [deploymentDocument, targetRoleRows, selected]);
@@ -759,6 +764,12 @@ export function ProgramPropertyEditor({
           // Catalog schema type `mock_signal_simulation` (contract 133): literal rows only.
           const mockField = MOCK_SIMULATION_NODE_IDS.has(selected.node_id)
             && parameter.id === MOCK_SIMULATION_PARAMETER && !repairMode;
+          const requiredInputsField = selected.node_id === 'gripper.command_position'
+            && parameter.id === 'required_inputs' && source === undefined && !repairMode
+            && !hasSourcesWithin(selected.value_sources, parameter.id)
+            && (!Array.isArray(literal) || new Set(literal.map((item) => (
+              item !== null && typeof item === 'object' && !Array.isArray(item) ? item.input : null
+            ))).size === literal.length);
           const storedText = (id: string) => (typeof selected.parameters[id] === 'string'
             ? selected.parameters[id] as string : undefined);
           return (
@@ -813,7 +824,16 @@ export function ProgramPropertyEditor({
                   {literal} does not apply to this key; choose {rule.choices.join(' or ')}.
                 </p>
               )}
-              {mockField ? (
+              {requiredInputsField ? (() => {
+                const target = draftTargetRoles.find((row) => row.target_role_id === selected.parameters.target_role);
+                return <div id={`property-${selected.instance_id}-${parameter.id}`}>
+                  <PneumaticRequiredInputsEditor value={literal}
+                    declaredKeys={declaredPneumaticInputs(deploymentDocument as Record<string, JsonValue> | null,
+                      target?.controllable_component_id, target?.command_target_id)}
+                    disabled={busy || rule.locked !== undefined}
+                    onCommit={(value) => commitLiteral(parameter, value)} />
+                </div>;
+              })() : mockField ? (
                 <div id={`property-${selected.instance_id}-${parameter.id}`}>
                   {(() => {
                     const signals = nodeMockSignals(selected);

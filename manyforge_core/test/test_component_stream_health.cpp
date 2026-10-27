@@ -87,6 +87,44 @@ TEST_F(ComponentStreamHealthTest, MessageStampMustAdvanceWithinBudget) {
   EXPECT_TRUE(verdicts_["arm"].empty());
 }
 
+TEST_F(ComponentStreamHealthTest, ASampleExactlyOneBudgetOldIsExpired) {
+  auto recorder = Declare("arm", Stream("measured_joints", StreamSeverityDTO::kBlocking,
+                                        StreamRecoveryDTO::kAuto));
+  recorder->Record(10);
+  Run();
+  EXPECT_EQ(Row("arm").state, StreamLivenessStateDTO::kLive);
+  Advance(99 * kMs);
+  EXPECT_EQ(Row("arm").state, StreamLivenessStateDTO::kLive);
+  // The deadline equals `now`: expired, not re-queued at `now` (that looped forever).
+  Advance(1 * kMs);
+  EXPECT_EQ(Row("arm").state, StreamLivenessStateDTO::kStale);
+  ASSERT_TRUE(verdicts_["arm"].motion_hold);
+}
+
+TEST_F(ComponentStreamHealthTest, AStampStepBackIsASampleAnEqualStampIsNot) {
+  auto recorder = Declare("arm", Stream("measured_joints", StreamSeverityDTO::kBlocking,
+                                        StreamRecoveryDTO::kAuto));
+  recorder->Record(5'000 * kMs);
+  Run();
+  EXPECT_EQ(Row("arm").state, StreamLivenessStateDTO::kLive);
+  // A simulator reset: sim time restarts near zero and keeps advancing.
+  for (int i = 1; i <= 5; ++i) {
+    Advance(60 * kMs);
+    recorder->Record(i * kMs);
+  }
+  Run();
+  EXPECT_EQ(Row("arm").state, StreamLivenessStateDTO::kLive);
+  EXPECT_TRUE(verdicts_["arm"].empty());
+  // Paused after the reset: the same stamp repeats and the stream goes stale.
+  for (int i = 0; i < 4; ++i) {
+    Advance(30 * kMs);
+    recorder->Record(5 * kMs);
+  }
+  Run();
+  EXPECT_EQ(Row("arm").state, StreamLivenessStateDTO::kStale);
+  ASSERT_TRUE(verdicts_["arm"].motion_hold);
+}
+
 TEST_F(ComponentStreamHealthTest, ArrivalStreamsAdvanceOnEverySample) {
   auto recorder = Declare("io", Stream("ready", StreamSeverityDTO::kBlocking, StreamRecoveryDTO::kAuto,
                                        StreamTimestampSourceDTO::kArrival));
@@ -131,12 +169,54 @@ TEST_F(ComponentStreamHealthTest, SeverityDecidesTheVerdict) {
   EXPECT_TRUE(verdicts_["b"].motion_hold);
   EXPECT_FALSE(verdicts_.contains("c"));
   EXPECT_EQ(Row("c").state, StreamLivenessStateDTO::kStale);
-  // `fault` always behaves as `ack`, but its incident is the latch: fresh
-  // again clears the stream condition itself.
+  // A `fault` stream's latch is its incident (the driver's): fresh again
+  // clears the stream condition itself.
   EXPECT_EQ(Row("a").recovery, StreamRecoveryDTO::kAck);
   fault->Record(2);
   Run();
   EXPECT_TRUE(verdicts_["a"].empty());
+}
+
+TEST_F(ComponentStreamHealthTest, FaultWithAutoRecoveryReportsAuto) {
+  auto fault = Declare("a", Stream("s", StreamSeverityDTO::kFault, StreamRecoveryDTO::kAuto));
+  fault->Record(1);
+  Run();
+  Advance(101 * kMs);
+  EXPECT_TRUE(verdicts_["a"].fault_loss);
+  EXPECT_EQ(Row("a").recovery, StreamRecoveryDTO::kAuto);
+  EXPECT_FALSE(Row("a").acknowledgement_required);
+  fault->Record(2);
+  Run();
+  EXPECT_TRUE(verdicts_["a"].empty());
+  EXPECT_EQ(Row("a").state, StreamLivenessStateDTO::kLive);
+}
+
+TEST_F(ComponentStreamHealthTest, AStaleStreamIsReportedOnceUntilLiveAgain) {
+  std::vector<std::string> lines;
+  health_.SetLog([&](const std::string& line) { lines.push_back(line); });
+  auto fault = Declare("a", Stream("s", StreamSeverityDTO::kFault, StreamRecoveryDTO::kAuto));
+  fault->Record(1);
+  Run();
+  const auto calls_live = calls_;
+  const auto lines_live = lines.size();
+  Advance(101 * kMs);
+  ASSERT_TRUE(verdicts_["a"].fault_loss);
+  EXPECT_EQ(calls_, calls_live + 1);
+  EXPECT_EQ(lines.size(), lines_live + 1U);
+  // Many budgets later, still stale: no further verdict, log line or deadline.
+  for (int i = 0; i < 10; ++i) Advance(100 * kMs);
+  EXPECT_EQ(calls_, calls_live + 1);
+  EXPECT_EQ(lines.size(), lines_live + 1U);
+  // Live again clears it once; the next break is one new report.
+  fault->Record(2);
+  Run();
+  EXPECT_TRUE(verdicts_["a"].empty());
+  EXPECT_EQ(calls_, calls_live + 2);
+  Advance(101 * kMs);
+  EXPECT_TRUE(verdicts_["a"].fault_loss);
+  EXPECT_EQ(calls_, calls_live + 3);
+  EXPECT_EQ(lines.size(), lines_live + 3U);
+  health_.SetLog({});
 }
 
 TEST_F(ComponentStreamHealthTest, AckLatchesUntilTheOperatorsRecover) {

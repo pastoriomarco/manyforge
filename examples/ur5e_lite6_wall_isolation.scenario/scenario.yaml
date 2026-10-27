@@ -8,12 +8,12 @@
   "description": "Two independent joint trajectories in the UR5e + Lite6 wall cell, in separate control groups for the isolation case.",
   "members": {
     "assignment.yaml": "sha256:f44d0d3f0adf5a93854e73a414393a779a4a5704a910f29b2500a491cf3a3ebe",
-    "deployment.yaml": "sha256:42043c9ce79ca0c327b3c5cb093489943850497dee070002d30d617316a3fcf4",
+    "deployment.yaml": "sha256:7f07f567324ea339d5f46b97c520bc4add12823b5316ba85a5c034697542148a",
     "program.yaml": "sha256:dda8af27ddaaa1ca4c75e02571c940a9cb734cef3b6653bb89aeb123e7b28c63"
   },
   "name": "ur5e_lite6_wall_isolation",
   "saved_status": {
-    "checked_content_digest": "sha256:11447e9cb2b51fbd9e24963059e9fb4bc17f75db0933ed948fcc23063d39e328",
+    "checked_content_digest": "sha256:f99220658fefe9e0e80445084743c1f732d957b66c9842d37896dd35b1a67f19",
     "last_known_status": "ready",
     "manyforge_version": "0.1.0"
   },
@@ -97,7 +97,7 @@
         "source_id": "component:lite6_robot:srdf"
       },
       {
-        "content_digest": "sha256:448485049362a14643f3a6418cee4a9e2119bc86509f0a127607aad54803b641",
+        "content_digest": "sha256:c205aea7474737989e1195fbbff16cb9d3f287fee3cefcd550c7ad2e4e606e90",
         "source_id": "component:lite6_robot:urdf"
       },
       {

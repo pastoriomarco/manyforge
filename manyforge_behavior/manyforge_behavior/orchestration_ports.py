@@ -99,6 +99,9 @@ class ProgramRunPortContext:
     program_binding: Mapping[str, Any]
     program: Mapping[str, Any] = field(default_factory=lambda: MappingProxyType({}))
     assistant_projection: Mapping[str, Any] | None = None
+    # Simulator entity mapping of the active Deployment links
+    # ({cell_frame_id, scene_entities}); None when it has none.
+    simulation_scene: Mapping[str, Any] | None = None
 
     def __post_init__(self) -> None:
         for field_name in ("program_run_id", "scenario_id", "program_id"):
@@ -156,6 +159,19 @@ class ProgramRunPortContext:
                 None
                 if self.assistant_projection is None
                 else _freeze(dict(self.assistant_projection))
+            ),
+        )
+        if self.simulation_scene is not None and not isinstance(
+            self.simulation_scene, Mapping
+        ):
+            raise TypeError("simulation_scene must be absent or a mapping")
+        object.__setattr__(
+            self,
+            "simulation_scene",
+            (
+                None
+                if self.simulation_scene is None
+                else _freeze(dict(self.simulation_scene))
             ),
         )
 
@@ -420,6 +436,22 @@ class OwnerInvocationHeldError(RuntimeError):
         if type(selection_revision) is not int or not 0 <= selection_revision <= 9_007_199_254_740_991:
             raise ValueError("held invocation requires an exact Stop selection revision")
         self.selection_revision = selection_revision
+
+
+class OwnerInvocationGatedError(RuntimeError):
+    """A gate rule (`on_trip: gate`) refused this motion before admission.
+
+    No effect was started. The refusal is transient (Rule 2): the condition
+    of global rule ``rule_id`` holds, and motion is allowed again once it
+    clears. ``refusal`` is the Kernel's own typed rejection, kept unchanged.
+    """
+
+    def __init__(self, rule_id: str, refusal: BaseException) -> None:
+        super().__init__(str(refusal) or f"global interrupt rule {rule_id} is active")
+        if not isinstance(rule_id, str) or not rule_id:
+            raise ValueError("a gated refusal names its rule")
+        self.rule_id = rule_id
+        self.refusal = refusal
 
 
 class OwnerInvocationRefusedByPriorityError(RuntimeError):
@@ -954,6 +986,7 @@ __all__ = [
     "OwnerInvocationResult",
     "OwnerInvocationPendingError",
     "OwnerInvocationHeldError",
+    "OwnerInvocationGatedError",
     "OwnerInvocationRefusedByPriorityError",
     "OwnerTaskPort",
     "OwnerTaskObservationUnavailableError",

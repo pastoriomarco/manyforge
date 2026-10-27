@@ -8,12 +8,12 @@
   "description": "lite6_lite_gripper_pick_and_place\n\nNative ManyForge pick-and-place deployment for UFACTORY Lite6 with the lite pneumatic gripper. The model bundle is self-contained; xarm_ros2 is a generation-time and real-robot runtime dependency only.",
   "members": {
     "assignment.yaml": "sha256:84e103dc895e6da75d430d5d08f69583126910c832efc100b1f652524690cb46",
-    "deployment.yaml": "sha256:0ea0deca7c4b89da32ca5e9f811cc706bc1055705bb4896d30c4ea48d29b9f8d",
+    "deployment.yaml": "sha256:c32df5b35344d8146ae26713f453018c1c7239cdc61775a877c676a7bb5182a4",
     "program.yaml": "sha256:d5889eb00e9ea6520a5da97c7e4eb66f00c936e317367f16198a0909b32bd530"
   },
   "name": "lite6_pick_and_place",
   "saved_status": {
-    "checked_content_digest": "sha256:9f5a8e37ebf47273b566f0e4f30bc4aa7a0510638dbe7e38473c1317e2b44703",
+    "checked_content_digest": "sha256:ff01ede66916d90f87de3ec29f009ff3138946da5dc575231f817f24cf256cad",
     "last_known_status": "ready",
     "manyforge_version": "0.1.0"
   },
@@ -97,7 +97,7 @@
         "source_id": "component:lite6_robot:srdf"
       },
       {
-        "content_digest": "sha256:448485049362a14643f3a6418cee4a9e2119bc86509f0a127607aad54803b641",
+        "content_digest": "sha256:c205aea7474737989e1195fbbff16cb9d3f287fee3cefcd550c7ad2e4e606e90",
         "source_id": "component:lite6_robot:urdf"
       }
     ],

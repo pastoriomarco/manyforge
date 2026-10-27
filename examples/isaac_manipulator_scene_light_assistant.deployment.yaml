@@ -43,6 +43,10 @@
             "scene.update_object_pose",
             "scene.upsert_object",
             "sequence",
+            "simulation.reset",
+            "simulation.set_entity_pose",
+            "simulation.set_state",
+            "simulation.step",
             "timer"
           ],
           "skills": [],
@@ -57,8 +61,6 @@
             "program_draft_remove_parameters",
             "program_draft_upsert_parameters",
             "program_read",
-            "propose_scene_object_nodes",
-            "propose_scene_objects",
             "scene_draft_add_object",
             "scene_draft_remove_objects",
             "scene_draft_update_object",
@@ -75,31 +77,11 @@
             "tree_draft_wrap_node"
           ]
         },
-        "description": "Scene-authoring proposal mode for Composer.",
+        "description": "Scene and Program authoring mode for Composer: edits land in the Program Draft.",
         "enabled": true,
         "grant_policy": {
           "approval_mode": null,
           "review_policy": "required",
-          "session_kind": null
-        },
-        "model_endpoint_alias": "assistant_model",
-        "provider_alias": "assistant_provider"
-      },
-      "query": {
-        "catalog": {
-          "nodes": [],
-          "skills": [],
-          "tools": [
-            "inspect_isaac_scene",
-            "program_read",
-            "scene_inspect"
-          ]
-        },
-        "description": "Read-only inspection mode for assistant questions.",
-        "enabled": true,
-        "grant_policy": {
-          "approval_mode": null,
-          "review_policy": "not_required",
           "session_kind": null
         },
         "model_endpoint_alias": "assistant_model",
@@ -1181,11 +1163,11 @@
         "schema_revision": "sha256:b242431032bf183f81718ae1b7b8501ee5f705e52d455732e0052215565bf4cc"
       },
       {
-        "content_addressed_store_key": "catalog/maintained/runtime_profile/manyforge.ros2_control_execution_runtime/b397e0aac654f6f9137c61b2824073af164f4191dc588807614d65d4eabb6a51",
-        "content_digest": "sha256:fcb7368e60ac0e79e8fdfaf0189fd376305cae51b1a55a44f7ad97a58fcf1388",
+        "content_addressed_store_key": "catalog/maintained/runtime_profile/manyforge.ros2_control_execution_runtime/b096aa212e1ad67f246a5203ffafa39e832bb405292270acde121ae780f27d06",
+        "content_digest": "sha256:af2713420310df874fef2bef33e38300b54d3575f981023adbf3fac93bfa3c7b",
         "record_id": "manyforge.ros2_control_execution_runtime",
         "record_kind": "runtime_profile",
-        "record_revision": "sha256:b397e0aac654f6f9137c61b2824073af164f4191dc588807614d65d4eabb6a51",
+        "record_revision": "sha256:b096aa212e1ad67f246a5203ffafa39e832bb405292270acde121ae780f27d06",
         "schema_id": "manyforge.runtime_profile.v1",
         "schema_revision": "sha256:c254afa8c2bfcc803f12a7af63b1f09a8ee804b1ffa2a65b7361ad9309b87ae7"
       },
@@ -1226,7 +1208,7 @@
     ]
   },
   "deployment_artifact_id": "isaac_manipulator_scene_light_assistant",
-  "deployment_revision": "sha256:899efcbaf5b5cc8435f5f3dee50d1cfa95d1ddec58510062300287f2b57189f7",
+  "deployment_revision": "sha256:086c97c10733b29d0ea89471916163e028cd7e429921abbd1b63a6398c3b2567",
   "description": "Retained Isaac UR10e light-scene deployment with the ROS 2 control execution product and the finite assistant scene-authoring overlay; simulator mutation remains operator-approved.",
   "desired_control_configurations": [
     {
@@ -1977,6 +1959,22 @@
       {
         "configuration": {
           "collision_monitor_period_ms": 100,
+          "component_streams": [
+            {
+              "budget_ns": 1000000000,
+              "controllable_component_id": "isaac_ur10e_assistant_robot",
+              "recovery": "auto",
+              "severity": "warning",
+              "stream_id": "gripper_feedback"
+            },
+            {
+              "budget_ns": 250000000,
+              "controllable_component_id": "isaac_ur10e_assistant_robot",
+              "recovery": "auto",
+              "severity": "warning",
+              "stream_id": "measured_joints"
+            }
+          ],
           "controller_profiles": [
             {
               "controllable_component_id": "isaac_ur10e_assistant_robot",
@@ -2036,7 +2034,6 @@
               "mount_frame": "tool0",
               "open_state_ref": "open",
               "output_mode": "commanded",
-              "state_freshness_timeout_s": 1,
               "tcp_frame": "grasp_frame",
               "touch_links": [
                 "left_inner_finger",
@@ -2061,7 +2058,6 @@
             -1.560498884,
             -2.038544566
           ],
-          "mode": "commanded_sim",
           "motion_target_limits": [
             {
               "command_target_id": "arm",
@@ -2081,7 +2077,7 @@
         },
         "dependency_runtime_unit_ids": [],
         "runtime_profile_id": "manyforge.ros2_control_execution_runtime",
-        "runtime_profile_revision": "sha256:b397e0aac654f6f9137c61b2824073af164f4191dc588807614d65d4eabb6a51",
+        "runtime_profile_revision": "sha256:b096aa212e1ad67f246a5203ffafa39e832bb405292270acde121ae780f27d06",
         "runtime_unit_id": "robot_cell.ros2_control_execution"
       }
     ]

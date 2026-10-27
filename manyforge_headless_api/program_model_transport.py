@@ -1,17 +1,12 @@
-"""Concrete site transport for compiler-qualified Program model requests."""
+"""Concrete transport for compiler-qualified Program model requests."""
 
 from __future__ import annotations
 
 from collections.abc import Mapping
-from dataclasses import dataclass, field
 import json
 import os
-from pathlib import Path
-import stat
 from threading import Event, RLock
-from types import MappingProxyType
 from typing import Any, Final
-from urllib.parse import urlsplit
 
 import httpx
 
@@ -27,20 +22,8 @@ from manyforge_headless_api.native import HeadlessCorePort
 
 _MAX_RESPONSE_BYTES: Final = 4 * 1024 * 1024
 _MAX_REQUEST_BYTES: Final = 8 * 1024 * 1024
-_MAX_SITE_CONFIG_BYTES: Final = 1024 * 1024
-_MAX_SITE_ENDPOINTS: Final = 64
-_MAX_SITE_HEADERS: Final = 64
 _STREAM_CHUNK_BYTES: Final = 64 * 1024
-_SITE_CONFIG_VERSION: Final = "manyforge.program_model_site_config.v1"
-_RESERVED_REQUEST_HEADERS: Final = frozenset(
-    {
-        "connection",
-        "content-length",
-        "content-type",
-        "host",
-        "transfer-encoding",
-    }
-)
+_TOOL_CALL_FAMILY: Final = "openai_chat_tools"
 
 
 class ProgramModelAuditCommitError(RuntimeError):
@@ -109,338 +92,18 @@ def _strict_object(raw: bytes, *, label: str) -> dict[str, Any]:
     return value
 
 
-@dataclass(frozen=True, slots=True)
-class ProgramModelEndpointConfig:
-    """One launcher-supplied external resource; never authored in a Program."""
+class OpenAICompatibleProgramModelTransport:
+    """Bounded OpenAI-compatible transport to the Deployment's AI model component.
 
-    external_resource_alias: str
-    chat_completions_url: str
-    model_endpoint_aliases: tuple[str, ...]
-    model_ids: tuple[str, ...]
-    tool_call_families: tuple[str, ...] = ("openai_chat_tools",)
-    headers: Mapping[str, str] = field(default_factory=dict, repr=False)
-    bearer_token: str | None = field(default=None, repr=False)
-
-    def __post_init__(self) -> None:
-        for field_name in ("external_resource_alias", "chat_completions_url"):
-            value = getattr(self, field_name)
-            if (
-                not isinstance(value, str)
-                or not value
-                or len(value.encode("utf-8")) > 4_096
-            ):
-                raise ValueError(f"{field_name} must be bounded non-empty text")
-        parsed = urlsplit(self.chat_completions_url)
-        if (
-            parsed.scheme not in {"http", "https"}
-            or not parsed.netloc
-            or parsed.username is not None
-            or parsed.password is not None
-        ):
-            raise ValueError("chat_completions_url must be an absolute HTTP(S) URL")
-        for field_name in (
-            "model_endpoint_aliases",
-            "model_ids",
-            "tool_call_families",
-        ):
-            values = getattr(self, field_name)
-            if (
-                not isinstance(values, tuple)
-                or not values
-                or tuple(sorted(set(values))) != values
-                or any(
-                    not isinstance(value, str)
-                    or not value
-                    or len(value.encode("utf-8")) > 512
-                    for value in values
-                )
-            ):
-                raise ValueError(f"{field_name} must be sorted unique bounded text")
-        if any(
-            family != "openai_chat_tools" for family in self.tool_call_families
-        ):
-            raise ValueError(
-                "the concrete baseline transport supports openai_chat_tools only"
-            )
-        if not isinstance(self.headers, Mapping) or any(
-            not isinstance(key, str)
-            or not key
-            or not isinstance(value, str)
-            or len(key.encode("utf-8")) > 256
-            or len(value.encode("utf-8")) > 4_096
-            for key, value in self.headers.items()
-        ):
-            raise ValueError("site model headers are invalid")
-        normalized_header_names = [key.lower() for key in self.headers]
-        if (
-            len(normalized_header_names) != len(set(normalized_header_names))
-            or _RESERVED_REQUEST_HEADERS.intersection(normalized_header_names)
-        ):
-            raise ValueError("site model headers contain ambiguous reserved fields")
-        if self.bearer_token is not None and (
-            not isinstance(self.bearer_token, str)
-            or not self.bearer_token
-            or len(self.bearer_token.encode("utf-8")) > 16_384
-        ):
-            raise ValueError("bearer_token must be absent or bounded text")
-        if self.bearer_token is not None and "authorization" in (
-            normalized_header_names
-        ):
-            raise ValueError(
-                "bearer_token and an explicit Authorization header are ambiguous"
-            )
-        object.__setattr__(self, "headers", MappingProxyType(dict(self.headers)))
-
-
-def _site_text(
-    value: object,
-    *,
-    field_name: str,
-    maximum_bytes: int = 4_096,
-) -> str:
-    if (
-        not isinstance(value, str)
-        or not value
-        or len(value.encode("utf-8")) > maximum_bytes
-    ):
-        raise ValueError(f"{field_name} must be bounded non-empty text")
-    return value
-
-
-def _site_text_tuple(
-    value: object,
-    *,
-    field_name: str,
-    maximum_values: int = 64,
-) -> tuple[str, ...]:
-    if (
-        not isinstance(value, list)
-        or not 1 <= len(value) <= maximum_values
-        or any(not isinstance(item, str) for item in value)
-    ):
-        raise ValueError(f"{field_name} must be a bounded text array")
-    result = tuple(
-        _site_text(item, field_name=field_name, maximum_bytes=512)
-        for item in value
-    )
-    if tuple(sorted(set(result))) != result:
-        raise ValueError(f"{field_name} must be sorted and unique")
-    return result
-
-
-def load_program_model_endpoint_configs(
-    path: str | os.PathLike[str],
-    *,
-    environ: Mapping[str, str] | None = None,
-) -> tuple[ProgramModelEndpointConfig, ...]:
-    """Load one strict launcher-owned model endpoint allowlist.
-
-    This is site configuration, not Program or deployment meaning. Secrets are
-    referenced by environment-variable name and are never read from retained
-    artifacts or returned through the public API.
+    Each request carries the component's ``base_url`` and token variable name;
+    the token is read from the environment at call time.
     """
 
-    filename = Path(path)
-    descriptor = -1
-    try:
-        descriptor = os.open(
-            filename,
-            os.O_RDONLY | os.O_CLOEXEC | os.O_NOFOLLOW,
-        )
-        status = os.fstat(descriptor)
-        if (
-            not stat.S_ISREG(status.st_mode)
-            or status.st_size <= 0
-            or status.st_size > _MAX_SITE_CONFIG_BYTES
-        ):
-            raise ValueError(
-                "Program model site configuration must be one bounded regular file"
-            )
-        chunks: list[bytes] = []
-        remaining = status.st_size
-        while remaining:
-            chunk = os.read(descriptor, min(remaining, 64 * 1024))
-            if not chunk:
-                raise ValueError(
-                    "Program model site configuration changed while read"
-                )
-            chunks.append(chunk)
-            remaining -= len(chunk)
-        if os.read(descriptor, 1):
-            raise ValueError("Program model site configuration changed while read")
-    except OSError as exc:
-        raise ValueError(
-            "Program model site configuration is not one readable plain file"
-        ) from exc
-    finally:
-        if descriptor >= 0:
-            os.close(descriptor)
-
-    try:
-        root = _strict_object(
-            b"".join(chunks),
-            label="Program model site configuration",
-        )
-    except ProgramModelTransportError as exc:
-        raise ValueError(str(exc)) from exc
-    if set(root) != {"api_version", "endpoints"}:
-        raise ValueError(
-            "Program model site configuration has unknown or missing fields"
-        )
-    if root["api_version"] != _SITE_CONFIG_VERSION:
-        raise ValueError("Program model site configuration version is unsupported")
-    rows = root["endpoints"]
-    if not isinstance(rows, list) or not 1 <= len(rows) <= _MAX_SITE_ENDPOINTS:
-        raise ValueError(
-            "Program model site endpoints are outside their fixed bound"
-        )
-
-    environment = os.environ if environ is None else environ
-    expected_fields = {
-        "bearer_token_env",
-        "chat_completions_url",
-        "external_resource_alias",
-        "headers",
-        "model_endpoint_aliases",
-        "model_ids",
-        "tool_call_families",
-    }
-    result: list[ProgramModelEndpointConfig] = []
-    for index, row in enumerate(rows):
-        field = f"endpoints[{index}]"
-        if not isinstance(row, dict) or set(row) != expected_fields:
-            raise ValueError(f"{field} has unknown or missing fields")
-        headers = row["headers"]
-        if (
-            not isinstance(headers, dict)
-            or len(headers) > _MAX_SITE_HEADERS
-            or any(
-                not isinstance(key, str) or not isinstance(value, str)
-                for key, value in headers.items()
-            )
-        ):
-            raise ValueError(f"{field}.headers is not a bounded text object")
-        bearer_token_env = row["bearer_token_env"]
-        bearer_token: str | None = None
-        if bearer_token_env is not None:
-            variable = _site_text(
-                bearer_token_env,
-                field_name=f"{field}.bearer_token_env",
-                maximum_bytes=256,
-            )
-            if variable not in environment:
-                raise ValueError(
-                    f"{field}.bearer_token_env names an unset environment variable"
-                )
-            bearer_token = _site_text(
-                environment[variable],
-                field_name=f"{field}.bearer_token",
-                maximum_bytes=16_384,
-            )
-        result.append(
-            ProgramModelEndpointConfig(
-                external_resource_alias=_site_text(
-                    row["external_resource_alias"],
-                    field_name=f"{field}.external_resource_alias",
-                ),
-                chat_completions_url=_site_text(
-                    row["chat_completions_url"],
-                    field_name=f"{field}.chat_completions_url",
-                ),
-                model_endpoint_aliases=_site_text_tuple(
-                    row["model_endpoint_aliases"],
-                    field_name=f"{field}.model_endpoint_aliases",
-                ),
-                model_ids=_site_text_tuple(
-                    row["model_ids"],
-                    field_name=f"{field}.model_ids",
-                ),
-                tool_call_families=_site_text_tuple(
-                    row["tool_call_families"],
-                    field_name=f"{field}.tool_call_families",
-                ),
-                headers=dict(headers),
-                bearer_token=bearer_token,
-            )
-        )
-
-    resources: set[str] = set()
-    aliases: set[str] = set()
-    for endpoint in result:
-        if endpoint.external_resource_alias in resources:
-            raise ValueError(
-                "site model external-resource aliases must be unique"
-            )
-        resources.add(endpoint.external_resource_alias)
-        overlap = aliases.intersection(endpoint.model_endpoint_aliases)
-        if overlap:
-            raise ValueError(
-                f"site model endpoint aliases are ambiguous: {sorted(overlap)}"
-            )
-        aliases.update(endpoint.model_endpoint_aliases)
-    return tuple(result)
-
-
-class OpenAICompatibleProgramModelTransport:
-    """Bounded OpenAI-compatible transport over explicit site configuration."""
-
-    def __init__(
-        self,
-        endpoints: tuple[ProgramModelEndpointConfig, ...],
-        *,
-        client: httpx.Client | None = None,
-    ) -> None:
-        if not endpoints or any(
-            not isinstance(endpoint, ProgramModelEndpointConfig)
-            for endpoint in endpoints
-        ):
-            raise ValueError("at least one valid site model endpoint is required")
-        by_resource = {
-            endpoint.external_resource_alias: endpoint for endpoint in endpoints
-        }
-        if len(by_resource) != len(endpoints):
-            raise ValueError("site model external-resource aliases must be unique")
-        aliases: set[str] = set()
-        for endpoint in endpoints:
-            overlap = aliases & set(endpoint.model_endpoint_aliases)
-            if overlap:
-                raise ValueError(
-                    f"site model endpoint aliases are ambiguous: {sorted(overlap)}"
-                )
-            aliases.update(endpoint.model_endpoint_aliases)
-        self._endpoints = MappingProxyType(by_resource)
+    def __init__(self, *, client: httpx.Client | None = None) -> None:
         self._client = client or httpx.Client()
         self._owns_client = client is None
         self._closed = False
         self._lock = RLock()
-
-    def _endpoint(
-        self,
-        *,
-        model_endpoint_alias: str,
-        external_resource_alias: str,
-        model_id: str,
-        tool_call_family: str,
-    ) -> ProgramModelEndpointConfig:
-        try:
-            endpoint = self._endpoints[external_resource_alias]
-        except KeyError as exc:
-            raise ProgramModelTransportError(
-                "retained external model resource is not configured at this site"
-            ) from exc
-        if model_endpoint_alias not in endpoint.model_endpoint_aliases:
-            raise ProgramModelTransportError(
-                "retained model endpoint alias is not allowed by site configuration"
-            )
-        if model_id not in endpoint.model_ids:
-            raise ProgramModelTransportError(
-                "retained model ID is not allowed by site configuration"
-            )
-        if tool_call_family not in endpoint.tool_call_families:
-            raise ProgramModelTransportError(
-                "retained model parser family is unavailable at this site"
-            )
-        return endpoint
 
     def validate_endpoint(
         self,
@@ -452,15 +115,10 @@ class OpenAICompatibleProgramModelTransport:
     ) -> None:
         if not isinstance(request_contract, Mapping):
             raise ProgramModelTransportError("model request contract is invalid")
-        family = request_contract.get("tool_call_family")
-        if not isinstance(family, str):
-            raise ProgramModelTransportError("model parser family is absent")
-        self._endpoint(
-            model_endpoint_alias=model_endpoint_alias,
-            external_resource_alias=external_resource_alias,
-            model_id=model_id,
-            tool_call_family=family,
-        )
+        if request_contract.get("tool_call_family") != _TOOL_CALL_FAMILY:
+            raise ProgramModelTransportError(
+                "the OpenAI-compatible transport supports openai_chat_tools only"
+            )
 
     @staticmethod
     def _request_body(request: ProgramModelRequest) -> dict[str, Any]:
@@ -474,7 +132,7 @@ class OpenAICompatibleProgramModelTransport:
                     )
                 except ProgramAssistantPortError as exc:
                     raise ProgramModelTransportError(
-                        "site transport received an invalid snapshot attachment"
+                        "model transport received an invalid snapshot attachment"
                     ) from exc
                 content = [
                     {"type": "text", "text": request.prompt},
@@ -485,7 +143,7 @@ class OpenAICompatibleProgramModelTransport:
                 ]
             elif attachment_kind != "state_json":
                 raise ProgramModelTransportError(
-                    "site transport received an unsupported attachment"
+                    "model transport received an unsupported attachment"
                 )
             else:
                 state_json = request.attachment.get("state_json")
@@ -567,24 +225,27 @@ class OpenAICompatibleProgramModelTransport:
             raise TypeError("model request or cancellation token is invalid")
         if cancel_event.is_set():
             raise ProgramModelTransportError("model request was cancelled")
-        endpoint = self._endpoint(
-            model_endpoint_alias=request.model_endpoint_alias,
-            external_resource_alias=request.external_resource_alias,
-            model_id=request.model_id,
-            tool_call_family=request.tool_call_family,
-        )
+        if request.tool_call_family != _TOOL_CALL_FAMILY:
+            raise ProgramModelTransportError(
+                "the OpenAI-compatible transport supports openai_chat_tools only"
+            )
         with self._lock:
             if self._closed:
-                raise ProgramModelTransportError("site model transport is closed")
-        headers = dict(endpoint.headers)
-        if endpoint.bearer_token is not None:
-            headers["Authorization"] = f"Bearer {endpoint.bearer_token}"
-        headers["Content-Type"] = "application/json"
+                raise ProgramModelTransportError("model transport is closed")
+        headers = {"Content-Type": "application/json"}
+        if request.api_key_env is not None:
+            token = os.environ.get(request.api_key_env)
+            if not token:
+                raise ProgramModelTransportError(
+                    f"the AI model token variable {request.api_key_env} is unset",
+                    reason_code="ai_model_token_unavailable",
+                )
+            headers["Authorization"] = f"Bearer {token}"
         request_bytes = self._request_bytes(request)
         try:
             with self._client.stream(
                 "POST",
-                endpoint.chat_completions_url,
+                request.base_url.rstrip("/") + "/chat/completions",
                 headers=headers,
                 content=request_bytes,
                 timeout=httpx.Timeout(request.timeout_s),
@@ -682,6 +343,4 @@ __all__ = [
     "HeadlessProgramModelAuditSink",
     "OpenAICompatibleProgramModelTransport",
     "ProgramModelAuditCommitError",
-    "ProgramModelEndpointConfig",
-    "load_program_model_endpoint_configs",
 ]

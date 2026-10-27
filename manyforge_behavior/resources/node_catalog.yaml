@@ -2,7 +2,7 @@
 api_version: manyforge.node_catalog.v2
 content_version: 2.7.0
 catalog_id: manyforge_builtin
-catalog_digest: sha256:29eaa1447b105a20b4582b508938ac0ba97d77b9fcdc26cd97467b42b628dc93
+catalog_digest: sha256:b9d90f6ec180af69c9f342b4d7c995668693ef16854e7ab8df177381c5db9806
 schema_types:
   motion_endpoint_ref:
     type: object
@@ -2830,6 +2830,28 @@ entries:
       type: float
       constraints:
         min_inclusive: 0.0
+  - id: required_inputs
+    required: false
+    default: []
+    schema:
+      type: array
+      max_items: 4
+      items:
+        type: object
+        additional_properties: false
+        required:
+        - input
+        - value
+        properties:
+          input:
+            type: enum
+            values:
+            - open
+            - closed
+            - pressure
+            - workpiece_grasped
+          value:
+            type: bool
   - id: dwell_while_held
     required: false
     default: pause

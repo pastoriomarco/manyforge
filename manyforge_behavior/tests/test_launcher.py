@@ -43,20 +43,8 @@ def test_ros_full_runtime_services_share_one_canonical_image() -> None:
 
     assert build_owner["build"]["dockerfile"] == "Dockerfile.ros-lyrical-full"
     assert canonical_image == "${MANYFORGE_ROS_FULL_IMAGE:-manyforge-ros-lyrical-full}"
-    service = services["composer-ros"]
-    assert service["image"] == canonical_image
-    assert "build" not in service
-
-
-def test_isaac_image_has_explicit_temporary_qualification_hold() -> None:
-    repo_root = Path(__file__).resolve().parents[2]
-    compose = yaml.safe_load(
-        (repo_root / "docker-compose.yaml").read_text(encoding="utf-8")
-    )
-    assert compose["services"]["isaac-topic-control"]["image"] == (
-        "${MANYFORGE_ISAAC_ROS_IMAGE:-manyforge-ros-jazzy-full:q44-20261010}"
-    )
-    assert "build" not in compose["services"]["isaac-topic-control"]
+    assert "composer-ros" not in services
+    assert "isaac-topic-control" not in services
 
 
 def test_real_lite6_base_keeps_its_temporary_qualification_hold() -> None:

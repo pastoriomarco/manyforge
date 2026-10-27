@@ -1,76 +1,52 @@
 # ManyForge xArm control
 
-`manyforge_xarm_control` is the thin ROS adapter for the build-owned Lite6
-brand-lifecycle product. It does not own CCLC transactions, caller authority,
-readiness, execution admission, retry policy, or Stop semantics.
+`manyforge_xarm_control` is the xArm vendor adapter of the ManyForge real lane
+(R7). It serves every xArm-family robot (xArm 5/6/7, Lite 6, UF850) through the
+unmodified vendor driver. It does not own CCLC transactions, readiness,
+execution admission, retries or Stop semantics.
 
-## Current boundary
+## Current boundary (R7 packages 3 and 4: observation and lifecycle actions)
 
-The package contains three production pieces:
+- `XArmRobotStatesTransport` subscribes to the driver's
+  `<component namespace>/xarm/robot_states` (`xarm_msgs/msg/RobotMsg`) and
+  keeps the status fields of the latest report, stamped at receipt. The pose
+  is never read. The joint angles are never a measured state (under an
+  emergency stop the controller reports all-zero angles; measured joints come
+  only from the joint state broadcaster); they serve only the Enable gate's
+  agreement check, with no vendor error.
+- `XArmBrandLifecyclePort` classifies that status into the common cause
+  classes (C1-C3 `emergency_stop`, C31 `collision`, other errors `fault`, an
+  unrequested mode/state change `external_control`, a report older than
+  0.5 s `availability`), the `device.*` facts and the
+  `manyforge.vendor_code.*` incident codes. The hardware activation (arming,
+  the plugin's `on_activate`) and deactivation (position mode) are own
+  effects, never external control. `CheckActivationGate` is the vendor part of
+  the Enable gate: the robot ready and the measured joints within the
+  per-robot tolerance of the reported angles.
+- `XArmDriverServices` calls the driver's `clean_error` and `clean_warn`
+  (`xarm.clear_error` / `xarm.clear_warning`) once each, bounded at 4 s; no
+  answer or a non-zero return is an unknown outcome, never retried.
+- The ros2_control motion domain merges this status and routes the vendor
+  primitives and the gate
+  (`RetainedRos2ControlRuntimeHandle::InstallDeviceStatusAdapter`); CCLC keeps
+  incidents, retained causes and provider loss.
+- `lifecycle_profile.hpp` holds the Real arm's catalog
+  (`manyforge.provider.ros2_control.xarm`): Prepare arms through the stock
+  hardware activation (never over a vendor error) and absorbs the plugin's
+  reactivate-all; Enable is the trajectory-controller activation; Disable
+  switches off the controller, then the hardware; Recover disarms and clears
+  the error, then the warning. It also holds the maintained Lite 6 gripper
+  plans and the native `xarm_arm_provider` Recover plan.
 
-- the generated Lite6 lifecycle product identity and canonical lifecycle plan
-  catalog;
-- `Lite6BrandLifecyclePort`, which implements Core's
-  `IBrandLifecyclePort` for one exact retained provider occurrence; and
-- `XArmRosTransportSession`, an NRT client of the restricted services and
-  supervised state published by the sole `xarm_ros2` transport owner.
-
-CCLC selects and sequences catalog steps, owns deadlines and reconciliation,
-and supplies the exact provider/runtime occurrence. The adapter validates that
-identity, projects fresh vendor observations, and translates only the closed
-catalog primitive set. It never accepts raw SDK mode, state, servo, or
-system-control arguments.
-
-```text
-CCLC transaction owner
-  -> IBrandLifecyclePort
-  -> Lite6BrandLifecyclePort
-  -> XArmRosTransportSession
-  -> restricted xarm_ros2 ROS services
-  -> sole xarm_ros2 SDK/session owner
-```
-
-One physical request is dispatched at most once. A timeout after dispatch is
-reported as outcome-unknown and requires CCLC reconciliation; it is never
-retried by this adapter. A supervised source-session replacement invalidates
-the transport object and requires reconstruction.
-
-The low-level renewable `set_command_gate` transport call remains only as an
-explicit I10 replacement seam. It is not an I7 caller/session authority and is
-not exposed through a public lifecycle API.
-
-## Removed legacy authority
-
-I7/L0.6 removed the former generic lifecycle supervisor, caller authority
-profiles/sessions, local-operator gateway, admission publisher, fake hardware
-plugin, and the unavailable compatibility executables. Their historical
-package names and entrypoints are not supported aliases. Current clients use
-the CCLC request/status APIs and the `manyforge_cclc_msgs` transport package.
-
-`shutdown_controller` remains a distinct, confirmation-bound transport
-primitive. The adapter maps it only to the dedicated supervised shutdown
-service; it cannot be smuggled through an ordinary lifecycle command value.
-Physical invocation remains subject to the attended I10 qualification gate.
+The supervised mode, its restricted transport session, the fork-only
+messages and the supervised Lite 6 lifecycle catalog were removed in R7
+package 5 (2026-10-25). The package builds against the standard `xarm_msgs`
+of the fork's `lyrical` branch.
 
 ## Qualification
 
-The focused package tests cover:
-
-- canonical generated catalog/product identity and exact provider occurrence
-  joins;
-- observation mapping, stale evidence, and source-session replacement;
-- exact named lifecycle dispatch with no automatic retry;
-- timeout-after-dispatch uncertainty;
-- the retained low-level command-gate seam; and
-- the dedicated confirmed shutdown path.
-
-From the maintained real-Lite6 image:
-
-```bash
-./scripts/ros/build-real-lite6-runtime.sh
-MANYFORGE_SKIP_REAL_LITE6_BUILD=1 \
-  ./scripts/ros/test-xarm-lifecycle-fake.sh
-```
-
-These are offline adapter/transport checks. They do not claim a physical robot
-command, motion qualification, or production I10 composition.
+`test_xarm_brand_lifecycle_port` covers the classification, the device facts,
+freshness, unrequested-change tracking, the activation gate and the Real
+catalog; `test_xarm_robot_states_transport` covers the subscription against a
+real ROS publisher; `test_xarm_driver_services` covers the two recovery
+services against in-process servers.

@@ -640,6 +640,8 @@ class ResourceAddressedExecutionKernel final : public IAddressedOperationOwner,
       bool cell_wide = false) override;
   [[nodiscard]] Result<ComponentIncidentContainmentReceiptDTO> RequestComponentIncidentContainment(
       const ComponentIncidentContainmentIntentDTO& intent) override;
+  [[nodiscard]] Result<bool> RecoverComponentIncidentContainment(
+      const std::string& incident_id) override;
   [[nodiscard]] Result<AuthoringAdmissionDTO> ReplaceManagerLivenessRequiredSet(
       const ManagerLivenessRequiredSetDTO& required_set);
 

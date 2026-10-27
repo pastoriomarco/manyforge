@@ -278,6 +278,35 @@ struct CCLCLifecycleTargetDriver::DomainCondition final {
   DomainObservation observed;
 };
 
+std::vector<ExpectedControlDomainRevisionDTO> ExpectedDomains(
+    const ComponentLifecycleCurrentSnapshotDTO& current) {
+  std::vector<ExpectedControlDomainRevisionDTO> expected_domains;
+  expected_domains.reserve(current.domains.size());
+  for (const auto& domain : current.domains) {
+    ExpectedActiveControlConfigurationDTO configuration{
+        ExpectedActiveControlConfigurationPresenceDTO::kAbsent, std::nullopt, std::nullopt};
+    if (const auto active = domain.configuration_identity()) {
+      configuration = {ExpectedActiveControlConfigurationPresenceDTO::kPresent,
+                       active->active_control_configuration_id,
+                       active->active_control_configuration_generation};
+    }
+    if (const auto* provider = domain.provider()) {
+      expected_domains.emplace_back(
+          domain.control_domain_id, domain.control_domain_revision,
+          ExpectedProviderDomainScopeDTO{provider->provider, configuration});
+      continue;
+    }
+    expected_domains.push_back({domain.control_domain_id, domain.control_domain_revision,
+                                domain.controller().controller_topology_id,
+                                domain.controller().topology_revision, configuration,
+                                domain.control_bindings()});
+  }
+  return expected_domains;
+}
+
+/// Who closes an incident whose `fault` + `auto` stream is live again.
+constexpr std::string_view kStreamAutoRecoverySourceLabel = "manyforge_component_stream_auto_recovery";
+
 RequestId LifecycleTargetRequestId(const ControllableComponentId& component,
                                    const std::uint64_t target_generation, const std::uint32_t step,
                                    const ComponentLifecycleIntentKindDTO intent,
@@ -456,6 +485,11 @@ CoordinatorLifecycleTargetDriverPorts::RequestIncidentContainment(
   return kernel_cell_admission_port_.RequestComponentIncidentContainment(intent);
 }
 
+Result<bool> CoordinatorLifecycleTargetDriverPorts::RecoverIncidentContainment(
+    const std::string& incident_id) {
+  return kernel_cell_admission_port_.RecoverComponentIncidentContainment(incident_id);
+}
+
 CCLCLifecycleTargetDriver::CCLCLifecycleTargetDriver(CCLCLifecycleTargetDriverConfig config,
                                                      ICCLCLifecycleTargetStore& store,
                                                      ICCLCLifecycleTargetDriverPorts& ports,
@@ -568,7 +602,8 @@ void CCLCLifecycleTargetDriver::WorkerLoop() {
     {
       std::lock_guard lock(state_mutex_);
       if (any_in_flight_) recheck = config_.in_flight_poll_period_ns;
-      else if (any_waiting_) recheck = config_.waiting_poll_period_ns;
+      else if (any_waiting_ || !containment_recoveries_.empty())
+        recheck = config_.waiting_poll_period_ns;
     }
     try {
       ScheduleRecheck(recheck);
@@ -747,6 +782,30 @@ Result<void> CCLCLifecycleTargetDriver::WithProgramResetPositionScope(
 }
 
 void CCLCLifecycleTargetDriver::RunOnce() {
+  RunPass();
+  RecoverClosedIncidentContainments();
+}
+
+void CCLCLifecycleTargetDriver::RecoverClosedIncidentContainments() {
+  std::set<std::string> pending;
+  {
+    std::lock_guard lock(state_mutex_);
+    pending = containment_recoveries_;
+  }
+  for (const auto& incident_id : pending) {
+    bool done = false;
+    try {
+      const auto recovered = ports_.RecoverIncidentContainment(incident_id);
+      done = recovered.ok() && recovered.value();
+    } catch (...) {
+    }
+    if (!done) continue;  // retried on the next pass (kept waiting)
+    std::lock_guard lock(state_mutex_);
+    containment_recoveries_.erase(incident_id);
+  }
+}
+
+void CCLCLifecycleTargetDriver::RunPass() {
   std::lock_guard run_lock(run_mutex_);
   const auto pinned = ports_.WithPinnedProduct(
       [&](ICCLCLifecycleTargetDriverPorts& ports) { RunOncePinned(ports); });
@@ -1248,6 +1307,14 @@ bool CCLCLifecycleTargetDriver::EvaluateIncident(
                         ApplyReplacesComponent(target.controllable_component_id);
   if (replaced) cause = LifecycleBlockingCauseClassDTO::kNone;
 
+  if (open && cause == LifecycleBlockingCauseClassDTO::kNone && !replaced &&
+      StreamIncidentRecovered(target.controllable_component_id, state, *open) &&
+      CloseRecoveredStreamIncident(ports, current, *open, now_ns)) {
+    Publish(state, LifecycleProgressPhaseDTO::kWaitingForPrerequisites, next_intent,
+            LifecycleBlockingCauseClassDTO::kNone, std::string("incident_recovered"), now_ns);
+    Wake();
+    return true;
+  }
   if (open) {
     // A guard/readiness incident can precede the launch's exit evidence. The
     // same owner keeps that first record; one later diagnostic is set once.
@@ -1352,6 +1419,73 @@ bool CCLCLifecycleTargetDriver::EvaluateIncident(
   state.unrecorded_incident = std::move(incident);
   state.unrecorded_incident_generation = state.recovery_generation;
   ContainAndRecordIncident(ports, state, now_ns);
+  return true;
+}
+
+bool CCLCLifecycleTargetDriver::StreamIncidentRecovered(const ControllableComponentId& component,
+                                                        const ComponentState& state,
+                                                        const ComponentIncidentRecordDTO& open) {
+  if (!config_.stream_health || state.streams.fault_loss || state.streams.fault_event ||
+      open.incident.cause_class != LifecycleBlockingCauseClassDTO::kProviderLost ||
+      open.incident.containment_state == ComponentIncidentContainmentStateDTO::kPending)
+    return false;
+  const auto streams = config_.stream_health->Read(component);
+  const auto auto_fault = [](const StreamHealthDTO& row) {
+    return row.severity == StreamSeverityDTO::kFault && row.recovery == StreamRecoveryDTO::kAuto;
+  };
+  if (std::none_of(streams.begin(), streams.end(), auto_fault)) return false;
+  // The stream that opened it is named by the incident's set-once diagnostic.
+  auto diagnostic = open.incident.diagnostic ? open.incident.diagnostic : open.diagnostic;
+  if (!diagnostic && !open.diagnostic_loaded) {
+    const auto loaded = store_.LoadOpenComponentIncident(component);
+    if (loaded.ok() && loaded.value() &&
+        loaded.value()->incident.incident_id == open.incident.incident_id)
+      diagnostic = loaded.value()->incident.diagnostic ? loaded.value()->incident.diagnostic
+                                                       : loaded.value()->diagnostic;
+  }
+  if (!diagnostic || (diagnostic->code != kComponentStreamStaleCode &&
+                      diagnostic->code != kComponentStreamAbsentCode))
+    return false;
+  const auto stream_id = diagnostic->details.find("stream_id");
+  if (stream_id == diagnostic->details.end()) return false;
+  return std::any_of(streams.begin(), streams.end(), [&](const StreamHealthDTO& row) {
+    return row.stream_id == stream_id->second && auto_fault(row) &&
+           row.state == StreamLivenessStateDTO::kLive;
+  });
+}
+
+bool CCLCLifecycleTargetDriver::CloseRecoveredStreamIncident(
+    ICCLCLifecycleTargetDriverPorts& ports, const ComponentLifecycleCurrentSnapshotDTO& current,
+    const ComponentIncidentRecordDTO& open, const std::int64_t now_ns) {
+  const auto& incident = open.incident;
+  std::string readable =
+      std::string(kStreamAutoRecoverySourceLabel) + "." + incident.incident_id;
+  if (readable.size() > kMaxLifecycleIdentityBytes)
+    readable = std::string(kStreamAutoRecoverySourceLabel) + "." +
+               content_identity::sha256_digest(readable).substr(0U, 71U);
+  // Recorded exactly like the operator's Recover (same journal close and
+  // history event), attributed to the stream's own recovery.
+  ComponentLifecycleIntentDTO intent{
+      {RequestId(std::move(readable)), ports.ReadRequestOwnerEpoch(),
+       std::string(kStreamAutoRecoverySourceLabel), std::string("component_stream.auto_recovery")},
+      incident.controllable_component_id,
+      ComponentLifecycleIntentKindDTO::kRecover,
+      current.active_publication_receipt.request.candidate_graph_revision,
+      current.component_lifecycle_generation,
+      ExpectedDomains(current),
+      std::string("component stream live again"),
+      RequestAttributionDTO{},
+      ports.ReadCellAdmission().admission_generation,
+      std::nullopt};
+  try {
+    const auto recovered = store_.RecoverComponentIncident(
+        ports.ReadRequestOwnerEpoch(), intent, std::string(kStreamAutoRecoverySourceLabel), now_ns);
+    if (!recovered.ok() || !recovered.value()) return false;
+  } catch (...) {
+    return false;
+  }
+  std::lock_guard lock(state_mutex_);
+  containment_recoveries_.insert(incident.incident_id);
   return true;
 }
 
@@ -1542,6 +1676,11 @@ bool CCLCLifecycleTargetDriver::EvaluateComponent(ICCLCLifecycleTargetDriverPort
   // CP9: pushed stream health, read once per pass (no observation pull).
   state.streams = config_.stream_health ? config_.stream_health->Verdict(component)
                                         : ComponentStreamVerdictDTO{};
+  // Streams are expected only while the target is active: for a prepared or
+  // disabled target (a Disable in progress included) a `fault` stream that is
+  // not live is no loss. Adapter-reported fault events still count.
+  if (actual_target && actual_target->requested_state != LifecycleTargetStateDTO::kActive)
+    state.streams.fault_loss.reset();
 
   // Retry what earlier passes observed but could not record (fail closed).
   // An intervention class keeps blocking from memory until it is durable; a
@@ -1903,27 +2042,6 @@ bool CCLCLifecycleTargetDriver::EvaluateComponent(ICCLCLifecycleTargetDriverPort
     return true;
   }
 
-  std::vector<ExpectedControlDomainRevisionDTO> expected_domains;
-  expected_domains.reserve(current.domains.size());
-  for (const auto& domain : current.domains) {
-    ExpectedActiveControlConfigurationDTO configuration{
-        ExpectedActiveControlConfigurationPresenceDTO::kAbsent, std::nullopt, std::nullopt};
-    if (const auto active = domain.configuration_identity()) {
-      configuration = {ExpectedActiveControlConfigurationPresenceDTO::kPresent,
-                       active->active_control_configuration_id,
-                       active->active_control_configuration_generation};
-    }
-    if (const auto* provider = domain.provider()) {
-      expected_domains.emplace_back(
-          domain.control_domain_id, domain.control_domain_revision,
-          ExpectedProviderDomainScopeDTO{provider->provider, configuration});
-      continue;
-    }
-    expected_domains.push_back({domain.control_domain_id, domain.control_domain_revision,
-                                domain.controller().controller_topology_id,
-                                domain.controller().topology_revision, configuration,
-                                domain.control_bindings()});
-  }
   ComponentLifecycleIntentDTO intent{
       {LifecycleTargetRequestId(component, target.target_generation, state.step, *next,
                                 state.attempt),
@@ -1933,7 +2051,7 @@ bool CCLCLifecycleTargetDriver::EvaluateComponent(ICCLCLifecycleTargetDriverPort
       *next,
       current.active_publication_receipt.request.candidate_graph_revision,
       current.component_lifecycle_generation,
-      std::move(expected_domains),
+      ExpectedDomains(current),
       "requested lifecycle target " + std::string(to_string(target.requested_state)) + " (" +
           std::string(to_string(target.origin)) + ", generation " +
           std::to_string(target.target_generation) + ")",

@@ -59,11 +59,7 @@ BoxObject(std::string id, SceneObjectPlacementDTO placement) {
       std::make_shared<const LogicalSceneSnapshotDTO>(std::move(logical_scene)),
       10,
       {std::move(world),
-       testing::make_test_logical_scene(binding)->configured_collision_policy,
-       {}},
-      1U,
-      1U,
-      {}};
+       testing::make_test_logical_scene(binding)->configured_collision_policy}};
 }
 
 [[nodiscard]] RuntimeParticipantBindingDTO ArmBinding() {

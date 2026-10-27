@@ -501,12 +501,6 @@ if(BUILD_TESTING)
         "the compatible replacement native execution host does not exist: "
         "${MANYFORGE_HEADLESS_TEST_ROS_REPLACEMENT_EXECUTION_HOST}")
     endif()
-    if(NOT TARGET manyforge_lite6_product)
-      add_subdirectory(
-        "${CMAKE_CURRENT_SOURCE_DIR}/../manyforge_lite6_product"
-        "${CMAKE_CURRENT_BINARY_DIR}/manyforge_lite6_product"
-        EXCLUDE_FROM_ALL)
-    endif()
     # This graph owns its normal structural preparation. Do not borrow the
     # RoboPlan graph's generated fixture or relabel an aggregate Lite6 package.
     set(MANYFORGE_HEADLESS_TEST_ROBOTIQ_SOURCE_ROOT
@@ -565,8 +559,7 @@ if(BUILD_TESTING)
       manyforge_generate_headless_manager_apply_test_package PRIVATE
       manyforge::deployment
       manyforge::deployment_admission
-      manyforge_deployment_canonical_package_generator
-      manyforge_lite6_product)
+      manyforge_deployment_canonical_package_generator)
 
     set(
       MANYFORGE_HEADLESS_TEST_MANAGER_APPLY_FIXTURE_ROOT

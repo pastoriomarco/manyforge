@@ -729,9 +729,13 @@ class WaitableManualScheduler final : public IScheduler {
     scheduler_.cancel(handle);
   }
 
+  // A failing drain misses its bound once, then completes.
   bool drain_for(SchedulerPriority priority, std::chrono::nanoseconds timeout) override {
-    return !fail_drain_ && scheduler_.drain_for(priority, timeout);
+    ++drain_count_;
+    return !fail_drain_.exchange(false) && scheduler_.drain_for(priority, timeout);
   }
+
+  [[nodiscard]] std::size_t drain_count() const noexcept { return drain_count_.load(); }
 
   [[nodiscard]] bool WaitForScheduled(std::size_t count, std::chrono::nanoseconds timeout) const {
     std::unique_lock lock(mutex_);
@@ -754,7 +758,8 @@ class WaitableManualScheduler final : public IScheduler {
   mutable std::condition_variable scheduled_;
   std::size_t scheduled_count_ = 0U;
   std::atomic<std::size_t> cancel_count_{0U};
-  bool fail_drain_ = false;
+  std::atomic<std::size_t> drain_count_{0U};
+  std::atomic<bool> fail_drain_{false};
 };
 
 [[nodiscard]] ComponentLifecycleCoordinatorConfig Config() {
@@ -4315,40 +4320,43 @@ TEST(ComponentLifecycleCoordinator, MissingDisableCatalogRejectsBeforeFence) {
   EXPECT_EQ(port->dispatch_count(), 0U);
   EXPECT_TRUE(reservations.snapshot().empty());
 }
-TEST(ComponentLifecycleCoordinator, ShutdownFailsClosedWhenTheLifecycleSchedulerLaneCannotDrain) {
-  EXPECT_DEATH(
-      {
-        ScopedTemporaryDirectory temporary;
-        SqliteCCLCJournal journal(temporary.path() / std::string(kCCLCJournalFilename),
-                                  CellId("cell.1"), 8U);
-        CCLCDomainReservationTable reservations;
-        FakeSnapshotSource snapshots({Snapshot(), Snapshot()});
-        FakeCatalogSource catalogs(PrepareCatalog());
-        auto port = std::make_shared<FakeBrandPort>(
-            journal,
-            std::vector<ComponentLifecycleStateDTO>{ComponentLifecycleStateDTO::kDeclared,
-                                                    ComponentLifecycleStateDTO::kDeclared});
-        FakeResolver resolver(port);
-        FakeCellAdmissionPort kernel;
-        FakeClock clock;
-        clock.set(100);
-        WaitableManualScheduler scheduler(true);
-        auto coordinator = std::make_unique<ComponentLifecycleCoordinator>(
-            Config(), journal, reservations, snapshots, catalogs, resolver, kernel, clock,
-            scheduler);
+TEST(ComponentLifecycleCoordinator,
+     ShutdownWaitsForAStuckLifecycleSchedulerLaneInsteadOfTerminating) {
+  ScopedTemporaryDirectory temporary;
+  SqliteCCLCJournal journal(temporary.path() / std::string(kCCLCJournalFilename), CellId("cell.1"),
+                            8U);
+  CCLCDomainReservationTable reservations;
+  FakeSnapshotSource snapshots({Snapshot(), Snapshot()});
+  FakeCatalogSource catalogs(PrepareCatalog());
+  auto port = std::make_shared<FakeBrandPort>(
+      journal, std::vector<ComponentLifecycleStateDTO>{ComponentLifecycleStateDTO::kDeclared,
+                                                       ComponentLifecycleStateDTO::kDeclared});
+  FakeResolver resolver(port);
+  FakeCellAdmissionPort kernel;
+  FakeClock clock;
+  clock.set(100);
+  WaitableManualScheduler scheduler(true);
+  auto coordinator = std::make_unique<ComponentLifecycleCoordinator>(
+      Config(), journal, reservations, snapshots, catalogs, resolver, kernel, clock, scheduler);
+  ASSERT_TRUE(coordinator->Start().ok());
+  const auto accepted =
+      coordinator->SubmitLifecycle(PrepareIntent(coordinator->request_owner_epoch()));
+  ASSERT_TRUE(accepted.ok());
+  ASSERT_TRUE(scheduler.WaitForScheduled(1U, std::chrono::seconds(2)));
 
-        if (!coordinator->Start().ok()) {
-          ::_exit(0);
-        }
-        const auto accepted =
-            coordinator->SubmitLifecycle(PrepareIntent(coordinator->request_owner_epoch()));
-        if (!accepted.ok() || !scheduler.WaitForScheduled(1U, std::chrono::seconds(2))) {
-          ::_exit(0);
-        }
-        coordinator.reset();
-        ::_exit(0);
-      },
-      ".*");
+  testing::internal::CaptureStderr();
+  coordinator.reset();
+  const auto output = testing::internal::GetCapturedStderr();
+
+  EXPECT_EQ(scheduler.drain_count(), 2U);
+  EXPECT_NE(output.find("manyforge_fault code=drain_stuck "
+                        "drain=lifecycle_coordinator.scheduler_lifecycle_lane bound_ms=5000 "
+                        "state=waiting_for_operator"),
+            std::string::npos)
+      << output;
+  EXPECT_NE(output.find("drain=lifecycle_coordinator.scheduler_lifecycle_lane state=drained_late"),
+            std::string::npos)
+      << output;
 }
 
 TEST(ComponentLifecycleCoordinator,

@@ -53,6 +53,7 @@ import { PersistentKeyValuesSection } from './PersistentKeyValues';
 import { UncertainOutputConfirmation } from './UncertainOutputConfirmation';
 import { globalRuleLatchNotices, type GlobalRuleLatch } from '../state/globalRuleLatches';
 import { useGlobalRuleRecovery } from '../hooks/useGlobalRuleRecovery';
+import { GLOBAL_INTERRUPT_GATED, motionWaitRefusalMessage } from '../state/motionWaitRefusal';
 import {
   allUncertainOutputsApproved,
   mergeUncertainOutputs,
@@ -319,6 +320,55 @@ export function ioSourceUnavailableNodes(
   ));
 }
 
+const MOTION_GATED = 'program_node_motion_gated';
+const MOTION_GATE_RELEASED = 'program_node_motion_gate_released';
+
+interface MotionGateWait {
+  waiting: boolean;
+  nodeInstanceId: string;
+  ruleId: string;
+}
+
+/** A motion node's gate wait transition (Rule 2), or null for another event. */
+function motionGateTransition(event: RuntimeControlAuditEvent): MotionGateWait | null {
+  if (event.kind !== MOTION_GATED && event.kind !== MOTION_GATE_RELEASED) return null;
+  const facts = event.facts as Record<string, JsonValue>;
+  if (typeof facts.node_instance_id !== 'string' || typeof facts.rule_id !== 'string') return null;
+  return { waiting: event.kind === MOTION_GATED, nodeInstanceId: facts.node_instance_id, ruleId: facts.rule_id };
+}
+
+/**
+ * The running motion nodes whose newest gate transition is "waiting": a gate
+ * rule refused their motion and the Runner keeps them RUNNING until it clears.
+ */
+export function motionGateWaitNodes(
+  audit: readonly RuntimeControlAuditEvent[],
+  nodeStatuses: Readonly<Record<string, string>>,
+): MotionGateWait[] {
+  const newest = new Map<string, MotionGateWait>();
+  for (const event of audit) {
+    const transition = motionGateTransition(event);
+    if (transition !== null) newest.set(transition.nodeInstanceId, transition);
+  }
+  return [...newest.values()].filter((wait) => (
+    wait.waiting && nodeStatuses[wait.nodeInstanceId] === 'running'
+  ));
+}
+
+/** "Motion waits: global interrupt rule X is active. …" for one node. */
+export function motionGateWaitText(wait: MotionGateWait): string {
+  return `${wait.nodeInstanceId}: ${motionWaitRefusalMessage(GLOBAL_INTERRUPT_GATED, { rule_id: wait.ruleId })}`;
+}
+
+/** The audit row of a gate wait transition, or null for another event. */
+export function motionGateAuditText(event: RuntimeControlAuditEvent): string | null {
+  const transition = motionGateTransition(event);
+  if (transition === null) return null;
+  return transition.waiting
+    ? `Motion of ${transition.nodeInstanceId} waits for global interrupt rule ${transition.ruleId}`
+    : `Global interrupt rule ${transition.ruleId} cleared: motion of ${transition.nodeInstanceId} admitted`;
+}
+
 function ioSourceUnavailableText(transition: IoSourceTransition): string {
   return `Waiting on ${transition.nodeInstanceId}: input source unavailable${transition.quality === null ? '' : ` (${transition.quality})`}. The wait continues once the source is fresh again.`;
 }
@@ -459,6 +509,9 @@ export function ProgramRuntimePanel({
   const ioSourceUnavailable = state.run === null || controls === null
     ? []
     : ioSourceUnavailableNodes(controls.audit, state.run.nodeStatuses);
+  const motionGateWaits = state.run === null || controls === null
+    ? []
+    : motionGateWaitNodes(controls.audit, state.run.nodeStatuses);
   const runReason = state.run?.reason ? formatStructuredError(state.run.reason) : null;
   // A held failure carries its cause on the offer; the run's failure is set
   // only once the cycle itself requires recovery.
@@ -675,6 +728,15 @@ export function ProgramRuntimePanel({
           role="status"
         >
           {ioSourceUnavailableText(transition)}
+        </p>
+      ))}
+      {motionGateWaits.map((wait) => (
+        <p
+          key={wait.nodeInstanceId}
+          className="inline-message severity-warning"
+          role="status"
+        >
+          {motionGateWaitText(wait)}
         </p>
       ))}
       {enabled && recoveryOffer !== null && (
@@ -934,6 +996,7 @@ export function ProgramRuntimePanel({
                   ) : automaticRetryText(event)
                     ?? takeoverFallbackText(event)
                     ?? ioSourceAuditText(event)
+                    ?? motionGateAuditText(event)
                     ?? actionLabel(event.kind)}
                 </li>
               );

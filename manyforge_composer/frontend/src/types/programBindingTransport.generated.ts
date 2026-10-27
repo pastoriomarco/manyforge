@@ -45,6 +45,7 @@ export interface ProgramTargetRoleBinding {
   collision_body_role_bindings: ProgramCollisionBodyRoleBinding[];
   capability_bindings: ProgramCapabilityBinding[];
   signal_role_bindings?: ProgramSignalRoleBinding[];
+  pneumatic_io?: ProgramPneumaticIoBinding;
 }
 export interface ProgramFrameRoleBinding {
   frame_role_id: string;
@@ -131,6 +132,21 @@ export interface ProgramSignalRoleBinding {
   direction: 'input' | 'output';
   transition_capability: 'sampled_only' | 'captured';
   signal_descriptor_digest: string;
+}
+export interface ProgramPneumaticIoBinding {
+  outputs: ProgramPneumaticOutputBinding[];
+  inputs: ProgramPneumaticInputBinding[];
+}
+export interface ProgramPneumaticOutputBinding {
+  target_role_id: string;
+  resource_role_id: string;
+  open_value: boolean;
+  close_value: boolean;
+}
+export interface ProgramPneumaticInputBinding {
+  input: 'open' | 'closed' | 'pressure' | 'workpiece_grasped';
+  target_role_id: string;
+  resource_role_id: string;
 }
 export interface ProgramContactReleaseBinding {
   contact_policy_id: string;

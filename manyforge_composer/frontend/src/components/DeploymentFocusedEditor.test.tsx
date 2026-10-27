@@ -150,7 +150,12 @@ function rosGripperController(
   }];
   const row = (configuration.gripper_target_configurations as Array<Record<string, JsonValue>>)[0];
   row.output_mode = outputMode;
-  row.state_freshness_timeout_s = 0.75;
+  configuration.component_streams = [
+    { controllable_component_id: 'robot', stream_id: 'gripper_feedback',
+      budget_ns: 1_000_000_000, severity: 'fault', recovery: 'ack' },
+    { controllable_component_id: 'robot', stream_id: 'measured_joints',
+      budget_ns: 250_000_000, severity: 'fault', recovery: 'ack' },
+  ];
   return value;
 }
 
@@ -200,17 +205,15 @@ async function mountGripper(
   actuationKind: 'position_commanded' | 'pneumatic',
   outputMode: 'commanded' | 'none' = 'commanded',
   timeoutSource?: JsonValue,
-  componentStreams?: JsonValue,
+  pneumaticIo?: JsonValue,
 ) {
   const value = rosGripperController(actuationKind, outputMode);
-  if (componentStreams !== undefined) {
-    (value.workspace!.draft.document!.policies as Record<string, JsonValue>).component_streams = componentStreams;
-  }
   const graph = value.workspace!.draft.document!.graph as Record<string, JsonValue>;
   const runtime = (graph.runtime_units as Array<Record<string, JsonValue>>)[0];
   const configuration = runtime.configuration as Record<string, JsonValue>;
   const sourceRow = (configuration.gripper_target_configurations as Array<Record<string, JsonValue>>)[0];
   if (timeoutSource !== undefined) sourceRow.delivery_result_timeout_s = timeoutSource;
+  if (pneumaticIo !== undefined) sourceRow.pneumatic_io = pneumaticIo;
   vi.mocked(value.mutate).mockResolvedValue(value.workspace);
   const descriptor: ManualControlGripperDescriptor = {
     ...statusFixture().directControlGripper!.targetDescriptor,
@@ -302,72 +305,6 @@ describe('DeploymentFocusedEditor', () => {
     }
   });
 
-  describe('gripper feedback timeout', () => {
-    const feedbackInput = (mounted: Awaited<ReturnType<typeof mountGripper>>) => (
-      mounted.field('Feedback timeout').children as Array<{ props: Props }>)[0].props;
-    const commit = async (mounted: Awaited<ReturnType<typeof mountGripper>>, text: string) => {
-      await act(() => feedbackInput(mounted).onChange?.({ target: { value: text } }));
-      await act(() => (feedbackInput(mounted).onBlur as () => void)());
-    };
-    const policiesWith = (mounted: Awaited<ReturnType<typeof mountGripper>>, streams?: JsonValue) => {
-      const policies = { ...(mounted.value.workspace!.draft.document!.policies as Record<string, JsonValue>) };
-      if (streams === undefined) delete policies.component_streams;
-      else policies.component_streams = streams;
-      return policies;
-    };
-    const other = { controllable_component_id: 'camera', stream_id: 'frames', severity: 'warning' };
-
-    it('adds a budget override in ns and shows the profile default as placeholder', async () => {
-      const mounted = await mountGripper('position_commanded');
-      try {
-        expect(feedbackInput(mounted).value).toBe('');
-        expect(feedbackInput(mounted).placeholder).toBe('750 ms (profile default)');
-        await commit(mounted, '250');
-        expect(mounted.value.mutate).toHaveBeenCalledExactlyOnceWith(['policies'], 'set', policiesWith(mounted, [
-          { controllable_component_id: 'robot', stream_id: 'gripper_feedback', budget_ns: 250_000_000 },
-        ]));
-      } finally { await mounted.unmount(); }
-    });
-
-    it('updates the override and keeps other rows and fields', async () => {
-      const mounted = await mountGripper('position_commanded', 'commanded', undefined, [
-        other,
-        { controllable_component_id: 'robot', stream_id: 'gripper_feedback', budget_ns: 1_500_000_000, severity: 'blocking' },
-      ]);
-      try {
-        expect(feedbackInput(mounted).value).toBe('1500');
-        await commit(mounted, '2000');
-        expect(mounted.value.mutate).toHaveBeenLastCalledWith(['policies'], 'set', policiesWith(mounted, [
-          other,
-          { controllable_component_id: 'robot', stream_id: 'gripper_feedback', budget_ns: 2_000_000_000, severity: 'blocking' },
-        ]));
-        await commit(mounted, '');
-        expect(mounted.value.mutate).toHaveBeenLastCalledWith(['policies'], 'set', policiesWith(mounted, [
-          other,
-          { controllable_component_id: 'robot', stream_id: 'gripper_feedback', severity: 'blocking' },
-        ]));
-      } finally { await mounted.unmount(); }
-    });
-
-    it('clearing a budget-only override removes the row and the empty table', async () => {
-      const mounted = await mountGripper('position_commanded', 'commanded', undefined, [
-        { controllable_component_id: 'robot', stream_id: 'gripper_feedback', budget_ns: 1_000_000_000 },
-      ]);
-      try {
-        await commit(mounted, '');
-        expect(mounted.value.mutate).toHaveBeenCalledExactlyOnceWith(['policies'], 'set', policiesWith(mounted));
-      } finally { await mounted.unmount(); }
-    });
-
-    it.each(['0', '-5'])('rejects non-positive timeout %s before mutation', async (text) => {
-      const mounted = await mountGripper('position_commanded');
-      try {
-        await commit(mounted, text);
-        expect(mounted.value.mutate).not.toHaveBeenCalled();
-      } finally { await mounted.unmount(); }
-    });
-  });
-
   it.each(['commanded', 'none'] as const)(
     'preserves explicit pneumatic timeout through edits and %s output changes', async (mode) => {
       const mounted = await mountGripper('pneumatic', mode, 2.5);
@@ -392,11 +329,32 @@ describe('DeploymentFocusedEditor', () => {
     },
   );
 
+  it('preserves pneumatic signal mappings when an unrelated gripper field changes', async () => {
+    const io: JsonValue = {
+      outputs: [{
+        signal: { controllable_component_id: 'valves', signal_name: 'open' },
+        open_value: true, close_value: false,
+      }],
+      inputs: {
+        workpiece_grasped: { signal: { controllable_component_id: 'sensors', signal_name: 'part' } },
+      },
+    };
+    const mounted = await mountGripper('pneumatic', 'commanded', undefined, io);
+    try {
+      await mounted.setDuration(0.25);
+      await mounted.update();
+      expect(mounted.value.mutate).toHaveBeenLastCalledWith(
+        ['graph', 'runtime_units', 0, 'configuration', 'gripper_target_configurations', 0],
+        'set', { ...mounted.sourceRow, command_duration_s: 0.25 },
+      );
+    } finally { await mounted.unmount(); }
+  });
+
   it.each(['position_commanded', 'pneumatic'] as const)(
     'retains timeout omission and the existing row fields for %s', async (kind) => {
       const mounted = await mountGripper(kind);
       try {
-        expect(Object.keys(mounted.sourceRow)).toHaveLength(14);
+        expect(Object.keys(mounted.sourceRow)).toHaveLength(13);
         await mounted.setDuration(0.25);
         await mounted.update();
         expect(mounted.value.mutate).toHaveBeenCalledExactlyOnceWith(
@@ -685,8 +643,6 @@ describe('DeploymentFocusedEditor', () => {
       sourceModel={{ status: 'loading' }} motionDescriptors={[descriptor]}
       gripperDescriptors={[]} />);
 
-    expect(markup).toContain('Isaac world');
-    expect(markup).toContain('lite6_grf_ros2');
     expect(markup).toContain('Maximum TCP linear speed');
     expect(markup).toContain('value="0.2"');
     expect(markup).toContain('robot · arm');
@@ -727,6 +683,46 @@ describe('DeploymentFocusedEditor', () => {
       expect(invalidMarkup).toContain('with a trailing');
       expect(invalidMarkup).toContain('aria-invalid="true"');
     }
+  });
+
+  it('offers a ROS component tool payload and shows its authored mass and centre of mass', () => {
+    const value = controller();
+    const component = {
+      component_id: 'robot',
+      component_profile_id: 'lite6_real_measured_v0',
+      frame_prefix: '',
+      model_source: { urdf: { project_path: 'sources/robot.urdf' }, package_roots: {} },
+      root_pose_in_cell: { position_m: [0, 0, 0], orientation_xyzw: [0, 0, 0, 1] },
+      target_settings: { arm: { maximum_tcp_linear_speed_mps: 0.15 } },
+      configuration: {
+        runtime_kind: 'ros2_control',
+        runtime_configuration: { real_profile: 'lite6_real', device_address_ref: 'lite6_main' },
+      },
+    };
+    value.workspace!.draft.document = {
+      api_version: 'manyforge.deployment_intent.v2',
+      deployment_artifact_id: 'cell-a',
+      name: 'Cell A',
+      components: [component],
+      attachments: [],
+      policies: {},
+    } as unknown as Record<string, JsonValue>;
+    value.workspace!.draft.deploymentRevision = null;
+    value.workspace!.draft.graphRevision = null;
+    const render = () => renderToStaticMarkup(<DeploymentFocusedEditor controller={value}
+      sourceModel={{ status: 'loading' }} motionDescriptors={[]} gripperDescriptors={[]} />);
+    const absent = render();
+    expect(absent).toContain('Add tool payload');
+    expect(absent).not.toContain('Adapter mode');
+    (component.configuration.runtime_configuration as Record<string, unknown>).tool_payload = {
+      mass_kg: 0.3, center_of_mass_m: [0, 0.01, 0.05],
+    };
+    const present = render();
+    expect(present).toContain('Tool payload (applied to a real robot at Enable)');
+    expect(present).toContain('value="0.3"');
+    expect(present).toContain('Centre of mass Z');
+    expect(present).toContain('value="0.05"');
+    expect(present).toContain('Remove tool payload');
   });
 
   it.each([
@@ -1028,5 +1024,7 @@ describe('DeploymentFocusedEditor', () => {
     expect(markup).toContain('binding feedback required');
     expect(markup).toContain('Update gripper Draft');
     expect(markup).toContain('finger_link');
+    expect(markup).toContain('Gripper feedback');
+    expect(markup).toContain('Default: 1000 ms · fault · ack');
   });
 });

@@ -240,6 +240,7 @@ class ProgramRunAdmission:
     readiness: NodeExecutionReadiness
     owner_identities: tuple[ProgramRunOwnerIdentity, ...]
     assistant_projection: Mapping[str, Any] | None = None
+    simulation_scene: Mapping[str, Any] | None = None
     node_policies: tuple[ProgramNodePolicy, ...] = field(init=False)
 
     def __post_init__(self) -> None:
@@ -322,6 +323,19 @@ class ProgramRunAdmission:
                 else MappingProxyType(deepcopy(dict(self.assistant_projection)))
             ),
         )
+        if self.simulation_scene is not None and not isinstance(
+            self.simulation_scene, Mapping
+        ):
+            raise TypeError("simulation_scene must be absent or one mapping")
+        object.__setattr__(
+            self,
+            "simulation_scene",
+            (
+                None
+                if self.simulation_scene is None
+                else MappingProxyType(deepcopy(dict(self.simulation_scene)))
+            ),
+        )
 
     def port_context(self, program_run_id: str) -> ProgramRunPortContext:
         """Project the same immutable owner context for preparation or Run."""
@@ -340,6 +354,7 @@ class ProgramRunAdmission:
             program_binding=self.program_binding,
             program=self.program.to_dict(),
             assistant_projection=self.assistant_projection,
+            simulation_scene=self.simulation_scene,
         )
 
 
@@ -3279,6 +3294,7 @@ def build_program_run_admission(
         "source_document_digest",
         "scenario_id",
         "schema_version",
+        "simulation_scene",
     }
     if selection.get("schema_version") != PROGRAM_RUN_INPUT_API:
         raise ProgramRunOwnerError("Program-run input version is unsupported")
@@ -3302,6 +3318,9 @@ def build_program_run_admission(
         raise ProgramRunOwnerError("scenario requires an absent assistant projection")
     if assistant_mode == "forbidden" and assistant_projection is not None:
         raise ProgramRunOwnerError("scenario forbids a present assistant projection")
+    simulation_scene = selection.get("simulation_scene")
+    if simulation_scene is not None and not isinstance(simulation_scene, dict):
+        raise ProgramRunOwnerError("simulation scene must be null or an object")
     scenario_id = _text(selection.get("scenario_id"), field="scenario_id")
     project_path = _text(
         selection.get("project_path"), field="project_path", maximum_bytes=4096
@@ -3451,6 +3470,7 @@ def build_program_run_admission(
         readiness=readiness,
         owner_identities=owner_identities,
         assistant_projection=assistant_projection,
+        simulation_scene=simulation_scene,
     )
 
 
@@ -3487,6 +3507,7 @@ def build_applied_program_run_admission(
         "source_document_digest",
         "scenario_id",
         "schema_version",
+        "simulation_scene",
         "source",
     }
     if applied.get("schema_version") != APPLIED_PROGRAM_SELECTION_API:
@@ -3530,6 +3551,7 @@ def build_applied_program_run_admission(
         "scenario_id": applied["scenario_id"],
         "project_path": applied["project_path"],
         "schema_version": PROGRAM_RUN_INPUT_API,
+        "simulation_scene": deepcopy(applied["simulation_scene"]),
     }
     return build_program_run_admission(
         normalized_selection,

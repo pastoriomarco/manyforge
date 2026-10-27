@@ -738,7 +738,6 @@ TEST(DeploymentArtifactCodec, RosGripperOutputChoiceIsExplicitAndPositionAlwaysC
     std::get<core::JsonObjectDTO>(common.front().value).erase("output_mode");
     EXPECT_THROW((void)detail::decode_ros2_control_execution_gripper_target_configurations(common),
                  RetainedBundleError);
-    std::get<core::JsonObjectDTO>(common.front().value).erase("state_freshness_timeout_s");
     // Archival data still has exactly its twelve fields; no ROS output default
     // or live Native admission is restored by its common pure extraction.
     EXPECT_NO_THROW((void)detail::decode_execution_gripper_target_configurations(
@@ -758,41 +757,191 @@ TEST(DeploymentArtifactCodec, RosGripperOutputChoiceIsExplicitAndPositionAlwaysC
   }
 }
 
-TEST(DeploymentArtifactCodec, RosGripperStateFreshnessTimeoutIsRequiredData) {
+TEST(DeploymentArtifactCodec, PneumaticIoResolvesTypedSignalsAndRejectsInvalidMappings) {
+  const auto fixture = test::make_lite6_ros2_control_gripper_only_cclc_product_retention_fixture(
+      {}, "pneumatic");
+  const auto &unit = fixture.qualified.deployment().graph().graph().runtime_units.front();
+  auto rows = std::get<core::JsonValueDTO::Array>(
+      unit.configuration.at("gripper_target_configurations").value);
+  ASSERT_EQ(rows.size(), 1U);
+  auto &fields = std::get<core::JsonObjectDTO>(rows.front().value);
+  const auto signal = [](std::string component, std::string name) {
+    return core::JsonValueDTO{core::JsonObjectDTO{
+        {"controllable_component_id", core::JsonValueDTO{std::move(component)}},
+        {"signal_name", core::JsonValueDTO{std::move(name)}}}};
+  };
+  const auto output = [&](std::string component, std::string name, bool open, bool close) {
+    return core::JsonValueDTO{core::JsonObjectDTO{
+        {"signal", signal(std::move(component), std::move(name))},
+        {"open_value", core::JsonValueDTO{open}},
+        {"close_value", core::JsonValueDTO{close}}}};
+  };
+  fields.emplace("pneumatic_io", core::JsonValueDTO{core::JsonObjectDTO{
+      {"outputs", core::JsonValueDTO{core::JsonValueDTO::Array{
+          output("valve_io", "close_valve", false, true),
+          output("valve_io", "open_valve", true, false)}}},
+      {"inputs", core::JsonValueDTO{core::JsonObjectDTO{
+          {"workpiece_grasped", core::JsonValueDTO{core::JsonObjectDTO{
+              {"signal", signal("sensor_io", "workpiece")}}}}}}}}});
+
+  const auto decoded = detail::decode_ros2_control_execution_gripper_target_configurations(rows);
+  ASSERT_EQ(decoded.size(), 1U);
+  ASSERT_TRUE(decoded.front().pneumatic_io.has_value());
+  const auto &io = *decoded.front().pneumatic_io;
+  ASSERT_EQ(io.outputs.size(), 2U);
+  EXPECT_EQ(io.outputs[0].signal.controllable_component_id.value(), "valve_io");
+  EXPECT_EQ(io.outputs[0].signal.name, "close_valve");
+  EXPECT_FALSE(io.outputs[0].open_value);
+  EXPECT_TRUE(io.outputs[0].close_value);
+  EXPECT_EQ(io.outputs[1].signal.name, "open_valve");
+  ASSERT_EQ(io.inputs.size(), 1U);
+  EXPECT_EQ(io.inputs.at("workpiece_grasped").controllable_component_id.value(), "sensor_io");
+  EXPECT_EQ(io.inputs.at("workpiece_grasped").name, "workpiece");
+
+  auto invalid = rows;
+  auto &invalid_fields = std::get<core::JsonObjectDTO>(invalid.front().value);
+  invalid_fields.at("output_mode").value = std::string("none");
+  EXPECT_THROW((void)detail::decode_ros2_control_execution_gripper_target_configurations(invalid),
+               RetainedBundleError);
+  invalid = rows;
+  auto &io_fields = std::get<core::JsonObjectDTO>(
+      std::get<core::JsonObjectDTO>(invalid.front().value).at("pneumatic_io").value);
+  auto &outputs = std::get<core::JsonValueDTO::Array>(io_fields.at("outputs").value);
+  outputs[1] = outputs[0];
+  EXPECT_THROW((void)detail::decode_ros2_control_execution_gripper_target_configurations(invalid),
+               RetainedBundleError);
+  invalid = rows;
+  auto &unknown_io = std::get<core::JsonObjectDTO>(
+      std::get<core::JsonObjectDTO>(invalid.front().value).at("pneumatic_io").value);
+  auto &inputs = std::get<core::JsonObjectDTO>(unknown_io.at("inputs").value);
+  inputs.emplace("other", inputs.at("workpiece_grasped"));
+  EXPECT_THROW((void)detail::decode_ros2_control_execution_gripper_target_configurations(invalid),
+               RetainedBundleError);
+}
+
+// The authored ROS runtime configuration with its `component_streams` member
+// replaced, or removed when no rows are given.
+CanonicalValue authored_component_streams(const CanonicalValue &value,
+                                          const std::optional<CanonicalValue> &rows) {
+  if (value.is_array()) {
+    CanonicalValue::Array result;
+    for (const auto &row : value.as_array())
+      result.push_back(authored_component_streams(row, rows));
+    return CanonicalValue(std::move(result));
+  }
+  if (!value.is_object()) return value;
+  const bool ros_configuration = value.find_object_member("controller_profiles") != nullptr;
+  CanonicalValue::Object fields;
+  for (const auto &[name, item] : value.as_object()) {
+    if (ros_configuration && name == "component_streams") continue;
+    fields.emplace_back(name, authored_component_streams(item, rows));
+  }
+  if (ros_configuration && rows.has_value()) fields.emplace_back("component_streams", *rows);
+  return CanonicalValue(std::move(fields));
+}
+
+TEST(DeploymentArtifactCodec, RosComponentStreamsAreRequiredData) {
   const auto fixture = test::make_lite6_ros2_control_gripper_only_cclc_product_retention_fixture(
       {}, "pneumatic");
   const auto &source = fixture.qualified.deployment().normalized_authored_root();
-  for (const double timeout : {0.01, 0.75, 60.0, 0.0, 0.005, 60.5}) {
-    SCOPED_TRACE(std::to_string(timeout));
-    const bool accepted = timeout >= 0.01 && timeout <= 60.0;
-    const auto authored = authored_gripper_field(
-        source, "state_freshness_timeout_s", CanonicalValue(timeout));
-    auto rows = std::get<core::JsonValueDTO::Array>(
-        fixture.qualified.deployment().graph().graph().runtime_units.front()
-            .configuration.at("gripper_target_configurations").value);
-    std::get<core::JsonObjectDTO>(rows.front().value).at("state_freshness_timeout_s").value =
-        timeout;
-    if (!accepted) {
-      EXPECT_THROW((void)compile_deployment_draft(canonical_json(authored)),
-                   DeploymentArtifactCodecError);
-      EXPECT_THROW((void)detail::decode_ros2_control_execution_gripper_target_configurations(rows),
-                   RetainedBundleError);
-      continue;
-    }
-    EXPECT_NO_THROW((void)compile_deployment_draft(canonical_json(authored)));
-    const auto decoded = detail::decode_ros2_control_execution_gripper_target_configurations(rows);
-    ASSERT_EQ(decoded.size(), 1U);
-    EXPECT_DOUBLE_EQ(decoded.front().state_freshness_timeout_s, timeout);
+  const auto &unit = fixture.qualified.deployment().graph().graph().runtime_units.front();
+  const auto component = fixture.qualified.deployment().graph().graph()
+                             .controllable_components.front().controllable_component_id.value();
+  const auto row = [&](std::string_view stream, double budget_ns, std::string_view severity,
+                       std::string_view recovery, std::string_view owner = {}) {
+    return CanonicalValue(CanonicalValue::Object{
+        {"budget_ns", CanonicalValue(budget_ns)},
+        {"controllable_component_id",
+         CanonicalValue(owner.empty() ? component : std::string(owner))},
+        {"recovery", CanonicalValue(std::string(recovery))},
+        {"severity", CanonicalValue(std::string(severity))},
+        {"stream_id", CanonicalValue(std::string(stream))},
+    });
+  };
+  const auto rows = [](std::initializer_list<CanonicalValue> values) {
+    return std::optional<CanonicalValue>(CanonicalValue(CanonicalValue::Array(values)));
+  };
+  const auto feedback = row("gripper_feedback", 1e9, "fault", "ack");
+  const auto measured = row("measured_joints", 1e9, "fault", "ack");
+  for (const double budget : {1e7, 2.5e8, 6e10}) {
+    SCOPED_TRACE(std::to_string(budget));
+    EXPECT_NO_THROW((void)compile_deployment_draft(canonical_json(authored_component_streams(
+        source, rows({row("gripper_feedback", budget, "blocking", "auto"), measured})))));
   }
-  const auto missing = authored_gripper_field(
-      source, "state_freshness_timeout_s", CanonicalValue(), true);
-  EXPECT_THROW((void)compile_deployment_draft(canonical_json(missing)),
-               DeploymentArtifactCodecError);
-  auto rows = std::get<core::JsonValueDTO::Array>(
-      fixture.qualified.deployment().graph().graph().runtime_units.front()
-          .configuration.at("gripper_target_configurations").value);
-  std::get<core::JsonObjectDTO>(rows.front().value).erase("state_freshness_timeout_s");
-  EXPECT_THROW((void)detail::decode_ros2_control_execution_gripper_target_configurations(rows),
+  // `fault` + `auto` is the user's choice: the incident closes once fresh.
+  EXPECT_NO_THROW((void)compile_deployment_draft(canonical_json(authored_component_streams(
+      source, rows({row("gripper_feedback", 1e9, "fault", "auto"), measured})))));
+  for (const auto &rejected : {
+           std::optional<CanonicalValue>{},
+           rows({measured}),
+           rows({feedback}),
+           rows({feedback, measured, row("measured_joints", 1e9, "fault", "ack", "foreign_robot")}),
+           rows({row("gripper_feedback", 9999999.0, "fault", "ack"), measured}),
+           rows({row("gripper_feedback", 60000000001.0, "fault", "ack"), measured}),
+           rows({row("gripper_feedback", 1e9 + 0.5, "fault", "ack"), measured}),
+           rows({feedback, measured, row("poses", 1e9, "warning", "auto")}),
+       }) {
+    SCOPED_TRACE(rejected.has_value() ? canonical_json(*rejected) : "absent");
+    EXPECT_THROW((void)compile_deployment_draft(
+                     canonical_json(authored_component_streams(source, rejected))),
+                 DeploymentArtifactCodecError);
+  }
+
+  // The strict retained decoder: typed rows sorted by (component, stream).
+  const auto decoded = detail::decode_ros2_control_execution_component_streams(unit.configuration);
+  ASSERT_EQ(decoded.size(), 2U);
+  EXPECT_EQ(decoded.front().controllable_component_id.value(), component);
+  EXPECT_EQ(decoded.front().stream_id, "gripper_feedback");
+  EXPECT_EQ(decoded.front().budget_ns, 1'000'000'000);
+  EXPECT_EQ(decoded.front().severity, core::StreamSeverityDTO::kFault);
+  EXPECT_EQ(decoded.front().recovery, core::StreamRecoveryDTO::kAck);
+  EXPECT_EQ(decoded.back().stream_id, "measured_joints");
+  const auto edited = [&](auto &&edit) {
+    auto configuration = unit.configuration;
+    edit(std::get<core::JsonValueDTO::Array>(configuration.at("component_streams").value));
+    return configuration;
+  };
+  const auto field = [](core::JsonValueDTO &value, const std::string &name) -> core::JsonValueDTO & {
+    return std::get<core::JsonObjectDTO>(value.value).at(name);
+  };
+  // `fault` + `auto` is accepted.
+  EXPECT_NO_THROW((void)detail::decode_ros2_control_execution_component_streams(edited(
+      [&](auto &streams) { field(streams.front(), "recovery").value = std::string("auto"); })));
+  EXPECT_THROW((void)detail::decode_ros2_control_execution_component_streams(edited(
+                   [&](auto &streams) { field(streams.front(), "budget_ns").value = 5e6; })),
+               RetainedBundleError);
+  EXPECT_THROW((void)detail::decode_ros2_control_execution_component_streams(edited(
+                   [](auto &streams) { streams.pop_back(); })),
+               RetainedBundleError);
+  auto absent = unit.configuration;
+  absent.erase("component_streams");
+  EXPECT_THROW((void)detail::decode_ros2_control_execution_component_streams(absent),
+               RetainedBundleError);
+
+  // Only a Real pneumatic target can omit its nonexistent gripper feedback.
+  auto real = unit.configuration;
+  auto &profiles = std::get<core::JsonValueDTO::Array>(real.at("controller_profiles").value);
+  ASSERT_EQ(profiles.size(), 1U);
+  auto &profile = std::get<core::JsonObjectDTO>(profiles.front().value);
+  profile.erase("mock_profile");
+  profile.erase("isaac_profile");
+  profile.emplace("real_profile", core::JsonValueDTO{std::string("lite6_real")});
+  auto &streams = std::get<core::JsonValueDTO::Array>(real.at("component_streams").value);
+  std::erase_if(streams, [&](const auto &entry) {
+    const auto &fields = std::get<core::JsonObjectDTO>(entry.value);
+    return std::get<std::string>(fields.at("stream_id").value) == "gripper_feedback";
+  });
+  EXPECT_NO_THROW((void)detail::decode_ros2_control_execution_component_streams(real));
+  auto position = real;
+  auto &targets = std::get<core::JsonValueDTO::Array>(
+      position.at("gripper_target_configurations").value);
+  std::get<core::JsonObjectDTO>(targets.front().value).at("actuation_kind").value =
+      std::string("position_commanded");
+  EXPECT_THROW((void)detail::decode_ros2_control_execution_component_streams(position),
+               RetainedBundleError);
+  auto missing_measured = real;
+  missing_measured.erase("component_streams");
+  EXPECT_THROW((void)detail::decode_ros2_control_execution_component_streams(missing_measured),
                RetainedBundleError);
 }
 

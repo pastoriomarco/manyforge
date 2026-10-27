@@ -1,6 +1,7 @@
 #include "resource_addressed_execution_kernel_internal.hpp"
 
 #include <manyforge_core/io_rule_stop_response.hpp>
+#include <manyforge_core/time/stuck_drain_wait.hpp>
 #include <manyforge_core/types/program_io_condition.hpp>
 #include <type_traits>
 
@@ -762,9 +763,8 @@ Result<void> ResourceAddressedExecutionKernel::reconfigure_runtime_participants_
   if (table_error.has_value()) {
     if (candidate_control_executor != nullptr) {
       candidate_control_executor->CloseIngress();
-      if (!candidate_control_executor->DrainFor(std::chrono::seconds(5))) {
-        std::terminate();
-      }
+      WaitForDrain("kernel_runtime.candidate_control_executor", std::chrono::seconds(5),
+                   [&](std::chrono::nanoseconds bound) { return candidate_control_executor->DrainFor(bound); });
       candidate_control_executor.reset();
     }
     for (const auto& subscription : added_subscriptions) {
@@ -775,9 +775,8 @@ Result<void> ResourceAddressedExecutionKernel::reconfigure_runtime_participants_
   if (publication_commit_error.has_value()) {
     if (candidate_control_executor != nullptr) {
       candidate_control_executor->CloseIngress();
-      if (!candidate_control_executor->DrainFor(std::chrono::seconds(5))) {
-        std::terminate();
-      }
+      WaitForDrain("kernel_runtime.candidate_control_executor", std::chrono::seconds(5),
+                   [&](std::chrono::nanoseconds bound) { return candidate_control_executor->DrainFor(bound); });
       candidate_control_executor.reset();
     }
     for (const auto& subscription : added_subscriptions) {
@@ -790,9 +789,8 @@ Result<void> ResourceAddressedExecutionKernel::reconfigure_runtime_participants_
   }
   if (retired_control_executor != nullptr) {
     retired_control_executor->CloseIngress();
-    if (!retired_control_executor->DrainFor(std::chrono::seconds(5))) {
-      std::terminate();
-    }
+    WaitForDrain("kernel_runtime.retired_control_executor", std::chrono::seconds(5),
+                 [&](std::chrono::nanoseconds bound) { return retired_control_executor->DrainFor(bound); });
     retired_control_executor.reset();
   }
   return Result<void>::Ok();
@@ -2095,9 +2093,8 @@ Result<void> ResourceAddressedExecutionKernel::release_retired_engine(
   }
   if (retired_control_executor != nullptr) {
     retired_control_executor->CloseIngress();
-    if (!retired_control_executor->DrainFor(std::chrono::seconds(5))) {
-      std::terminate();
-    }
+    WaitForDrain("kernel_runtime.retired_control_executor", std::chrono::seconds(5),
+                 [&](std::chrono::nanoseconds bound) { return retired_control_executor->DrainFor(bound); });
     retired_control_executor.reset();
   }
   engine->unsubscribe_events(subscription->handle);

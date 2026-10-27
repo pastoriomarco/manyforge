@@ -434,6 +434,14 @@ core::Result<void> RetainedObservedStateChannel::RebindRoute(
       return rebound;
     }
     current_binding_ = std::move(binding);
+    if (publication_.query_context().state_authority_class ==
+        core::StateAuthorityClass::kMeasured) {
+      // CP8 step 1: a measurement is never re-stamped. The new route has no
+      // state until the measured source publishes again, so the freshness
+      // gate stays closed for recovery readers.
+      notify_render_change();
+      return core::Result<void>::Ok();
+    }
     // AddressedObservedStatePublication has just republished the complete
     // owner sample at the transition time. It is therefore current under the
     // new route and must not be stranded behind the recovery freshness gate.

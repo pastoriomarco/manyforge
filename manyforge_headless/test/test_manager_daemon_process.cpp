@@ -1802,7 +1802,7 @@ std::string SceneRuntimePoseObserveRequest(
            {"source", CanonicalValue(CanonicalValue::Object{
                           {"entity", CanonicalValue("/box")}})},
        })},
-      {"policy_id", CanonicalValue("before_planning")},
+      {"policy_id", CanonicalValue("scene")},
       {"payload_quality", CanonicalValue("good")},
       {"source_epoch", CanonicalValue(std::string(source_epoch))},
       {"source_id", CanonicalValue(std::string(source_id))},
@@ -2332,11 +2332,21 @@ TEST(ManagerDaemonProcess,
         SceneRuntimeObserverOpenRequest(*initial, "observer-epoch-1"));
     EXPECT_NE(opened_first.find("\"source_epoch_order\":1"), std::string::npos)
         << opened_first;
-    const auto changed_registration =
+    // Eligible object bindings observe as "scene"; the application policy
+    // is the Deployment link row only.
+    const auto policy_named_binding =
         SendCommand(directory.socket_path(),
                     SceneRuntimeObserverOpenRequest(
                         *initial, "observer-epoch-1", "isaac.observer",
                         "scene_object", "continuous_unattached", true));
+    EXPECT_NE(policy_named_binding.find("manager_command_rejected"),
+              std::string::npos)
+        << policy_named_binding;
+    const auto changed_registration =
+        SendCommand(directory.socket_path(),
+                    SceneRuntimeObserverOpenRequest(
+                        *initial, "observer-epoch-1", "isaac.observer",
+                        "scene_object", "scene", true));
     EXPECT_NE(
         changed_registration.find("scene_runtime_observer_request_conflict"),
         std::string::npos)
@@ -2403,14 +2413,14 @@ TEST(ManagerDaemonProcess,
         SendCommand(directory.socket_path(),
                     SceneRuntimeObserverOpenRequest(
                         *initial, "writer-epoch-1", "isaac.writer.a",
-                        "scene_object", "continuous_unattached", true));
+                        "scene_object", "scene", true));
     EXPECT_NE(writable_open.find("\"ok\":true"), std::string::npos)
         << writable_open;
     const auto conflicting_writer =
         SendCommand(directory.socket_path(),
                     SceneRuntimeObserverOpenRequest(
                         *initial, "writer-epoch-1", "isaac.writer.b",
-                        "scene_object", "before_planning", true));
+                        "scene_object", "scene", true));
     EXPECT_NE(conflicting_writer.find("scene_runtime_pose_writer_conflict"),
               std::string::npos)
         << conflicting_writer;
@@ -2429,13 +2439,15 @@ TEST(ManagerDaemonProcess,
         SendCommand(directory.socket_path(),
                     SceneRuntimeObserverOpenRequest(
                         *initial, "planner-epoch-1", "isaac.planning-writer",
-                        "scene-process-box", "before_planning", true));
+                        "scene-process-box", "scene", true));
     EXPECT_NE(before_planning_open.find("\"ok\":true"), std::string::npos)
         << before_planning_open;
+    // The canonical-empty bundle has no object link row for this binding, so
+    // it is never applied or latched (no fallback to the binding policy_id).
     const auto never_seen_latch = SendCommand(
         directory.socket_path(),
         SceneRuntimeBeforePlanningLatchRequest(*initial, *initial_scene));
-    EXPECT_NE(never_seen_latch.find("scene_runtime_pose_observation_missing"),
+    EXPECT_NE(never_seen_latch.find("\"latched_observation_count\":0"),
               std::string::npos)
         << never_seen_latch;
     const auto added_object = SendCommand(
@@ -2451,7 +2463,7 @@ TEST(ManagerDaemonProcess,
         directory.socket_path(),
         SceneRuntimePoseObserveRequest(*initial, "planner-epoch-1", 1U));
     EXPECT_NE(before_planning.find(
-                  "\"scene_application_status\":\"deferred_before_planning\""),
+                  "\"scene_application_status\":\"not_requested\""),
               std::string::npos)
         << before_planning;
     EXPECT_NE(before_planning.find("\"scene_projection_revision\":null"),
@@ -2460,7 +2472,7 @@ TEST(ManagerDaemonProcess,
     const auto latched = SendCommand(
         directory.socket_path(),
         SceneRuntimeBeforePlanningLatchRequest(*initial, *scene_before_latch));
-    EXPECT_NE(latched.find("scene_runtime_pose_provider_invalid"),
+    EXPECT_NE(latched.find("\"latched_observation_count\":0"),
               std::string::npos)
         << latched;
     const auto scene_after_latch = scene_source.Read();
@@ -2473,7 +2485,7 @@ TEST(ManagerDaemonProcess,
     const auto repeated_latch = SendCommand(
         directory.socket_path(),
         SceneRuntimeBeforePlanningLatchRequest(*initial, *scene_after_latch));
-    EXPECT_NE(repeated_latch.find("scene_runtime_pose_provider_invalid"),
+    EXPECT_NE(repeated_latch.find("\"latched_observation_count\":0"),
               std::string::npos)
         << repeated_latch;
     const auto advanced_scene =
@@ -2497,7 +2509,7 @@ TEST(ManagerDaemonProcess,
         directory.socket_path(),
         SceneRuntimeBeforePlanningLatchRequest(*initial, *scene_after_advance));
     EXPECT_NE(
-        stale_observation_latch.find("scene_runtime_pose_observation_stale"),
+        stale_observation_latch.find("\"latched_observation_count\":0"),
         std::string::npos)
         << stale_observation_latch;
 

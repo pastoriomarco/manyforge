@@ -539,5 +539,73 @@ TEST(RuntimeSnapshotAggregator, RejectsMissingNonBooleanAndUnknownCanonicalEmpty
   }
 }
 
+CanonicalValue DependencyRow(const std::string &component,
+                             const std::string &simulator) {
+  return CanonicalValue(CanonicalValue::Object{
+      {"controllable_component_id", CanonicalValue(component)},
+      {"simulator", CanonicalValue(simulator)},
+  });
+}
+
+// Publishes a Manager payload whose active section carries `dependencies`
+// and returns the aggregated Manager section.
+CanonicalValue ManagerSectionWithDependencies(const CanonicalValue &dependencies) {
+  TemporaryDirectory directory;
+  auto members = ManagerPayload("cell-a", "graph-1").as_object();
+  for (auto &[name, value] : members) {
+    if (name != "active") continue;
+    auto active = value.as_object();
+    active.emplace_back("component_simulator_dependencies", dependencies);
+    value = CanonicalValue(std::move(active));
+  }
+  AtomicSourceSnapshotChannel manager(directory.path(), "manager-source.json");
+  static_cast<void>(manager.Publish("component_manager", "component-manager.cell-a",
+                                   "manager-epoch", 10, CanonicalValue(std::move(members))));
+  const auto observed = manager.ReadObserved();
+  if (!observed.has_value()) {
+    throw std::runtime_error("runtime snapshot test lost its Manager source");
+  }
+  RuntimeSnapshotAggregator aggregator(directory.path(), "cell-a", "api.cell-a", "epoch",
+                                       {100, 100, 100},
+                                       [&] { return observed->file_modified_at_unix_ns; },
+                                       [] { return 1; });
+  return Section(aggregator.Evaluate(), "manager");
+}
+
+TEST(RuntimeSnapshotAggregator, AcceptsOptionalComponentSimulatorDependencies) {
+  for (const auto &rows :
+       {CanonicalValue::Array{},
+        CanonicalValue::Array{DependencyRow("arm.isaac", "isaac"),
+                              DependencyRow("arm.real", "none")}}) {
+    const auto section = ManagerSectionWithDependencies(CanonicalValue(rows));
+    ASSERT_TRUE(RequiredBool(section, "available"));
+    const auto &active = RequiredMember(RequiredMember(section, "payload"), "active");
+    EXPECT_EQ(RequiredMember(active, "component_simulator_dependencies"),
+              CanonicalValue(rows));
+  }
+}
+
+TEST(RuntimeSnapshotAggregator, RejectsMalformedComponentSimulatorDependencies) {
+  auto open_row = DependencyRow("arm", "none").as_object();
+  open_row.emplace_back("isaac_profile", CanonicalValue("lite6"));
+  const std::vector<CanonicalValue> invalid{
+      CanonicalValue(CanonicalValue::Object{}),
+      CanonicalValue(CanonicalValue::Array{CanonicalValue("arm")}),
+      CanonicalValue(CanonicalValue::Array{CanonicalValue(std::move(open_row))}),
+      CanonicalValue(CanonicalValue::Array{CanonicalValue(CanonicalValue::Object{
+          {"controllable_component_id", CanonicalValue("arm")}})}),
+      CanonicalValue(CanonicalValue::Array{DependencyRow("arm", "mock")}),
+      CanonicalValue(CanonicalValue::Array{DependencyRow("", "none")}),
+      CanonicalValue(CanonicalValue::Array{DependencyRow("arm", "none"),
+                                           DependencyRow("arm", "isaac")}),
+  };
+  for (const auto &rows : invalid) {
+    const auto section = ManagerSectionWithDependencies(rows);
+    EXPECT_FALSE(RequiredBool(section, "available"));
+    EXPECT_NE(content_identity::canonical_json(section).find("manager_source_invalid"),
+              std::string::npos);
+  }
+}
+
 } // namespace
 } // namespace manyforge::headless

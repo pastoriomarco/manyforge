@@ -31,6 +31,7 @@
 #include <manyforge_core/types/error_code_mapping.hpp>
 #include <manyforge_core/types/kernel_event_factories.hpp>
 #include <manyforge_core/types/reason_codes.hpp>
+#include <manyforge_core/time/stuck_drain_wait.hpp>
 #include <map>
 #include <memory>
 #include <stdexcept>
@@ -943,30 +944,21 @@ ExecutionKernel::~ExecutionKernel() {
     lookahead->disarm();
     lookahead.reset();
   }
-  const auto drain_scheduler_or_terminate = [this](const char* phase) {
-    constexpr auto kSchedulerDrainTimeout = std::chrono::seconds(1);
-    if (!scheduler_.drain_all_for(kSchedulerDrainTimeout)) {
-      // Fail closed: these scheduler callbacks can capture `this`. Once
-      // teardown starts, continuing after a missed drain risks UAF, while
-      // waiting forever can hang process shutdown.
-      std::cerr
-          << "manyforge_execution_kernel_scheduler_drain_timeout" << " phase=" << phase
-          << " timeout_ms="
-          << std::chrono::duration_cast<std::chrono::milliseconds>(kSchedulerDrainTimeout).count()
-          << '\n';
-      // Flush the flight ring before dying: the event history of the last
-      // seconds is exactly the evidence a fail-closed teardown needs to be
-      // diagnosable post-mortem.
-      (void)flight_recorder_.dump_now("scheduler_drain_timeout");
-      std::terminate();
-    }
+  const auto drain_scheduler_or_wait = [this](const char* drain) {
+    // These scheduler callbacks can capture `this`: continuing after a missed
+    // drain risks UAF. A stuck drain waits for the operator instead, after
+    // flushing the flight ring as post-mortem evidence of the last seconds.
+    WaitForDrain(
+        drain, std::chrono::seconds(1),
+        [this](std::chrono::nanoseconds bound) { return scheduler_.drain_all_for(bound); },
+        [this] { (void)flight_recorder_.dump_now("scheduler_drain_timeout"); });
   };
 
   // Scheduled collision callbacks capture `this`; cancel them before any
   // member teardown so destruction cannot race a monitor tick.
   stop_collision_monitoring(RuntimeCollisionMonitorRelease::kResetOrTeardown, std::nullopt,
                             /*drain_callbacks=*/true);
-  drain_scheduler_or_terminate("collision_monitor_stop");
+  drain_scheduler_or_wait("execution_kernel.scheduler.collision_monitor_stop");
 
   // Join before member destruction so worker callbacks cannot notify the
   // condition variable after it has been destroyed. This is intentionally
@@ -1000,7 +992,7 @@ ExecutionKernel::~ExecutionKernel() {
       recovery_refresh_scheduled_ = false;
     }
   }
-  drain_scheduler_or_terminate("recovery_freshness_deadline_cancel");
+  drain_scheduler_or_wait("execution_kernel.scheduler.recovery_freshness_deadline_cancel");
 }
 
 bool ExecutionKernel::settle_execution(const std::uint64_t exec_id, const std::string& move_id,

@@ -5,7 +5,6 @@ from __future__ import annotations
 import json
 import os
 from pathlib import Path
-import re
 import subprocess
 import sys
 
@@ -498,27 +497,16 @@ def test_unsupported_generator_rejects_before_build(tmp_path: Path) -> None:
     assert not (tmp_path / "build").exists()
 
 
-def test_compose_retains_explicit_ros_runtime_products_and_build_cache() -> None:
+def test_compose_keeps_toolchain_services_without_legacy_runtime_services() -> None:
     compose = yaml.safe_load((_REPO_ROOT / "docker-compose.yaml").read_text(encoding="utf-8"))
     services = compose["services"]
 
     for name in ("dev", "ros-jazzy", "ros-jazzy-full", "composer", "composer-api"):
         assert services[name]["volumes"] == [".:/workspace"]
-    assert services["composer-ros"]["restart"] == "no"
-    assert services["composer-ros"]["command"][-1] == ("./scripts/ros/start-composer-ros.sh")
-    assert services["isaac-topic-control"]["restart"] == "no"
-    assert services["isaac-topic-control"]["command"][-1] == (
-        "./scripts/ros/launch-isaac-topic-based-control.sh"
-    )
-    assert services["isaac-topic-control"]["network_mode"] == "host"
-    assert services["isaac-topic-control"]["ipc"] == "host"
-    assert {
-        "ROS_DOMAIN_ID=${ROS_DOMAIN_ID:-0}",
-        "RMW_IMPLEMENTATION=${RMW_IMPLEMENTATION:-rmw_fastrtps_cpp}",
-        "ROS_AUTOMATIC_DISCOVERY_RANGE=${ROS_AUTOMATIC_DISCOVERY_RANGE:-LOCALHOST}",
-        "ROS_STATIC_PEERS=${ROS_STATIC_PEERS:-192.168.1.132;192.168.1.68}",
-    } <= set(services["isaac-topic-control"]["environment"])
-    assert "ros-full-build-cache" in compose["volumes"]
+    # The workbench (scripts/compose-dev.sh) is the only runtime route.
+    assert "composer-ros" not in services
+    assert "isaac-topic-control" not in services
+    assert "volumes" not in compose
 
 
 def test_current_build_lanes_use_fresh_container_local_products() -> None:
@@ -602,17 +590,6 @@ def test_product_launcher_maps_removed_cleanup_without_dormant_effects() -> None
     assert "docker " not in source
     assert "kill " not in source
     assert "rm " not in source
-
-
-def test_assistant_supervisor_wrapper_is_only_a_typed_gate() -> None:
-    wrapper = _REPO_ROOT / "scripts" / "run-assistant-supervisor.sh"
-    source = wrapper.read_text(encoding="utf-8")
-
-    assert "3daf0d53a35ba250d825dc45d66d3a575c04f884" in source
-    assert "manyforge_fail_composable_cell_runtime_unavailable" in source
-    assert "manyforge_assistant_bridge.supervisor" not in source
-    assert "VENV_PYTHON" not in source
-    assert re.search(r"^exec\s", source, re.MULTILINE) is None
 
 
 def test_hermes_gateway_matrix_cannot_activate_the_deleted_bridge() -> None:
@@ -988,7 +965,7 @@ def test_deployment_package_participates_in_repository_version_guard() -> None:
 def test_ros_services_share_the_official_full_lyrical_image() -> None:
     compose = yaml.safe_load((_REPO_ROOT / "docker-compose.yaml").read_text())
     services = compose["services"]
-    for name in ("ros-jazzy", "ros-jazzy-full", "composer-ros"):
+    for name in ("ros-jazzy", "ros-jazzy-full"):
         assert services[name]["image"] == "${MANYFORGE_ROS_FULL_IMAGE:-manyforge-ros-lyrical-full}"
     assert "build" not in services["ros-jazzy"]
     assert services["ros-jazzy-full"]["build"]["dockerfile"] == "Dockerfile.ros-lyrical-full"

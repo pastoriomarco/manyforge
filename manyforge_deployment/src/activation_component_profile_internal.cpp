@@ -23,6 +23,11 @@ constexpr std::string_view kDescriptionApiVersion =
 constexpr std::string_view kDescriptionRelativePath =
     "manyforge_deployment/resources/maintained/"
     "maintained_deployment_sources.v1.json";
+constexpr std::string_view kAssistantProfilesApiVersion =
+    "manyforge.maintained_assistant_profiles.v1";
+constexpr std::string_view kAssistantProfilesRelativePath =
+    "manyforge_deployment/resources/maintained/"
+    "maintained_assistant_profiles.v1.json";
 constexpr std::size_t kMaximumModelFamilies = 128U;
 constexpr std::size_t kMaximumRuntimeProfiles = 256U;
 
@@ -84,8 +89,9 @@ void require_fields(const CanonicalValue &value,
 }
 
 [[nodiscard]] std::string
-read_description(const std::filesystem::path &capability_root) {
-  const auto path = capability_root / kDescriptionRelativePath;
+read_description(const std::filesystem::path &capability_root,
+                 std::string_view relative_path = kDescriptionRelativePath) {
+  const auto path = capability_root / relative_path;
   if (std::filesystem::is_symlink(path) ||
       !std::filesystem::is_regular_file(path)) {
     fail("description must select one plain file: " + path.string());
@@ -127,6 +133,8 @@ parse_runtime_kind(const CanonicalValue &configuration,
     return ActivationRuntimeKind::kIoProvider;
   if (value == "pose_source")
     return ActivationRuntimeKind::kPoseSource;
+  if (value == "ai_model")
+    return ActivationRuntimeKind::kAiModel;
   fail(std::string(label) + ".runtime_kind is unsupported: " + value);
 }
 
@@ -137,6 +145,8 @@ runtime_kind_text(ActivationRuntimeKind kind) noexcept {
     return "io_provider";
   case ActivationRuntimeKind::kPoseSource:
     return "pose_source";
+  case ActivationRuntimeKind::kAiModel:
+    return "ai_model";
   case ActivationRuntimeKind::kRos2Control:
     break;
   }
@@ -153,6 +163,7 @@ constexpr ModelFreeProfileRow kModelFreeProfileRows[] = {
     {"io_provider_runtime", "io_device_v0", ActivationRuntimeKind::kIoProvider},
     {"pose_source_runtime", "pose_source_v0",
      ActivationRuntimeKind::kPoseSource},
+    {"ai_model_runtime", "ai_model_v0", ActivationRuntimeKind::kAiModel},
 };
 
 [[nodiscard]] const ModelFreeProfileRow *
@@ -375,6 +386,36 @@ std::vector<ActivationComponentProfile> resolve_activation_component_profiles(
     });
   }
   return result;
+}
+
+std::optional<ActivationAssistantProfile> resolve_activation_assistant_profile(
+    const std::filesystem::path &capability_root,
+    const ActivationDeploymentIntent &intent) {
+  if (!intent.assistant_profile_id.has_value())
+    return std::nullopt;
+  const auto parsed = parse_strict_json_model_yaml(
+      read_description(capability_root, kAssistantProfilesRelativePath));
+  const auto &root = parsed.root();
+  require_fields(root, {"api_version", "mode_profiles", "profiles"},
+                 "assistant profiles");
+  if (text(member(root, "api_version", "assistant profiles"),
+           "assistant profiles.api_version") != kAssistantProfilesApiVersion)
+    fail("assistant profiles have an unsupported api_version");
+  for (const auto &row : array(member(root, "profiles", "assistant profiles"),
+                               "assistant profiles.profiles")) {
+    if (text(member(row, "profile_id", "assistant profile"),
+             "assistant profile.profile_id") != *intent.assistant_profile_id)
+      continue;
+    const auto &mode_profile_id =
+        member(row, "mode_profile_id", "assistant profile");
+    if (mode_profile_id.is_null())
+      return ActivationAssistantProfile{row, CanonicalValue(Object{})};
+    return ActivationAssistantProfile{
+        row, member(member(root, "mode_profiles", "assistant profiles"),
+                    text(mode_profile_id, "assistant profile.mode_profile_id"),
+                    "assistant profiles.mode_profiles")};
+  }
+  fail("assistant profile is unknown: " + *intent.assistant_profile_id);
 }
 
 } // namespace manyforge::deployment::detail

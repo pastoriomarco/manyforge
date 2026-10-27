@@ -67,6 +67,23 @@ function hasAlert(all: (match: (props: MountedProps) => boolean) => MountedProps
 }
 
 describe('IoSignalConfigurationSection', () => {
+  it('authors xArm input with the standard 250 ms age and selected bank', async () => {
+    const mounted = await mount([existing]);
+    try {
+      await mounted.type('part_present Source profile', 'xarm_digital');
+      await mounted.type('part_present Robot component', 'lite6_robot');
+      await mounted.type('part_present Bank', 'controller');
+      await mounted.type('part_present Pin', '15');
+      expect(mounted.control('part_present Maximum sample age').value).toBe('250');
+      await mounted.click('Update I/O Draft');
+      expect(mounted.controller.mutate).toHaveBeenCalledExactlyOnceWith(
+        ['graph', 'runtime_units', 0, 'configuration', 'io_signals'], 'set',
+        [{ ...existing, update_mode: 'sampled', freshness: { mode: 'sample_age', maximum_age_ns: 250_000_000 },
+          provider: { profile: 'xarm_digital', robot_component_id: 'lite6_robot', bank: 'controller', pin: 15 } }],
+      );
+    } finally { await mounted.unmount(); }
+  });
+
   it('commits the whole io_signals array, keeping existing rows and outputs exact', async () => {
     const mounted = await mount([existing, output]);
     try {
@@ -203,7 +220,6 @@ describe('IoSignalConfigurationSection', () => {
         [{ ...existing, update_mode: 'sampled',
           freshness: { mode: 'sample_age', maximum_age_ns: 75_000_000 }, provider: {
           profile: 'geometric_contact',
-          ingress_depth: 64,
           endpoint: {
             controllable_component_id: 'arm', command_target_id: 'tool', frame_role_id: 'tcp',
           },

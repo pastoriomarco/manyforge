@@ -168,10 +168,6 @@ struct ComponentStreamHealth::Shared final {
     if (found->second.recovery) slot.effective.recovery = *found->second.recovery;
   }
 
-  [[nodiscard]] static StreamRecoveryDTO EffectiveRecovery(const StreamDeclarationDTO& value) {
-    return value.severity == StreamSeverityDTO::kFault ? StreamRecoveryDTO::kAck : value.recovery;
-  }
-
   [[nodiscard]] static ErrorDTO Condition(const StreamRecorder::Slot& slot, const std::string_view code) {
     const auto& id = slot.defaults.stream_id;
     const std::string what = code == kComponentStreamStaleCode    ? "is stale"
@@ -238,7 +234,7 @@ struct ComponentStreamHealth::Shared final {
         slot->notify_pending.store(false);
         if (!self->CurrentLocked(slot)) continue;
         const auto advanced = slot->last_advance_ns.load();
-        if (advanced == kNever || now - advanced > slot->effective.budget_ns) continue;
+        if (advanced == kNever || now - advanced >= slot->effective.budget_ns) continue;
         if (slot->state != StreamLivenessStateDTO::kLive) {
           slot->state = StreamLivenessStateDTO::kLive;
           slot->absent_classified = false;
@@ -265,21 +261,23 @@ struct ComponentStreamHealth::Shared final {
           continue;
         }
         if (slot->state != StreamLivenessStateDTO::kLive) continue;
+        // A sample exactly one budget old is expired, so a re-queued deadline is always > now.
         auto advanced = slot->last_advance_ns.load();
-        if (now - advanced <= budget) {
+        if (now - advanced < budget) {
           self->PushDeadlineLocked(slot, advanced + budget);
           continue;
         }
         slot->live.store(false);
         // A sample racing with the flag: it found `live` still set.
         advanced = slot->last_advance_ns.load();
-        if (now - advanced <= budget) {
+        if (now - advanced < budget) {
           slot->live.store(true);
           self->PushDeadlineLocked(slot, advanced + budget);
           continue;
         }
         slot->state = StreamLivenessStateDTO::kStale;
-        if (EffectiveRecovery(slot->effective) == StreamRecoveryDTO::kAck &&
+        // A `fault` stream never latches here: its latch is the incident.
+        if (slot->effective.recovery == StreamRecoveryDTO::kAck &&
             slot->effective.severity != StreamSeverityDTO::kFault)
           slot->latched = true;
         self->dirty.insert(slot->component);
@@ -379,8 +377,9 @@ void RecordSample(const std::shared_ptr<StreamRecorder::Slot>& slot,
                   const std::optional<std::int64_t> source_stamp_ns) noexcept {
   if (source_stamp_ns &&
       slot->defaults.timestamp_source == StreamTimestampSourceDTO::kMessageStamp) {
-    if (*source_stamp_ns <= slot->last_stamp.load(std::memory_order_relaxed)) return;
-    slot->last_stamp.store(*source_stamp_ns, std::memory_order_relaxed);
+    // Any change advances (a simulator reset steps backwards); an equal stamp does not.
+    if (slot->last_stamp.exchange(*source_stamp_ns, std::memory_order_relaxed) == *source_stamp_ns)
+      return;
   }
   Advance(slot);
 }
@@ -495,7 +494,7 @@ Result<void> ComponentStreamHealth::SetOverrides(std::vector<StreamParameterOver
     const auto before = slot->effective;
     shared_->ApplyEffectiveLocked(*slot);
     if (before == slot->effective) continue;
-    if (Shared::EffectiveRecovery(slot->effective) == StreamRecoveryDTO::kAuto ||
+    if (slot->effective.recovery == StreamRecoveryDTO::kAuto ||
         slot->effective.severity == StreamSeverityDTO::kFault)
       slot->latched = false;
     // A changed budget takes effect at once; older entries are refreshed lazily.
@@ -523,7 +522,7 @@ std::vector<StreamHealthDTO> ComponentStreamHealth::Read(const ControllableCompo
     if (advanced != kNever) row.age_ns = std::max<std::int64_t>(0, now - advanced);
     row.budget_ns = slot.effective.budget_ns;
     row.severity = slot.effective.severity;
-    row.recovery = Shared::EffectiveRecovery(slot.effective);
+    row.recovery = slot.effective.recovery;
     row.timestamp_source = slot.defaults.timestamp_source;
     row.acknowledgement_required = slot.latched;
     if (slot.fault_event) {

@@ -14,14 +14,9 @@
   justify-content: space-between;
 }
 
-.assistant-mode-select,
 .assistant-input {
   display: grid;
   gap: 0.35rem;
-}
-
-.assistant-mode-select select {
-  max-width: 24rem;
 }
 
 .assistant-mode-description,
@@ -76,30 +71,4 @@
 .assistant-actions {
   flex-wrap: wrap;
   justify-content: flex-start;
-}
-
-.assistant-proposals {
-  display: grid;
-  gap: 0.65rem;
-  padding-left: 1rem;
-}
-
-.assistant-proposals pre {
-  max-height: 14rem;
-  overflow: auto;
-  font-size: var(--mf-font-size-068);
-  white-space: pre-wrap;
-}
-
-.assistant-proposal-actions {
-  display: flex;
-  flex-wrap: wrap;
-  align-items: center;
-  gap: 0.4rem;
-  margin-top: 0.4rem;
-}
-
-.assistant-proposal-actions span {
-  color: var(--mf-text-neutral-64b);
-  font-size: var(--mf-font-size-068);
 }

@@ -43,6 +43,7 @@ describe('assistant wire parsers', () => {
       graph_revision: 'graph.1',
       assistant_projection_digest: `sha256:${'3'.repeat(64)}`,
       instrument_registry_digest: `sha256:${'4'.repeat(64)}`,
+      ai_model_component_id: 'assistant_model',
       node_environment: nodeEnvironment(),
       modes: [{
         mode: 'composer-assistant',
@@ -56,6 +57,22 @@ describe('assistant wire parsers', () => {
       source: source(),
     });
     expect(parsed.modes[0]?.mode).toBe('composer-assistant');
+    expect(parsed.aiModelComponentId).toBe('assistant_model');
+  });
+
+  it('reports a Deployment without an AI model component as null', () => {
+    const parsed = parseAssistantModeIndex({
+      schema_version: 'manyforge.assistant_mode_index.v1',
+      retained_bundle_id: 'bundle.1',
+      graph_revision: 'graph.1',
+      assistant_projection_digest: `sha256:${'3'.repeat(64)}`,
+      instrument_registry_digest: `sha256:${'4'.repeat(64)}`,
+      ai_model_component_id: null,
+      node_environment: nodeEnvironment(),
+      modes: [],
+      source: source(),
+    });
+    expect(parsed.aiModelComponentId).toBeNull();
   });
 
   it('rejects stale mode discovery and undeclared fields', () => {
@@ -67,6 +84,7 @@ describe('assistant wire parsers', () => {
       graph_revision: 'graph.1',
       assistant_projection_digest: `sha256:${'3'.repeat(64)}`,
       instrument_registry_digest: `sha256:${'4'.repeat(64)}`,
+      ai_model_component_id: null,
       node_environment: nodeEnvironment(),
       modes: [],
       source: stale,
@@ -94,14 +112,6 @@ describe('assistant wire parsers', () => {
         assistantMode: 'composer-assistant',
         catalogHash: `sha256:${'5'.repeat(64)}`,
         message: 'Draft updated.',
-        proposals: [{
-          toolId: 'propose_scene_object_nodes',
-          effect: 'proposal',
-          arguments: {},
-          inputSchemaHash: `sha256:${'8'.repeat(64)}`,
-          status: 'draft',
-          requiresReview: true,
-        }],
         toolCalls: [{
           toolId: 'scene_draft_add_object',
           status: 'completed',
@@ -120,10 +130,10 @@ describe('assistant wire parsers', () => {
       },
     });
     expect(status.response?.draftMutated).toBe(true);
-    expect(status.response?.proposals[0]?.toolId).toBe('propose_scene_object_nodes');
+    expect(status.response?.toolCalls[0]?.toolId).toBe('scene_draft_add_object');
 
     const mismatched = structuredClone(status);
-    if (mismatched.response) mismatched.response.assistantMode = 'query';
+    if (mismatched.response) mismatched.response.assistantMode = 'other-mode';
     expect(() => parseAssistantProviderStatus({
       schemaVersion: 'manyforge.assistant.provider_status.v1',
       requestId: mismatched.requestId,

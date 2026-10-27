@@ -179,10 +179,12 @@ class IoProviderLifecycleProductTest : public ::testing::Test {
 protected:
   void TearDown() override { driver.reset(); }
   void Build(bool output_only = false, std::string epoch = "runtime.1",
-             std::vector<std::string> pose_streams = {}) {
+             std::vector<std::string> pose_streams = {},
+             std::string_view observer_manifest =
+                 core::kPoseSourceLifecycleManifestId) {
     const bool pose = !pose_streams.empty();
     auto provider_manifest =
-        pose ? manifest(core::kPoseSourceLifecycleManifestId) : manifest();
+        pose ? manifest(observer_manifest) : manifest();
     const auto catalog =
         core::MakeIoProviderLifecycleCatalog(provider_manifest);
     ASSERT_TRUE(catalog.ok());
@@ -1327,7 +1329,7 @@ TEST_F(IoProviderLifecycleProductTest,
   const std::vector<std::string> streams{"poses/box/latch",
                                          "poses/robot/viewer"};
   Build(false, "runtime.1", streams);
-  ASSERT_TRUE(driver->pose_source());
+  ASSERT_TRUE(driver->stream_observer());
   EXPECT_FALSE(driver->resources_installed());
   EXPECT_EQ(Step("prepare").dispatch,
             core::LifecyclePrimitiveDispatchStateDTO::kNotDispatched);
@@ -1348,7 +1350,7 @@ TEST_F(IoProviderLifecycleProductTest,
     std::vector<std::unique_ptr<core::StreamRecorder>> partial;
     partial.push_back(declare(streams.front()));
     auto lock = driver->AcquireDelivery();
-    const auto refused = driver->InstallPoseSourceLocked(std::move(partial));
+    const auto refused = driver->InstallObserverStreamsLocked(std::move(partial));
     ASSERT_FALSE(refused.ok());
     EXPECT_EQ(refused.error().details.at("reason"),
               "driver_resource_closure_not_exact");
@@ -1358,7 +1360,7 @@ TEST_F(IoProviderLifecycleProductTest,
     recorders.push_back(declare(streams.back()));
     recorders.push_back(declare(streams.front()));
     auto lock = driver->AcquireDelivery();
-    const auto installed = driver->InstallPoseSourceLocked(std::move(recorders));
+    const auto installed = driver->InstallObserverStreamsLocked(std::move(recorders));
     ASSERT_TRUE(installed.ok()) << installed.error().message;
   }
   EXPECT_TRUE(driver->resources_installed());
@@ -1396,6 +1398,54 @@ TEST_F(IoProviderLifecycleProductTest,
             core::LifecyclePrimitiveDispatchStateDTO::kNotDispatched);
 
   // Retirement releases the recorders, which undeclares the streams.
+  driver->Shutdown();
+  EXPECT_TRUE(health.Read(kSignal.controllable_component_id).empty());
+}
+
+TEST_F(IoProviderLifecycleProductTest,
+       AiModelDriverOwnsItsEndpointStreamAndReportsTheTypedProcessFault) {
+  Build(false, "runtime.1", {"endpoint"}, core::kAiModelLifecycleManifestId);
+  ASSERT_TRUE(driver->stream_observer());
+  EXPECT_EQ(Step("prepare").dispatch,
+            core::LifecyclePrimitiveDispatchStateDTO::kNotDispatched);
+
+  core::ManualScheduler scheduler;
+  core::ComponentStreamHealth health(*clock, scheduler);
+  {
+    std::vector<std::unique_ptr<core::StreamRecorder>> recorders;
+    auto declared = health.Declare(
+        kSignal.controllable_component_id,
+        {"endpoint", 10'000'000'000LL, core::StreamSeverityDTO::kWarning,
+         core::StreamRecoveryDTO::kAuto,
+         core::StreamTimestampSourceDTO::kArrival});
+    ASSERT_TRUE(declared.ok());
+    recorders.push_back(std::move(declared.value()));
+    auto lock = driver->AcquireDelivery();
+    const auto installed =
+        driver->InstallObserverStreamsLocked(std::move(recorders));
+    ASSERT_TRUE(installed.ok()) << installed.error().message;
+  }
+  EXPECT_TRUE(driver->resources_installed());
+
+  // Prepare/enable follow the probe process, not the endpoint: the stream
+  // has no sample yet and both still succeed.
+  auto exit_fault = std::make_shared<std::optional<core::ErrorDTO>>();
+  driver->SetSupervisedProcessFaultSource([exit_fault] { return *exit_fault; });
+  ASSERT_EQ(Step("prepare").known,
+            core::LifecyclePrimitiveKnownResultDTO::kSucceeded);
+  ASSERT_EQ(Step("enable").known,
+            core::LifecyclePrimitiveKnownResultDTO::kSucceeded);
+
+  *exit_fault = core::ErrorDTO{"ai_model_config_invalid",
+                               "ai model probe exited with status 78",
+                               {}};
+  const auto faulted = driver->ReadLifecycleHealth(kDomain, clock->now());
+  ASSERT_TRUE(faulted.ok());
+  EXPECT_EQ(faulted.value().observed_state,
+            core::ComponentLifecycleStateDTO::kFaulted);
+  ASSERT_TRUE(faulted.value().diagnostic.has_value());
+  EXPECT_EQ(faulted.value().diagnostic->code, "ai_model_config_invalid");
+
   driver->Shutdown();
   EXPECT_TRUE(health.Read(kSignal.controllable_component_id).empty());
 }
@@ -1494,7 +1544,7 @@ TEST_F(IoProviderLifecycleProductTest,
   const auto installed_driver = driver;
   const IoProviderDriverGroup installed_drivers{installed_driver};
   const auto plan = plan_simulated_plc(
-      "commanded_sim", "plc_io", {{"ros_bool", "/plc_io/ready", std::nullopt}},
+      true, "plc_io", {{"ros_bool", "/plc_io/ready", std::nullopt}},
       root / "sim_plc");
   ASSERT_TRUE(plan.has_value());
   ControllerLaunchSupervisor supervisor(2s);
@@ -1609,7 +1659,7 @@ TEST_F(IoProviderLifecycleProductTest,
   InstallInput();
   const IoProviderDriverGroup drivers{driver};
   const auto plan = plan_simulated_plc(
-      "commanded_sim", "plc_io", {{"ros_bool", "/plc_io/ready", std::nullopt}},
+      true, "plc_io", {{"ros_bool", "/plc_io/ready", std::nullopt}},
       root / "sim_plc");
   ASSERT_TRUE(plan.has_value());
   ControllerLaunchSupervisor supervisor(2s);

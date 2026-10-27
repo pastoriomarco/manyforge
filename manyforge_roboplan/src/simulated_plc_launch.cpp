@@ -37,11 +37,11 @@ std::filesystem::path simulated_plc_config_dir_from_environment() {
 }
 
 std::optional<SimulatedPlcPlan>
-plan_simulated_plc(const std::string_view unit_mode, std::string device_id,
+plan_simulated_plc(const bool simulated_unit, std::string device_id,
                    const std::vector<SimulatedPlcRow> &rows,
                    std::filesystem::path config_dir) {
   // D1/D6: only a simulated unit ever gets a simulated PLC.
-  if (unit_mode != "commanded_sim")
+  if (!simulated_unit)
     return std::nullopt;
   SimulatedPlcPlan plan;
   for (const auto &row : rows) {

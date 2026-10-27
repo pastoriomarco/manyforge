@@ -19,6 +19,7 @@
 #include <map>
 #include <memory>
 #include <mutex>
+#include <set>
 #include <optional>
 #include <string>
 #include <thread>
@@ -138,6 +139,14 @@ class ICCLCLifecycleTargetDriverPorts {
   /// Kernel's Stop ingress. Returns at acceptance; never waits for the Stop.
   [[nodiscard]] virtual Result<ComponentIncidentContainmentReceiptDTO> RequestIncidentContainment(
       const ComponentIncidentContainmentIntentDTO& intent) = 0;
+  /// CP9 `fault` + `auto`: recovers the cell latch of exactly this closed
+  /// incident's containment. True when nothing is left to do automatically.
+  [[nodiscard]] virtual Result<bool> RecoverIncidentContainment(const std::string& incident_id) {
+    static_cast<void>(incident_id);
+    return Result<bool>::Err(
+        {"lifecycle_incident_containment_recovery_unavailable",
+         "incident containment recovery is unavailable", {}});
+  }
 };
 
 /// Production ports over the composed CCLC owner and its verified sources.
@@ -188,6 +197,7 @@ class CoordinatorLifecycleTargetDriverPorts final : public ICCLCLifecycleTargetD
       const LifecycleTransactionId& lifecycle_transaction_id) override;
   [[nodiscard]] Result<ComponentIncidentContainmentReceiptDTO> RequestIncidentContainment(
       const ComponentIncidentContainmentIntentDTO& intent) override;
+  [[nodiscard]] Result<bool> RecoverIncidentContainment(const std::string& incident_id) override;
 
  private:
   ComponentLifecycleCoordinator& coordinator_;
@@ -475,6 +485,21 @@ class CCLCLifecycleTargetDriver final {
   /// it; a failed record keeps it for the next pass.
   void ContainAndRecordIncident(ICCLCLifecycleTargetDriverPorts& ports, ComponentState& state,
                                 std::int64_t now_ns);
+  /// CP9 `fault` + `auto`: the open incident was opened by a `fault` stream
+  /// with `auto` recovery that is live again, and nothing else holds it.
+  [[nodiscard]] bool StreamIncidentRecovered(const ControllableComponentId& component,
+                                             const ComponentState& state,
+                                             const ComponentIncidentRecordDTO& open);
+  /// Closes that incident (recorded like a Recover by the stream itself) and
+  /// queues the release of its containment latch. False when not closed.
+  [[nodiscard]] bool CloseRecoveredStreamIncident(ICCLCLifecycleTargetDriverPorts& ports,
+                                                  const ComponentLifecycleCurrentSnapshotDTO& current,
+                                                  const ComponentIncidentRecordDTO& open,
+                                                  std::int64_t now_ns);
+  /// Outside the pass (the Kernel's recovery reads CheckNoOpenIncidents):
+  /// recovers the latches of incidents closed by their stream.
+  void RecoverClosedIncidentContainments();
+  void RunPass();
   void PublishIncident(ComponentState& state, const ComponentLifecycleIncidentDTO& incident,
                        std::int64_t now_ns,
                        const std::optional<ErrorDTO>& diagnostic = std::nullopt,
@@ -538,6 +563,9 @@ class CCLCLifecycleTargetDriver final {
   /// Containment outcomes of incidents this driver already contained (run
   /// lane), so neither a retried record nor a later pass requests it again.
   std::map<std::string, ContainmentOutcome> containments_;
+  /// Incidents closed by their `fault` + `auto` stream whose containment
+  /// latch is not yet recovered (state_mutex_).
+  std::set<std::string> containment_recoveries_;
 
   std::shared_ptr<WakeState> wake_;
   std::mutex recheck_mutex_;

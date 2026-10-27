@@ -440,8 +440,12 @@ export function interruptConditionKeyUses(
 export type GlobalRuleScope = 'all_motion' | 'everything' | { execution_groups: string[] };
 export type GlobalRuleScopeKind = 'all_motion' | 'execution_groups' | 'everything';
 export type IdleBehaviour = 'latch' | 'ignore';
-/** Contract 78: who clears a cell-level latch (omitted = the operator). */
-export type LatchRelease = 'operator' | 'auto_on_clear';
+/**
+ * What a trip does (omitted = gate): `gate` refuses new motion in scope while
+ * the condition holds and releases by itself when it clears; `full_stop` trips
+ * a cell Full Stop and latches until the operator clears it.
+ */
+export type OnTrip = 'gate' | 'full_stop';
 
 export interface GlobalInterruptRule {
   rule_id: string;
@@ -449,13 +453,14 @@ export interface GlobalInterruptRule {
   scope: GlobalRuleScope;
   /** 0–100; omitted = 0 (contract 59). */
   priority?: number;
+  on_trip?: OnTrip;
+  /** Only with `on_trip: full_stop`. */
   idle_behaviour?: IdleBehaviour;
-  latch_release?: LatchRelease;
   stop_entry_stage_id?: string;
 }
 
 const RULE_FIELDS = new Set([
-  'rule_id', 'condition', 'scope', 'priority', 'idle_behaviour', 'latch_release', 'stop_entry_stage_id',
+  'rule_id', 'condition', 'scope', 'priority', 'on_trip', 'idle_behaviour', 'stop_entry_stage_id',
 ]);
 const PORTABLE_ID = /^[a-z][a-z0-9_.-]*$/;
 /** The components whose signals a condition reads (its source providers). */
@@ -543,11 +548,14 @@ export function globalRuleProblem(
     if (new Set(ids).size !== ids.length) return 'Execution group ids must be unique.';
     if (ids.some((group, at) => at > 0 && ids[at - 1] > group)) return 'Execution group ids must be sorted.';
   }
+  if (rule.on_trip !== undefined && rule.on_trip !== 'gate' && rule.on_trip !== 'full_stop') {
+    return 'On trip is gate or full_stop.';
+  }
   if (rule.idle_behaviour !== undefined && rule.idle_behaviour !== 'latch' && rule.idle_behaviour !== 'ignore') {
     return 'Idle behaviour is latch or ignore.';
   }
-  if (rule.latch_release !== undefined && rule.latch_release !== 'operator' && rule.latch_release !== 'auto_on_clear') {
-    return 'Latch release is operator or auto_on_clear.';
+  if (rule.idle_behaviour !== undefined && rule.on_trip !== 'full_stop') {
+    return 'Idle behaviour applies to on_trip full_stop only; a gate always gates.';
   }
   if (rule.stop_entry_stage_id !== undefined && (typeof rule.stop_entry_stage_id !== 'string' || rule.stop_entry_stage_id === '')) {
     return 'Stop entry stage must be a qualified stage id.';

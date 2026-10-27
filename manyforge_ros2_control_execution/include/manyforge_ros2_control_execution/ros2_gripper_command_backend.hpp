@@ -52,10 +52,9 @@ struct Ros2GripperActionConfig {
   // intentionally separate from joint_name, which is the compiled coordinate
   // used by the execution-state projection sink.
   std::string state_joint_name;
-  // Optional execution-state sink projection metadata. When set, the ROS
-  // position-commanded gripper path also updates the declared gripper group so
-  // Composer's FK/link-pose scene state renders the gripper through the same
-  // robot-state path as the arm.
+  // Optional execution-state sink projection metadata. The position-commanded
+  // path and the no-feedback pneumatic no-output path update the declared
+  // gripper group through the same robot-state path as the arm.
   std::string group_id;
   std::string joint_name;
   std::string completion_policy = "position_reached";
@@ -64,11 +63,12 @@ struct Ros2GripperActionConfig {
   double open_effort = 0.0;
   double close_effort = 0.0;
   bool publish_nominal_position = false;
-  /// Feedback staleness threshold, from the gripper target configuration's
-  /// `state_freshness_timeout_s` (no code default; must be positive); also the
-  /// default budget of the CP9 `gripper_feedback` stream (overridable per
-  /// component in the Deployment).
+  /// Feedback staleness threshold (no code default; must be positive): the
+  /// budget of the component's CP9 `gripper_feedback` stream row.
   double state_freshness_timeout_s{};
+  /// That row's severity/recovery, used when the host declares the stream.
+  core::StreamSeverityDTO feedback_stream_severity{};
+  core::StreamRecoveryDTO feedback_stream_recovery{};
   /// CP9 `gripper_feedback` stream of the owning component, declared by the
   /// host. When set it records every matched feedback sample and owns the
   /// staleness judgement (the readiness snapshot no longer ages feedback).
@@ -78,8 +78,7 @@ struct Ros2GripperActionConfig {
   std::optional<double> result_timeout_s;
   core::GripperActuationKind actuation_kind{
       core::GripperActuationKind::kPositionCommanded};
-  /// Pneumatic display only; never an authoritative execution-state
-  /// publication.
+  /// Display-only callback for pneumatic paths with feedback or no model group.
   std::function<core::Result<void>(double)> publish_display_position;
   core::GripperOutputMode output_mode{core::GripperOutputMode::kCommanded};
 };

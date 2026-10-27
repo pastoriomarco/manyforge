@@ -19,6 +19,7 @@ from manyforge_behavior.assistant_program_port import (
     ProgramAssistantPortError,
     ProgramModelRequest,
     ProgramModelResponse,
+    ProgramModelTransportError,
     ProgramSnapshotSourceError,
 )
 from manyforge_behavior.catalog import NodeCatalog
@@ -65,6 +66,26 @@ def _node(program: Program, instance_id: str) -> ProgramTreeNode:
 
 def _assistant_projection() -> dict[str, Any]:
     return {
+        "ai_models": [
+            {
+                "api_key_env": None,
+                "base_url": "http://chat.test/v1",
+                "controllable_component_id": "chat_model",
+                "model": "chat-model-v1",
+            },
+            {
+                "api_key_env": "MANYFORGE_AI_TEST_TOKEN",
+                "base_url": "http://models.test/v1",
+                "controllable_component_id": "selection_model",
+                "model": "selection-model-v1",
+            },
+            {
+                "api_key_env": None,
+                "base_url": "http://vision.test/v1",
+                "controllable_component_id": "vision_model",
+                "model": "vision-model-v1",
+            },
+        ],
         "api_version": "manyforge.retained_assistant.v1",
         "projection_digest": _DIGEST_D,
         "audit_policy": {
@@ -1000,6 +1021,8 @@ def test_selection_and_model_query_use_exact_captured_contracts() -> None:
         }
         request = model_transport.requests[0]
         assert request.external_resource_alias == "selection_model"
+        assert request.base_url == "http://models.test/v1"
+        assert request.api_key_env == "MANYFORGE_AI_TEST_TOKEN"
         assert request.tool_call_family == "openai_chat_tools"
         assert request.response_tool is not None
         assert request.response_tool["name"] == "select_scene_object"
@@ -1418,6 +1441,84 @@ def test_unbind_retries_the_exact_completed_outcome_after_audit_failure(timestam
         assert audit.records[0]["validated_output_digest"] is not None
         with pytest.raises(ProgramAssistantPortError, match="unknown"):
             port.observe(started.task_id)
+    finally:
+        port.close()
+
+
+class _TokenlessModelTransport(_ModelTransport):
+    def complete(
+        self, request: ProgramModelRequest, _cancel_event: Event
+    ) -> ProgramModelResponse:
+        self.requests.append(request)
+        raise ProgramModelTransportError(
+            "token unset", reason_code="ai_model_token_unavailable"
+        )
+
+
+@pytest.mark.parametrize(
+    ("ai_model", "transport", "reason_code", "audited"),
+    [
+        (None, _ModelTransport(), "assistant_ai_model_absent", []),
+        (
+            "keep",
+            _TokenlessModelTransport(),
+            "ai_model_token_unavailable",
+            ["transport_error"],
+        ),
+    ],
+)
+def test_query_model_ai_model_failures_are_typed(
+    ai_model: Any,
+    transport: _ModelTransport,
+    reason_code: str,
+    audited: list[str],
+) -> None:
+    projection = _assistant_projection()
+    if ai_model is None:
+        projection["ai_models"] = [
+            row
+            for row in projection["ai_models"]
+            if row["controllable_component_id"] != "selection_model"
+        ]
+    audit = _AuditSink()
+    port = ProgramAssistantPort(
+        transport,
+        HeadlessProgramSceneSource(_SceneTransport()),
+        audit_sink=audit,
+    )
+    selection_context = build_scene_selection_context(
+        selection_request_text="Select the sphere object.",
+        scene_objects=[
+            {
+                **_scene_object(
+                    "sphere_part",
+                    position=(0.4, -0.14, 0.009),
+                    shape="sphere",
+                ),
+                "pose_in_cell": {
+                    "position_m": {"x": 0.4, "y": -0.14, "z": 0.009},
+                    "orientation_xyzw": [0.0, 0.0, 0.0, 1.0],
+                },
+                "attached": False,
+            }
+        ],
+        candidate_object_ids=["sphere_part"],
+        frame_id="cell-a",
+    )
+    try:
+        port.bind(_context(_program(), assistant_projection=projection))
+        started = port.start(
+            "assistant.query_model",
+            _identity(f"typed-{reason_code}"),
+            _query_inputs(selection_context),
+        )
+        failed = _wait_terminal(port, started.task_id)
+
+        assert failed.state is OwnerTaskState.FAILED
+        assert failed.reason_code == reason_code
+        assert [record["outcome"] for record in audit.records] == audited
+        if audited:
+            assert audit.records[0]["error_code"] == reason_code
     finally:
         port.close()
 

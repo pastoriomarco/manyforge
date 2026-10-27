@@ -17,6 +17,8 @@ export interface AssistantModeIndex {
   graphRevision: string;
   assistantProjectionDigest: string;
   instrumentRegistryDigest: string;
+  /** The active Deployment's AI model component, or null when it has none. */
+  aiModelComponentId: string | null;
   modes: AssistantModeSummary[];
 }
 
@@ -29,15 +31,6 @@ export interface AssistantToolCallResult {
   draftMutated?: boolean;
 }
 
-export interface AssistantProposal {
-  toolId: string;
-  effect: 'proposal' | 'runtime_mutating';
-  arguments: Record<string, JsonValue>;
-  inputSchemaHash: string;
-  status: 'draft';
-  requiresReview: true;
-}
-
 export interface AssistantProviderResponse {
   requestId: string;
   requestOwnerEpoch: string;
@@ -47,7 +40,6 @@ export interface AssistantProviderResponse {
   assistantMode: string;
   catalogHash: string;
   message: string;
-  proposals: AssistantProposal[];
   toolCalls: AssistantToolCallResult[];
   warnings: string[];
   requiresReview: true;

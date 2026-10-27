@@ -4,8 +4,8 @@
 // joint_trajectory_controller, enough for host tests of the thin JTC adapter:
 // FollowJointTrajectory goals (feedback, result, preemption by a replacement,
 // cancel with deceleration), `controller_state`, the speed-scaling input, the
-// controller manager's `switch_controller` service and transient-local
-// `~/activity` topic. Playback interpolates the received points over the
+// controller manager's `switch_controller` and `set_hardware_component_state`
+// services and transient-local `~/activity` topic. Playback interpolates the received points over the
 // controller's own cursor (path time advancing at the applied factor). No
 // claim is made about the stock controller beyond these message shapes.
 
@@ -13,6 +13,7 @@
 #include <control_msgs/msg/joint_trajectory_controller_state.hpp>
 #include <control_msgs/msg/speed_scaling_factor.hpp>
 #include <controller_manager_msgs/msg/controller_manager_activity.hpp>
+#include <controller_manager_msgs/srv/set_hardware_component_state.hpp>
 #include <controller_manager_msgs/srv/switch_controller.hpp>
 #include <lifecycle_msgs/msg/state.hpp>
 #include <rclcpp/rclcpp.hpp>
@@ -384,6 +385,26 @@ public:
           }
           response->ok = true;
         });
+    // R7 package 4: a Real arm's hardware is (de)activated by name.
+    hardware_state_ = node()->create_service<
+        controller_manager_msgs::srv::SetHardwareComponentState>(
+        manager + "/set_hardware_component_state",
+        [this](const std::shared_ptr<
+                   controller_manager_msgs::srv::SetHardwareComponentState::Request>
+                   request,
+               std::shared_ptr<
+                   controller_manager_msgs::srv::SetHardwareComponentState::Response>
+                   response) {
+          const bool active =
+              request->target_state.id ==
+              lifecycle_msgs::msg::State::PRIMARY_STATE_ACTIVE;
+          {
+            std::lock_guard lock(reset_mutex_);
+            hardware_history_.push_back(active);
+          }
+          response->ok = request->name == hardware_ && !hardware_refused_;
+          if (response->ok) SetHardwareActive(active);
+        });
     if (!reset_writer_.empty()) {
       const auto manager_suffix = manager.rfind('/');
       reset_subscription_ =
@@ -419,6 +440,7 @@ public:
   void StopAndDestroyEndpoints() {
     PeerNode::Stop();
     switch_.reset();
+    hardware_state_.reset();
     activity_.reset();
   }
 
@@ -440,6 +462,29 @@ public:
   void SetHardwareActive(bool active) {
     hardware_active_ = active;
     Publish();
+  }
+
+  /// R7 package 4: list the joint state broadcaster in the activity (absent
+  /// unless set, as for the Mock tests).
+  void SetBroadcasterActive(bool active) {
+    broadcaster_listed_ = true;
+    broadcaster_active_ = active;
+    Publish();
+  }
+
+  /// The plugin's deactivate-all / reactivate-all in one activity sample.
+  void SetAllControllersActive(bool active) {
+    broadcaster_listed_ = true;
+    broadcaster_active_ = active;
+    SetControllerActive(active);
+  }
+
+  void SetHardwareRefused(bool refused) { hardware_refused_ = refused; }
+
+  /// Every `set_hardware_component_state` request, `true` for active.
+  [[nodiscard]] std::vector<bool> hardware_history() const {
+    std::lock_guard lock(reset_mutex_);
+    return hardware_history_;
   }
 
   /// Deterministically hold the old transient-local activity while a switch
@@ -479,6 +524,13 @@ private:
                          : lifecycle_msgs::msg::State::PRIMARY_STATE_INACTIVE;
       message.controllers.push_back(controller);
     }
+    if (broadcaster_listed_) {
+      controller.name = "joint_state_broadcaster";
+      controller.state.id =
+          broadcaster_active_ ? lifecycle_msgs::msg::State::PRIMARY_STATE_ACTIVE
+                              : lifecycle_msgs::msg::State::PRIMARY_STATE_INACTIVE;
+      message.controllers.push_back(controller);
+    }
     controller_manager_msgs::msg::NamedLifecycleState hardware;
     hardware.name = hardware_;
     hardware.state.id = hardware_active_ ? lifecycle_msgs::msg::State::PRIMARY_STATE_ACTIVE
@@ -505,9 +557,15 @@ private:
   std::atomic<bool> active_{false};
   std::atomic<bool> activity_publication_enabled_{true};
   std::atomic<bool> hardware_active_{true};
+  std::atomic<bool> broadcaster_listed_{false};
+  std::atomic<bool> broadcaster_active_{false};
+  std::atomic<bool> hardware_refused_{false};
+  std::vector<bool> hardware_history_;
   std::atomic<std::size_t> switch_requests_{0U};
   rclcpp::Publisher<controller_manager_msgs::msg::ControllerManagerActivity>::SharedPtr activity_;
   rclcpp::Service<controller_manager_msgs::srv::SwitchController>::SharedPtr switch_;
+  rclcpp::Service<controller_manager_msgs::srv::SetHardwareComponentState>::SharedPtr
+      hardware_state_;
 };
 
 template <typename Predicate>

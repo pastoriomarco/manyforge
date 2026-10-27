@@ -8,12 +8,12 @@
   "description": "R5 trial (e) signal moves: search_trip scripts probe_contact false then true after 1000 ms -> signal_trip/success; search_no_trip scripts edge_sensor false with no change and completes without trip -> no_signal_trip (default success); probe_no_trip descends slowly (TCP ≤ 10 mm/s, endpoint gripper/tcp) to a requested goal 1 mm past the probe_block top, so the fingertips touch the block; probe_contact_policy allows contact only for the endpoint bodies against probe_block in the last 20% of the motion (≤ 2 mm); it scripts edge_sensor false with no change and completes without a trip (on_no_signal success) -> no_signal_trip. end_rest withdraws from the probe_block contact under withdrawal_contact_policy (same endpoint/block pair, 2 mm initial cap, decreasing penetration, separation required, no recontact). The node_outcome keys are checked.",
   "members": {
     "assignment.yaml": "sha256:77fd5d97e616e9123768bcebde15a9618d5df196c3de864f743aaf19680af06a",
-    "deployment.yaml": "sha256:7e1baa2fa2ce2a9b1fd5c6ef05b2ce3fc4dbe5bb35fa921f944d22d4142e8db0",
+    "deployment.yaml": "sha256:cabab82d01a8a53fbfd79b7f183bbabf557460deed639b7768fcc2e636033246",
     "program.yaml": "sha256:97c8e8e6810c48a9fa932f8e0099a503feed776b0fa2fe57e7763738cb1dcbfe"
   },
   "name": "r5_trial_e_signal",
   "saved_status": {
-    "checked_content_digest": "sha256:d2d2c153a55bee79e9e90903b4e8c773d26fbbd93c140653bc3f89fa471431af",
+    "checked_content_digest": "sha256:dbd480ec6d00fee7ba7aa48dccdac8d709c14343502a3c7c88bc80f5e17f4b70",
     "last_known_status": "unknown",
     "manyforge_version": "0.1.0"
   },
@@ -97,7 +97,7 @@
         "source_id": "component:lite6_robot:srdf"
       },
       {
-        "content_digest": "sha256:448485049362a14643f3a6418cee4a9e2119bc86509f0a127607aad54803b641",
+        "content_digest": "sha256:c205aea7474737989e1195fbbff16cb9d3f287fee3cefcd550c7ad2e4e606e90",
         "source_id": "component:lite6_robot:urdf"
       }
     ],

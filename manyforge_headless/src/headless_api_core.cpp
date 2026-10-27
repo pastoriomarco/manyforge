@@ -18,6 +18,7 @@
 #include <initializer_list>
 #include <iterator>
 #include <limits>
+#include <map>
 #include <manyforge_content_identity/content_identity.hpp>
 #include <manyforge_core/io_rule_outcome_codec.hpp>
 #include <manyforge_core/types/carried_object_lost.hpp>
@@ -1463,7 +1464,74 @@ std::string NonExecutableMessage(
   return message;
 }
 
+// Simulator entity mapping of the active bundle: its eligible
+// simulation-entity object links (expanded pose-source rows) and their one
+// cell frame; null when the bundle has none.
+CanonicalValue SimulationScene(const deployment::RetainedBundle &bundle) {
+  using Object = core::JsonValueDTO::Object;
+  using Array = core::JsonValueDTO::Array;
+  const auto sources =
+      deployment::ResolveRetainedPoseSources(bundle.value().cell_graph);
+  if (!sources.ok())
+    CoreFail("program_applied_selection_invalid",
+             "active pose-source configuration is invalid");
+  std::optional<std::string> cell_frame_id;
+  std::map<std::string, std::string> entities;  // scene_resource_id -> entity
+  const auto text = [](const Object &row, const char *key) {
+    return std::get<std::string>(row.at(key).value);
+  };
+  for (const auto &source : sources.value()) {
+    const auto &row = std::get<Object>(source.row.value);
+    for (const auto &item :
+         std::get<Array>(row.at("simulation_entities").value)) {
+      const auto &binding = std::get<Object>(item.value);
+      if (!std::get<bool>(binding.at("eligible").value))
+        continue;
+      const auto frame = text(binding, "source_coordinate_frame_id");
+      if (cell_frame_id && *cell_frame_id != frame)
+        CoreFail("simulation_cell_frame_ambiguous",
+                 "simulation object links use more than one cell frame (" +
+                     *cell_frame_id + ", " + frame + ")");
+      cell_frame_id = frame;
+      entities.emplace(text(binding, "object_id"), text(binding, "entity"));
+    }
+  }
+  if (!cell_frame_id)
+    return CanonicalValue(nullptr);
+  CanonicalValue::Array scene_entities;
+  for (const auto &[scene_resource_id, entity] : entities)
+    scene_entities.emplace_back(CanonicalValue::Object{
+        {"entity", CanonicalValue(entity)},
+        {"scene_resource_id", CanonicalValue(scene_resource_id)},
+    });
+  return CanonicalValue(CanonicalValue::Object{
+      {"cell_frame_id", CanonicalValue(*cell_frame_id)},
+      {"scene_entities", CanonicalValue(std::move(scene_entities))},
+  });
+}
+
 } // namespace
+
+// Each assistant model alias names its component through
+// `external_resource_alias`.
+CanonicalValue AssistantAiModels(const core::CellGraphDTO &graph) {
+  const auto models = deployment::ResolveRetainedAiModels(graph);
+  if (!models.ok())
+    CoreFail("program_applied_selection_invalid",
+             "active AI model configuration is invalid");
+  CanonicalValue::Array rows;
+  for (const auto &model : models.value())
+    rows.emplace_back(CanonicalValue::Object{
+        {"api_key_env", model.api_key_env.has_value()
+                            ? CanonicalValue(*model.api_key_env)
+                            : CanonicalValue(nullptr)},
+        {"base_url", CanonicalValue(model.base_url)},
+        {"controllable_component_id",
+         CanonicalValue(model.controllable_component_id.value())},
+        {"model", CanonicalValue(model.model)},
+    });
+  return CanonicalValue(std::move(rows));
+}
 
 CanonicalValue HeadlessApiCore::ActiveProgramSelectionLocked(
     const HeadlessRuntimeSnapshot &runtime) {
@@ -1513,17 +1581,24 @@ CanonicalValue HeadlessApiCore::ActiveProgramSelectionLocked(
           "program_applied_selection_invalid",
           "active Program and binding are divergent");
 
+  // The retained assistant member plus `ai_models`: the AI model components
+  // its Program model calls use.
   CanonicalValue assistant_projection(nullptr);
   if (bundle->value().assistant.has_value()) {
+    auto ai_models = AssistantAiModels(bundle->value().cell_graph);
+    CanonicalValue::Object members;
     try {
-      assistant_projection = deployment::parse_strict_json_model_yaml(
-                                 bundle->value().assistant->canonical_json)
-                                 .root();
+      members = deployment::parse_strict_json_model_yaml(
+                    bundle->value().assistant->canonical_json)
+                    .root()
+                    .as_object();
     } catch (const std::exception &error) {
       CoreFail("program_applied_selection_invalid",
                "active assistant projection is invalid: " +
                    std::string(error.what()));
     }
+    members.emplace_back("ai_models", std::move(ai_models));
+    assistant_projection = CanonicalValue(std::move(members));
   }
 
   const auto environment = NodeEnvironmentProjectionLocked(runtime);
@@ -1586,6 +1661,7 @@ CanonicalValue HeadlessApiCore::ActiveProgramSelectionLocked(
       {"project_path", RequiredMember(origin, "project_path")},
       {"schema_version",
        CanonicalValue(std::string(kAppliedProgramSelectionSchemaVersion))},
+      {"simulation_scene", SimulationScene(*bundle)},
       {"source", CanonicalValue(CanonicalValue::Object{
                      {"record_digest", RequiredMember(record, "intent_digest")},
                      {"semantic_content_digest",
