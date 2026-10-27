@@ -55,8 +55,6 @@ const char* runtime_collision_tick_reason_name(RuntimeCollisionTickReason reason
       return "runtime_collision_bundle_capacity_exceeded";
     case RuntimeCollisionTickReason::kBundleLookupOrderInvalid:
       return "runtime_collision_bundle_lookup_order_invalid";
-    case RuntimeCollisionTickReason::kProjectionMismatch:
-      return "runtime_collision_projection_revision_mismatch";
     case RuntimeCollisionTickReason::kPolicyUnavailable:
       return "missing_collision_policy_snapshot";
     case RuntimeCollisionTickReason::kPolicyIndexMismatch:
@@ -174,15 +172,13 @@ const char* runtime_collision_engine_status_name(CollisionEngineStatus status) n
 RuntimeCollisionQuerySession::RuntimeCollisionQuerySession(
     RuntimeCollisionStateProjection projection, ICollisionWorldSnapshotPublisher& publisher,
     std::shared_ptr<ICollisionQueryEngine> engine, std::string active_contact_policy_id,
-    std::int64_t query_timeout_ns,
-    std::optional<ProjectionRevisionDTO> admission_projection_revision)
+    std::int64_t query_timeout_ns)
     : projection_(std::move(projection)),
       publisher_(&publisher),
       engine_(std::move(engine)),
       capability_(engine_ ? &engine_->capability() : nullptr),
       active_contact_policy_id_(std::move(active_contact_policy_id)),
       query_timeout_ns_(query_timeout_ns),
-      admission_projection_revision_(std::move(admission_projection_revision)),
       query_positions_rad_(projection_.template_positions_rad) {}
 
 RuntimeCollisionQueryBundlePtr RuntimeCollisionQuerySession::acquire_bundle() const {
@@ -205,19 +201,6 @@ bool joint_names_unique(std::span<const std::string> names) noexcept {
     }
   }
   return true;
-}
-
-bool projection_is_same_or_forward_in_lineage(const ProjectionRevisionDTO& candidate,
-                                              const ProjectionRevisionDTO& floor) noexcept {
-  if (!candidate.valid() || !floor.valid() ||
-      candidate.retained_bundle_id != floor.retained_bundle_id ||
-      candidate.graph_revision != floor.graph_revision ||
-      candidate.scene_revision.scene_id != floor.scene_revision.scene_id ||
-      candidate.scene_revision.revision_id < floor.scene_revision.revision_id) {
-    return false;
-  }
-  return candidate.scene_revision.revision_id != floor.scene_revision.revision_id ||
-         candidate.scene_revision.content_hash == floor.scene_revision.content_hash;
 }
 
 }  // namespace
@@ -289,20 +272,11 @@ std::optional<ErrorDTO> RuntimeCollisionQuerySession::prepare(
                     "Runtime collision snapshot is unavailable",
                     {{"reason", "runtime_collision_snapshot_not_published"}}};
   }
-  if (admission_projection_revision_.has_value() &&
-      (!initial_bundle->projection_revision.has_value() ||
-       *initial_bundle->projection_revision != *admission_projection_revision_)) {
-    return ErrorDTO{kErrorValidationCollision,
-                    "Runtime collision admission did not use the retained projection",
-                    {{"reason", "runtime_collision_projection_revision_mismatch"}}};
-  }
-  if (initial_bundle->world->bodies.size() > capability.runtime_query_max_world_bodies ||
-      initial_bundle->body_freshness.size() > capability.runtime_query_max_world_bodies) {
+  if (initial_bundle->world->bodies.size() > capability.runtime_query_max_world_bodies) {
     return ErrorDTO{kErrorValidationCollision,
                     "Runtime collision bundle exceeds engine body bound",
                     {{"reason", "runtime_collision_bundle_capacity_exceeded"},
                      {"body_count", std::to_string(initial_bundle->world->bodies.size())},
-                     {"freshness_count", std::to_string(initial_bundle->body_freshness.size())},
                      {"body_bound", std::to_string(capability.runtime_query_max_world_bodies)}}};
   }
   if (!initial_bundle->lookup_order_valid) {
@@ -336,9 +310,6 @@ std::optional<ErrorDTO> RuntimeCollisionQuerySession::prepare(
         {{"reason", "runtime_collision_snapshot_prepare_failed"},
          {"prepare_status", runtime_collision_query_prepare_status_name(snapshot_prepare)},
          {"engine_id", capability.engine_id}}};
-  }
-  if (initial_bundle->projection_revision.has_value()) {
-    latest_projection_revision_ = initial_bundle->projection_revision;
   }
   return std::nullopt;
 }
@@ -856,8 +827,7 @@ RuntimeCollisionTickOutcome RuntimeCollisionQuerySession::tick(
     return {};
   }
   const auto& capability = *capability_;
-  if (bundle->world->bodies.size() > capability.runtime_query_max_world_bodies ||
-      bundle->body_freshness.size() > capability.runtime_query_max_world_bodies) {
+  if (bundle->world->bodies.size() > capability.runtime_query_max_world_bodies) {
     RuntimeCollisionTickOutcome out;
     out.reason = RuntimeCollisionTickReason::kBundleCapacityExceeded;
     return out;
@@ -867,23 +837,10 @@ RuntimeCollisionTickOutcome RuntimeCollisionQuerySession::tick(
     out.reason = RuntimeCollisionTickReason::kBundleLookupOrderInvalid;
     return out;
   }
-  if (admission_projection_revision_.has_value()) {
-    const auto& floor = latest_projection_revision_.has_value() ? *latest_projection_revision_
-                                                                : *admission_projection_revision_;
-    if (!bundle->projection_revision.has_value() ||
-        !projection_is_same_or_forward_in_lineage(*bundle->projection_revision, floor)) {
-      RuntimeCollisionTickOutcome out;
-      out.reason = RuntimeCollisionTickReason::kProjectionMismatch;
-      return out;
-    }
-  }
   if (!bind_policy(bundle)) {
     RuntimeCollisionTickOutcome out;
     out.reason = policy_binding_error_;
     return out;
-  }
-  if (bundle->projection_revision.has_value()) {
-    latest_projection_revision_ = bundle->projection_revision;
   }
   auto projection = project_observed_state(observed_positions_rad);
   if (projection.status == RuntimeCollisionTickStatus::kInconclusive) {

@@ -511,24 +511,103 @@ const SHELL_DIAGNOSTIC_FIELDS = new Set([
 
 const runtimeShellKeys = new WeakMap<object, string>();
 
+function without(record: Record<string, unknown>, names: readonly string[]) {
+  const rest = { ...record };
+  for (const name of names) delete rest[name];
+  return rest;
+}
+
+const sceneIdOf = (revision: unknown) => recordField(revision)?.scene_id ?? null;
+
+/**
+ * The logical Scene as the shell compares it: by structure. Pose-only state
+ * moves continuously with pose sources and is read from the latest snapshot
+ * (viewer, or ``getLatestSnapshot`` at use time): provider-driven object
+ * poses, carried poses and attachment revisions, and the scene revision,
+ * transaction sequence and topology epoch.
+ * Object and attachment ids, shapes, placement kinds, carriers, authored
+ * poses, provider identity, scene id, policy and access stay.
+ */
+function logicalSceneShellPayload(payload: Record<string, unknown> | null): unknown {
+  const snapshot = recordField(payload?.snapshot);
+  if (payload === null || snapshot === null) return payload;
+  const access = recordField(payload.access);
+  const active = recordField(access?.active_projection);
+  const objects = Array.isArray(snapshot.objects)
+    ? snapshot.objects.map((value: unknown) => {
+      const object = recordField(value);
+      const placement = recordField(object?.placement);
+      if (object === null || placement === null) return value;
+      const evidence = recordField(object.provider_evidence);
+      return {
+        ...object,
+        placement: without(placement, evidence === null
+          ? ['carried_object_attachment_revision']
+          : ['carried_object_attachment_revision', 'pose_in_cell']),
+      };
+    })
+    : snapshot.objects;
+  const attachments = Array.isArray(snapshot.carried_object_attachments)
+    ? snapshot.carried_object_attachments.map((value: unknown) => {
+      const attachment = recordField(value);
+      return attachment === null
+        ? value
+        : without(attachment, ['carried_object_attachment_revision', 'pose_in_carrier_frame']);
+    })
+    : snapshot.carried_object_attachments;
+  return {
+    ...payload,
+    access: access === null || active === null
+      ? payload.access
+      : { ...access, active_projection: { ...active, scene_revision: sceneIdOf(active.scene_revision) } },
+    snapshot: {
+      ...without(snapshot, ['transaction_sequence', 'topology_epoch']),
+      revision: sceneIdOf(snapshot.revision),
+      objects,
+      carried_object_attachments: attachments,
+    },
+  };
+}
+
+/** Scene-runtime pose sources without their sampled values (the viewer shows them). */
+function sceneRuntimeShellPayload(payload: Record<string, unknown> | null): unknown {
+  const state = recordField(payload?.state);
+  if (payload === null || state === null || !Array.isArray(state.pose_sources)) return payload;
+  return {
+    ...payload,
+    state: {
+      ...state,
+      pose_sources: state.pose_sources.map((value: unknown) => {
+        const source = recordField(value);
+        const sample = recordField(source?.payload);
+        return source === null || sample === null
+          ? value
+          : { ...source, payload: without(sample, ['pose', 'positions', 'source_stamp_ns']) };
+      }),
+    },
+  };
+}
+
 function runtimeShellKey(runtime: ComposerHeadlessState['runtime']): string {
   const cached = runtimeShellKeys.get(runtime);
   if (cached !== undefined) return cached;
   type Section = ComposerHeadlessState['runtime']['sections']['manager'];
-  // Manager heartbeats and Scene-runtime pose samples advance these source
-  // generations; only their presence is status. The logical-scene generation
-  // names owner content and Scene mutation identity, so it is kept.
+  // Manager heartbeats, Scene-runtime pose samples and pose-only Scene
+  // commits advance these source generations; only their presence is status.
+  // The logical Scene and the pose sources are compared by structure.
   const counted = (section: Section) => ({
     ...section,
     sourceGeneration: section.sourceGeneration !== null,
   });
+  const { logicalScene, sceneRuntime } = runtime.sections;
   const key = JSON.stringify(
     {
       ...runtime,
       sections: {
         ...runtime.sections,
         manager: counted(runtime.sections.manager),
-        sceneRuntime: counted(runtime.sections.sceneRuntime),
+        logicalScene: { ...counted(logicalScene), payload: logicalSceneShellPayload(logicalScene.payload) },
+        sceneRuntime: { ...counted(sceneRuntime), payload: sceneRuntimeShellPayload(sceneRuntime.payload) },
       },
     },
     (name, value: unknown) => (SHELL_DIAGNOSTIC_FIELDS.has(name) ? undefined : value),
@@ -604,7 +683,7 @@ export function sameViewerProjection(
       candidate.runtime.unavailableSections,
     )
     // The logical-scene generation names owner content (object poses and
-    // geometry) and keys Scene mesh URLs, so it still publishes.
+    // geometry), so it still wakes the viewer.
     && sameSourceSection(
       current.runtime.sections.logicalScene,
       candidate.runtime.sections.logicalScene,
@@ -765,6 +844,8 @@ export class HeadlessStateSource implements ExecutionObservationReader {
 
   readonly getShellSnapshot = () => this.shellResult;
   readonly getViewerSnapshot = () => this.viewerResult;
+  /** The newest accepted snapshot, for imperative readers of poses and revisions. */
+  readonly getLatestSnapshot = () => this.latest;
   readonly getLatestExecutionObservation = () => this.latestExecutionObservation;
   readonly markExecutionObservationApplied = (
     frame: ExecutionObservationFrame,

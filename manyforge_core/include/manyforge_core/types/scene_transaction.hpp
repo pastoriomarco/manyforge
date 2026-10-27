@@ -88,6 +88,8 @@ struct AttachCarriedObjectRequestDTO final {
   FrameRoleId frame_role_id;
   std::vector<CollisionBodyRoleId> touch_body_roles;
   std::vector<ComponentAttachmentRevision> expected_component_attachment_revisions;
+  /// Optional Program attach-node bound, kept with the attachment.
+  std::optional<CarriedObjectGraspLostBoundDTO> grasp_lost_bound{};
 };
 
 struct DetachCarriedObjectRequestDTO final {
@@ -335,25 +337,6 @@ enum class ProjectionCommitResultStateDTO {
   kCommitted,
   kRejectedRollbackProven,
   kFailedProjectionUncertain,
-};
-
-/// A newer same-origin provider observation that confirms the unchanged
-/// committed pose of an unattached cell-fixed scene object. It refreshes
-/// runtime freshness only: it is not an owner transaction and it does not
-/// advance SceneRevision. `pose_in_cell` must equal the committed pose and
-/// `evidence` must share the committed evidence origin and freshness budget
-/// with a strictly newer provider source sequence.
-struct ProviderFreshnessConfirmationDTO final {
-  ProjectionRevisionDTO expected_projection_revision;
-  SceneResourceId scene_resource_id;
-  Pose3DTO pose_in_cell;
-  SceneObjectProviderEvidenceDTO evidence;
-
-  [[nodiscard]] bool valid() const noexcept {
-    return expected_projection_revision.valid() &&
-           !scene_resource_id.empty() && evidence.valid() &&
-           evidence.source_freshness_budget_ns.has_value();
-  }
 };
 
 /// One native projection's exact acknowledgement or rollback evidence.

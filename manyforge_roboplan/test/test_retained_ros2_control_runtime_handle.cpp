@@ -14,6 +14,7 @@
 #include <manyforge_core/time/fake_clock.hpp>
 #include <manyforge_core/time/manual_scheduler.hpp>
 #include <manyforge_core/types/lifecycle_cause.hpp>
+#include <manyforge_roboplan/host_component_stream_health.hpp>
 #include <manyforge_roboplan/native_runtime_support.hpp>
 #include <manyforge_roboplan/retained_isaac_ros2_control_profile.hpp>
 #include <manyforge_roboplan/retained_ros2_control_runtime_handle.hpp>
@@ -438,6 +439,7 @@ struct GripperWorld final {
             *resources, sink, clock, scheduler, true);
     gripper_backend = gripper.get();
     ros2_control_execution::Ros2GripperActionConfig config;
+    config.state_freshness_timeout_s = 1.0;
     config.action_name = prefix + "/gripper_controller/gripper_cmd";
     config.group_id = "gripper";
     config.joint_name = "gripper_joint";
@@ -556,6 +558,7 @@ struct GripperOnlyWorld final {
         std::make_unique<ros2_control_execution::Ros2GripperCommandBackend>(
             *resources, sink, clock, scheduler, true);
     ros2_control_execution::Ros2GripperActionConfig config;
+    config.state_freshness_timeout_s = 1.0;
     config.action_name = prefix + "/gripper_controller/gripper_cmd";
     config.group_id = "gripper";
     config.joint_name = "gripper_joint";
@@ -2747,6 +2750,14 @@ TEST(RetainedRos2ControlRuntimeHandle, InactiveJointStateSamplesAreMeasuredAndRe
   EXPECT_EQ(sampled.value().state_authority_class, core::StateAuthorityClass::kMeasured);
   EXPECT_EQ(sampled.value().source_timestamp_ns, 2'000'000'003);
   EXPECT_EQ(sampled.value().received_timestamp_ns, 1000);
+  // CP9: every received sample is pushed to the component's stream.
+  const auto streams = host_component_stream_health()->Read(
+      world.binding.value().controllable_component_id);
+  ASSERT_EQ(streams.size(), 1U);
+  EXPECT_EQ(streams.front().stream_id, "measured_joints");
+  EXPECT_EQ(streams.front().severity, core::StreamSeverityDTO::kFault);
+  EXPECT_EQ(streams.front().recovery, core::StreamRecoveryDTO::kAck);
+  EXPECT_TRUE(streams.front().age_ns.has_value());
   clock->set(9'000'000);
   EXPECT_EQ(reader->current_state(query, 1050).value(), sampled.value());
   EXPECT_TRUE(reader->current_state(query, 1100).ok());
@@ -3263,6 +3274,7 @@ TEST(RetainedRos2ControlRuntimeHandleTest,
   auto backend = std::make_unique<ros2_control_execution::Ros2GripperCommandBackend>(
       *resources, sink, *clock, scheduler, true);
   ros2_control_execution::Ros2GripperActionConfig config;
+  config.state_freshness_timeout_s = 1.0;
   config.action_name = prefix + "/gripper_controller/gripper_cmd";
   config.group_id = "gripper";
   config.joint_name = "gripper_joint";
@@ -3383,6 +3395,7 @@ TEST(RetainedRos2ControlRuntimeHandleTest,
   auto backend = std::make_unique<ros2_control_execution::Ros2GripperCommandBackend>(
       *resources, sink, clock, scheduler, true);
   ros2_control_execution::Ros2GripperActionConfig config;
+  config.state_freshness_timeout_s = 1.0;
   config.actuation_kind = core::GripperActuationKind::kPneumatic;
   config.output_mode = core::GripperOutputMode::kNone;
   config.action_name.clear();
@@ -3491,6 +3504,7 @@ TEST(RetainedRos2ControlRuntimeHandleTest,
     auto backend = std::make_unique<ros2_control_execution::Ros2GripperCommandBackend>(
         *resources, sink, clock, scheduler, true);
     ros2_control_execution::Ros2GripperActionConfig config;
+    config.state_freshness_timeout_s = 1.0;
     config.actuation_kind = core::GripperActuationKind::kPneumatic;
     config.completion_policy = "output_delivery";
     if (no_output) {

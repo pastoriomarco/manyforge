@@ -6,7 +6,6 @@
 #include "native_projection_rpc_internal.hpp"
 #include "selected_runtime_composition_rpc_internal.hpp"
 #include <manyforge_deployment/apply_affected_scope.hpp>
-#include <manyforge_content_identity/content_identity.hpp>
 
 #include <fcntl.h>
 #include <poll.h>
@@ -95,10 +94,10 @@ constexpr auto kGracefulStopTimeout = std::chrono::seconds(2);
 
 [[nodiscard]] std::string_view ProjectionOperationName(
     const detail::NativeProjectionRpcRequest &request) noexcept {
-  static constexpr std::array<std::string_view, 11U> names{
+  static constexpr std::array<std::string_view, 10U> names{
       "prepare", "health", "transaction", "rebuild", "bootstrap-rebuild",
       "bootstrap-status", "retain", "release", "scene-frame",
-      "effective-policy", "provider-freshness",
+      "effective-policy",
   };
   static_assert(names.size() ==
                 std::variant_size_v<detail::NativeProjectionRpcRequest>);
@@ -369,47 +368,6 @@ void SetNonBlocking(const int fd) {
     result.push_back(kHex[byte & 0x0fU]);
   }
   return result;
-}
-
-[[nodiscard]] std::filesystem::path
-CaptureIsaacSiteSettings(const std::filesystem::path &run_root,
-                         const std::string_view document,
-                         const std::optional<std::chrono::steady_clock::time_point> deadline = std::nullopt) {
-  const auto check_deadline = [&] {
-    if (deadline && std::chrono::steady_clock::now() >= *deadline)
-      Fail("observer config capture exceeded the supplied scene startup budget");
-  };
-  check_deadline();
-  const auto path = run_root / ("isaac-site-settings-" + RandomHex() + ".yaml");
-  UniqueFd file(::open(path.c_str(),
-                       O_WRONLY | O_CREAT | O_EXCL | O_CLOEXEC | O_NOFOLLOW,
-                       S_IRUSR | S_IWUSR));
-  if (!file) {
-    Fail(ErrnoDetail("could not create Isaac site snapshot " + path.string(),
-                     errno));
-  }
-  std::size_t offset = 0U;
-  while (offset < document.size()) {
-    check_deadline();
-    const auto count = ::write(file.get(), document.data() + offset,
-                               document.size() - offset);
-    if (count < 0 && errno == EINTR) {
-      continue;
-    }
-    if (count <= 0) {
-      Fail(ErrnoDetail("could not write Isaac site snapshot " + path.string(),
-                       count == 0 ? EIO : errno));
-    }
-    offset += static_cast<std::size_t>(count);
-  }
-  if (::fchmod(file.get(), S_IRUSR | S_IWUSR) != 0) {
-    Fail(ErrnoDetail("could not set private Isaac site snapshot mode " +
-                         path.string(), errno));
-  }
-  check_deadline();
-  // Retain even a failed capture with the run's evidence; no later write or
-  // automatic cleanup can replace the bytes used by a successfully launched child.
-  return path;
 }
 
 [[nodiscard]] bool WaitForEvent(const int fd, const short events,
@@ -778,22 +736,16 @@ void KillAndReap(const pid_t pid) noexcept {
   }
 }
 
-void ConfirmExecOrThrow(const pid_t pid, const int error_fd,
-                        const std::chrono::milliseconds budget =
-                            std::chrono::duration_cast<std::chrono::milliseconds>(kExecTimeout),
-                        const std::optional<std::chrono::steady_clock::time_point> deadline = std::nullopt,
-                        const bool reap_on_failure = true) {
+void ConfirmExecOrThrow(const pid_t pid, const int error_fd) {
   pollfd descriptor{error_fd, POLLIN | POLLHUP, 0};
   int result = -1;
   do {
-    const auto poll_budget = deadline.has_value()
-        ? std::max(std::chrono::milliseconds::zero(), std::min(budget,
-              std::chrono::ceil<std::chrono::milliseconds>(*deadline - std::chrono::steady_clock::now())))
-        : budget;
-    result = ::poll(&descriptor, 1U, static_cast<int>(poll_budget.count()));
+    result = ::poll(&descriptor, 1U,
+                    static_cast<int>(std::chrono::duration_cast<std::chrono::milliseconds>(
+                                         kExecTimeout).count()));
   } while (result < 0 && errno == EINTR);
   if (result <= 0) {
-    if (reap_on_failure) KillAndReap(pid);
+    KillAndReap(pid);
     if (result == 0) {
       Fail("native execution target exec timed out");
     }
@@ -802,16 +754,12 @@ void ConfirmExecOrThrow(const pid_t pid, const int error_fd,
   int child_error = 0;
   ssize_t count = -1;
   do {
-    if (deadline.has_value() && std::chrono::steady_clock::now() >= *deadline) {
-      if (reap_on_failure) KillAndReap(pid);
-      Fail("native execution target exec status exceeded its supplied deadline");
-    }
     count = ::read(error_fd, &child_error, sizeof(child_error));
   } while (count < 0 && errno == EINTR);
   if (count == 0) {
     return;
   }
-  if (reap_on_failure) KillAndReap(pid);
+  KillAndReap(pid);
   if (count == static_cast<ssize_t>(sizeof(child_error))) {
     Fail(ErrnoDetail("native execution target exec failed", child_error));
   }
@@ -821,123 +769,6 @@ void ConfirmExecOrThrow(const pid_t pid, const int error_fd,
   Fail("native execution target returned a malformed exec status");
 }
 
-[[noreturn]] void EnterObserverConfigCheckChild(const pid_t parent, const int output_fd,
-                                               const int error_fd, const char *executable,
-                                               char *const argv[]) noexcept {
-  if (::prctl(PR_SET_PDEATHSIG, SIGTERM) != 0) ChildExit(error_fd, errno);
-  if (::getppid() != parent) ChildExit(error_fd, ECHILD);
-  const int output_copy = ::fcntl(output_fd, F_DUPFD_CLOEXEC, 4);
-  const int error_copy = ::fcntl(error_fd, F_DUPFD_CLOEXEC, 4);
-  if (output_copy < 0 || error_copy < 0 || ::dup3(output_copy, STDOUT_FILENO, 0) < 0 ||
-      ::dup3(error_copy, 3, O_CLOEXEC) < 0)
-    ChildExit(error_fd, errno);
-#ifdef SYS_close_range
-  const auto closed = ::syscall(SYS_close_range, 4U, UINT_MAX, 0U);
-  if (closed != 0 && errno != ENOSYS) ChildExit(3, errno);
-  if (closed != 0) {
-#endif
-    const long maximum = ::sysconf(_SC_OPEN_MAX);
-    const int upper = maximum > 0 && maximum < INT_MAX ? static_cast<int>(maximum) : 65536;
-    for (int fd = 4; fd < upper; ++fd) static_cast<void>(::close(fd));
-#ifdef SYS_close_range
-  }
-#endif
-  // The installed ROS console script is executed by pathname. Unlike the
-  // managed ELF target, it must not be fexecve'd through a CLOEXEC script FD.
-  ::execve(executable, argv, environ);
-  ChildExit(3, errno);
-}
-
-[[nodiscard]] std::string RunObserverConfigCheck(const std::filesystem::path &executable,
-                                                const std::filesystem::path &snapshot,
-                                                const std::chrono::steady_clock::time_point deadline) {
-  if (!executable.is_absolute() || executable.string().find('\0') != std::string::npos)
-    Fail("observer config check requires its installed absolute executable");
-  struct stat executable_status {};
-  if (::stat(executable.c_str(), &executable_status) != 0 || !S_ISREG(executable_status.st_mode) ||
-      ::access(executable.c_str(), X_OK) != 0)
-    Fail(ErrnoDetail("observer config check executable is unavailable", errno));
-  auto output = MakePipe();
-  auto exec_error = MakePipe();
-  SetNonBlocking(output[0].get());
-  std::array<std::string, 3U> arguments{executable.string(), "--check-config", snapshot.string()};
-  std::array<char *, 4U> argv{arguments[0].data(), arguments[1].data(), arguments[2].data(), nullptr};
-  const auto parent = ::getpid();
-  const auto pid = ::fork();
-  if (pid < 0) Fail(ErrnoDetail("observer config check fork failed", errno));
-  if (pid == 0)
-    EnterObserverConfigCheckChild(parent, output[1].get(), exec_error[1].get(),
-                                  arguments[0].c_str(), argv.data());
-  output[1].Reset();
-  exec_error[1].Reset();
-  bool reaped = false;
-  try {
-    const auto remaining = std::chrono::ceil<std::chrono::milliseconds>(deadline - std::chrono::steady_clock::now());
-    if (remaining <= std::chrono::milliseconds::zero())
-      Fail("observer config check exceeded the supplied scene startup budget before exec");
-    ConfirmExecOrThrow(pid, exec_error[0].get(), std::min(
-        remaining, std::chrono::duration_cast<std::chrono::milliseconds>(kExecTimeout)), deadline, false);
-    exec_error[0].Reset();
-    // The strict observer config has at most 128 bindings and 1024-byte text
-    // fields: worst-case JSON escaping is below 1,594,116 bytes. This capture
-    // bound therefore preserves every value the existing loader accepts.
-    constexpr std::size_t maximum_metadata = 2U * 1024U * 1024U;
-    std::string metadata;
-    std::array<char, 8192U> bytes{};
-    bool eof = false;
-    int status = 0;
-    const auto check_deadline = [&] {
-      if (std::chrono::steady_clock::now() >= deadline)
-        Fail("observer config check exceeded the supplied scene startup budget");
-    };
-    while (!eof || !reaped) {
-      check_deadline();
-      for (;;) {
-        check_deadline();
-        const auto count = ::read(output[0].get(), bytes.data(), bytes.size());
-        if (count > 0) {
-          if (metadata.size() + static_cast<std::size_t>(count) > maximum_metadata)
-            Fail("observer config check metadata exceeds its lossless capture bound");
-          metadata.append(bytes.data(), static_cast<std::size_t>(count));
-        } else if (count == 0) { eof = true; break; }
-        else if (errno == EINTR) continue;
-        else if (errno == EAGAIN || errno == EWOULDBLOCK) break;
-        else Fail(ErrnoDetail("observer config check stdout read failed", errno));
-      }
-      if (!reaped) {
-        pid_t waited;
-        do {
-          check_deadline();
-          waited = ::waitpid(pid, &status, WNOHANG);
-        } while (waited < 0 && errno == EINTR);
-        if (waited < 0) {
-          if (errno == ECHILD) reaped = true;
-          Fail(ErrnoDetail("observer config check wait failed", errno));
-        }
-        reaped = waited == pid;
-      }
-      check_deadline();
-      if (eof && reaped) break;
-      const auto remaining_time = deadline - std::chrono::steady_clock::now();
-      if (remaining_time <= std::chrono::steady_clock::duration::zero())
-        Fail("observer config check exceeded the supplied scene startup budget");
-      pollfd descriptor{eof ? -1 : output[0].get(), POLLIN | POLLHUP, 0};
-      const auto wait_ms = std::min<std::int64_t>(
-          10, std::chrono::ceil<std::chrono::milliseconds>(remaining_time).count());
-      const auto polled = ::poll(&descriptor, 1U, static_cast<int>(wait_ms));
-      if (polled < 0 && errno == EINTR) continue;
-      if (polled < 0) Fail(ErrnoDetail("observer config check stdout poll failed", errno));
-    }
-    check_deadline();
-    if (!WIFEXITED(status) || WEXITSTATUS(status) != 0)
-      Fail("observer config check refused configuration or exited abnormally (wait status " +
-           std::to_string(status) + ")");
-    return metadata;
-  } catch (...) {
-    if (!reaped) KillAndReap(pid);
-    throw;
-  }
-}
 
 } // namespace
 
@@ -1038,9 +869,7 @@ struct RetainedNativeRuntimeUnitAdapter::Impl final
        std::filesystem::path logical_scene_database,
        std::filesystem::path program_cycle_journal,
        std::filesystem::path activation_root,
-       std::filesystem::path scene_asset_root,
-       std::optional<std::string> isaac_site_settings_document,
-       std::optional<std::filesystem::path> isaac_pose_observer_executable)
+       std::filesystem::path scene_asset_root)
       : target_root_path(
             NormalizedPlainDirectory(std::move(trusted_installed_target_root),
                                      "trusted installed-target root")),
@@ -1052,8 +881,6 @@ struct RetainedNativeRuntimeUnitAdapter::Impl final
                 ? std::filesystem::path{}
                 : NormalizedPlainDirectory(std::move(activation_root),
                                            "candidate retained-package root")),
-        isaac_site_settings_document(std::move(isaac_site_settings_document)),
-        isaac_pose_observer_executable(std::move(isaac_pose_observer_executable)),
         scene_asset_root_path(
             scene_asset_root.empty()
                 ? std::filesystem::path{}
@@ -1075,11 +902,6 @@ struct RetainedNativeRuntimeUnitAdapter::Impl final
         launch_environment_contracts(
             std::move(selected_launch_environment_contracts)),
         observer_instance_id("native-observer-" + RandomHex()) {
-    if (this->isaac_site_settings_document.has_value()) {
-      if (this->isaac_site_settings_document->find('\0') != std::string::npos) {
-        Fail("Isaac site settings document cannot contain NUL");
-      }
-    }
     const std::array<const std::filesystem::path *, 4U> typed_roots{
         &manager_state_root_path, &manager_run_root_path,
         &execution_state_root_path, &execution_run_root_path};
@@ -1146,10 +968,6 @@ struct RetainedNativeRuntimeUnitAdapter::Impl final
     if (::fstat(target_root_fd.get(), &status) != 0 ||
         !S_ISDIR(status.st_mode)) {
       Fail("trusted installed-target root is not a directory");
-    }
-    if (this->isaac_site_settings_document.has_value()) {
-      isaac_site_settings_snapshot = CaptureIsaacSiteSettings(
-          manager_run_root_path, *this->isaac_site_settings_document);
     }
   }
 
@@ -2292,24 +2110,6 @@ struct RetainedNativeRuntimeUnitAdapter::Impl final
       arguments.emplace_back("--manyforge-managed-scene-asset-root-fd");
       arguments.push_back(std::to_string(kChildSceneAssetRootFd));
     }
-    if (isaac_site_settings_snapshot.has_value()) {
-      arguments.emplace_back("--manyforge-managed-isaac-site-settings");
-      arguments.push_back(isaac_site_settings_snapshot->string());
-    }
-    if (isaac_pose_observer_executable.has_value()) {
-      arguments.emplace_back("--manyforge-managed-isaac-pose-observer-executable");
-      arguments.push_back(isaac_pose_observer_executable->string());
-    }
-    if (isaac_pose_observer_startup_facts) {
-      const auto &facts = *isaac_pose_observer_startup_facts;
-      arguments.emplace_back("--manyforge-managed-isaac-observer-snapshot");
-      arguments.push_back(facts.retained_snapshot_path);
-      arguments.emplace_back("--manyforge-managed-isaac-observer-source-id");
-      arguments.push_back(manyforge::content_identity::canonical_json(
-          manyforge::content_identity::CanonicalValue(facts.source_id)));
-      arguments.emplace_back("--manyforge-managed-isaac-observer-epoch-base");
-      arguments.push_back(facts.source_epoch_base);
-    }
     std::vector<char *> argv;
     argv.reserve(arguments.size() + 1U);
     for (auto &argument : arguments) {
@@ -2571,10 +2371,6 @@ struct RetainedNativeRuntimeUnitAdapter::Impl final
   UniqueFd package_root_fd;
   std::filesystem::path activation_root_path;
   UniqueFd activation_root_fd;
-  std::optional<std::string> isaac_site_settings_document;
-  std::optional<std::filesystem::path> isaac_pose_observer_executable;
-  std::optional<std::filesystem::path> isaac_site_settings_snapshot;
-  std::optional<ManagerIsaacPoseObserverLaunchFactsDTO> isaac_pose_observer_startup_facts;
   std::filesystem::path scene_asset_root_path;
   UniqueFd scene_asset_root_fd;
   std::filesystem::path manager_state_root_path;
@@ -2618,47 +2414,6 @@ public:
         binding_, detail::NativeProjectionTransactionRequest{binding_, transaction});
     RequireHealth(result.resulting_health);
     return result;
-  }
-
-  manyforge::core::Result<void> ApplyProviderFreshness(
-      const manyforge::core::ProviderFreshnessConfirmationDTO &confirmation)
-      override {
-    const auto failed = [](std::string message) {
-      return manyforge::core::Result<void>::Err(manyforge::core::ErrorDTO{
-          "projection_state_uncertain",
-          std::move(message),
-          {{"reason", "native_projection_provider_freshness_failed"}}});
-    };
-    if (!confirmation.valid()) {
-      return manyforge::core::Result<void>::Err(manyforge::core::ErrorDTO{
-          "invariant_violation",
-          "native projection provider freshness confirmation is invalid",
-          {{"reason", "provider_freshness_invalid"}}});
-    }
-    // The result contract is Result<void>: a transport, codec or child
-    // failure is reported as an error, never as an applied confirmation.
-    try {
-      auto result = adapter_->ProjectionResultCall<
-          detail::NativeProjectionProviderFreshnessResult>(
-          binding_, detail::NativeProjectionProviderFreshnessRequest{
-                        binding_, confirmation});
-      if (!result.ok()) {
-        return manyforge::core::Result<void>::Err(result.error());
-      }
-      const auto &applied = result.value();
-      if (applied.projection_revision !=
-              confirmation.expected_projection_revision ||
-          applied.scene_resource_id != confirmation.scene_resource_id ||
-          applied.provider_source_sequence !=
-              confirmation.evidence.provider_source_sequence) {
-        return failed("native projection acknowledged a different provider "
-                      "freshness confirmation");
-      }
-      return manyforge::core::Result<void>::Ok();
-    } catch (const std::exception &error) {
-      return failed("native projection provider freshness failed: " +
-                    std::string(error.what()));
-    }
   }
 
   manyforge::core::Result<manyforge::core::CollisionWorldLeaseInventory>
@@ -2859,9 +2614,7 @@ RetainedNativeRuntimeUnitAdapter::RetainedNativeRuntimeUnitAdapter(
     std::filesystem::path logical_scene_database,
     std::filesystem::path program_cycle_journal,
     std::filesystem::path activation_root,
-    std::filesystem::path scene_asset_root,
-       std::optional<std::string> isaac_site_settings_document,
-       std::optional<std::filesystem::path> isaac_pose_observer_executable)
+    std::filesystem::path scene_asset_root)
     : RetainedNativeRuntimeUnitAdapter(
           std::move(trusted_installed_target_root),
           std::move(trusted_package_root), std::move(manager_state_root),
@@ -2870,9 +2623,7 @@ RetainedNativeRuntimeUnitAdapter::RetainedNativeRuntimeUnitAdapter(
           std::move(operating_system),
           std::vector<std::string>{std::move(launch_environment_contract)},
           std::move(logical_scene_database), std::move(program_cycle_journal),
-          std::move(activation_root), std::move(scene_asset_root),
-          std::move(isaac_site_settings_document),
-          std::move(isaac_pose_observer_executable)) {}
+          std::move(activation_root), std::move(scene_asset_root)) {}
 
 RetainedNativeRuntimeUnitAdapter::RetainedNativeRuntimeUnitAdapter(
     std::filesystem::path trusted_installed_target_root,
@@ -2889,9 +2640,7 @@ RetainedNativeRuntimeUnitAdapter::RetainedNativeRuntimeUnitAdapter(
     std::filesystem::path logical_scene_database,
     std::filesystem::path program_cycle_journal,
     std::filesystem::path activation_root,
-    std::filesystem::path scene_asset_root,
-       std::optional<std::string> isaac_site_settings_document,
-       std::optional<std::filesystem::path> isaac_pose_observer_executable)
+    std::filesystem::path scene_asset_root)
     : impl_(std::make_shared<Impl>(
           std::move(trusted_installed_target_root),
           std::move(trusted_package_root), std::move(manager_state_root),
@@ -2899,86 +2648,9 @@ RetainedNativeRuntimeUnitAdapter::RetainedNativeRuntimeUnitAdapter(
           std::move(execution_run_root), bundle_source, artifact_source,
           std::move(operating_system), std::move(launch_environment_contracts),
           std::move(logical_scene_database), std::move(program_cycle_journal),
-          std::move(activation_root), std::move(scene_asset_root),
-          std::move(isaac_site_settings_document),
-          std::move(isaac_pose_observer_executable))) {}
+          std::move(activation_root), std::move(scene_asset_root))) {}
 
 RetainedNativeRuntimeUnitAdapter::~RetainedNativeRuntimeUnitAdapter() = default;
-
-IsaacPoseObserverCheckedConfiguration
-RetainedNativeRuntimeUnitAdapter::CheckIsaacPoseObserverConfiguration(
-    const std::filesystem::path &config_path,
-    const double observer_configuration_timeout_s) {
-  const auto owner = impl_;  // Keep the existing process adapter/root alive while waiting.
-  if (!std::isfinite(observer_configuration_timeout_s) ||
-      observer_configuration_timeout_s <= 0.0)
-    Fail("observer config check requires the supplied positive budget");
-  const auto started = std::chrono::steady_clock::now();
-  const auto maximum = std::chrono::duration<double>(std::chrono::steady_clock::time_point::max() - started).count();
-  const auto deadline = observer_configuration_timeout_s >= maximum
-      ? std::chrono::steady_clock::time_point::max()
-      : started + std::chrono::duration_cast<std::chrono::steady_clock::duration>(
-          std::chrono::duration<double>(observer_configuration_timeout_s));
-  if (!owner->isaac_pose_observer_executable)
-    Fail("configured Isaac observer needs --isaac-pose-observer-executable");
-  const auto check_deadline = [&] {
-    if (std::chrono::steady_clock::now() >= deadline)
-      Fail("observer config capture exceeded the supplied budget");
-  };
-  check_deadline();
-  struct stat before {};
-  if (::lstat(config_path.c_str(), &before) != 0 || !S_ISREG(before.st_mode) ||
-      before.st_size <= 0 || before.st_size > 256 * 1024)
-    Fail("observer configuration source must be a bounded non-symlink regular file");
-  UniqueFd input(::open(config_path.c_str(), O_RDONLY | O_CLOEXEC | O_NONBLOCK | O_NOFOLLOW));
-  struct stat opened {};
-  if (!input || ::fstat(input.get(), &opened) != 0 || !S_ISREG(opened.st_mode) ||
-      opened.st_dev != before.st_dev || opened.st_ino != before.st_ino)
-    Fail("observer configuration source identity changed while opening");
-  std::string document;
-  std::array<char, 8192U> bytes{};
-  for (;;) {
-    check_deadline();
-    const auto count = ::read(input.get(), bytes.data(), bytes.size());
-    if (count == 0) break;
-    if (count < 0 && errno == EINTR) continue;
-    if (count < 0) Fail(ErrnoDetail("observer configuration snapshot read failed", errno));
-    // Same encoded input bound as the existing Python observer strict loader.
-    if (document.size() + static_cast<std::size_t>(count) > 256U * 1024U)
-      Fail("observer configuration exceeds the existing 256KiB input bound");
-    document.append(bytes.data(), static_cast<std::size_t>(count));
-    if (std::chrono::steady_clock::now() >= deadline)
-      Fail("observer config capture exceeded the supplied scene startup budget");
-  }
-  struct stat after {};
-  if (::fstat(input.get(), &after) != 0 ||
-      document.size() != static_cast<std::size_t>(before.st_size) ||
-      after.st_dev != before.st_dev || after.st_ino != before.st_ino ||
-      after.st_size != before.st_size ||
-      after.st_mtim.tv_sec != before.st_mtim.tv_sec ||
-      after.st_mtim.tv_nsec != before.st_mtim.tv_nsec ||
-      after.st_ctim.tv_sec != before.st_ctim.tv_sec ||
-      after.st_ctim.tv_nsec != before.st_ctim.tv_nsec)
-    Fail("observer configuration source changed while reading");
-  check_deadline();
-  input.Reset();
-  const auto snapshot = CaptureIsaacSiteSettings(owner->manager_run_root_path, document, deadline);
-  if (std::chrono::steady_clock::now() >= deadline)
-    Fail("observer config capture exceeded the supplied scene startup budget");
-  auto metadata = RunObserverConfigCheck(*owner->isaac_pose_observer_executable,
-                                         snapshot, deadline);
-  return {snapshot, std::move(metadata)};
-}
-
-
-void RetainedNativeRuntimeUnitAdapter::SetIsaacPoseObserverStartupLaunchFacts(
-    std::optional<ManagerIsaacPoseObserverLaunchFactsDTO> facts) {
-  if (facts && !facts->valid()) Fail("checked observer startup facts are invalid");
-  std::lock_guard lock(impl_->mutex);
-  if (!impl_->children.empty())
-    Fail("observer startup facts cannot overwrite an existing managed child");
-  impl_->isaac_pose_observer_startup_facts = std::move(facts);
-}
 
 ProcessPresenceObservation RetainedNativeRuntimeUnitAdapter::ObserveProcess(
     const RuntimeUnitConvergenceQueryDTO &query) {

@@ -323,12 +323,22 @@ bool LiveAdoptionMatches(const std::optional<ProductAdoptionRequest> &live, cons
   return actual != nullptr && *actual == request;
 }
 
+// Apply binds the candidate Deployment and the Scene identity only. The
+// target takes the Scene revision actually captured (the latest at Stage or
+// Begin); the request's revision is evidence of the moment of the request.
 template <typename Request>
 ProjectionRevisionDTO AdoptionTarget(
-    const Request &request) {
+    const Request &request, const core::SceneRevision &scene_revision) {
   return {request.candidate_retained_bundle.retained_bundle_id,
           request.candidate_retained_bundle.cell_graph.graph_revision,
-          request.expected_snapshot_identity.revision};
+          scene_revision};
+}
+
+[[nodiscard]] bool SameSnapshotScene(
+    const core::LogicalSceneSnapshotIdentityDTO &left,
+    const core::LogicalSceneSnapshotIdentityDTO &right) noexcept {
+  return left.cell_id == right.cell_id &&
+         left.revision.scene_id == right.revision.scene_id;
 }
 
 template <typename Request>
@@ -360,9 +370,12 @@ void ValidateAdoptionRequest(const Request &request,
               "predecessor_graph") ||
       invalid(request.candidate_retained_bundle.cell_graph.cell_id != cell_id,
               "candidate_cell") ||
-      invalid(!AdoptionTarget(request).valid(), "target_projection") ||
+      invalid(!AdoptionTarget(request, request.expected_snapshot_identity.revision).valid(),
+              "target_projection") ||
       invalid(std::is_same_v<Request, QualifiedSceneProductAdoptionRequest> &&
-                  AdoptionTarget(request) == request.expected_active_projection_revision,
+                  core::SameActiveDeployment(
+                      AdoptionTarget(request, request.expected_snapshot_identity.revision),
+                      request.expected_active_projection_revision),
               "legacy_projection_unchanged") ||
       invalid(request.native_runtime_bindings.size() > kMaximumNativeProjectionBindings,
               "native_bindings_limit")) {
@@ -483,15 +496,19 @@ void RequireAdoptionCurrentScene(
     const DurableState &state,
     const Request &request,
     const bool completed = false) {
+  // Identity only: the current Scene may have moved on since the request.
+  const auto expected =
+      completed ? AdoptionTarget(request, request.expected_snapshot_identity.revision)
+                : request.expected_active_projection_revision;
   if (state.projection_desynchronized || state.unresolved_scene_transaction ||
       state.legacy_native_effects_uncertain ||
       !state.active_projection.has_value() ||
-      *state.active_projection != (completed ? AdoptionTarget(request)
-                                            : request.expected_active_projection_revision) ||
+      !core::SameProjectionIdentity(*state.active_projection, expected) ||
       !state.active_scene_snapshot.has_value() ||
-      state.active_scene_snapshot->identity() != request.expected_snapshot_identity) {
+      !SameSnapshotScene(state.active_scene_snapshot->identity(),
+                         request.expected_snapshot_identity)) {
     throw LogicalSceneOwnerConflictError(
-        "qualified Scene adoption requires the exact synchronized current Scene");
+        "qualified Scene adoption requires the same synchronized current Scene");
   }
 }
 
@@ -499,9 +516,10 @@ template <typename Request>
 void RequireAdoptionRow(
     const MaintenanceInitializationState &row,
     const Request &request) {
-  if (row.predecessor != request.expected_active_projection_revision ||
-      row.target != AdoptionTarget(request) ||
-      row.authoritative_snapshot.identity() != request.expected_snapshot_identity ||
+  if (!core::SameProjectionIdentity(row.predecessor, request.expected_active_projection_revision) ||
+      !core::SameProjectionIdentity(
+          row.target, AdoptionTarget(request, request.expected_snapshot_identity.revision)) ||
+      !SameSnapshotScene(row.authoritative_snapshot.identity(), request.expected_snapshot_identity) ||
       row.bindings != request.native_runtime_bindings ||
       row.initial_baseline_request_digest.has_value() ||
       row.repaired_transaction_sequence.has_value()) {
@@ -603,8 +621,10 @@ LogicalSceneOwner::OriginalManagerProductAdoptionProjectionHealthImpl(
     throw LogicalSceneOwnerConflictError(
         "candidate projection staging has no open original Scene window");
   }
+  // Stage from the latest Scene. A later commit does not invalidate staging:
+  // Begin brings the candidate projections forward to the Scene it captures.
   const auto snapshot = std::make_shared<const LogicalSceneSnapshotDTO>(*state.active_scene_snapshot);
-  const auto target = AdoptionTarget(request);
+  const auto target = AdoptionTarget(request, snapshot->revision);
   lock.unlock();
 
   // Registry preparation already owns each uninitialized candidate model and
@@ -618,11 +638,11 @@ LogicalSceneOwner::OriginalManagerProductAdoptionProjectionHealthImpl(
     auto observed = projection.preflight_health;
     if (observed.native_runtime_binding != binding ||
         (observed.state == ProjectionHealthState::kHealthy &&
-         !observed.healthy_for_target(target))) {
+         !observed.healthy_for_identity(target))) {
       throw LogicalSceneOwnerConflictError(
           "candidate projection staging requires its exact binding and target");
     }
-    if (stage && !observed.healthy_for_target(target)) {
+    if (stage && !observed.healthy_for_identity(target)) {
       const core::NativeProjectionRebuildDTO rebuild{
           binding, target,
           request.candidate_retained_bundle.compiled_products.planning_collision_model,
@@ -656,9 +676,9 @@ LogicalSceneOwner::OriginalManagerProductAdoptionProjectionHealthImpl(
   lock.lock();
   const auto current = impl_->ReadStateTransaction();
   RequireAdoptionCurrentScene(current, request);
-  if (*current.active_scene_snapshot != *snapshot || !AccessStatus(current).scene_writes_open) {
+  if (!AccessStatus(current).scene_writes_open) {
     throw LogicalSceneOwnerConflictError(
-        "logical Scene changed while staging candidate projections");
+        "logical Scene closed while staging candidate projections");
   }
   return health;
 }
@@ -727,13 +747,12 @@ LogicalSceneOwner::BeginQualifiedProductAdoptionImpl(
     throw LogicalSceneOwnerConflictError(
         "qualified Scene adoption cannot enter this maintenance window");
   }
-  const auto snapshot = *state.active_scene_snapshot;
-  const auto target = AdoptionTarget(request);
+  const auto staged_target = AdoptionTarget(request, state.active_scene_snapshot->revision);
   lock.unlock();
   for (const auto &binding : request.native_runtime_bindings) {
     const auto projection = ResolveRequiredProjection(
-            binding, impl_->projection_resolver_, target);
-    if (!projection.preflight_health.healthy_for_target(target)) {
+            binding, impl_->projection_resolver_, staged_target);
+    if (!projection.preflight_health.healthy_for_identity(staged_target)) {
       throw LogicalSceneOwnerConflictError(
           "qualified Scene adoption requires already healthy candidate projections");
     }
@@ -747,10 +766,6 @@ LogicalSceneOwner::BeginQualifiedProductAdoptionImpl(
   impl_->InvalidateSceneCommitState();
   state = impl_->ReadStateTransaction();
   RequireAdoptionCurrentScene(state, request);
-  if (*state.active_scene_snapshot != snapshot) {
-    throw LogicalSceneOwnerConflictError(
-        "qualified Scene adoption snapshot changed before capture");
-  }
   found = find_operation(state);
   if (found != state.maintenance_initializations.end()) {
     RequireAdoptionRow(*found, request);
@@ -760,6 +775,11 @@ LogicalSceneOwner::BeginQualifiedProductAdoptionImpl(
     throw LogicalSceneOwnerConflictError(
         "qualified Scene adoption lost its maintenance window");
   }
+  // Capture the latest Scene. Writes close with this row, so it stays the
+  // adopted Scene until completion.
+  const auto snapshot = *state.active_scene_snapshot;
+  const auto predecessor = *state.active_projection;
+  const auto target = AdoptionTarget(request, snapshot.revision);
 
   // Capture the original request before the durable boundary. Even a lost
   // commit response cannot let an ordinary call complete this private row.
@@ -784,7 +804,7 @@ LogicalSceneOwner::BeginQualifiedProductAdoptionImpl(
     insert.Bind(1, CheckedSafeCounter(sequence, "initialization sequence"));
     insert.Bind(2, owner.apply_id.value());
     insert.Bind(3, CheckedSafeCounter(owner.apply_generation.value(), "Apply generation"));
-    BindProjection(insert, 4, request.expected_active_projection_revision);
+    BindProjection(insert, 4, predecessor);
     BindProjection(insert, 9, target);
     insert.Bind(14, logical_scene_codec_internal::EncodeSnapshot(snapshot));
     insert.Bind(15, static_cast<std::int64_t>(request.native_runtime_bindings.size()));
@@ -823,10 +843,38 @@ LogicalSceneOwner::BeginQualifiedProductAdoptionImpl(
   }
   const auto captured = impl_->ReadStateTransaction();
   const auto result = MaintenanceStatus(*captured.LatestMaintenanceInitialization());
+  lock.unlock();
+  // Candidate projections staged at an earlier revision of this Scene move to
+  // the captured one in place. A failure here is uncertainty, not rollback.
+  const auto latest = std::make_shared<const LogicalSceneSnapshotDTO>(snapshot);
+  for (const auto &binding : request.native_runtime_bindings) {
+    const auto projection = ResolveRequiredProjection(
+        binding, impl_->projection_resolver_, target);
+    const auto &health = projection.preflight_health;
+    if (health.healthy_for_target(target)) {
+      continue;
+    }
+    if (!health.healthy_for_identity(target)) {
+      throw LogicalSceneOwnerConflictError(
+          "qualified Scene adoption lost a healthy candidate projection");
+    }
+    const auto rebuilt = projection.projection->RebuildProjection(
+        {binding, target,
+         request.candidate_retained_bundle.compiled_products.planning_collision_model,
+         latest, std::pair{owner.apply_id, owner.apply_generation},
+         *health.active_projection_revision});
+    if (!rebuilt.presence_valid() ||
+        rebuilt.result != core::ProjectionCommitResultStateDTO::kCommitted ||
+        rebuilt.acknowledged_projection_revision != target ||
+        !rebuilt.resulting_health.healthy_for_target(target)) {
+      const auto detail = rebuilt.error.has_value() ? ": " + rebuilt.error->message : std::string{};
+      throw LogicalSceneOwnerConflictError(
+          "candidate native projection did not adopt the captured Scene" + detail);
+    }
+  }
   if (original_parent_fence != nullptr) {
     // A lost/changed remote response after commit is uncertainty, not rollback.
     // Keep the original continuation and durable row for observation only.
-    lock.unlock();
     RequireHeldAdoptionParent(request, impl_->cell_admission_, nullptr, original_parent_fence);
     RequireCurrentPublication(impl_->publication_reader_, request.expected_predecessor_publication);
   }
@@ -863,7 +911,6 @@ LogicalSceneOwner::BeginMaintenanceInitialization(
 
   std::unique_lock lock(impl_->mutex_);
   impl_->InvalidateSceneCommitState();
-  impl_->provider_freshness_records_.clear();
   auto *database = impl_->database();
   auto state = impl_->ReadStateTransaction();
   auto found = std::find_if(
@@ -1369,7 +1416,8 @@ LogicalSceneOwner::CompleteQualifiedProductAdoption(
   }
   const auto &owner = AdoptionOwner(request);
   return CompleteMaintenanceInitializationImpl(
-      {owner.apply_id, owner.apply_generation, AdoptionTarget(request),
+      {owner.apply_id, owner.apply_generation,
+       AdoptionTarget(request, request.expected_snapshot_identity.revision),
        request.expected_snapshot_identity, publication}, &request, &held_fence, nullptr);
 }
 
@@ -1386,7 +1434,8 @@ LogicalSceneOwner::CompleteOriginalManagerProductAdoption(
   }
   const auto &owner = AdoptionOwner(request);
   return CompleteMaintenanceInitializationImpl(
-      {owner.apply_id, owner.apply_generation, AdoptionTarget(request),
+      {owner.apply_id, owner.apply_generation,
+       AdoptionTarget(request, request.expected_snapshot_identity.revision),
        request.expected_snapshot_identity, publication}, &request, nullptr, &original_parent_fence);
 }
 
@@ -1403,7 +1452,8 @@ LogicalSceneOwner::CompleteOriginalManagerConfigurationAdoption(
   }
   const auto &owner = AdoptionOwner(request);
   return CompleteMaintenanceInitializationImpl(
-      {owner.apply_id, owner.apply_generation, AdoptionTarget(request),
+      {owner.apply_id, owner.apply_generation,
+       AdoptionTarget(request, request.expected_snapshot_identity.revision),
        request.expected_snapshot_identity, publication}, &request, nullptr, &original_parent_fence);
 }
 
@@ -1425,7 +1475,6 @@ LogicalSceneOwner::CompleteMaintenanceInitializationImpl(
   }
   std::unique_lock lock(impl_->mutex_);
   impl_->InvalidateSceneCommitState();
-  impl_->provider_freshness_records_.clear();
   auto *database = impl_->database();
   auto state = impl_->ReadStateTransaction();
   auto found = std::find_if(
@@ -1435,9 +1484,10 @@ LogicalSceneOwner::CompleteMaintenanceInitializationImpl(
                value.apply_generation == completion.apply_generation;
       });
   if (found == state.maintenance_initializations.end() ||
-      found->target != completion.target_projection_revision ||
-      found->authoritative_snapshot.identity() !=
-          completion.authoritative_snapshot_identity) {
+      !core::SameProjectionIdentity(found->target,
+                                    completion.target_projection_revision) ||
+      !SameSnapshotScene(found->authoritative_snapshot.identity(),
+                         completion.authoritative_snapshot_identity)) {
     throw LogicalSceneOwnerConflictError(
         "maintenance completion has no exact initialized Scene operation");
   }
@@ -1457,7 +1507,8 @@ LogicalSceneOwner::CompleteMaintenanceInitializationImpl(
         "private Scene adoption requires its still-held parent completion");
   }
   if (found->publication_receipt.has_value()) {
-    if (*found->publication_receipt != completion.publication_receipt) {
+    if (!core::SamePublicationIdentity(*found->publication_receipt,
+                                       completion.publication_receipt)) {
       throw LogicalSceneOwnerConflictError(
           "maintenance completion replay changed the publication receipt");
     }
@@ -1520,7 +1571,8 @@ LogicalSceneOwner::CompleteMaintenanceInitializationImpl(
     }
   }
   if (found->publication_receipt.has_value()) {
-    if (*found->publication_receipt != completion.publication_receipt) {
+    if (!core::SamePublicationIdentity(*found->publication_receipt,
+                                       completion.publication_receipt)) {
       throw LogicalSceneOwnerConflictError(
           "maintenance completion replay changed the publication receipt");
     }

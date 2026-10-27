@@ -8,11 +8,6 @@ export function statusFixture(ownerEpoch = 'execution-owner-1'): ExecutionOwnerS
     activePublicationGeneration: 1,
     graphRevision: 'sha256:graph',
     retainedBundleId: 'sha256:bundle',
-    sceneRevision: {
-      scene_id: 'scene-1',
-      revision_id: 3,
-      content_hash: 'sha256:scene',
-    },
     directControl: {
       controllableComponentId: 'robot-a',
       commandTargetId: 'arm',
@@ -218,7 +213,7 @@ export function receiptFixture(
     programRunId: status.directControl!.programRunId,
     graphRevision: status.graphRevision,
     retainedBundleId: status.retainedBundleId,
-    sceneRevision: { ...status.sceneRevision },
+    sceneRevision: { scene_id: 'scene-1', revision_id: 3, content_hash: 'sha256:scene' },
     componentRoleId: status.directControl!.componentRoleId,
     targetRoleId: status.directControl!.targetRoleId,
     requiredCapabilityId: status.directControl!.operationCapabilityId,
@@ -303,7 +298,6 @@ export function gripperReceiptFixture(
     programRunId: gripper.programRunId,
     graphRevision: status.graphRevision,
     retainedBundleId: status.retainedBundleId,
-    sceneRevision: { ...status.sceneRevision },
     componentRoleId: gripper.componentRoleId,
     targetRoleId: gripper.targetRoleId,
     requiredCapabilityId: gripper.operationCapabilityId,

@@ -1001,7 +1001,7 @@ def _direct_control_joint_operation(
         "program_run_id": manual_control["program_run_id"],
         "expected_graph_revision": identity["graph_revision"],
         "expected_retained_bundle_id": identity["retained_bundle_id"],
-        "expected_scene_revision": identity["scene_revision"],
+        "expected_scene_revision": None,
         "participants": [
             {
                 "component_role_id": command["component_role_id"],
@@ -1064,7 +1064,7 @@ def _direct_control_gripper_operation(
         "program_run_id": manual_control["program_run_id"],
         "expected_graph_revision": identity["graph_revision"],
         "expected_retained_bundle_id": identity["retained_bundle_id"],
-        "expected_scene_revision": identity["scene_revision"],
+        "expected_scene_revision": None,
         "participants": [
             {
                 "component_role_id": direct["component_role_id"],
@@ -1301,7 +1301,6 @@ def test_arm_only_native_process_publishes_component_based_status(
             "graph_revision",
             "owner_epoch",
             "retained_bundle_id",
-            "scene_revision",
             "schema_version",
         }
         assert targets["schema_version"] == "manyforge.execution_targets.v3"
@@ -1615,7 +1614,6 @@ def test_reconciliation_gate_does_not_block_ordinary_accept_or_exact_read(
             "graph_revision",
             "owner_epoch",
             "retained_bundle_id",
-            "scene_revision",
             "schema_version",
         }
         assert identity["identity"]["control_management_mode"] == (
@@ -3085,29 +3083,6 @@ def test_native_manual_preview_control_and_restart_contracts(tmp_path: Path) -> 
             after_preview_status, presentation="motion"
         )
         assert after_preview_arm["positions_rad"] == before_preview_state
-
-        stale_scene_intent = copy.deepcopy(direct_intent)
-        stale_scene_intent["request_context"][
-            "request_id"
-        ] = "composer-direct-stale-scene"
-        stale_scene_intent["expected_scene_revision"]["revision_id"] += 1
-        with pytest.raises(HeadlessClientError) as stale_scene:
-            composer.preview_motion(stale_scene_intent)
-        assert stale_scene.value.code == "scene_changed_during_validation"
-        # The host accepts an earlier revision of the same Scene (a status read
-        # that lags a scene edit or a before-planning latch) but never another
-        # Scene lineage. This standalone fixture has no Scene owner, so the
-        # earlier-revision acceptance is covered where a Scene can advance.
-        other_scene_intent = copy.deepcopy(direct_intent)
-        other_scene_intent["request_context"][
-            "request_id"
-        ] = "composer-direct-other-scene"
-        other_scene_intent["expected_scene_revision"]["scene_id"] = (
-            "sha256:" + "0" * 64
-        )
-        with pytest.raises(HeadlessClientError) as other_scene:
-            composer.preview_motion(other_scene_intent)
-        assert other_scene.value.code == "scene_changed_during_validation"
 
         direct_accepted = composer.execute(direct_intent)
         direct_operation_id = direct_accepted["accepted"]["operation_id"]

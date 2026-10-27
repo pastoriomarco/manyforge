@@ -8,12 +8,12 @@
   "description": "R5 trial (c): per-group failure hold. An unreachable move (1 automatic retry) holds for intervention in arm_group (intervention_stop_scope own_groups). Retry re-runs it; Continue fails the node so the Fallback takes the reachable alternative.",
   "members": {
     "assignment.yaml": "sha256:f4dd3bfffcc14e0cb446f820e79e2405f4477ecbc470ca9fdc127dce17086e06",
-    "deployment.yaml": "sha256:fae26670e4448800d823a9804399a844b4e8f255dd7af58f9860e2aad426e039",
+    "deployment.yaml": "sha256:180af7bcc7be010bc3fbd5e8c2d56b8e4bd3464b5f05eee574010c52071db1c4",
     "program.yaml": "sha256:597cbee2f6c7c116f0510ebc096f27eff3deffb862b05463b471133ec3589ad5"
   },
   "name": "r5_trial_c_hold",
   "saved_status": {
-    "checked_content_digest": "sha256:87b32e239d7c24cf44fcfb7073399e83f1675fcb42119816696a0d2dfd9f49c6",
+    "checked_content_digest": "sha256:c347b5113799d172d05688f9525cb4da2f92b0157edee290c4241c8244446d9c",
     "last_known_status": "unknown",
     "manyforge_version": "0.1.0"
   },

@@ -10,7 +10,18 @@
 
 namespace manyforge::deployment::detail {
 
-enum class ActivationRuntimeKind { kRos2Control = 1, kIoProvider = 2 };
+enum class ActivationRuntimeKind {
+  kRos2Control = 1,
+  kIoProvider = 2,
+  kPoseSource = 3
+};
+
+/// I/O devices and pose sources select no model and no physical type.
+[[nodiscard]] constexpr bool
+is_model_free_runtime_kind(ActivationRuntimeKind kind) noexcept {
+  return kind == ActivationRuntimeKind::kIoProvider ||
+         kind == ActivationRuntimeKind::kPoseSource;
+}
 
 /// Exact repository-owned semantics selected by one authored component.
 ///
@@ -20,8 +31,9 @@ enum class ActivationRuntimeKind { kRos2Control = 1, kIoProvider = 2 };
 struct ActivationComponentProfile final {
   std::string component_id;
   std::string component_profile_id;
-  // Model identity fields are empty and model_family is null for kIoProvider;
-  // that explicit kind never selects a model or physical component type.
+  // Model identity fields are empty and model_family is null for model-free
+  // kinds (kIoProvider, kPoseSource); they never select a model or physical
+  // component type.
   std::string model_family_id;
   std::string model_asset_id;
   std::string accepted_package_uri_prefix;

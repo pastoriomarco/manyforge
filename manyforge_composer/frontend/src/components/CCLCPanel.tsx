@@ -15,6 +15,7 @@ import {
   componentReadinessOccurrencePresentation,
   readinessErrorPresentation,
 } from '../state/componentLifecyclePresentation';
+import { componentStreamHealthPresentation } from '../state/componentStreamHealthPresentation';
 
 const ACTIONS: Array<{
   intent: CCLCLifecycleIntent;
@@ -81,6 +82,7 @@ function ComponentLifecycleSummary({ snapshot }: { snapshot: CCLCComponentSnapsh
       .filter((text): text is string => text !== null);
   });
   const measured = readinessErrorPresentation(snapshot.readiness.measuredState.error);
+  const streams = componentStreamHealthPresentation(snapshot);
   return (
     <div className="cclc-lifecycle-summary" role="status" aria-label="Component lifecycle status">
       <div className="cclc-verdict">
@@ -98,6 +100,17 @@ function ComponentLifecycleSummary({ snapshot }: { snapshot: CCLCComponentSnapsh
         <dt>Requested target</dt><dd>{presentation.target}</dd>
         <dt>Readiness</dt><dd>{presentation.readiness}</dd>
       </dl>
+      {streams !== null && (
+        <details className="cclc-details" aria-label="Component stream health">
+          <summary>
+            <span className={`component-dot ${streams.dotClass}`} aria-hidden="true" />
+            {' '}Streams · {streams.summary}
+          </summary>
+          <ul className="cclc-fact-list">
+            {streams.streams.map((stream) => <li key={stream.streamId}>{stream.line}</li>)}
+          </ul>
+        </details>
+      )}
       <details className="cclc-details">
         <summary>Provider occurrences and owner facts</summary>
         {snapshot.readiness.providerOccurrences.map((domain) => {
@@ -239,6 +252,7 @@ export function CCLCPanelView({
             const current = controller.componentHealth?.[id];
             const rowSnapshot = id === controllableComponentId && snapshot !== null ? snapshot : current?.snapshot ?? null;
             const presentation = rowSnapshot === null ? null : componentLifecyclePresentation(rowSnapshot);
+            const streams = rowSnapshot === null ? null : componentStreamHealthPresentation(rowSnapshot);
             const selected = id === controllableComponentId;
             return (
               <li key={id}>
@@ -253,6 +267,13 @@ export function CCLCPanelView({
                   <span className="muted cclc-row-message">
                     {presentation?.message ?? current?.error ?? 'Current component health has not been read.'}
                   </span>
+                  {streams !== null && (
+                    <span className="muted cclc-row-streams"
+                      title={streams.streams.map((stream) => stream.line).join('\n')}>
+                      <span className={`component-dot ${streams.dotClass}`} aria-hidden="true" />
+                      {' '}{streams.summary}
+                    </span>
+                  )}
                 </button>
               </li>
             );
@@ -280,6 +301,17 @@ export function CCLCPanelView({
                 label: 'Activate component?', detail: 'Prepare if required, then Enable this component to Active.' })}>
               Activate
             </button>
+            {componentStreamHealthPresentation(snapshot)?.recoverOffered === true && (
+              <button type="button"
+                disabled={!enabled || busy}
+                title={!enabled ? 'CCLC owner is unavailable.'
+                  : busy ? 'Another lifecycle request is being read or submitted.'
+                    : 'Acknowledge the latched stream so the component can move again.'}
+                onClick={() => setConfirmation({ kind: 'lifecycle', intent: 'recover', label: 'Recover component?',
+                  detail: 'Acknowledge the stream that needs acknowledgement. Nothing moves.' })}>
+                Recover
+              </button>
+            )}
             {ACTIONS.map((action) => {
               const reason = !enabled
                 ? 'CCLC owner is unavailable.'

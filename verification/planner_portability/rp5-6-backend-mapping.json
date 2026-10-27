@@ -220,16 +220,16 @@
       "reference": "manyforge_core/test/test_execution_kernel.cpp::Execute_RelativeMove_ResolvesToPoseGoalBeforePlanning"
     },
     {
-      "requirement": "exact_revision_cache_hit_revalidates",
+      "requirement": "cache_hit_revalidates",
       "reference": "manyforge_core/test/test_execution_kernel.cpp::Execute_CacheHit_SkipsPlanning"
     },
     {
-      "requirement": "older_revision_candidate_revalidates_current_snapshot",
-      "reference": "manyforge_core/test/test_execution_kernel.cpp::Execute_CrossRevisionCacheCandidateRevalidatesWithoutPlanning"
+      "requirement": "cache_hit_revalidates_against_latest_scene",
+      "reference": "manyforge_core/test/test_execution_kernel.cpp::Execute_CachedTrajectoryRevalidatesAgainstChangedSceneWithoutPlanning"
     },
     {
       "requirement": "failed_revalidation_forces_planning",
-      "reference": "manyforge_core/test/test_execution_kernel.cpp::Execute_FailedCrossRevisionCacheCandidateInvalidatesAndReplansOnce"
+      "reference": "manyforge_core/test/test_execution_kernel.cpp::Execute_FailedCachedTrajectoryInvalidatesAndReplansOnce"
     },
     {
       "requirement": "intent_change_forces_planning",

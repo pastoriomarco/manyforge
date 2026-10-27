@@ -1707,14 +1707,6 @@ struct ActiveOperationParticipant final {
   /// Q58: a Stop that did not wait for this command's still-returning dispatch
   /// leaves its exact local settlement here; the dispatch return performs it.
   std::optional<AddressedParticipantStopSettlementRequestDTO> deferred_stop_settlement{};
-  /// The degraded-Stop error (item 25) exactly as the settling Stop recorded
-  /// it, with that Stop's scope key. Settled-Stop proof reuse accepts this
-  /// one terminal error, from that one Stop, as settled containment.
-  struct DegradedStopTerminal final {
-    StopScopeEntryKeyDTO key;
-    ErrorDTO error;
-  };
-  std::optional<DegradedStopTerminal> degraded_stop_terminal{};
   /// Q60: a Stop that closed without waiting for this never-dispatched
   /// participant's prepared cancellation to return leaves its exact local
   /// settlement here. The cancellation's own terminal hands it to the Stop

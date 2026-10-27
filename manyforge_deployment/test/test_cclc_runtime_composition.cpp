@@ -369,33 +369,6 @@ controller_sources(const RetainedBundle &bundle) {
   return result;
 }
 
-[[nodiscard]] core::CellObserverIncidentRecordDTO
-ObserverLossRecord(const core::CellId &cell_id) {
-  using manyforge::content_identity::CanonicalValue;
-  const core::CellObserverIncidentTargetDTO target{cell_id, "observer.source", "manager-observer"};
-  return {"observer." + std::string(64U, 'a'), target, 0, "observer exited with signal 11",
-          CanonicalValue(CanonicalValue::Object{
-              {"exit", CanonicalValue(CanonicalValue::Object{
-                           {"status", CanonicalValue(nullptr)},
-                           {"signal", CanonicalValue(11.0)},
-                           {"core_dumped", CanonicalValue(false)},
-                           {"observed_utc", CanonicalValue("2026-10-12T14:00:00Z")}})},
-              {"context", CanonicalValue(CanonicalValue::Object{
-                              {"cell_id", CanonicalValue(target.cell_id.value())},
-                              {"source_id", CanonicalValue(target.source_id)},
-                              {"source_epoch_base", CanonicalValue(target.source_epoch_base)}})},
-              {"settings", CanonicalValue(CanonicalValue::Object{})},
-              {"generated", CanonicalValue(CanonicalValue::Object{})},
-              {"output", CanonicalValue(CanonicalValue::Object{
-                             {"tail", CanonicalValue("fatal observer\n")},
-                             {"line_count", CanonicalValue(1.0)},
-                             {"truncated", CanonicalValue(false)},
-                             {"dropped_forward_lines", CanonicalValue(0.0)},
-                             {"dropped_forward_bytes", CanonicalValue(0.0)},
-                             {"invalid_text_bytes", CanonicalValue(0.0)}})},
-              {"core_dump_link", CanonicalValue(nullptr)}})};
-}
-
 [[nodiscard]] std::string Exchange(const std::filesystem::path &socket_path,
                                    const std::string &request) {
   const int descriptor = ::socket(AF_UNIX, SOCK_SEQPACKET | SOCK_CLOEXEC, 0);
@@ -643,32 +616,7 @@ TEST(CCLCRuntimeComposition,
       scheduler);
   ASSERT_TRUE(composition.ok()) << composition.error().message;
   EXPECT_FALSE(composition.value()->coordinator().accepting_new_requests());
-  const auto observer = ObserverLossRecord(config.cell_id);
-  ASSERT_TRUE(observer.locally_valid());
-  const auto unstarted_owner = composition.value()->coordinator().request_owner_epoch();
-  const auto absent_observer = composition.value()->LoadOpenCellObserverIncident();
-  ASSERT_TRUE(absent_observer.ok()) << absent_observer.error().message;
-  EXPECT_FALSE(absent_observer.value());
-  const auto stored_observer = composition.value()->RecordCellObserverIncident(observer);
-  ASSERT_TRUE(stored_observer.ok()) << stored_observer.error().message;
-  EXPECT_EQ(stored_observer.value(), observer);
-  const auto open_observer = composition.value()->LoadOpenCellObserverIncident();
-  ASSERT_TRUE(open_observer.ok()) << open_observer.error().message;
-  ASSERT_TRUE(open_observer.value());
-  EXPECT_EQ(*open_observer.value(), stored_observer.value());
-  EXPECT_EQ(composition.value()->coordinator().request_owner_epoch(), unstarted_owner);
-  EXPECT_FALSE(composition.value()->coordinator().accepting_new_requests());
   EXPECT_FALSE(composition.value()->coordinator().admission_fault_closed());
-  auto conflicting_observer = observer;
-  conflicting_observer.summary = "conflicting exit evidence for the same occurrence";
-  const auto observer_conflict =
-      composition.value()->RecordCellObserverIncident(conflicting_observer);
-  ASSERT_FALSE(observer_conflict.ok());
-  EXPECT_EQ(observer_conflict.error().code, "component_lifecycle_incident_conflict");
-  const auto before_start_observer = composition.value()->LoadOpenCellObserverIncident();
-  ASSERT_TRUE(before_start_observer.ok());
-  ASSERT_TRUE(before_start_observer.value());
-  EXPECT_EQ(*before_start_observer.value(), stored_observer.value());
   const auto run_root = root.path() / "run";
   EXPECT_FALSE(std::filesystem::exists(
       run_root / std::string(kCCLCOpenRequestSocketFilename)));
@@ -762,13 +710,6 @@ TEST(CCLCRuntimeComposition,
   EXPECT_EQ(after_stop.value()->rejection, rejection);
   EXPECT_FALSE(after_stop.value()->acceptance);
   EXPECT_FALSE(after_stop.value()->status);
-  const auto stopped_open_observer = composition.value()->LoadOpenCellObserverIncident();
-  ASSERT_TRUE(stopped_open_observer.ok()) << stopped_open_observer.error().message;
-  ASSERT_TRUE(stopped_open_observer.value());
-  EXPECT_EQ(*stopped_open_observer.value(), stored_observer.value());
-  const auto retained_observer = composition.value()->RecordCellObserverIncident(observer);
-  ASSERT_TRUE(retained_observer.ok()) << retained_observer.error().message;
-  EXPECT_EQ(retained_observer.value(), stored_observer.value());
   EXPECT_EQ(composition.value()->coordinator().request_owner_epoch(), first_owner);
   EXPECT_TRUE(composition.value()->coordinator().accepting_new_requests());
   EXPECT_FALSE(composition.value()->coordinator().admission_fault_closed());
@@ -1303,7 +1244,6 @@ TEST(CCLCRuntimeComposition, ExchangesVerifiedNonemptyToEmptyOnSameFacadeAndReta
   }
   EXPECT_EQ(composition.value()->coordinator().request_owner_epoch(), owner);
   EXPECT_TRUE(composition.value()->coordinator().accepting_new_requests());
-  EXPECT_TRUE(composition.value()->LoadOpenCellObserverIncident().ok());
   EXPECT_EQ(composition.value()->open_request_socket_path(), socket_path);
   struct stat socket_after {};
   ASSERT_EQ(::stat(socket_path.c_str(), &socket_after), 0);
@@ -1435,8 +1375,6 @@ TEST(CCLCRuntimeComposition,
   ASSERT_TRUE(replay.ok()) << replay.error().message;
   EXPECT_EQ(replay.value().phase,
             core::ComponentLifecycleProductExchangePhase::kCompleted);
-  // Exact journal reads remain attached to the same stable owner.
-  EXPECT_TRUE(composition.value()->LoadOpenCellObserverIncident().ok());
 }
 
 TEST(CCLCRuntimeComposition,

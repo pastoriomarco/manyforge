@@ -90,7 +90,9 @@ struct ActiveBundlePublicationReceiptDTO final {
     return valid() && transaction != nullptr &&
            transaction->apply_id == apply_id &&
            transaction->apply_generation == apply_generation &&
-           request.candidate_projection_revision == candidate_revision;
+           // The Scene revision is Apply-time evidence, never a binding.
+           SameProjectionIdentity(request.candidate_projection_revision,
+                                  candidate_revision);
   }
 
   [[nodiscard]] bool matches_bootstrap(
@@ -109,5 +111,26 @@ struct ActiveBundlePublicationReceiptDTO final {
   friend bool operator==(const ActiveBundlePublicationReceiptDTO&,
                          const ActiveBundlePublicationReceiptDTO&) = default;
 };
+
+/// Whether two receipts name the same publication. A named Apply's candidate
+/// Scene revision is evidence of a moment (the Manager records the request's,
+/// the Scene owner the one it adopted), so only its Scene identity is compared.
+[[nodiscard]] inline bool SamePublicationIdentity(
+    ActiveBundlePublicationReceiptDTO left,
+    const ActiveBundlePublicationReceiptDTO& right) {
+  if (!SameProjectionIdentity(left.request.candidate_projection_revision,
+                              right.request.candidate_projection_revision)) {
+    return false;
+  }
+  left.request.candidate_projection_revision.scene_revision =
+      right.request.candidate_projection_revision.scene_revision;
+  return left == right;
+}
+
+[[nodiscard]] inline bool SamePublicationIdentity(
+    const std::optional<ActiveBundlePublicationReceiptDTO>& left,
+    const ActiveBundlePublicationReceiptDTO& right) {
+  return left.has_value() && SamePublicationIdentity(*left, right);
+}
 
 }  // namespace manyforge::core

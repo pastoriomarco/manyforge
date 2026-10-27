@@ -8,12 +8,12 @@
   "description": "R5 trial (b): preemption. A slow priority-10 move is taken over after 1 s by a priority-50 move (expect preempted + smooth takeover or spring-back); then a priority-10 newcomer against a running priority-50 move is refused_by_priority. Both losers return success (preempted_result) so the tree continues to the outcome-key checks.",
   "members": {
     "assignment.yaml": "sha256:f4dd3bfffcc14e0cb446f820e79e2405f4477ecbc470ca9fdc127dce17086e06",
-    "deployment.yaml": "sha256:2a964ea03ca388a8cb6d393454fe3ef7a4883885b61a636482b7586229b2a834",
+    "deployment.yaml": "sha256:2e7e2ba35804f2bdb0db2e54aa770228f030dd673dd0215a6e478284703f0ebd",
     "program.yaml": "sha256:9356e7306326ef8bf717019669f05201596b8bf8c980d987cdf7aabaf79ce581"
   },
   "name": "r5_trial_b_preemption",
   "saved_status": {
-    "checked_content_digest": "sha256:b655272e0b5cca00672693f702a68746d9df0fe79097354d34e37a242e8a8e74",
+    "checked_content_digest": "sha256:5eed747a885dd7ff0bc0aa0d137e4df89569691e84ae13db887908c390b62177",
     "last_known_status": "unknown",
     "manyforge_version": "0.1.0"
   },

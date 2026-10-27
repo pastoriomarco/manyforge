@@ -563,6 +563,10 @@ private:
   std::set<std::string> active_runtime_fault_kinds_;
   bool runtime_health_baseline_observed_{};
   AdapterCursor scene_adapter_;
+  /// Scene-domain alarm source: `scene.carried_object_lost` events.
+  AdapterCursor scene_pose_adapter_;
+  /// Event ids of the published losses already alarmed.
+  std::set<std::string> raised_carried_object_losses_;
   AdapterCursor operation_adapter_;
   AdapterCursor program_failure_adapter_;
   std::uint64_t program_failure_control_revision_{};

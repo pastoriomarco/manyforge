@@ -682,21 +682,6 @@ function sceneRuntimeFixture(): Record<string, unknown> {
   };
 }
 
-function sceneCellObserverFixture(overrides: Record<string, unknown> = {}): Record<string, unknown> {
-  return {
-    availability: 'available',
-    cell_id: 'cell-a',
-    exit: null,
-    incident_id: null,
-    incident_persistence: 0,
-    observation_current: true,
-    process_presence: 'present',
-    source_epoch_base: 'observer-epoch',
-    source_id: 'isaac-observer',
-    ...overrides,
-  };
-}
-
 function poseSourceFixture(
   payload: Record<string, unknown>,
   overrides: Record<string, unknown> = {},
@@ -2902,96 +2887,48 @@ describe('headless projection parsers', () => {
     expect(parseSceneRuntimeProjection(sceneRuntimeFixture()).state.state).toBe('open');
   });
 
-  it('accepts the closed cell_observer runtime extension and keeps the legacy shape valid', () => {
-    const fixture = sceneRuntimeFixture();
-    fixture.cell_observer = sceneCellObserverFixture({
-      expected_joint_state: {
-        object_id: 'robot-1',
-        policy_id: 'viewer.measured_robot',
-        topic: '/isaac_joint_states',
-      },
-    });
-
-    expect(parseSceneRuntimeProjection(fixture).cell_observer).toEqual({
-      availability: 'available',
-      cell_id: 'cell-a',
-      exit: null,
-      expected_joint_state: {
-        object_id: 'robot-1',
-        policy_id: 'viewer.measured_robot',
-        topic: '/isaac_joint_states',
-      },
-      incident_id: null,
-      incident_persistence: 0,
-      observation_current: true,
-      process_presence: 'present',
-      source_epoch_base: 'observer-epoch',
+  it('accepts the closed configured_joint_states member and keeps the legacy shape valid', () => {
+    const configured = {
+      object_id: 'robot-1',
+      policy_id: 'viewer.measured_robot',
       source_id: 'isaac-observer',
-    });
-    const noJointState = sceneRuntimeFixture();
-    noJointState.cell_observer = sceneCellObserverFixture({ expected_joint_state: null });
-    expect(parseSceneRuntimeProjection(noJointState).cell_observer?.expected_joint_state).toBeNull();
-    expect(parseSceneRuntimeProjection(sceneRuntimeFixture()).cell_observer).toBeUndefined();
+      topic: '/isaac_joint_states',
+    };
+    const fixture = sceneRuntimeFixture();
+    fixture.configured_joint_states = [configured];
+    expect(parseSceneRuntimeProjection(fixture).configured_joint_states).toEqual([configured]);
+
+    const empty = sceneRuntimeFixture();
+    empty.configured_joint_states = [];
+    expect(parseSceneRuntimeProjection(empty).configured_joint_states).toEqual([]);
+    expect(parseSceneRuntimeProjection(sceneRuntimeFixture()).configured_joint_states)
+      .toBeUndefined();
   });
 
-  it('rejects malformed cell_observer DTOs and inconsistent exit incidents', () => {
+  it('rejects malformed configured_joint_states rows and the retired cell_observer member', () => {
     const extraField = sceneRuntimeFixture();
-    extraField.cell_observer = sceneCellObserverFixture({ unexpected: true });
+    extraField.configured_joint_states = [{
+      object_id: 'robot-1',
+      policy_id: 'viewer.measured_robot',
+      source_id: 'isaac-observer',
+      topic: '/isaac_joint_states',
+      unexpected: true,
+    }];
     expect(() => parseSceneRuntimeProjection(extraField)).toThrow(/exactly/);
 
-    const extraExpectedField = sceneRuntimeFixture();
-    extraExpectedField.cell_observer = sceneCellObserverFixture({
-      expected_joint_state: {
-        object_id: 'robot-1',
-        policy_id: 'viewer.measured_robot',
-        topic: '/isaac_joint_states',
-        unexpected: true,
-      },
-    });
-    expect(() => parseSceneRuntimeProjection(extraExpectedField)).toThrow(/exactly/);
+    const emptyTopic = sceneRuntimeFixture();
+    emptyTopic.configured_joint_states = [{
+      object_id: 'robot-1', policy_id: 'viewer.measured_robot', source_id: 'isaac-observer', topic: '',
+    }];
+    expect(() => parseSceneRuntimeProjection(emptyTopic)).toThrow('must be a non-empty string');
 
-    const emptyExpectedTopic = sceneRuntimeFixture();
-    emptyExpectedTopic.cell_observer = sceneCellObserverFixture({
-      expected_joint_state: {
-        object_id: 'robot-1', policy_id: 'viewer.measured_robot', topic: '',
-      },
-    });
-    expect(() => parseSceneRuntimeProjection(emptyExpectedTopic)).toThrow(
-      'must be a non-empty string',
-    );
+    const notArray = sceneRuntimeFixture();
+    notArray.configured_joint_states = {};
+    expect(() => parseSceneRuntimeProjection(notArray)).toThrow();
 
-    const wrongCell = sceneRuntimeFixture();
-    wrongCell.cell_observer = sceneCellObserverFixture({ cell_id: 'cell-b' });
-    expect(() => parseSceneRuntimeProjection(wrongCell)).toThrow('the scene runtime cell_id');
-
-    const invalidAvailability = sceneRuntimeFixture();
-    invalidAvailability.cell_observer = sceneCellObserverFixture({ availability: 'running' });
-    expect(() => parseSceneRuntimeProjection(invalidAvailability)).toThrow(
-      'a supported cell-observer availability',
-    );
-
-    const inconsistentIncident = sceneRuntimeFixture();
-    inconsistentIncident.cell_observer = sceneCellObserverFixture({ incident_id: 'incident-1' });
-    expect(() => parseSceneRuntimeProjection(inconsistentIncident)).toThrow(
-      'a consistent exit, incident_id, and incident_persistence combination',
-    );
-
-    const invalidExit = sceneRuntimeFixture();
-    invalidExit.cell_observer = sceneCellObserverFixture({
-      exit: {
-        core_dumped: false,
-        detected_at_ns: 10,
-        exit_status: null,
-        observed_utc: '2026-10-24T12:00:00Z',
-        pid: 123,
-        signal: null,
-      },
-      incident_id: 'incident-1',
-      incident_persistence: 2,
-    });
-    expect(() => parseSceneRuntimeProjection(invalidExit)).toThrow(
-      'exactly one of exit_status and signal to be present',
-    );
+    const retired = sceneRuntimeFixture();
+    retired.cell_observer = {};
+    expect(() => parseSceneRuntimeProjection(retired)).toThrow(/exactly/);
   });
 
   it('accepts the complete captured live owner sections and all five current objects', () => {
@@ -3035,21 +2972,16 @@ describe('headless projection parsers', () => {
           'isaac_soup_can',
           'isaac_table_low_327',
         ]);
-      expect(facts.facts.sceneRuntime.cell_observer?.source_id).toBe('isaac_scene_objects');
-      expect(facts.facts.sceneRuntime.state.configured_pose_source).toEqual({
-        freshness_open: true,
-        source_epoch_base: 'isaac-source-995486bda18407d1177567122de2f4df',
-        source_id: 'isaac_scene_objects',
-      });
+      expect(facts.facts.sceneRuntime.configured_joint_states?.[0]?.source_id)
+        .toBe('isaac_scene_objects');
     }
 
     const malformedRuntime = structuredClone(runtimeWire);
     const malformedSections = malformedRuntime.sections as Record<string, Record<string, unknown>>;
     const sceneRuntimeSection = malformedSections.scene_runtime;
     const sceneRuntimePayload = sceneRuntimeSection.payload as Record<string, unknown>;
-    const state = sceneRuntimePayload.state as Record<string, unknown>;
-    const configuredPoseSource = state.configured_pose_source as Record<string, unknown>;
-    configuredPoseSource.unexpected = true;
+    const configuredJointStates = sceneRuntimePayload.configured_joint_states as Record<string, unknown>[];
+    configuredJointStates[0]!.unexpected = true;
     const malformed = sceneOwnerFacts(
       parseHeadlessRuntimeSnapshot(malformedRuntime),
       parseSourceModelProjection(sourceModel),
@@ -3058,9 +2990,34 @@ describe('headless projection parsers', () => {
     expect(malformed.available).toBe(false);
     if (!malformed.available) {
       expect(malformed.reason).toContain(
-        'sceneRuntime.state.configured_pose_source must be an object with exactly',
+        'sceneRuntime.configured_joint_states[0] must be an object with exactly',
       );
     }
+
+    const lostRuntime = structuredClone(runtimeWire);
+    const lostState = ((lostRuntime.sections as Record<string, Record<string, unknown>>)
+      .scene_runtime.payload as Record<string, unknown>).state as Record<string, unknown>;
+    const loss = {
+      code: 'scene.carried_object_lost',
+      event_id: 'scene-runtime-pose-1',
+      full_text: 'isaac_cheese_box moved 52.0 mm / 3.0° from its grasp pose (bound 30.0 mm / 14.9°); it was detached and the motion stopped.',
+      scene_resource_id: 'isaac_cheese_box',
+    };
+    lostState.carried_object_losses = [loss];
+    const lost = sceneOwnerFacts(
+      parseHeadlessRuntimeSnapshot(lostRuntime),
+      parseSourceModelProjection(sourceModel),
+      environment,
+    );
+    expect(lost.available, lost.available ? undefined : lost.reason).toBe(true);
+    if (lost.available) expect(lost.facts.sceneRuntime.state.carried_object_losses).toEqual([loss]);
+    lostState.carried_object_losses = [{ ...loss, code: 'carried_object_lost' }];
+    const wrongCode = sceneOwnerFacts(
+      parseHeadlessRuntimeSnapshot(lostRuntime),
+      parseSourceModelProjection(sourceModel),
+      environment,
+    );
+    expect(wrongCode.available).toBe(false);
   });
 
   it('strictly parses carried-object attachment hierarchy metadata', () => {
@@ -4006,7 +3963,6 @@ describe('addressed Robot Control parsers', () => {
         },
         graph_revision: 'sha256:graph',
         retained_bundle_id: 'sha256:bundle',
-        scene_revision: sceneRevision,
         direct_control: {
           controllable_component_id: 'robot-a',
           command_target_id: 'arm',
@@ -4163,7 +4119,6 @@ describe('addressed Robot Control parsers', () => {
       graph_revision: 'sha256:graph',
       owner_epoch: 'owner-1',
       retained_bundle_id: 'sha256:bundle',
-      scene_revision: sceneRevision,
       schema_version: 'manyforge.execution_identity.v2',
     };
     const parsedIdentity = parseExecutionIdentity({
@@ -4172,6 +4127,8 @@ describe('addressed Robot Control parsers', () => {
     });
     expect(parsedIdentity.ownerEpoch).toBe('owner-1');
     expect(parsedIdentity.controlManagementMode).toBe('component_lifecycle');
+    // The Scene revision is not part of the execution identity.
+    expect(parsedIdentity).not.toHaveProperty('sceneRevision');
     // v1's primary-target and Program fields are gone, not nulled.
     expect(() => parseExecutionIdentity({
       command: 'identity',
@@ -5002,7 +4959,6 @@ describe('addressed Robot Control parsers', () => {
         program_run_id: 'direct-control-gripper-owner-1',
         graph_revision: 'sha256:graph',
         retained_bundle_id: 'sha256:bundle',
-        scene_revision: sceneRevision,
         component_role_id: 'controlled_component',
         target_role_id: 'command_target',
         required_capability_id: 'tool.gripper.command',
@@ -5031,11 +4987,10 @@ describe('addressed Robot Control parsers', () => {
     expect(parseCapabilityCommandPreviewResponse(componentLocal).sourceKind)
       .toBe('component_local');
 
-    const undeclaredNested = structuredClone(response);
-    Object.assign(undeclaredNested.preview_receipt.scene_revision, {
-      private_generation: 7,
-    });
-    expect(() => parseCapabilityCommandPreviewResponse(undeclaredNested))
+    // The capability preview does not involve the Scene and echoes no revision.
+    const withScene = structuredClone(response);
+    Object.assign(withScene.preview_receipt, { scene_revision: sceneRevision });
+    expect(() => parseCapabilityCommandPreviewResponse(withScene))
       .toThrow(/exactly/);
   });
 });

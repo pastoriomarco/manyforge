@@ -1,12 +1,14 @@
 #pragma once
 
 #include <cstdint>
+#include <manyforge_core/component_stream_health.hpp>
 #include <manyforge_core/types/deployment_applicability.hpp>
 #include <memory>
 #include <optional>
 #include <stdexcept>
 #include <string_view>
 #include <utility>
+#include <vector>
 
 #include "manyforge_deployment/artifact_codec.hpp"
 #include "manyforge_deployment/assistant_settings_codec.hpp"
@@ -335,5 +337,20 @@ resolve_and_verify_commissioning_evidence_ref(
     const core::CommissionedStopInterfaceDTO& commissioned_interface,
     const core::ContentAddressedStoreKey& resolved_store_key,
     std::string_view stored_bytes);
+
+/// CP9 Deployment overrides of component stream parameters
+/// (`policies.component_streams`). Closed rows of `controllable_component_id`,
+/// `stream_id` and at least one of `budget_ns` (> 0), `severity`
+/// (`fault|blocking|warning`) and `recovery` (`ack|auto`); unique per
+/// `(controllable_component_id, stream_id)` and returned in that order.
+/// Graph occurrence is checked by the deployment and retained-bundle codecs.
+/// Throws DeploymentApplicabilityCodecError at
+/// `$.policies.component_streams[...]`.
+[[nodiscard]] std::vector<core::StreamParameterOverrideDTO>
+decode_component_stream_overrides(const CanonicalValue& value);
+
+/// Canonical array of the rows (absent parameters omitted).
+[[nodiscard]] CanonicalValue encode_component_stream_overrides(
+    const std::vector<core::StreamParameterOverrideDTO>& rows);
 
 }  // namespace manyforge::deployment

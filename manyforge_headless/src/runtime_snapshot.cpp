@@ -1,7 +1,6 @@
 #include "manyforge_headless/runtime_snapshot.hpp"
 
 #include <algorithm>
-#include <cmath>
 #include <cstdint>
 #include <optional>
 #include <string>
@@ -118,106 +117,19 @@ void ValidatePoseSourcesShape(const CanonicalValue& state) {
           "scene/runtime pose_sources must be an array");
 }
 
-void ValidateCellObserver(const CanonicalValue &observer,
-                          const std::string &cell_id) {
-  Require(observer.is_object(),
-          "scene/runtime cell_observer must be an object");
-  const auto *expected_joint_state =
-      observer.find_object_member("expected_joint_state");
-  Require(observer.as_object().size() ==
-              (expected_joint_state == nullptr ? 9U : 10U),
-          "scene/runtime cell_observer is not the closed v1 shape");
-  Require(RequiredString(observer, "cell_id") == cell_id,
-          "scene/runtime cell_observer belongs to a different cell");
-  const auto source_id = RequiredString(observer, "source_id");
-  const auto source_epoch_base = RequiredString(observer, "source_epoch_base");
-  constexpr std::string_view kMaximumSourceEpochSuffix = ".9007199254740991";
-  Require(source_id.size() <= 256U &&
-              source_epoch_base.size() <=
-                  256U - kMaximumSourceEpochSuffix.size() &&
-              source_epoch_base.find('\0') == std::string::npos,
-          "scene/runtime cell_observer source identity is invalid");
-  const auto availability = RequiredString(observer, "availability");
-  Require(availability == "available" || availability == "pending" ||
-              availability == "unavailable" || availability == "unknown",
-          "scene/runtime cell_observer availability is unsupported");
-  static_cast<void>(RequiredBool(observer, "observation_current"));
-  const auto presence = RequiredString(observer, "process_presence");
-  Require(presence == "present" || presence == "absent" ||
-              presence == "unknown",
-          "scene/runtime cell_observer process_presence is unsupported");
-  if (expected_joint_state != nullptr &&
-      !std::holds_alternative<std::nullptr_t>(
-          expected_joint_state->storage())) {
-    Require(expected_joint_state->is_object() &&
-                expected_joint_state->as_object().size() == 3U,
-            "scene/runtime expected_joint_state is not the closed v1 shape");
-    const auto object_id = RequiredString(*expected_joint_state, "object_id");
-    const auto policy_id = RequiredString(*expected_joint_state, "policy_id");
-    const auto topic = RequiredString(*expected_joint_state, "topic");
-    Require(object_id.size() <= 256U && policy_id.size() <= 256U &&
-                topic.size() <= 256U,
-            "scene/runtime expected_joint_state identity exceeds its bound");
-  }
-  const auto &exit = RequiredMember(observer, "exit");
-  Require(std::holds_alternative<std::nullptr_t>(exit.storage()) ||
-              exit.is_object(),
-          "scene/runtime cell_observer exit must be null or an object");
-  if (exit.is_object()) {
-    Require(exit.as_object().size() == 6U,
-            "scene/runtime cell_observer exit is not the closed v1 shape");
-    const auto exact_integer = [](const CanonicalValue &value,
-                                  const double minimum,
-                                  const double maximum) {
-      const auto *number = std::get_if<double>(&value.storage());
-      return number != nullptr && std::isfinite(*number) &&
-             *number >= minimum && *number <= maximum &&
-             std::floor(*number) == *number;
-    };
-    Require(exact_integer(RequiredMember(exit, "pid"), 1.0, 2147483647.0),
-            "scene/runtime cell_observer exit pid is invalid");
-    static_cast<void>(content_identity::parse_nonnegative_int64(
-        RequiredMember(exit, "detected_at_ns")));
-    const auto nullable_byte = [&](const std::string_view field) {
-      const auto &value = RequiredMember(exit, field);
-      return std::holds_alternative<std::nullptr_t>(value.storage()) ||
-             exact_integer(value, 0.0, 255.0);
-    };
-    Require(nullable_byte("exit_status") && nullable_byte("signal"),
-            "scene/runtime cell_observer exit status field is invalid");
-    const bool has_exit_status = !std::holds_alternative<std::nullptr_t>(
-        RequiredMember(exit, "exit_status").storage());
-    const bool has_signal = !std::holds_alternative<std::nullptr_t>(
-        RequiredMember(exit, "signal").storage());
-    Require(has_exit_status != has_signal,
-            "scene/runtime cell_observer exit must select status or signal");
-    static_cast<void>(RequiredBool(exit, "core_dumped"));
-    const auto *observed_utc = std::get_if<std::string>(
-        &RequiredMember(exit, "observed_utc").storage());
-    Require(observed_utc != nullptr && observed_utc->size() <= 128U,
-            "scene/runtime cell_observer exit observed_utc is invalid");
-  }
-  const auto &incident_id = RequiredMember(observer, "incident_id");
-  const auto *incident = std::get_if<std::string>(&incident_id.storage());
-  Require(std::holds_alternative<std::nullptr_t>(incident_id.storage()) ||
-              (incident != nullptr && !incident->empty() &&
-               incident->size() <= 128U),
-          "scene/runtime cell_observer incident_id must be null or a string");
-  const auto *persistence = std::get_if<double>(
-      &RequiredMember(observer, "incident_persistence").storage());
-  Require(persistence != nullptr && std::isfinite(*persistence) &&
-              *persistence >= 0.0 && std::floor(*persistence) == *persistence &&
-              *persistence <= 4.0,
-          "scene/runtime cell_observer incident_persistence must be a number");
-  if (std::holds_alternative<std::nullptr_t>(exit.storage())) {
-    Require(incident == nullptr && *persistence == 0.0,
-            "scene/runtime cell_observer non-exit incident state is invalid");
-  } else if (incident == nullptr) {
-    Require(*persistence == 4.0,
-            "scene/runtime cell_observer unknown exit incident is invalid");
-  } else {
-    Require(*persistence >= 1.0,
-            "scene/runtime cell_observer exit incident state is invalid");
+void ValidateConfiguredJointStates(const CanonicalValue &rows) {
+  Require(rows.is_array(),
+          "scene/runtime configured_joint_states must be an array");
+  for (const auto &row : rows.as_array()) {
+    Require(row.is_object() && row.as_object().size() == 4U,
+            "scene/runtime configured_joint_states row is not the closed v1 "
+            "shape");
+    for (const std::string_view field :
+         {"object_id", "policy_id", "source_id", "topic"}) {
+      Require(RequiredString(row, field).size() <= 256U,
+              "scene/runtime configured_joint_states identity exceeds its "
+              "bound");
+    }
   }
 }
 
@@ -239,7 +151,8 @@ void ValidateSceneRuntimePayload(const CanonicalValue &payload,
   static_cast<void>(RequiredString(state, "state"));
   ValidatePoseSourcesShape(state);
   if (payload.as_object().size() == 4U) {
-    ValidateCellObserver(RequiredMember(payload, "cell_observer"), cell_id);
+    ValidateConfiguredJointStates(
+        RequiredMember(payload, "configured_joint_states"));
   }
 }
 

@@ -17,11 +17,6 @@ const controller = vi.hoisted(() => ({
       activePublicationGeneration: 1,
       graphRevision: 'sha256:graph',
       retainedBundleId: 'sha256:bundle',
-      sceneRevision: {
-        scene_id: 'scene-1',
-        revision_id: 1,
-        content_hash: 'sha256:scene',
-      },
       directControl: {
         controllableComponentId: 'robot-1',
         commandTargetId: 'arm',
@@ -149,7 +144,6 @@ const controller = vi.hoisted(() => ({
       cartesianMaxBlendDeviationRad: 0.01, jointLimits: {} },
     generation: 1,
     intent: {},
-    // Approval compares the receipt with the displayed Scene revision.
     preview: {
       sceneRevision: {
         scene_id: 'scene-1',
@@ -485,12 +479,11 @@ describe('RobotControlPanel layout', () => {
     state.operation = null;
   });
 
-  it('resets typed inputs on another Scene, never on a pose-only Scene revision', () => {
+  it('never resets typed inputs on Scene changes', () => {
     const source = readFileSync(new URL('./RobotControlPanel.tsx', import.meta.url), 'utf8');
     const start = source.indexOf('const inputResetKey = [');
     const key = source.slice(start, source.indexOf("].join('\\u0000');", start));
     expect(start).toBeGreaterThan(0);
-    expect(key).toContain('status?.sceneRevision.scene_id');
-    expect(key).not.toMatch(/revision_id|content_hash/);
+    expect(key).not.toMatch(/scene|revision_id|content_hash/i);
   });
 });

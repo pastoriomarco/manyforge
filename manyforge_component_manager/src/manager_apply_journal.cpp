@@ -504,7 +504,6 @@ struct EncodedIntent final {
   std::int64_t predecessor_scene_revision_id;
   std::optional<std::int64_t> expected_admission_generation;
   std::optional<std::string> parent_authoring_claim;
-  std::optional<std::string> isaac_pose_observer_launch_facts;
   std::string intent_digest;
 };
 
@@ -598,12 +597,6 @@ EncodedIntent EncodeIntent(const ManagerApplyIntentDTO &intent) {
                 EncodeParentAuthoringClaim(*intent.parent_authoring_claim))
           : std::nullopt;
 
-  const auto observer_launch_facts =
-      intent.isaac_pose_observer_launch_facts
-          ? std::optional(EncodeManagerIsaacPoseObserverLaunchFacts(
-                *intent.isaac_pose_observer_launch_facts))
-          : std::nullopt;
-
   std::string record;
   AppendField(record, "domain", kDigestDomain);
   AppendField(record, "request_id", intent.request_context.request_id.value());
@@ -662,12 +655,8 @@ EncodedIntent EncodeIntent(const ManagerApplyIntentDTO &intent) {
                   : "");
   AppendField(record, "parent_authoring_claim",
               parent_authoring_claim.value_or(""));
-  // Absence contributes no bytes: ordinary pre-DX362 intent digests stay exact.
-  if (observer_launch_facts) {
-    AppendField(record, "isaac_pose_observer_launch_facts", *observer_launch_facts);
-  }
   return {generation, scene_revision, expected_admission_generation,
-          parent_authoring_claim, observer_launch_facts, RawDigest(record)};
+          parent_authoring_claim, RawDigest(record)};
 }
 
 std::int64_t CheckedNonnegativeSigned(const std::uint64_t value,
@@ -2693,27 +2682,12 @@ void ValidateApplyJournalIdentityAndSchema(
              ? std::string(sqlite3_db_filename(database, "main"))
              : source_path.string()) +
         " has format version " + std::to_string(user_version) +
-        "; expected v18. Preserve this file, including interrupted operations; "
+        "; expected v19. Preserve this file, including interrupted operations; "
         "reconcile the original operations with their owner and retained "
         "evidence "
-        "before explicitly selecting a fresh v18 journal. No migration, "
+        "before explicitly selecting a fresh v19 journal. No migration, "
         "conversion "
         "or deletion is performed");
-  }
-  const auto intent_table = existing.find({"table", "manager_apply_intents"});
-  if (intent_table != existing.end() &&
-      intent_table->second.find("isaac_pose_observer_launch_facts") ==
-          std::string::npos) {
-    throw ManagerApplyJournalIntegrityError(
-        "Manager Apply journal " +
-        (source_path.empty()
-             ? std::string(sqlite3_db_filename(database, "main"))
-             : source_path.string()) +
-        " has an unsupported earlier v18 format missing "
-        "isaac_pose_observer_launch_facts. Preserve this file, including "
-        "interrupted operations; reconcile the original operations with their "
-        "owner and retained evidence before explicitly selecting a fresh v18 "
-        "journal. No migration, conversion or deletion is performed");
   }
   if (existing != ExpectedSchemaObjects()) {
     throw ManagerApplyJournalIntegrityError(
@@ -2936,9 +2910,7 @@ bool ManagerApplyIntentDTO::valid() const noexcept {
          !apply_id.empty() && apply_generation.nonzero() && !cell_id.empty() &&
          expected_active_projection_revision.valid() &&
          !candidate_retained_bundle_id.empty() &&
-         !candidate_graph_revision.empty() && prepared_activation.valid() &&
-         (!isaac_pose_observer_launch_facts ||
-          isaac_pose_observer_launch_facts->valid());
+         !candidate_graph_revision.empty() && prepared_activation.valid();
 }
 
 class SqliteManagerApplyJournal::Impl final {
@@ -3268,8 +3240,8 @@ public:
         "program_binding_id,prepared_activation_id,"
         "prepared_activation_receipt_json,"
         "expected_admission_generation,parent_authoring_claim,"
-        "isaac_pose_observer_launch_facts,intent_digest,scene_initialization"
-        ") VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)");
+        "intent_digest,scene_initialization"
+        ") VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)");
     insert.Bind(1, intent.apply_id.value());
     insert.Bind(2, encoded.apply_generation);
     insert.Bind(3, intent.request_context.request_id.value());
@@ -3312,13 +3284,8 @@ public:
     } else {
       insert.BindNull(21);
     }
-    if (encoded.isaac_pose_observer_launch_facts) {
-      insert.BindBlob(22, *encoded.isaac_pose_observer_launch_facts);
-    } else {
-      insert.BindNull(22);
-    }
-    insert.Bind(23, encoded.intent_digest);
-    insert.Bind(24, ToString(intent.scene_initialization));
+    insert.Bind(22, encoded.intent_digest);
+    insert.Bind(23, ToString(intent.scene_initialization));
     static_cast<void>(insert.Step());
 
     const auto stored = IntentLocked(intent.apply_id, encoded.apply_generation);
@@ -3683,7 +3650,7 @@ public:
         "program_binding_id,prepared_activation_id,"
         "prepared_activation_receipt_json,"
         "expected_admission_generation,parent_authoring_claim,"
-        "isaac_pose_observer_launch_facts,intent_digest,scene_initialization "
+        "intent_digest,scene_initialization "
         "FROM manager_apply_intents "
         "WHERE apply_id=? AND apply_generation=?");
     row.Bind(1, apply_id.value());
@@ -3721,9 +3688,8 @@ public:
           static_cast<std::uint64_t>(stored_admission_generation));
     }
     const auto parent_authoring_claim = row.OptionalBlob(20);
-    const auto observer_launch_facts_encoding = row.OptionalBlob(21);
-    const auto stored_digest = row.Text(22);
-    const auto scene_initialization = row.Text(23);
+    const auto stored_digest = row.Text(21);
+    const auto scene_initialization = row.Text(22);
     if (scene_initialization != "preserve" &&
         scene_initialization != "initialize") {
       throw ManagerApplyJournalIntegrityError(
@@ -3736,17 +3702,6 @@ public:
     if (stored_generation <= 0 || predecessor_scene_revision_id <= 0) {
       throw ManagerApplyJournalIntegrityError(
           "stored Apply intent generation is invalid");
-    }
-
-    std::optional<ManagerIsaacPoseObserverLaunchFactsDTO> observer_launch_facts;
-    if (observer_launch_facts_encoding) {
-      try {
-        observer_launch_facts = DecodeManagerIsaacPoseObserverLaunchFacts(
-            *observer_launch_facts_encoding);
-      } catch (const std::exception &) {
-        throw ManagerApplyJournalIntegrityError(
-            "stored observer launch facts are invalid or noncanonical");
-      }
     }
 
     ManagerApplyIntentDTO intent{
@@ -3785,7 +3740,6 @@ public:
             ? std::optional<core::CellAdmissionClaimDTO>(
                   DecodeParentAuthoringClaim(*parent_authoring_claim))
             : std::nullopt,
-        std::move(observer_launch_facts),
         scene_initialization == "initialize"
             ? ManagerSceneInitialization::kInitialize
             : ManagerSceneInitialization::kPreserve,

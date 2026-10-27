@@ -631,7 +631,6 @@ function executionIdentityAt(value: unknown, path: string): ExecutionIdentity {
     'graph_revision',
     'owner_epoch',
     'retained_bundle_id',
-    'scene_revision',
     'schema_version',
   ], path);
   if (stringAt(identity.schema_version, `${path}.schema_version`)
@@ -660,10 +659,6 @@ function executionIdentityAt(value: unknown, path: string): ExecutionIdentity {
     retainedBundleId: stringAt(
       identity.retained_bundle_id,
       `${path}.retained_bundle_id`,
-    ),
-    sceneRevision: sceneRevisionAt(
-      identity.scene_revision,
-      `${path}.scene_revision`,
     ),
   };
 }
@@ -993,7 +988,6 @@ export function parseExecutionControlStatus(
       graph_revision: identity.graphRevision,
       owner_epoch: identity.ownerEpoch,
       retained_bundle_id: identity.retainedBundleId,
-      scene_revision: identity.sceneRevision,
     },
   });
   // Null when no motion target supports scaling (for example gripper-only).
@@ -1837,10 +1831,6 @@ function normalizedOwnerStatusAt(value: unknown): ExecutionOwnerStatus {
       status.retained_bundle_id,
       'executionStatus.status.retained_bundle_id',
     ),
-    sceneRevision: sceneRevisionAt(
-      status.scene_revision,
-      'executionStatus.status.scene_revision',
-    ),
     components,
     directControl: motion?.directControl ?? null,
     directControlGripper,
@@ -2318,7 +2308,6 @@ export function parseCapabilityCommandPreviewResponse(
     'request_owner_epoch',
     'required_capability_id',
     'retained_bundle_id',
-    'scene_revision',
     'schema_version',
     'source_coordinate_name',
     'source_kind',
@@ -2388,14 +2377,6 @@ export function parseCapabilityCommandPreviewResponse(
       'an in-limit commit-eligible command',
     );
   }
-  exactKeysAt(
-    objectAt(
-      receipt.scene_revision,
-      'capabilityCommandPreview.preview_receipt.scene_revision',
-    ),
-    ['content_hash', 'revision_id', 'scene_id'],
-    'capabilityCommandPreview.preview_receipt.scene_revision',
-  );
   return {
     schemaVersion,
     receiptDigest: stringAt(
@@ -2437,10 +2418,6 @@ export function parseCapabilityCommandPreviewResponse(
     retainedBundleId: stringAt(
       receipt.retained_bundle_id,
       'capabilityCommandPreview.preview_receipt.retained_bundle_id',
-    ),
-    sceneRevision: sceneRevisionAt(
-      receipt.scene_revision,
-      'capabilityCommandPreview.preview_receipt.scene_revision',
     ),
     componentRoleId: stringAt(
       receipt.component_role_id,

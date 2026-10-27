@@ -1494,51 +1494,31 @@ export type SceneRuntimePoseSource =
       payload_quality: 'unknown';
     });
 
-export interface SceneRuntimeCellObserverExit {
-  pid: number;
-  exit_status: number | null;
-  signal: number | null;
-  core_dumped: boolean;
-  observed_utc: string;
-  detected_at_ns: Nanoseconds;
-}
-
-export type SceneRuntimeCellObserverIncidentPersistence = 0 | 1 | 2 | 3 | 4;
-
-export interface SceneRuntimeExpectedJointState {
+/** One configured Isaac/pose-source JointState binding from the active bundle. */
+export interface SceneRuntimeConfiguredJointState {
+  source_id: string;
   object_id: string;
   policy_id: string;
   topic: string;
 }
 
-export interface SceneRuntimeCellObserver {
-  cell_id: string;
-  source_id: string;
-  source_epoch_base: string;
-  /** Omitted by older owners; null means the checked observer expects no JointState stream. */
-  expected_joint_state?: SceneRuntimeExpectedJointState | null;
-  availability: 'available' | 'pending' | 'unavailable' | 'unknown';
-  observation_current: boolean;
-  process_presence: 'present' | 'absent' | 'unknown';
-  exit: SceneRuntimeCellObserverExit | null;
-  incident_id: string | null;
-  incident_persistence: SceneRuntimeCellObserverIncidentPersistence;
-}
-
-export interface SceneRuntimeConfiguredPoseSource {
-  source_id: string;
-  source_epoch_base: string;
-  freshness_open: boolean;
+/** One `scene.carried_object_lost` event (published for its operator alarm). */
+export interface SceneRuntimeCarriedObjectLoss {
+  code: 'scene.carried_object_lost';
+  event_id: string;
+  full_text: string;
+  scene_resource_id: string;
 }
 
 export interface SceneRuntimeProjection {
   api_version: 'manyforge.scene_runtime_source.v1';
   cell_id: string;
-  cell_observer?: SceneRuntimeCellObserver;
+  /** Omitted by older owners; treated as empty. */
+  configured_joint_states?: SceneRuntimeConfiguredJointState[];
   state: {
     api_version: 'manyforge.scene_runtime_state.v2';
     active_replay_id: number | null;
-    configured_pose_source?: SceneRuntimeConfiguredPoseSource;
+    carried_object_losses?: SceneRuntimeCarriedObjectLoss[];
     counters: Record<string, number>;
     deferred: boolean;
     error: string | null;

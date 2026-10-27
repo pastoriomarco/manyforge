@@ -217,6 +217,24 @@ describe('CCLC presentation', () => {
     expect(html).toContain('Activate all');
   });
 
+  it('shows stream health on the row and the selected component, with Recover for a latch', () => {
+    const current = controller();
+    current.snapshot = { ...current.snapshot!, lifecycleState: 'active', streamHealth: [{
+      streamId: 'sim_clock', state: 'live', ageNs: 5_000_000, budgetNs: 1_000_000_000, severity: 'blocking',
+      recovery: 'ack', timestampSource: 'message_stamp', acknowledgementRequired: true,
+      error: { code: 'component_stream_acknowledgement_required', message: 'latched', details: {} },
+    }] };
+    const html = renderToStaticMarkup(createElement(CCLCPanelView, {
+      enabled: true, mutationAvailable: true, mutationUnavailableReason: null, controller: current,
+    }));
+    expect(html.split('sim_clock: needs acknowledgement · blocking').length).toBe(3);
+    expect(html).toContain('sim_clock: needs acknowledgement · age 5 ms / budget 1.0 s · blocking · recovery ack');
+    expect(html).toMatch(/<button type="button"[^>]*>Recover<\/button>/);
+    expect(renderToStaticMarkup(createElement(CCLCPanelView, {
+      enabled: true, mutationAvailable: true, mutationUnavailableReason: null, controller: controller(),
+    }))).not.toContain('Streams');
+  });
+
   it('shows target, achieved state, readiness and consequence while manual controls stay available', () => {
     const waiting = controller();
     waiting.snapshot = {

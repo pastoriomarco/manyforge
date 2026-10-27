@@ -8,12 +8,12 @@
   "description": "R5 trial (f): global rule light_curtain (Deployment, all_motion, latch, operator release). Toggle curtain_blocked during move_a (Stop -> latch -> hold) and during idle_window (Run in flight, robot still -> latch; move_b refused until the operator clears). Watch interrupt_state.light_curtain in the key panel; curtain_clear_at_end checks it reads clear.",
   "members": {
     "assignment.yaml": "sha256:f4dd3bfffcc14e0cb446f820e79e2405f4477ecbc470ca9fdc127dce17086e06",
-    "deployment.yaml": "sha256:fae26670e4448800d823a9804399a844b4e8f255dd7af58f9860e2aad426e039",
+    "deployment.yaml": "sha256:180af7bcc7be010bc3fbd5e8c2d56b8e4bd3464b5f05eee574010c52071db1c4",
     "program.yaml": "sha256:cdd8315c8fc7f6b42e451a3bad3ebb13bfd8f8d4135cd61fac074dcd4d864299"
   },
   "name": "r5_trial_f_global_rule",
   "saved_status": {
-    "checked_content_digest": "sha256:beeb0810a3d02b1e26e9deeb35df91c154d0769ca5e74e8d6109fc1985d80c15",
+    "checked_content_digest": "sha256:08211909adc3f152f6c267f0f0f153dcfe85fcd653d7599da3cce6d2fdf9cdc4",
     "last_known_status": "unknown",
     "manyforge_version": "0.1.0"
   },

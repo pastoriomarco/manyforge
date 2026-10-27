@@ -281,29 +281,37 @@ _EXPECTED_RUNTIME_RESTORATION_PROFILE_DIGESTS: Final = {
         "28b47a00f2ae915e3281bc6a58c0927f164aaa8a8d4a4635a997a49e6436f6b1"
     ),
     "lite6_isaac_commanded_v0": (
-        "28be83380ef33cb9db845c41774a7633d68af657c1dc83cee15b2f3115e8b034"
+        "350f4d6e6ccaf544ef5b94358ba4cb1bd98c693e7db9cec49c9701b298b5ba5a"
     ),
     "lite6_mock_commanded_v0": (
-        "6093a4058a33b59117b1cff8e3bcf4e1331cbe020c2bddd143927d2a2f8b653a"
+        "2a854c48a0abe25d4f9484c95ab84220ad14a8e6799829d870ee1944b61c6887"
+    ),
+    "pose_source_v0": (
+        "a28e7e7a46931cb858ad4bc15c45ac13a5e42eb9d76be318ff28e75600e7ec58"
     ),
     "ur10e_robotiq_assistant_isaac_commanded_v0": (
-        "09b9855179e247f2956d5559c37f9b252d3bdb2991bc5322f2c119f790415512"
+        "a2a7cfdac8d6decab6123c353fdeb29d17c85290a1c9a9b6434c3f7c7134c1a1"
     ),
     "ur10e_robotiq_assistant_mock_commanded_v0": (
-        "9a8e4e5bafb2a3042e435a0611f0a6d0a6dfb0968003469de04bacb99f152412"
+        "f1639309835d38c8e846ba8a9645df5e566826d4fb82f06fed410d9529a3f8ab"
     ),
     "ur10e_robotiq_isaac_commanded_v0": (
-        "2ac011899a66492599bcaed4fb8a0c0b8cc18f06180ca8990e6c11d491c9b4e0"
+        "f0f0f155cb958c4ab1f318fd50d566fb41e8d0875899532213c91ffe9b42c3b4"
     ),
     "ur10e_robotiq_mock_commanded_v0": (
-        "50b4a0d3b03687b172aeacb1cb89ea914af483e222e22b4f20eb5fcf725f0c58"
+        "1ce483999e32e1831d6fd7227176f4e71c1a183583a7ff6da3fd47aa9aee8c5a"
     ),
     "ur5_mock_commanded_v0": (
         "e4b832ee25720120dafb59ceffcc825d9818b6891c0aa4f23e2552b77c171c0a"
     ),
     "ur5e_robotiq_mock_commanded_v0": (
-        "e5ee9d2c728b3732ab8db5b0fb84f4df88d7a652c756fbac1ffe390281987a26"
+        "78de6e26b63cf831c0187e289b2846e080d62b43a16068ddb5afebafe26bb526"
     ),
+}
+# Model-free component profiles: runtime member -> exact profile id.
+_MODEL_FREE_PROFILE_IDS: Final = {
+    "io_provider_runtime": "io_device_v0",
+    "pose_source_runtime": "pose_source_v0",
 }
 _EXPECTED_RUNTIME_RESTORATION_PROFILE_FAMILIES: Final = {
     "lite6_isaac_commanded_v0": "lite6_lite_gripper",
@@ -1622,6 +1630,59 @@ def _validate_role_assignment(
     return scenario_id, aliases
 
 
+def _validate_pose_source(
+    value: object, *, component_occurrence_id: object, path: str
+) -> None:
+    """Shape of the model-free pose-source component of an Isaac Deployment.
+
+    The runtime configuration itself is checked by the closed Deployment
+    schema; this only keeps the generator projection coherent.
+    """
+    pose_source = _exact(
+        value,
+        required=frozenset(
+            {"component_id", "runtime_configuration", "scene_pose_sources"}
+        ),
+        path=path,
+    )
+    component_id = _identifier(
+        pose_source["component_id"], path=f"{path}.component_id"
+    )
+    if component_id == component_occurrence_id:
+        raise SourceDescriptionError(
+            f"{path}.component_id must differ from the robot component"
+        )
+    configuration = _exact(
+        pose_source["runtime_configuration"],
+        required=frozenset({"pose_sources"}),
+        path=f"{path}.runtime_configuration",
+    )
+    rows = _array(
+        configuration["pose_sources"],
+        path=f"{path}.runtime_configuration.pose_sources",
+    )
+    if (
+        len(rows) != 1
+        or _object(rows[0], path=f"{path}.runtime_configuration.pose_sources[0]").get(
+            "controllable_component_id"
+        )
+        != component_id
+    ):
+        raise SourceDescriptionError(
+            f"{path}.runtime_configuration.pose_sources must be one row of "
+            "this component"
+        )
+    for index, row in enumerate(
+        _array(pose_source["scene_pose_sources"], path=f"{path}.scene_pose_sources")
+    ):
+        if _object(row, path=f"{path}.scene_pose_sources[{index}]").get(
+            "source_id"
+        ) != component_id:
+            raise SourceDescriptionError(
+                f"{path}.scene_pose_sources[{index}].source_id must be this component"
+            )
+
+
 def validate(source: Path, root: Path) -> None:
     try:
         value = json.loads(
@@ -1846,18 +1907,23 @@ def validate(source: Path, root: Path) -> None:
         path = f"$.runtime_restoration_profiles[{index}]"
         raw_profile_object = _object(raw_profile, path=path)
         is_ros2_control = "ros2_control_runtime" in raw_profile_object
-        is_io_provider = "io_provider_runtime" in raw_profile_object
-        if is_io_provider:
-            expected_io_profile = {
-                "runtime_restoration_profile_id": "io_device_v0",
-                "io_provider_runtime": {},
+        model_free_runtime = next(
+            (key for key in _MODEL_FREE_PROFILE_IDS if key in raw_profile_object),
+            None,
+        )
+        if model_free_runtime is not None:
+            expected_model_free_profile = {
+                "runtime_restoration_profile_id": _MODEL_FREE_PROFILE_IDS[
+                    model_free_runtime
+                ],
+                model_free_runtime: {},
                 "source_fields": {},
                 "stop_profiles": {},
                 "acceptance_obligations": [],
             }
-            if raw_profile_object != expected_io_profile:
+            if raw_profile_object != expected_model_free_profile:
                 raise SourceDescriptionError(
-                    f"{path} changes the exact model-free I/O component profile"
+                    f"{path} changes the exact model-free component profile"
                 )
             profile = raw_profile_object
         else:
@@ -1893,7 +1959,7 @@ def validate(source: Path, root: Path) -> None:
             raise SourceDescriptionError(
                 f"{path} changes the exact runtime restoration/example-policy input"
             )
-        if is_io_provider:
+        if model_free_runtime is not None:
             continue
         is_mock = is_ros2_control and "mock_profile" in _object(
             profile["ros2_control_runtime"], path=f"{path}.ros2_control_runtime"
@@ -1986,6 +2052,7 @@ def validate(source: Path, root: Path) -> None:
                     "historical_program_blob",
                     "i9_behavior_obligations",
                     "root_pose_in_cell",
+                    "pose_source",
                 }
             )
         row = _exact(
@@ -2083,6 +2150,12 @@ def validate(source: Path, root: Path) -> None:
                 )
         if row["model_family_id"] not in family_ids:
             raise SourceDescriptionError(f"{path}.model_family_id is unavailable")
+        if is_i9:
+            _validate_pose_source(
+                row["pose_source"],
+                component_occurrence_id=row["component_occurrence_id"],
+                path=f"{path}.pose_source",
+            )
         runtime_profile_id = _identifier(
             row["runtime_restoration_profile_id"],
             path=f"{path}.runtime_restoration_profile_id",

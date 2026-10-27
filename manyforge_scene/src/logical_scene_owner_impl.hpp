@@ -115,6 +115,9 @@ public:
                          kMaintenanceInitializationSchemaVersion) {
                 ValidateMaintenanceDatabase(preflight, fixed_query_,
                                             admission_digest_);
+              } else if (version == kInitialSceneBaselineSchemaVersion) {
+                ValidateInitialSceneBaselineDatabase(preflight, fixed_query_,
+                                                     admission_digest_);
               } else {
                 ValidateDatabase(preflight, fixed_query_, admission_digest_);
               }
@@ -235,10 +238,21 @@ public:
           InsertInitialSceneBaselineMigrationMetadata(database_);
           transaction.Commit();
           changed_schema = true;
+        } else if (version == kInitialSceneBaselineSchemaVersion) {
+          ValidateInitialSceneBaselineDatabase(database_, fixed_query_,
+                                               admission_digest_);
+          ConfigureDurability(database_);
         } else {
           ValidateDatabase(database_, fixed_query_, admission_digest_);
           ConfigureDurability(database_);
         }
+      }
+      if (ScalarInteger(database_, "PRAGMA user_version") ==
+          kInitialSceneBaselineSchemaVersion) {
+        Transaction transaction(database_, "BEGIN IMMEDIATE");
+        ConvertProviderObservationEvidence(database_);
+        transaction.Commit();
+        changed_schema = true;
       }
       const bool interrupted_initialization =
           SettleInterruptedMaintenanceInitializations(database_);
@@ -286,8 +300,6 @@ public:
     std::lock_guard operation_lock(maintenance_operation_mutex_);
     std::lock_guard lock(mutex_);
     InvalidateSceneCommitState();
-    provider_freshness_records_.clear();
-    provider_sequence_watermarks_.clear();
     auto lifecycle_lock = sqlite_lifecycle_internal::
         AcquireCanonicalEmptySceneStoreLifecycleLockForClose();
     if (database_ == nullptr) {
@@ -387,53 +399,6 @@ public:
   mutable std::mutex mutex_;
   sqlite3 *database_{};
   mutable std::optional<SceneCommitStateCache> scene_commit_state_cache_;
-  /// Drops freshness records and sequence watermarks of objects that no
-  /// longer exist in `snapshot`.
-  void PruneProviderFreshnessState(const LogicalSceneSnapshotDTO &snapshot) {
-    const auto absent = [&](const auto &entry) {
-      return FindSceneObject(snapshot, entry.first) == nullptr;
-    };
-    std::erase_if(provider_freshness_records_, absent);
-    std::erase_if(provider_sequence_watermarks_, absent);
-  }
-
-  /// Raises the object's same-origin sequence high-water mark, or resets it
-  /// to `evidence` when the provider origin changed.
-  void AdvanceProviderSequenceWatermark(
-      const SceneResourceId &scene_resource_id,
-      const core::SceneObjectProviderEvidenceDTO &evidence) {
-    const auto [watermark, inserted] =
-        provider_sequence_watermarks_.try_emplace(scene_resource_id, evidence);
-    if (!inserted &&
-        (!SameProviderOrigin(watermark->second, evidence) ||
-         evidence.provider_source_sequence >
-             watermark->second.provider_source_sequence)) {
-      watermark->second = evidence;
-    }
-  }
-
-  /// The same-origin sequence high-water mark for `evidence`, if any.
-  [[nodiscard]] std::optional<std::uint64_t> ProviderSequenceWatermark(
-      const SceneResourceId &scene_resource_id,
-      const core::SceneObjectProviderEvidenceDTO &evidence) const {
-    const auto watermark = provider_sequence_watermarks_.find(scene_resource_id);
-    if (watermark == provider_sequence_watermarks_.end() ||
-        !SameProviderOrigin(watermark->second, evidence)) {
-      return std::nullopt;
-    }
-    return watermark->second.provider_source_sequence;
-  }
-
-  /// Never persisted: owner reconstruction starts with no confirmations.
-  std::map<SceneResourceId, ProviderFreshnessRecord>
-      provider_freshness_records_;
-  /// Per-object (provider origin, highest accepted provider source sequence)
-  /// over committed evidence and confirmations. Only the origin fields and
-  /// the sequence are meaningful. It survives record clearing, history
-  /// compaction and unrelated commits for the owner process lifetime, and is
-  /// reset only by object removal or a committed origin change.
-  std::map<SceneResourceId, core::SceneObjectProviderEvidenceDTO>
-      provider_sequence_watermarks_;
 };
 
 } // namespace manyforge::scene

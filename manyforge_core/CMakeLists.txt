@@ -45,6 +45,7 @@ add_library(manyforge_core
   src/component_lifecycle_coordinator.cpp
   src/cclc_open_request.cpp
   src/cclc_lifecycle_target_driver.cpp
+  src/component_stream_health.cpp
   src/component_incident.cpp
   src/cell_admission.cpp
   src/kernel_cell_admission_owner.cpp
@@ -132,7 +133,6 @@ add_library(manyforge_core
   src/runtime_scale_governor.cpp
   src/runtime_collision_query_session.cpp
   src/runtime_collision_lookahead_session.cpp
-  src/scene_snapshot_lease.cpp
   src/scene_frame_resolution.cpp
   src/stop_intent.cpp
   src/stop_scope_resolver.cpp
@@ -769,6 +769,11 @@ if(BUILD_TESTING)
   gtest_discover_tests(test_fake_clock
     PROPERTIES TIMEOUT ${MANYFORGE_GTEST_TIMEOUT_SECONDS})
 
+  add_executable(test_component_stream_health test/test_component_stream_health.cpp)
+  target_link_libraries(test_component_stream_health PRIVATE manyforge_core GTest::gtest_main)
+  gtest_discover_tests(test_component_stream_health
+    PROPERTIES TIMEOUT ${MANYFORGE_GTEST_TIMEOUT_SECONDS})
+
   add_executable(test_manual_scheduler test/test_manual_scheduler.cpp)
   target_link_libraries(test_manual_scheduler PRIVATE manyforge_core GTest::gtest_main)
   gtest_discover_tests(test_manual_scheduler
@@ -982,13 +987,6 @@ if(BUILD_TESTING)
   target_link_libraries(test_collision_world_snapshot PRIVATE
     manyforge_core GTest::gtest_main)
   gtest_discover_tests(test_collision_world_snapshot
-    PROPERTIES TIMEOUT ${MANYFORGE_GTEST_TIMEOUT_SECONDS})
-
-  add_executable(test_scene_snapshot_lease
-    test/test_scene_snapshot_lease.cpp)
-  target_link_libraries(test_scene_snapshot_lease PRIVATE
-    manyforge_core GTest::gtest_main)
-  gtest_discover_tests(test_scene_snapshot_lease
     PROPERTIES TIMEOUT ${MANYFORGE_GTEST_TIMEOUT_SECONDS})
 
   add_executable(test_soft_on_path_stop_planner

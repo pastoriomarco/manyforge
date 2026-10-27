@@ -53,7 +53,7 @@ ROS2_CONTROL_RUNTIME_CONFIGURATION_SCHEMA_ID: Final = (
     "manyforge.value_schema.runtime.ros2_control_execution.v1"
 )
 ROS2_CONTROL_RUNTIME_CONFIGURATION_SCHEMA_REVISION: Final = (
-    "sha256:d60c4f1e7196f4eb6c4ebf4fd8d99980f4aa6b93f83de3e747f5253d7ea4795a"
+    "sha256:eb4a5f93825a6aede99963d3910f981c5159bdadcb7d48e1c8df1b2356fe2173"
 )
 EMPTY_PROVIDER_CONTRACT_SCHEMA_ID: Final = (
     "manyforge.value_schema.provider_contract.empty.v1"
@@ -227,6 +227,11 @@ CAPABILITIES: Final = {
     ),
     "validation.trajectory.non_collision": (
         "sha256:3cd04895527038906ddcb9c6ca9fd87f4535eba41e5014b04917c66603f26653",
+        "target_binding",
+        "capability_provider_binding",
+    ),
+    "scene.pose.observe": (
+        "sha256:7ce48309e3a8f884850dd1285cbd66e19da631fbbfd27d269828fb7048832a57",
         "target_binding",
         "capability_provider_binding",
     ),
@@ -1300,13 +1305,15 @@ def io_provider_lifecycle_plans() -> list[dict[str, Any]]:
     return plans
 
 
-def io_signal_lifecycle_product() -> tuple[dict[str, Any], dict[str, Any]]:
-    manifest, catalog = lifecycle_product(
-        "manyforge.provider.io_signals", io_provider_lifecycle_plans())
+def io_lifecycle_product(
+    provider_id: str, capability_ids: tuple[str, ...], endpoint_roles: list[str]
+) -> tuple[dict[str, Any], dict[str, Any]]:
+    """A model-free provider using the I/O lifecycle plans plus its offers."""
+    manifest, catalog = lifecycle_product(provider_id, io_provider_lifecycle_plans())
     manifest["offered_capabilities"].extend(
         {**capability_selector(capability_id),
-         "required_endpoint_role_ids": ["io_signal_service"]}
-        for capability_id in ("io.gpio.get_input", "io.gpio.wait_for_input", "io.gpio.set_output")
+         "required_endpoint_role_ids": endpoint_roles}
+        for capability_id in capability_ids
     )
     manifest["offered_capabilities"].sort(key=lambda row: row["capability_id"])
     manifest = revisioned_document(
@@ -1317,6 +1324,20 @@ def io_signal_lifecycle_product() -> tuple[dict[str, Any], dict[str, Any]]:
         catalog, domain="brand-lifecycle-plan-catalog",
         api_version=LIFECYCLE_CATALOG_API_VERSION, revision_field="catalog_digest")
     return manifest, catalog
+
+
+def io_signal_lifecycle_product() -> tuple[dict[str, Any], dict[str, Any]]:
+    return io_lifecycle_product(
+        "manyforge.provider.io_signals",
+        ("io.gpio.get_input", "io.gpio.wait_for_input", "io.gpio.set_output"),
+        ["io_signal_service"],
+    )
+
+
+def pose_source_lifecycle_product() -> tuple[dict[str, Any], dict[str, Any]]:
+    return io_lifecycle_product(
+        "manyforge.provider.pose_source", ("scene.pose.observe",), []
+    )
 
 
 def lite6_lifecycle_product() -> tuple[dict[str, Any], dict[str, Any]]:
@@ -2046,8 +2067,10 @@ def catalog_sources(
         include_motion_controlled_stop=False,
     )
     io_signal_manifest, _io_signal_catalog = io_signal_lifecycle_product()
+    pose_source_manifest, _pose_source_catalog = pose_source_lifecycle_product()
     manifests = {
         "io_signals": io_signal_manifest,
+        "pose_source": pose_source_manifest,
         "planning": provider_manifest(
             "manyforge.provider.native_planning",
             planner_capabilities,
@@ -3394,6 +3417,27 @@ def _deployment_intent(
         "assistant_profile_id": deployment["assistant_profile_id"],
         "compatibility": copy.deepcopy(deployment["compatibility"]),
     }
+    pose_source = deployment.get("pose_source")
+    if pose_source is not None:
+        # Model-free pose-source component (Isaac object observer).
+        result["components"].append(
+            {
+                "component_id": pose_source["component_id"],
+                "component_profile_id": "pose_source_v0",
+                "configuration": {
+                    "runtime_kind": "pose_source",
+                    "runtime_configuration": copy.deepcopy(
+                        pose_source["runtime_configuration"]
+                    ),
+                },
+                "target_settings": {},
+            }
+        )
+        result["components"].sort(key=lambda row: row["component_id"])
+        if pose_source["scene_pose_sources"]:
+            result["policies"]["scene_pose_sources"] = copy.deepcopy(
+                pose_source["scene_pose_sources"]
+            )
     return result
 
 

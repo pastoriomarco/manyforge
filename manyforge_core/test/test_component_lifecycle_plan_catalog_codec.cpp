@@ -193,6 +193,27 @@ TEST(ComponentLifecyclePlanCatalogCodec, IoConfiguredLimitMatchesMaintainedSeman
   EXPECT_FALSE(MakeIoProviderLifecycleCatalog(manifest).ok());
 }
 
+TEST(ComponentLifecyclePlanCatalogCodec, PoseSourceManifestReusesIoPlans) {
+  const auto plans = MakeIoProviderLifecyclePlans();
+  ASSERT_TRUE(plans.ok());
+  const auto catalog = MakeBrandLifecyclePlanCatalog(
+      ProviderManifestId(std::string(kPoseSourceLifecycleManifestId)),
+      ProviderManifestRevision(
+          "sha256:ef6556d1c96cb87d853aab52c2b03eed9536cec10b9787eecd22fbc2c83559ac"),
+      plans.value());
+  ASSERT_TRUE(catalog.ok());
+  auto manifest = ManifestFor(catalog.value());
+  // Same digest as the generated maintained pose-source provider manifest.
+  EXPECT_EQ(manifest.lifecycle_plan_catalog->semantic_digest.value(),
+            "sha256:475e9a13c72727fa02bf99122b1babd791a7bd878ce5bae279413a1e95632c48");
+  const auto actual = MakeIoProviderLifecycleCatalog(manifest);
+  ASSERT_TRUE(actual.ok()) << actual.error().message;
+  EXPECT_EQ(actual.value().plans, catalog.value().plans);
+
+  manifest.provider_manifest_id = ProviderManifestId("manyforge.provider.other");
+  EXPECT_FALSE(MakeIoProviderLifecycleCatalog(manifest).ok());
+}
+
 TEST(ComponentLifecyclePlanCatalogCodec, RejectsInvalidDigestAndUnsafeJsonInteger) {
   auto catalog = Catalog();
   catalog.catalog_digest =

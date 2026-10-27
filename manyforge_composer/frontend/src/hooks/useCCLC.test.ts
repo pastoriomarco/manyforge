@@ -111,11 +111,6 @@ const execution = {
   controlManagementMode: 'component_lifecycle',
   graphRevision: snapshot.graphRevision,
   retainedBundleId: snapshot.retainedBundleId,
-  sceneRevision: {
-    scene_id: 'scene.1',
-    revision_id: 1,
-    content_hash: 'sha256:scene',
-  },
 } satisfies ExecutionIdentity;
 
 afterEach(() => {

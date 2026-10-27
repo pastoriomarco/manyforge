@@ -738,6 +738,7 @@ TEST(DeploymentArtifactCodec, RosGripperOutputChoiceIsExplicitAndPositionAlwaysC
     std::get<core::JsonObjectDTO>(common.front().value).erase("output_mode");
     EXPECT_THROW((void)detail::decode_ros2_control_execution_gripper_target_configurations(common),
                  RetainedBundleError);
+    std::get<core::JsonObjectDTO>(common.front().value).erase("state_freshness_timeout_s");
     // Archival data still has exactly its twelve fields; no ROS output default
     // or live Native admission is restored by its common pure extraction.
     EXPECT_NO_THROW((void)detail::decode_execution_gripper_target_configurations(
@@ -755,6 +756,102 @@ TEST(DeploymentArtifactCodec, RosGripperOutputChoiceIsExplicitAndPositionAlwaysC
     EXPECT_TRUE(fixture.qualified.deployment().graph().graph().control_bindings.size() == 1U);
     EXPECT_TRUE(std::get<core::JsonValueDTO::Array>(unit.configuration.at("motion_target_limits").value).empty());
   }
+}
+
+TEST(DeploymentArtifactCodec, RosGripperStateFreshnessTimeoutIsRequiredData) {
+  const auto fixture = test::make_lite6_ros2_control_gripper_only_cclc_product_retention_fixture(
+      {}, "pneumatic");
+  const auto &source = fixture.qualified.deployment().normalized_authored_root();
+  for (const double timeout : {0.01, 0.75, 60.0, 0.0, 0.005, 60.5}) {
+    SCOPED_TRACE(std::to_string(timeout));
+    const bool accepted = timeout >= 0.01 && timeout <= 60.0;
+    const auto authored = authored_gripper_field(
+        source, "state_freshness_timeout_s", CanonicalValue(timeout));
+    auto rows = std::get<core::JsonValueDTO::Array>(
+        fixture.qualified.deployment().graph().graph().runtime_units.front()
+            .configuration.at("gripper_target_configurations").value);
+    std::get<core::JsonObjectDTO>(rows.front().value).at("state_freshness_timeout_s").value =
+        timeout;
+    if (!accepted) {
+      EXPECT_THROW((void)compile_deployment_draft(canonical_json(authored)),
+                   DeploymentArtifactCodecError);
+      EXPECT_THROW((void)detail::decode_ros2_control_execution_gripper_target_configurations(rows),
+                   RetainedBundleError);
+      continue;
+    }
+    EXPECT_NO_THROW((void)compile_deployment_draft(canonical_json(authored)));
+    const auto decoded = detail::decode_ros2_control_execution_gripper_target_configurations(rows);
+    ASSERT_EQ(decoded.size(), 1U);
+    EXPECT_DOUBLE_EQ(decoded.front().state_freshness_timeout_s, timeout);
+  }
+  const auto missing = authored_gripper_field(
+      source, "state_freshness_timeout_s", CanonicalValue(), true);
+  EXPECT_THROW((void)compile_deployment_draft(canonical_json(missing)),
+               DeploymentArtifactCodecError);
+  auto rows = std::get<core::JsonValueDTO::Array>(
+      fixture.qualified.deployment().graph().graph().runtime_units.front()
+          .configuration.at("gripper_target_configurations").value);
+  std::get<core::JsonObjectDTO>(rows.front().value).erase("state_freshness_timeout_s");
+  EXPECT_THROW((void)detail::decode_ros2_control_execution_gripper_target_configurations(rows),
+               RetainedBundleError);
+}
+
+TEST(DeploymentArtifactCodec, ComponentStreamOverridesNameGraphComponents) {
+  const auto policies = [](std::string_view streams) {
+    return std::string(
+               ",\"policies\":{\"retained_policy_records\":[],"
+               "\"stop_stage_parameters\":[],"
+               "\"commissioned_stop_interfaces\":[],"
+               "\"interrupt_sources\":[],\"interrupt_policies\":[],"
+               "\"interrupt_config\":{\"queue_depth\":8,"
+               "\"cancel_validation_timeout_ns\":1000,"
+               "\"motion_scope_arm_timeout_ns\":1000,"
+               "\"supervisory_poll_rate_hz\":10}") +
+           std::string(streams) + "}";
+  };
+  // An absent or empty table keeps the existing Deployment identity.
+  const auto ordinary =
+      produce(document(empty_graph(), "[]", "{\"records\":[]}", policies("")));
+  const auto empty_table =
+      produce(document(empty_graph(), "[]", "{\"records\":[]}",
+                       policies(",\"component_streams\":[]")));
+  EXPECT_EQ(empty_table.deployment_revision(), ordinary.deployment_revision());
+  expect_compute_error(
+      document(empty_graph(), "[]", "{\"records\":[]}",
+               policies(R"(,"component_streams":[{"controllable_component_id":"octomap_1","stream_id":"map_updates","severity":"fault"}])")),
+      "$.policies.component_streams[0].controllable_component_id");
+
+  const auto fixture =
+      test::make_lite6_ros2_control_gripper_only_cclc_product_retention_fixture(
+          {}, "pneumatic");
+  const auto &deployment = fixture.qualified.deployment();
+  ASSERT_FALSE(deployment.graph().graph().controllable_components.empty());
+  const auto &component = deployment.graph()
+                              .graph()
+                              .controllable_components.front()
+                              .controllable_component_id;
+  CanonicalValue::Object root = deployment.normalized_authored_root().as_object();
+  const auto found =
+      std::find_if(root.begin(), root.end(),
+                   [](const auto &member) { return member.first == "policies"; });
+  ASSERT_NE(found, root.end());
+  auto fields = found->second.as_object();
+  fields.emplace_back(
+      "component_streams",
+      CanonicalValue(CanonicalValue::Array{CanonicalValue(CanonicalValue::Object{
+          {"controllable_component_id", CanonicalValue(component.value())},
+          {"stream_id", CanonicalValue("measured_joints")},
+          {"budget_ns", CanonicalValue(300000000.0)},
+      })}));
+  found->second = CanonicalValue(std::move(fields));
+  const auto compiled =
+      compile_deployment_draft(canonical_json(CanonicalValue(std::move(root))));
+  EXPECT_NE(compiled.canonical_json.find("\"component_streams\""),
+            std::string::npos);
+  EXPECT_NE(compiled.deployment_revision,
+            deployment.deployment_revision().value());
+  const auto verified = verify_deployment_draft(compiled.canonical_json);
+  EXPECT_EQ(verified.deployment_revision, compiled.deployment_revision);
 }
 
 } // namespace

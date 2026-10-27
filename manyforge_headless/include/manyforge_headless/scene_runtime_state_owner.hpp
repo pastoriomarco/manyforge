@@ -128,14 +128,17 @@ struct SceneInitializationCounters final {
   std::uint64_t stale_completion_rejected{};
 };
 
-/// One Manager-configured cell source; loss does not discard historical poses.
-struct ConfiguredPoseSourceAvailability final {
-  std::string source_id;
-  std::string source_epoch_base;
-  bool available{true};
-  friend bool operator==(const ConfiguredPoseSourceAvailability &,
-                         const ConfiguredPoseSourceAvailability &) = default;
+/// One `scene.carried_object_lost` event, published for the operator alarm
+/// only. The last kMaximumCarriedObjectLossEvents are kept; nothing else
+/// reads them.
+struct CarriedObjectLossEvent final {
+  std::string event_id;
+  std::string scene_resource_id;
+  std::string full_text;
+  friend bool operator==(const CarriedObjectLossEvent &,
+                         const CarriedObjectLossEvent &) = default;
 };
+inline constexpr std::size_t kMaximumCarriedObjectLossEvents = 16U;
 
 struct SceneRuntimeStateSnapshot final {
   std::uint64_t initialization_generation{};
@@ -150,7 +153,7 @@ struct SceneRuntimeStateSnapshot final {
   std::optional<std::uint64_t> active_replay_id;
   SceneInitializationCounters counters;
   std::vector<PoseSourceLifetimeSnapshot> pose_sources;
-  std::optional<ConfiguredPoseSourceAvailability> configured_pose_source{};
+  std::vector<CarriedObjectLossEvent> carried_object_losses{};
 };
 
 struct SceneReplayBatch final {
@@ -196,15 +199,6 @@ public:
   void RetirePoseSource(const SceneRuntimeIdentity &expected_runtime_identity,
                         std::string_view source_id);
 
-  /// Pins the current checked source. Exact re-publication never clears loss.
-  void ConfigurePoseSourceAvailability(
-      const SceneRuntimeIdentity &expected_runtime_identity,
-      std::string source_id, std::string source_epoch_base);
-  /// Exact current-source loss closes freshness independently of incident IO.
-  void MarkPoseSourceUnavailable(
-      const SceneRuntimeIdentity &expected_runtime_identity,
-      std::string_view source_id, std::string_view source_epoch_base);
-
   [[nodiscard]] std::string BeginInitialization(SceneRuntimeIdentity candidate,
                                                 bool deferred,
                                                 std::string reason);
@@ -219,6 +213,9 @@ public:
   [[nodiscard]] PoseObservationAcceptance
   ObservePose(PoseSourceObservation observation,
               std::string_view apply_policy = {});
+
+  /// Appends one loss event, dropping the oldest beyond the bound.
+  void RecordCarriedObjectLoss(CarriedObjectLossEvent event);
 
   [[nodiscard]] SceneRuntimeStateSnapshot Snapshot() const;
 
@@ -250,7 +247,7 @@ private:
   std::optional<std::string> active_replay_digest_;
   SceneInitializationCounters counters_;
   std::map<PoseObservationKey, PoseRecord> pose_records_;
-  std::optional<ConfiguredPoseSourceAvailability> configured_pose_source_;
+  std::vector<CarriedObjectLossEvent> carried_object_losses_;
 };
 
 [[nodiscard]] manyforge::content_identity::CanonicalValue

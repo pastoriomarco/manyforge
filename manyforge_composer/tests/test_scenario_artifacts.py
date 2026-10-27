@@ -1027,7 +1027,7 @@ def test_scenario_load_settles_only_proven_preacceptance_rejection(
             (
                 "Manager rejected the exact Deployment candidate: "
                 "apply_rejected: "
-                "named Isaac world requires --isaac-site-settings"
+                "named Isaac world is unavailable"
             ),
         )
 
@@ -1052,7 +1052,7 @@ def test_scenario_load_settles_only_proven_preacceptance_rejection(
         assert detail["managerOutcome"] == "rejected"
         assert detail["causeCode"] == "manager_apply_rejected"
         assert "effect" not in detail
-        assert "named Isaac world requires --isaac-site-settings" in detail["message"]
+        assert "named Isaac world is unavailable" in detail["message"]
         assert claim_owner.settlements == ["owner_commit"]
         assert coordinator.local_claim_pending is False
         assert coordinator.mutation_ready is True

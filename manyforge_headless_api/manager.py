@@ -91,6 +91,17 @@ class ManagerPort(Protocol):
     ) -> dict[str, Any]: ...
 
 
+def _transaction_body(request: SceneTransactionRequest) -> dict[str, Any]:
+    """Wire body; absent optional members stay absent, not null."""
+
+    transaction = request.model_dump(mode="json")
+    if transaction.get("program_node_evidence") is None:
+        transaction.pop("program_node_evidence", None)
+    if transaction["operation"].get("grasp_lost_bound", ...) is None:
+        transaction["operation"].pop("grasp_lost_bound")
+    return transaction
+
+
 def _canonical_json(value: dict[str, Any]) -> bytes:
     try:
         return rfc8785.dumps(value)
@@ -545,9 +556,7 @@ class ManagerCommandClient:
             "principal_id": trusted_principal_id,
             "transport": "http",
         }
-        transaction = request.model_dump(mode="json")
-        if transaction.get("program_node_evidence") is None:
-            transaction.pop("program_node_evidence", None)
+        transaction = _transaction_body(request)
         transaction["attribution"] = attribution
         response = self._exchange(
             {
@@ -560,9 +569,7 @@ class ManagerCommandClient:
         return response
 
     def scene_transaction_status(self, request: SceneTransactionRequest) -> dict[str, Any]:
-        transaction = request.model_dump(mode="json")
-        if transaction.get("program_node_evidence") is None:
-            transaction.pop("program_node_evidence", None)
+        transaction = _transaction_body(request)
         # Attribution is not mutation intent. Lookup performs no Scene write.
         transaction["attribution"] = {
             "assurance": "unverified", "principal_id": None, "transport": "http"}

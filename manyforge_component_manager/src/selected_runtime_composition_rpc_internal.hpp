@@ -65,8 +65,6 @@ DecodeSelectedRuntimeCompositionRpcRequest(std::string_view bytes);
 [[nodiscard]] SelectedRuntimeCompositionRpcRequest
 DecodeSelectedRuntimeCompositionRpcRequestVariant(std::string_view bytes);
 
-// An optional positive observer-retirement receipt extends only ordinary
-// result tails. Omitted receipts preserve launch-facts and legacy bytes.
 [[nodiscard]] std::string EncodeSelectedRuntimeCompositionRpcResponse(
     const SelectedRuntimeCompositionRpcResponse &response);
 [[nodiscard]] SelectedRuntimeCompositionRpcResponse

@@ -3,6 +3,7 @@
 #include <manyforge_content_identity/canonical_value.hpp>
 #include <manyforge_content_identity/content_identity.hpp>
 #include <manyforge_core/geometry/pose_math.hpp>
+#include <manyforge_core/types/carried_object_lost.hpp>
 
 #include <algorithm>
 #include <cmath>
@@ -37,8 +38,6 @@ constexpr std::string_view kPoseApplicationRequestApiVersion =
     "manyforge.scene_runtime_pose_application.v1";
 constexpr std::uint64_t kMaximumSafeInteger = 9007199254740991ULL;
 constexpr std::size_t kMaximumTextBytes = 1024U;
-constexpr std::string_view kProviderFreshnessUnsupported =
-    "provider_freshness_unsupported";
 
 core::ErrorDTO Error(const std::string_view code,
                      const std::string_view message,
@@ -135,7 +134,6 @@ struct DecodedReference final {
 
 struct DecodedPose final {
   core::Pose3DTO pose;
-  std::optional<std::int64_t> source_timestamp_ns;
   std::optional<DecodedReference> reference;
 };
 
@@ -210,8 +208,8 @@ DecodedPose DecodePose(const CanonicalValue &payload) {
         "pose payload is not in the semantic cell frame");
   }
   static_cast<void>(Text(Member(pose, "frame_id"), "pose frame_id"));
+  static_cast<void>(SourceTimestampNs(Member(pose, "source_stamp_ns")));
   return {DecodeRigidPose(pose, "pose"),
-          SourceTimestampNs(Member(pose, "source_stamp_ns")),
           referenced ? std::optional(DecodeReference(Member(payload, "reference")))
                      : std::nullopt};
 }
@@ -293,10 +291,10 @@ std::string SceneRequestId(const core::ProjectionRevisionDTO &projection,
                  {"object_id", CanonicalValue(observation.key.object_id)},
                  {"payload", observation.payload},
                  {"policy_id", CanonicalValue(observation.key.policy_id)},
+                 {"observed_at_ns",
+                  Integer(observation.observed_at_ns, "observed_at_ns")},
                  {"provider_source_epoch",
                   CanonicalValue(evidence.provider_source_epoch)},
-                 {"received_at_ns",
-                  Integer(evidence.received_at_ns, "received_at_ns")},
                  {"source_epoch", CanonicalValue(observation.source_epoch)},
                  {"source_epoch_order", Unsigned(observation.source_epoch_order,
                                                  "source_epoch_order")},
@@ -304,14 +302,6 @@ std::string SceneRequestId(const core::ProjectionRevisionDTO &projection,
                  {"source_sequence",
                   Unsigned(observation.source_sequence, "source_sequence")},
              })));
-}
-
-bool SameProviderOrigin(const core::SceneObjectProviderEvidenceDTO &left,
-                        const core::SceneObjectProviderEvidenceDTO &right) {
-  return left.provider_instance_id == right.provider_instance_id &&
-         left.provider_manifest_id == right.provider_manifest_id &&
-         left.provider_manifest_revision == right.provider_manifest_revision &&
-         left.provider_source_epoch == right.provider_source_epoch;
 }
 
 // URDF origin: translation, then fixed-axis roll, pitch and yaw.
@@ -327,35 +317,12 @@ core::Pose3DTO JointOrigin(const deployment::UrdfOriginIr &origin) {
            cr * cp * sy - sr * sp * cy, cr * cp * cy + sr * sp * sy}};
 }
 
-// The observed reference-relative object pose composed onto the attachment's
-// carrier frame. The relative pose must come from one source instant.
-core::Result<std::pair<core::Pose3DTO, core::ComponentSceneFrameRefDTO>>
-RelativeCarrierPose(const core::ISceneAuthority &scene_authority,
-                    const SceneRuntimeReferenceLinkResolver &resolver,
-                    const core::ProjectionRevisionDTO &projection,
-                    const core::SceneObjectStateDTO &object_state,
-                    const DecodedPose &decoded) {
-  using Reply =
-      core::Result<std::pair<core::Pose3DTO, core::ComponentSceneFrameRefDTO>>;
-  if (!decoded.reference.has_value()) {
-    return Reply::Err(Error(
-        "scene_runtime_pose_reference_missing",
-        "relative attached pose update requires an observation relative to "
-        "a gripper reference",
-        {{"scene_resource_id", object_state.scene_resource_id.value()}}));
-  }
-  const auto &reference = *decoded.reference;
-  if (!reference.pose_in_reference.has_value()) {
-    return Reply::Err(Error("scene_runtime_pose_reference_unavailable",
-                            "source has no reference-relative object pose",
-                            {{"reference_link", reference.link}}));
-  }
-  if (!reference.coherent) {
-    return Reply::Err(Error(
-        "scene_runtime_pose_reference_not_coherent",
-        "source did not read object and reference at one instant",
-        {{"reference_link", reference.link}}));
-  }
+// The attachment row of an attached object in the admitted projection.
+core::Result<core::CarriedObjectAttachmentDTO>
+CurrentAttachment(const core::ISceneAuthority &scene_authority,
+                  const core::ProjectionRevisionDTO &projection,
+                  const core::SceneObjectStateDTO &object_state) {
+  using Reply = core::Result<core::CarriedObjectAttachmentDTO>;
   const auto snapshot = scene_authority.LogicalSnapshot();
   if (snapshot == nullptr ||
       snapshot->revision != projection.scene_revision) {
@@ -376,8 +343,66 @@ RelativeCarrierPose(const core::ISceneAuthority &scene_authority,
         "attached pose-source object has no exact carried attachment",
         {{"scene_resource_id", object_state.scene_resource_id.value()}}));
   }
-  const auto *carrier =
-      std::get_if<core::ComponentSceneFrameRefDTO>(&attachment->carrier_frame_ref);
+  return Reply::Ok(*attachment);
+}
+
+// Unchanged within the deadband; a zero bound compares that axis exactly.
+bool WithinDeadband(const core::Pose3DTO &current,
+                    const core::Pose3DTO &observed,
+                    const SceneRuntimePoseDeadband &deadband) {
+  if (current == observed) {
+    return true;
+  }
+  const auto distance = SceneRuntimePoseDistanceBetween(current, observed);
+  return (deadband.translation_m > 0.0
+              ? distance.translation_m <= deadband.translation_m
+              : current.position_m == observed.position_m) &&
+         (deadband.rotation_rad > 0.0
+              ? distance.rotation_rad <= deadband.rotation_rad
+              : current.orientation == observed.orientation);
+}
+
+struct CarrierPose final {
+  core::Pose3DTO observed_in_carrier;
+  core::CarriedObjectAttachmentDTO attachment;
+  core::ComponentSceneFrameRefDTO carrier;
+};
+
+// The observed reference-relative object pose composed onto the attachment's
+// carrier frame, with the attachment row. The relative pose must come from
+// one source instant.
+core::Result<CarrierPose>
+RelativeCarrierPose(const core::ISceneAuthority &scene_authority,
+                    const SceneRuntimeReferenceLinkResolver &resolver,
+                    const core::ProjectionRevisionDTO &projection,
+                    const core::SceneObjectStateDTO &object_state,
+                    const DecodedPose &decoded) {
+  using Reply = core::Result<CarrierPose>;
+  if (!decoded.reference.has_value()) {
+    return Reply::Err(Error(
+        "scene_runtime_pose_reference_missing",
+        "relative attached pose update requires an observation relative to "
+        "a gripper reference",
+        {{"scene_resource_id", object_state.scene_resource_id.value()}}));
+  }
+  const auto &reference = *decoded.reference;
+  if (!reference.pose_in_reference.has_value()) {
+    return Reply::Err(Error("scene_runtime_pose_reference_unavailable",
+                            "source has no reference-relative object pose",
+                            {{"reference_link", reference.link}}));
+  }
+  if (!reference.coherent) {
+    return Reply::Err(Error(
+        "scene_runtime_pose_reference_not_coherent",
+        "source did not read object and reference at one instant",
+        {{"reference_link", reference.link}}));
+  }
+  auto attachment = CurrentAttachment(scene_authority, projection, object_state);
+  if (!attachment.ok()) {
+    return Reply::Err(attachment.error());
+  }
+  const auto *carrier = std::get_if<core::ComponentSceneFrameRefDTO>(
+      &attachment.value().carrier_frame_ref);
   if (carrier == nullptr || !resolver) {
     return Reply::Err(Error(
         "scene_runtime_pose_reference_unresolved",
@@ -389,13 +414,28 @@ RelativeCarrierPose(const core::ISceneAuthority &scene_authority,
   if (!carrier_in_reference.ok()) {
     return Reply::Err(carrier_in_reference.error());
   }
-  return Reply::Ok(std::make_pair(
+  return Reply::Ok(CarrierPose{
       core::multiply_poses(core::inverse_pose(carrier_in_reference.value()),
                            *reference.pose_in_reference),
-      *carrier));
+      attachment.value(), *carrier});
 }
 
 } // namespace
+
+SceneRuntimePoseDistance
+SceneRuntimePoseDistanceBetween(const core::Pose3DTO &from,
+                                const core::Pose3DTO &to) noexcept {
+  const auto dx = to.position_m.x_m - from.position_m.x_m;
+  const auto dy = to.position_m.y_m - from.position_m.y_m;
+  const auto dz = to.position_m.z_m - from.position_m.z_m;
+  const auto &a = from.orientation;
+  const auto &b = to.orientation;
+  const auto dot = std::abs(a.x * b.x + a.y * b.y + a.z * b.z + a.w * b.w) /
+                   std::sqrt((a.x * a.x + a.y * a.y + a.z * a.z + a.w * a.w) *
+                             (b.x * b.x + b.y * b.y + b.z * b.z + b.w * b.w));
+  return {std::sqrt(dx * dx + dy * dy + dz * dz),
+          2.0 * std::acos(std::min(1.0, dot))};
+}
 
 core::Result<core::Pose3DTO>
 SceneRuntimeFixedLinkTransform(const deployment::UrdfDocumentIr &urdf,
@@ -487,22 +527,19 @@ ToString(const SceneRuntimePoseApplicationStatus status) noexcept {
     return "already_applied";
   case SceneRuntimePoseApplicationStatus::kSkippedAttached:
     return "skipped_attached";
-  case SceneRuntimePoseApplicationStatus::kFreshnessConfirmed:
-    return "freshness_confirmed";
+  case SceneRuntimePoseApplicationStatus::kUnchanged:
+    return "unchanged";
   }
   return {};
 }
 
 bool SceneRuntimePoseApplicationRetainsPlanningEvidence(
-    const SceneRuntimePoseApplicationStatus status,
-    const std::uint64_t retained_provider_source_sequence,
-    const std::uint64_t observation_source_sequence) noexcept {
+    const SceneRuntimePoseApplicationStatus status) noexcept {
   switch (status) {
   case SceneRuntimePoseApplicationStatus::kCommitted:
   case SceneRuntimePoseApplicationStatus::kAlreadyApplied:
-    return retained_provider_source_sequence == observation_source_sequence;
-  case SceneRuntimePoseApplicationStatus::kFreshnessConfirmed:
-    return retained_provider_source_sequence < observation_source_sequence;
+  case SceneRuntimePoseApplicationStatus::kUnchanged:
+    return true;
   case SceneRuntimePoseApplicationStatus::kNotRequested:
   case SceneRuntimePoseApplicationStatus::kDeferredBeforePlanning:
   case SceneRuntimePoseApplicationStatus::kDeferredBetweenNodes:
@@ -527,7 +564,7 @@ bool SceneRuntimePoseApplicationResult::valid() const noexcept {
            update_status.has_value();
   case SceneRuntimePoseApplicationStatus::kAlreadyApplied:
   case SceneRuntimePoseApplicationStatus::kSkippedAttached:
-  case SceneRuntimePoseApplicationStatus::kFreshnessConfirmed:
+  case SceneRuntimePoseApplicationStatus::kUnchanged:
     return scene_request_id.has_value() && !scene_request_id->empty() &&
            projection_revision.has_value() && projection_revision->valid() &&
            !update_status.has_value();
@@ -537,9 +574,11 @@ bool SceneRuntimePoseApplicationResult::valid() const noexcept {
 
 SceneRuntimePoseProjector::SceneRuntimePoseProjector(
     core::ISceneAuthority &scene_authority, core::CellId cell_id,
-    SceneRuntimeReferenceLinkResolver reference_resolver)
+    SceneRuntimeReferenceLinkResolver reference_resolver,
+    SceneRuntimeCarrierStopRequester carrier_stop_requester)
     : scene_authority_(scene_authority), cell_id_(std::move(cell_id)),
-      reference_resolver_(std::move(reference_resolver)) {
+      reference_resolver_(std::move(reference_resolver)),
+      carrier_stop_requester_(std::move(carrier_stop_requester)) {
   if (cell_id_.empty()) {
     throw std::invalid_argument("pose projector cell_id must be non-empty");
   }
@@ -552,7 +591,8 @@ SceneRuntimePoseProjector::Apply(
     const core::GraphRevision &active_graph_revision,
     const PoseSourceObservation &observation,
     const std::optional<SceneRuntimePoseApplicationResult> &prior_application,
-    const std::string_view apply_policy) {
+    const std::string_view apply_policy,
+    const SceneRuntimePoseDeadband deadband) {
   const auto policy = apply_policy.empty()
                           ? std::string_view(observation.key.policy_id)
                           : apply_policy;
@@ -598,23 +638,14 @@ SceneRuntimePoseProjector::Apply(
               "logical-scene projection does not match the admitted runtime"));
   }
 
-  const auto freshness_budget =
-      observation.expires_at_ns - observation.observed_at_ns;
+  // The logical scene carries the provider identity only; the observation's
+  // sequence and times stay in the scene runtime.
   core::SceneObjectProviderEvidenceDTO evidence{
       provider->provider_instance_id,
       provider->provider_manifest_id,
       provider->provider_manifest_revision,
       SceneRuntimePoseProviderSourceEpoch(observation),
-      observation.source_sequence,
-      observation.observed_at_ns,
-      decoded.source_timestamp_ns,
-      freshness_budget,
   };
-  if (policy == "before_planning" || policy == "between_nodes") {
-    // A safe-point capture is a planning snapshot, not a continuous feed.
-    evidence.source_timestamp_ns.reset();
-    evidence.source_freshness_budget_ns.reset();
-  }
   if (!evidence.valid()) {
     return core::Result<SceneRuntimePoseApplicationResult>::Err(
         Error("scene_runtime_pose_evidence_invalid",
@@ -661,167 +692,9 @@ SceneRuntimePoseProjector::Apply(
         {SceneRuntimePoseApplicationStatus::kAlreadyApplied, request_id,
          projection, std::nullopt});
   }
-  if (!object_state.attached && object_state.provider_evidence.has_value() &&
-      SameProviderOrigin(*object_state.provider_evidence, evidence)) {
-    const auto &previous = *object_state.provider_evidence;
-    if (previous.provider_source_sequence > evidence.provider_source_sequence) {
-      return core::Result<SceneRuntimePoseApplicationResult>::Err(
-          Error("scene_runtime_pose_observation_stale",
-                "logical scene already contains a newer provider observation",
-                {{"previous_source_sequence",
-                  std::to_string(previous.provider_source_sequence)},
-                 {"received_source_sequence",
-                  std::to_string(evidence.provider_source_sequence)}}));
-    }
-    const bool safe_point_policy =
-        policy == "before_planning" || policy == "between_nodes";
-    if (evidence.provider_source_sequence >
-            previous.provider_source_sequence &&
-        safe_point_policy && !evidence.source_timestamp_ns.has_value() &&
-        !evidence.source_freshness_budget_ns.has_value() &&
-        !previous.source_timestamp_ns.has_value() &&
-        !previous.source_freshness_budget_ns.has_value() &&
-        previous.received_at_ns <= evidence.received_at_ns) {
-      core::Result<core::Pose3DTO> current_pose;
-      try {
-        current_pose = scene_authority_.GetObjectPose(
-            core::SceneResourceId(observation.key.object_id));
-      } catch (const std::exception &error) {
-        return core::Result<SceneRuntimePoseApplicationResult>::Err(
-            Error("scene_runtime_pose_scene_unavailable", error.what()));
-      }
-      if (!current_pose.ok()) {
-        return core::Result<SceneRuntimePoseApplicationResult>::Err(
-            Error("scene_runtime_pose_scene_unavailable",
-                  current_pose.error().message.empty()
-                      ? "logical-scene object pose is unavailable"
-                      : current_pose.error().message,
-                  {{"scene_error_code", current_pose.error().code}}));
-      }
-      if (current_pose.value() == decoded.pose) {
-        auto result = SceneRuntimePoseApplicationResult{
-            SceneRuntimePoseApplicationStatus::kAlreadyApplied, request_id,
-            projection, std::nullopt};
-        return core::Result<SceneRuntimePoseApplicationResult>::Ok(
-            std::move(result));
-      }
-    }
-    if (previous.provider_source_sequence ==
-        evidence.provider_source_sequence) {
-      if (previous.source_timestamp_ns != evidence.source_timestamp_ns ||
-          previous.source_freshness_budget_ns !=
-              evidence.source_freshness_budget_ns) {
-        return core::Result<SceneRuntimePoseApplicationResult>::Err(
-            Error("scene_runtime_pose_evidence_conflict",
-                  "provider observation identity has changed timing evidence"));
-      }
-      core::Result<core::Pose3DTO> current_pose;
-      try {
-        current_pose = scene_authority_.GetObjectPose(
-            core::SceneResourceId(observation.key.object_id));
-      } catch (const std::exception &error) {
-        return core::Result<SceneRuntimePoseApplicationResult>::Err(
-            Error("scene_runtime_pose_scene_unavailable", error.what()));
-      }
-      if (!current_pose.ok()) {
-        return core::Result<SceneRuntimePoseApplicationResult>::Err(
-            Error("scene_runtime_pose_scene_unavailable",
-                  current_pose.error().message.empty()
-                      ? "logical-scene object pose is unavailable"
-                      : current_pose.error().message,
-                  {{"scene_error_code", current_pose.error().code}}));
-      }
-      if (current_pose.value() != decoded.pose) {
-        return core::Result<SceneRuntimePoseApplicationResult>::Err(
-            Error("scene_runtime_pose_evidence_conflict",
-                  "provider observation identity has changed pose content"));
-      }
-      auto result = SceneRuntimePoseApplicationResult{
-          SceneRuntimePoseApplicationStatus::kAlreadyApplied, request_id,
-          projection, std::nullopt};
-      return core::Result<SceneRuntimePoseApplicationResult>::Ok(
-          std::move(result));
-    }
-    // A strictly newer observation of the exact committed pose with the same
-    // origin and freshness budget only refreshes runtime freshness. The
-    // source timestamp is diagnostic and never gates this branch.
-    if (evidence.source_freshness_budget_ns.has_value() &&
-        previous.source_freshness_budget_ns ==
-            evidence.source_freshness_budget_ns &&
-        previous.received_at_ns <= evidence.received_at_ns) {
-      core::Result<core::Pose3DTO> current_pose;
-      try {
-        current_pose = scene_authority_.GetObjectPose(
-            core::SceneResourceId(observation.key.object_id));
-      } catch (const std::exception &error) {
-        return core::Result<SceneRuntimePoseApplicationResult>::Err(
-            Error("scene_runtime_pose_scene_unavailable", error.what()));
-      }
-      if (!current_pose.ok()) {
-        return core::Result<SceneRuntimePoseApplicationResult>::Err(
-            Error("scene_runtime_pose_scene_unavailable",
-                  current_pose.error().message.empty()
-                      ? "logical-scene object pose is unavailable"
-                      : current_pose.error().message,
-                  {{"scene_error_code", current_pose.error().code}}));
-      }
-      if (current_pose.value() == decoded.pose) {
-        if (prior_application.has_value() &&
-            prior_application->status ==
-                SceneRuntimePoseApplicationStatus::kFreshnessConfirmed) {
-          // This exact observation was already confirmed; a replay reports
-          // the outcome again without refreshing freshness age.
-          auto result = SceneRuntimePoseApplicationResult{
-              SceneRuntimePoseApplicationStatus::kFreshnessConfirmed,
-              request_id, projection, std::nullopt};
-          return core::Result<SceneRuntimePoseApplicationResult>::Ok(
-              std::move(result));
-        }
-        core::Result<core::ProjectionRevisionDTO> confirmed;
-        try {
-          confirmed = scene_authority_.ConfirmProviderFreshness(
-              core::ProviderFreshnessConfirmationDTO{
-                  projection,
-                  core::SceneResourceId(observation.key.object_id),
-                  decoded.pose,
-                  evidence,
-              });
-        } catch (const std::exception &error) {
-          return core::Result<SceneRuntimePoseApplicationResult>::Err(
-              Error("scene_runtime_pose_scene_unavailable", error.what()));
-        }
-        if (confirmed.ok()) {
-          if (confirmed.value() != projection) {
-            return core::Result<SceneRuntimePoseApplicationResult>::Err(Error(
-                "scene_runtime_pose_freshness_confirmation_invalid",
-                "logical-scene owner changed the projection revision of a "
-                "freshness-only confirmation"));
-          }
-          auto result = SceneRuntimePoseApplicationResult{
-              SceneRuntimePoseApplicationStatus::kFreshnessConfirmed,
-              request_id, projection, std::nullopt};
-          return core::Result<SceneRuntimePoseApplicationResult>::Ok(
-              std::move(result));
-        }
-        if (confirmed.error().code != kProviderFreshnessUnsupported) {
-          // No Commit fallback: surface the owner's refusal with its complete
-          // details (including failed, applied and uncertain projections of a
-          // partial propagation) instead of a revision-advancing write.
-          auto details = confirmed.error().details;
-          details["scene_error_code"] = confirmed.error().code;
-          return core::Result<SceneRuntimePoseApplicationResult>::Err(
-              Error("scene_runtime_pose_freshness_confirmation_failed",
-                    confirmed.error().message.empty()
-                        ? "logical-scene owner rejected the freshness "
-                          "confirmation"
-                        : confirmed.error().message,
-                    std::move(details)));
-        }
-        // The authority has no freshness-only path: keep today's commit.
-      }
-    }
+  if (!object_state.attached) {
+    ForgetGraspBaseline(observation.key.object_id);
   }
-
   core::Pose3DTO update_pose = decoded.pose;
   core::SceneTransactionFrameRefDTO update_frame =
       core::CellSceneFrameRefDTO{cell_id_};
@@ -829,9 +702,14 @@ SceneRuntimePoseProjector::Apply(
       (policy == "continuous" || policy == "between_nodes")
           ? std::nullopt
           : std::optional(false);
+  // Observation order (stale or repeated samples) is enforced per source by
+  // the scene runtime before an observation reaches this projector.
+  const bool same_origin = object_state.provider_evidence == evidence;
+  // The object's pose already in the scene in the update frame, when the
+  // update frame is the cell or the attachment's carrier.
+  std::optional<core::Pose3DTO> current_pose;
   if (object_state.attached && policy == kRelativeToAttachedPolicy) {
-    core::Result<std::pair<core::Pose3DTO, core::ComponentSceneFrameRefDTO>>
-        carried;
+    core::Result<CarrierPose> carried;
     try {
       carried = RelativeCarrierPose(scene_authority_, reference_resolver_,
                                     projection, object_state, decoded);
@@ -843,70 +721,89 @@ SceneRuntimePoseProjector::Apply(
       return core::Result<SceneRuntimePoseApplicationResult>::Err(
           carried.error());
     }
-    update_pose = carried.value().first;
-    update_frame = carried.value().second;
+    if (const auto lost = GraspDrift(carried.value().attachment,
+                                     carried.value().observed_in_carrier)) {
+      return CarriedObjectLost(carried.value().attachment, *lost, projection,
+                               request_id, decoded.pose);
+    }
+    update_pose = carried.value().observed_in_carrier;
+    update_frame = carried.value().carrier;
+    current_pose = carried.value().attachment.pose_in_carrier_frame;
     expected_attached = true;
+  } else if (object_state.attached && policy == "continuous") {
+    // The cell-frame observation expressed on the carrier through the
+    // object's current resolved pose: the measured carried offset. Without
+    // an exact current attachment row this sample is applied unchecked, as
+    // before; the scene owner resolves the carrier itself.
+    try {
+      const auto attachment =
+          CurrentAttachment(scene_authority_, projection, object_state);
+      if (attachment.ok() && attachment.value().grasp_lost_check) {
+        const auto object_pose = scene_authority_.GetObjectPose(
+            core::SceneResourceId(observation.key.object_id));
+        if (!object_pose.ok()) {
+          return core::Result<SceneRuntimePoseApplicationResult>::Err(Error(
+              "scene_runtime_pose_scene_unavailable",
+              object_pose.error().message,
+              {{"scene_error_code", object_pose.error().code}}));
+        }
+        const auto measured = core::multiply_poses(
+            core::multiply_poses(attachment.value().pose_in_carrier_frame,
+                                 core::inverse_pose(object_pose.value())),
+            decoded.pose);
+        if (const auto lost = GraspDrift(attachment.value(), measured)) {
+          return CarriedObjectLost(attachment.value(), *lost, projection,
+                                   request_id, decoded.pose);
+        }
+      }
+    } catch (const std::exception &error) {
+      return core::Result<SceneRuntimePoseApplicationResult>::Err(
+          Error("scene_runtime_pose_scene_unavailable", error.what()));
+    }
+  } else if (!object_state.attached && same_origin) {
+    core::Result<core::Pose3DTO> cell_pose;
+    try {
+      cell_pose = scene_authority_.GetObjectPose(
+          core::SceneResourceId(observation.key.object_id));
+    } catch (const std::exception &error) {
+      return core::Result<SceneRuntimePoseApplicationResult>::Err(
+          Error("scene_runtime_pose_scene_unavailable", error.what()));
+    }
+    if (!cell_pose.ok()) {
+      return core::Result<SceneRuntimePoseApplicationResult>::Err(
+          Error("scene_runtime_pose_scene_unavailable",
+                cell_pose.error().message.empty()
+                    ? "logical-scene object pose is unavailable"
+                    : cell_pose.error().message,
+                {{"scene_error_code", cell_pose.error().code}}));
+    }
+    current_pose = cell_pose.value();
+  }
+  // A same-origin sample of the pose already in the scene, within the
+  // binding's deadband (exact by default), changes nothing: no transaction,
+  // no new revision.
+  if (same_origin && current_pose &&
+      WithinDeadband(*current_pose, update_pose, deadband)) {
+    return core::Result<SceneRuntimePoseApplicationResult>::Ok(
+        {SceneRuntimePoseApplicationStatus::kUnchanged, request_id, projection,
+         std::nullopt});
   }
 
-  core::SceneCommitResultDTO committed{
-      request_id,
-      core::RequestReplayStatusDTO::kAcceptedNew,
-      false,
-      Error("scene_runtime_pose_scene_unavailable",
-            "logical-scene owner was not called"),
-      std::nullopt,
-      std::nullopt,
-      core::SceneProjectionCommitStatusDTO::kNotAttempted,
-      std::nullopt,
-  };
+  std::optional<core::SceneCommitResultDTO> submitted;
   try {
-    core::SceneTransactionRequestDTO request{
-        core::PublicRequestContextDTO{
-            request_id,
-            scene_authority_.CurrentRequestOwnerEpoch(),
-            "scene_runtime_pose_source",
-            request_id.value(),
-        },
-        {},
-        projection,
-        core::UpdateObjectPoseRequestDTO{
-            core::SceneResourceId(observation.key.object_id),
-            update_pose,
-            update_frame,
-            evidence,
-            expected_attached,
-        },
-        std::nullopt,
-    };
-    committed = scene_authority_.Commit(request);
-    // Only this exact, pre-acceptance housekeeping refusal permits one new
-    // request. An old-epoch rejection without this proof is not replayable.
-    if (committed.presence_valid() && !committed.success && committed.error &&
-        committed.replay_status == core::RequestReplayStatusDTO::kStaleRequestOwnerEpoch &&
-        committed.request_id == request.request_context.request_id &&
-        committed.projection_status == core::SceneProjectionCommitStatusDTO::kNotAttempted &&
-        !committed.transaction_sequence &&
-        committed.error->code == "stale_request_owner_epoch") {
-      const auto &details = committed.error->details;
-      const auto reason = details.find("reason");
-      const auto previous = details.find("previous_request_owner_epoch");
-      const auto next = details.find("expected_request_owner_epoch");
-      if (reason != details.end() && reason->second == "scene_history_compaction_no_effect" &&
-          previous != details.end() && next != details.end() &&
-          previous->second == request.request_context.request_owner_epoch.value() &&
-          next->second != previous->second && !next->second.empty() &&
-          scene_authority_.CurrentProjectionRevision() == projection &&
-          scene_authority_.CurrentRequestOwnerEpoch().value() == next->second) {
-        request.request_context.request_owner_epoch = core::RequestOwnerEpoch(next->second);
-        request_id = core::RequestId(request_id.value() + ".after-compaction");
-        request.request_context.request_id = request_id;
-        committed = scene_authority_.Commit(request);
-      }
-    }
+    submitted = Commit(request_id, projection,
+                       core::UpdateObjectPoseRequestDTO{
+                           core::SceneResourceId(observation.key.object_id),
+                           update_pose,
+                           update_frame,
+                           evidence,
+                           expected_attached,
+                       });
   } catch (const std::exception &error) {
     return core::Result<SceneRuntimePoseApplicationResult>::Err(
         Error("scene_runtime_pose_scene_unavailable", error.what()));
   }
+  const auto &committed = *submitted;
   if (!committed.presence_valid()) {
     return core::Result<SceneRuntimePoseApplicationResult>::Err(
         Error("scene_runtime_pose_commit_invalid",
@@ -930,7 +827,7 @@ SceneRuntimePoseProjector::Apply(
               std::move(details)));
   }
   auto result = SceneRuntimePoseApplicationResult{
-      SceneRuntimePoseApplicationStatus::kCommitted, request_id,
+      SceneRuntimePoseApplicationStatus::kCommitted, committed.request_id,
       *committed.committed_projection_revision, committed.update_status};
   if (!result.valid()) {
     return core::Result<SceneRuntimePoseApplicationResult>::Err(Error(
@@ -938,6 +835,141 @@ SceneRuntimePoseProjector::Apply(
         "logical-scene owner returned an incomplete pose-update success"));
   }
   return core::Result<SceneRuntimePoseApplicationResult>::Ok(std::move(result));
+}
+
+core::SceneCommitResultDTO
+SceneRuntimePoseProjector::Commit(core::RequestId request_id,
+                                  const core::ProjectionRevisionDTO &projection,
+                                  core::SceneOperationRequestDTO operation) {
+  core::SceneTransactionRequestDTO request{
+      core::PublicRequestContextDTO{
+          request_id,
+          scene_authority_.CurrentRequestOwnerEpoch(),
+          "scene_runtime_pose_source",
+          request_id.value(),
+      },
+      {},
+      projection,
+      std::move(operation),
+      std::nullopt,
+  };
+  auto committed = scene_authority_.Commit(request);
+  // Only this exact, pre-acceptance housekeeping refusal permits one new
+  // request. An old-epoch rejection without this proof is not replayable.
+  if (committed.presence_valid() && !committed.success && committed.error &&
+      committed.replay_status == core::RequestReplayStatusDTO::kStaleRequestOwnerEpoch &&
+      committed.request_id == request.request_context.request_id &&
+      committed.projection_status == core::SceneProjectionCommitStatusDTO::kNotAttempted &&
+      !committed.transaction_sequence &&
+      committed.error->code == "stale_request_owner_epoch") {
+    const auto &details = committed.error->details;
+    const auto reason = details.find("reason");
+    const auto previous = details.find("previous_request_owner_epoch");
+    const auto next = details.find("expected_request_owner_epoch");
+    if (reason != details.end() && reason->second == "scene_history_compaction_no_effect" &&
+        previous != details.end() && next != details.end() &&
+        previous->second == request.request_context.request_owner_epoch.value() &&
+        next->second != previous->second && !next->second.empty() &&
+        scene_authority_.CurrentProjectionRevision() == projection &&
+        scene_authority_.CurrentRequestOwnerEpoch().value() == next->second) {
+      request.request_context.request_owner_epoch = core::RequestOwnerEpoch(next->second);
+      request_id = core::RequestId(request_id.value() + ".after-compaction");
+      request.request_context.request_id = request_id;
+      committed = scene_authority_.Commit(request);
+    }
+  }
+  return committed;
+}
+
+std::optional<SceneRuntimePoseDistance> SceneRuntimePoseProjector::GraspDrift(
+    const core::CarriedObjectAttachmentDTO &attachment,
+    const core::Pose3DTO &measured_in_carrier) {
+  if (!attachment.grasp_lost_check) {
+    return std::nullopt;
+  }
+  // The baseline is the first measured carried offset of this attachment, so
+  // the comparison never mixes the stream's frames with the scene's own
+  // attach-time offset (they can differ by a fixed frame or symmetry offset
+  // plus the real grasp error).
+  std::lock_guard lock(grasp_baselines_mutex_);
+  const auto found = grasp_baselines_.find(attachment.scene_resource_id.value());
+  if (found == grasp_baselines_.end() ||
+      found->second.carried_object_attachment_id !=
+          attachment.carried_object_attachment_id) {
+    grasp_baselines_.insert_or_assign(
+        attachment.scene_resource_id.value(),
+        GraspBaseline{attachment.carried_object_attachment_id,
+                      measured_in_carrier});
+    return std::nullopt;
+  }
+  const auto &bound = attachment.grasp_lost_check->bound;
+  const auto distance = SceneRuntimePoseDistanceBetween(
+      found->second.measured_in_carrier, measured_in_carrier);
+  if (distance.translation_m <= bound.translation_m &&
+      distance.rotation_rad <= bound.rotation_rad) {
+    return std::nullopt;
+  }
+  return distance;
+}
+
+void SceneRuntimePoseProjector::ForgetGraspBaseline(
+    const std::string &scene_resource_id) {
+  std::lock_guard lock(grasp_baselines_mutex_);
+  grasp_baselines_.erase(scene_resource_id);
+}
+
+core::Result<SceneRuntimePoseApplicationResult>
+SceneRuntimePoseProjector::CarriedObjectLost(
+    const core::CarriedObjectAttachmentDTO &attachment,
+    const SceneRuntimePoseDistance &distance,
+    const core::ProjectionRevisionDTO &projection,
+    const core::RequestId &request_id,
+    const core::Pose3DTO &observed_in_cell) {
+  ForgetGraspBaseline(attachment.scene_resource_id.value());
+  const auto &bound = attachment.grasp_lost_check->bound;
+  std::map<std::string, std::string> details{
+      {"scene_resource_id", attachment.scene_resource_id.value()},
+      {"carried_object_attachment_id",
+       attachment.carried_object_attachment_id.value()},
+      {"controllable_component_id",
+       attachment.controllable_component_id.value()},
+      {"translation_m", std::to_string(distance.translation_m)},
+      {"rotation_rad", std::to_string(distance.rotation_rad)},
+      {"bound_translation_m", std::to_string(bound.translation_m)},
+      {"bound_rotation_rad", std::to_string(bound.rotation_rad)},
+      {"event_id", request_id.value()},
+  };
+  // 1. Stop the carrier's motion first, so the next motion leaves the
+  //    contact through the start-contact allowance instead of a misleading
+  //    runtime-collision Stop.
+  if (carrier_stop_requester_) {
+    const auto refused = carrier_stop_requester_(SceneRuntimeCarriedObjectLoss{
+        attachment.scene_resource_id, attachment.carried_object_attachment_id,
+        attachment.controllable_component_id, projection.graph_revision,
+        request_id.value() + ".stop"});
+    details.emplace("stop", refused ? refused->code : "requested");
+  }
+  // 2. Detach it as an ordinary world object at the observed pose.
+  try {
+    const auto detached = Commit(
+        core::RequestId(request_id.value() + ".detach"), projection,
+        core::DetachCarriedObjectRequestDTO{
+            attachment.carried_object_attachment_id,
+            attachment.carried_object_attachment_revision, observed_in_cell,
+            core::CellSceneFrameRefDTO{cell_id_}});
+    details.emplace("detach", detached.success
+                                  ? "committed"
+                                  : (detached.error ? detached.error->code
+                                                    : "rejected"));
+  } catch (const std::exception &) {
+    details.emplace("detach", "scene_runtime_pose_scene_unavailable");
+  }
+  return core::Result<SceneRuntimePoseApplicationResult>::Err(Error(
+      core::kCarriedObjectLostReason,
+      core::CarriedObjectLostFullText(
+          attachment.scene_resource_id.value(), distance.translation_m,
+          distance.rotation_rad, bound.translation_m, bound.rotation_rad),
+      std::move(details)));
 }
 
 } // namespace manyforge::headless

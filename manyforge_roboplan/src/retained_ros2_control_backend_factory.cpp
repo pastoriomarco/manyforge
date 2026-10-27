@@ -7,10 +7,31 @@
 #include <thread>
 #include <utility>
 
+#include <manyforge_roboplan/host_component_stream_health.hpp>
 #include <manyforge_roboplan/retained_execution_state_sink.hpp>
 
 namespace manyforge::roboplan_backend {
 namespace {
+
+/// CP9: the gripper's `gripper_feedback` stream where the backend subscribes
+/// to raw feedback (Isaac effort transport): `fault` + `ack` (a stale gripper
+/// after the target was reached is a lost provider, as before), arrival
+/// liveness, budget = the gripper's `state_freshness_timeout_s`.
+void declare_gripper_feedback_stream(ros2_control_execution::Ros2GripperActionConfig &config,
+                                     const core::RuntimeParticipantBinding &binding) {
+  if (config.output_mode == core::GripperOutputMode::kNone ||
+      config.transport_kind != "isaac_joint_state_effort" || config.state_topic.empty())
+    return;
+  auto declared = host_component_stream_health()->Declare(
+      binding.value().controllable_component_id,
+      core::StreamDeclarationDTO{
+          "gripper_feedback",
+          static_cast<core::Duration>(config.state_freshness_timeout_s * 1e9),
+          core::StreamSeverityDTO::kFault, core::StreamRecoveryDTO::kAck,
+          core::StreamTimestampSourceDTO::kArrival});
+  if (!declared.ok()) throw std::invalid_argument(declared.error().message);
+  config.feedback_stream = std::move(declared.value());
+}
 
 class SingleUseRos2ControlBackendConfig final {
 public:
@@ -250,6 +271,7 @@ RetainedRuntimeBackendFactory make_retained_ros2_control_backend_factory(
           gripper = std::make_unique<
               ros2_control_execution::Ros2GripperCommandBackend>(
               *resources, sink, clock, scheduler, true);
+          declare_gripper_feedback_stream(*selected.gripper, *gripper_binding);
           gripper->configure_gripper_action(
               gripper_binding->value().command_target_id.value(),
               *selected.gripper);
@@ -389,6 +411,7 @@ make_retained_ros2_control_gripper_backend(
       config.ros_context_provider);
   auto gripper = std::make_unique<ros2_control_execution::Ros2GripperCommandBackend>(
       *resources, sink, clock, scheduler, true);
+  declare_gripper_feedback_stream(*config.gripper, binding);
   gripper->configure_gripper_action(binding.value().command_target_id.value(), *config.gripper);
   auto* const backend = gripper.get();
   const auto bound = handle->BindGripperOnly(

@@ -1,6 +1,6 @@
 schema_version: manyforge.operator_alarm_catalog.v1
-catalog_version: 2.6.0
-descriptor_digest: sha256:7cbf4060ee2b4e6790a4ee425c9b3e5c07eb4dcb91aa61395f3e759055ff6a7f
+catalog_version: 2.7.0
+descriptor_digest: sha256:eae2f502411ddcb0aacb0d71cf73716ecb833dbf5d0496d5cb2d5cfe292b6049
 definitions:
   - definition_id: manyforge.motion.runtime_collision
     version: 2
@@ -323,4 +323,31 @@ definitions:
     acknowledgement_required: true
     acknowledgement_reason_required: false
     requires_motion_attention: true
+    max_evidence_refs: 1
+
+  - definition_id: scene.carried_object_lost
+    version: 1
+    title: Carried object lost
+    message_template: "Carried object lost: {subject_id}"
+    alarm_class: scene
+    priority: high
+    priority_rationale: >-
+      A carried object left its grasp; the motion was stopped and the object
+      detached, and the operator should check the cell.
+    consequence: >-
+      The Program node that was moving fails with carried_object_lost; the
+      object is an ordinary world object at its observed pose.
+    operator_response: >-
+      Read the detail text, check the object and the gripper, acknowledge, then
+      continue or reset the Program.
+    scope_fields: [subject_kind, subject_id, resource_ids]
+    set_authority: manyforge.runtime.scene_pose_condition
+    clear_authority: manyforge.runtime.scene_pose_condition
+    adapter_id: manyforge.alarm_adapter.runtime_scene_condition
+    runtime_modes:
+      - program
+      - direct_control
+    acknowledgement_required: true
+    acknowledgement_reason_required: false
+    requires_motion_attention: false
     max_evidence_refs: 1

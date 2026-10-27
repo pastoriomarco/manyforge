@@ -3569,13 +3569,6 @@ TEST(ManagerNamedApplyCoordinator,
         predecessor.request.candidate_retained_bundle_id,
         predecessor.request.candidate_graph_revision, package.bundle->retained_bundle_id(),
         prototype.prepared_activation, core::AdmissionGeneration(7U), std::nullopt};
-    if (scenario == 0) {
-      request.isaac_pose_observer_launch_facts =
-          ManagerIsaacPoseObserverLaunchFactsDTO{
-              "/run/manyforge/checked-observer.yaml", "observer.actual",
-              "manager.original.observer.1"};
-      ASSERT_TRUE(request.valid());
-    }
     int original_source_calls = 0;
     const ManagerNamedApplyCoordinator::OriginalBringUpPlanSource original =
         [&](const ManagerApplyIntentDTO &intent, const deployment::RetainedBundle &old,
@@ -3657,8 +3650,6 @@ TEST(ManagerNamedApplyCoordinator,
       ASSERT_TRUE(plan);
       const auto stored = journal.ReadIntent(accepted.apply_id, accepted.apply_generation);
       ASSERT_TRUE(stored);
-      EXPECT_EQ(stored->intent.isaac_pose_observer_launch_facts,
-                request.isaac_pose_observer_launch_facts);
       ASSERT_EQ(cell_admission.lookup_intents.size(), 1U);
       EXPECT_EQ(cell_admission.lookup_intents.front().request_payload_digest, plan->plan_digest);
       EXPECT_EQ(cell_admission.acquire_calls, 1);
@@ -3681,13 +3672,6 @@ TEST(ManagerNamedApplyCoordinator,
                    ManagerNamedApplyCoordinatorError);
       EXPECT_EQ(stored->intent.scene_initialization,
                 ManagerSceneInitialization::kPreserve);
-      auto conflicting_facts = request;
-      conflicting_facts.isaac_pose_observer_launch_facts->source_epoch_base =
-          "manager.original.observer.foreign";
-      ASSERT_TRUE(conflicting_facts.valid());
-      EXPECT_THROW(static_cast<void>(coordinator.AcceptOrReplay(
-                       conflicting_facts, never_reconstruct)),
-                   ManagerNamedApplyCoordinatorError);
       EXPECT_TRUE(coordinator.AcceptOrReplay(request, never_reconstruct).request_replayed);
       EXPECT_EQ(cell_admission.acquire_calls, 1);
       EXPECT_EQ(cell_admission.lookup_intents.size(), lookups);
@@ -3705,11 +3689,14 @@ TEST(ManagerNamedApplyCoordinator,
 
 TEST(ManagerNamedApplyCoordinator,
      OriginalLinkedApplyUsesActualScenePreservingObjectsAttachmentsAndStopsOnUncertainty) {
-  for (int scenario = -1; scenario != 13; ++scenario) {
+  for (int scenario = -1; scenario != 14; ++scenario) {
     SCOPED_TRACE(scenario);
     ScopedPackageRoot package_root;
     ScopedPackageRoot state_root;
-    const bool initial = scenario == -1 || scenario >= 7;
+    // Scenario 13 streams pose-only commits after the request and between
+    // Stage and Begin; Apply binds identity only and still succeeds.
+    const bool streaming = scenario == 13;
+    const bool initial = scenario == -1 || (scenario >= 7 && !streaming);
     auto empty = MaterializeRosRuntimePackage(package_root.path(), true);
     auto previous = MaterializeRosRuntimePackage(package_root.path(), initial, deployment::test::kLite6ArmTargetId, kDigestOne);
     auto package = MaterializeRosRuntimePackage(package_root.path(), false, deployment::test::kLite6ArmTargetId, kDigestTwo);
@@ -3760,11 +3747,44 @@ TEST(ManagerNamedApplyCoordinator,
     const auto attached = actual_scene.Commit(attach);
     ASSERT_TRUE(attached.success) << (attached.error ? attached.error->message : "missing error");
     }
+    if (streaming) {
+      SceneTransactionRequestDTO add_streamed{
+          {RequestId("actual-add-streamed"), actual_scene.CurrentRequestOwnerEpoch(), "Manager regression",
+           std::nullopt},
+          {}, actual_scene.CurrentProjectionRevision(),
+          AddObjectRequestDTO{SceneResourceId("streamed-box"), BoxShapeDTO{{0.1, 0.1, 0.1}},
+                              Pose3DTO{}, CellSceneFrameRefDTO{journal.cell_id()}, {}},
+          cell_admission.GetAuthoringAdmission().admission_generation};
+      const auto streamed = actual_scene.Commit(add_streamed);
+      ASSERT_TRUE(streamed.success) << (streamed.error ? streamed.error->message : "missing error");
+    }
     cell_admission.last_release.reset();
     const auto preserved = actual_scene.LogicalSnapshot();
-    ASSERT_EQ(preserved->objects.size(), initial ? 0U : 1U);
+    ASSERT_EQ(preserved->objects.size(), initial ? 0U : (streaming ? 2U : 1U));
     ASSERT_EQ(preserved->carried_object_attachments.size(), initial ? 0U : 1U);
-    const auto preserved_bytes = scene::EncodeLogicalSceneSnapshot(*preserved);
+    // The adopted Scene: the latest one, after any streamed pose commit.
+    auto preserved_bytes = scene::EncodeLogicalSceneSnapshot(*preserved);
+    std::uint64_t streamed_sequence = 0U;
+    const auto stream_pose = [&](const double x_m) {
+      Pose3DTO pose;
+      pose.position_m.x_m = x_m;
+      ++streamed_sequence;
+      const SceneTransactionRequestDTO update{
+          {RequestId("streamed-pose-" + std::to_string(streamed_sequence)),
+           actual_scene.CurrentRequestOwnerEpoch(), "pose source", std::nullopt},
+          {}, actual_scene.CurrentProjectionRevision(),
+          UpdateObjectPoseRequestDTO{
+              SceneResourceId("streamed-box"), pose, CellSceneFrameRefDTO{journal.cell_id()},
+              SceneObjectProviderEvidenceDTO{ProviderInstanceId("stream-provider"),
+                                             ProviderManifestId("stream-manifest"),
+                                             ProviderManifestRevision(std::string(kDigestOne)),
+                                             "stream-epoch"},
+              false},
+          std::nullopt};
+      const auto committed = actual_scene.Commit(update);
+      ASSERT_TRUE(committed.success) << (committed.error ? committed.error->message : "missing error");
+      preserved_bytes = scene::EncodeLogicalSceneSnapshot(*actual_scene.LogicalSnapshot());
+    };
     const auto original_scene_owner = actual_scene.CurrentRequestOwnerEpoch();
     FixedActiveRuntimePlanSource active_plan_source(
         predecessor, BuildVerifiedRuntimeConvergencePlan(
@@ -3814,6 +3834,10 @@ TEST(ManagerNamedApplyCoordinator,
         projection->accept_next_rebuild = scenario == 8;
         resolver.clients.push_back(std::move(projection));
       }
+      if (streaming) stream_pose(0.30);  // after the request, before Stage
+    };
+    scene_owner.before_begin = [&](const auto &) {
+      if (streaming) stream_pose(0.35);  // after Stage, before adoption
     };
     scene_owner.alter_begin = [&](auto &input) {
       if (scenario == 1) input.parent_authority.parent_claim.intent.owner_epoch = RequestOwnerEpoch("foreign-manager");
@@ -3928,7 +3952,7 @@ TEST(ManagerNamedApplyCoordinator,
     const auto component = plan->plan.children.front().intent.controllable_component_id;
     auto first = coordinator.RecoverIncompleteApply();
     ASSERT_TRUE(first);
-    if (scenario >= 9) {
+    if (scenario >= 9 && !streaming) {
       ASSERT_EQ(first->state, ManagerNamedApplyResultState::kUnknownEffect);
       ASSERT_TRUE(first->terminal_outcome && first->terminal_outcome->failure);
       EXPECT_EQ(first->terminal_outcome->failure->failure_code, "scene_product_projection_staging_failed");
@@ -4155,7 +4179,11 @@ TEST(ManagerNamedApplyCoordinator,
       EXPECT_EQ(runtime_composition.phases.size(), scenario == 6 ? 2U : 1U);
       EXPECT_EQ(scene_owner.ReadMaintenanceInitialization({accepted.apply_id, accepted.apply_generation}).has_value(), scenario >= 4);
     } else {
-      ASSERT_EQ(progressed->state, ManagerNamedApplyResultState::kPending);
+      ASSERT_EQ(progressed->state, ManagerNamedApplyResultState::kPending)
+          << (progressed->terminal_outcome && progressed->terminal_outcome->failure
+                  ? progressed->terminal_outcome->failure->failure_code + ": " +
+                        progressed->terminal_outcome->failure->failure_message
+                  : std::string("no failure"));
       EXPECT_EQ(publication_store.publish_calls, 1);
       EXPECT_EQ(scene_owner.complete_calls, 1);
       ASSERT_TRUE(journal.ReadPublicationReceipt(accepted.apply_id, accepted.apply_generation));
@@ -4204,8 +4232,9 @@ TEST(ManagerNamedApplyCoordinator,
           throw std::logic_error("replacement reconstructed original plan callback");
         });
     EXPECT_TRUE(observed.request_replayed);
-    EXPECT_EQ(observed.state, (scenario <= 0 || scenario == 8) ? ManagerNamedApplyResultState::kSucceeded
-                                          : ManagerNamedApplyResultState::kUnknownEffect);
+    EXPECT_EQ(observed.state, (scenario <= 0 || scenario == 8 || streaming)
+                                  ? ManagerNamedApplyResultState::kSucceeded
+                                  : ManagerNamedApplyResultState::kUnknownEffect);
     static_cast<void>(replaced.RecoverIncompleteApply());
     EXPECT_EQ(runtime_composition.calls, composition_calls);
     EXPECT_EQ(runtime_composition.child_submit_calls, 1);
@@ -4224,7 +4253,10 @@ TEST(ManagerNamedApplyCoordinator,
 }
 
 
-void ExerciseOriginalConfigurationScene(const bool lose_stage_response, const int eligibility = 0) {
+// `streaming` commits pose-only updates after the request and before Begin;
+// Apply binds identity only and adopts the latest Scene.
+void ExerciseOriginalConfigurationScene(const bool lose_stage_response, const int eligibility = 0,
+                                        const bool streaming = false) {
     ScopedPackageRoot package_root;
     ScopedPackageRoot state_root;
     auto empty = MaterializeRosRuntimePackage(package_root.path(), true);
@@ -4275,11 +4307,44 @@ void ExerciseOriginalConfigurationScene(const bool lose_stage_response, const in
         "attach", "attach:attempt.1", "scene.carried_attachment"};
     const auto attached = actual_scene.Commit(attach);
     ASSERT_TRUE(attached.success) << (attached.error ? attached.error->message : "missing error");
+    if (streaming) {
+      SceneTransactionRequestDTO add_streamed{
+          {RequestId("actual-add-streamed"), actual_scene.CurrentRequestOwnerEpoch(), "Manager regression",
+           std::nullopt},
+          {}, actual_scene.CurrentProjectionRevision(),
+          AddObjectRequestDTO{SceneResourceId("streamed-box"), BoxShapeDTO{{0.1, 0.1, 0.1}},
+                              Pose3DTO{}, CellSceneFrameRefDTO{journal.cell_id()}, {}},
+          cell_admission.GetAuthoringAdmission().admission_generation};
+      const auto streamed = actual_scene.Commit(add_streamed);
+      ASSERT_TRUE(streamed.success) << (streamed.error ? streamed.error->message : "missing error");
+    }
     cell_admission.last_release.reset();
     const auto preserved = actual_scene.LogicalSnapshot();
-    ASSERT_EQ(preserved->objects.size(), 1U);
+    ASSERT_EQ(preserved->objects.size(), streaming ? 2U : 1U);
     ASSERT_EQ(preserved->carried_object_attachments.size(), 1U);
-    const auto preserved_bytes = scene::EncodeLogicalSceneSnapshot(*preserved);
+    // The adopted Scene: the latest one, after any streamed pose commit.
+    auto preserved_bytes = scene::EncodeLogicalSceneSnapshot(*preserved);
+    std::uint64_t streamed_sequence = 0U;
+    const auto stream_pose = [&](const double x_m) {
+      Pose3DTO pose;
+      pose.position_m.x_m = x_m;
+      ++streamed_sequence;
+      const SceneTransactionRequestDTO update{
+          {RequestId("streamed-pose-" + std::to_string(streamed_sequence)),
+           actual_scene.CurrentRequestOwnerEpoch(), "pose source", std::nullopt},
+          {}, actual_scene.CurrentProjectionRevision(),
+          UpdateObjectPoseRequestDTO{
+              SceneResourceId("streamed-box"), pose, CellSceneFrameRefDTO{journal.cell_id()},
+              SceneObjectProviderEvidenceDTO{ProviderInstanceId("stream-provider"),
+                                             ProviderManifestId("stream-manifest"),
+                                             ProviderManifestRevision(std::string(kDigestOne)),
+                                             "stream-epoch"},
+              false},
+          std::nullopt};
+      const auto committed = actual_scene.Commit(update);
+      ASSERT_TRUE(committed.success) << (committed.error ? committed.error->message : "missing error");
+      preserved_bytes = scene::EncodeLogicalSceneSnapshot(*actual_scene.LogicalSnapshot());
+    };
     const auto original_scene_owner = actual_scene.CurrentRequestOwnerEpoch();
     FixedActiveRuntimePlanSource active_plan_source(
         predecessor, BuildVerifiedRuntimeConvergencePlan(
@@ -4348,7 +4413,10 @@ void ExerciseOriginalConfigurationScene(const bool lose_stage_response, const in
           ActiveControlConfigurationGeneration(1U)});
     }
     std::vector<std::string> events;
-    scene_owner.configuration_event = [&](const auto &event) { events.push_back(event); };
+    scene_owner.configuration_event = [&](const auto &event) {
+      events.push_back(event);
+      if (streaming && event == "Begin") stream_pose(0.35);  // after Stage, before adoption
+    };
     scene_owner.before_configuration_stage = [&](const auto &input) {
       events.push_back("Stage");
       const auto stored = journal.ReadIntent(input.authority.owner.apply_id, input.authority.owner.apply_generation);
@@ -4368,6 +4436,7 @@ void ExerciseOriginalConfigurationScene(const bool lose_stage_response, const in
         projection->accept_next_rebuild = true;
         resolver.clients.push_back(std::move(projection));
       }
+      if (streaming) stream_pose(0.30);  // after the request, before Stage
     };
     scene_owner.after_configuration_stage = [&] {
       if (lose_stage_response) throw std::runtime_error("lost original configuration Stage response");
@@ -4507,12 +4576,21 @@ void ExerciseOriginalConfigurationScene(const bool lose_stage_response, const in
       ASSERT_EQ(completed->state, ProjectionMaintenanceInitializationState::kCompleted);
       const auto publication = journal.ReadPublicationReceipt(accepted.apply_id, accepted.apply_generation);
       ASSERT_TRUE(publication);
-      EXPECT_EQ(completed->publication_receipt, publication->publication.publication_receipt);
-      EXPECT_EQ(completed->authoritative_snapshot_identity.revision, preserved->revision);
+      // The Scene owner names the Scene it adopted; the publication keeps the
+      // request's revision as evidence.
+      EXPECT_TRUE(SamePublicationIdentity(completed->publication_receipt,
+                                          publication->publication.publication_receipt));
+      EXPECT_EQ(completed->authoritative_snapshot_identity.revision,
+                actual_scene.LogicalSnapshot()->revision);
+      EXPECT_EQ(completed->authoritative_snapshot_identity.revision == preserved->revision, !streaming);
       const auto head = publication_store.ReadActiveBundlePublication(publication->publication.publication_receipt.publication_generation);
       ASSERT_TRUE(head.ok());
       EXPECT_EQ(head.value(), publication->publication.publication_receipt);
-      EXPECT_EQ(actual_scene.CurrentProjectionRevision(), publication->publication.publication_receipt.request.candidate_projection_revision);
+      EXPECT_TRUE(SameProjectionIdentity(
+          actual_scene.CurrentProjectionRevision(),
+          publication->publication.publication_receipt.request.candidate_projection_revision));
+      EXPECT_EQ(actual_scene.CurrentProjectionRevision().scene_revision,
+                completed->target_projection_revision.scene_revision);
       EXPECT_EQ(runtime_composition.phases, std::vector<ManagerSelectedRuntimeCompositionPhase>({
           ManagerSelectedRuntimeCompositionPhase::kPrepare, ManagerSelectedRuntimeCompositionPhase::kFinalize,
           ManagerSelectedRuntimeCompositionPhase::kFinalize}));
@@ -4588,6 +4666,11 @@ TEST(ManagerNamedApplyCoordinator,
 TEST(ManagerNamedApplyCoordinator,
      OriginalConfigurationStageUncertaintyKeepsParentHeldWithoutReplacementRecapture) {
   ExerciseOriginalConfigurationScene(true);
+}
+
+TEST(ManagerNamedApplyCoordinator,
+     OriginalConfigurationApplyAdoptsLatestSceneAfterPoseOnlyCommits) {
+  ExerciseOriginalConfigurationScene(false, 0, true);
 }
 
 } // namespace

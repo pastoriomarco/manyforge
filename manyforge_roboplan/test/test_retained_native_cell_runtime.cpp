@@ -1886,6 +1886,7 @@ TEST(RetainedNativeCellRuntimeTest,
   config.arm.gripper_controller = RetainedRos2ControlArmController{
       config.node_namespace + "/controller_manager", "gripper_controller", "TestSystem"};
   ros2_control_execution::Ros2GripperActionConfig transport;
+  transport.state_freshness_timeout_s = 1.0;
   transport.action_name = config.node_namespace + "/gripper_controller/gripper_cmd";
   transport.group_id = binding.value().model_groups.front().compiled_group_name;
   transport.joint_name = joint;

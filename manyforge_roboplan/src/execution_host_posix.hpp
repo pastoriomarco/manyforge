@@ -80,9 +80,6 @@ ExistingRegularFile(std::filesystem::path path, std::string_view label,
 
 [[nodiscard]] std::string RandomToken(std::string_view prefix);
 
-[[nodiscard]] component_manager::IsaacSiteSettings
-LoadManagedIsaacSiteSettings(const std::filesystem::path &path);
-
 [[nodiscard]] bool
 IsPortableRuntimeIdentity(const std::string_view value) noexcept;
 

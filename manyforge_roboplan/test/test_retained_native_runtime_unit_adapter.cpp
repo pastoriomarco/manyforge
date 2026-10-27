@@ -1740,12 +1740,12 @@ TEST(RetainedNativeRuntimeUnitAdapter,
   ASSERT_NE(identity, nullptr);
   EXPECT_EQ(TextMember(*identity, "schema_version"),
             "manyforge.execution_identity.v2");
-  EXPECT_EQ(identity->as_object().size(), 8U);
+  EXPECT_EQ(identity->as_object().size(), 7U);
   for (const auto field : {"gripper_command_schema_id",
                            "gripper_command_schema_revision",
                            "gripper_target_role_id", "motion_target_role_id",
                            "program_binding_id", "program_id",
-                           "program_revision"}) {
+                           "program_revision", "scene_revision"}) {
     EXPECT_EQ(identity->find_object_member(field), nullptr) << field;
   }
 
@@ -3505,14 +3505,6 @@ int RunSelectedAdapterPacketChild(const int argc, char **argv) {
   const core::RuntimeEpoch epoch(arguments.at("--runtime-epoch"));
   const auto run_root = std::filesystem::path(
       arguments.at("--manyforge-managed-execution-run-root"));
-  if (arguments.contains("--manyforge-managed-isaac-site-settings")) {
-    std::ofstream captured(run_root / "site.arguments", std::ios::binary);
-    for (int index = 1; index < argc; ++index) {
-      captured << argv[index];
-      captured.put('\0');
-    }
-    if (!captured) throw std::runtime_error("site argv fixture capture failed");
-  }
   if (std::filesystem::exists(run_root / "shutdown-probe.mode")) {
     return RunShutdownPacketProbe(
         channel,
@@ -4459,187 +4451,9 @@ TEST(RetainedNativeRuntimeUnitAdapter,
 
 } // namespace
 
-TEST(RetainedNativeRuntimeUnitAdapter,
-     SiteDocumentIsCapturedAndRetainedWithOnlyItsPathInExecArguments) {
-  NativeFixture fixture;
-  ScopedTemporaryRoot targets;
-  const auto executable = InstallSelectedPacketTestTargets(targets.path());
-  const auto arguments_path = fixture.execution_run_root.path() / "site.arguments";
-  std::string document =
-      "schema: manyforge.isaac_attach_site.v1\n"
-      "observer_configuration_timeout_s: 60\n"
-      "pose_observers_by_cell: {}\n"
-      "# shell-looking text stays data: ; $(not_a_command) 'quoted'\n";
-  // Accepted site documents can exceed Linux's single exec argument limit.
-  document.append(256U * 1024U, ' ');
-  const auto expected_document = document;
-  std::filesystem::path snapshot_path;
-  {
-    auto adapter = component_manager::RetainedNativeRuntimeUnitAdapter(
-        targets.path(), fixture.root / "retained-package",
-        fixture.manager_state_root.path(), fixture.manager_run_root.path(),
-        fixture.execution_state_root.path(), fixture.execution_run_root.path(),
-        fixture.bundle_source, fixture.artifact_source,
-        std::string(contract::kOperatingSystem),
-        std::string(contract::kLaunchEnvironmentContract), {}, {}, {}, {}, document, executable);
-    const component_manager::ManagerIsaacPoseObserverLaunchFactsDTO observer_facts{
-        (fixture.manager_run_root.path() / "original-observer.json").string(),
-        std::string("configured\0source", 17U), "manager-spawn-1"};
-    adapter.SetIsaacPoseObserverStartupLaunchFacts(observer_facts);
-    document.assign("changed caller storage");
-    const auto started = adapter.EnsureRunning(*fixture.query);
-    ASSERT_EQ(started.state(), component_manager::ProcessPresenceState::kPresent);
-    for (int attempt = 0; attempt < 200 &&
-         !std::filesystem::exists(arguments_path); ++attempt) {
-      std::this_thread::sleep_for(std::chrono::milliseconds(10));
-    }
-    ASSERT_TRUE(std::filesystem::exists(arguments_path));
-    EXPECT_THROW(adapter.SetIsaacPoseObserverStartupLaunchFacts(std::nullopt),
-                 component_manager::RetainedNativeRuntimeUnitAdapterError);
-    std::istringstream captured(ReadFile(arguments_path));
-    std::vector<std::string> arguments;
-    for (std::string argument; std::getline(captured, argument, '\0');)
-      arguments.push_back(std::move(argument));
-    const auto expect_argument = [&](const std::string_view name,
-                                     const std::string &expected) {
-      const auto found = std::find(arguments.begin(), arguments.end(), name);
-      ASSERT_NE(found, arguments.end());
-      ASSERT_NE(std::next(found), arguments.end());
-      EXPECT_EQ(*std::next(found), expected);
-    };
-    expect_argument("--manyforge-managed-isaac-observer-snapshot",
-                    observer_facts.retained_snapshot_path);
-    expect_argument("--manyforge-managed-isaac-observer-source-id",
-                    manyforge::content_identity::canonical_json(
-                        CanonicalValue(observer_facts.source_id)));
-    expect_argument("--manyforge-managed-isaac-observer-epoch-base",
-                    observer_facts.source_epoch_base);
-    const auto option = std::find(arguments.begin(), arguments.end(),
-                                 "--manyforge-managed-isaac-site-settings");
-    ASSERT_NE(option, arguments.end());
-    ASSERT_NE(std::next(option), arguments.end());
-    snapshot_path = *std::next(option);
-    EXPECT_EQ(snapshot_path.parent_path(), fixture.manager_run_root.path());
-    EXPECT_NE(*std::next(option), expected_document);
-    EXPECT_EQ(ReadFile(snapshot_path), expected_document);
-    struct stat snapshot_status {};
-    ASSERT_EQ(::lstat(snapshot_path.c_str(), &snapshot_status), 0);
-    EXPECT_TRUE(S_ISREG(snapshot_status.st_mode));
-    EXPECT_EQ(snapshot_status.st_mode & 0777, 0600);
-    EXPECT_EQ(std::count(arguments.begin(), arguments.end(),
-                         "--manyforge-managed-isaac-site-settings"), 1);
-    EXPECT_EQ(adapter.EnsureStopped(*fixture.query).state(),
-              component_manager::ProcessPresenceState::kAbsent);
-    EXPECT_EQ(ReadFile(snapshot_path), expected_document);
-  }
-  // Adapter destruction and child retirement keep the original run evidence.
-  EXPECT_EQ(ReadFile(snapshot_path), expected_document);
-}
-
-
-TEST(RetainedNativeRuntimeUnitAdapter, ObserverCheckCapturesLosslessOutputAndKeepsSnapshot) {
-  NativeFixture fixture;
-  ScopedTemporaryRoot targets;
-  const auto executable = InstallSelectedPacketTestTargets(targets.path());
-  auto adapter = component_manager::RetainedNativeRuntimeUnitAdapter(
-      targets.path(), fixture.root / "retained-package",
-      fixture.manager_state_root.path(), fixture.manager_run_root.path(),
-      fixture.execution_state_root.path(), fixture.execution_run_root.path(),
-      fixture.bundle_source, fixture.artifact_source,
-      std::string(contract::kOperatingSystem),
-      std::string(contract::kLaunchEnvironmentContract), {}, {}, {}, {}, std::nullopt,
-      executable);
-  const auto source = fixture.manager_run_root.path() / "observer-check.input";
-  std::string expected = "{\"cell_id\":\"cell\",\"source_id\":\"source\",\"bindings\":[]}\n";
-  expected.append(256U * 1024U, ' ');
-  const std::string document("fixture-expanded");
-  { std::ofstream input(source, std::ios::binary); input << document; }
-  const auto checked = adapter.CheckIsaacPoseObserverConfiguration(source, 5.0);
-  EXPECT_EQ(checked.metadata, expected);
-  EXPECT_EQ(ReadFile(checked.retained_snapshot), document);
-  EXPECT_EQ(checked.retained_snapshot.parent_path(), fixture.manager_run_root.path());
-  { std::ofstream input(source, std::ios::binary); input << "changed external input"; }
-  EXPECT_EQ(ReadFile(checked.retained_snapshot), document);
-  EXPECT_EQ(adapter.ObserveProcess(*fixture.query).state(), component_manager::ProcessPresenceState::kAbsent);
-  struct stat status {};
-  ASSERT_EQ(::lstat(checked.retained_snapshot.c_str(), &status), 0);
-  EXPECT_EQ(status.st_mode & 0777, 0600);
-}
-
-TEST(RetainedNativeRuntimeUnitAdapter, ObserverCheckRefusalTimeoutAndOutputOverflowStayUnavailable) {
-  NativeFixture fixture;
-  ScopedTemporaryRoot targets;
-  const auto executable = InstallSelectedPacketTestTargets(targets.path());
-  auto adapter = component_manager::RetainedNativeRuntimeUnitAdapter(
-      targets.path(), fixture.root / "retained-package",
-      fixture.manager_state_root.path(), fixture.manager_run_root.path(),
-      fixture.execution_state_root.path(), fixture.execution_run_root.path(),
-      fixture.bundle_source, fixture.artifact_source,
-      std::string(contract::kOperatingSystem),
-      std::string(contract::kLaunchEnvironmentContract), {}, {}, {}, {}, std::nullopt,
-      executable);
-  const auto source = fixture.manager_run_root.path() / "observer-check.input";
-  for (const auto &input : {std::string("fixture-refuse"), std::string("fixture-wait"),
-                            std::string("fixture-overflow")}) {
-    { std::ofstream file(source, std::ios::binary); file << input; }
-    EXPECT_THROW((void)adapter.CheckIsaacPoseObserverConfiguration(
-                     source, input == "fixture-wait" ? 0.05 : 5.0),
-                 component_manager::RetainedNativeRuntimeUnitAdapterError);
-    EXPECT_EQ(adapter.ObserveProcess(*fixture.query).state(), component_manager::ProcessPresenceState::kAbsent);
-  }
-}
-
-TEST(RetainedNativeRuntimeUnitAdapter, ObserverCheckPreservesStrictSourceFileQualification) {
-  NativeFixture fixture;
-  ScopedTemporaryRoot targets;
-  const auto executable = InstallSelectedPacketTestTargets(targets.path());
-  auto adapter = component_manager::RetainedNativeRuntimeUnitAdapter(
-      targets.path(), fixture.root / "retained-package",
-      fixture.manager_state_root.path(), fixture.manager_run_root.path(),
-      fixture.execution_state_root.path(), fixture.execution_run_root.path(),
-      fixture.bundle_source, fixture.artifact_source,
-      std::string(contract::kOperatingSystem),
-      std::string(contract::kLaunchEnvironmentContract), {}, {}, {}, {}, std::nullopt,
-      executable);
-  const auto source = fixture.manager_run_root.path() / "observer-source.input";
-  const auto alias = fixture.manager_run_root.path() / "observer-source.alias";
-  { std::ofstream input(source, std::ios::binary); input << "fixture-expanded"; }
-  std::filesystem::create_symlink(source, alias);
-  EXPECT_THROW((void)adapter.CheckIsaacPoseObserverConfiguration(alias, 5.0),
-               component_manager::RetainedNativeRuntimeUnitAdapterError);
-  { std::ofstream input(source, std::ios::binary); }
-  EXPECT_THROW((void)adapter.CheckIsaacPoseObserverConfiguration(source, 5.0),
-               component_manager::RetainedNativeRuntimeUnitAdapterError);
-  { std::ofstream input(source, std::ios::binary); input << std::string(256U * 1024U + 1U, 'x'); }
-  EXPECT_THROW((void)adapter.CheckIsaacPoseObserverConfiguration(source, 5.0),
-               component_manager::RetainedNativeRuntimeUnitAdapterError);
-  EXPECT_EQ(adapter.ObserveProcess(*fixture.query).state(), component_manager::ProcessPresenceState::kAbsent);
-}
-
 } // namespace manyforge::roboplan_backend
 
 int main(int argc, char **argv) {
-  if (argc == 3 && std::string_view(argv[1]) == "--check-config") {
-    std::ifstream input(argv[2], std::ios::binary);
-    if (!input) return 78;
-    const std::string document{std::istreambuf_iterator<char>(input), std::istreambuf_iterator<char>()};
-    if (document == "fixture-refuse") return 78;
-    if (document == "fixture-wait") {
-      std::this_thread::sleep_for(std::chrono::seconds(2));
-      return 0;
-    }
-    if (document == "fixture-expanded") {
-      std::cout << "{\"cell_id\":\"cell\",\"source_id\":\"source\",\"bindings\":[]}\n"
-                << std::string(256U * 1024U, ' ') << std::flush;
-      return std::cout ? 0 : 78;
-    }
-    if (document == "fixture-overflow") {
-      std::cout << std::string(2U * 1024U * 1024U + 1U, ' ') << std::flush;
-      return std::cout ? 0 : 78;
-    }
-    std::cout << document << std::flush;
-    return std::cout ? 0 : 78;
-  }
   for (int index = 1; index < argc; ++index) {
     if (std::string_view(argv[index]) ==
         "--manyforge-managed-runtime-channel-fd") {

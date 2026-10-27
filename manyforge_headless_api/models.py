@@ -1855,7 +1855,7 @@ class UpdateSceneObjectPoseRequest(StrictRequest):
     pose: Pose3Request
     frame_ref: SceneTransactionFrameRequest
     # Provider-backed ingress requires a separately configured trusted
-    # provider adapter so received_at_ns cannot be forged by an open caller.
+    # provider adapter so provider evidence cannot be forged by an open caller.
     provider_evidence: None = None
     expected_attached: bool | None = None
 
@@ -1867,6 +1867,13 @@ class UpdateSceneObjectPoseRequest(StrictRequest):
             label="scene_resource_id",
             maximum_bytes=MAX_IDENTITY_BYTES,
         )
+
+
+class CarriedObjectGraspLostBound(StrictRequest):
+    """Attach-node bound around the attach-time carried offset."""
+
+    translation_m: Annotated[float, Field(gt=0, allow_inf_nan=False)]
+    rotation_rad: Annotated[float, Field(gt=0, allow_inf_nan=False)]
 
 
 class AttachCarriedObjectRequest(StrictRequest):
@@ -1881,6 +1888,7 @@ class AttachCarriedObjectRequest(StrictRequest):
         list[Annotated[str, Field(pattern=SHA256_PATTERN)]],
         Field(max_length=4096),
     ]
+    grasp_lost_bound: CarriedObjectGraspLostBound | None = None
 
     @field_validator(
         "carried_object_attachment_id",
@@ -3137,8 +3145,6 @@ def _validate_pick_place_operations(
     }
     if len(contexts) != 1:
         raise ValueError("pick/place phases must share one Program and owner context")
-    if approach.expected_scene_revision is None:
-        raise ValueError("pick/place planning requires one exact scene revision")
     if not isinstance(approach.participants[0].payload, MotionParticipantRequest):
         raise ValueError("pick/place approach must be a motion operation")
     if not isinstance(descend.participants[0].payload, MotionParticipantRequest):

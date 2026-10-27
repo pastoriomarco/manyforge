@@ -1,6 +1,6 @@
 api_version: manyforge.closed_schema.v1
 schema_id: manyforge.value_schema.runtime.ros2_control_execution.v1
-schema_revision: sha256:d60c4f1e7196f4eb6c4ebf4fd8d99980f4aa6b93f83de3e747f5253d7ea4795a
+schema_revision: sha256:eb4a5f93825a6aede99963d3910f981c5159bdadcb7d48e1c8df1b2356fe2173
 schema_purpose: value
 root_definition_id: ros2_control_execution_runtime_configuration
 definitions:
@@ -392,6 +392,18 @@ definitions:
                         value: 0
                       - kind: maximum
                         value: 60
+                - field_id: state_freshness_timeout_s
+                  presence: required
+                  default:
+                    kind: absent
+                  value_schema:
+                    kind: scalar
+                    scalar_type: number
+                    constraints:
+                      - kind: minimum
+                        value: 0.01
+                      - kind: maximum
+                        value: 60
                 - field_id: touch_links
                   presence: required
                   default:
@@ -624,6 +636,468 @@ definitions:
                     constraints:
                       - kind: "exclusive_minimum"
                         value: 0
+
+        - field_id: "pose_sources"
+          presence: "optional"
+          default:
+            kind: "absent"
+          value_schema:
+            kind: "array"
+            min_items: 0
+            max_items: 4096
+            collection:
+              kind: "keyed_record_set"
+              key_paths:
+                - - "controllable_component_id"
+            item_schema:
+              kind: "object"
+              fields:
+                - field_id: "controllable_component_id"
+                  presence: "required"
+                  default:
+                    kind: "absent"
+                  value_schema:
+                    kind: "scalar"
+                    scalar_type: "string"
+                    constraints:
+                      - kind: "string_format"
+                        value: "portable_id"
+                - field_id: "detection3d_sources"
+                  presence: "required"
+                  default:
+                    kind: "absent"
+                  value_schema:
+                    kind: "array"
+                    min_items: 0
+                    max_items: 128
+                    collection:
+                      kind: "ordered"
+                    item_schema:
+                      kind: "object"
+                      fields:
+                        - field_id: "eligible"
+                          presence: "required"
+                          default:
+                            kind: "absent"
+                          value_schema:
+                            kind: "scalar"
+                            scalar_type: "boolean"
+                            constraints: []
+                        - field_id: "fallback_frame_id"
+                          presence: "required"
+                          default:
+                            kind: "absent"
+                          value_schema:
+                            kind: "scalar"
+                            scalar_type: "string"
+                            constraints:
+                              - kind: "max_length"
+                                value: 1024
+                        - field_id: "frame_kind"
+                          presence: "required"
+                          default:
+                            kind: "absent"
+                          value_schema:
+                            kind: "scalar"
+                            scalar_type: "string"
+                            constraints:
+                              - kind: "enum"
+                                values:
+                                  - "cell_frame"
+                        - field_id: "lifetime_ns"
+                          presence: "required"
+                          default:
+                            kind: "absent"
+                          value_schema:
+                            kind: "scalar"
+                            scalar_type: "integer"
+                            constraints:
+                              - kind: "minimum"
+                                value: 1
+                              - kind: "maximum"
+                                value: 60000000000
+                        - field_id: "object_id"
+                          presence: "required"
+                          default:
+                            kind: "absent"
+                          value_schema:
+                            kind: "scalar"
+                            scalar_type: "string"
+                            constraints:
+                              - kind: "min_length"
+                                value: 1
+                              - kind: "max_length"
+                                value: 256
+                        - field_id: "policy_id"
+                          presence: "required"
+                          default:
+                            kind: "absent"
+                          value_schema:
+                            kind: "scalar"
+                            scalar_type: "string"
+                            constraints:
+                              - kind: "min_length"
+                                value: 1
+                              - kind: "max_length"
+                                value: 256
+                        - field_id: "selector"
+                          presence: "required"
+                          default:
+                            kind: "absent"
+                          value_schema:
+                            kind: "object"
+                            fields:
+                              - field_id: "class_id"
+                                presence: "required"
+                                default:
+                                  kind: "absent"
+                                value_schema:
+                                  kind: "scalar"
+                                  scalar_type: "string"
+                                  constraints:
+                                    - kind: "max_length"
+                                      value: 1024
+                              - field_id: "confidence_min"
+                                presence: "required"
+                                default:
+                                  kind: "absent"
+                                value_schema:
+                                  kind: "scalar"
+                                  scalar_type: "number"
+                                  constraints: []
+                              - field_id: "detection_id"
+                                presence: "required"
+                                default:
+                                  kind: "absent"
+                                value_schema:
+                                  kind: "scalar"
+                                  scalar_type: "string"
+                                  constraints:
+                                    - kind: "max_length"
+                                      value: 1024
+                              - field_id: "max_position_variance_m2"
+                                presence: "required"
+                                default:
+                                  kind: "absent"
+                                value_schema:
+                                  kind: "scalar"
+                                  scalar_type: "number"
+                                  constraints:
+                                    - kind: "minimum"
+                                      value: 0
+                              - field_id: "selection"
+                                presence: "required"
+                                default:
+                                  kind: "absent"
+                                value_schema:
+                                  kind: "scalar"
+                                  scalar_type: "string"
+                                  constraints:
+                                    - kind: "enum"
+                                      values:
+                                        - ""
+                                        - "best_score"
+                                        - "first"
+                        - field_id: "target_frame_id"
+                          presence: "required"
+                          default:
+                            kind: "absent"
+                          value_schema:
+                            kind: "scalar"
+                            scalar_type: "string"
+                            constraints:
+                              - kind: "min_length"
+                                value: 1
+                              - kind: "max_length"
+                                value: 1024
+                        - field_id: "topic"
+                          presence: "required"
+                          default:
+                            kind: "absent"
+                          value_schema:
+                            kind: "scalar"
+                            scalar_type: "string"
+                            constraints:
+                              - kind: "min_length"
+                                value: 2
+                              - kind: "max_length"
+                                value: 256
+                - field_id: "joint_state"
+                  presence: "optional"
+                  default:
+                    kind: "absent"
+                  value_schema:
+                    kind: "object"
+                    fields:
+                      - field_id: "eligible"
+                        presence: "required"
+                        default:
+                          kind: "absent"
+                        value_schema:
+                          kind: "scalar"
+                          scalar_type: "boolean"
+                          constraints: []
+                      - field_id: "lifetime_ns"
+                        presence: "required"
+                        default:
+                          kind: "absent"
+                        value_schema:
+                          kind: "scalar"
+                          scalar_type: "integer"
+                          constraints:
+                            - kind: "minimum"
+                              value: 1
+                            - kind: "maximum"
+                              value: 60000000000
+                      - field_id: "object_id"
+                        presence: "required"
+                        default:
+                          kind: "absent"
+                        value_schema:
+                          kind: "scalar"
+                          scalar_type: "string"
+                          constraints:
+                            - kind: "min_length"
+                              value: 1
+                            - kind: "max_length"
+                              value: 256
+                      - field_id: "policy_id"
+                        presence: "required"
+                        default:
+                          kind: "absent"
+                        value_schema:
+                          kind: "scalar"
+                          scalar_type: "string"
+                          constraints:
+                            - kind: "min_length"
+                              value: 1
+                            - kind: "max_length"
+                              value: 256
+                      - field_id: "required_joint_names"
+                        presence: "required"
+                        default:
+                          kind: "absent"
+                        value_schema:
+                          kind: "array"
+                          min_items: 1
+                          max_items: 128
+                          collection:
+                            kind: "ordered"
+                          item_schema:
+                            kind: "scalar"
+                            scalar_type: "string"
+                            constraints:
+                              - kind: "min_length"
+                                value: 1
+                              - kind: "max_length"
+                                value: 1024
+                      - field_id: "topic"
+                        presence: "required"
+                        default:
+                          kind: "absent"
+                        value_schema:
+                          kind: "scalar"
+                          scalar_type: "string"
+                          constraints:
+                            - kind: "min_length"
+                              value: 2
+                            - kind: "max_length"
+                              value: 256
+                - field_id: "simulation_entities"
+                  presence: "required"
+                  default:
+                    kind: "absent"
+                  value_schema:
+                    kind: "array"
+                    min_items: 0
+                    max_items: 128
+                    collection:
+                      kind: "ordered"
+                    item_schema:
+                      kind: "object"
+                      fields:
+                        - field_id: "eligible"
+                          presence: "required"
+                          default:
+                            kind: "absent"
+                          value_schema:
+                            kind: "scalar"
+                            scalar_type: "boolean"
+                            constraints: []
+                        - field_id: "entity"
+                          presence: "required"
+                          default:
+                            kind: "absent"
+                          value_schema:
+                            kind: "scalar"
+                            scalar_type: "string"
+                            constraints:
+                              - kind: "min_length"
+                                value: 1
+                              - kind: "max_length"
+                                value: 1024
+                        - field_id: "frame_kind"
+                          presence: "required"
+                          default:
+                            kind: "absent"
+                          value_schema:
+                            kind: "scalar"
+                            scalar_type: "string"
+                            constraints:
+                              - kind: "enum"
+                                values:
+                                  - "cell_frame"
+                        - field_id: "lifetime_ns"
+                          presence: "required"
+                          default:
+                            kind: "absent"
+                          value_schema:
+                            kind: "scalar"
+                            scalar_type: "integer"
+                            constraints:
+                              - kind: "minimum"
+                                value: 1
+                              - kind: "maximum"
+                                value: 60000000000
+                        - field_id: "local_orientation_xyzw"
+                          presence: "required"
+                          default:
+                            kind: "absent"
+                          value_schema:
+                            kind: "array"
+                            min_items: 4
+                            max_items: 4
+                            collection:
+                              kind: "ordered"
+                            item_schema:
+                              kind: "scalar"
+                              scalar_type: "number"
+                              constraints: []
+                        - field_id: "local_position_xyz"
+                          presence: "required"
+                          default:
+                            kind: "absent"
+                          value_schema:
+                            kind: "array"
+                            min_items: 3
+                            max_items: 3
+                            collection:
+                              kind: "ordered"
+                            item_schema:
+                              kind: "scalar"
+                              scalar_type: "number"
+                              constraints: []
+                        - field_id: "object_id"
+                          presence: "required"
+                          default:
+                            kind: "absent"
+                          value_schema:
+                            kind: "scalar"
+                            scalar_type: "string"
+                            constraints:
+                              - kind: "min_length"
+                                value: 1
+                              - kind: "max_length"
+                                value: 256
+                        - field_id: "policy_id"
+                          presence: "required"
+                          default:
+                            kind: "absent"
+                          value_schema:
+                            kind: "scalar"
+                            scalar_type: "string"
+                            constraints:
+                              - kind: "min_length"
+                                value: 1
+                              - kind: "max_length"
+                                value: 256
+                        - field_id: "relative_reference"
+                          presence: "optional"
+                          default:
+                            kind: "absent"
+                          value_schema:
+                            kind: "object"
+                            fields:
+                              - field_id: "entity"
+                                presence: "required"
+                                default:
+                                  kind: "absent"
+                                value_schema:
+                                  kind: "scalar"
+                                  scalar_type: "string"
+                                  constraints:
+                                    - kind: "min_length"
+                                      value: 1
+                                    - kind: "max_length"
+                                      value: 1024
+                              - field_id: "link"
+                                presence: "required"
+                                default:
+                                  kind: "absent"
+                                value_schema:
+                                  kind: "scalar"
+                                  scalar_type: "string"
+                                  constraints:
+                                    - kind: "min_length"
+                                      value: 1
+                                    - kind: "max_length"
+                                      value: 256
+                              - field_id: "source_header_frame_id"
+                                presence: "required"
+                                default:
+                                  kind: "absent"
+                                value_schema:
+                                  kind: "scalar"
+                                  scalar_type: "string"
+                                  constraints:
+                                    - kind: "min_length"
+                                      value: 1
+                                    - kind: "max_length"
+                                      value: 1024
+                        - field_id: "source_coordinate_frame_id"
+                          presence: "required"
+                          default:
+                            kind: "absent"
+                          value_schema:
+                            kind: "scalar"
+                            scalar_type: "string"
+                            constraints:
+                              - kind: "max_length"
+                                value: 1024
+                        - field_id: "source_header_frame_id"
+                          presence: "required"
+                          default:
+                            kind: "absent"
+                          value_schema:
+                            kind: "scalar"
+                            scalar_type: "string"
+                            constraints:
+                              - kind: "max_length"
+                                value: 1024
+                        - field_id: "target_frame_id"
+                          presence: "required"
+                          default:
+                            kind: "absent"
+                          value_schema:
+                            kind: "scalar"
+                            scalar_type: "string"
+                            constraints:
+                              - kind: "min_length"
+                                value: 1
+                              - kind: "max_length"
+                                value: 1024
+                - field_id: "simulation_poll_period_ms"
+                  presence: "required"
+                  default:
+                    kind: "absent"
+                  value_schema:
+                    kind: "scalar"
+                    scalar_type: "integer"
+                    constraints:
+                      - kind: "minimum"
+                        value: 20
+                      - kind: "maximum"
+                        value: 60000
 
         - field_id: "io_signals"
           presence: "optional"

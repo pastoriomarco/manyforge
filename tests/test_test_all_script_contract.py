@@ -847,7 +847,9 @@ def test_i9_isaac_launcher_enforces_the_recorded_topology_and_owner_split() -> N
     assert "simulation_interfaces" not in source
     assert "runtime_namespace:=${runtime_namespace}" in source
     assert "command_gate_owner_namespace" not in source
-    assert "manager_run_root:=${MANYFORGE_MANAGER_RUN_ROOT}" in source
+    # The pose observer is a Deployment component's supervised process.
+    assert "manager_run_root:=" not in source
+    assert "pose_observer_site_config" not in source
     assert "MANYFORGE_MANAGER_STATE_ROOT" not in source
     assert "MANYFORGE_ISAAC_COMPONENT_ID" in source
     for forbidden in (

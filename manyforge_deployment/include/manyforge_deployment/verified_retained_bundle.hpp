@@ -3,6 +3,7 @@
 #include <atomic>
 #include <cstdint>
 #include <filesystem>
+#include <manyforge_core/component_stream_health.hpp>
 #include <manyforge_core/types/kinematic_state_view.hpp>
 #include <manyforge_core/types/manager_liveness.hpp>
 #include <manyforge_core/types/projection_bootstrap.hpp>
@@ -106,6 +107,13 @@ class RetainedBundle final {
 /// retained identity is a new value and is verified on its own first check.
 [[nodiscard]] bool
 verify_retained_bundle_identity(const RetainedBundle& bundle);
+
+/// CP9 Deployment overrides of component stream parameters
+/// (`policies.component_streams`) retained by the bundle, sorted by
+/// `(controllable_component_id, stream_id)`; empty when the Deployment
+/// declares none. The table is checked by the bundle verification.
+[[nodiscard]] std::vector<core::StreamParameterOverrideDTO>
+ComponentStreamParameterOverrides(const RetainedBundle& bundle);
 
 struct RetainedProviderManifestQuery final {
   core::RetainedBundleId retained_bundle_id;

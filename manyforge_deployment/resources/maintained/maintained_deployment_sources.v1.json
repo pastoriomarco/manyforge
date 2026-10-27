@@ -66,7 +66,7 @@
       "ros2_control_runtime": {
         "collision_monitor_period_ms": 50.0,
         "execution_tick_hz": 100,
-        "gripper_target_configurations": [{"actuation_kind": "pneumatic", "attach_frame": "link_tcp", "auxiliary_frames": ["lite_gripper_base_link"], "closed_state_ref": "closed", "command_duration_s": 0.8, "command_target_id": "gripper", "controllable_component_id": "lite6_robot", "description": "UFACTORY lite pneumatic gripper through Isaac JointState effort commands.", "mount_frame": "link_eef", "open_state_ref": "open", "output_mode": "commanded", "tcp_frame": "link_tcp", "touch_links": ["lite_gripper_base_link", "lite_gripper_left_finger", "lite_gripper_right_finger"], "delivery_result_timeout_s": 1.0}],
+        "gripper_target_configurations": [{"actuation_kind": "pneumatic", "attach_frame": "link_tcp", "auxiliary_frames": ["lite_gripper_base_link"], "closed_state_ref": "closed", "command_duration_s": 0.8, "command_target_id": "gripper", "controllable_component_id": "lite6_robot", "description": "UFACTORY lite pneumatic gripper through Isaac JointState effort commands.", "mount_frame": "link_eef", "open_state_ref": "open", "output_mode": "commanded", "state_freshness_timeout_s": 1.0, "tcp_frame": "link_tcp", "touch_links": ["lite_gripper_base_link", "lite_gripper_left_finger", "lite_gripper_right_finger"], "delivery_result_timeout_s": 1.0}],
         "initial_joint_positions_rad": [0.0, 0.0, 1.57, 0.0, 0.0, 0.0],
         "isaac_profile": "lite6",
         "mode": "commanded_sim",
@@ -153,7 +153,7 @@
       "ros2_control_runtime": {
         "collision_monitor_period_ms": 50.0,
         "execution_tick_hz": 100,
-        "gripper_target_configurations": [{"actuation_kind": "pneumatic", "attach_frame": "link_tcp", "auxiliary_frames": ["lite_gripper_base_link"], "closed_state_ref": "closed", "command_duration_s": 0.8, "command_target_id": "gripper", "controllable_component_id": "lite6_robot", "description": "Native simulated UFACTORY lite pneumatic gripper.", "mount_frame": "link_eef", "open_state_ref": "open", "output_mode": "commanded", "tcp_frame": "link_tcp", "touch_links": ["lite_gripper_base_link", "lite_gripper_left_finger", "lite_gripper_right_finger"], "delivery_result_timeout_s": 1.0}],
+        "gripper_target_configurations": [{"actuation_kind": "pneumatic", "attach_frame": "link_tcp", "auxiliary_frames": ["lite_gripper_base_link"], "closed_state_ref": "closed", "command_duration_s": 0.8, "command_target_id": "gripper", "controllable_component_id": "lite6_robot", "description": "Native simulated UFACTORY lite pneumatic gripper.", "mount_frame": "link_eef", "open_state_ref": "open", "output_mode": "commanded", "state_freshness_timeout_s": 1.0, "tcp_frame": "link_tcp", "touch_links": ["lite_gripper_base_link", "lite_gripper_left_finger", "lite_gripper_right_finger"], "delivery_result_timeout_s": 1.0}],
         "initial_joint_positions_rad": [0.0, 0.0, 1.57, 0.0, 0.0, 0.0],
         "mock_profile": "lite6_lite_gripper",
         "mode": "commanded_sim",
@@ -211,6 +211,13 @@
       ]
     },
     {
+      "runtime_restoration_profile_id": "pose_source_v0",
+      "pose_source_runtime": {},
+      "source_fields": {},
+      "stop_profiles": {},
+      "acceptance_obligations": []
+    },
+    {
       "runtime_restoration_profile_id": "ur10e_robotiq_assistant_isaac_commanded_v0",
       "model_family_id": "ur10e_robotiq_2f_140",
       "source_fields": {
@@ -236,7 +243,7 @@
       "ros2_control_runtime": {
         "collision_monitor_period_ms": 100.0,
         "execution_tick_hz": 100,
-        "gripper_target_configurations": [{"actuation_kind": "position_commanded", "attach_frame": "grasp_frame", "auxiliary_frames": ["gripper_frame"], "closed_state_ref": "closed", "command_duration_s": 0.8, "command_target_id": "gripper", "controllable_component_id": "ur10e_robot", "description": "Robotiq 2F-140 command through the standard ROS GripperCommand action.", "mount_frame": "tool0", "open_state_ref": "open", "output_mode": "commanded", "tcp_frame": "grasp_frame", "touch_links": ["left_inner_finger", "left_inner_finger_pad", "left_inner_knuckle", "left_outer_finger", "left_outer_knuckle", "right_inner_finger", "right_inner_finger_pad", "right_inner_knuckle", "right_outer_finger", "right_outer_knuckle", "robotiq_base_link"]}],
+        "gripper_target_configurations": [{"actuation_kind": "position_commanded", "attach_frame": "grasp_frame", "auxiliary_frames": ["gripper_frame"], "closed_state_ref": "closed", "command_duration_s": 0.8, "command_target_id": "gripper", "controllable_component_id": "ur10e_robot", "description": "Robotiq 2F-140 command through the standard ROS GripperCommand action.", "mount_frame": "tool0", "open_state_ref": "open", "output_mode": "commanded", "state_freshness_timeout_s": 1.0, "tcp_frame": "grasp_frame", "touch_links": ["left_inner_finger", "left_inner_finger_pad", "left_inner_knuckle", "left_outer_finger", "left_outer_knuckle", "right_inner_finger", "right_inner_finger_pad", "right_inner_knuckle", "right_outer_finger", "right_outer_knuckle", "robotiq_base_link"]}],
         "initial_joint_positions_rad": [2.63422544, -0.875980752, 1.551074106, -2.29231544, -1.560498884, -2.038544566],
         "isaac_profile": "ur10e",
         "mode": "commanded_sim",
@@ -331,7 +338,7 @@
       "ros2_control_runtime": {
         "collision_monitor_period_ms": 50.0,
         "execution_tick_hz": 100,
-        "gripper_target_configurations": [{"actuation_kind": "position_commanded", "attach_frame": "grasp_frame", "auxiliary_frames": ["gripper_frame"], "closed_state_ref": "closed", "command_duration_s": 0.8, "command_target_id": "gripper", "controllable_component_id": "ur10e_robot", "description": "Native simulated Robotiq 2F-140 finger actuation.", "mount_frame": "tool0", "open_state_ref": "open", "output_mode": "commanded", "tcp_frame": "grasp_frame", "touch_links": ["left_inner_finger", "left_inner_finger_pad", "left_inner_knuckle", "left_outer_finger", "left_outer_knuckle", "right_inner_finger", "right_inner_finger_pad", "right_inner_knuckle", "right_outer_finger", "right_outer_knuckle", "robotiq_base_link"]}],
+        "gripper_target_configurations": [{"actuation_kind": "position_commanded", "attach_frame": "grasp_frame", "auxiliary_frames": ["gripper_frame"], "closed_state_ref": "closed", "command_duration_s": 0.8, "command_target_id": "gripper", "controllable_component_id": "ur10e_robot", "description": "Native simulated Robotiq 2F-140 finger actuation.", "mount_frame": "tool0", "open_state_ref": "open", "output_mode": "commanded", "state_freshness_timeout_s": 1.0, "tcp_frame": "grasp_frame", "touch_links": ["left_inner_finger", "left_inner_finger_pad", "left_inner_knuckle", "left_outer_finger", "left_outer_knuckle", "right_inner_finger", "right_inner_finger_pad", "right_inner_knuckle", "right_outer_finger", "right_outer_knuckle", "robotiq_base_link"]}],
         "initial_joint_positions_rad": [0.0, -1.57, 1.57, -1.57, -1.57, 0.0],
         "mock_profile": "ur10e_robotiq_2f_140",
         "mode": "commanded_sim",
@@ -412,11 +419,11 @@
       "ros2_control_runtime": {
         "collision_monitor_period_ms": 100.0,
         "execution_tick_hz": 100,
-        "gripper_target_configurations": [{"actuation_kind": "position_commanded", "attach_frame": "grasp_frame", "auxiliary_frames": ["gripper_frame"], "closed_state_ref": "closed", "command_duration_s": 0.8, "command_target_id": "gripper", "controllable_component_id": "ur10e_robot", "description": "Robotiq 2F-140 command through the standard ROS GripperCommand action.", "mount_frame": "tool0", "open_state_ref": "open", "output_mode": "commanded", "tcp_frame": "grasp_frame", "touch_links": ["left_inner_finger", "left_inner_finger_pad", "left_inner_knuckle", "left_outer_finger", "left_outer_knuckle", "right_inner_finger", "right_inner_finger_pad", "right_inner_knuckle", "right_outer_finger", "right_outer_knuckle", "robotiq_base_link"]}],
+        "gripper_target_configurations": [{"actuation_kind": "position_commanded", "attach_frame": "grasp_frame", "auxiliary_frames": ["gripper_frame"], "closed_state_ref": "closed", "command_duration_s": 0.8, "command_target_id": "gripper", "controllable_component_id": "ur10e_robot", "description": "Robotiq 2F-140 command through the standard ROS GripperCommand action.", "mount_frame": "tool0", "open_state_ref": "open", "output_mode": "commanded", "state_freshness_timeout_s": 1.0, "tcp_frame": "grasp_frame", "touch_links": ["left_inner_finger", "left_inner_finger_pad", "left_inner_knuckle", "left_outer_finger", "left_outer_knuckle", "right_inner_finger", "right_inner_finger_pad", "right_inner_knuckle", "right_outer_finger", "right_outer_knuckle", "robotiq_base_link"]}],
         "initial_joint_positions_rad": [2.63422544, -0.875980752, 1.551074106, -2.29231544, -1.560498884, -2.038544566],
         "isaac_profile": "ur10e",
         "mode": "commanded_sim",
-        "motion_target_limits": [{"command_target_id": "arm", "controllable_component_id": "ur10e_robot", "maximum_tcp_linear_speed_mps": 0.25}],
+        "motion_target_limits": [{"command_target_id": "arm", "controllable_component_id": "ur10e_robot", "maximum_tcp_linear_speed_mps": 0.5}],
         "planner_rng_seed": 12345,
         "runtime_collision_immediate_query_budget_ms": 75.0,
         "runtime_collision_lookahead_cycle_budget_ms": 350.0,
@@ -507,7 +514,7 @@
       "ros2_control_runtime": {
         "collision_monitor_period_ms": 50.0,
         "execution_tick_hz": 100,
-        "gripper_target_configurations": [{"actuation_kind": "position_commanded", "attach_frame": "grasp_frame", "auxiliary_frames": ["gripper_frame"], "closed_state_ref": "closed", "command_duration_s": 0.8, "command_target_id": "gripper", "controllable_component_id": "ur10e_robot", "description": "Native simulated Robotiq 2F-140 finger actuation.", "mount_frame": "tool0", "open_state_ref": "open", "output_mode": "commanded", "tcp_frame": "grasp_frame", "touch_links": ["left_inner_finger", "left_inner_finger_pad", "left_inner_knuckle", "left_outer_finger", "left_outer_knuckle", "right_inner_finger", "right_inner_finger_pad", "right_inner_knuckle", "right_outer_finger", "right_outer_knuckle", "robotiq_base_link"]}],
+        "gripper_target_configurations": [{"actuation_kind": "position_commanded", "attach_frame": "grasp_frame", "auxiliary_frames": ["gripper_frame"], "closed_state_ref": "closed", "command_duration_s": 0.8, "command_target_id": "gripper", "controllable_component_id": "ur10e_robot", "description": "Native simulated Robotiq 2F-140 finger actuation.", "mount_frame": "tool0", "open_state_ref": "open", "output_mode": "commanded", "state_freshness_timeout_s": 1.0, "tcp_frame": "grasp_frame", "touch_links": ["left_inner_finger", "left_inner_finger_pad", "left_inner_knuckle", "left_outer_finger", "left_outer_knuckle", "right_inner_finger", "right_inner_finger_pad", "right_inner_knuckle", "right_outer_finger", "right_outer_knuckle", "robotiq_base_link"]}],
         "initial_joint_positions_rad": [0.0, -1.57, 1.57, -1.57, -1.57, 0.0],
         "mock_profile": "ur10e_robotiq_2f_140",
         "mode": "commanded_sim",
@@ -665,7 +672,7 @@
       "ros2_control_runtime": {
         "collision_monitor_period_ms": 50.0,
         "execution_tick_hz": 100,
-        "gripper_target_configurations": [{"actuation_kind": "position_commanded", "attach_frame": "robotiq_85_base_link", "auxiliary_frames": ["robotiq_85_base_link"], "closed_state_ref": "closed", "command_duration_s": 1.0, "command_target_id": "gripper", "controllable_component_id": "ur5e_robot", "description": "Native simulated Robotiq 2F-85 gripper.", "mount_frame": "tool0", "open_state_ref": "open", "output_mode": "commanded", "tcp_frame": "robotiq_85_base_link", "touch_links": ["robotiq_85_base_link", "robotiq_85_left_finger_link", "robotiq_85_left_finger_tip_link", "robotiq_85_left_inner_knuckle_link", "robotiq_85_left_knuckle_link", "robotiq_85_right_finger_link", "robotiq_85_right_finger_tip_link", "robotiq_85_right_inner_knuckle_link", "robotiq_85_right_knuckle_link"]}],
+        "gripper_target_configurations": [{"actuation_kind": "position_commanded", "attach_frame": "robotiq_85_base_link", "auxiliary_frames": ["robotiq_85_base_link"], "closed_state_ref": "closed", "command_duration_s": 1.0, "command_target_id": "gripper", "controllable_component_id": "ur5e_robot", "description": "Native simulated Robotiq 2F-85 gripper.", "mount_frame": "tool0", "open_state_ref": "open", "output_mode": "commanded", "state_freshness_timeout_s": 1.0, "tcp_frame": "robotiq_85_base_link", "touch_links": ["robotiq_85_base_link", "robotiq_85_left_finger_link", "robotiq_85_left_finger_tip_link", "robotiq_85_left_inner_knuckle_link", "robotiq_85_left_knuckle_link", "robotiq_85_right_finger_link", "robotiq_85_right_finger_tip_link", "robotiq_85_right_inner_knuckle_link", "robotiq_85_right_knuckle_link"]}],
         "initial_joint_positions_rad": [0.0, -1.57, 1.57, -1.57, -1.57, 0.0],
         "mock_profile": "ur5e_robotiq_2f_85",
         "mode": "commanded_sim",
@@ -1040,6 +1047,35 @@
         "position_m": [0.0, 0.0, 0.0],
         "orientation_xyzw": [0.0, 0.0, 0.0, 1.0]
       },
+      "pose_source": {
+        "component_id": "isaac_lite6_observer",
+        "runtime_configuration": {
+          "pose_sources": [
+            {
+              "controllable_component_id": "isaac_lite6_observer",
+              "detection3d_sources": [],
+              "joint_state": {
+                "eligible": false,
+                "lifetime_ns": 1000000000,
+                "object_id": "isaac_lite6_robot",
+                "policy_id": "viewer.measured_robot",
+                "required_joint_names": [
+                  "joint1",
+                  "joint2",
+                  "joint3",
+                  "joint4",
+                  "joint5",
+                  "joint6"
+                ],
+                "topic": "/isaac_joint_states"
+              },
+              "simulation_entities": [],
+              "simulation_poll_period_ms": 250
+            }
+          ]
+        },
+        "scene_pose_sources": []
+      },
       "program_role_assignments": [
         {
           "scenario_id": "isaac-lite6-pick-place",
@@ -1094,6 +1130,80 @@
         "position_m": [-0.21814000606536865, -0.571590006351471, 0.12999999523162842],
         "orientation_xyzw": [0.0, 0.0, -0.7071067690846544, 0.7071067932884405]
       },
+      "pose_source": {
+        "component_id": "isaac_scene_objects",
+        "runtime_configuration": {
+          "pose_sources": [
+            {
+              "controllable_component_id": "isaac_scene_objects",
+              "detection3d_sources": [],
+              "joint_state": {
+                "eligible": false,
+                "lifetime_ns": 1000000000,
+                "object_id": "isaac_ur10e_assistant_robot",
+                "policy_id": "viewer.measured_robot",
+                "required_joint_names": [
+                  "shoulder_pan_joint",
+                  "shoulder_lift_joint",
+                  "elbow_joint",
+                  "wrist_1_joint",
+                  "wrist_2_joint",
+                  "wrist_3_joint"
+                ],
+                "topic": "/isaac_joint_states"
+              },
+              "simulation_entities": [
+                {
+                  "eligible": false,
+                  "entity": "/World/ur10e_robotiq2f_140_ROS/ur10e_robotiq2f_140/ee_link/robotiq_arg2f_base_link",
+                  "frame_kind": "cell_frame",
+                  "lifetime_ns": 1000000000,
+                  "local_orientation_xyzw": [
+                    0,
+                    0,
+                    0,
+                    1
+                  ],
+                  "local_position_xyz": [
+                    0,
+                    0,
+                    0.2
+                  ],
+                  "object_id": "isaac_ur10e_assistant_robot",
+                  "policy_id": "viewer.measured_tcp",
+                  "source_coordinate_frame_id": "universe",
+                  "source_header_frame_id": "robotiq_arg2f_base_link",
+                  "target_frame_id": "universe"
+                },
+                {
+                  "eligible": true,
+                  "entity": "/mac_n_cheese_centered",
+                  "frame_kind": "cell_frame",
+                  "lifetime_ns": 2000000000,
+                  "local_orientation_xyzw": [
+                    0,
+                    0,
+                    0,
+                    1
+                  ],
+                  "local_position_xyz": [
+                    0,
+                    0,
+                    0
+                  ],
+                  "object_id": "isaac_cheese_box",
+                  "policy_id": "continuous_unattached",
+                  "source_coordinate_frame_id": "universe",
+                  "source_header_frame_id": "mac_n_cheese_centered",
+                  "target_frame_id": "universe"
+                }
+              ],
+              "simulation_poll_period_ms": 250
+            }
+          ]
+        },
+        "scene_pose_sources": []
+      },
       "program_role_assignments": [
         {
           "scenario_id": "isaac-ur10e-light-scene-assistant",
@@ -1146,6 +1256,91 @@
         "position_m": [-0.21814000606536865, -0.571590006351471, 0.12999999523162842],
         "orientation_xyzw": [0.0, 0.0, -0.7071067690846544, 0.7071067932884405]
       },
+      "pose_source": {
+        "component_id": "isaac_scene_objects",
+        "runtime_configuration": {
+          "pose_sources": [
+            {
+              "controllable_component_id": "isaac_scene_objects",
+              "detection3d_sources": [],
+              "joint_state": {
+                "eligible": false,
+                "lifetime_ns": 1000000000,
+                "object_id": "isaac_ur10e_light_robot",
+                "policy_id": "viewer.measured_robot",
+                "required_joint_names": [
+                  "shoulder_pan_joint",
+                  "shoulder_lift_joint",
+                  "elbow_joint",
+                  "wrist_1_joint",
+                  "wrist_2_joint",
+                  "wrist_3_joint"
+                ],
+                "topic": "/isaac_joint_states"
+              },
+              "simulation_entities": [
+                {
+                  "eligible": false,
+                  "entity": "/World/ur10e_robotiq2f_140_ROS/ur10e_robotiq2f_140/ee_link/robotiq_arg2f_base_link",
+                  "frame_kind": "cell_frame",
+                  "lifetime_ns": 1000000000,
+                  "local_orientation_xyzw": [
+                    0,
+                    0,
+                    0,
+                    1
+                  ],
+                  "local_position_xyz": [
+                    0,
+                    0,
+                    0.2
+                  ],
+                  "object_id": "isaac_ur10e_light_robot",
+                  "policy_id": "viewer.measured_tcp",
+                  "source_coordinate_frame_id": "universe",
+                  "source_header_frame_id": "robotiq_arg2f_base_link",
+                  "target_frame_id": "universe"
+                },
+                {
+                  "eligible": true,
+                  "entity": "/mac_n_cheese_centered",
+                  "frame_kind": "cell_frame",
+                  "lifetime_ns": 2000000000,
+                  "local_orientation_xyzw": [
+                    0,
+                    0,
+                    0,
+                    1
+                  ],
+                  "local_position_xyz": [
+                    0,
+                    0,
+                    0
+                  ],
+                  "object_id": "isaac_cheese_box",
+                  "policy_id": "continuous_unattached",
+                  "relative_reference": {
+                    "entity": "/World/ur10e_robotiq2f_140_ROS/ur10e_robotiq2f_140/ee_link/robotiq_arg2f_base_link",
+                    "link": "robotiq_base_link",
+                    "source_header_frame_id": "robotiq_arg2f_base_link"
+                  },
+                  "source_coordinate_frame_id": "universe",
+                  "source_header_frame_id": "mac_n_cheese_centered",
+                  "target_frame_id": "universe"
+                }
+              ],
+              "simulation_poll_period_ms": 250
+            }
+          ]
+        },
+        "scene_pose_sources": [
+          {
+            "apply_policy": "continuous_relative_to_attached",
+            "scene_resource_id": "isaac_cheese_box",
+            "source_id": "isaac_scene_objects"
+          }
+        ]
+      },
       "program_role_assignments": [
         {
           "scenario_id": "isaac-ur10e-light-scene",
@@ -1197,6 +1392,80 @@
       "root_pose_in_cell": {
         "position_m": [-0.21814000606536865, -0.571590006351471, 0.12999999523162842],
         "orientation_xyzw": [0.0, 0.0, -0.7071067690846544, 0.7071067932884405]
+      },
+      "pose_source": {
+        "component_id": "isaac_scene_objects",
+        "runtime_configuration": {
+          "pose_sources": [
+            {
+              "controllable_component_id": "isaac_scene_objects",
+              "detection3d_sources": [],
+              "joint_state": {
+                "eligible": false,
+                "lifetime_ns": 1000000000,
+                "object_id": "isaac_ur10e_collision_robot",
+                "policy_id": "viewer.measured_robot",
+                "required_joint_names": [
+                  "shoulder_pan_joint",
+                  "shoulder_lift_joint",
+                  "elbow_joint",
+                  "wrist_1_joint",
+                  "wrist_2_joint",
+                  "wrist_3_joint"
+                ],
+                "topic": "/isaac_joint_states"
+              },
+              "simulation_entities": [
+                {
+                  "eligible": false,
+                  "entity": "/World/ur10e_robotiq2f_140_ROS/ur10e_robotiq2f_140/ee_link/robotiq_arg2f_base_link",
+                  "frame_kind": "cell_frame",
+                  "lifetime_ns": 1000000000,
+                  "local_orientation_xyzw": [
+                    0,
+                    0,
+                    0,
+                    1
+                  ],
+                  "local_position_xyz": [
+                    0,
+                    0,
+                    0.2
+                  ],
+                  "object_id": "isaac_ur10e_collision_robot",
+                  "policy_id": "viewer.measured_tcp",
+                  "source_coordinate_frame_id": "universe",
+                  "source_header_frame_id": "robotiq_arg2f_base_link",
+                  "target_frame_id": "universe"
+                },
+                {
+                  "eligible": true,
+                  "entity": "/mac_n_cheese_centered",
+                  "frame_kind": "cell_frame",
+                  "lifetime_ns": 2000000000,
+                  "local_orientation_xyzw": [
+                    0,
+                    0,
+                    0,
+                    1
+                  ],
+                  "local_position_xyz": [
+                    0,
+                    0,
+                    0
+                  ],
+                  "object_id": "isaac_cheese_box",
+                  "policy_id": "continuous_unattached",
+                  "source_coordinate_frame_id": "universe",
+                  "source_header_frame_id": "mac_n_cheese_centered",
+                  "target_frame_id": "universe"
+                }
+              ],
+              "simulation_poll_period_ms": 250
+            }
+          ]
+        },
+        "scene_pose_sources": []
       },
       "program_role_assignments": [
         {
@@ -1394,6 +1663,53 @@
       "root_pose_in_cell": {
         "position_m": [0.0, 0.0, 0.0],
         "orientation_xyzw": [0.0, 0.0, 0.0, 1.0]
+      },
+      "pose_source": {
+        "component_id": "foundationpose_trocar",
+        "runtime_configuration": {
+          "pose_sources": [
+            {
+              "controllable_component_id": "foundationpose_trocar",
+              "detection3d_sources": [
+                {
+                  "eligible": true,
+                  "fallback_frame_id": "link_base",
+                  "frame_kind": "cell_frame",
+                  "lifetime_ns": 5000000000,
+                  "object_id": "graspable",
+                  "policy_id": "before_planning",
+                  "selector": {
+                    "class_id": "",
+                    "confidence_min": 0,
+                    "detection_id": "",
+                    "max_position_variance_m2": 0.0025,
+                    "selection": "first"
+                  },
+                  "target_frame_id": "link_base",
+                  "topic": "/output"
+                }
+              ],
+              "joint_state": {
+                "eligible": false,
+                "lifetime_ns": 1000000000,
+                "object_id": "isaac_lite6_trocar_robot",
+                "policy_id": "viewer.measured_robot",
+                "required_joint_names": [
+                  "joint1",
+                  "joint2",
+                  "joint3",
+                  "joint4",
+                  "joint5",
+                  "joint6"
+                ],
+                "topic": "/isaac_joint_states"
+              },
+              "simulation_entities": [],
+              "simulation_poll_period_ms": 100
+            }
+          ]
+        },
+        "scene_pose_sources": []
       },
       "program_role_assignments": [
         {

@@ -2226,7 +2226,7 @@ def test_only_typed_preacceptance_rejection_becomes_definite_manager_refusal() -
         effect: str | None = "none"
 
         def manager_apply(self, _body):
-            message = "named Isaac world requires --isaac-site-settings"
+            message = "named Isaac world is unavailable"
             details = {"effect": self.effect} if self.effect is not None else {}
             raise HeadlessClientError(
                 "apply_rejected",
@@ -2254,7 +2254,7 @@ def test_only_typed_preacceptance_rejection_becomes_definite_manager_refusal() -
     assert str(rejected.value) == (
         "Manager rejected the exact Deployment candidate: "
         "apply_rejected: "
-        "named Isaac world requires --isaac-site-settings"
+        "named Isaac world is unavailable"
     )
 
     # The generic Manager catch also covers failures during or after durable

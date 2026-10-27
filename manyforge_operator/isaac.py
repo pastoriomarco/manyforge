@@ -152,7 +152,6 @@ class RemoteNativeConfig:
     cache_root: str = ""
     runtime_root: str = ""
     evidence_root: str = ""
-    isaac_site_settings: str = ""
 
     def __post_init__(self) -> None:
         if self.container_image_id:
@@ -164,8 +163,6 @@ class RemoteNativeConfig:
             for name in ("cache_root", "runtime_root", "evidence_root"):
                 if not getattr(self, name).startswith("/"):
                     raise ValueError(f"{name} must be explicit absolute host storage")
-        if self.isaac_site_settings and not self.isaac_site_settings.startswith("/"):
-            raise ValueError("isaac_site_settings must be absolute")
         if not self.target or any(character.isspace() for character in self.target):
             raise ValueError("remote target must be one bounded SSH target")
         required_paths = (
@@ -305,7 +302,7 @@ class IsaacLauncherConfig:
             inputs["remote_container"] = {name: getattr(self.remote, name) for name in
                 ("container_image_id", "container_name", "cache_root", "runtime_root", "evidence_root",
                  "install_root", "canonical_empty_admission_filename", "composer_static_dir",
-                 "simulation_control_config", "isaac_site_settings", "node_catalog_path", "alarm_catalog_path", "package_aggregate_sha256",
+                 "simulation_control_config", "node_catalog_path", "alarm_catalog_path", "package_aggregate_sha256",
                  "compiler_build_manifest_sha256", "node_environment_sha256")}
         if self.joint_commands_topic is not None:
             inputs["joint_commands_topic"] = self.joint_commands_topic
@@ -725,7 +722,6 @@ class IsaacLauncher:
             "MANYFORGE_DEV_OPERATOR_ALARM_CATALOG": remote.alarm_catalog_path,
             "MANYFORGE_DEV_COMPOSER_STATIC_DIR": remote.composer_static_dir,
             "MANYFORGE_DEV_SIMULATION_CONTROL_CONFIG": remote.simulation_control_config,
-            "MANYFORGE_DEV_ISAAC_SITE_SETTINGS": getattr(remote, "isaac_site_settings", ""),
         }
         resources = (self._remote_status or {}).get("owned_resources", [])
         if not resources:

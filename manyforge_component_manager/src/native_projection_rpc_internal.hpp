@@ -95,29 +95,6 @@ struct NativeProjectionEffectivePolicyRequest final {
   }
 };
 
-/// Freshness-only confirmation for one unchanged committed object at the
-/// exact expected projection revision. Not an owner transaction.
-struct NativeProjectionProviderFreshnessRequest final {
-  manyforge::core::ProjectionNativeRuntimeBindingDTO native_runtime_binding;
-  manyforge::core::ProviderFreshnessConfirmationDTO confirmation;
-
-  [[nodiscard]] bool valid() const noexcept {
-    return native_runtime_binding.valid() && confirmation.valid();
-  }
-};
-
-/// Exact acknowledgement of an applied freshness confirmation; it echoes the
-/// unchanged projection revision, the object and the accepted sequence.
-struct NativeProjectionProviderFreshnessResult final {
-  manyforge::core::ProjectionRevisionDTO projection_revision;
-  manyforge::core::SceneResourceId scene_resource_id;
-  std::uint64_t provider_source_sequence{};
-
-  [[nodiscard]] bool valid() const noexcept {
-    return projection_revision.valid() && !scene_resource_id.empty();
-  }
-};
-
 struct NativeProjectionRetainResult final {
   manyforge::core::ProjectionLeaseBindingDTO projection_binding;
 };
@@ -135,8 +112,7 @@ using NativeProjectionRpcRequest =
                  NativeProjectionRetainRequest,
                  NativeProjectionReleaseRequest,
                  NativeProjectionSceneFrameRequest,
-                 NativeProjectionEffectivePolicyRequest,
-                 NativeProjectionProviderFreshnessRequest>;
+                 NativeProjectionEffectivePolicyRequest>;
 
 struct NativeProjectionRpcFailure final {
   manyforge::core::ErrorDTO error;
@@ -151,8 +127,7 @@ using NativeProjectionRpcResponse =
                  NativeProjectionRetainResult,
                  NativeProjectionReleaseResult,
                  manyforge::core::SceneFrameResolutionReceiptDTO,
-                 manyforge::core::CollisionPolicySnapshot,
-                 NativeProjectionProviderFreshnessResult>;
+                 manyforge::core::CollisionPolicySnapshot>;
 
 [[nodiscard]] std::string
 EncodeNativeProjectionRpcRequest(const NativeProjectionRpcRequest &request);

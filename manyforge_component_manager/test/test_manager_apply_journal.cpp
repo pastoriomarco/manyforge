@@ -2151,51 +2151,6 @@ TEST(ManagerApplyJournal,
   EXPECT_EQ(reopened.VerifyIntegrity().apply_intent_count, 1);
 }
 
-TEST(ManagerApplyJournal, ObserverFactsReplayExactlyConflictAndSurviveReopen) {
-  TemporaryDirectory directory;
-  const auto path = directory.path() / "observer-facts.sqlite3";
-  auto intent = Intent();
-  intent.isaac_pose_observer_launch_facts = ManagerIsaacPoseObserverLaunchFactsDTO{
-      "/retained/check/observer.yaml", "checked-source", "checked-epoch-base"};
-  ASSERT_TRUE(intent.valid());
-  const auto digest = ComputeManagerApplyIntentDigest(intent);
-  EXPECT_NE(digest, ComputeManagerApplyIntentDigest(Intent()));
-  {
-    SqliteManagerApplyJournal journal(path, intent.cell_id);
-    const auto accepted = journal.EnsureIntent(intent);
-    EXPECT_TRUE(accepted.inserted);
-    EXPECT_EQ(accepted.record.intent, intent);
-    EXPECT_EQ(accepted.record.intent_digest, digest);
-    EXPECT_FALSE(journal.EnsureIntent(intent).inserted);
-    const auto reject = [&](const auto &mutate) {
-      auto changed = intent;
-      mutate(changed);
-      ASSERT_TRUE(changed.valid());
-      EXPECT_NE(ComputeManagerApplyIntentDigest(changed), digest);
-      EXPECT_THROW(static_cast<void>(journal.EnsureIntent(changed)), ManagerApplyJournalConflictError);
-    };
-    reject([](auto &value) {
-      value.isaac_pose_observer_launch_facts->retained_snapshot_path =
-          "/retained/check/other-observer.yaml";
-    });
-    reject([](auto &value) {
-      value.isaac_pose_observer_launch_facts->source_id = "other-checked-source";
-    });
-    reject([](auto &value) {
-      value.isaac_pose_observer_launch_facts->source_epoch_base = "other-checked-base";
-    });
-    reject([](auto &value) { value.isaac_pose_observer_launch_facts.reset(); });
-    EXPECT_EQ(journal.ReadStatusInventory().front().intent.intent, intent);
-  }
-  SqliteManagerApplyJournal reopened(path, intent.cell_id);
-  const auto stored = reopened.ReadIntent(intent.apply_id, intent.apply_generation);
-  ASSERT_TRUE(stored);
-  EXPECT_EQ(stored->intent, intent);
-  EXPECT_EQ(stored->intent_digest, digest);
-  EXPECT_FALSE(reopened.EnsureIntent(stored->intent).inserted);
-  EXPECT_EQ(reopened.VerifyIntegrity().apply_intent_count, 1);
-}
-
 TEST(ManagerApplyJournalIntegrity,
      IntentDigestIsSensitiveToEveryPersistedField) {
   TemporaryDirectory directory;
@@ -4143,9 +4098,7 @@ TEST(ManagerApplyBringUpJournal,
 TEST(ManagerApplyBringUpJournal, ReadOnlyClaimIntentResolvesOnlyExactRetainedParent) {
   TemporaryDirectory directory;
   const auto path = directory.path() / "parent-claim-intent-read.sqlite3";
-  auto parent = Intent();
-  parent.isaac_pose_observer_launch_facts = ManagerIsaacPoseObserverLaunchFactsDTO{
-      "/retained/check/parent-observer.yaml", "parent-source", "parent-epoch-base"};
+  const auto parent = Intent();
   const auto claim = [&] {
     SqliteManagerApplyJournal journal(path, parent.cell_id);
     const auto accepted_plan = journal.EnsureBringUpIntent(parent, BringUpPlan(parent));
@@ -4584,43 +4537,14 @@ TEST(ManagerApplyBringUpJournal,
 }
 
 TEST(ManagerApplyJournalIntegrity,
-     RefusesEarlierV18MissingObserverColumnWithoutMutatingInterruptedFile) {
-  for (const bool interrupted : {false, true}) {
-    TemporaryDirectory directory;
-    const auto path = directory.path() / "earlier-v18.sqlite3";
-    {
-      SqliteManagerApplyJournal owner(path, CellId("cell-1"));
-      if (interrupted) static_cast<void>(owner.EnsureIntent(Intent()));
-    }
-    ExecSql(path, "ALTER TABLE manager_apply_intents DROP COLUMN isaac_pose_observer_launch_facts;");
-    const auto before = ReadFileBytes(path);
-    try {
-      SqliteManagerApplyJournal refused(path, CellId("cell-1"));
-      FAIL() << "earlier v18 journal must be refused";
-    } catch (const ManagerApplyJournalIntegrityError &error) {
-      const std::string message(error.what());
-      EXPECT_NE(message.find(path.string()), std::string::npos);
-      EXPECT_NE(message.find("unsupported earlier v18"), std::string::npos);
-      EXPECT_NE(message.find("isaac_pose_observer_launch_facts"), std::string::npos);
-      EXPECT_NE(message.find("Preserve"), std::string::npos);
-      EXPECT_NE(message.find("interrupted"), std::string::npos);
-      EXPECT_NE(message.find("reconcile"), std::string::npos);
-      EXPECT_NE(message.find("No migration"), std::string::npos);
-    }
-    EXPECT_EQ(ReadFileBytes(path), before);
-    ExpectNoSqliteSidecars(path);
-  }
-}
-
-TEST(ManagerApplyJournalIntegrity,
-     RefusesV16InterruptedIntentWithActionablePreservationMessage) {
+     RefusesV18InterruptedIntentWithActionablePreservationMessage) {
   TemporaryDirectory directory;
-  const auto path = directory.path() / "interrupted-v16.sqlite3";
+  const auto path = directory.path() / "interrupted-v18.sqlite3";
   {
     SqliteManagerApplyJournal owner(path, CellId("cell-1"));
     static_cast<void>(owner.EnsureIntent(Intent()));
   }
-  ExecSql(path, "PRAGMA user_version=16;");
+  ExecSql(path, "PRAGMA user_version=18;");
   const auto before = ReadFileBytes(path);
   try {
     SqliteManagerApplyJournal refused(path, CellId("cell-1"));
@@ -4628,8 +4552,8 @@ TEST(ManagerApplyJournalIntegrity,
   } catch (const ManagerApplyJournalIntegrityError &error) {
     const std::string message(error.what());
     EXPECT_NE(message.find(path.string()), std::string::npos);
-    EXPECT_NE(message.find("version 16"), std::string::npos);
-    EXPECT_NE(message.find("v18"), std::string::npos);
+    EXPECT_NE(message.find("version 18"), std::string::npos);
+    EXPECT_NE(message.find("v19"), std::string::npos);
     EXPECT_NE(message.find("Preserve"), std::string::npos);
     EXPECT_NE(message.find("interrupted"), std::string::npos);
     EXPECT_NE(message.find("reconcile"), std::string::npos);

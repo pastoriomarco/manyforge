@@ -11,7 +11,6 @@
 #include <stdexcept>
 #include <string>
 #include <utility>
-#include <variant>
 #include <vector>
 
 #include <manyforge_core/types/controller_launch_group_drain.hpp>
@@ -73,8 +72,11 @@ mock_controller_launch_command(const ControllerLaunchArtifacts &artifacts);
 /// facts the generated URDF's hardware section was written from so the
 /// launch's readiness topics agree with it by construction). The user opens
 /// the Isaac scene; this process only attaches the ROS controller stack.
+/// `gripper_state_freshness_timeout_s` is the gripper target configuration's
+/// value, passed to the launch's gripper transport adapter (one source).
 [[nodiscard]] ControllerLaunchCommand isaac_controller_launch_command(
-    const ControllerLaunchArtifacts &artifacts, const IsaacControllerLane &lane);
+    const ControllerLaunchArtifacts &artifacts, const IsaacControllerLane &lane,
+    std::optional<double> gripper_state_freshness_timeout_s = std::nullopt);
 
 /// What one activation does with a component's launch process.
 enum class ControllerLaunchDecision {
@@ -171,33 +173,6 @@ struct ControllerLaunchOutputSnapshot final {
   std::uint64_t dropped_forward_bytes{0};
 };
 
-enum class CellLaunchRole { kPoseObserver };
-
-/// A real cell-owned process, never a component registered in the supervisor.
-/// The host supplies qualified argv/identity; this primitive adds no policy.
-struct CellLaunchCommand final {
-  core::CellId cell_id;
-  CellLaunchRole role;
-  /// Exact configured Scene source ID for an observer; absent for a barrier.
-  std::optional<std::string> observer_source_id;
-  std::vector<std::string> argv;
-  std::string identity;
-};
-
-struct CellLaunchExitEvidence final {
-  int pid;
-  std::optional<int> exit_status;
-  std::optional<int> signal;
-  bool core_dumped;
-  std::string observed_utc;
-  CellLaunchCommand command;
-  std::filesystem::path upstream_log_directory;
-  std::string description;
-  std::string request_context;
-};
-
-class CellLaunchProcess;
-
 /// One started launch process. Its own process group holds the whole
 /// `ros2 launch` tree; stopping signals the group. On parent death the canonical
 /// Mock/Isaac controller launch roles receive SIGINT, other roles SIGTERM
@@ -210,7 +185,7 @@ public:
 
   [[nodiscard]] int pid() const noexcept { return pid_; }
   [[nodiscard]] const ControllerLaunchCommand &command() const noexcept {
-    return std::get<ControllerLaunchCommand>(command_);
+    return command_;
   }
   /// Non-blocking: the exit description once the child has exited. The
   /// leader stays unreaped to pin its process-group identity until stop().
@@ -236,15 +211,11 @@ public:
 
 private:
   friend class ControllerLaunchSupervisor;
-  friend class CellLaunchProcess;
   struct ForwardingCounters;
   ControllerLaunchProcess(ControllerLaunchCommand command, int pid,
                           std::filesystem::path upstream_log_directory,
                           std::string context,
                           std::shared_ptr<ForwardingCounters> counters);
-  ControllerLaunchProcess(CellLaunchCommand command, int pid,
-                          std::filesystem::path upstream_log_directory,
-                          std::string context);
   void begin_stop(std::chrono::milliseconds grace) noexcept;
   [[nodiscard]] bool poll_stop() noexcept;
   void append_start_header();
@@ -258,7 +229,7 @@ private:
   struct Output;
   std::shared_ptr<Output> output_;
 
-  std::variant<ControllerLaunchCommand, CellLaunchCommand> command_;
+  ControllerLaunchCommand command_;
   int pid_{-1};
   mutable std::mutex mutex_;
   /// Serializes the exact group retirement/reap without blocking scalar reads.
@@ -272,7 +243,6 @@ private:
   std::string start_context_;
   std::string current_request_context_;
   std::optional<ControllerLaunchExitEvidence> exit_evidence_;
-  std::optional<CellLaunchExitEvidence> cell_exit_evidence_;
   bool exact_leader_reaped_{false};
   // One retirement, shared by blocking callers and host aggregate polling.
   std::optional<std::chrono::steady_clock::time_point> stop_deadline_;
@@ -288,36 +258,6 @@ private:
   bool readiness_capture_complete_{false};
   std::string last_incident_id_;
   std::string last_incident_context_;
-};
-
-/// Typed cell view of the same private process-group/output occurrence.
-/// The host holds this owner outside per-component composition roots.
-class CellLaunchProcess final {
-public:
-  [[nodiscard]] int pid() const noexcept { return occurrence_->pid(); }
-  [[nodiscard]] const CellLaunchCommand &command() const noexcept {
-    return std::get<CellLaunchCommand>(occurrence_->command_);
-  }
-  [[nodiscard]] std::optional<CellLaunchExitEvidence> exit_evidence();
-  /// Cached positive group scan plus this host's exact leader reap. An exit,
-  /// timeout, missing handle or owner epoch change cannot establish this fact.
-  [[nodiscard]] bool group_drained() const;
-  [[nodiscard]] ControllerLaunchOutputSnapshot output_snapshot() const {
-    return occurrence_->output_snapshot();
-  }
-  [[nodiscard]] ControllerLaunchForwardingCounters output_counters() const {
-    return occurrence_->output_counters();
-  }
-  void update_request_context(std::string context) {
-    occurrence_->update_request_context(std::move(context));
-  }
-  void stop(std::chrono::milliseconds grace) noexcept { occurrence_->stop(grace); }
-
-private:
-  friend class ControllerLaunchSupervisor;
-  explicit CellLaunchProcess(std::shared_ptr<ControllerLaunchProcess> occurrence)
-      : occurrence_(std::move(occurrence)) {}
-  std::shared_ptr<ControllerLaunchProcess> occurrence_;
 };
 
 /// Per-host owner of every component's controller launch (Q66: one controller
@@ -351,21 +291,6 @@ public:
   [[nodiscard]] Ensured ensure(const ControllerLaunchCommand &command,
                                const std::filesystem::path &artifacts_root,
                                std::string context = {});
-
-  /// One explicit spawn using the existing Spawner, group and bounded output.
-  /// No map registration, keep/restart decision, retry or lifecycle permission.
-  /// Validate the existing upstream log root before effects. The caller must
-  /// retire cell occurrences before this supervisor's lifetime ends.
-  [[nodiscard]] std::shared_ptr<CellLaunchProcess>
-  start_cell_process(const CellLaunchCommand &command,
-                     const std::filesystem::path &artifacts_root,
-                     std::string context = {});
-
-  /// Retire a real cell occurrence using this supervisor's existing grace.
-  /// True proves this host actually reaped the exact leader; a cached exit or
-  /// ECHILD never proves that receipt. No component map entry is touched.
-  [[nodiscard]] bool
-  retire_cell_process(const std::shared_ptr<CellLaunchProcess> &process);
 
   /// Discard a candidate-owned launch only when it is still the exact
   /// current process. Borrowed kKeep receipts and superseded processes are
@@ -402,16 +327,14 @@ public:
   using HostShutdownSnapshot =
       std::vector<std::shared_ptr<ControllerLaunchProcess>>;
   /// One host-exit cut: close launch submission and retain the actual component
-  /// and caller-owned cell occurrences. Every group begins before any poll.
-  [[nodiscard]] HostShutdownSnapshot BeginHostShutdown(
-      const std::vector<std::shared_ptr<CellLaunchProcess>> &cells);
+  /// occurrences. Every group begins before any poll.
+  [[nodiscard]] HostShutdownSnapshot BeginHostShutdown();
   /// Advance each original retirement once, without renewing its grace.
   /// Completed exact map entries retire; later publications are never removed.
   [[nodiscard]] ShutdownProgress
   PollHostShutdown(const HostShutdownSnapshot &snapshot) noexcept;
 
-  /// Stop every registered component. Host-owned cell processes retire through
-  /// their own exact occurrence, independently of component removal.
+  /// Stop every registered component.
   void stop_all() noexcept;
   /// Bounded best-effort host notice; no output IO runs in the caller.
   void enqueue_host_log(std::string line) noexcept;

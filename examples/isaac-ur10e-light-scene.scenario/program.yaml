@@ -147,26 +147,26 @@
           "node_id": "motion.move_to_pose",
           "parameters": {
             "base_frame_role": "base",
-            "execution_timeout_s": 30.0,
+            "execution_timeout_s": 30,
             "goal": {
               "orientation": {
                 "rpy_deg": [
-                  180.0,
-                  0.0,
-                  -180.0
+                  180,
+                  0,
+                  -180
                 ]
               },
               "position_m": [
-                0.0,
-                0.0,
-                0.08
+                0,
+                0,
+                0.06
               ]
             },
             "offset_reference": {
               "frame_role_id": "base",
               "type": "frame_role"
             },
-            "planning_timeout_s": 10.0,
+            "planning_timeout_s": 10,
             "target_mode": "relative",
             "target_reference": {
               "scene_resource_id": "isaac_cheese_box",
@@ -199,7 +199,7 @@
                 },
                 "position": {
                   "kind": "angular_rad",
-                  "value_rad": 0.6
+                  "value_rad": 0.55
                 },
                 "target_role": "gripper"
               }

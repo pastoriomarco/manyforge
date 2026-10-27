@@ -292,8 +292,10 @@ def _validate_component_readiness(
 
     try:
         counters = {"dropped_output_lines", "dropped_output_bytes"}
+        optional = (counters if counters & set(snapshot) else set()) | (
+            {"stream_health"} if "stream_health" in snapshot else set())
         fields = (_COMPONENT_FIELDS - {"lifecycle_progress", "lifecycle_target", "readiness"}
-                  if lifecycle_only else _COMPONENT_FIELDS | (counters if counters & set(snapshot) else set()))
+                  if lifecycle_only else _COMPONENT_FIELDS | optional)
         require(set(snapshot) == fields)
         state = snapshot["component_lifecycle_state"]
         require(_member(state, _LIFECYCLE_STATES))
@@ -592,6 +594,44 @@ def _valid_incident(incident: Any) -> bool:
     )
 
 
+_STREAM_STATES = frozenset({"live", "stale", "absent"})
+_STREAM_SEVERITIES = frozenset({"fault", "blocking", "warning"})
+_STREAM_RECOVERIES = frozenset({"ack", "auto"})
+_STREAM_TIMESTAMP_SOURCES = frozenset({"message_stamp", "arrival"})
+_STREAM_ROW_FIELDS = {
+    "acknowledgement_required", "age_ns", "budget_ns", "error", "recovery",
+    "severity", "state", "stream_id", "timestamp_source",
+}
+
+
+def _valid_stream_health(value: Any) -> bool:
+    """CP9 per-stream health rows (contract (c)), closed and sorted."""
+
+    def row_valid(row: Any) -> bool:
+        return (
+            _closed(row, _STREAM_ROW_FIELDS)
+            and _diagnostic_text(row["stream_id"], 64, nonempty=True)
+            and _member(row["state"], _STREAM_STATES)
+            and _member(row["severity"], _STREAM_SEVERITIES)
+            and _member(row["recovery"], _STREAM_RECOVERIES)
+            and _member(row["timestamp_source"], _STREAM_TIMESTAMP_SOURCES)
+            and type(row["acknowledgement_required"]) is bool
+            and _is_int(row["budget_ns"]) and 1 <= row["budget_ns"] <= MAXIMUM_SAFE_INTEGER
+            and (row["age_ns"] is None
+                 or (_is_int(row["age_ns"]) and 0 <= row["age_ns"] <= MAXIMUM_SAFE_INTEGER))
+            and _readiness_error(row["error"])
+        )
+
+    try:
+        return (
+            _canonical_rows(value, 256, lambda row: row["stream_id"])
+            and bool(value)
+            and all(row_valid(row) for row in value)
+        )
+    except (KeyError, TypeError):
+        return False
+
+
 def _invalid_lifecycle_fact(field: str) -> HeadlessApiError:
     return HeadlessApiError(
         "cclc_open_response_invalid",
@@ -608,6 +648,8 @@ def _validate_lifecycle_target_facts(snapshot: Mapping[str, Any]) -> None:
     Available output-loss counters arrive as one exact uint64 pair.
     """
 
+    if "stream_health" in snapshot and not _valid_stream_health(snapshot["stream_health"]):
+        raise _invalid_lifecycle_fact("stream_health")
     output_counter_fields = {"dropped_output_lines", "dropped_output_bytes"}
     present_output_counters = output_counter_fields.intersection(snapshot)
     if present_output_counters and (
@@ -689,6 +731,27 @@ def _validate_incident_recovery(
     """
 
     close = intent.get("close_incident_recovery")
+    if "stream_acknowledgement" in result:
+        # CP9: a Recover with no open incident that cleared a latched stream.
+        acknowledged = result["stream_acknowledgement"]
+        if (
+            close is not None
+            or intent.get("intent") != "recover"
+            or not isinstance(acknowledged, dict)
+            or set(acknowledged) != {"acknowledged_at_ns", "controllable_component_id"}
+            or not _is_owner_ns(acknowledged["acknowledged_at_ns"])
+            or acknowledged["controllable_component_id"] != intent.get("controllable_component_id")
+            or result.get("acceptance") is not None
+            or result.get("status") is not None
+            or result.get("replay_status") != "accepted_new"
+            or "rejection" in result
+            or "incident_recovery" in result
+        ):
+            raise HeadlessApiError(
+                "cclc_open_response_invalid",
+                "CCLC stream acknowledgement result is invalid",
+            )
+        return
     if "incident_recovery" not in result:
         if close is not None:
             if (set(result) == {"acceptance", "replay_status", "status"}

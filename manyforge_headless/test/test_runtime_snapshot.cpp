@@ -110,70 +110,22 @@ CanonicalValue SceneRuntimePayload(const std::string &cell_id) {
   });
 }
 
-CanonicalValue SceneRuntimePayloadWithObserver(
-    const std::string &cell_id, const std::string &availability,
-    const std::string &process_presence, const bool observation_current,
-    const bool expects_joint_state = true,
-    const bool extra_observer_field = false) {
+CanonicalValue
+SceneRuntimePayloadWithJointStates(const std::string &cell_id,
+                                   CanonicalValue::Array rows) {
   auto payload = SceneRuntimePayload(cell_id).as_object();
-  CanonicalValue expected_joint_state(nullptr);
-  if (expects_joint_state) {
-    expected_joint_state = CanonicalValue(CanonicalValue::Object{
-        {"object_id", CanonicalValue("robot.1")},
-        {"policy_id", CanonicalValue("viewer.measured_robot")},
-        {"topic", CanonicalValue("/isaac_joint_states")},
-    });
-  }
-  CanonicalValue::Object observer_fields{
-      {"availability", CanonicalValue(availability)},
-      {"cell_id", CanonicalValue(cell_id)},
-      {"exit", CanonicalValue(nullptr)},
-      {"expected_joint_state", std::move(expected_joint_state)},
-      {"incident_id", CanonicalValue(nullptr)},
-      {"incident_persistence", CanonicalValue(0.0)},
-      {"observation_current", CanonicalValue(observation_current)},
-      {"process_presence", CanonicalValue(process_presence)},
-      {"source_epoch_base", CanonicalValue("source-epoch-base")},
-      {"source_id", CanonicalValue("isaac_scene_objects")},
-  };
-  if (extra_observer_field) {
-    observer_fields.emplace_back("unexpected", CanonicalValue(true));
-  }
-  payload.emplace_back("cell_observer",
-                       CanonicalValue(std::move(observer_fields)));
+  payload.emplace_back("configured_joint_states",
+                       CanonicalValue(std::move(rows)));
   return CanonicalValue(std::move(payload));
 }
 
-CanonicalValue
-SceneRuntimePayloadWithExitedObserver(const std::string &cell_id) {
-  auto payload = SceneRuntimePayload(cell_id).as_object();
-  payload.emplace_back(
-      "cell_observer",
-      CanonicalValue(CanonicalValue::Object{
-          {"availability", CanonicalValue("unknown")},
-          {"cell_id", CanonicalValue(cell_id)},
-          {"exit", CanonicalValue(CanonicalValue::Object{
-                       {"core_dumped", CanonicalValue(false)},
-                       {"detected_at_ns", CanonicalValue("9007199254740993")},
-                       {"exit_status", CanonicalValue(1.0)},
-                       {"observed_utc", CanonicalValue("2026-10-24T12:00:00Z")},
-                       {"pid", CanonicalValue(42.0)},
-                       {"signal", CanonicalValue(nullptr)},
-                   })},
-          {"expected_joint_state",
-           CanonicalValue(CanonicalValue::Object{
-               {"object_id", CanonicalValue("robot.1")},
-               {"policy_id", CanonicalValue("viewer.measured_robot")},
-               {"topic", CanonicalValue("/isaac_joint_states")},
-           })},
-          {"incident_id", CanonicalValue("observer-exit-1")},
-          {"incident_persistence", CanonicalValue(3.0)},
-          {"observation_current", CanonicalValue(true)},
-          {"process_presence", CanonicalValue("absent")},
-          {"source_epoch_base", CanonicalValue("source-epoch-base")},
-          {"source_id", CanonicalValue("isaac_scene_objects")},
-      }));
-  return CanonicalValue(std::move(payload));
+CanonicalValue::Object JointStateRow() {
+  return CanonicalValue::Object{
+      {"object_id", CanonicalValue("robot.1")},
+      {"policy_id", CanonicalValue("viewer.measured_robot")},
+      {"source_id", CanonicalValue("isaac_scene_objects")},
+      {"topic", CanonicalValue("/isaac_joint_states")},
+  };
 }
 
 bool RequiredBool(const CanonicalValue &root, const std::string_view name) {
@@ -310,7 +262,7 @@ TEST(RuntimeSnapshotAggregator,
 }
 
 TEST(RuntimeSnapshotAggregator,
-     AcceptsTypedAvailableAndWaitingCellObserverButRejectsMalformedShape) {
+     AcceptsConfiguredJointStatesButRejectsMalformedShape) {
   TemporaryDirectory directory;
   AtomicSourceSnapshotChannel manager(directory.path(), "manager-source.json");
   AtomicSourceSnapshotChannel scene(directory.path(),
@@ -326,7 +278,7 @@ TEST(RuntimeSnapshotAggregator,
                                   LogicalScenePayload(cell_id)));
   static_cast<void>(scene_runtime.Publish(
       "scene_runtime", "scene-runtime." + cell_id, "scene-runtime-epoch-1", 30,
-      SceneRuntimePayloadWithObserver(cell_id, "available", "present", true)));
+      SceneRuntimePayloadWithJointStates(cell_id, {})));
   std::int64_t wall_now = std::max(
       {manager.ReadObserved()->file_modified_at_unix_ns,
        scene.ReadObserved()->file_modified_at_unix_ns,
@@ -340,52 +292,41 @@ TEST(RuntimeSnapshotAggregator,
 
   static_cast<void>(scene_runtime.Publish(
       "scene_runtime", "scene-runtime." + cell_id, "scene-runtime-epoch-1", 40,
-      SceneRuntimePayloadWithObserver(cell_id, "pending", "unknown", false)));
+      SceneRuntimePayloadWithJointStates(cell_id,
+                                         {CanonicalValue(JointStateRow())})));
   wall_now = scene_runtime.ReadObserved()->file_modified_at_unix_ns + 10;
   EXPECT_TRUE(RequiredBool(aggregator.Evaluate().root, "complete"));
 
-  static_cast<void>(scene_runtime.Publish(
-      "scene_runtime", "scene-runtime." + cell_id, "scene-runtime-epoch-1", 50,
-      SceneRuntimePayloadWithObserver(cell_id, "unavailable", "absent",
-                                      false)));
-  wall_now = scene_runtime.ReadObserved()->file_modified_at_unix_ns + 10;
-  EXPECT_TRUE(RequiredBool(aggregator.Evaluate().root, "complete"));
-
-  static_cast<void>(scene_runtime.Publish(
-      "scene_runtime", "scene-runtime." + cell_id, "scene-runtime-epoch-1", 55,
-      SceneRuntimePayloadWithObserver(cell_id, "available", "present", true,
-                                      false)));
-  wall_now = scene_runtime.ReadObserved()->file_modified_at_unix_ns + 10;
-  EXPECT_TRUE(RequiredBool(aggregator.Evaluate().root, "complete"));
-
-  static_cast<void>(scene_runtime.Publish(
-      "scene_runtime", "scene-runtime." + cell_id, "scene-runtime-epoch-1", 57,
-      SceneRuntimePayloadWithObserver(cell_id, "available", "present", true,
-                                      true, true)));
-  wall_now = scene_runtime.ReadObserved()->file_modified_at_unix_ns + 10;
-  const auto invalid_observer = aggregator.Evaluate();
-  EXPECT_FALSE(RequiredBool(invalid_observer.root, "complete"));
-  EXPECT_NE(content_identity::canonical_json(invalid_observer.root)
-                .find("scene_runtime_source_invalid"),
-            std::string::npos);
-
-  static_cast<void>(scene_runtime.Publish(
-      "scene_runtime", "scene-runtime." + cell_id, "scene-runtime-epoch-1", 60,
-      SceneRuntimePayloadWithExitedObserver(cell_id)));
-  wall_now = scene_runtime.ReadObserved()->file_modified_at_unix_ns + 10;
-  EXPECT_TRUE(RequiredBool(aggregator.Evaluate().root, "complete"));
-
+  const auto expect_invalid = [&](const std::int64_t observed_at,
+                                  CanonicalValue payload) {
+    static_cast<void>(scene_runtime.Publish(
+        "scene_runtime", "scene-runtime." + cell_id, "scene-runtime-epoch-1",
+        observed_at, std::move(payload)));
+    wall_now = scene_runtime.ReadObserved()->file_modified_at_unix_ns + 10;
+    const auto invalid = aggregator.Evaluate();
+    EXPECT_FALSE(RequiredBool(invalid.root, "complete"));
+    EXPECT_NE(content_identity::canonical_json(invalid.root)
+                  .find("scene_runtime_source_invalid"),
+              std::string::npos);
+  };
+  auto extra_field = JointStateRow();
+  extra_field.emplace_back("unexpected", CanonicalValue(true));
+  expect_invalid(50, SceneRuntimePayloadWithJointStates(
+                         cell_id, {CanonicalValue(std::move(extra_field))}));
+  auto missing_topic = JointStateRow();
+  missing_topic.pop_back();
+  expect_invalid(55, SceneRuntimePayloadWithJointStates(
+                         cell_id, {CanonicalValue(std::move(missing_topic))}));
+  auto non_string = JointStateRow();
+  non_string.back().second = CanonicalValue(1.0);
+  expect_invalid(57, SceneRuntimePayloadWithJointStates(
+                         cell_id, {CanonicalValue(std::move(non_string))}));
+  auto not_array = SceneRuntimePayload(cell_id).as_object();
+  not_array.emplace_back("configured_joint_states", CanonicalValue(nullptr));
+  expect_invalid(60, CanonicalValue(std::move(not_array)));
   auto malformed = SceneRuntimePayload(cell_id).as_object();
   malformed.emplace_back("unexpected", CanonicalValue(true));
-  static_cast<void>(scene_runtime.Publish(
-      "scene_runtime", "scene-runtime." + cell_id, "scene-runtime-epoch-1", 70,
-      CanonicalValue(std::move(malformed))));
-  wall_now = scene_runtime.ReadObserved()->file_modified_at_unix_ns + 10;
-  const auto invalid = aggregator.Evaluate();
-  EXPECT_FALSE(RequiredBool(invalid.root, "complete"));
-  EXPECT_NE(content_identity::canonical_json(invalid.root)
-                .find("scene_runtime_source_invalid"),
-            std::string::npos);
+  expect_invalid(70, CanonicalValue(std::move(malformed)));
 }
 
 TEST(RuntimeSnapshotAggregator,

@@ -31,3 +31,28 @@ it('offers the six supported policies and edits the Deployment through its owner
   });
   await act(() => root.unmount());
 });
+
+it('keeps the deadband on the binding, in mm and degrees, and omits zero', async () => {
+  const binding = { source_id: 'camera', scene_resource_id: 'part', apply_policy: 'continuous' };
+  const mutate = vi.fn().mockResolvedValue({});
+  const controller = {
+    workspace: { draft: { document: { policies: { scene_pose_sources: [binding] } } } },
+    mutationAvailable: true, busy: false, loading: false, mutate,
+  } as unknown as DeploymentWorkspaceController;
+  const { host, find } = reactPropsHost();
+  const { createRoot } = await import('react-dom/client');
+  const root = createRoot(host as unknown as Element);
+  await act(() => root.render(<ScenePoseSourcePolicySection controller={controller} sources={[]} />));
+  const field = (unit: string) => find((props) => props['aria-label'] === `Pose deadband ${unit} for part from camera`);
+  const blur = (unit: string, value: string) => act(() => (
+    field(unit).onBlur as (event: { target: { value: string } }) => void)({ target: { value } }));
+  expect(field('mm').defaultValue).toBe(0);
+  await blur('mm', '0.1');
+  const rows = (mutate.mock.calls[0][2] as { scene_pose_sources: Record<string, unknown>[] }).scene_pose_sources;
+  expect(rows).toHaveLength(1);
+  expect(rows[0].deadband_translation_m as number).toBeCloseTo(0.0001);
+  expect(rows[0]).not.toHaveProperty('deadband_rotation_rad');
+  await blur('°', '0');
+  expect(mutate).toHaveBeenLastCalledWith(['policies'], 'set', { scene_pose_sources: [binding] });
+  await act(() => root.unmount());
+});

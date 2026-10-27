@@ -3,6 +3,7 @@
 #include <algorithm>
 #include <cmath>
 #include <cstddef>
+#include <optional>
 #include <set>
 #include <stdexcept>
 #include <string>
@@ -238,16 +239,23 @@ ActivationDeploymentIntent parse_activation_deployment_intent(
   if (components.size() > kMaximumComponents) {
     fail("has an invalid component count");
   }
-  const bool has_io = std::any_of(
-      components.begin(), components.end(), [](const auto &component) {
-        const auto *configuration =
-            component.find_object_member("configuration");
-        const auto *kind =
-            configuration ? configuration->find_object_member("runtime_kind")
-                          : nullptr;
-        return kind && kind->is_string() && kind->as_string() == "io_provider";
+  // Model-free components (I/O devices, pose sources) own no model source.
+  const auto model_free_profile =
+      [](const CanonicalValue &component) -> std::optional<std::string_view> {
+    const auto *configuration = component.find_object_member("configuration");
+    const auto *kind =
+        configuration ? configuration->find_object_member("runtime_kind")
+                      : nullptr;
+    if (kind == nullptr || !kind->is_string()) return std::nullopt;
+    if (kind->as_string() == "io_provider") return "io_device_v0";
+    if (kind->as_string() == "pose_source") return "pose_source_v0";
+    return std::nullopt;
+  };
+  const bool has_model_free = std::any_of(
+      components.begin(), components.end(), [&](const auto &component) {
+        return model_free_profile(component).has_value();
       });
-  if (!has_io && components.size() != captured_sources.size())
+  if (!has_model_free && components.size() != captured_sources.size())
     fail("component count differs from the captured source closure");
   const auto &attachments =
       array(member(value, "attachments", "root"), "attachments");
@@ -271,15 +279,8 @@ ActivationDeploymentIntent parse_activation_deployment_intent(
   for (std::size_t index = 0U; index < components.size(); ++index) {
     const auto &component = components[index];
     const std::string label = "components[" + std::to_string(index) + "]";
-    const auto *raw_configuration =
-        component.find_object_member("configuration");
-    const auto *runtime_kind =
-        raw_configuration == nullptr
-            ? nullptr
-            : raw_configuration->find_object_member("runtime_kind");
-    const bool io_provider = runtime_kind && runtime_kind->is_string() &&
-                             runtime_kind->as_string() == "io_provider";
-    if (io_provider)
+    const auto required_model_free_profile = model_free_profile(component);
+    if (required_model_free_profile)
       require_fields(component,
                      {"component_id", "component_profile_id", "configuration",
                       "target_settings"},
@@ -305,11 +306,13 @@ ActivationDeploymentIntent parse_activation_deployment_intent(
     static_cast<void>(object(configuration, label + ".configuration"));
     std::optional<CapturedComponentModelSource> captured;
     std::optional<CanonicalValue> pose;
-    if (io_provider) {
+    if (required_model_free_profile) {
       require_fields(configuration, {"runtime_kind", "runtime_configuration"},
                      {}, label + ".configuration");
-      if (profile_id != "io_device_v0" || !target_settings.as_object().empty())
-        fail(label + " requires io_device_v0 and empty target_settings");
+      if (profile_id != *required_model_free_profile ||
+          !target_settings.as_object().empty())
+        fail(label + " requires " + std::string(*required_model_free_profile) +
+             " and empty target_settings");
     } else {
       if (captured_index == captured_sources.size() ||
           captured_sources[captured_index].component_id != component_id)

@@ -121,7 +121,14 @@ ControllerLaunchSupervisor::Ensured StartSimulatedPlcCandidate(
     for (const auto &driver : drivers)
       if (driver)
         driver->SetSupervisedProcessFaultSource(
-            ControllerLaunchSupervisor::fault_source(process));
+            [source = ControllerLaunchSupervisor::fault_source(process)]()
+                -> std::optional<core::ErrorDTO> {
+              auto reason = source();
+              if (!reason)
+                return std::nullopt;
+              return core::ErrorDTO{"simulated_plc_exited", std::move(*reason),
+                                    {}};
+            });
   unowned.ensured = nullptr;
   return ensured;
 }

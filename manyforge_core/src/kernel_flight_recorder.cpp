@@ -32,8 +32,6 @@ const char* kernel_event_type_name(KernelEventType type) {
     case kPlanCompleted: return "plan_completed";
     case kCacheHit: return "cache_hit";
     case kCacheMiss: return "cache_miss";
-    case kCacheRevalidationCandidate: return "cache_revalidation_candidate";
-    case kCacheRevalidated: return "cache_revalidated";
     case kCacheRevalidationFailed: return "cache_revalidation_failed";
     case kCacheInvalidated: return "cache_invalidated";
     case kValidationStarted: return "validation_started";

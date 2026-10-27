@@ -17,19 +17,6 @@ inline constexpr char kContactPolicyRejection[] =
 inline constexpr char kStartStateInCollision[] = "start_state_in_collision";
 inline constexpr char kPreviewFailed[] = "preview_failed";
 
-inline constexpr char kSceneSnapshotLeaseMissing[] =
-    "scene_snapshot_lease_missing";
-inline constexpr char kLiveSceneSnapshotUnavailable[] =
-    "live_scene_snapshot_unavailable";
-inline constexpr char kSceneSnapshotLeaseExpired[] =
-    "scene_snapshot_lease_expired";
-inline constexpr char kObservedSceneSourceStale[] =
-    "observed_scene_source_stale";
-inline constexpr char kProjectionStructureChangedAfterValidation[] =
-    "projection_structure_changed_after_validation";
-inline constexpr char kSceneSnapshotStructureInvalid[] =
-    "scene_snapshot_structure_invalid";
-
 inline constexpr char kRuntimeContactGraspMonitor[] =
     "runtime_contact_grasp_monitor";
 inline constexpr char kRuntimeContactGraspUnknownPolicy[] =

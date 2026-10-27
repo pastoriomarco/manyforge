@@ -20,6 +20,7 @@
 #include <limits>
 #include <manyforge_content_identity/content_identity.hpp>
 #include <manyforge_core/io_rule_outcome_codec.hpp>
+#include <manyforge_core/types/carried_object_lost.hpp>
 #include <manyforge_core/types/io_rule_state.hpp>
 #include <manyforge_core/types/component_incident.hpp>
 #include <manyforge_deployment/artifact_codec.hpp>
@@ -765,8 +766,8 @@ HeadlessApiCore::HeadlessApiCore(HeadlessApiCoreConfig config,
                    clocks_.monotonic_time_ns, clocks_.wall_time_text,
                    // Headless currently owns operation and runtime-health
                    // alarm adapters.  Scene-initialization faults use the
-                   // runtime-health adapter; no independent scene-domain
-                   // producer exists on this boundary.
+                   // runtime-health adapter. The scene-domain carried-object
+                   // alarm is optional for reconciliation.
                    {"motion", "runtime_health"}),
       runtime_health_adapter_{
           config_.owner_id + ".runtime-health-adapter",
@@ -794,6 +795,10 @@ HeadlessApiCore::HeadlessApiCore(HeadlessApiCoreConfig config,
           {},
           std::nullopt,
       },
+      scene_pose_adapter_{
+          config_.owner_id + ".scene-carried-object-adapter", "scene",
+          "manyforge.alarm_adapter.runtime_scene_condition", {}, 0U, 0U, {},
+          std::nullopt},
       operation_adapter_{
           config_.owner_id + ".operation-condition-adapter",
           "motion",
@@ -3648,46 +3653,8 @@ HeadlessApiCore::RecordCCLCIncidentEvent(std::string cclc_owner_epoch,
               RequiredString(details, "incident_id") == incident_id &&
               RequiredString(details, "event_kind") == event_kind,
           code, "CCLC incident event does not match its record");
-  // Cell-observer loss shares this event stream but retains its distinct,
-  // current closed codec. It is not a component-v2 alias or an old-format
-  // fallback: its explicit target discriminator selects the exact decoder.
-  if (const auto *target_kind = details.find_object_member("target_kind")) {
-    Require(target_kind->is_string() && target_kind->as_string() == "cell_observer",
-            code, "CCLC incident target kind is unsupported");
-    try {
-      auto initial_fields = details.as_object();
-      if (event_kind == core::kComponentIncidentAcknowledgedEventKind) {
-        const auto &acknowledgement = RequiredMember(details, "acknowledgement");
-        const auto &first_open = RequiredMember(acknowledgement, "first_open");
-        Require(acknowledgement.is_object() && acknowledgement.as_object().size() == 6U &&
-                    first_open.is_object() && first_open.as_object().size() == 2U &&
-                    RequiredString(acknowledgement, "request_id").size() <= core::kMaxLifecycleIdentityBytes &&
-                    RequiredString(acknowledgement, "request_owner_epoch").size() <= core::kMaxLifecycleIdentityBytes &&
-                    RequiredString(acknowledgement, "source_label").size() <= core::kMaxLifecycleRequestLabelBytes &&
-                    RequiredString(acknowledgement, "reason") == "superseded by operator bring-up",
-                code, "CCLC cell-observer acknowledgement is invalid");
-        const core::CellObserverBringUpOpenDTO opened{
-            RequiredString(first_open, "source_epoch"),
-            RequiredCounter(first_open, "source_epoch_order", 1U),
-            content_identity::parse_nonnegative_int64(RequiredMember(acknowledgement, "at_ns"))};
-        Require(opened.locally_valid(), code, "CCLC cell-observer first Open is invalid");
-        // Validate the unchanged incident body with its one existing closed
-        // codec; only the actual closure event's two fields differ.
-        for (auto &[name, value] : initial_fields) {
-          if (name == "event_kind")
-            value = CanonicalValue(std::string(core::kComponentIncidentEventKind));
-          if (name == "acknowledgement") value = CanonicalValue(nullptr);
-        }
-      }
-      static_cast<void>(core::DecodeCellObserverIncidentRecord(
-          content_identity::canonical_json(CanonicalValue(std::move(initial_fields)))));
-    } catch (const std::exception &) {
-      CoreFail(code, "CCLC cell-observer incident payload is invalid");
-    }
-  } else {
-    Require(RequiredString(details, "schema_version") == core::kComponentIncidentEventSchemaVersion,
-            code, "CCLC component incident version is unsupported");
-  }
+  Require(RequiredString(details, "schema_version") == core::kComponentIncidentEventSchemaVersion,
+          code, "CCLC component incident version is unsupported");
   const auto cclc_occurred_at_ns = content_identity::parse_nonnegative_int64(
       RequiredMember(event, "occurred_at_ns"));
   const auto key = std::make_pair(incident_id, event_kind);
@@ -4383,9 +4350,11 @@ void HeadlessApiCore::RefreshSceneAdapterLocked(
     const HeadlessRuntimeSnapshot &runtime) {
   const auto &section = RequiredSection(runtime.root, "scene_runtime");
   if (!SectionFresh(section)) {
-    if (!scene_adapter_.source_epoch.empty()) {
-      alarm_owner_.MarkSourceQualityUnknown(scene_adapter_.source_id,
-                                            scene_adapter_.source_epoch);
+    for (const auto *cursor : {&scene_adapter_, &scene_pose_adapter_}) {
+      if (!cursor->source_epoch.empty()) {
+        alarm_owner_.MarkSourceQualityUnknown(cursor->source_id,
+                                              cursor->source_epoch);
+      }
     }
     return;
   }
@@ -4416,6 +4385,38 @@ void HeadlessApiCore::RefreshSceneAdapterLocked(
   static_cast<void>(DeliverFactsLocked(mutation.lifecycle_facts));
   alarm_owner_.CompleteSourceSnapshot(scene_adapter_.source_id,
                                       scene_adapter_.source_epoch,
+                                      AlarmConditionQuality::kGood);
+
+  // Each new carried-object-lost event raises its dedicated alarm once. It
+  // returns at once and stays listed until acknowledged; nothing is blocked.
+  RegisterAdapterEpochLocked(scene_pose_adapter_, *source_epoch);
+  std::set<std::string> published;
+  if (const auto *losses = state.find_object_member("carried_object_losses")) {
+    for (const auto &loss : losses->as_array()) {
+      const auto event_id = RequiredString(loss, "event_id");
+      published.insert(event_id);
+      if (raised_carried_object_losses_.contains(event_id)) {
+        continue;
+      }
+      const AlarmSubject subject{"scene_resource",
+                                 RequiredString(loss, "scene_resource_id"), {}};
+      const CanonicalValue loss_details(CanonicalValue::Object{
+          {"code", RequiredMember(loss, "code")},
+          {"event_id", CanonicalValue(event_id)},
+          {"full_text", RequiredMember(loss, "full_text")},
+      });
+      for (const bool active : {true, false}) {
+        const auto raised = SubmitAdapterUpdateLocked(
+            scene_pose_adapter_,
+            std::string(manyforge::core::kCarriedObjectLostRow.code), subject,
+            active, loss_details, correlations);
+        static_cast<void>(DeliverFactsLocked(raised.lifecycle_facts));
+      }
+    }
+  }
+  raised_carried_object_losses_ = std::move(published);
+  alarm_owner_.CompleteSourceSnapshot(scene_pose_adapter_.source_id,
+                                      scene_pose_adapter_.source_epoch,
                                       AlarmConditionQuality::kGood);
 }
 

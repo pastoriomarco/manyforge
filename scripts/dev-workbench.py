@@ -404,7 +404,8 @@ def _capture_ros_bootstrap_project(
             for component in (deployment or {}).get("components", [])
             if "runtime_kind" in component.get("configuration", {})
         }
-        if runtime_kinds != {"ros2_control"}:
+        # Model-free pose sources run inside the same ROS execution host.
+        if runtime_kinds - {"pose_source"} != {"ros2_control"}:
             raise WorkbenchError(
                 "ROS startup requires an intended first Scenario with only "
                 "ros2_control execution components"
@@ -662,7 +663,6 @@ class Workbench:
         composer_static_dir: Path | None = None,
         composer_bind_host: str = "127.0.0.1",
         simulation_control_config: Path | None = None,
-        isaac_site_settings: Path | None = None,
         package_aggregate_digest: str | None = None,
         operator_instance_id: str | None = None,
         node_catalog_path: Path | None = None,
@@ -683,7 +683,6 @@ class Workbench:
         self.composer_static_dir = composer_static_dir
         self.composer_bind_host = composer_bind_host
         self.simulation_control_config = simulation_control_config
-        self.isaac_site_settings = isaac_site_settings
         self.package_aggregate_digest = package_aggregate_digest
         self.operator_instance_id = operator_instance_id
         self.node_catalog_path = node_catalog_path or NODE_CATALOG
@@ -766,16 +765,6 @@ class Workbench:
         if self._readiness_deadline is not None:
             timeout_seconds = max(0.0, self._readiness_deadline - time.monotonic())
         return _wait_until(description, predicate, processes, timeout_seconds=timeout_seconds)
-
-    def _isaac_manager_arguments(self) -> tuple[str, ...]:
-        if self.isaac_site_settings is None:
-            return ()
-        _regular_file(self.isaac_site_settings, "Isaac site settings")
-        observer = (BUILD_ROOT / "isaac/ros-overlay/install/manyforge_ros_bringup"
-                    / "lib/manyforge_ros_bringup/pose_source_snapshot_publisher")
-        _regular_file(observer, "installed Isaac pose observer", executable=True)
-        return ("--isaac-site-settings", str(self.isaac_site_settings),
-                "--isaac-pose-observer-executable", str(observer))
 
     def start(self) -> None:
         if not self.ros2_control:
@@ -1010,7 +999,7 @@ class Workbench:
                 # as examples/<name>/meshes/*.obj resolve below the checkout.
                 "--scene-asset-root",
                 str(WORKSPACE),
-            ) + self._isaac_manager_arguments(),
+            ),
         )
         self._wait_until(
             "Manager command socket",
@@ -1350,7 +1339,6 @@ def _parser() -> argparse.ArgumentParser:
             command.add_argument("--composer-static-dir", type=Path)
             command.add_argument("--composer-bind-host", default="127.0.0.1")
             command.add_argument("--simulation-control-config", type=Path)
-            command.add_argument("--isaac-site-settings", type=Path)
             command.add_argument("--package-aggregate-sha256")
     return parser
 
@@ -1395,7 +1383,6 @@ def main(argv: Sequence[str] | None = None) -> int:
             composer_static_dir=args.composer_static_dir,
             composer_bind_host=args.composer_bind_host,
             simulation_control_config=args.simulation_control_config,
-            isaac_site_settings=args.isaac_site_settings,
             package_aggregate_digest=args.package_aggregate_sha256,
             operator_instance_id=args.operator_instance_id,
             node_catalog_path=args.node_catalog_path,

@@ -444,7 +444,7 @@ TEST(ComposableCellContracts, StopEvidencePolicyTypesPreserveTheClosedDeclarativ
 
 TEST(ComposableCellContracts, CapabilityDefinitionRegistryIsExactTypedAndCodeOwned) {
   EXPECT_EQ(kCapabilityDefinitionApiVersion, "manyforge.capability_definition.v1");
-  ASSERT_EQ(kBuiltinCapabilityDefinitionRegistry.size(), 67U);
+  ASSERT_EQ(kBuiltinCapabilityDefinitionRegistry.size(), 68U);
 
   std::set<std::string_view> capability_ids;
   std::size_t target_binding_count = 0U;
@@ -479,11 +479,11 @@ TEST(ComposableCellContracts, CapabilityDefinitionRegistryIsExactTypedAndCodeOwn
     EXPECT_EQ(materialized.provider_binding_kind, descriptor.provider_binding_kind);
     EXPECT_FALSE(materialized.requirement_parameters_schema_ref.has_value());
   }
-  EXPECT_EQ(target_binding_count, 31U);
+  EXPECT_EQ(target_binding_count, 32U);
   EXPECT_EQ(cell_global_count, 28U);
   EXPECT_EQ(control_domain_count, 8U);
-  EXPECT_EQ(control_binding_count, 20U);
-  EXPECT_EQ(capability_provider_binding_count, 47U);
+  EXPECT_EQ(control_binding_count, 17U);
+  EXPECT_EQ(capability_provider_binding_count, 51U);
   EXPECT_EQ(find_builtin_capability_definition("context.state.current"), nullptr);
   EXPECT_EQ(find_builtin_capability_definition("unknown.capability"), nullptr);
 }

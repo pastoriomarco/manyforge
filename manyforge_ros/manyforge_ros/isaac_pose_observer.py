@@ -212,6 +212,16 @@ class _PendingObservation:
     source_sequence: int
 
 
+def pose_source_stream_id(binding: ObservationBinding) -> str:
+    """CP9 stream of one binding: ``poses/<object_id>/<policy_id>``.
+
+    Same rule as the C++ ``pose_source_stream_id``; object ids repeat across
+    policies, so the policy is part of the id.
+    """
+
+    return f"poses/{binding.object_id}/{binding.policy_id}"
+
+
 def load_isaac_pose_observer_site_config(
     path: Path,
 ) -> IsaacPoseObserverSiteConfig:

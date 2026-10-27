@@ -199,7 +199,8 @@ def _effect_observations(folder: Path) -> tuple[str, list[str], list[str]]:
             "SELECT 1 FROM manager_apply_terminal_outcomes WHERE outcome_state='unknown_effect' OR effect_disposition='unknown' LIMIT 1",
         ], ["manager_apply_intents"]),
         ("manager", "manager/active-bundle-publication.sqlite3", 1296449872, 1, [], ["active_bundle_publication_receipts"]),
-        ("scene", "logical-scene.sqlite3", 1296454467, 9, [
+        # v9 stores are converted to v10 when the scene owner next opens them.
+        ("scene", "logical-scene.sqlite3", 1296454467, (9, 10), [
             "SELECT 1 FROM logical_scene_transaction_intents i LEFT JOIN logical_scene_request_outcomes t USING(transaction_sequence) WHERE t.transaction_sequence IS NULL LIMIT 1",
             "SELECT 1 FROM logical_scene_request_outcomes WHERE projection_status='failed_projection_uncertain' LIMIT 1",
             "SELECT 1 FROM logical_scene_maintenance_initialization_intents i LEFT JOIN logical_scene_maintenance_initialization_results r USING(initialization_sequence) WHERE r.initialization_sequence IS NULL LIMIT 1",
@@ -217,7 +218,7 @@ def _effect_observations(folder: Path) -> tuple[str, list[str], list[str]]:
                     raise ValueError("journal integrity unknown")
                 if database.execute("PRAGMA foreign_key_check").fetchone() is not None:
                     raise ValueError("journal references unknown")
-                if application is not None and (database.execute("PRAGMA application_id").fetchone() != (application,) or database.execute("PRAGMA user_version").fetchone() != (version,)):
+                if application is not None and (database.execute("PRAGMA application_id").fetchone() != (application,) or database.execute("PRAGMA user_version").fetchone()[0] not in (version if isinstance(version, tuple) else (version,))):
                     raise ValueError("unsupported journal schema")
                 if family == "program_cycle":
                     if database.execute("SELECT singleton,schema_version FROM program_cycle_metadata").fetchall() != [(1, 7)]:

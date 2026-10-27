@@ -323,62 +323,6 @@ InstalledInventoryRequest() {
 }
 
 TEST(SelectedRuntimeCompositionRpcInternal,
-     CheckedObserverFactsAreExactRequestAndResultIdentity) {
-  auto request = Request();
-  request.isaac_pose_observer_launch_facts = ManagerIsaacPoseObserverLaunchFactsDTO{
-      "/run/manager/observer-original.json", "configured.source", "manager-spawn-1"};
-  ASSERT_TRUE(request.valid());
-  const auto value = EncodeManagerIsaacPoseObserverLaunchFacts(
-      *request.isaac_pose_observer_launch_facts);
-  EXPECT_EQ(DecodeManagerIsaacPoseObserverLaunchFacts(value),
-            *request.isaac_pose_observer_launch_facts);
-  EXPECT_THROW((void)DecodeManagerIsaacPoseObserverLaunchFacts(value + " "),
-               std::invalid_argument);
-  const auto packet = EncodeSelectedRuntimeCompositionRpcRequest(request);
-  EXPECT_EQ(DecodeSelectedRuntimeCompositionRpcRequest(packet), request);
-  EXPECT_EQ(std::get<ManagerSelectedRuntimeCompositionRequestDTO>(
-                DecodeSelectedRuntimeCompositionRpcRequestVariant(packet)), request);
-  const auto ordinary_packet = EncodeSelectedRuntimeCompositionRpcRequest(Request());
-  EXPECT_EQ(packet.substr(0U, ordinary_packet.size()), ordinary_packet);
-  EXPECT_THROW((void)DecodeSelectedRuntimeCompositionRpcRequest(packet + "extra"),
-               std::invalid_argument);
-  auto changed = request;
-  changed.isaac_pose_observer_launch_facts->source_epoch_base = "manager-spawn-2";
-  EXPECT_NE(changed, request);
-  EXPECT_NE(EncodeSelectedRuntimeCompositionRpcRequest(changed), packet);
-  const ManagerSelectedRuntimeCompositionResultDTO result{
-      request, ManagerSelectedRuntimeCompositionState::kPreparing, {}};
-  const auto result_packet = EncodeSelectedRuntimeCompositionRpcResponse(result);
-  const auto decoded = DecodeSelectedRuntimeCompositionRpcResponse(result_packet);
-  EXPECT_EQ(std::get<ManagerSelectedRuntimeCompositionResultDTO>(decoded), result);
-  const auto ordinary_result_packet = EncodeSelectedRuntimeCompositionRpcResponse(
-      ManagerSelectedRuntimeCompositionResultDTO{
-          Request(), ManagerSelectedRuntimeCompositionState::kPreparing, {}});
-  EXPECT_EQ(result_packet.substr(0U, ordinary_result_packet.size()), ordinary_result_packet);
-  EXPECT_THROW((void)DecodeSelectedRuntimeCompositionRpcResponse(result_packet + "extra"),
-               std::invalid_argument);
-  auto truncated = packet;
-  truncated.pop_back();
-  EXPECT_THROW((void)DecodeSelectedRuntimeCompositionRpcRequest(truncated),
-               std::invalid_argument);
-}
-
-TEST(SelectedRuntimeCompositionRpcInternal,
-     ManagedEpochAcceptsOnlyCurrentBaseAndCanonicalBoundedRotation) {
-  const ManagerIsaacPoseObserverLaunchFactsDTO facts{
-      "/run/manager/original.json", "configured.source", "manager-spawn-1"};
-  EXPECT_TRUE(facts.accepts_source_epoch("manager-spawn-1.1"));
-  EXPECT_TRUE(facts.accepts_source_epoch("manager-spawn-1.10"));
-  EXPECT_TRUE(facts.accepts_source_epoch("manager-spawn-1.9007199254740991"));
-  for (const auto *epoch : {"manager-spawn-2.1", "manager-spawn-1.0",
-                           "manager-spawn-1.01", "manager-spawn-1.-1",
-                           "manager-spawn-1.1.extra", "manager-spawn-1.",
-                           "manager-spawn-1.9007199254740992"}) {
-    EXPECT_FALSE(facts.accepts_source_epoch(epoch)) << epoch;
-  }
-}
-
-TEST(SelectedRuntimeCompositionRpcInternal,
      RoundTripsExactRequestAndBothResultStates) {
   for (const auto phase : {ManagerSelectedRuntimeCompositionPhase::kPrepare,
                            ManagerSelectedRuntimeCompositionPhase::kFinalize}) {
@@ -669,8 +613,6 @@ TEST(SelectedRuntimeCompositionRpcInternal,
         ManagerSelectedRuntimeCompositionResultDTO{request, state, {}});
     EXPECT_EQ(bytes.size(), 1239U);
     EXPECT_EQ(manyforge::content_identity::sha256_digest(bytes), fingerprint);
-    EXPECT_FALSE(std::get<ManagerSelectedRuntimeCompositionResultDTO>(
-        DecodeSelectedRuntimeCompositionRpcResponse(bytes)).isaac_pose_observer_retirement_receipt);
   }
   const auto failure = EncodeSelectedRuntimeCompositionRpcResponse(
       SelectedRuntimeCompositionRpcFailure{{"composition_failed",
@@ -1264,7 +1206,7 @@ TEST(SelectedRuntimeCompositionRpcInternal, OrdinaryPortDefaultsRefuseApplyDeleg
 }
 
 TEST(SelectedRuntimeCompositionRpcInternal,
-     InspectionWithoutObserverPreservesExactTag12GoldenBytes) {
+     InspectionPreservesExactTag12GoldenBytes) {
   const ManagerComponentBringUpInspectionResultDTO result{
       InspectionRequest(),
       {{ControllableComponentId("arm.1"), ProcessPresenceState::kUnknown},
@@ -1522,252 +1464,6 @@ TEST(SelectedRuntimeCompositionRpcInternal,
 }
 
 TEST(SelectedRuntimeCompositionRpcInternal,
-     ObserverInspectPreservesBytesExitFactsAndStableIdAcrossPersistenceStates) {
-  ManagerCellObserverObservationDTO observer{
-      CellId("cell.main"), std::string("source\0camera", 13U), "manager-base"};
-  for (const auto presence : {ProcessPresenceState::kUnknown,
-                             ProcessPresenceState::kAbsent,
-                             ProcessPresenceState::kPresent}) {
-    observer.process_presence = presence;
-    const ManagerComponentBringUpInspectionResultDTO result{
-        InspectionRequest(), {}, observer};
-    ASSERT_TRUE(result.valid());
-    EXPECT_EQ(std::get<ManagerComponentBringUpInspectionResultDTO>(
-                  DecodeSelectedRuntimeCompositionRpcResponse(
-                      EncodeSelectedRuntimeCompositionRpcResponse(result))),
-              result);
-  }
-  observer.process_presence = ProcessPresenceState::kAbsent;
-  observer.exit = ManagerCellObserverExitDTO{
-      123, std::uint8_t{0}, std::nullopt, false, "2026-10-12T14:00:00Z",
-      std::numeric_limits<std::int64_t>::max()};
-  observer.incident_id = "observer." + std::string(64U, 'a');
-  const auto stable_id = observer.incident_id;
-  for (const bool signalled : {false, true}) {
-    observer.exit->exit_status =
-        signalled ? std::nullopt : std::optional<std::uint8_t>{0U};
-    observer.exit->signal =
-        signalled ? std::optional<std::uint8_t>{11U} : std::nullopt;
-    observer.exit->core_dumped = signalled;
-    for (const auto persistence : {ManagerCellObserverIncidentPersistenceDTO::kPending,
-                                   ManagerCellObserverIncidentPersistenceDTO::kPersisted,
-                                   ManagerCellObserverIncidentPersistenceDTO::kFailed,
-                                   ManagerCellObserverIncidentPersistenceDTO::kUnknown}) {
-      observer.incident_persistence = persistence;
-      const ManagerComponentBringUpInspectionResultDTO result{
-          InspectionRequest(), {}, observer};
-      ASSERT_TRUE(result.valid());
-      const auto decoded = std::get<ManagerComponentBringUpInspectionResultDTO>(
-          DecodeSelectedRuntimeCompositionRpcResponse(
-              EncodeSelectedRuntimeCompositionRpcResponse(result)));
-      EXPECT_EQ(decoded, result);
-      ASSERT_TRUE(decoded.cell_observer);
-      EXPECT_EQ(decoded.cell_observer->source_id, std::string("source\0camera", 13U));
-      EXPECT_EQ(decoded.cell_observer->incident_id, stable_id);
-    }
-  }
-}
-
-TEST(SelectedRuntimeCompositionRpcInternal,
-     ObserverExitWithUnknownSlotPreservesUnavailableWithoutInventingAnIncident) {
-  ManagerCellObserverObservationDTO observer{
-      CellId("cell.main"), "source", "base", ProcessPresenceState::kAbsent,
-      ManagerCellObserverExitDTO{123, std::nullopt, std::uint8_t{11}, true,
-                               "2026-10-12T14:00:00Z", 12},
-      std::nullopt, ManagerCellObserverIncidentPersistenceDTO::kUnknown};
-  const ManagerComponentBringUpInspectionResultDTO unknown{InspectionRequest(), {}, observer};
-  ASSERT_TRUE(unknown.valid());
-  EXPECT_EQ(std::get<ManagerComponentBringUpInspectionResultDTO>(
-                DecodeSelectedRuntimeCompositionRpcResponse(
-                    EncodeSelectedRuntimeCompositionRpcResponse(unknown))), unknown);
-  for (const auto persistence : {ManagerCellObserverIncidentPersistenceDTO::kPending,
-                                ManagerCellObserverIncidentPersistenceDTO::kPersisted,
-                                ManagerCellObserverIncidentPersistenceDTO::kFailed,
-                                ManagerCellObserverIncidentPersistenceDTO::kNotApplicable}) {
-    observer.incident_persistence = persistence;
-    const ManagerComponentBringUpInspectionResultDTO invalid{InspectionRequest(), {}, observer};
-    EXPECT_FALSE(invalid.valid());
-    EXPECT_THROW((void)EncodeSelectedRuntimeCompositionRpcResponse(invalid), std::invalid_argument);
-  }
-  observer.incident_persistence = ManagerCellObserverIncidentPersistenceDTO::kUnknown;
-  observer.incident_id = "";
-  EXPECT_FALSE(observer.valid());
-  observer.incident_id = std::string(core::kMaxComponentIncidentIdBytes + 1U, 'i');
-  EXPECT_FALSE(observer.valid());
-}
-
-TEST(SelectedRuntimeCompositionRpcInternal,
-     ObserverInspectRejectsInvalidIdentitiesFactsAndPersistenceCombinations) {
-  const ManagerCellObserverObservationDTO observer{
-      CellId("cell.main"), "source", "base", ProcessPresenceState::kAbsent,
-      ManagerCellObserverExitDTO{1, std::uint8_t{0}, std::nullopt, false, "", 0},
-      "observer.id", ManagerCellObserverIncidentPersistenceDTO::kFailed};
-  const auto rejects = [&](auto mutate) {
-    auto invalid = observer;
-    mutate(invalid);
-    const ManagerComponentBringUpInspectionResultDTO result{
-        InspectionRequest(), {}, invalid};
-    EXPECT_FALSE(result.valid());
-    EXPECT_THROW((void)EncodeSelectedRuntimeCompositionRpcResponse(result),
-                 std::invalid_argument);
-  };
-  rejects([](auto &value) { value.cell_id = CellId(""); });
-  rejects([](auto &value) { value.cell_id = CellId(std::string(257U, 'c')); });
-  rejects([](auto &value) { value.source_id.clear(); });
-  rejects([](auto &value) { value.source_id.resize(257U, 's'); });
-  rejects([](auto &value) { value.source_epoch_base.clear(); });
-  rejects([](auto &value) { value.source_epoch_base.resize(240U, 'b'); });
-  rejects([](auto &value) { value.source_epoch_base = std::string("b\0ase", 5U); });
-  rejects([](auto &value) {
-    value.process_presence = static_cast<ProcessPresenceState>(255);
-  });
-  rejects([](auto &value) { value.exit->pid = 0; });
-  rejects([](auto &value) { value.exit->pid = -1; });
-  rejects([](auto &value) { value.exit->exit_status.reset(); });
-  rejects([](auto &value) { value.exit->signal = 11U; });
-  rejects([](auto &value) { value.exit->observed_utc.resize(129U, 't'); });
-  rejects([](auto &value) { value.exit->detected_at_ns = -1; });
-  rejects([](auto &value) { value.incident_id.reset(); });
-  rejects([](auto &value) { value.incident_id = ""; });
-  rejects([](auto &value) { value.incident_id = std::string(129U, 'i'); });
-  rejects([](auto &value) {
-    value.incident_persistence =
-        ManagerCellObserverIncidentPersistenceDTO::kNotApplicable;
-  });
-  rejects([](auto &value) {
-    value.incident_persistence =
-        static_cast<ManagerCellObserverIncidentPersistenceDTO>(255);
-  });
-  rejects([](auto &value) { value.exit.reset(); });
-  rejects([](auto &value) {
-    value.exit.reset();
-    value.incident_id.reset();
-  });
-  rejects([](auto &value) {
-    value.exit.reset();
-    value.incident_persistence =
-        ManagerCellObserverIncidentPersistenceDTO::kNotApplicable;
-  });
-}
-
-TEST(SelectedRuntimeCompositionRpcInternal,
-     ObserverInspectTailIsClosedAndRejectsMalformedWireDomains) {
-  const ManagerComponentBringUpInspectionResultDTO absent{InspectionRequest(), {}};
-  const auto body = EncodeSelectedRuntimeCompositionRpcResponse(absent);
-  const ManagerCellObserverObservationDTO observer{
-      CellId("c"), "s", "b", ProcessPresenceState::kAbsent,
-      ManagerCellObserverExitDTO{1, std::uint8_t{0}, std::nullopt, false, "", 0},
-      "i", ManagerCellObserverIncidentPersistenceDTO::kFailed};
-  const auto packet = EncodeSelectedRuntimeCompositionRpcResponse(
-      ManagerComponentBringUpInspectionResultDTO{InspectionRequest(), {}, observer});
-  ASSERT_EQ(packet.substr(0U, body.size()), body);
-  const std::string golden_tail(
-      "\x01\x00\x00\x00\x01\x63\x00\x00\x00\x01\x73\x00\x00\x00\x01"
-      "\x62\x01\x01\x00\x00\x00\x01\x01\x00\x00\x00\x00\x00\x00\x00"
-      "\x00\x00\x00\x00\x00\x00\x00\x00\x01\x00\x00\x00\x01\x69\x03",
-      45U);
-  EXPECT_EQ(packet.substr(body.size()), golden_tail);
-  const auto rejects = [](const auto &bytes) {
-    EXPECT_THROW((void)DecodeSelectedRuntimeCompositionRpcResponse(bytes),
-                 std::invalid_argument);
-  };
-  rejects(body + std::string(1U, '\0'));  // Explicit false is not canonical absence.
-  rejects(packet + packet.substr(body.size()));  // Duplicate extension.
-  rejects(packet + "extra");
-  for (std::size_t size = body.size() + 1U; size < packet.size(); ++size)
-    rejects(packet.substr(0U, size));
-  const auto presence = body.size() + 1U + 3U * 5U;
-  const auto exit = presence + 1U;
-  // Extension, presence, exit/status/signal/core/incident booleans, persistence.
-  for (const auto offset : {body.size(), presence, exit, exit + 5U,
-                            exit + 7U, exit + 8U, exit + 21U, packet.size() - 1U}) {
-    auto malformed = packet;
-    malformed[offset] = static_cast<char>(255);
-    rejects(malformed);
-  }
-  auto malformed = packet;
-  malformed[exit + 1U] = static_cast<char>(0x80);  // PID exceeds positive int32.
-  rejects(malformed);
-  malformed = packet;
-  malformed[exit + 13U] = static_cast<char>(0x80);  // Time exceeds nonnegative int64.
-  rejects(malformed);
-  malformed = packet;
-  // Canonically encoded exit with neither status nor signal.
-  malformed[exit + 5U] = '\0';
-  malformed.erase(exit + 6U, 1U);
-  rejects(malformed);
-  malformed = packet;
-  malformed[exit + 7U] = '\1';  // Both status and signal.
-  malformed.insert(exit + 8U, 1U, '\13');
-  rejects(malformed);
-  malformed = packet;
-  malformed[exit + 21U] = '\0';  // Exit without incident ID.
-  malformed.erase(exit + 22U, 5U);
-  rejects(malformed);
-  auto no_exit = observer;
-  no_exit.exit.reset();
-  no_exit.incident_id.reset();
-  no_exit.incident_persistence =
-      ManagerCellObserverIncidentPersistenceDTO::kNotApplicable;
-  malformed = EncodeSelectedRuntimeCompositionRpcResponse(
-      ManagerComponentBringUpInspectionResultDTO{InspectionRequest(), {}, no_exit});
-  malformed.back() =
-      static_cast<char>(ManagerCellObserverIncidentPersistenceDTO::kPending);
-  rejects(malformed);
-}
-
-TEST(SelectedRuntimeCompositionRpcInternal,
-     ObserverInspectMaximumTailKeepsWholePacketCapWithoutDroppingComponents) {
-  const ManagerCellObserverObservationDTO observer{
-      CellId(std::string(256U, 'c')), std::string(255U, 's') + '\0',
-      std::string(239U, 'b'), ProcessPresenceState::kAbsent,
-      ManagerCellObserverExitDTO{std::numeric_limits<std::int32_t>::max(),
-                                std::uint8_t{255}, std::nullopt, false,
-                                std::string(128U, 't'),
-                                std::numeric_limits<std::int64_t>::max()},
-      std::string(128U, 'i'), ManagerCellObserverIncidentPersistenceDTO::kUnknown};
-  ManagerComponentBringUpInspectionResultDTO result{
-      InspectionRequest(),
-      {{ControllableComponentId("arm.1"), ProcessPresenceState::kPresent}},
-      observer};
-  ASSERT_TRUE(result.valid());
-  auto absent = result;
-  absent.cell_observer.reset();
-  const auto body = EncodeSelectedRuntimeCompositionRpcResponse(absent);
-  const auto packet = EncodeSelectedRuntimeCompositionRpcResponse(result);
-  // The approved 1049-byte upper bound counts both optional status/signal
-  // payloads; exactly one is valid, so the attainable maximum is 1048.
-  EXPECT_EQ(packet.size() - body.size(), 1048U);
-  EXPECT_LE(packet.size() - body.size(), 1049U);
-  EXPECT_EQ(packet.substr(0U, body.size()), body);
-  result.request.runtime_epoch = RuntimeEpoch(
-      std::string(result.request.runtime_epoch.value().size() +
-                      kMaximumSelectedRuntimeCompositionRpcPacketBytes - packet.size(),
-                  'e'));
-  const auto maximum = EncodeSelectedRuntimeCompositionRpcResponse(result);
-  EXPECT_EQ(maximum.size(), kMaximumSelectedRuntimeCompositionRpcPacketBytes);
-  EXPECT_EQ(std::get<ManagerComponentBringUpInspectionResultDTO>(
-                DecodeSelectedRuntimeCompositionRpcResponse(maximum)),
-            result);
-  result.request.runtime_epoch =
-      RuntimeEpoch(result.request.runtime_epoch.value() + "e");
-  EXPECT_THROW((void)EncodeSelectedRuntimeCompositionRpcResponse(result),
-               std::invalid_argument);
-  // A legal existing body at the cap cannot acquire a tail by truncating rows.
-  absent.request = result.request;
-  absent.request.runtime_epoch = RuntimeEpoch(
-      absent.request.runtime_epoch.value() + std::string(1047U, 'e'));
-  EXPECT_EQ(EncodeSelectedRuntimeCompositionRpcResponse(absent).size(),
-            kMaximumSelectedRuntimeCompositionRpcPacketBytes);
-  absent.cell_observer = observer;
-  EXPECT_THROW((void)EncodeSelectedRuntimeCompositionRpcResponse(absent),
-               std::invalid_argument);
-  EXPECT_EQ(absent.configured_components.size(), 1U);
-  EXPECT_THROW((void)DecodeSelectedRuntimeCompositionRpcResponse(maximum + "e"),
-               std::invalid_argument);
-}
-
-TEST(SelectedRuntimeCompositionRpcInternal,
      OrdinaryPortInspectionDefaultHasNoEffects) {
   class OrdinaryOnlyPort final : public IManagerSelectedRuntimeCompositionPort {
   public:
@@ -1798,47 +1494,37 @@ TEST(SelectedRuntimeCompositionRpcInternal,
 }
 
 TEST(SelectedRuntimeCompositionRpcInternal,
-     InspectionPlanningFactsRoundTripWithoutChangingLegacyOrObserverPrefixes) {
-  for (const auto with_observer : {false, true}) {
-    for (const auto qualified : {false, true}) {
-      SCOPED_TRACE(with_observer);
-      SCOPED_TRACE(qualified);
-      auto request = InspectionRequest();
-      const auto legacy_request_bytes = EncodeSelectedRuntimeCompositionRpcRequest(request);
-      request.planning_component_id = ControllableComponentId("arm.1");
-      ASSERT_TRUE(request.valid());
-      const auto request_bytes = EncodeSelectedRuntimeCompositionRpcRequest(request);
-      EXPECT_EQ(request_bytes.substr(0U, legacy_request_bytes.size()), legacy_request_bytes);
-      EXPECT_EQ(std::get<ManagerComponentBringUpInspectionRequestDTO>(
-          DecodeSelectedRuntimeCompositionRpcRequestVariant(request_bytes)), request);
-      auto facts = PlanningFacts();
-      if (qualified) {
-        facts.generation_selection = {std::nullopt, ComponentLifecycleGeneration(2U), 0U,
-            ApplyComponentQualifiedPredecessorDTO{ComponentLifecycleGeneration(1U), ContentDigest(std::string(kDigestOne))}};
-      }
-      ASSERT_TRUE(facts.valid());
-      std::optional<ManagerCellObserverObservationDTO> observer;
-      if (with_observer) {
-        observer = ManagerCellObserverObservationDTO{CellId("cell.1"), "observer.source", "observer.epoch",
-            ProcessPresenceState::kPresent, std::nullopt, std::nullopt,
-            ManagerCellObserverIncidentPersistenceDTO::kNotApplicable};
-      }
-      const ManagerComponentBringUpInspectionResultDTO result{request,
-          {{ControllableComponentId("arm.1"), ProcessPresenceState::kUnknown}}, observer, facts};
-      ASSERT_TRUE(result.valid());
-      auto legacy = result;
-      legacy.request.planning_component_id.reset();
-      legacy.planning_facts.reset();
-      const auto legacy_bytes = EncodeSelectedRuntimeCompositionRpcResponse(legacy);
-      const auto bytes = EncodeSelectedRuntimeCompositionRpcResponse(result);
-      EXPECT_EQ(bytes.substr(0U, legacy_bytes.size()), legacy_bytes);
-      const auto decoded = std::get<ManagerComponentBringUpInspectionResultDTO>(
-          DecodeSelectedRuntimeCompositionRpcResponse(bytes));
-      EXPECT_EQ(decoded, result);
-      EXPECT_EQ(EncodeSelectedRuntimeCompositionRpcResponse(decoded), bytes);
-      EXPECT_EQ(decoded.cell_observer, observer);
-      EXPECT_FALSE(decoded.planning_facts->generation_selection.predecessor_generation);
+     InspectionPlanningFactsRoundTripWithoutChangingLegacyPrefixes) {
+  for (const auto qualified : {false, true}) {
+    SCOPED_TRACE(qualified);
+    auto request = InspectionRequest();
+    const auto legacy_request_bytes = EncodeSelectedRuntimeCompositionRpcRequest(request);
+    request.planning_component_id = ControllableComponentId("arm.1");
+    ASSERT_TRUE(request.valid());
+    const auto request_bytes = EncodeSelectedRuntimeCompositionRpcRequest(request);
+    EXPECT_EQ(request_bytes.substr(0U, legacy_request_bytes.size()), legacy_request_bytes);
+    EXPECT_EQ(std::get<ManagerComponentBringUpInspectionRequestDTO>(
+        DecodeSelectedRuntimeCompositionRpcRequestVariant(request_bytes)), request);
+    auto facts = PlanningFacts();
+    if (qualified) {
+      facts.generation_selection = {std::nullopt, ComponentLifecycleGeneration(2U), 0U,
+          ApplyComponentQualifiedPredecessorDTO{ComponentLifecycleGeneration(1U), ContentDigest(std::string(kDigestOne))}};
     }
+    ASSERT_TRUE(facts.valid());
+    const ManagerComponentBringUpInspectionResultDTO result{request,
+        {{ControllableComponentId("arm.1"), ProcessPresenceState::kUnknown}}, facts};
+    ASSERT_TRUE(result.valid());
+    auto legacy = result;
+    legacy.request.planning_component_id.reset();
+    legacy.planning_facts.reset();
+    const auto legacy_bytes = EncodeSelectedRuntimeCompositionRpcResponse(legacy);
+    const auto bytes = EncodeSelectedRuntimeCompositionRpcResponse(result);
+    EXPECT_EQ(bytes.substr(0U, legacy_bytes.size()), legacy_bytes);
+    const auto decoded = std::get<ManagerComponentBringUpInspectionResultDTO>(
+        DecodeSelectedRuntimeCompositionRpcResponse(bytes));
+    EXPECT_EQ(decoded, result);
+    EXPECT_EQ(EncodeSelectedRuntimeCompositionRpcResponse(decoded), bytes);
+    EXPECT_FALSE(decoded.planning_facts->generation_selection.predecessor_generation);
   }
 }
 
@@ -1847,7 +1533,7 @@ TEST(SelectedRuntimeCompositionRpcInternal,
   auto request = InspectionRequest();
   request.planning_component_id = ControllableComponentId("arm.1");
   const ManagerComponentBringUpInspectionResultDTO actual{request,
-      {{ControllableComponentId("arm.1"), ProcessPresenceState::kAbsent}}, std::nullopt, PlanningFacts()};
+      {{ControllableComponentId("arm.1"), ProcessPresenceState::kAbsent}}, PlanningFacts()};
   ASSERT_TRUE(actual.valid());
   const auto exact = EncodeSelectedRuntimeCompositionRpcResponse(actual);
   EXPECT_EQ(std::get<ManagerComponentBringUpInspectionResultDTO>(DecodeSelectedRuntimeCompositionRpcResponse(exact)), actual);
@@ -1892,7 +1578,7 @@ TEST(SelectedRuntimeCompositionRpcInternal,
   request.planning_component_id = ControllableComponentId("arm.1");
   const auto request_bytes = EncodeSelectedRuntimeCompositionRpcRequest(request);
   const ManagerComponentBringUpInspectionResultDTO result{request, legacy.configured_components,
-      std::nullopt, PlanningFacts()};
+      PlanningFacts()};
   const auto response_bytes = EncodeSelectedRuntimeCompositionRpcResponse(result);
   const auto request_tail = request_bytes.substr(legacy_request.size());
   const auto response_tail = response_bytes.substr(legacy_response.size());
@@ -1941,7 +1627,7 @@ TEST(SelectedRuntimeCompositionRpcInternal,
       [](const auto &lhs, const auto &rhs) { return lhs.control_domain_id < rhs.control_domain_id; });
   EXPECT_FALSE(facts.valid());
   const ManagerComponentBringUpInspectionResultDTO too_many{request,
-      {{ControllableComponentId("arm.1"), ProcessPresenceState::kUnknown}}, std::nullopt, facts};
+      {{ControllableComponentId("arm.1"), ProcessPresenceState::kUnknown}}, facts};
   EXPECT_THROW((void)EncodeSelectedRuntimeCompositionRpcResponse(too_many), std::invalid_argument);
   facts = PlanningFacts();
   facts.candidate_expected_domains.front().controller().expected_control_bindings.clear();
@@ -1959,111 +1645,7 @@ TEST(SelectedRuntimeCompositionRpcInternal,
             });
   ASSERT_TRUE(facts.valid());
   const ManagerComponentBringUpInspectionResultDTO oversized{request,
-      {{ControllableComponentId("arm.1"), ProcessPresenceState::kUnknown}}, std::nullopt, facts};
-  EXPECT_THROW((void)EncodeSelectedRuntimeCompositionRpcResponse(oversized), std::invalid_argument);
-}
-
-[[nodiscard]] ManagerSelectedRuntimeCompositionResultDTO PrepareRetirementResult() {
-  auto request = Request();
-  request.phase = ManagerSelectedRuntimeCompositionPhase::kPrepare;
-  return {request, ManagerSelectedRuntimeCompositionState::kInstalled, {},
-      ManagerIsaacPoseObserverRetirementReceiptDTO{
-          {"/run/manager/predecessor.json", "observer.source", "predecessor-spawn"}, 1234}};
-}
-
-TEST(SelectedRuntimeCompositionRpcInternal,
-     PrepareRetirementReceiptRoundTripsWithOrWithoutSuccessorFacts) {
-  for (const auto with_successor : {false, true}) {
-    SCOPED_TRACE(with_successor);
-    auto result = PrepareRetirementResult();
-    if (with_successor) {
-      result.request.isaac_pose_observer_launch_facts = ManagerIsaacPoseObserverLaunchFactsDTO{
-          "/run/manager/successor.json", "observer.source", "successor-spawn"};
-    }
-    ASSERT_TRUE(result.valid());
-    const auto request_bytes = EncodeSelectedRuntimeCompositionRpcRequest(result.request);
-    auto absent = result;
-    absent.isaac_pose_observer_retirement_receipt.reset();
-    // Installed alone remains an observation, not positive reap evidence.
-    ASSERT_TRUE(absent.valid());
-    const auto absent_bytes = EncodeSelectedRuntimeCompositionRpcResponse(absent);
-    const auto bytes = EncodeSelectedRuntimeCompositionRpcResponse(result);
-    EXPECT_EQ(bytes.substr(0U, absent_bytes.size()), absent_bytes);
-    EXPECT_EQ(EncodeSelectedRuntimeCompositionRpcRequest(result.request), request_bytes);
-    const auto decoded = std::get<ManagerSelectedRuntimeCompositionResultDTO>(
-        DecodeSelectedRuntimeCompositionRpcResponse(bytes));
-    EXPECT_EQ(decoded, result);
-    EXPECT_EQ(EncodeSelectedRuntimeCompositionRpcResponse(decoded), bytes);
-    EXPECT_EQ(std::get<ManagerSelectedRuntimeCompositionResultDTO>(
-        DecodeSelectedRuntimeCompositionRpcResponse(absent_bytes)), absent);
-  }
-  auto maximum = PrepareRetirementResult();
-  maximum.isaac_pose_observer_retirement_receipt->leader_pid = std::numeric_limits<std::int32_t>::max();
-  ASSERT_TRUE(maximum.valid());
-  EXPECT_EQ(std::get<ManagerSelectedRuntimeCompositionResultDTO>(DecodeSelectedRuntimeCompositionRpcResponse(
-      EncodeSelectedRuntimeCompositionRpcResponse(maximum))), maximum);
-}
-
-TEST(SelectedRuntimeCompositionRpcInternal,
-     RetirementReceiptRequiresPrepareInstalledAndExactDistinctPredecessor) {
-  const auto actual = PrepareRetirementResult();
-  ASSERT_TRUE(actual.valid());
-  for (unsigned mutation = 0U; mutation != 10U; ++mutation) {
-    SCOPED_TRACE(mutation);
-    auto foreign = actual;
-    auto &receipt = *foreign.isaac_pose_observer_retirement_receipt;
-    if (mutation == 0U) foreign.request.phase = ManagerSelectedRuntimeCompositionPhase::kFinalize;
-    if (mutation == 1U) foreign.state = ManagerSelectedRuntimeCompositionState::kPreparing;
-    if (mutation == 2U) receipt.leader_pid = 0;
-    if (mutation == 3U) receipt.leader_pid = -1;
-    if (mutation == 4U) receipt.leader_pid = static_cast<std::int64_t>(std::numeric_limits<std::int32_t>::max()) + 1;
-    if (mutation == 5U) receipt.predecessor.retained_snapshot_path = "relative.json";
-    if (mutation == 6U) receipt.predecessor.source_id.clear();
-    if (mutation == 7U) receipt.predecessor.source_epoch_base.clear();
-    if (mutation == 8U) foreign.request.isaac_pose_observer_launch_facts = receipt.predecessor;
-    if (mutation == 9U) {
-      foreign.request.isaac_pose_observer_launch_facts = ManagerIsaacPoseObserverLaunchFactsDTO{
-          "/run/manager/different-path.json", "different.source", receipt.predecessor.source_epoch_base};
-    }
-    EXPECT_FALSE(foreign.valid());
-    EXPECT_THROW((void)EncodeSelectedRuntimeCompositionRpcResponse(foreign), std::invalid_argument);
-  }
-}
-
-TEST(SelectedRuntimeCompositionRpcInternal,
-     RetirementResultTailRejectsMalformedTruncatedDuplicateAndRequestPackets) {
-  const auto result = PrepareRetirementResult();
-  auto absent = result;
-  absent.isaac_pose_observer_retirement_receipt.reset();
-  const auto legacy = EncodeSelectedRuntimeCompositionRpcResponse(absent);
-  const auto bytes = EncodeSelectedRuntimeCompositionRpcResponse(result);
-  const auto tail = bytes.substr(legacy.size());
-  ASSERT_GT(tail.size(), 8U);
-  for (std::size_t length = legacy.size() + 1U; length < bytes.size(); ++length) {
-    EXPECT_THROW((void)DecodeSelectedRuntimeCompositionRpcResponse(bytes.substr(0U, length)), std::invalid_argument);
-  }
-  EXPECT_THROW((void)DecodeSelectedRuntimeCompositionRpcResponse(bytes + tail), std::invalid_argument);
-  EXPECT_THROW((void)DecodeSelectedRuntimeCompositionRpcRequest(
-      EncodeSelectedRuntimeCompositionRpcRequest(result.request) + tail), std::invalid_argument);
-  auto malformed = bytes;
-  malformed[legacy.size()] = static_cast<char>(4U);
-  EXPECT_THROW((void)DecodeSelectedRuntimeCompositionRpcResponse(malformed), std::invalid_argument);
-  malformed = bytes;
-  malformed[legacy.size() + 5U] = 'X';
-  EXPECT_THROW((void)DecodeSelectedRuntimeCompositionRpcResponse(malformed), std::invalid_argument);
-  // The trailing eight bytes are the full unsigned wire PID.
-  malformed = bytes;
-  std::fill(malformed.end() - 8, malformed.end(), static_cast<char>(0xffU));
-  EXPECT_THROW((void)DecodeSelectedRuntimeCompositionRpcResponse(malformed), std::invalid_argument);
-  malformed = bytes;
-  std::fill(malformed.end() - 8, malformed.end(), '\0');
-  EXPECT_THROW((void)DecodeSelectedRuntimeCompositionRpcResponse(malformed), std::invalid_argument);
-  malformed = bytes;
-  malformed[8U] = static_cast<char>(2U); // Preparing cannot carry positive reap.
-  EXPECT_THROW((void)DecodeSelectedRuntimeCompositionRpcResponse(malformed), std::invalid_argument);
-  auto oversized = result;
-  oversized.request.runtime_epoch = RuntimeEpoch(std::string(kMaximumSelectedRuntimeCompositionRpcPacketBytes, 'e'));
-  ASSERT_TRUE(oversized.valid());
+      {{ControllableComponentId("arm.1"), ProcessPresenceState::kUnknown}}, facts};
   EXPECT_THROW((void)EncodeSelectedRuntimeCompositionRpcResponse(oversized), std::invalid_argument);
 }
 
@@ -2086,7 +1668,7 @@ TEST(SelectedRuntimeCompositionRpcInternal,
           (target == LifecycleTargetStateDTO::kPrepared && intent == ComponentLifecycleIntentKindDTO::kPrepare) ||
           (target == LifecycleTargetStateDTO::kDisabled && intent == ComponentLifecycleIntentKindDTO::kDisable);
       const ManagerComponentBringUpInspectionResultDTO result{request,
-          {{ControllableComponentId("arm.1"), ProcessPresenceState::kUnknown}}, std::nullopt, facts};
+          {{ControllableComponentId("arm.1"), ProcessPresenceState::kUnknown}}, facts};
       EXPECT_EQ(result.valid(), permissible);
       if (permissible) {
         const auto bytes = EncodeSelectedRuntimeCompositionRpcResponse(result);
@@ -2418,10 +2000,8 @@ TEST(SelectedRuntimeCompositionRpcInternal, CandidateNoneObservationIsActualAbse
   auto request = InspectionRequest();
   request.planning_component_id = ControllableComponentId("arm.1");
   const auto facts = PlanningFacts();
-  ManagerCellObserverObservationDTO observer{CellId("cell"), "source", "base",
-      ProcessPresenceState::kPresent};
   const ManagerComponentBringUpInspectionResultDTO result{request,
-      {{ControllableComponentId("arm.1"), ProcessPresenceState::kPresent}, NoneInspectionRow()}, observer, facts};
+      {{ControllableComponentId("arm.1"), ProcessPresenceState::kPresent}, NoneInspectionRow()}, facts};
   ASSERT_TRUE(result.valid());
   const auto exact = EncodeSelectedRuntimeCompositionRpcResponse(result);
   EXPECT_EQ(std::get<ManagerComponentBringUpInspectionResultDTO>(DecodeSelectedRuntimeCompositionRpcResponse(exact)), result);
@@ -2595,7 +2175,6 @@ TEST(SelectedRuntimeCompositionRpcInternal,
   const ManagerComponentBringUpInspectionResultDTO result{
       request,
       {{ControllableComponentId("arm.1"), ProcessPresenceState::kAbsent}},
-      std::nullopt,
       facts};
   ASSERT_TRUE(result.valid());
   const auto packet = EncodeSelectedRuntimeCompositionRpcResponse(result);

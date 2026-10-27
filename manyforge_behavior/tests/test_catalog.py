@@ -23,7 +23,7 @@ from manyforge_behavior.node_registry import build_node_registry
 
 
 CATALOG_PATH = Path(__file__).parent.parent / "resources" / "node_catalog.yaml"
-EXPECTED_CATALOG_DIGEST = "sha256:376863946817c83ee0e92f3a72257bc2ac25e3f9cdbdca0029aab5af42c3d6e2"
+EXPECTED_CATALOG_DIGEST = "sha256:29eaa1447b105a20b4582b508938ac0ba97d77b9fcdc26cd97467b42b628dc93"
 
 
 def _catalog_data() -> dict[str, object]:
@@ -218,6 +218,10 @@ def test_catalog_exposes_structured_v2_semantics() -> None:
     } == {"execution.trajectory.execute"}
 
 
+def test_pose_source_observation_is_target_scoped() -> None:
+    assert catalog_module.CAPABILITY_SCOPES["scene.pose.observe"] == "target_binding"
+
+
 def test_effectful_requirements_are_explicit_target_commands() -> None:
     catalog = NodeCatalog(CATALOG_PATH)
     expected = {
@@ -348,6 +352,19 @@ def test_catalog_projects_declared_semantic_scope_for_fields_and_array_items() -
 
     assert carrier_schema["x-manyforge-semantic-scope-parameter"] == "target_role"
     assert touch_schema["items"]["x-manyforge-semantic-scope-parameter"] == ("target_role")
+
+
+def test_attach_node_grasp_lost_bound_parameters_have_defaults() -> None:
+    attach = NodeCatalog(CATALOG_PATH).get("scene.attach_carried_object")
+    parameters = {parameter.id: parameter for parameter in attach.parameters}
+    for parameter_id, default in (
+        ("grasp_lost_translation_m", 0.03),
+        ("grasp_lost_rotation_rad", 0.26),
+    ):
+        parameter = parameters[parameter_id]
+        assert parameter.required is False
+        assert parameter.has_default is True
+        assert parameter.default == default
 
 
 def test_recomputed_catalog_rejects_unknown_semantic_scope_parameter(

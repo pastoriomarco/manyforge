@@ -171,10 +171,6 @@ RuntimeCollisionUnavailableReason classify_runtime_collision_unavailable_reason(
       reason.find("collision_policy") != std::string_view::npos) {
     return RuntimeCollisionUnavailableReason::kCollisionSnapshot;
   }
-  if (reason.find("dynamic_collision_body") != std::string_view::npos ||
-      reason.find("dynamic_body_freshness") != std::string_view::npos) {
-    return RuntimeCollisionUnavailableReason::kDynamicBodyFreshness;
-  }
   if (reason == "observed_state_unavailable") {
     return RuntimeCollisionUnavailableReason::kObservedStateUnavailable;
   }
@@ -201,8 +197,6 @@ const char* runtime_collision_unavailable_reason_name(
       return "collision_resources";
     case RuntimeCollisionUnavailableReason::kCollisionSnapshot:
       return "collision_snapshot";
-    case RuntimeCollisionUnavailableReason::kDynamicBodyFreshness:
-      return "dynamic_body_freshness";
     case RuntimeCollisionUnavailableReason::kObservedStateUnavailable:
       return "observed_state_unavailable";
     case RuntimeCollisionUnavailableReason::kObservedStateStale:
@@ -239,117 +233,6 @@ bool snapshot_too_old(std::int64_t now_ns, std::int64_t timestamp_ns, std::int64
   const auto age_ns = now_ns - timestamp_ns;
   details[age_key] = std::to_string(age_ns);
   return age_ns > max_age_ns;
-}
-
-std::optional<std::string> validate_dynamic_body_freshness(
-    const CollisionWorldSnapshot& snapshot,
-    const std::vector<CollisionWorldBodyFreshness>& body_freshness, std::int64_t now_ns,
-    std::int64_t runtime_cap_ns, std::map<std::string, std::string>& details) {
-  const auto check =
-      check_runtime_dynamic_body_freshness(snapshot, body_freshness, now_ns, runtime_cap_ns);
-  if (check.status == RuntimeDynamicBodyFreshnessStatus::kSidecarUnsorted) {
-    details["dynamic_body_freshness_sidecar_status"] = "unsorted";
-    return runtime_dynamic_body_freshness_reason(check.status);
-  }
-  if (check.body != nullptr) {
-    details["dynamic_body_id"] = check.body->body_id;
-    const auto& source_id =
-        check.freshness != nullptr ? check.freshness->source_id : check.body->source_id;
-    const auto& timestamp = check.freshness != nullptr ? check.freshness->source_timestamp_ns
-                                                       : check.body->source_timestamp_ns;
-    const auto& budget = check.freshness != nullptr ? check.freshness->source_freshness_budget_ns
-                                                    : check.body->source_freshness_budget_ns;
-    if (source_id) {
-      details["dynamic_body_source_id"] = *source_id;
-    }
-    if (budget) {
-      details["dynamic_body_declared_freshness_budget_ns"] = std::to_string(*budget);
-    }
-    details["dynamic_body_effective_freshness_budget_ns"] =
-        std::to_string(check.effective_budget_ns);
-    if (timestamp) {
-      details["dynamic_body_source_timestamp_ns"] = std::to_string(*timestamp);
-    }
-    details["dynamic_body_age_ns"] = std::to_string(check.age_ns);
-  }
-  if (check.status == RuntimeDynamicBodyFreshnessStatus::kFresh) {
-    return std::nullopt;
-  }
-  return runtime_dynamic_body_freshness_reason(check.status);
-}
-
-RuntimeDynamicBodyFreshnessCheck check_runtime_dynamic_body_freshness(
-    const CollisionWorldSnapshot& snapshot,
-    const std::vector<CollisionWorldBodyFreshness>& body_freshness, std::int64_t now_ns,
-    std::int64_t runtime_cap_ns, bool lookup_order_prevalidated) noexcept {
-  RuntimeDynamicBodyFreshnessCheck out;
-  if (!lookup_order_prevalidated &&
-      !runtime_collision_lookup_order_is_valid(snapshot, body_freshness)) {
-    out.status = RuntimeDynamicBodyFreshnessStatus::kSidecarUnsorted;
-    return out;
-  }
-
-  std::size_t freshness_index = 0;
-  for (const auto& body : snapshot.bodies) {
-    while (freshness_index < body_freshness.size() &&
-           body_freshness[freshness_index].body_id < body.body_id) {
-      ++freshness_index;
-    }
-    const auto* freshness = freshness_index < body_freshness.size() &&
-                                    body_freshness[freshness_index].body_id == body.body_id
-                                ? &body_freshness[freshness_index]
-                                : nullptr;
-    const auto& freshness_budget = freshness != nullptr ? freshness->source_freshness_budget_ns
-                                                        : body.source_freshness_budget_ns;
-    const auto& source_timestamp =
-        freshness != nullptr ? freshness->source_timestamp_ns : body.source_timestamp_ns;
-    if (!freshness_budget.has_value()) {
-      continue;
-    }
-    const auto effective_budget_ns =
-        runtime_cap_ns > 0 ? std::min(*freshness_budget, runtime_cap_ns) : *freshness_budget;
-    out.body = &body;
-    out.freshness = freshness;
-    out.effective_budget_ns = effective_budget_ns;
-    if (!source_timestamp.has_value()) {
-      out.status = RuntimeDynamicBodyFreshnessStatus::kMissingTimestamp;
-      return out;
-    }
-    if (*source_timestamp < 0) {
-      out.status = RuntimeDynamicBodyFreshnessStatus::kInvalidTimestamp;
-      out.age_ns = -1;
-      return out;
-    }
-    if (*source_timestamp > now_ns) {
-      out.status = RuntimeDynamicBodyFreshnessStatus::kInvalidTimestamp;
-      out.age_ns = now_ns - *source_timestamp;
-      return out;
-    }
-    const auto age_ns = now_ns - *source_timestamp;
-    out.age_ns = age_ns;
-    if (effective_budget_ns <= 0 || age_ns > effective_budget_ns) {
-      out.status = RuntimeDynamicBodyFreshnessStatus::kStale;
-      return out;
-    }
-  }
-  out.status = RuntimeDynamicBodyFreshnessStatus::kFresh;
-  return out;
-}
-
-const char* runtime_dynamic_body_freshness_reason(
-    RuntimeDynamicBodyFreshnessStatus status) noexcept {
-  switch (status) {
-    case RuntimeDynamicBodyFreshnessStatus::kFresh:
-      return "none";
-    case RuntimeDynamicBodyFreshnessStatus::kSidecarUnsorted:
-      return "dynamic_body_freshness_sidecar_not_sorted";
-    case RuntimeDynamicBodyFreshnessStatus::kMissingTimestamp:
-      return "dynamic_body_missing_source_timestamp";
-    case RuntimeDynamicBodyFreshnessStatus::kInvalidTimestamp:
-    case RuntimeDynamicBodyFreshnessStatus::kStale:
-      return "stale_dynamic_collision_body";
-  }
-  return "stale_dynamic_collision_body";
 }
 
 Result<RuntimeCollisionStateProjection> build_runtime_collision_state_projection(
@@ -618,19 +501,14 @@ Result<RuntimeCollisionQueryBundlePtr> load_published_runtime_collision_query_bu
 }
 
 RuntimeCollisionQueryBundlePtr build_runtime_collision_query_bundle(
-    CollisionWorldPolicySnapshotBundle bundle, std::uint64_t epoch,
+    CollisionWorldPolicySnapshotBundle bundle,
     std::optional<ProjectionRevisionDTO> projection_revision) {
   auto runtime_bundle = std::make_shared<RuntimeCollisionQueryBundle>();
   runtime_bundle->projection_revision = std::move(projection_revision);
   runtime_bundle->distance_selection_order_valid = true;
   runtime_bundle->world = std::move(bundle.world);
-  runtime_bundle->body_freshness = std::move(bundle.body_freshness);
-  std::sort(runtime_bundle->body_freshness.begin(), runtime_bundle->body_freshness.end(),
-            [](const auto& lhs, const auto& rhs) { return lhs.body_id < rhs.body_id; });
   runtime_bundle->lookup_order_valid =
-      runtime_bundle->world && runtime_collision_lookup_order_is_valid(
-                                   *runtime_bundle->world, runtime_bundle->body_freshness);
-  runtime_bundle->epoch = epoch;
+      runtime_bundle->world && runtime_collision_lookup_order_is_valid(*runtime_bundle->world);
   if (bundle.policy) {
     auto policy = std::make_shared<CollisionPolicySnapshot>(std::move(*bundle.policy));
     if (runtime_bundle->world) {
@@ -663,19 +541,11 @@ RuntimeCollisionQueryBundlePtr build_runtime_collision_query_bundle(
   return runtime_bundle;
 }
 
-bool runtime_collision_lookup_order_is_valid(
-    const CollisionWorldSnapshot& world,
-    const std::vector<CollisionWorldBodyFreshness>& body_freshness) noexcept {
-  const auto bodies_ordered = std::adjacent_find(
-      world.bodies.begin(), world.bodies.end(),
-      [](const auto& lhs, const auto& rhs) { return lhs.body_id >= rhs.body_id; });
-  if (bodies_ordered != world.bodies.end()) {
-    return false;
-  }
-  const auto freshness_ordered = std::adjacent_find(
-      body_freshness.begin(), body_freshness.end(),
-      [](const auto& lhs, const auto& rhs) { return lhs.body_id >= rhs.body_id; });
-  return freshness_ordered == body_freshness.end();
+bool runtime_collision_lookup_order_is_valid(const CollisionWorldSnapshot& world) noexcept {
+  return std::adjacent_find(world.bodies.begin(), world.bodies.end(),
+                            [](const auto& lhs, const auto& rhs) {
+                              return lhs.body_id >= rhs.body_id;
+                            }) == world.bodies.end();
 }
 
 void append_collision_failure_diagnostics(std::map<std::string, std::string>& details,
@@ -1165,11 +1035,6 @@ CollisionCheckResultDTO collision_check_result_from_bundle(
 
 bool collision_world_revision_is_set(const CollisionWorldRevision& revision) {
   return revision.revision_id != 0 || !revision.content_hash.empty();
-}
-
-bool collision_world_revisions_equal(const CollisionWorldRevision& lhs,
-                                     const CollisionWorldRevision& rhs) {
-  return lhs.revision_id == rhs.revision_id && lhs.content_hash == rhs.content_hash;
 }
 
 bool engines_require_single_context_exclusivity(

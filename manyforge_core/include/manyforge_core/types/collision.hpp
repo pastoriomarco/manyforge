@@ -46,60 +46,6 @@ struct CollisionWorldRevision {
   std::string content_hash;
 };
 
-/// Mutation source for a CollisionWorldLedgerEntry (spec §3.8.1).
-///
-/// Names which subsystem caused the revision bump. Audit consumers use
-/// this to reconstruct the chain of changes that produced a given world
-/// state.
-enum class CollisionWorldMutationSource {
-  kSceneInitialize,
-  kSceneEdit,
-  kCarriedObjectAttach,
-  kCarriedObjectDetach,
-  kComponentAttachmentApply,
-  kPoseSourceApply,
-  kDeploymentApply,
-  kPolicyUpdate,
-};
-
-/// Bounded-ledger entry recording a single collision-world revision
-/// transition (spec §3.8.1).
-///
-/// The publisher appends one entry per successful mutation, in trajectory
-/// order. The ledger is read-only to consumers; failure archives and audit
-/// tools use it to explain how the world state evolved.
-struct CollisionWorldLedgerEntry {
-  CollisionWorldRevision revision;
-
-  /// Revision id immediately before this entry. Zero for the scene-initialize
-  /// or deployment-apply entry that establishes the initial revision.
-  std::uint64_t previous_revision_id = 0;
-
-  CollisionWorldMutationSource mutation_source =
-      CollisionWorldMutationSource::kSceneInitialize;
-
-  /// Body ids whose identity or presence in the collision world is changed
-  /// by this mutation. MAY be empty for scene-initialize / deployment-apply
-  /// entries that affect the whole inventory.
-  std::vector<std::string> affected_body_ids;
-
-  /// Authoritative ordering within the collision-world publisher epoch.
-  std::uint64_t owner_sequence = 0;
-
-  /// Injected-clock observation timestamp. Ordering never falls back to this
-  /// value when owner_sequence is available.
-  std::int64_t observed_timestamp_ns = 0;
-
-  /// Provenance stamped by the receiving transport adapter.
-  RequestAttributionDTO attribution;
-
-  /// Accepted request-context label, e.g. "scene_edit_route".
-  std::string source_label;
-
-  /// Optional cross-owner/request correlation token.
-  std::optional<std::string> correlation_id;
-};
-
 /// Canonical unordered pair of collision body ids (spec §3.8.1).
 ///
 /// Canonical form: body_a <= body_b in lexicographic order. The canonical

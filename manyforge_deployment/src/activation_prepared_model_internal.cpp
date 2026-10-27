@@ -313,7 +313,7 @@ std::vector<ActivationPreparedModel> qualify_activation_prepared_models(
     std::vector<PreparedComponentModelSource> prepared_sources) {
   const auto physical_count = static_cast<std::size_t>(
       std::count_if(profiles.begin(), profiles.end(), [](const auto &profile) {
-        return profile.runtime_kind != ActivationRuntimeKind::kIoProvider;
+        return !is_model_free_runtime_kind(profile.runtime_kind);
       }));
   if (intent.components.size() != profiles.size() ||
       physical_count != prepared_sources.size()) {
@@ -335,10 +335,10 @@ std::vector<ActivationPreparedModel> qualify_activation_prepared_models(
     if (profile.component_id != component.component_id) {
       fail("component profile order differs from authored intent");
     }
-    if (profile.runtime_kind == ActivationRuntimeKind::kIoProvider) {
+    if (is_model_free_runtime_kind(profile.runtime_kind)) {
       if (component.model_source || component.root_pose_in_cell ||
           prepared.contains(component.component_id))
-        fail("I/O component cannot carry a prepared model");
+        fail("model-free component cannot carry a prepared model");
       continue;
     }
     if (!component.model_source)

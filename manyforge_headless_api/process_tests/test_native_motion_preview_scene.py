@@ -1,11 +1,8 @@
-"""Managed motion preview accepts a lagging Scene revision of the same Scene."""
+"""Managed motion preview plans on the latest Scene; callers name no Scene revision."""
 
-import copy
 from pathlib import Path
 
-import pytest
-
-from manyforge_headless_api.client import HeadlessClientError, HeadlessHttpClient
+from manyforge_headless_api.client import HeadlessHttpClient
 from manyforge_headless_api.process_tests.test_process_stack import _assistant_stack
 from manyforge_headless_api.tests.test_models import _planning_motion
 
@@ -18,7 +15,6 @@ def test_managed_preview_computes_on_the_current_scene_after_a_scene_edit(
     ) as headless:
         status = headless.execution_diagnostics()["status"]
         identity = status["identity"]
-        stale_revision = identity["scene_revision"]
         ((component, target),) = [
             (component, target)
             for component in status["targets"]["components"]
@@ -41,8 +37,9 @@ def test_managed_preview_computes_on_the_current_scene_after_a_scene_edit(
         ]
 
         # One ordinary authored Scene edit, far from the arm, advances the
-        # Manager-owned Scene revision past the one the status read named.
+        # Manager-owned Scene revision past the one read before it.
         scene = headless.scene()["logical_scene"]
+        stale_revision = scene["payload"]["access"]["active_projection"]["scene_revision"]
         committed = headless.commit_scene_transaction(
             {
                 "request_context": {
@@ -94,7 +91,7 @@ def test_managed_preview_computes_on_the_current_scene_after_a_scene_edit(
             "program_run_id": manual_control["program_run_id"],
             "expected_graph_revision": identity["graph_revision"],
             "expected_retained_bundle_id": identity["retained_bundle_id"],
-            "expected_scene_revision": stale_revision,
+            "expected_scene_revision": None,
             "participants": [
                 {
                     "component_role_id": command["component_role_id"],
@@ -133,31 +130,10 @@ def test_managed_preview_computes_on_the_current_scene_after_a_scene_edit(
             "coordination_policy": "independent",
         }
 
-        # The earlier revision is accepted; the receipt names the revision the
-        # preview was computed on. No before-planning pose source is open, so
-        # the latch leaves the committed revision current.
+        # The receipt names the latest revision the preview was computed on.
+        # No before-planning pose source is open, so the latch leaves the
+        # committed revision current.
         receipt = headless.preview_motion(intent)["preview_receipt"]
         assert receipt["commit_eligible"] is True
         assert receipt["scene_revision"] == current_revision
         assert receipt["scene_revision"] != stale_revision
-
-        # An equal revision id names exactly the current revision.
-        forged_hash = copy.deepcopy(intent)
-        forged_hash["request_context"]["request_id"] = "motion-preview-scene.hash"
-        forged_hash["expected_scene_revision"] = {
-            **current_revision,
-            "content_hash": "sha256:" + "0" * 64,
-        }
-        with pytest.raises(HeadlessClientError) as different_hash:
-            headless.preview_motion(forged_hash)
-        assert different_hash.value.code == "scene_changed_during_validation"
-
-        future = copy.deepcopy(intent)
-        future["request_context"]["request_id"] = "motion-preview-scene.future"
-        future["expected_scene_revision"] = {
-            **current_revision,
-            "revision_id": current_revision["revision_id"] + 1,
-        }
-        with pytest.raises(HeadlessClientError) as future_revision:
-            headless.preview_motion(future)
-        assert future_revision.value.code == "scene_changed_during_validation"

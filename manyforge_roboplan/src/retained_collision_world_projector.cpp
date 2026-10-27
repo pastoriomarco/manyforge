@@ -603,8 +603,7 @@ RetainedCollisionWorldProjector::project(
       }
       // A `continuous` pose source may keep updating a carried object's
       // carrier-relative pose; its evidence is provenance only here. The
-      // carried pose is the attachment's, and it never becomes a freshness-
-      // checked snapshot obstacle (see below and project_live_objects).
+      // carried pose is the attachment's.
       const auto* target =
           find_target(model_map_, attachment->controllable_component_id,
                       attachment->command_target_id);
@@ -657,81 +656,12 @@ RetainedCollisionWorldProjector::project(
         body.frame_id = model_map_.compiled_cell_frame_name;
         body.pose = fixed->pose_in_cell;
       }
-      if (!carried_parent.has_value() && object.provider_evidence.has_value() &&
-          object.provider_evidence->source_freshness_budget_ns.has_value()) {
-        body.source_id = object.provider_evidence->provider_instance_id.value();
-        body.source_timestamp_ns = object.provider_evidence->received_at_ns;
-        body.source_freshness_budget_ns =
-            object.provider_evidence->source_freshness_budget_ns;
-      }
       body.geometries.push_back(scene_geometry_descriptor(
           body.body_id, object.collision_shapes[shape_index]));
       builder.add_body(std::move(body));
     }
   }
   return builder.build();
-}
-
-std::vector<core::CollisionWorldBodyFreshness>
-RetainedCollisionWorldProjector::project_body_freshness(
-    const core::CollisionWorldSnapshot& world) const {
-  std::vector<core::CollisionWorldBodyFreshness> result;
-  for (const auto& body : world.bodies) {
-    if (!body.source_id.has_value() &&
-        !body.source_timestamp_ns.has_value() &&
-        !body.source_freshness_budget_ns.has_value()) {
-      continue;
-    }
-    result.push_back({body.body_id, body.source_id, body.source_timestamp_ns,
-                      body.source_freshness_budget_ns});
-  }
-  return result;
-}
-
-std::vector<core::SceneSnapshotLiveObject>
-RetainedCollisionWorldProjector::project_live_objects(
-    const core::LogicalSceneSnapshotDTO& logical_scene,
-    const core::CollisionWorldSnapshot& world) const {
-  std::vector<core::SceneSnapshotLiveObject> result;
-  result.reserve(logical_scene.objects.size());
-  for (const auto& object : logical_scene.objects) {
-    core::SceneSnapshotLiveObject live;
-    live.object_id = object.scene_resource_id.value();
-    const std::string body_prefix =
-        "scene/" + object.scene_resource_id.value() + "/shape/";
-    for (const auto& body : world.bodies) {
-      if (body.body_id.starts_with(body_prefix)) {
-        live.collision_body_ids.push_back(body.body_id);
-        live.body_content_hashes.emplace(body.body_id,
-                                         body.body_content_hash);
-      }
-    }
-    live.object_revision_token =
-        core::logical_scene_identity::ComputeSceneObjectCollisionIdentity(
-            object, logical_scene.cell_id)
-            .value();
-    const auto* fixed =
-        std::get_if<core::CellFixedSceneObjectPlacementDTO>(&object.placement);
-    if (fixed != nullptr) {
-      live.pose = fixed->pose_in_cell;
-    }
-    // A carried object's provider evidence is provenance only; it carries no
-    // freshness fields.
-    if (object.provider_evidence.has_value() && fixed != nullptr) {
-      const auto& evidence = *object.provider_evidence;
-      live.source_id = evidence.provider_instance_id.value() + "@" +
-                       evidence.provider_source_epoch;
-      // Freshness is evaluated in the native receiver's monotonic clock
-      // domain. The raw provider stamp remains retained in logical-scene
-      // evidence for trace correlation, but may be ROS simulation time or a
-      // synchronized remote-wall domain and is not a safe age origin here.
-      live.source_timestamp_ns = evidence.received_at_ns;
-      live.source_freshness_budget_ns =
-          evidence.source_freshness_budget_ns;
-    }
-    result.push_back(std::move(live));
-  }
-  return result;
 }
 
 }  // namespace manyforge::roboplan_backend

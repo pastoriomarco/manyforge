@@ -52,7 +52,7 @@ def _container_config(tmp_path: Path) -> IsaacLauncherConfig:
     return replace(config, remote=replace(config.remote,
         container_image_id="sha256:" + "e" * 64, container_name="manyforge-g-fixture",
         cache_root="/srv/manyforge/cache", runtime_root="/srv/manyforge/runtime",
-        evidence_root="/srv/manyforge/evidence", isaac_site_settings="/srv/manyforge/site.json"))
+        evidence_root="/srv/manyforge/evidence"))
 
 
 
@@ -259,7 +259,7 @@ def test_g_container_uses_existing_workbench_and_exact_inputs_without_host_ros(t
     assert environment["MANYFORGE_DEV_LAUNCH_INPUT_DIGEST"] == launcher.config.input_digest()
     assert environment["MANYFORGE_DEV_RUNTIME_STATE_ROOT"] == launcher.config.remote.runtime_root
     assert environment["MANYFORGE_DEV_EVIDENCE_ROOT"] == launcher.config.remote.evidence_root
-    assert environment["MANYFORGE_DEV_ISAAC_SITE_SETTINGS"] == launcher.config.remote.isaac_site_settings
+    assert "MANYFORGE_DEV_ISAAC_SITE_SETTINGS" not in environment
     assert environment["ROS_DOMAIN_ID"] == str(launcher.config.ros_domain)
     assert environment["ROS_STATIC_PEERS"] == ";".join(launcher.config.static_peers)
     assert "source " not in launcher._container_shell("start")

@@ -26,6 +26,11 @@ import type {
   CCLCLifecycleTargetState,
   CCLCRouteTemplateWire,
   CCLCRouteTemplateSet,
+  CCLCStreamHealth,
+  CCLCStreamRecovery,
+  CCLCStreamSeverity,
+  CCLCStreamState,
+  CCLCStreamTimestampSource,
   CCLCTransactionStatus,
 } from '../types/cclc';
 
@@ -826,9 +831,48 @@ function providerDomainAt(domain: JsonObject, path: string): CCLCProviderCompone
   };
 }
 
+const STREAM_STATES = new Set<CCLCStreamState>(['live', 'stale', 'absent']);
+const STREAM_SEVERITIES = new Set<CCLCStreamSeverity>(['fault', 'blocking', 'warning']);
+const STREAM_RECOVERIES = new Set<CCLCStreamRecovery>(['ack', 'auto']);
+const STREAM_TIMESTAMP_SOURCES = new Set<CCLCStreamTimestampSource>(['message_stamp', 'arrival']);
+
+function memberAt<T extends string>(value: unknown, allowed: Set<T>, path: string): T {
+  if (typeof value !== 'string' || !allowed.has(value as T)) {
+    return fail(path, `one of [${[...allowed].join(', ')}]`);
+  }
+  return value as T;
+}
+
+/** CP9 per-stream health rows (contract (c)). */
+function streamHealthAt(value: unknown, path: string): CCLCStreamHealth[] {
+  const rows = arrayAt(value, path, 256).map((candidate, index) => {
+    const at = `${path}[${index}]`;
+    const row = objectAt(candidate, at);
+    exact(row, [
+      'acknowledgement_required', 'age_ns', 'budget_ns', 'error', 'recovery',
+      'severity', 'state', 'stream_id', 'timestamp_source',
+    ], at);
+    const ageNs = row.age_ns === null ? null : safeIntegerAt(row.age_ns, `${at}.age_ns`);
+    if (ageNs !== null && ageNs < 0) fail(`${at}.age_ns`, 'a nonnegative safe integer');
+    return {
+      streamId: textAt(row.stream_id, `${at}.stream_id`),
+      state: memberAt(row.state, STREAM_STATES, `${at}.state`),
+      ageNs,
+      budgetNs: integerAt(row.budget_ns, `${at}.budget_ns`),
+      severity: memberAt(row.severity, STREAM_SEVERITIES, `${at}.severity`),
+      recovery: memberAt(row.recovery, STREAM_RECOVERIES, `${at}.recovery`),
+      timestampSource: memberAt(row.timestamp_source, STREAM_TIMESTAMP_SOURCES, `${at}.timestamp_source`),
+      acknowledgementRequired: booleanAt(row.acknowledgement_required, `${at}.acknowledgement_required`),
+      error: readinessErrorAt(row.error, `${at}.error`),
+    };
+  });
+  return canonicalBy(rows, (row) => row.streamId, path, { nonempty: true });
+}
+
 export function parseCCLCComponentSnapshot(value: unknown): CCLCComponentSnapshot {
   const row = objectAt(value, 'cclcComponent');
   const hasOutputCounters = 'dropped_output_lines' in row || 'dropped_output_bytes' in row;
+  const hasStreamHealth = 'stream_health' in row;
   exact(row, [
     'active_public_pointer_digest', 'component_lifecycle_generation',
     'component_lifecycle_state', 'controllable_component_id', 'domains',
@@ -836,6 +880,7 @@ export function parseCCLCComponentSnapshot(value: unknown): CCLCComponentSnapsho
     'provider_occurrences', 'publication_generation',
     'retained_bundle_id', 'snapshot_digest', 'readiness',
     ...(hasOutputCounters ? ['dropped_output_lines', 'dropped_output_bytes'] : []),
+    ...(hasStreamHealth ? ['stream_health'] : []),
   ], 'cclcComponent');
   const state = textAt(
     row.component_lifecycle_state,
@@ -1021,6 +1066,9 @@ export function parseCCLCComponentSnapshot(value: unknown): CCLCComponentSnapsho
         row.dropped_output_bytes, 'cclcComponent.dropped_output_bytes',
       ),
     } : {}),
+    ...(hasStreamHealth ? {
+      streamHealth: streamHealthAt(row.stream_health, 'cclcComponent.stream_health'),
+    } : {}),
   };
 }
 
@@ -1191,11 +1239,14 @@ export function parseCCLCAdmission(
 ): CCLCAdmission {
   const row = objectAt(value, 'cclcAdmission');
   const recovered = kind === 'lifecycle' && 'incident_recovery' in row;
+  const streamAcknowledged = kind === 'lifecycle' && !recovered && 'stream_acknowledgement' in row;
   exact(
     row,
     recovered
       ? ['acceptance', 'incident_recovery', 'replay_status', 'status']
-      : ['acceptance', 'replay_status', 'status'],
+      : streamAcknowledged
+        ? ['acceptance', 'replay_status', 'status', 'stream_acknowledgement']
+        : ['acceptance', 'replay_status', 'status'],
     'cclcAdmission',
   );
   const replayStatus = textAt(row.replay_status, 'cclcAdmission.replay_status');
@@ -1245,12 +1296,32 @@ export function parseCCLCAdmission(
     }
     incidentRecovery = incidentRecoveryAt(row.incident_recovery, 'cclcAdmission.incident_recovery');
   }
+  let streamAcknowledgement: CCLCAdmission['streamAcknowledgement'];
+  if (streamAcknowledged) {
+    if (row.acceptance !== null || row.status !== null || replayStatus !== 'accepted_new') {
+      fail('cclcAdmission.stream_acknowledgement', 'an accepted Recover without a transaction');
+    }
+    const acknowledged = objectAt(row.stream_acknowledgement, 'cclcAdmission.stream_acknowledgement');
+    exact(acknowledged, ['acknowledged_at_ns', 'controllable_component_id'],
+      'cclcAdmission.stream_acknowledgement');
+    streamAcknowledgement = {
+      controllableComponentId: textAt(
+        acknowledged.controllable_component_id,
+        'cclcAdmission.stream_acknowledgement.controllable_component_id',
+      ),
+      acknowledgedAtNs: parseNanoseconds(
+        acknowledged.acknowledged_at_ns,
+        'cclcAdmission.stream_acknowledgement.acknowledged_at_ns',
+      ),
+    };
+  }
   return {
     replayStatus: replayStatus as CCLCAdmission['replayStatus'],
     requestId,
     transactionId,
     status,
     incidentRecovery,
+    ...(streamAcknowledgement ? { streamAcknowledgement } : {}),
   };
 }
 

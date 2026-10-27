@@ -20,17 +20,6 @@ class ISceneAuthority {
       const SceneResourceId& scene_resource_id) const = 0;
   [[nodiscard]] virtual Result<Pose3DTO> GetObjectPose(
       const SceneResourceId& scene_resource_id) const = 0;
-
-  /// Refresh runtime freshness for an unchanged committed pose without an
-  /// owner transaction or SceneRevision change; see
-  /// ProviderFreshnessConfirmationDTO. Returns the unchanged projection.
-  [[nodiscard]] virtual Result<ProjectionRevisionDTO> ConfirmProviderFreshness(
-      const ProviderFreshnessConfirmationDTO& /*confirmation*/) {
-    return Result<ProjectionRevisionDTO>::Err(ErrorDTO{
-        "provider_freshness_unsupported",
-        "scene authority does not support freshness-only confirmation",
-        {}});
-  }
 };
 
 }  // namespace manyforge::core

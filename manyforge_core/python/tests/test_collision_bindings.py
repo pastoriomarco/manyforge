@@ -108,21 +108,6 @@ def test_collision_failure_kind_enum():
         assert getattr(e, name) is not None
 
 
-def test_collision_world_mutation_source_enum():
-    e = manyforge_core_py.CollisionWorldMutationSource
-    for name in (
-        "kSceneInitialize",
-        "kSceneEdit",
-        "kCarriedObjectAttach",
-        "kCarriedObjectDetach",
-        "kComponentAttachmentApply",
-        "kPoseSourceApply",
-        "kDeploymentApply",
-        "kPolicyUpdate",
-    ):
-        assert getattr(e, name) is not None
-
-
 def test_collision_pair_classification_enum():
     e = manyforge_core_py.CollisionPairClassification
     for name in (
@@ -137,74 +122,6 @@ def test_collision_pair_classification_enum():
         "kDiagnosticIncomplete",
     ):
         assert getattr(e, name) is not None
-
-
-# ---------------------------------------------------------------------------
-# CollisionWorldLedgerEntry (Chunk 2)
-# ---------------------------------------------------------------------------
-
-
-def test_collision_world_ledger_entry_default():
-    e = manyforge_core_py.CollisionWorldLedgerEntry()
-    assert e.revision.revision_id == 0
-    assert e.revision.content_hash == ""
-    assert e.previous_revision_id == 0
-    assert (
-        e.mutation_source
-        == manyforge_core_py.CollisionWorldMutationSource.kSceneInitialize
-    )
-    assert e.affected_body_ids == []
-    assert e.owner_sequence == 0
-    assert e.observed_timestamp_ns == 0
-    assert e.attribution.transport == manyforge_core_py.RequestTransportDTO.kInternal
-    assert (
-        e.attribution.assurance
-        == manyforge_core_py.RequestAssuranceDTO.kUnverified
-    )
-    assert e.attribution.principal_id is None
-    assert e.source_label == ""
-    assert e.correlation_id is None
-
-
-def test_collision_world_ledger_entry_round_trip():
-    e = manyforge_core_py.CollisionWorldLedgerEntry()
-    e.revision = manyforge_core_py.CollisionWorldRevision(
-        revision_id=3, content_hash="rev-3"
-    )
-    e.previous_revision_id = 2
-    e.mutation_source = (
-        manyforge_core_py.CollisionWorldMutationSource.kCarriedObjectAttach
-    )
-    e.affected_body_ids = ["scene/box_a/shape/0"]
-    e.owner_sequence = 7
-    e.observed_timestamp_ns = 1_700_000_000_000_000_000
-    e.attribution.transport = manyforge_core_py.RequestTransportDTO.kHttp
-    e.attribution.assurance = (
-        manyforge_core_py.RequestAssuranceDTO.kExternallyAuthenticated
-    )
-    e.attribution.principal_id = "operator-42"
-    e.source_label = "scene_edit.attach_object"
-    e.correlation_id = "correlation-42"
-
-    assert e.revision.revision_id == 3
-    assert e.revision.content_hash == "rev-3"
-    assert e.previous_revision_id == 2
-    assert (
-        e.mutation_source
-        == manyforge_core_py.CollisionWorldMutationSource.kCarriedObjectAttach
-    )
-    assert e.affected_body_ids == ["scene/box_a/shape/0"]
-    assert e.owner_sequence == 7
-    assert e.observed_timestamp_ns == 1_700_000_000_000_000_000
-    assert e.attribution.transport == manyforge_core_py.RequestTransportDTO.kHttp
-    assert (
-        e.attribution.assurance
-        == manyforge_core_py.RequestAssuranceDTO.kExternallyAuthenticated
-    )
-    assert e.attribution.principal_id == "operator-42"
-    assert e.source_label == "scene_edit.attach_object"
-    assert e.correlation_id == "correlation-42"
-    assert "revision_id=3" in repr(e)
 
 
 # ---------------------------------------------------------------------------
@@ -761,14 +678,10 @@ def test_collision_world_snapshot_default():
 
 def test_collision_world_body_round_trip():
     b = _component_body("link1")
-    b.source_timestamp_ns = 123
-    b.source_freshness_budget_ns = 50_000_000
     assert b.body_id == "component/arm/model/arm_model/body/link1/collision/0"
     assert b.owner_kind == manyforge_core_py.CollisionOwnerKind.kComponentModelBody
     assert b.parent_body_id is None
     assert b.frame_id == "compiled_link1"
-    assert b.source_timestamp_ns == 123
-    assert b.source_freshness_budget_ns == 50_000_000
     assert len(b.geometries) == 1
 
 

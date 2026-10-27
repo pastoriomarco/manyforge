@@ -93,6 +93,7 @@ make_gripper_request(double target_position, double duration_s,
 
 Ros2GripperActionConfig isaac_gripper_config(std::string command_topic) {
   Ros2GripperActionConfig config;
+  config.state_freshness_timeout_s = 1.0;
   config.transport_kind = "isaac_joint_state_effort";
   config.command_topic = std::move(command_topic);
   config.command_joint_names = {"finger_joint"};

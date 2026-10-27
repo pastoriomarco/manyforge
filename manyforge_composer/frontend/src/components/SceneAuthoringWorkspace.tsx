@@ -2178,8 +2178,7 @@ const SceneViewerBridge = memo(function SceneViewerBridge({
       onBeginCandidateTcpDrag={beginCandidateDragStable}
       candidateContextKey={JSON.stringify([robotControl.selectedStatus?.ownerEpoch,
         robotControl.selectedStatus?.retainedBundleId, robotControl.selectedStatus?.graphRevision,
-        // Scene identity only: pose updates advance its revision during a drag.
-        robotControl.selectedStatus?.directControl?.programBindingId, robotControl.selectedStatus?.sceneRevision.scene_id,
+        robotControl.selectedStatus?.directControl?.programBindingId,
         robotControl.state.mode, robotControl.state.moveToDraft?.source,
         candidatePresentationAllowed, runtimeEnabled])}
       gizmo={gizmo}

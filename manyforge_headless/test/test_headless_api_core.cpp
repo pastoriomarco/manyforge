@@ -1469,7 +1469,13 @@ TEST(HeadlessApiCore,
   EXPECT_TRUE(Array(alarms, "alarms").empty());
   EXPECT_TRUE(std::get<bool>(Member(alarms, "reconciled").storage()));
   const auto &domains = Array(alarms, "domains");
-  ASSERT_EQ(domains.size(), 2U);
+  ASSERT_EQ(domains.size(), 3U);
+  const auto scene =
+      std::find_if(domains.begin(), domains.end(), [](const auto &domain) {
+        return Text(domain, "domain") == "scene";
+      });
+  ASSERT_NE(scene, domains.end());
+  EXPECT_TRUE(std::get<bool>(Member(*scene, "reconciled").storage()));
   const auto motion =
       std::find_if(domains.begin(), domains.end(), [](const auto &domain) {
         return Text(domain, "domain") == "motion";
@@ -4539,144 +4545,6 @@ TEST(HeadlessApiCore,
   EXPECT_FALSE(pending(unregistered));
   EXPECT_EQ(observe_empty(unregistered, empty), "empty");
   EXPECT_FALSE(pending(unregistered));
-}
-
-TEST(HeadlessApiCore, CurrentCellObserverIncidentKeepsItsTypedPayloadAndHistoryReplay) {
-  TemporaryDirectory directory;
-  const core::CellObserverIncidentTargetDTO target{
-      core::CellId(std::string(kCellId)), "observer", "observer.epoch"};
-  const core::CellObserverIncidentRecordDTO record{
-      "incident.observer.loss.1", target, 5000, "observer exited with signal 11",
-      CanonicalValue(CanonicalValue::Object{
-          {"exit", CanonicalValue(CanonicalValue::Object{
-                       {"status", CanonicalValue(nullptr)}, {"signal", CanonicalValue(11.0)},
-                       {"core_dumped", CanonicalValue(false)},
-                       {"observed_utc", CanonicalValue("2026-10-18T10:00:00Z")}})},
-          {"context", CanonicalValue(CanonicalValue::Object{
-                          {"cell_id", CanonicalValue(target.cell_id.value())},
-                          {"source_id", CanonicalValue(target.source_id)},
-                          {"source_epoch_base", CanonicalValue(target.source_epoch_base)}})},
-          {"settings", CanonicalValue(CanonicalValue::Object{})},
-          {"generated", CanonicalValue(CanonicalValue::Object{})},
-          {"output", CanonicalValue(CanonicalValue::Object{
-                         {"tail", CanonicalValue("observer exit\n")},
-                         {"line_count", CanonicalValue(1.0)}, {"truncated", CanonicalValue(false)},
-                         {"dropped_forward_lines", CanonicalValue(0.0)},
-                         {"dropped_forward_bytes", CanonicalValue(0.0)},
-                         {"invalid_text_bytes", CanonicalValue(0.0)}})},
-          {"core_dump_link", CanonicalValue(nullptr)}})};
-  ASSERT_TRUE(record.locally_valid());
-  // The actual Core event producer is byte-identical to its stored observer
-  // record; this separate current shape intentionally has no schema_version.
-  const auto bytes = core::CellObserverIncidentEventPayload(record);
-  EXPECT_EQ(bytes, core::EncodeCellObserverIncidentRecord(record));
-  EXPECT_EQ(core::DecodeCellObserverIncidentRecord(bytes), record);
-  const auto payload = content_identity::parse_canonical_json(bytes);
-  ASSERT_EQ(payload.find_object_member("schema_version"), nullptr);
-  core::SqliteCCLCJournal journal(directory.path() / "observer-incidents.sqlite3", target.cell_id);
-  ASSERT_TRUE(journal.RecordCellObserverIncident(record).ok());
-  core::CellObserverBringUpRecordDTO admitted{
-      {{core::RequestId("bring-up.1"), core::RequestOwnerEpoch("operator.owner"),
-        "Components observer bring-up", std::nullopt},
-       {core::RequestTransportDTO::kHttp, core::RequestAssuranceDTO::kExternallyAuthenticated,
-        std::string("operator")},
-       {core::RetainedBundleId("bundle.1"), core::GraphRevision("graph.1"),
-        {core::SceneId(Digest('a')), 1U, core::ContentDigest(Digest('b'))}},
-       core::ActiveBundlePublicationGeneration(1U), core::ContentDigest(Digest('c')),
-       core::RuntimeUnitId("host.unit"), core::RuntimeEpoch("host.epoch"),
-       "manager.epoch", "scene.epoch",
-       content_identity::canonical_json(CanonicalValue(CanonicalValue::Object{
-           {"deployment_generation", CanonicalValue(1.0)},
-           {"graph_revision", CanonicalValue("graph.1")},
-           {"program_generation", CanonicalValue(1.0)},
-           {"retained_bundle_id", CanonicalValue("bundle.1")},
-           {"runtime_generation", CanonicalValue(1.0)}})),
-       target, {target.cell_id, target.source_id, "observer.replacement"},
-       "/run/observer-input.json", record.incident_id},
-      core::CellObserverBringUpPhaseDTO::kAdmitted, 5001, 5001,
-      core::CellObserverBringUpProcessDTO{1234, "launch.old"}, false,
-      std::nullopt, std::nullopt, std::nullopt};
-  const auto loss = journal.LoadOpenCellObserverLossAssociation();
-  ASSERT_TRUE(loss.ok());
-  admitted.predecessor_loss = loss.value();
-  ASSERT_TRUE(admitted.locally_valid());
-  ASSERT_TRUE(journal.BeginLatestCellObserverBringUp(admitted, std::nullopt).ok());
-  auto retiring = admitted;
-  retiring.phase = core::CellObserverBringUpPhaseDTO::kRetiring;
-  retiring.updated_at_ns = 5002;
-  ASSERT_TRUE(journal.UpdateLatestCellObserverBringUp(admitted, retiring).ok());
-  auto started = retiring;
-  started.phase = core::CellObserverBringUpPhaseDTO::kStarted;
-  started.updated_at_ns = 5003;
-  started.predecessor_drained_or_absent = true;
-  started.started_process = core::CellObserverBringUpProcessDTO{2345, "launch.new"};
-  ASSERT_TRUE(journal.UpdateLatestCellObserverBringUp(retiring, started).ok());
-  const core::CellObserverBringUpOpenDTO opened{"observer.replacement.1", 1U, 5004};
-  const auto closed = journal.CloseCellObserverIncidentByOperatorBringUp(started, opened);
-  ASSERT_TRUE(closed.ok()) << closed.error().message;
-  EXPECT_EQ(closed.value().phase, core::CellObserverBringUpPhaseDTO::kOpenAccepted);
-  EXPECT_FALSE(journal.LoadOpenCellObserverIncident().value());
-  const auto events = journal.LoadComponentIncidentEvents(0U, 8U);
-  ASSERT_TRUE(events.ok());
-  ASSERT_EQ(events.value().size(), 2U);
-  EXPECT_EQ(events.value().front().payload_json, bytes);
-  const auto acknowledged = content_identity::parse_canonical_json(events.value().back().payload_json);
-  EXPECT_EQ(Text(acknowledged, "event_kind"), core::kComponentIncidentAcknowledgedEventKind);
-  ASSERT_FALSE(Member(acknowledged, "acknowledgement").is_null());
-  const auto event = [&](const CanonicalValue &details) {
-    const bool ack = Text(details, "event_kind") == core::kComponentIncidentAcknowledgedEventKind;
-    const auto &actual = ack ? events.value().back() : events.value().front();
-    return CanonicalValue(CanonicalValue::Object{
-        {"event_kind", CanonicalValue(actual.event_kind)},
-        {"event_sequence", CanonicalValue(static_cast<double>(actual.sequence))},
-        {"incident_id", CanonicalValue(actual.incident_id)},
-        {"occurred_at_ns", content_identity::nonnegative_int64_value(actual.occurred_at_ns)},
-        {"payload", details}});
-  };
-  HistorianQuery query;
-  query.components.insert("manyforge.cclc");
-  query.correlations = {{"incident_id", record.incident_id}};
-  {
-    HeadlessApiCore api(Config(directory, "api.epoch.1"), Clocks());
-    for (const auto &invalid : {
-             JournalField(payload, "target_kind", CanonicalValue("unknown")),
-             JournalField(payload, "cause_class", CanonicalValue("fault")),
-             JournalField(payload, "schema_version", CanonicalValue("manyforge.component_incident_event.v2")),
-             JournalField(payload, "diagnostic_snapshot", CanonicalValue(nullptr))}) {
-      EXPECT_THROW(static_cast<void>(api.RecordCCLCIncidentEvent("cclc.epoch.1", event(invalid))),
-                   OperatorAlarmError);
-    }
-    const auto &ack = Member(acknowledged, "acknowledgement");
-    for (const auto &invalid : {
-             JournalField(acknowledged, "acknowledgement", CanonicalValue(nullptr)),
-             JournalField(acknowledged, "acknowledgement", JournalField(ack, "reason", CanonicalValue("unknown"))),
-             JournalField(acknowledged, "acknowledgement", JournalField(ack, "first_open", JournalField(
-                 Member(ack, "first_open"), "source_epoch_order", CanonicalValue(0.0)))),
-             JournalField(acknowledged, "summary", CanonicalValue(""))}) {
-      EXPECT_THROW(static_cast<void>(api.RecordCCLCIncidentEvent("cclc.epoch.1", event(invalid))),
-                   OperatorAlarmError);
-    }
-    EXPECT_EQ(Text(api.RecordCCLCIncidentEvent("cclc.epoch.1", event(payload)), "status"), "recorded");
-    EXPECT_EQ(Text(api.RecordCCLCIncidentEvent("cclc.epoch.1", event(acknowledged)), "status"), "recorded");
-    EXPECT_EQ(Text(api.RecordCCLCIncidentEvent("cclc.epoch.1", event(payload)), "status"), "duplicate");
-    EXPECT_EQ(Text(api.RecordCCLCIncidentEvent("cclc.epoch.1", event(acknowledged)), "status"), "duplicate");
-    const auto deadline = std::chrono::steady_clock::now() + 2s;
-    while (Array(api.HistoryPage(query), "events").size() != 2U &&
-           std::chrono::steady_clock::now() < deadline) std::this_thread::yield();
-    const auto page = api.HistoryPage(query);
-    ASSERT_EQ(Array(page, "events").size(), 2U);
-    for (const auto &row : Array(page, "events")) {
-      const auto &saved = Member(Member(row, "event"), "payload");
-      EXPECT_EQ(Text(saved, "schema_version"), "manyforge.cclc_incident_history_event.v2");
-      EXPECT_EQ(Member(saved, "details"), Text(saved, "event_kind") == core::kComponentIncidentAcknowledgedEventKind
-                                              ? acknowledged : payload);
-    }
-    api.Shutdown();
-  }
-  HeadlessApiCore replacement(Config(directory, "api.epoch.2"), Clocks());
-  EXPECT_EQ(Text(replacement.RecordCCLCIncidentEvent("cclc.epoch.1", event(payload)), "status"), "duplicate");
-  EXPECT_EQ(Text(replacement.RecordCCLCIncidentEvent("cclc.epoch.1", event(acknowledged)), "status"), "duplicate");
-  EXPECT_EQ(Array(replacement.HistoryPage(query), "events").size(), 2U);
 }
 
 TEST(HeadlessApiCore, CCLCIncidentEventsAreRecordedOncePerIncidentAndKind) {

@@ -1,6 +1,6 @@
 api_version: manyforge.program.v2
 program_id: isaac_manipulator_scene_light
-program_revision: sha256:341dcc281d7a2a0e2ec579c4e01d401240cf816a40544430d8a0dcaf12ee489a
+program_revision: sha256:52a72192e6ca356f32f6e3f50609ab18a4ce9f5e28b6972dd15cf1d316a38dfd
 program_profile: composable-cell-v1
 name: isaac_manipulator_scene_light
 description: >-
@@ -131,8 +131,8 @@ scene:
 parameters:
   - parameter_id: velocity_scale
     type: float64
-    default: 0.2
-    constraints: {min_exclusive: 0.0, max_inclusive: 1.0}
+    default: 0.4
+    constraints: {min_exclusive: 0, max_inclusive: 1}
     description: Velocity scale for all retained-world moves.
 tree:
   node_id: sequence
@@ -206,9 +206,9 @@ tree:
           instance_id: close_gripper
           parameters:
             target_role: gripper
-            position: {kind: angular_rad, value_rad: 0.55}
-            max_effort: {kind: angular_newton_meter, value_nm: 40.0}
-            command_duration_s: 1.0
+            position: {kind: angular_rad, value_rad: 0.6}
+            max_effort: {kind: angular_newton_meter, value_nm: 40}
+            command_duration_s: 1
           children: []
         - node_id: timer
           instance_id: wait_before_attach

@@ -93,6 +93,9 @@ struct Composition final : ExecutionProduct {
   // One actual generic transport holder shared by all generic devices and
   // retained across Apply; physical transport holders remain independent.
   std::shared_ptr<ros2_control_execution::Ros2TransportResources> io_transport{};
+  // CP9: the host's one component-stream sample bridge (Python sinks), pinned
+  // by every composition hosting a pose source; on `io_transport`'s node.
+  std::shared_ptr<void> component_stream_sample_bridge{};
   // The actual canonical leaves/engines, shared across retained Apply. Metadata
   // lives in each leaf; this is only its existing composition lifetime pin.
   std::vector<std::shared_ptr<HostIoOutputChannelEntry>> io_output_channels{};

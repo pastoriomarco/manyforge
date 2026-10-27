@@ -1,6 +1,7 @@
 #pragma once
 
 #include <cstdint>
+#include <manyforge_deployment/canonical_value.hpp>
 #include <manyforge_deployment/execution_runtime_contract.hpp>
 #include <manyforge_core/types/motion_interrupt.hpp>
 #include <manyforge_core/types/gripper.hpp>
@@ -120,14 +121,18 @@ struct Configuration final {
     /// reject this field. None retains positive metadata but has no delivery
     /// deadline or transport.
     std::optional<double> delivery_result_timeout_s;
+    /// Required gripper feedback staleness threshold [s]; also the default
+    /// budget of the CP9 `gripper_feedback` stream.
+    double state_freshness_timeout_s;
 
     GripperTargetConfiguration(
         execution_runtime_contract::Configuration::GripperTargetConfiguration value,
-        core::GripperOutputMode mode,
+        core::GripperOutputMode mode, double freshness_timeout_s,
         std::optional<double> delivery_timeout = std::nullopt)
         : execution_runtime_contract::Configuration::GripperTargetConfiguration(
               std::move(value)), output_mode(mode),
-          delivery_result_timeout_s(delivery_timeout) {}
+          delivery_result_timeout_s(delivery_timeout),
+          state_freshness_timeout_s(freshness_timeout_s) {}
 
     friend bool operator==(const GripperTargetConfiguration &,
                            const GripperTargetConfiguration &) = default;
@@ -143,6 +148,41 @@ struct Configuration final {
   std::optional<std::uint32_t> runtime_collision_lookahead_workers;
   std::optional<double> runtime_dynamic_body_max_age_cap_ms;
   std::optional<std::uint32_t> validation_collision_workers;
+
+  /// CP9: one row per model-free pose-source component (runtime kind
+  /// `pose_source`, profile `pose_source_v0`), sorted by component. The
+  /// component id is the observer's `source_id`.
+  struct PoseSource final {
+    /// One observation binding (joint_state, simulation entity or
+    /// Detection3D source), keyed by (object_id, policy_id).
+    struct Binding final {
+      std::string object_id;
+      std::string policy_id;
+      bool eligible{};
+      std::int64_t lifetime_ns{};
+
+      friend bool operator==(const Binding &, const Binding &) = default;
+    };
+    struct JointState final {
+      std::string object_id;
+      std::string policy_id;
+      std::string topic;
+
+      friend bool operator==(const JointState &, const JointState &) = default;
+    };
+    core::ControllableComponentId controllable_component_id;
+    /// The normalized unit-configuration row minus `controllable_component_id`:
+    /// `simulation_poll_period_ms`, optional `joint_state`,
+    /// `simulation_entities`, `detection3d_sources`. The host writes it back
+    /// as the observer's JSON document.
+    CanonicalValue observer_configuration{nullptr};
+    /// Observer order: joint_state, simulation_entities, detection3d_sources.
+    std::vector<Binding> bindings;
+    std::optional<JointState> joint_state;
+
+    friend bool operator==(const PoseSource &, const PoseSource &) = default;
+  };
+  std::vector<PoseSource> pose_sources;
 
   friend bool operator==(const Configuration &,
                          const Configuration &) = default;
@@ -167,6 +207,16 @@ require_configuration(const RetainedBundle &retained_bundle,
 [[nodiscard]] CanonicalValue component_configuration_projection(
     const RetainedBundle &bundle, const core::RuntimeUnitId &runtime_unit_id,
     const core::ControllableComponentId &component_id);
+
+/// CP9: the stream id of one pose-source binding,
+/// `poses/<object_id>/<policy_id>` (the compiler keeps it a valid stream id).
+[[nodiscard]] std::string
+pose_source_stream_id(const Configuration::PoseSource::Binding &binding);
+
+/// The pose-source row of one hosted component, or none.
+[[nodiscard]] const Configuration::PoseSource *
+find_pose_source(const Configuration &configuration,
+                 const core::ControllableComponentId &component_id);
 
 /// The controller profile row of one hosted component, or none.
 [[nodiscard]] const Configuration::ControllerProfile *

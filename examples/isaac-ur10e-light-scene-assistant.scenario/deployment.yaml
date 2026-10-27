@@ -19,6 +19,84 @@
   },
   "components": [
     {
+      "component_id": "isaac_scene_objects",
+      "component_profile_id": "pose_source_v0",
+      "configuration": {
+        "runtime_configuration": {
+          "pose_sources": [
+            {
+              "controllable_component_id": "isaac_scene_objects",
+              "detection3d_sources": [],
+              "joint_state": {
+                "eligible": false,
+                "lifetime_ns": 1000000000,
+                "object_id": "isaac_ur10e_assistant_robot",
+                "policy_id": "viewer.measured_robot",
+                "required_joint_names": [
+                  "shoulder_pan_joint",
+                  "shoulder_lift_joint",
+                  "elbow_joint",
+                  "wrist_1_joint",
+                  "wrist_2_joint",
+                  "wrist_3_joint"
+                ],
+                "topic": "/isaac_joint_states"
+              },
+              "simulation_entities": [
+                {
+                  "eligible": false,
+                  "entity": "/World/ur10e_robotiq2f_140_ROS/ur10e_robotiq2f_140/ee_link/robotiq_arg2f_base_link",
+                  "frame_kind": "cell_frame",
+                  "lifetime_ns": 1000000000,
+                  "local_orientation_xyzw": [
+                    0,
+                    0,
+                    0,
+                    1
+                  ],
+                  "local_position_xyz": [
+                    0,
+                    0,
+                    0.2
+                  ],
+                  "object_id": "isaac_ur10e_assistant_robot",
+                  "policy_id": "viewer.measured_tcp",
+                  "source_coordinate_frame_id": "universe",
+                  "source_header_frame_id": "robotiq_arg2f_base_link",
+                  "target_frame_id": "universe"
+                },
+                {
+                  "eligible": true,
+                  "entity": "/mac_n_cheese_centered",
+                  "frame_kind": "cell_frame",
+                  "lifetime_ns": 2000000000,
+                  "local_orientation_xyzw": [
+                    0,
+                    0,
+                    0,
+                    1
+                  ],
+                  "local_position_xyz": [
+                    0,
+                    0,
+                    0
+                  ],
+                  "object_id": "isaac_cheese_box",
+                  "policy_id": "continuous_unattached",
+                  "source_coordinate_frame_id": "universe",
+                  "source_header_frame_id": "mac_n_cheese_centered",
+                  "target_frame_id": "universe"
+                }
+              ],
+              "simulation_poll_period_ms": 250
+            }
+          ]
+        },
+        "runtime_kind": "pose_source"
+      },
+      "target_settings": {}
+    },
+    {
       "component_id": "isaac_ur10e_assistant_robot",
       "component_profile_id": "ur10e_robotiq_assistant_isaac_commanded_v0",
       "configuration": {
@@ -54,6 +132,7 @@
               "mount_frame": "tool0",
               "open_state_ref": "open",
               "output_mode": "commanded",
+              "state_freshness_timeout_s": 1.0,
               "tcp_frame": "grasp_frame",
               "touch_links": [
                 "left_inner_finger",

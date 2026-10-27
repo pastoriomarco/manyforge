@@ -22,7 +22,6 @@ manyforge_isaac_gripper_action_bridge:
     completion_tolerance_rad: 0.04
     completion_settle_time_s: 0.1
     completion_min_samples: 3
-    state_freshness_timeout_s: 1.0
     # Emergency ceiling only. The ManyForge C++ ROS gripper owner normally
     # cancels first at motion_time_s + result_timeout_s (15.8 s in the light
     # scene deployments); this later bound prevents orphaned external goals.

@@ -49,6 +49,7 @@
               "mount_frame": "tool0",
               "open_state_ref": "open",
               "output_mode": "commanded",
+              "state_freshness_timeout_s": 1.0,
               "tcp_frame": "robotiq_85_base_link",
               "touch_links": [
                 "robotiq_85_base_link",

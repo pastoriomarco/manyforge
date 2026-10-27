@@ -115,9 +115,6 @@ export function useHeldNodePreview({
     return () => { mounted.current = false; };
   }, []);
 
-  // Scene identity only: pose updates advance its revision, and re-planning
-  // on each of them would never let a slower preview land.
-  const sceneId = snapshot?.executionControlStatus?.sceneRevision.scene_id ?? null;
   // The native execution owner's epoch: Robot Control discards preview
   // evidence when that owner is replaced, so a reply from a previous owner is
   // never shown as ready for the current one.
@@ -128,7 +125,7 @@ export function useHeldNodePreview({
     : JSON.stringify([
       held.run.ownerEpoch, executionOwnerEpoch, held.offer.programRunId, held.offer.nodeInstanceId,
       held.offer.nodeAttemptId, held.run.capture.programBindingId,
-      held.run.capture.programRevision, sceneId, inputs,
+      held.run.capture.programRevision, inputs,
     ]);
   const basis = useRef({ held, inputs });
   useEffect(() => {

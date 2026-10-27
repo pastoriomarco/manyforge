@@ -48,7 +48,6 @@ enum class NativeShutdownPhase : unsigned {
   kRetiredCompositionDestruction,
   kActiveCompositionDestruction,
   kFailedCompositionDestruction,
-  kCellProcessesDestruction,
   kProjectionDestruction,
   kLivenessReceiverDestruction,
   kStopSurveillanceDestruction,

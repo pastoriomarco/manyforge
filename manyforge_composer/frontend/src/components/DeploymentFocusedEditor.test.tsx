@@ -150,6 +150,7 @@ function rosGripperController(
   }];
   const row = (configuration.gripper_target_configurations as Array<Record<string, JsonValue>>)[0];
   row.output_mode = outputMode;
+  row.state_freshness_timeout_s = 0.75;
   return value;
 }
 
@@ -199,8 +200,12 @@ async function mountGripper(
   actuationKind: 'position_commanded' | 'pneumatic',
   outputMode: 'commanded' | 'none' = 'commanded',
   timeoutSource?: JsonValue,
+  componentStreams?: JsonValue,
 ) {
   const value = rosGripperController(actuationKind, outputMode);
+  if (componentStreams !== undefined) {
+    (value.workspace!.draft.document!.policies as Record<string, JsonValue>).component_streams = componentStreams;
+  }
   const graph = value.workspace!.draft.document!.graph as Record<string, JsonValue>;
   const runtime = (graph.runtime_units as Array<Record<string, JsonValue>>)[0];
   const configuration = runtime.configuration as Record<string, JsonValue>;
@@ -297,6 +302,72 @@ describe('DeploymentFocusedEditor', () => {
     }
   });
 
+  describe('gripper feedback timeout', () => {
+    const feedbackInput = (mounted: Awaited<ReturnType<typeof mountGripper>>) => (
+      mounted.field('Feedback timeout').children as Array<{ props: Props }>)[0].props;
+    const commit = async (mounted: Awaited<ReturnType<typeof mountGripper>>, text: string) => {
+      await act(() => feedbackInput(mounted).onChange?.({ target: { value: text } }));
+      await act(() => (feedbackInput(mounted).onBlur as () => void)());
+    };
+    const policiesWith = (mounted: Awaited<ReturnType<typeof mountGripper>>, streams?: JsonValue) => {
+      const policies = { ...(mounted.value.workspace!.draft.document!.policies as Record<string, JsonValue>) };
+      if (streams === undefined) delete policies.component_streams;
+      else policies.component_streams = streams;
+      return policies;
+    };
+    const other = { controllable_component_id: 'camera', stream_id: 'frames', severity: 'warning' };
+
+    it('adds a budget override in ns and shows the profile default as placeholder', async () => {
+      const mounted = await mountGripper('position_commanded');
+      try {
+        expect(feedbackInput(mounted).value).toBe('');
+        expect(feedbackInput(mounted).placeholder).toBe('750 ms (profile default)');
+        await commit(mounted, '250');
+        expect(mounted.value.mutate).toHaveBeenCalledExactlyOnceWith(['policies'], 'set', policiesWith(mounted, [
+          { controllable_component_id: 'robot', stream_id: 'gripper_feedback', budget_ns: 250_000_000 },
+        ]));
+      } finally { await mounted.unmount(); }
+    });
+
+    it('updates the override and keeps other rows and fields', async () => {
+      const mounted = await mountGripper('position_commanded', 'commanded', undefined, [
+        other,
+        { controllable_component_id: 'robot', stream_id: 'gripper_feedback', budget_ns: 1_500_000_000, severity: 'blocking' },
+      ]);
+      try {
+        expect(feedbackInput(mounted).value).toBe('1500');
+        await commit(mounted, '2000');
+        expect(mounted.value.mutate).toHaveBeenLastCalledWith(['policies'], 'set', policiesWith(mounted, [
+          other,
+          { controllable_component_id: 'robot', stream_id: 'gripper_feedback', budget_ns: 2_000_000_000, severity: 'blocking' },
+        ]));
+        await commit(mounted, '');
+        expect(mounted.value.mutate).toHaveBeenLastCalledWith(['policies'], 'set', policiesWith(mounted, [
+          other,
+          { controllable_component_id: 'robot', stream_id: 'gripper_feedback', severity: 'blocking' },
+        ]));
+      } finally { await mounted.unmount(); }
+    });
+
+    it('clearing a budget-only override removes the row and the empty table', async () => {
+      const mounted = await mountGripper('position_commanded', 'commanded', undefined, [
+        { controllable_component_id: 'robot', stream_id: 'gripper_feedback', budget_ns: 1_000_000_000 },
+      ]);
+      try {
+        await commit(mounted, '');
+        expect(mounted.value.mutate).toHaveBeenCalledExactlyOnceWith(['policies'], 'set', policiesWith(mounted));
+      } finally { await mounted.unmount(); }
+    });
+
+    it.each(['0', '-5'])('rejects non-positive timeout %s before mutation', async (text) => {
+      const mounted = await mountGripper('position_commanded');
+      try {
+        await commit(mounted, text);
+        expect(mounted.value.mutate).not.toHaveBeenCalled();
+      } finally { await mounted.unmount(); }
+    });
+  });
+
   it.each(['commanded', 'none'] as const)(
     'preserves explicit pneumatic timeout through edits and %s output changes', async (mode) => {
       const mounted = await mountGripper('pneumatic', mode, 2.5);
@@ -325,7 +396,7 @@ describe('DeploymentFocusedEditor', () => {
     'retains timeout omission and the existing row fields for %s', async (kind) => {
       const mounted = await mountGripper(kind);
       try {
-        expect(Object.keys(mounted.sourceRow)).toHaveLength(13);
+        expect(Object.keys(mounted.sourceRow)).toHaveLength(14);
         await mounted.setDuration(0.25);
         await mounted.update();
         expect(mounted.value.mutate).toHaveBeenCalledExactlyOnceWith(

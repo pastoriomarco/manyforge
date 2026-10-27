@@ -71,7 +71,6 @@ def _parser() -> argparse.ArgumentParser:
     start.add_argument("--remote-cache-root")
     start.add_argument("--remote-runtime-root")
     start.add_argument("--remote-evidence-root")
-    start.add_argument("--remote-isaac-site-settings")
     start.add_argument("--remote-simulation-control-config")
     start.add_argument("--remote-bridge-state-root")
     start.add_argument("--remote-ros-setup-script")
@@ -179,7 +178,6 @@ def _isaac_config(args: argparse.Namespace) -> IsaacLauncherConfig:
         cache_root=args.remote_cache_root,
         runtime_root=args.remote_runtime_root,
         evidence_root=args.remote_evidence_root,
-        isaac_site_settings=args.remote_isaac_site_settings or "",
         simulation_control_config=args.remote_simulation_control_config,
         bridge_state_root=args.remote_bridge_state_root or "/mnt/nova_ssd/codex-manyforge/runners/isaac-bridge",
         ros_setup_script=args.remote_ros_setup_script or "/opt/ros/jazzy/setup.bash",

@@ -1463,7 +1463,7 @@ class NativeKernelProgramPort:
     def bind(self, context: ProgramRunPortContext) -> None:
         if not isinstance(context, ProgramRunPortContext):
             raise TypeError("bind requires one exact Program-run port context")
-        owner_epoch, _scene = self._owner_status_for_capture(context)
+        owner_epoch = self._owner_status_for_capture(context)
         parsed = self._parse_context(
             context,
             request_owner_epoch=owner_epoch,
@@ -1602,7 +1602,7 @@ class NativeKernelProgramPort:
     def _owner_status_for_capture(
         self,
         capture: ProgramRunPortContext,
-    ) -> tuple[str, dict[str, Any]]:
+    ) -> str:
         envelope = self._kernel.identity()
         status = _mapping(envelope.get("identity"), field="execution identity")
         owner_epoch = _text(status.get("owner_epoch"), field="owner_epoch")
@@ -1613,17 +1613,9 @@ class NativeKernelProgramPort:
             raise ProductionPortError(
                 "native execution owner and captured Program deployment disagree"
             )
-        scene = dict(_mapping(status.get("scene_revision"), field="scene_revision"))
-        if (
-            not isinstance(scene.get("scene_id"), str)
-            or type(scene.get("revision_id")) is not int
-            or scene["revision_id"] < 1
-            or not isinstance(scene.get("content_hash"), str)
-        ):
-            raise ProductionPortError("native execution owner has no exact scene revision")
-        return owner_epoch, scene
+        return owner_epoch
 
-    def _owner_status(self, context: _BoundContext) -> tuple[str, dict[str, Any]]:
+    def _owner_status(self, context: _BoundContext) -> str:
         return self._owner_status_for_capture(context.capture)
 
     def _motion_payload(
@@ -1731,7 +1723,7 @@ class NativeKernelProgramPort:
                 "motion admission",
             )
         try:
-            owner_epoch, scene_revision = self._owner_status(context)
+            owner_epoch = self._owner_status(context)
         except Exception as error:
             raise ProgramMotionPreviewUnavailableError(
                 "execution_owner_unavailable", _owner_failure_message(error)
@@ -1755,7 +1747,6 @@ class NativeKernelProgramPort:
             context,
             request_id=preview_request_id,
             owner_epoch=owner_epoch,
-            scene_revision=scene_revision,
             participants=[previewed],
             coordination_policy="independent",
         )
@@ -2135,7 +2126,6 @@ class NativeKernelProgramPort:
         payload: Mapping[str, Any],
         identity: NodeAttemptIdentity,
         owner_epoch: str,
-        scene_revision: Mapping[str, Any],
         phase: str,
     ) -> dict[str, Any]:
         child_attempt_id = f"{identity.node_attempt_id}:{phase}"
@@ -2165,7 +2155,7 @@ class NativeKernelProgramPort:
             "program_run_id": context.capture.program_run_id,
             "expected_graph_revision": context.capture.graph_revision,
             "expected_retained_bundle_id": context.capture.retained_bundle_id,
-            "expected_scene_revision": dict(scene_revision),
+            "expected_scene_revision": None,
             "participants": [
                 {
                     "component_role_id": target.component_role_id,
@@ -2197,7 +2187,7 @@ class NativeKernelProgramPort:
         )
         tool_role_id = _text(parameters.get("tool_target_role"), field="tool_target_role")
         tool = self._target(context, tool_role_id, "tool.gripper.command")
-        owner_epoch, scene_revision = self._owner_status(context)
+        owner_epoch = self._owner_status(context)
         selected_object_id = _text(parameters.get("selected_object_id"), field="selected_object_id")
         kind = "place" if node_id == "planning.plan_place_sequence" else "pick"
         sequence_id = _request_identity(
@@ -2313,7 +2303,6 @@ class NativeKernelProgramPort:
                 payload=(tool_payload if phase == "tool" else phase_payloads[phase]),
                 identity=identity,
                 owner_epoch=owner_epoch,
-                scene_revision=scene_revision,
                 phase=phase,
             )
             for phase in ("approach", "descend", "tool", "retreat")
@@ -2499,7 +2488,7 @@ class NativeKernelProgramPort:
                 scene_resource_ids=(selected_object_id,),
             )
             context = self._context(identity.program_run_id)
-            current_owner_epoch, current_scene_revision = self._owner_status(context)
+            current_owner_epoch = self._owner_status(context)
             for phase in ("approach", "descend", "tool", "retreat"):
                 operation = intent.get(f"{phase}_operation")
                 if not isinstance(operation, dict):
@@ -2512,7 +2501,6 @@ class NativeKernelProgramPort:
                     raise ProductionPortError(
                         "Kernel owner changed during between-nodes pose latching"
                     )
-                operation["expected_scene_revision"] = dict(current_scene_revision)
         response = (
             self._kernel.plan_pick(intent)
             if kind == "pick"
@@ -2598,7 +2586,7 @@ class NativeKernelProgramPort:
             "planning.plan_place_sequence",
         }:
             return self._start_pick_place_planning(node_id, identity, inputs)
-        preset_owner_status: tuple[str, dict[str, Any]] | None = None
+        preset_owner_status: str | None = None
         gripper_timing = None
         if node_id in _MOTION_NODE_IDS or node_id in _INTERRUPT_MOTION_NODE_IDS:
             context, target, payload = self._motion_payload(node_id, inputs.parameters, identity)
@@ -2608,7 +2596,7 @@ class NativeKernelProgramPort:
             self._require_scope_open(identity.program_run_id)
             preset_owner_status = self._owner_status(context)
             context, target, payload, gripper_timing = self._gripper_payload(
-                inputs.parameters, identity, expected_owner_epoch=preset_owner_status[0], capture_timing=True,
+                inputs.parameters, identity, expected_owner_epoch=preset_owner_status, capture_timing=True,
             )
             capability_id = "tool.gripper.command"
         elif node_id == _IO_OUTPUT_NODE_ID:
@@ -2639,7 +2627,7 @@ class NativeKernelProgramPort:
         self._require_scope_open(identity.program_run_id)
         if node_id in _MOTION_NODE_IDS or node_id in _INTERRUPT_MOTION_NODE_IDS:
             self._latch_motion_between_nodes(identity, payload)
-        owner_epoch, scene_revision = preset_owner_status or self._owner_status(context)
+        owner_epoch = preset_owner_status or self._owner_status(context)
         request_id = _request_identity(
             "program-node", identity.program_run_id, identity.node_attempt_id
         )
@@ -2647,7 +2635,6 @@ class NativeKernelProgramPort:
             context,
             request_id=request_id,
             owner_epoch=owner_epoch,
-            scene_revision=scene_revision,
             participants=[participant],
             coordination_policy="independent",
         )
@@ -2741,7 +2728,6 @@ class NativeKernelProgramPort:
         *,
         request_id: str,
         owner_epoch: str,
-        scene_revision: Mapping[str, Any],
         participants: Sequence[Mapping[str, Any]],
         coordination_policy: str,
     ) -> dict[str, Any]:
@@ -2758,7 +2744,7 @@ class NativeKernelProgramPort:
             "program_run_id": context.capture.program_run_id,
             "expected_graph_revision": context.capture.graph_revision,
             "expected_retained_bundle_id": context.capture.retained_bundle_id,
-            "expected_scene_revision": dict(scene_revision),
+            "expected_scene_revision": None,
             "participants": [dict(participant) for participant in participants],
             "coordination_policy": coordination_policy,
         }
@@ -3523,7 +3509,7 @@ class NativeKernelProgramPort:
             raise ProductionPortError("native Stop generation is invalid")
         try:
             context = self._context(task.identity.program_run_id)
-            owner_epoch, _scene = self._owner_status(context)
+            owner_epoch = self._owner_status(context)
             self._kernel.stop(
                 {
                     "request_context": {
@@ -5409,7 +5395,6 @@ class HeadlessSceneProgramPort:
             raise TypeError("runtime Scene transport has no exact result lookup")
         self._scene = SceneClient(transport)
         self._contexts: dict[str, _SceneBoundContext] = {}
-        self._prepared: dict[str, dict[str, Any]] = {}
         self._lock = RLock()
         self._pose_source_latch_lock = RLock()
 
@@ -6353,8 +6338,8 @@ class HeadlessSceneProgramPort:
         ):
             return False
         frame_ref = _mapping(operation.get("frame_ref"), field="frame_ref")
-        # Component-frame intent is resolved by the native
-        # owner, so only an owner-issued prepared proof can compare it.
+        # Component-frame intent is resolved by the native owner and cannot
+        # be compared here, so it is always committed again.
         if frame_ref.get("kind") != "cell_frame":
             return False
         return current.get("placement") == {
@@ -6402,7 +6387,6 @@ class HeadlessSceneProgramPort:
             "graph_revision": context.capture.graph_revision,
             "desired_scene_digest": desired_scene_digest,
             "scene_identity": HeadlessSceneProgramPort._scene_identity(view),
-            "projection_revision": deepcopy(view.projection_revision),
         }
 
     @staticmethod
@@ -6420,33 +6404,16 @@ class HeadlessSceneProgramPort:
         return identity
 
     @staticmethod
-    def _proof_matches(
-        context: _SceneBoundContext,
-        view: _SceneView,
-        desired_scene_digest: str,
-        proof: Mapping[str, Any],
-    ) -> bool:
-        return dict(proof) == HeadlessSceneProgramPort._proof(context, view, desired_scene_digest)
-
-    @staticmethod
     def _proof_identifies(
         context: _SceneBoundContext,
         view: _SceneView,
         desired_scene_digest: str,
         proof: Mapping[str, Any],
     ) -> bool:
-        current = HeadlessSceneProgramPort._proof(context, view, desired_scene_digest)
         return (
-            {key: value for key, value in proof.items() if key != "projection_revision"}
-            == {key: value for key, value in current.items() if key != "projection_revision"}
+            dict(proof) == HeadlessSceneProgramPort._proof(context, view, desired_scene_digest)
             and not view.attachments
         )
-
-    def _remember_proof(self, desired_scene_digest: str, proof: Mapping[str, Any]) -> None:
-        with self._lock:
-            if desired_scene_digest not in self._prepared and len(self._prepared) >= _MAX_CONTEXTS:
-                self._prepared.pop(next(iter(self._prepared)))
-            self._prepared[desired_scene_digest] = deepcopy(dict(proof))
 
     def _initial_scene_operations(
         self,
@@ -6519,14 +6486,10 @@ class HeadlessSceneProgramPort:
         view = self._read_view(parsed)
         operations = self._initial_scene_operations(parsed, initial_scene, cell_id=view.cell_id)
         desired_scene_digest = self._desired_scene_digest(parsed, operations)
-        with self._lock:
-            cached = self._prepared.get(desired_scene_digest)
-        if (
-            cached is not None and self._proof_matches(parsed, view, desired_scene_digest, cached)
-        ) or self._scene_matches_operations(view, operations):
-            proof = self._proof(parsed, view, desired_scene_digest)
-            self._remember_proof(desired_scene_digest, proof)
-            return proof
+        # Always converge against the current objects; the Scene revision is
+        # not a precondition, so there is no proof of an earlier preparation.
+        if self._scene_matches_operations(view, operations):
+            return self._proof(parsed, view, desired_scene_digest)
 
         expected = view.projection_revision
         ordinal = 0
@@ -6667,7 +6630,6 @@ class HeadlessSceneProgramPort:
         with self._lock:
             if self._contexts.get(context.program_run_id) != parsed:
                 raise ProductionPortError("Program-run scene context was rebound")
-        self._remember_proof(desired_scene_digest, proof)
         return proof
 
     def verify_initial_scene(
@@ -6862,6 +6824,22 @@ class HeadlessSceneProgramPort:
                         )
                     ),
                 }
+                # The node's grasp-lost bound (catalog defaults) travels with
+                # the attachment; the Manager checks later measured offsets.
+                if (
+                    "grasp_lost_translation_m" in parameters
+                    or "grasp_lost_rotation_rad" in parameters
+                ):
+                    operation["grasp_lost_bound"] = {
+                        "translation_m": _number(
+                            parameters.get("grasp_lost_translation_m"),
+                            field="grasp_lost_translation_m",
+                        ),
+                        "rotation_rad": _number(
+                            parameters.get("grasp_lost_rotation_rad"),
+                            field="grasp_lost_rotation_rad",
+                        ),
+                    }
             elif node_id == "scene.detach_carried_object":
                 scene_resource_id = _text(
                     parameters.get("scene_resource_id"),

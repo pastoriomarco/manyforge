@@ -2446,7 +2446,7 @@ HeadlessHttpClient.scene_transaction_status = read_receipt
                             )
                         }
                     )
-                    manual["expected_scene_revision"] = status["scene_revision"]
+                    manual["expected_scene_revision"] = None
                     participant = manual["participants"][0]
                     participant.pop("execution_scope", None)
                     participant["action_span"] = None

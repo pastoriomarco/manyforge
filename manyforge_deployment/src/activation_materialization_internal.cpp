@@ -89,7 +89,7 @@ namespace deployment = manyforge::deployment;
       candidate.front().runtime_profile_id.value() ==
           deployment::ros2_control_execution_runtime_contract::kRuntimeProfileId) {
     auto expected = candidate.front();
-    for (const auto name : {"io_signals", "io_provider_devices"}) {
+    for (const auto name : {"io_signals", "io_provider_devices", "pose_sources"}) {
       const auto field = expected.configuration.find(name);
       if (field != expected.configuration.end())
         field->second = core::JsonValueDTO{core::JsonValueDTO::Array{}};
@@ -1577,7 +1577,7 @@ qualify_catalog(const std::filesystem::path &root,
   QualifiedCatalogClosure result;
 
   for (const auto &path :
-       source_files(catalog_root / "capability_definition", 45U)) {
+       source_files(catalog_root / "capability_definition", 46U)) {
     const std::string bytes = read_file(path);
     const auto reference =
         make_reference<core::CapabilityDefinitionCatalogRecordRefDTO>(bytes);
@@ -1595,7 +1595,7 @@ qualify_catalog(const std::filesystem::path &root,
       target_capabilities.push_back(capability);
     }
   }
-  if (target_capabilities.size() != 24U) {
+  if (target_capabilities.size() != 25U) {
     throw std::logic_error(
         "maintained component closure has the wrong target-capability count");
   }
@@ -1689,7 +1689,7 @@ qualify_catalog(const std::filesystem::path &root,
   bool found_lite6_gripper_lifecycle_manifest = false;
   bool found_ros2_control_lifecycle_manifest = false;
   for (const auto &path :
-       source_files(catalog_root / "provider_manifest", 8U)) {
+       source_files(catalog_root / "provider_manifest", 9U)) {
     const std::string bytes = read_file(path);
     const auto reference =
         make_reference<core::ProviderManifestCatalogRecordRefDTO>(bytes);
@@ -1939,7 +1939,7 @@ void verify_scenarios(const std::filesystem::path &root,
              "maintained_deployment_sources.v1.json");
   if (deployment::sha256_digest(description_bytes) !=
       "sha256:"
-      "9f175667e058441df1adb88405061b166e2391dc30c47548aeb72f6cae8058f8") {
+      "294e30271585f711d37d5a5fc7c7c8ce0a5861f263be1325f828c6585f132bef") {
     throw std::invalid_argument(
         "maintained runtime input source differs from its qualified source pin");
   }
@@ -2656,8 +2656,12 @@ PreparedActivationMaterialization materialize_prepared_activation(
   ExactCompilerInputSource input_source;
   auto catalog = qualify_catalog(options.workspace_root, input_source, {},
                                  prepared_models);
-  const auto io_types = prepare_activation_io_types(intent, component_profiles,
-                                                    catalog.capabilities);
+  auto io_types = prepare_activation_io_types(intent, component_profiles,
+                                              catalog.capabilities);
+  // Pose sources reuse the model-free derived-type pipeline.
+  for (auto &prepared : prepare_activation_pose_source_types(
+           intent, component_profiles, catalog.capabilities))
+    io_types.push_back(std::move(prepared));
   for (const auto &prepared : io_types) {
     const auto &reference = prepared.type.reference();
     input_source.add(reference.content_addressed_store_key,

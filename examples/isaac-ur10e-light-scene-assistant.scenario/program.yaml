@@ -192,14 +192,14 @@
               "instance_id": "close_gripper",
               "node_id": "gripper.command_position",
               "parameters": {
-                "command_duration_s": 1.0,
+                "command_duration_s": 1,
                 "max_effort": {
                   "kind": "angular_newton_meter",
-                  "value_nm": 40.0
+                  "value_nm": 40
                 },
                 "position": {
                   "kind": "angular_rad",
-                  "value_rad": 0.55
+                  "value_rad": 0.6
                 },
                 "target_role": "gripper"
               }
@@ -523,10 +523,10 @@
   "parameters": [
     {
       "constraints": {
-        "max_inclusive": 1.0,
-        "min_exclusive": 0.0
+        "max_inclusive": 1,
+        "min_exclusive": 0
       },
-      "default": 0.2,
+      "default": 0.4,
       "description": "Velocity scale for all retained-world moves.",
       "parameter_id": "velocity_scale",
       "type": "float64"

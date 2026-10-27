@@ -591,6 +591,11 @@ manyforge_embed_closed_schema(
   resources/closed_schema/value/manyforge.value_schema.runtime.io_provider_execution.v1.yaml
   mf_io_cfg)
 manyforge_embed_closed_schema(
+  kEmbeddedPoseSourceComponentConfigurationSchema
+  pose_source_component_configuration
+  resources/closed_schema/value/manyforge.value_schema.runtime.pose_source_execution.v1.yaml
+  mf_pose_cfg)
+manyforge_embed_closed_schema(
   kEmbeddedEmptyProviderContractSchema
   empty_provider_contract
   resources/closed_schema/value/manyforge.value_schema.provider_contract.empty.v1.yaml
@@ -884,6 +889,7 @@ endif()
 # provenance and are not interpreted as current-reader compatibility profiles.
 add_library(manyforge_deployment
   src/activation_io_provider_internal.cpp
+  src/activation_pose_source_internal.cpp
   src/activation_component_profile_internal.cpp
   src/activation_deployment_compiler_internal.cpp
   src/activation_deployment_intent_internal.cpp
@@ -1279,6 +1285,14 @@ if(BUILD_TESTING)
   target_link_libraries(test_activation_io_provider PRIVATE
     manyforge_preparation_support manyforge_deployment GTest::gtest_main)
   gtest_discover_tests(test_activation_io_provider PROPERTIES TIMEOUT ${MANYFORGE_GTEST_TIMEOUT_SECONDS})
+
+  add_executable(test_activation_pose_source test/test_activation_pose_source.cpp)
+  target_compile_definitions(test_activation_pose_source PRIVATE
+    MANYFORGE_WORKSPACE_ROOT="${_MANYFORGE_WORKSPACE_ROOT}")
+  target_include_directories(test_activation_pose_source PRIVATE "${CMAKE_CURRENT_SOURCE_DIR}/src")
+  target_link_libraries(test_activation_pose_source PRIVATE
+    manyforge_preparation_support manyforge_deployment GTest::gtest_main)
+  gtest_discover_tests(test_activation_pose_source PROPERTIES TIMEOUT ${MANYFORGE_GTEST_TIMEOUT_SECONDS})
 
   add_executable(test_io_signal_catalog test/test_io_signal_catalog.cpp)
   target_include_directories(test_io_signal_catalog PRIVATE

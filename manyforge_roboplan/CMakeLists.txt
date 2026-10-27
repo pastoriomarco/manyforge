@@ -202,6 +202,7 @@ target_link_libraries(manyforge_geometric_contact_input_provider PUBLIC
 
 add_library(manyforge_roboplan_native_runtime_support
   src/native_runtime_support.cpp
+  src/host_component_stream_health.cpp
   src/retained_externally_managed_lifecycle_ports.cpp)
 target_include_directories(manyforge_roboplan_native_runtime_support PUBLIC
   $<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}/include>
@@ -278,13 +279,14 @@ target_link_libraries(manyforge_roboplan_controller_launch_artifacts
 # execution host starts per component (ROS-free).
 add_library(manyforge_roboplan_controller_launch_process
   src/controller_launch_process.cpp
+  src/pose_source_launch.cpp
   src/simulated_plc_launch.cpp)
 target_include_directories(manyforge_roboplan_controller_launch_process
   PUBLIC
     $<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}/include>
     $<INSTALL_INTERFACE:include>)
 target_link_libraries(manyforge_roboplan_controller_launch_process
-  PUBLIC manyforge_roboplan_controller_launch_artifacts
+  PUBLIC manyforge_roboplan_controller_launch_artifacts manyforge::content_identity
   PRIVATE Threads::Threads)
 
 add_library(manyforge_roboplan_native_focused_adapters
@@ -414,7 +416,9 @@ if(MANYFORGE_BUILD_ROS2_CONTROL_RUNTIME)
     ${ur_msgs_TARGETS} ${control_msgs_TARGETS})
 
   find_package(pal_statistics_msgs REQUIRED)
+  find_package(diagnostic_msgs REQUIRED)
   add_library(manyforge_roboplan_ros2_control_runtime
+    src/component_stream_sample_bridge.cpp
     src/io_provider_lifecycle_product.cpp
     src/simulated_plc_readiness.cpp
     src/retained_isaac_ros2_control_profile.cpp
@@ -437,6 +441,7 @@ if(MANYFORGE_BUILD_ROS2_CONTROL_RUNTIME)
     manyforge_roboplan_controller_launch_process
     manyforge_ros2_control_execution
     ${pal_statistics_msgs_TARGETS}
+    ${diagnostic_msgs_TARGETS}
     manyforge::content_identity)
 endif()
 
@@ -797,7 +802,8 @@ if(BUILD_TESTING)
       manyforge_core manyforge::content_identity GTest::gtest_main)
 
     add_executable(test_controller_launch_process
-      test/test_controller_launch_process.cpp)
+      test/test_controller_launch_process.cpp
+      test/test_pose_source_launch.cpp)
     target_compile_definitions(test_controller_launch_process PRIVATE
       MANYFORGE_TEST_REPOSITORY_ROOT="${_MANYFORGE_REPOSITORY_SOURCE_ROOT}")
     target_link_libraries(test_controller_launch_process PRIVATE

@@ -69,19 +69,6 @@ struct CollisionWorldBody {
   /// Pose of the body within `frame_id` at snapshot time.
   Pose3DTO pose;
 
-  /// Optional timestamp of the upstream observation that produced this body
-  /// pose. Leave unset for static authored geometry. Dynamic pose-source /
-  /// simulator-observed bodies SHOULD set this together with
-  /// `source_freshness_budget_ns`; runtime monitors then fail closed when the
-  /// body pose has aged beyond its declared budget.
-  std::optional<std::string> source_id;
-  std::optional<std::int64_t> source_timestamp_ns;
-
-  /// Optional freshness budget for `source_timestamp_ns`. Leave unset for
-  /// static authored geometry. When set, `source_timestamp_ns` MUST also be
-  /// set, non-negative, and this budget MUST be positive.
-  std::optional<std::int64_t> source_freshness_budget_ns;
-
   /// Geometries making up this body. Ordering is preserved by the
   /// builder; engines MUST treat the list as a multi-set keyed by
   /// `body_id + index`.

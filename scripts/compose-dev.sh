@@ -390,7 +390,7 @@ case "$command" in
         --package-aggregate-sha256 "${MANYFORGE_DEV_OPERATOR_PACKAGE_SHA256:?qualified package digest required}"
         --composer-port 9000 --composer-bind-host 0.0.0.0)
       startup_mounts=(-v "$install_root:$install_root:ro")
-      for option in COMPOSER_STATIC_DIR SIMULATION_CONTROL_CONFIG ISAAC_SITE_SETTINGS OPERATOR_NODE_CATALOG OPERATOR_ALARM_CATALOG; do
+      for option in COMPOSER_STATIC_DIR SIMULATION_CONTROL_CONFIG OPERATOR_NODE_CATALOG OPERATOR_ALARM_CATALOG; do
         variable="MANYFORGE_DEV_$option"
         if [[ -n ${!variable:-} ]]; then
           path=${!variable}
@@ -398,7 +398,6 @@ case "$command" in
           case "$option" in
             COMPOSER_STATIC_DIR) [[ -f "$path/index.html" ]] || exit 64; option_name=--composer-static-dir; parent=$path ;;
             SIMULATION_CONTROL_CONFIG) [[ -f "$path" ]] || exit 64; option_name=--simulation-control-config; parent=$(dirname "$path") ;;
-            ISAAC_SITE_SETTINGS) [[ -f "$path" ]] || exit 64; option_name=--isaac-site-settings; parent=$(dirname "$path") ;;
             OPERATOR_NODE_CATALOG) [[ -f "$path" ]] || exit 64; option_name=--node-catalog-path; parent=$(dirname "$path") ;;
             OPERATOR_ALARM_CATALOG) [[ -f "$path" ]] || exit 64; option_name=--alarm-catalog-path; parent=$(dirname "$path") ;;
           esac
@@ -408,13 +407,6 @@ case "$command" in
       done
       operator_labels=(--log-driver json-file --label "manyforge.launch-instance=$operator_instance"
         --label "manyforge.launch-input-digest=$operator_digest")
-    elif [[ -n ${MANYFORGE_DEV_ISAAC_SITE_SETTINGS:-} ]]; then
-      path=$MANYFORGE_DEV_ISAAC_SITE_SETTINGS
-      [[ "$path" == /* ]] || { echo "Development Isaac site settings must be an absolute path" >&2; exit 64; }
-      [[ -f "$path" ]] || { echo "Development Isaac site settings file is unavailable: $path" >&2; exit 64; }
-      parent=$(dirname "$path")
-      startup_mounts+=(-v "$parent:$parent:ro")
-      serve_args+=(--isaac-site-settings "$path")
     fi
     ros_environment=()
     ros_identity=()
@@ -459,7 +451,7 @@ case "$command" in
     [[ -z "$stopped_container_receipt" ]] || session_proof=(--stopped-container-receipt "$stopped_container_receipt")
     python3 "$session_helper" "$runtime_root" --session-id "$session_id" --lock-fd "$session_lock_fd" "${session_proof[@]}" >/dev/null
     session_environment=(-e "MANYFORGE_DEV_COLD_SESSION_ID=$session_id")
-    for variable in MANYFORGE_MOTION_TRACE_DIR MANYFORGE_DEBUG_SCENE_DIVERGENCE \
+    for variable in MANYFORGE_MOTION_TRACE_DIR \
         MANYFORGE_EXPERIMENTAL_RELEASE_TIMER \
         MANYFORGE_EXPERIMENTAL_MIDTICK_STAMP MANYFORGE_EXPERIMENTAL_V0_PAYLOAD \
         MANYFORGE_EXPERIMENTAL_SCHEDULED_SPRING_BACK_FAST \

@@ -58,9 +58,9 @@ _SCENE_APPLICATION_STATUSES = {
     "committed",
     "deferred_before_planning",
     "deferred_between_nodes",
-    "freshness_confirmed",
     "not_requested",
     "skipped_attached",
+    "unchanged",
 }
 _SCENE_UPDATE_STATUSES = {"freshness_only", "geometry_changed", "no_op"}
 
@@ -525,8 +525,8 @@ class ManagerSceneRuntimeClient:
                 or request_id is None
                 or update_status is not None
             ):
-                # already_applied, skipped_attached and freshness_confirmed
-                # carry the unchanged current projection and no update status.
+                # already_applied, skipped_attached and unchanged carry the
+                # unchanged current projection and no update status.
                 raise ValueError("idempotent or skipped observation result is invalid")
             if projection is not None and (
                 projection.retained_bundle_id

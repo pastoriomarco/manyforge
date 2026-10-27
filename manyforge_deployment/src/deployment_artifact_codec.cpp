@@ -348,6 +348,26 @@ struct DecodedDeployment final {
 
   const TypedDeploymentApplicabilityInputsCandidate applicability_candidate =
       decode_deployment_applicability_inputs_candidate(parsed_deployment);
+  if (const auto &policies = applicability_candidate.normalized_policies();
+      policies.has_value()) {
+    if (const auto *streams = policies->find_object_member("component_streams");
+        streams != nullptr) {
+      const auto &components =
+          identity_ready_graph.graph().controllable_components;
+      const auto rows = decode_component_stream_overrides(*streams);
+      for (std::size_t index = 0U; index < rows.size(); ++index) {
+        if (std::none_of(components.begin(), components.end(),
+                         [&](const auto &component) {
+                           return component.controllable_component_id ==
+                                  rows[index].controllable_component_id;
+                         })) {
+          fail("$.policies.component_streams[" + std::to_string(index) +
+                   "].controllable_component_id",
+               "references an unknown controllable component");
+        }
+      }
+    }
+  }
 
   return {
       deployment_artifact_id,

@@ -1462,7 +1462,8 @@ encode_external_resources(const std::vector<ExternalResourceDTO> &values) {
     const std::optional<double> motion_takeover_planning_budget_s,
     const CanonicalValue *interrupt_rules = nullptr,
     const std::vector<core::ScenePoseSourcePolicyDTO> &scene_pose_sources =
-        {}) {
+        {},
+    const CanonicalValue *component_streams = nullptr) {
   CanonicalValue::Object result{
       {"retained_policy_records",
        encode_retained_policy_records(retained_policy_records)},
@@ -1488,6 +1489,9 @@ encode_external_resources(const std::vector<ExternalResourceDTO> &values) {
   if (!scene_pose_sources.empty())
     result.emplace_back("scene_pose_sources",
                         EncodeScenePoseSources(scene_pose_sources));
+  // Absent/empty overrides preserve every existing policy identity.
+  if (component_streams && !component_streams->as_array().empty())
+    result.emplace_back("component_streams", *component_streams);
   return CanonicalValue(std::move(result));
 }
 
@@ -2594,7 +2598,158 @@ parse_interrupt_rules(const CanonicalValue::Object &policies) {
   return CanonicalValue(std::move(normalized));
 }
 
+// Same grammar as core::ValidStreamId (1..64 bytes of `[a-z0-9_./-]`).
+[[nodiscard]] bool valid_stream_id(std::string_view value) noexcept {
+  return !value.empty() && value.size() <= core::kMaxStreamIdBytes &&
+         std::all_of(value.begin(), value.end(), [](const char c) {
+           return (c >= 'a' && c <= 'z') || (c >= '0' && c <= '9') ||
+                  c == '_' || c == '.' || c == '/' || c == '-';
+         });
+}
+
+[[nodiscard]] std::string_view
+stream_severity_text(const core::StreamSeverityDTO value) noexcept {
+  switch (value) {
+  case core::StreamSeverityDTO::kFault:
+    return "fault";
+  case core::StreamSeverityDTO::kBlocking:
+    return "blocking";
+  case core::StreamSeverityDTO::kWarning:
+    return "warning";
+  }
+  return "fault";
+}
+
+[[nodiscard]] std::string_view
+stream_recovery_text(const core::StreamRecoveryDTO value) noexcept {
+  switch (value) {
+  case core::StreamRecoveryDTO::kAck:
+    return "ack";
+  case core::StreamRecoveryDTO::kAuto:
+    return "auto";
+  }
+  return "ack";
+}
+
 } // namespace
+
+std::vector<core::StreamParameterOverrideDTO>
+decode_component_stream_overrides(const CanonicalValue &value) {
+  constexpr std::string_view kPath = "$.policies.component_streams";
+  constexpr std::uint64_t kMaximumIJsonInteger = 9007199254740991ULL;
+  const auto &rows = require_array(value, kPath);
+  if (rows.size() > core::kMaxDeploymentApplicabilityRows) {
+    fail(kPath, "row count exceeds the 4096-row deployment ceiling");
+  }
+  std::vector<core::StreamParameterOverrideDTO> result;
+  result.reserve(rows.size());
+  for (std::size_t index = 0U; index < rows.size(); ++index) {
+    const std::string path = index_path(kPath, index);
+    const auto &object = require_object(rows[index], path);
+    require_closed_fields(object, {"controllable_component_id", "stream_id"},
+                          {"budget_ns", "severity", "recovery"}, path);
+    core::StreamParameterOverrideDTO row{
+        parse_portable_id<ControllableComponentId>(
+            require_member(object, "controllable_component_id", path),
+            child_path(path, "controllable_component_id")),
+        require_string(require_member(object, "stream_id", path),
+                       child_path(path, "stream_id")),
+        std::nullopt,
+        std::nullopt,
+        std::nullopt,
+    };
+    if (!valid_stream_id(row.stream_id)) {
+      fail(child_path(path, "stream_id"),
+           "expected 1..64 bytes of [a-z0-9_./-]");
+    }
+    if (const auto *budget = find_member(object, "budget_ns")) {
+      row.budget_ns = static_cast<std::int64_t>(
+          require_integer_in_range(*budget, 1U, kMaximumIJsonInteger,
+                                   child_path(path, "budget_ns")));
+    }
+    if (const auto *severity = find_member(object, "severity")) {
+      const std::string severity_path = child_path(path, "severity");
+      const std::string &text = require_string(*severity, severity_path);
+      for (const auto candidate :
+           {core::StreamSeverityDTO::kFault, core::StreamSeverityDTO::kBlocking,
+            core::StreamSeverityDTO::kWarning}) {
+        if (text == stream_severity_text(candidate)) {
+          row.severity = candidate;
+        }
+      }
+      if (!row.severity) {
+        fail(severity_path, "expected fault, blocking, or warning");
+      }
+    }
+    if (const auto *recovery = find_member(object, "recovery")) {
+      const std::string recovery_path = child_path(path, "recovery");
+      const std::string &text = require_string(*recovery, recovery_path);
+      for (const auto candidate :
+           {core::StreamRecoveryDTO::kAck, core::StreamRecoveryDTO::kAuto}) {
+        if (text == stream_recovery_text(candidate)) {
+          row.recovery = candidate;
+        }
+      }
+      if (!row.recovery) {
+        fail(recovery_path, "expected ack or auto");
+      }
+    }
+    if (!row.budget_ns && !row.severity && !row.recovery) {
+      fail(path, "expected at least one of budget_ns, severity, or recovery");
+    }
+    // A `fault` stream opens an incident, which only the operator's Recover
+    // closes: `auto` recovery cannot apply to it.
+    if (row.severity == core::StreamSeverityDTO::kFault &&
+        row.recovery == core::StreamRecoveryDTO::kAuto) {
+      fail(child_path(path, "recovery"),
+           "severity fault requires recovery ack (fault + auto is invalid)");
+    }
+    result.push_back(std::move(row));
+  }
+  const auto key = [](const core::StreamParameterOverrideDTO &row) {
+    return std::tie(row.controllable_component_id, row.stream_id);
+  };
+  std::sort(result.begin(), result.end(),
+            [&key](const auto &left, const auto &right) {
+              return key(left) < key(right);
+            });
+  if (std::adjacent_find(result.begin(), result.end(),
+                         [&key](const auto &left, const auto &right) {
+                           return key(left) == key(right);
+                         }) != result.end()) {
+    fail(kPath, "duplicate (controllable_component_id, stream_id) row");
+  }
+  return result;
+}
+
+CanonicalValue encode_component_stream_overrides(
+    const std::vector<core::StreamParameterOverrideDTO> &rows) {
+  CanonicalValue::Array result;
+  result.reserve(rows.size());
+  for (const auto &row : rows) {
+    CanonicalValue::Object object{
+        {"controllable_component_id",
+         CanonicalValue(row.controllable_component_id.value())},
+        {"stream_id", CanonicalValue(row.stream_id)},
+    };
+    if (row.budget_ns) {
+      object.emplace_back("budget_ns",
+                          CanonicalValue(static_cast<double>(*row.budget_ns)));
+    }
+    if (row.severity) {
+      object.emplace_back(
+          "severity",
+          CanonicalValue(std::string(stream_severity_text(*row.severity))));
+    }
+    if (row.recovery) {
+      object.emplace_back(
+          "recovery",
+          CanonicalValue(std::string(stream_recovery_text(*row.recovery))));
+    }
+    result.emplace_back(std::move(object));
+  }
+  return CanonicalValue(std::move(result));
+}
 
 TypedDeploymentApplicabilityInputsCandidate
 decode_deployment_applicability_inputs_candidate(
@@ -2673,10 +2828,15 @@ decode_deployment_applicability_inputs_candidate(
                            "interrupt_policies", "interrupt_config"},
                           {"motion_takeover_preparation_budget_s",
                            "motion_takeover_planning_budget_s",
-                           "interrupt_rules", "scene_pose_sources"},
+                           "interrupt_rules", "scene_pose_sources",
+                           "component_streams"},
                           "$.policies");
     if (const auto *sources = find_member(policies, "scene_pose_sources"))
       scene_pose_sources = DecodeScenePoseSources(*sources);
+    std::optional<CanonicalValue> component_streams;
+    if (const auto *rows = find_member(policies, "component_streams"))
+      component_streams = encode_component_stream_overrides(
+          decode_component_stream_overrides(*rows));
     if (const auto *budget =
             find_member(policies, "motion_takeover_preparation_budget_s")) {
       constexpr auto path = "$.policies.motion_takeover_preparation_budget_s";
@@ -2744,7 +2904,8 @@ decode_deployment_applicability_inputs_candidate(
         retained_policy_records, normalized_interrupt_sources,
         normalized_interrupt_policies, interrupt_config,
         motion_takeover_preparation_budget_s, motion_takeover_planning_budget_s,
-        &normalized_interrupt_rules, scene_pose_sources);
+        &normalized_interrupt_rules, scene_pose_sources,
+        component_streams ? &*component_streams : nullptr);
   }
 
   std::optional<SiteOverlayRefDTO> site_overlay_ref;
@@ -2840,7 +3001,9 @@ compute_capability_provider_binding_revisions(
         value.motion_takeover_preparation_budget_s,
         value.motion_takeover_planning_budget_s,
         candidate.normalized_policies()->find_object_member("interrupt_rules"),
-        value.scene_pose_sources);
+        value.scene_pose_sources,
+        candidate.normalized_policies()->find_object_member(
+            "component_streams"));
   }
 
   return RevisionVerifiedDeploymentApplicabilityInputs(

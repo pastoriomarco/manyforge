@@ -20,6 +20,7 @@
 #include <control_msgs/action/gripper_command.hpp>
 #include <cstdint>
 #include <functional>
+#include <manyforge_core/component_stream_health.hpp>
 #include <manyforge_core/ports/iexecution_state_sink.hpp>
 #include <manyforge_core/ports/igripper_command_backend.hpp>
 #include <manyforge_core/time/iclock.hpp>
@@ -63,7 +64,15 @@ struct Ros2GripperActionConfig {
   double open_effort = 0.0;
   double close_effort = 0.0;
   bool publish_nominal_position = false;
-  double state_freshness_timeout_s = 1.0;
+  /// Feedback staleness threshold, from the gripper target configuration's
+  /// `state_freshness_timeout_s` (no code default; must be positive); also the
+  /// default budget of the CP9 `gripper_feedback` stream (overridable per
+  /// component in the Deployment).
+  double state_freshness_timeout_s{};
+  /// CP9 `gripper_feedback` stream of the owning component, declared by the
+  /// host. When set it records every matched feedback sample and owns the
+  /// staleness judgement (the readiness snapshot no longer ages feedback).
+  std::shared_ptr<core::StreamRecorder> feedback_stream{};
   double wait_for_action_server_timeout_s = 2.0;
   // Omission uses the typed default: pneumatic 1s, position 5s.
   std::optional<double> result_timeout_s;

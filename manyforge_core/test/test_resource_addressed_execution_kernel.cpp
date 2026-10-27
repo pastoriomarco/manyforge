@@ -4490,6 +4490,71 @@ TEST(ResourceAddressedExecutionKernelTest,
   ASSERT_TRUE(recovery.value().recovered_stops.front().terminal_certificate.has_value());
   EXPECT_FALSE(recovery.value().recovered_stops.front().fault_latch.has_value());
 }
+
+TEST(ResourceAddressedExecutionKernelTest,
+     ForeignEpochStopIsJournaledUnderTheKernelEpochWithoutLatch) {
+  // Live incident 2026-10-26: the Manager's carried-object-lost Stop names its
+  // own label as owner epoch. The Kernel accepted and executed it, but the
+  // durable journal refused the projection and the cell stayed latched
+  // "waiting for durable record" until a runtime restart.
+  TemporaryOperationJournal temporary;
+  FakeClock clock;
+  ManualScheduler scheduler;
+  FakeParticipantEngine engine;
+  SqliteOperationJournal journal(temporary.directory / "operation.sqlite3", CellId("cell.test"),
+                                 8U);
+  ResourceAddressedExecutionKernel kernel(
+      {registration(
+          make_binding("arm", "arm", "execution.trajectory.execute", CoordinateKind::kAngular),
+          engine)},
+      clock, scheduler, journal, {RequestOwnerEpoch("kernel.epoch.1"), CellId("cell.test"), 8U});
+  const auto operation = kernel.execute(motion_operation());
+  ASSERT_TRUE(operation.ok()) << operation.error().message;
+  auto request = stop_request("request.foreign-epoch.stop", operation.value(), 1U);
+  request.request_context.request_owner_epoch = RequestOwnerEpoch("manager.carried_object_lost");
+  const auto stopped = kernel.stop(request);
+  ASSERT_TRUE(stopped.ok()) << stopped.error().message;
+  EXPECT_TRUE(std::any_of(stopped.value().stale_diagnostics.begin(),
+                          stopped.value().stale_diagnostics.end(), [](const auto& diagnostic) {
+                            return diagnostic.field == StopScopeStaleFieldDTO::kRequestOwnerEpoch;
+                          }));
+  ASSERT_TRUE(wait_until([&] {
+    const auto status = kernel.get_stop_status(stopped.value().stop_id);
+    return status.ok() &&
+           status.value().terminal_projection.state != StopDurableProjectionStateDTO::kPending;
+  }));
+  const auto status = kernel.get_stop_status(stopped.value().stop_id);
+  ASSERT_TRUE(status.ok()) << status.error().message;
+  EXPECT_EQ(status.value().acceptance_projection.state, StopDurableProjectionStateDTO::kRecorded)
+      << (status.value().acceptance_projection.error.has_value()
+              ? status.value().acceptance_projection.error->message
+              : std::string{});
+  EXPECT_EQ(status.value().terminal_projection.state, StopDurableProjectionStateDTO::kRecorded);
+  EXPECT_FALSE(status.value().fault_latch.has_value());
+  EXPECT_FALSE(kernel.get_stop_fault_latch().has_value());
+  EXPECT_EQ(engine.stop_calls.load(), 1);
+
+  const auto replay = kernel.stop(request);
+  ASSERT_TRUE(replay.ok()) << replay.error().message;
+  EXPECT_EQ(replay.value().replay_status, RequestReplayStatusDTO::kReplayedExact);
+  EXPECT_EQ(replay.value().stop_id, stopped.value().stop_id);
+
+  const auto before_reset = kernel.get_operation_projection(operation.value().operation_id);
+  ASSERT_TRUE(before_reset.ok()) << before_reset.error().message;
+  ASSERT_EQ(before_reset.value().operation.state, OperationStateKind::kStopped);
+  const auto reset = kernel.reset(
+      control_request("request.foreign-epoch.reset", operation.value(),
+                      before_reset.value().operation.operation_revision.value()));
+  ASSERT_TRUE(reset.ok()) << reset.error().message;
+  ASSERT_TRUE(wait_until([&] {
+    const auto slots = kernel.resource_snapshot();
+    return std::all_of(slots.begin(), slots.end(), [](const auto& slot) {
+      return slot.state == ResourceSlotState::kFree && !slot.owner;
+    });
+  }));
+  const auto next = kernel.execute(motion_operation("request.after-foreign-epoch-stop"));
+  EXPECT_TRUE(next.ok()) << next.error().message;
+}
 #endif
 
 TEST(ResourceAddressedExecutionKernelTest, StopDeadlineOverflowIsRejectedWithoutWrappedBudget) {
@@ -5393,6 +5458,39 @@ TEST(ResourceAddressedExecutionKernelTest,
   EXPECT_EQ(engine.dispatch_prepared_motion_calls, 0);
   EXPECT_EQ(engine.translate_stop_stage_calls.load(), 0);
   EXPECT_EQ(engine.execute_calls, 0);
+}
+
+TEST(ResourceAddressedExecutionKernelTest,
+     CarriedObjectLostStopEndsTheStoppedMotionWithItsTypedCause) {
+  FakeClock clock;
+  ManualScheduler scheduler;
+  FakeParticipantEngine engine;
+  ResourceAddressedExecutionKernel kernel(
+      {registration(
+          make_binding("arm", "arm", "execution.trajectory.execute", CoordinateKind::kAngular),
+          engine)},
+      clock, scheduler, default_journal,
+      {RequestOwnerEpoch("kernel.epoch.1"), CellId("cell.test"), 8U});
+  const auto operation = kernel.execute(motion_operation("request.carried-lost"));
+  ASSERT_TRUE(operation.ok()) << operation.error().message;
+  auto intent = stop_request("request.carried-lost.stop", operation.value(), 1U);
+  intent.request_context.source_label = "manager.carried_object_lost";
+  intent.reason = "carried_object_lost";
+  const auto stopped = kernel.stop(intent);
+  ASSERT_TRUE(stopped.ok()) << stopped.error().message;
+  ASSERT_TRUE(wait_until([&] {
+    return kernel.get_stop_status(stopped.value().stop_id).value().state ==
+           StopStatusStateDTO::kSucceeded;
+  }));
+  // As any failed motion, the operation then needs intervention; the
+  // participant carries the typed cause the Program node fails with.
+  const auto state = kernel.get_operation_state(operation.value().operation_id).value();
+  EXPECT_EQ(state.state, OperationStateKind::kInterventionRequired);
+  ASSERT_EQ(state.participants.size(), 1U);
+  EXPECT_EQ(state.participants.front().state, OperationStateKind::kFailed);
+  ASSERT_TRUE(state.participants.front().terminal_error.has_value());
+  EXPECT_EQ(state.participants.front().terminal_error->code, "carried_object_lost");
+  EXPECT_FALSE(kernel.get_stop_fault_latch().has_value());
 }
 
 TEST(ResourceAddressedExecutionKernelTest,
@@ -6710,6 +6808,139 @@ TEST(ResourceAddressedExecutionKernelTest,
   }
   // The contained collision is no Stop fault: no cell-wide latch.
   EXPECT_FALSE(kernel.get_stop_fault_latch().has_value());
+}
+
+TEST(ResourceAddressedExecutionKernelTest,
+     ProgramResetAfterRuntimeCollisionContainmentKeepsMotionAdmissible) {
+  // Live incident 2026-10-26: Program Reset's run Stop re-captured an
+  // operation its own runtime-collision Stop had already contained; the
+  // second settlement was refused and closed motion admission for good.
+  FakeClock clock;
+  ManualScheduler scheduler;
+  FakeParticipantEngine engine;
+  ResourceAddressedExecutionKernel kernel(
+      {registration(
+          make_binding("arm", "arm", "execution.trajectory.execute", CoordinateKind::kAngular),
+          engine)},
+      clock, scheduler, default_journal,
+      {RequestOwnerEpoch("kernel.epoch.1"), CellId("cell.test"), 16U});
+  const auto accepted = kernel.execute(motion_operation("request.collision.program-reset"));
+  ASSERT_TRUE(accepted.ok()) << accepted.error().message;
+  engine.emit_transition(ExecutionState::kPlanning, ExecutionState::kExecuting);
+  engine.translate_stop_stage_hook = [&] {
+    engine.emit_transition(ExecutionState::kStopping, ExecutionState::kStopped);
+  };
+  engine.emit_collision();
+  std::optional<StopId> collision_stop;
+  ASSERT_TRUE(wait_until([&] {
+    const auto operation = kernel.get_operation_state(accepted.value().operation_id);
+    if (!operation.ok() || !operation.value().active_stop_id) return false;
+    collision_stop = operation.value().active_stop_id;
+    const auto status = kernel.get_stop_status(*collision_stop);
+    return status.ok() && status.value().state == StopStatusStateDTO::kSucceeded &&
+           operation.value().state == OperationStateKind::kInterventionRequired;
+  }));
+  ASSERT_EQ(engine.participant_stop_settlement_calls.load(), 1);
+  // The real ExecutionKernel refuses a second Stop settling the same execution.
+  engine.participant_stop_settlement_error = ErrorDTO{"addressed_motion_stop_identity_conflict",
+      "A different Stop already owns the current motion execution", {}};
+
+  const auto run_stop = kernel.stop(program_run_stop_request("request.collision.run-stop", "run.1"));
+  ASSERT_TRUE(run_stop.ok()) << run_stop.error().message;
+  ASSERT_TRUE(wait_until([&] {
+    const auto status = kernel.get_stop_status(run_stop.value().stop_id);
+    return status.ok() && status.value().stop_certificate.has_value();
+  }));
+  const auto held = kernel.get_operation_state(accepted.value().operation_id);
+  ASSERT_TRUE(held.ok()) << held.error().message;
+  EXPECT_EQ(held.value().state, OperationStateKind::kInterventionRequired);
+  EXPECT_FALSE(kernel.get_stop_fault_latch().has_value());
+
+  const auto reset = kernel.reset(control_request("request.collision.reset", accepted.value(),
+                                                  held.value().operation_revision.value()));
+  ASSERT_TRUE(reset.ok()) << reset.error().message;
+  ASSERT_TRUE(wait_until([&] {
+    return kernel.resource_snapshot().front().state == ResourceSlotState::kFree;
+  }));
+  engine.next_execution_id = 42U;
+  engine.next_execute_result = Result<std::uint64_t>::Ok(42U);
+  auto manual = motion_operation("request.collision.manual-after-reset");
+  manual.program_run_id = ProgramRunId("manual.run");
+  const auto next = kernel.execute(manual);
+  ASSERT_TRUE(next.ok()) << next.error().message;
+  EXPECT_TRUE(wait_until([&] { return engine.execute_calls.load() == 2; }));
+}
+
+TEST(ResourceAddressedExecutionKernelTest,
+     ProgramRunStopReusesSettledRuntimeCollisionStopProof) {
+  // One rule for every Stop kind: the runtime-collision Stop's settled
+  // certificate is the proof. The later Program-run Stop captures nothing
+  // physically, settles nothing again and chains that certificate.
+  FakeClock clock;
+  ManualScheduler scheduler;
+  FakeParticipantEngine engine;
+  ResourceAddressedExecutionKernel kernel(
+      {registration(
+          make_binding("arm", "arm", "execution.trajectory.execute", CoordinateKind::kAngular),
+          engine)},
+      clock, scheduler, default_journal,
+      {RequestOwnerEpoch("kernel.epoch.1"), CellId("cell.test"), 16U});
+  const auto accepted = kernel.execute(motion_operation("request.collision.proof-reuse"));
+  ASSERT_TRUE(accepted.ok()) << accepted.error().message;
+  engine.emit_transition(ExecutionState::kPlanning, ExecutionState::kExecuting);
+  engine.translate_stop_stage_hook = [&] {
+    engine.emit_transition(ExecutionState::kStopping, ExecutionState::kStopped);
+  };
+  engine.emit_collision();
+  std::optional<StopId> collision_stop;
+  ASSERT_TRUE(wait_until([&] {
+    const auto operation = kernel.get_operation_state(accepted.value().operation_id);
+    if (!operation.ok() || !operation.value().active_stop_id) return false;
+    collision_stop = operation.value().active_stop_id;
+    const auto status = kernel.get_stop_status(*collision_stop);
+    return status.ok() && status.value().state == StopStatusStateDTO::kSucceeded &&
+           operation.value().state == OperationStateKind::kInterventionRequired;
+  }));
+  ASSERT_EQ(engine.participant_stop_settlement_calls.load(), 1);
+  const auto contained = kernel.get_operation_state(accepted.value().operation_id).value();
+  const auto stages_before = engine.translate_stop_stage_calls.load();
+
+  const auto run_stop =
+      kernel.stop(program_run_stop_request("request.collision.proof-reuse.run-stop", "run.1"));
+  ASSERT_TRUE(run_stop.ok()) << run_stop.error().message;
+  EXPECT_TRUE(run_stop.value().affected_operation_revisions.empty());
+  ASSERT_TRUE(wait_until([&] {
+    const auto status = kernel.get_stop_status(run_stop.value().stop_id);
+    return status.ok() && status.value().stop_certificate.has_value();
+  }));
+  EXPECT_EQ(engine.translate_stop_stage_calls.load(), stages_before);
+  EXPECT_EQ(engine.participant_stop_settlement_calls.load(), 1);
+  const auto run_status = kernel.get_stop_status(run_stop.value().stop_id).value();
+  EXPECT_EQ(run_status.state, StopStatusStateDTO::kSucceeded);
+  const auto run_certificate =
+      kernel.get_stop_certificate(run_status.stop_certificate->stop_certificate_id);
+  ASSERT_TRUE(run_certificate.ok()) << run_certificate.error().message;
+  EXPECT_FALSE(run_certificate.value().terminal_error.has_value());
+  ASSERT_EQ(run_certificate.value().predecessor_certificates.size(), 1U);
+  EXPECT_EQ(run_certificate.value().predecessor_certificates.front().stop_id, *collision_stop);
+  // The operation keeps the collision Stop's outcome unchanged.
+  EXPECT_EQ(kernel.get_operation_state(accepted.value().operation_id).value(), contained);
+  EXPECT_FALSE(kernel.get_stop_fault_latch().has_value());
+
+  const auto reset = kernel.reset(control_request("request.collision.proof-reuse.reset",
+                                                  accepted.value(),
+                                                  contained.operation_revision.value()));
+  ASSERT_TRUE(reset.ok()) << reset.error().message;
+  ASSERT_TRUE(wait_until([&] {
+    return kernel.resource_snapshot().front().state == ResourceSlotState::kFree;
+  }));
+  engine.next_execution_id = 42U;
+  engine.next_execute_result = Result<std::uint64_t>::Ok(42U);
+  auto manual = motion_operation("request.collision.proof-reuse.manual-after-reset");
+  manual.program_run_id = ProgramRunId("manual.run");
+  const auto next = kernel.execute(manual);
+  ASSERT_TRUE(next.ok()) << next.error().message;
+  EXPECT_TRUE(wait_until([&] { return engine.execute_calls.load() == 2; }));
 }
 
 TEST(ResourceAddressedExecutionKernelTest,
@@ -12023,9 +12254,10 @@ TEST(ResourceAddressedExecutionKernelTest,
   ASSERT_FALSE(conflict.ok());
   EXPECT_EQ(conflict.error().details.at("reason"), "request_id_conflict");
 
+  // The Full Stop closes no cell admission; its fenced resources refuse.
   const auto fresh = kernel.execute(motion_operation("request.fresh-during-stop"));
   ASSERT_FALSE(fresh.ok());
-  EXPECT_EQ(fresh.error().details.at("reason"), "motion_admission_closed");
+  EXPECT_EQ(fresh.error().details.at("reason"), "participant_engine_busy");
 }
 
 TEST(ResourceAddressedExecutionKernelTest, SubordinateEventsAdvanceExactSlotsAndOperationState) {
@@ -12888,6 +13120,61 @@ TEST(ResourceAddressedExecutionKernelTest, PneumaticCallbackReconcilesDuringMovi
   ASSERT_TRUE(wait_until([&] { return kernel.get_stop_status(stopped.value().stop_id).value().stop_certificate.has_value(); }));
 }
 
+TEST(ResourceAddressedExecutionKernelTest, ComponentStreamHoldRefusesNewCommandsUntilLifted) {
+  // CP9: a `fault`/`blocking` stream that is not live blocks new commands of
+  // its component with the published typed refusal; lifting it re-admits.
+  FakeClock clock;
+  ManualScheduler scheduler;
+  FakeParticipantEngine output;
+  output.configured_gripper_actuation = GripperActuationKind::kPneumatic;
+  const ProgramCommandSchemaRefDTO schema{CommandSchemaId(std::string(kGripperPositionCommandSchemaId)),
+      CommandSchemaRevision(std::string(kGripperPositionCommandSchemaRevision))};
+  const auto command = make_binding("gripper", "gripper.target", "tool.gripper.command", CoordinateKind::kLinear, schema);
+  ResourceAddressedExecutionKernel kernel({LogicalGripperRegistration(command, output)}, clock, scheduler,
+      default_journal, {RequestOwnerEpoch("kernel.epoch.1"), CellId("cell.test"), 8U});
+  const auto component = command.value().controllable_component_id;
+  const ErrorDTO hold{"invalid_state_transition", "Component gripper stream s is stale.",
+                      {{"reason", "component_stream_stale"}, {"stream_id", "s"}}};
+  ASSERT_TRUE(kernel.PublishComponentStreamHold(component, hold).ok());
+  const auto refused = kernel.execute(command_operation("stream.hold.refused"));
+  ASSERT_FALSE(refused.ok());
+  EXPECT_EQ(refused.error().details.at("reason"), "component_stream_stale");
+  EXPECT_EQ(refused.error().details.at("stream_id"), "s");
+  ASSERT_TRUE(kernel.PublishComponentStreamHold(component, std::nullopt).ok());
+  const auto admitted = kernel.execute(command_operation("stream.hold.lifted"));
+  EXPECT_TRUE(admitted.ok()) << admitted.error().message;
+}
+
+TEST(ResourceAddressedExecutionKernelTest, CellWideComponentStreamHoldRefusesEveryComponentUntilLifted) {
+  // CP9: a component without motion of its own (a pose source) has no
+  // commands; its `blocking`/`fault` stream holds new motion cell-wide.
+  FakeClock clock;
+  ManualScheduler scheduler;
+  FakeParticipantEngine output;
+  output.configured_gripper_actuation = GripperActuationKind::kPneumatic;
+  const ProgramCommandSchemaRefDTO schema{CommandSchemaId(std::string(kGripperPositionCommandSchemaId)),
+      CommandSchemaRevision(std::string(kGripperPositionCommandSchemaRevision))};
+  const auto command = make_binding("gripper", "gripper.target", "tool.gripper.command", CoordinateKind::kLinear, schema);
+  ResourceAddressedExecutionKernel kernel({LogicalGripperRegistration(command, output)}, clock, scheduler,
+      default_journal, {RequestOwnerEpoch("kernel.epoch.1"), CellId("cell.test"), 8U});
+  const ControllableComponentId pose_source("isaac_scene_objects");
+  const ErrorDTO hold{"invalid_state_transition", "Component isaac_scene_objects stream is stale.",
+                      {{"reason", "component_stream_stale"}, {"stream_id", "poses/box/latch"}}};
+  ASSERT_TRUE(kernel.PublishComponentStreamHold(pose_source, hold, true).ok());
+  const auto refused = kernel.execute(command_operation("stream.hold.cell"));
+  ASSERT_FALSE(refused.ok());
+  EXPECT_EQ(refused.error().details.at("reason"), "component_stream_stale");
+  EXPECT_EQ(refused.error().details.at("stream_id"), "poses/box/latch");
+  // Lifting re-admits; a later cell-wide hold refuses again.
+  ASSERT_TRUE(kernel.PublishComponentStreamHold(pose_source, std::nullopt).ok());
+  ASSERT_TRUE(kernel.PublishComponentStreamHold(pose_source, hold, true).ok());
+  EXPECT_FALSE(kernel.execute(command_operation("stream.hold.cell.again")).ok());
+  // The same hold published per component no longer touches the gripper.
+  ASSERT_TRUE(kernel.PublishComponentStreamHold(pose_source, hold).ok());
+  const auto admitted = kernel.execute(command_operation("stream.hold.cell.lifted"));
+  EXPECT_TRUE(admitted.ok()) << admitted.error().message;
+}
+
 TEST(ResourceAddressedExecutionKernelTest, ForeignCommandTargetIdentityOrGenerationCannotTerminalizeOwner) {
   for (const int foreign : {0, 1, 2}) {
     SCOPED_TRACE(foreign);
@@ -13290,10 +13577,11 @@ TEST(ResourceAddressedExecutionKernelTest, FullStopAllowsIntrinsicManualPneumati
   unknown.participants.front().target_role_id = TargetRoleId("unknown");
   const auto refused_unknown = kernel.execute(unknown);
   ASSERT_FALSE(refused_unknown.ok());
-  EXPECT_EQ(refused_unknown.error().details.at("reason"), "motion_admission_closed");
+  EXPECT_EQ(refused_unknown.error().details.at("reason"), "runtime_participant_unavailable");
+  // The Full Stop closes no cell admission; the arm still being stopped refuses.
   const auto refused_motion = kernel.execute(motion_operation("full.manual.moving.refused"));
   ASSERT_FALSE(refused_motion.ok());
-  EXPECT_EQ(refused_motion.error().details.at("reason"), "motion_admission_closed");
+  EXPECT_EQ(refused_motion.error().details.at("reason"), "participant_engine_busy");
   const auto accepted = kernel.execute(manual);
   ASSERT_TRUE(accepted.ok()) << accepted.error().message;
   EXPECT_EQ(backend.commands, 1);
@@ -13309,36 +13597,40 @@ TEST(ResourceAddressedExecutionKernelTest, FullStopAllowsIntrinsicManualPneumati
   ASSERT_TRUE(wait_until([&] { return kernel.get_stop_status(stopped.value().stop_id).value().stop_certificate.has_value(); }));
 }
 
-TEST(ResourceAddressedExecutionKernelTest, FullStopKeepsPositionGripperAdmissionClosed) {
+TEST(ResourceAddressedExecutionKernelTest, FullStopWithoutFaultLeavesMotionAdmissible) {
+  // A Full Stop closes nothing by itself: new motion is gated only by the
+  // fault/incident/latch that caused it. An operator Full Stop without a
+  // fault leaves nothing to clear.
   FakeClock clock;
   ManualScheduler scheduler;
+  FakeParticipantEngine arm;
   FakeParticipantEngine position;
   const ProgramCommandSchemaRefDTO schema{CommandSchemaId(std::string(kGripperPositionCommandSchemaId)),
       CommandSchemaRevision(std::string(kGripperPositionCommandSchemaRevision))};
+  const auto motion = make_binding("arm", "arm", "execution.trajectory.execute", CoordinateKind::kAngular);
   const auto physical = make_binding("gripper", "gripper.target", "tool.gripper.command", CoordinateKind::kLinear, schema);
   auto direct = LogicalGripperRegistration(physical, position);
   direct.intrinsic_direct_control = true;
   ASSERT_EQ(position.gripper_actuation_kind("gripper.target"), GripperActuationKind::kPositionCommanded);
-  ASSERT_FALSE(direct.stop_readiness->value().resolved_stop_base_plan.gripper_actuation_kind.has_value());
   ResourceAddressedExecutionKernelConfig config{RequestOwnerEpoch("kernel.epoch.1"), CellId("cell.test"), 8U};
   config.manager_liveness_required_set = EmptyManagerLivenessSet();
-  ResourceAddressedExecutionKernel kernel({direct}, clock, scheduler, default_journal, config);
+  ResourceAddressedExecutionKernel kernel({registration(motion, arm), direct}, clock, scheduler, default_journal, config);
   ASSERT_TRUE(ready_cell_admission(kernel).ok());
   const auto stopped = kernel.full_stop(FullStopIntentDTO{
       {RequestId("full.position.stop"), RequestOwnerEpoch("kernel.epoch.1"), "test", {}}, StopGeneration(0U), {}});
   ASSERT_TRUE(stopped.ok());
   ASSERT_TRUE(wait_until([&] { return kernel.get_stop_status(stopped.value().stop_id).value().stop_certificate.has_value(); }));
   EXPECT_FALSE(kernel.get_stop_fault_latch());
-  auto manual = command_operation("full.position.refused");
+  auto manual = command_operation("full.position.after");
   manual.program_run_id = ProgramRunId("manual.run");
   const auto available = kernel.get_manual_control_availability(manual);
   ASSERT_TRUE(available.ok());
-  EXPECT_FALSE(available.value().available);
-  const auto refused = kernel.execute(manual);
-  ASSERT_FALSE(refused.ok());
-  EXPECT_EQ(refused.error().details.at("reason"), "motion_admission_closed");
-  EXPECT_EQ(position.prepare_command_calls, 0);
-  EXPECT_EQ(position.command_calls, 0);
+  EXPECT_TRUE(available.value().available);
+  auto moving = motion_operation("full.arm.after");
+  moving.program_run_id = ProgramRunId("manual.run");
+  const auto accepted = kernel.execute(moving);
+  ASSERT_TRUE(accepted.ok()) << accepted.error().message;
+  EXPECT_TRUE(wait_until([&] { return arm.execute_calls.load() == 1; }));
 }
 
 TEST(ResourceAddressedExecutionKernelTest, FullStopAllowsSourceDerivedContinueWithRawHeldProjection) {
@@ -14878,10 +15170,17 @@ TEST(ResourceAddressedExecutionKernelTest,
         }));
         engine.next_execution_id = 42U;
         engine.next_execute_result = Result<std::uint64_t>::Ok(42U);
+        // A Full Stop without a fault leaves nothing to clear: once the
+        // operation is reset, new motion is admitted. A failed fault write
+        // is its own retained journal fault and still gates motion.
         const auto next = kernel.execute(motion_operation("request.failed-settlement.next"));
-        ASSERT_FALSE(next.ok());
-        EXPECT_EQ(next.error().details.at("reason"), "motion_admission_closed");
-        // An operation Reset must not clear the independent Full Stop latch.
+        if (std::string_view(persistence) == "recorded") {
+          ASSERT_TRUE(next.ok()) << next.error().message;
+        } else {
+          ASSERT_FALSE(next.ok());
+          EXPECT_EQ(next.error().details.at("reason"), "motion_admission_closed");
+          EXPECT_TRUE(kernel.get_operation_journal_write_fault().has_value());
+        }
       }
     }
   }
@@ -29274,8 +29573,8 @@ TEST(ResourceAddressedExecutionKernelTest,
 
 // Both terminal outcomes of the physical P1 Stop are exercised: nominal, and
 // escalated through the existing injected first-stage refusal. The escalated
-// P1 settles with the degraded-Stop diagnostic that this same Stop recorded;
-// that exact error is accepted as settled proof and the result stays escalated.
+// P1 settles with the degraded-Stop diagnostic; its certificate row is the
+// proof, as for any Stop kind, and the result stays escalated.
 // The attributed variant's refusal names the operation, so P1's certificate
 // terminal error may be attributed to it.
 TEST(ResourceAddressedExecutionKernelTest,

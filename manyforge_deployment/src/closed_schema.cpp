@@ -35,6 +35,7 @@
 #include "embedded_provider_manifest_schema.hpp"
 #include "embedded_ros2_control_execution_runtime_configuration_schema.hpp"
 #include "embedded_io_provider_component_configuration_schema.hpp"
+#include "embedded_pose_source_component_configuration_schema.hpp"
 #include "embedded_runtime_profile_schema.hpp"
 #include "embedded_stop_evidence_policy_schema.hpp"
 #include "manyforge_deployment/content_identity.hpp"
@@ -1978,7 +1979,7 @@ BuildQualifiedClosedSchemaRegistry::BuildQualifiedClosedSchemaRegistry() {
        "catalog/manyforge.stop_evidence_policy.v2.yaml",
        detail::kEmbeddedStopEvidencePolicySchema},
   }};
-  const std::array<QualifiedValueSchemaSource, 6U> qualified_value_sources{{
+  const std::array<QualifiedValueSchemaSource, 7U> qualified_value_sources{{
       {"value/manyforge.value_schema.provider_contract.empty.v1.yaml",
        detail::kEmbeddedEmptyProviderContractSchema},
       {"value/"
@@ -1994,6 +1995,8 @@ BuildQualifiedClosedSchemaRegistry::BuildQualifiedClosedSchemaRegistry() {
        detail::kEmbeddedRos2ControlExecutionRuntimeConfigurationSchema},
       {"value/manyforge.value_schema.runtime.io_provider_execution.v1.yaml",
        detail::kEmbeddedIoProviderComponentConfigurationSchema},
+      {"value/manyforge.value_schema.runtime.pose_source_execution.v1.yaml",
+       detail::kEmbeddedPoseSourceComponentConfigurationSchema},
   }};
 
   auto storage = std::make_shared<Storage>();

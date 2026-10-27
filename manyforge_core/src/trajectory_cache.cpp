@@ -13,26 +13,6 @@ void append_field(std::string& encoded, const std::string_view value) {
   encoded.push_back('|');
 }
 
-[[nodiscard]] bool same_projection_lineage(const ProjectionRevisionDTO& left,
-                                           const ProjectionRevisionDTO& right) noexcept {
-  return left.retained_bundle_id == right.retained_bundle_id &&
-         left.graph_revision == right.graph_revision &&
-         left.scene_revision.scene_id == right.scene_revision.scene_id;
-}
-
-[[nodiscard]] bool same_revision_number_has_conflicting_content(
-    const TrajectoryCacheRevisionEvidence& stored,
-    const TrajectoryCacheRevisionEvidence& expected) noexcept {
-  return (stored.projection_revision.scene_revision.revision_id ==
-              expected.projection_revision.scene_revision.revision_id &&
-          stored.projection_revision.scene_revision.content_hash !=
-              expected.projection_revision.scene_revision.content_hash) ||
-         (stored.collision_world_revision.revision_id ==
-              expected.collision_world_revision.revision_id &&
-          stored.collision_world_revision.content_hash !=
-              expected.collision_world_revision.content_hash);
-}
-
 }  // namespace
 
 TrajectoryCache::TrajectoryCache(CacheConfig config) : config_(config) {}
@@ -54,10 +34,9 @@ std::string TrajectoryCache::encoded_key(const TrajectoryCacheKey& key) {
 }
 
 void TrajectoryCache::store(const TrajectoryCacheKey& key, TrajectoryDTO trajectory,
-                            TrajectoryCacheRevisionEvidence evidence, std::string intent_identity) {
-  if (!key.valid() || !evidence.valid() || intent_identity.empty()) {
-    throw std::invalid_argument(
-        "trajectory cache store requires a complete slot, projection evidence, and intent");
+                            std::string intent_identity) {
+  if (!key.valid() || intent_identity.empty()) {
+    throw std::invalid_argument("trajectory cache store requires a complete slot and intent");
   }
   auto shared_trajectory = std::make_shared<const TrajectoryDTO>(std::move(trajectory));
   const auto encoded = encoded_key(key);
@@ -67,7 +46,6 @@ void TrajectoryCache::store(const TrajectoryCacheKey& key, TrajectoryDTO traject
   if (it != entries_.end()) {
     it->second.key = key;
     it->second.trajectory = std::move(shared_trajectory);
-    it->second.evidence = std::move(evidence);
     it->second.intent_identity = std::move(intent_identity);
     return;
   }
@@ -76,8 +54,7 @@ void TrajectoryCache::store(const TrajectoryCacheKey& key, TrajectoryDTO traject
     entries_.erase(insertion_order_.front());
     insertion_order_.pop_front();
   }
-  entries_.emplace(encoded, Entry{key, std::move(shared_trajectory), std::move(evidence),
-                                  std::move(intent_identity)});
+  entries_.emplace(encoded, Entry{key, std::move(shared_trajectory), std::move(intent_identity)});
   insertion_order_.push_back(encoded);
 }
 
@@ -106,14 +83,10 @@ std::optional<TrajectoryDTO> TrajectoryCache::peek_unvalidated(
   return *found;
 }
 
-TrajectoryCacheLookupResult TrajectoryCache::lookup_with_revision(
-    const TrajectoryCacheKey& key, const TrajectoryCacheRevisionEvidence& expected_evidence,
-    const std::string& expected_intent_identity) {
+TrajectoryCacheLookupResult TrajectoryCache::lookup(const TrajectoryCacheKey& key,
+                                                    const std::string& expected_intent_identity) {
   if (!key.valid()) {
     return {TrajectoryCacheLookupDisposition::kMiss, std::nullopt};
-  }
-  if (!expected_evidence.valid()) {
-    return {TrajectoryCacheLookupDisposition::kAuthoritativeRevisionUnavailable, std::nullopt};
   }
 
   const auto encoded = encoded_key(key);
@@ -122,53 +95,14 @@ TrajectoryCacheLookupResult TrajectoryCache::lookup_with_revision(
   if (it == entries_.end()) {
     return {TrajectoryCacheLookupDisposition::kMiss, std::nullopt};
   }
-  if (!it->second.evidence.valid()) {
-    erase_locked(encoded);
-    return {TrajectoryCacheLookupDisposition::kRevisionMismatch, std::nullopt};
-  }
   if (it->second.intent_identity != expected_intent_identity) {
     erase_locked(encoded);
     return {TrajectoryCacheLookupDisposition::kIntentMismatch, std::nullopt};
   }
 
-  const auto& stored = it->second.evidence;
-  const bool exact = stored == expected_evidence;
-  const bool lineage_matches =
-      same_projection_lineage(stored.projection_revision, expected_evidence.projection_revision);
-  const bool scene_not_older = expected_evidence.projection_revision.scene_revision.revision_id >=
-                               stored.projection_revision.scene_revision.revision_id;
-  const bool collision_not_older = expected_evidence.collision_world_revision.revision_id >=
-                                   stored.collision_world_revision.revision_id;
-  const bool advanced = expected_evidence.projection_revision.scene_revision.revision_id >
-                            stored.projection_revision.scene_revision.revision_id ||
-                        expected_evidence.collision_world_revision.revision_id >
-                            stored.collision_world_revision.revision_id;
-  const bool revalidation_candidate =
-      lineage_matches && scene_not_older && collision_not_older && advanced &&
-      !same_revision_number_has_conflicting_content(stored, expected_evidence);
-  if (!exact && !revalidation_candidate) {
-    erase_locked(encoded);
-    return {TrajectoryCacheLookupDisposition::kRevisionMismatch, std::nullopt};
-  }
-
   auto found = it->second.trajectory;
   lock.unlock();
-  return {exact ? TrajectoryCacheLookupDisposition::kHit
-                : TrajectoryCacheLookupDisposition::kRevalidationCandidate,
-          *found};
-}
-
-std::optional<TrajectoryCacheRevisionEvidence> TrajectoryCache::revision_of(
-    const TrajectoryCacheKey& key) const {
-  if (!key.valid()) {
-    return std::nullopt;
-  }
-  std::lock_guard<std::mutex> lock(mutex_);
-  const auto it = entries_.find(encoded_key(key));
-  if (it == entries_.end() || !it->second.evidence.valid()) {
-    return std::nullopt;
-  }
-  return it->second.evidence;
+  return {TrajectoryCacheLookupDisposition::kFound, *found};
 }
 
 void TrajectoryCache::invalidate(const TrajectoryCacheKey& key) {

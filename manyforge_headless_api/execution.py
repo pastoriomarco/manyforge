@@ -224,7 +224,6 @@ CAPABILITY_COMMAND_PREVIEW_RECEIPT_KEYS = frozenset(
         "request_owner_epoch",
         "required_capability_id",
         "retained_bundle_id",
-        "scene_revision",
         "schema_version",
         "source_coordinate_name",
         "source_kind",
@@ -359,28 +358,6 @@ class ExecutionPort(Protocol):
     ) -> dict[str, Any]: ...
 
     def read_volatile_motion_trace(self, allowance_bytes: int) -> dict[str, Any]: ...
-
-
-def _motion_preview_scene_revision_matches(
-    observed: object, expected: dict[str, Any]
-) -> bool:
-    """Return whether a motion receipt names the intent's Scene or a later one.
-
-    The native owner may latch ``before_planning`` observations and compute the
-    preview on a newer owner-minted revision of the same Scene. The receipt is
-    explanatory evidence; approval still requires the current revision.
-    """
-    if observed == expected:
-        return True
-    try:
-        parsed = SceneRevisionRequest.model_validate(observed)
-    except ValueError:
-        return False
-    return (
-        parsed.model_dump(mode="json") == observed
-        and parsed.scene_id == expected["scene_id"]
-        and parsed.revision_id > expected["revision_id"]
-    )
 
 
 def _canonical_json(value: dict[str, Any]) -> bytes:
@@ -1545,7 +1522,6 @@ class ExecutionCommandClient:
         expected_intent_digest = (
             "sha256:" + hashlib.sha256(_canonical_json(operation)).hexdigest()
         )
-        expected_scene = operation["expected_scene_revision"]
         if (
             set(response) != MOTION_PREVIEW_RESPONSE_KEYS
             or not isinstance(receipt, dict)
@@ -1571,9 +1547,6 @@ class ExecutionCommandClient:
             or receipt.get("graph_revision") != operation["expected_graph_revision"]
             or receipt.get("retained_bundle_id")
             != operation["expected_retained_bundle_id"]
-            or not _motion_preview_scene_revision_matches(
-                receipt.get("scene_revision"), expected_scene
-            )
             or receipt.get("component_role_id") != participant["component_role_id"]
             or receipt.get("target_role_id") != participant["target_role_id"]
             or receipt.get("required_capability_id")
@@ -1696,7 +1669,6 @@ class ExecutionCommandClient:
             or receipt.get("graph_revision") != operation["expected_graph_revision"]
             or receipt.get("retained_bundle_id")
             != operation["expected_retained_bundle_id"]
-            or receipt.get("scene_revision") != operation["expected_scene_revision"]
             or receipt.get("component_role_id") != participant["component_role_id"]
             or receipt.get("target_role_id") != participant["target_role_id"]
             or receipt.get("required_capability_id")

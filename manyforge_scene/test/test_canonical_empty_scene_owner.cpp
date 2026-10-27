@@ -1362,6 +1362,36 @@ core::PublicRequestContextDTO
 SceneRequestContext(std::string request_id,
                     const ProjectionRevisionDTO &expected);
 
+TEST(LogicalSceneTransactionCodec, AttachGraspLostBoundIsOptionalAndRoundTrips) {
+  const ProjectionRevisionDTO expected{
+      core::RetainedBundleId(Digest('b').value()),
+      GraphRevision(Digest('c').value()),
+      core::SceneRevision{core::SceneId(Digest('d').value()), 1U, Digest('a')},
+  };
+  auto request = AddBoxRequest(expected, CellId("cell-a"));
+  request.operation = core::AttachCarriedObjectRequestDTO{
+      core::CarriedObjectAttachmentId("attachment.1"),
+      core::SceneResourceId("scene-box"),
+      core::ControllableComponentId("component.1"),
+      core::CommandTargetId("arm"),
+      core::FrameRoleId("tool_frame"),
+      {},
+      {}};
+  const auto plain = logical_scene_codec_internal::EncodeRequest(request);
+  EXPECT_EQ(plain.find("grasp_lost_bound"), std::string::npos);
+  EXPECT_FALSE(std::get<core::AttachCarriedObjectRequestDTO>(
+                   DecodeCanonicalSceneTransactionRequest(plain).operation)
+                   .grasp_lost_bound.has_value());
+  std::get<core::AttachCarriedObjectRequestDTO>(request.operation)
+      .grasp_lost_bound = core::CarriedObjectGraspLostBoundDTO{0.03, 0.26};
+  const auto bounded = logical_scene_codec_internal::EncodeRequest(request);
+  const auto decoded = DecodeCanonicalSceneTransactionRequest(bounded);
+  EXPECT_EQ(std::get<core::AttachCarriedObjectRequestDTO>(decoded.operation)
+                .grasp_lost_bound,
+            (core::CarriedObjectGraspLostBoundDTO{0.03, 0.26}));
+  EXPECT_EQ(logical_scene_codec_internal::EncodeRequest(decoded), bounded);
+}
+
 TEST(LogicalSceneTransactionCodec,
      CanonicalInternalRequestRoundTripsAndRejectsWireDrift) {
   const ProjectionRevisionDTO expected{
@@ -1536,7 +1566,10 @@ TEST(CanonicalEmptySceneOwner,
   const auto first =
       owner.Commit(AddBoxRequest(active, admission.cell_id(), "advance"));
   ASSERT_TRUE(first.success);
-  auto request = AddBoxRequest(active, admission.cell_id(), "stale");
+  // Only another Deployment or Scene is refused; any revision is accepted.
+  auto foreign = active;
+  foreign.graph_revision = core::GraphRevision(Digest('d').value());
+  auto request = AddBoxRequest(foreign, admission.cell_id(), "stale");
   std::atomic<bool> reconciled{true};
   const auto rejected = headless::detail::CommitSceneWithAdmissionObservation(
       owner, request, reconciled);
@@ -1980,17 +2013,17 @@ TEST(CanonicalEmptySceneOwner,
   ASSERT_TRUE(first_result.committed_projection_revision.has_value());
 
   // The other connection must observe the committed revision rather than use
-  // its stale cached predecessor. Its stale request still fails before effect.
-  auto stale_request = AddBoxRequest(
-      initial, admission.cell_id(), "scene-request-stale-second-owner");
-  std::get<core::AddObjectRequestDTO>(stale_request.operation)
-      .scene_resource_id = core::SceneResourceId("scene-box-stale");
-  const auto stale_result = second.Commit(stale_request);
-  ASSERT_FALSE(stale_result.success);
-  ASSERT_TRUE(stale_result.error.has_value());
-  EXPECT_EQ(stale_result.error->code, "stale_revision");
-  EXPECT_EQ(second.CurrentProjectionRevision(),
-            *first_result.committed_projection_revision);
+  // its stale cached predecessor: a request naming the older revision commits
+  // on top of the first connection's commit.
+  auto older_request = AddBoxRequest(
+      initial, admission.cell_id(), "scene-request-older-second-owner");
+  std::get<core::AddObjectRequestDTO>(older_request.operation)
+      .scene_resource_id = core::SceneResourceId("scene-box-older");
+  const auto older_result = second.Commit(older_request);
+  ASSERT_TRUE(older_result.success);
+  ASSERT_TRUE(older_result.committed_projection_revision.has_value());
+  EXPECT_EQ(older_result.committed_projection_revision->scene_revision.revision_id,
+            first_result.committed_projection_revision->scene_revision.revision_id + 1U);
 
   auto second_request = AddBoxRequest(
       *first_result.committed_projection_revision, admission.cell_id(),
@@ -2003,8 +2036,8 @@ TEST(CanonicalEmptySceneOwner,
 
   EXPECT_EQ(first.CurrentProjectionRevision(),
             *second_result.committed_projection_revision);
-  EXPECT_EQ(first.LogicalSnapshot()->objects.size(), 2U);
-  EXPECT_EQ(first.VerifyIntegrity().transaction_intent_count, 2);
+  EXPECT_EQ(first.LogicalSnapshot()->objects.size(), 3U);
+  EXPECT_EQ(first.VerifyIntegrity().transaction_intent_count, 3);
 }
 
 TEST(CanonicalEmptySceneOwner,
@@ -2230,9 +2263,6 @@ public:
     resolved_frame_role_override_.reset();
     retained_leases_.clear();
     transactions_.clear();
-    freshness_confirmations_.clear();
-    freshness_attempts_ = 0U;
-    freshness_error_.reset();
     health_ = core::ProjectionHealthDTO{
         binding_,    1U,           core::ProjectionHealthState::kHealthy,
         target,      1U,
@@ -2291,29 +2321,6 @@ public:
   }
 
   void SetMode(const Mode mode) noexcept { mode_ = mode; }
-
-  [[nodiscard]] const std::vector<core::ProviderFreshnessConfirmationDTO> &
-  freshness_confirmations() const noexcept {
-    return freshness_confirmations_;
-  }
-
-  [[nodiscard]] std::size_t freshness_attempts() const noexcept {
-    return freshness_attempts_;
-  }
-
-  void RejectProviderFreshness(std::optional<core::ErrorDTO> error) {
-    freshness_error_ = std::move(error);
-  }
-
-  core::Result<void> ApplyProviderFreshness(
-      const core::ProviderFreshnessConfirmationDTO &confirmation) override {
-    ++freshness_attempts_;
-    if (freshness_error_.has_value()) {
-      return core::Result<void>::Err(*freshness_error_);
-    }
-    freshness_confirmations_.push_back(confirmation);
-    return core::Result<void>::Ok();
-  }
 
   void ThrowAfterNextRebuildEffect() noexcept {
     throw_after_next_rebuild_effect_ = true;
@@ -2656,10 +2663,6 @@ private:
   std::size_t rebuild_calls_{};
   std::vector<core::NativeProjectionRebuildDTO> rebuild_requests_;
   std::vector<core::SceneTransactionDTO> transactions_;
-  std::vector<core::ProviderFreshnessConfirmationDTO>
-      freshness_confirmations_;
-  std::size_t freshness_attempts_{};
-  std::optional<core::ErrorDTO> freshness_error_;
   core::Pose3DTO frame_pose_in_cell_{};
   std::vector<core::ComponentAttachmentRevision> attachment_revisions_;
   std::optional<core::ErrorDTO> frame_resolution_error_;
@@ -2702,8 +2705,12 @@ TEST(CanonicalEmptySceneOwner, DefaultProjectionHealthSelectorRefusesConflicting
   auto foreign = selected;
   foreign.retained_bundle_id = core::RetainedBundleId(Digest('e').value());
   EXPECT_THROW(default_health(foreign), std::invalid_argument);
+  // Any revision of the same Scene is the same projection identity.
+  auto newer_revision = selected;
+  ++newer_revision.scene_revision.revision_id;
+  EXPECT_NO_THROW(default_health(newer_revision));
   auto other_scene = selected;
-  ++other_scene.scene_revision.revision_id;
+  other_scene.scene_revision.scene_id = core::SceneId(Digest('e').value());
   EXPECT_THROW(default_health(other_scene), std::invalid_argument);
   EXPECT_EQ(projection.ProjectionHealth().active_projection_revision, exact.active_projection_revision);
   EXPECT_EQ(projection.ProjectionHealth().source_sequence, exact.source_sequence);
@@ -2724,11 +2731,6 @@ public:
   core::ProjectionCommitResultDTO
   ApplyTransaction(const core::SceneTransactionDTO &request) override {
     return projection_.ApplyTransaction(request);
-  }
-
-  core::Result<void> ApplyProviderFreshness(
-      const core::ProviderFreshnessConfirmationDTO &confirmation) override {
-    return projection_.ApplyProviderFreshness(confirmation);
   }
 
   core::Result<core::CollisionWorldLeaseInventory>
@@ -3091,6 +3093,24 @@ deployment::test::DurableLite6RetainedConsumerFixture AdoptionProduct(
           false, false, std::nullopt, false,
           deployment::test::kLite6ArmTargetId, std::nullopt, std::nullopt, {},
           true, {}, "manyforge.provider.ros2_control", false, true));
+}
+
+/// The same request for another Scene. Only identity is bound by Apply, so a
+/// different revision of the same Scene is accepted, but a foreign Scene is not.
+template <typename Request>
+void NameForeignScene(Request &request) {
+  auto &scene = request.expected_snapshot_identity.revision.scene_id;
+  scene = core::SceneId(Digest(scene.value() == Digest('e').value() ? 'f' : 'e').value());
+  request.expected_active_projection_revision.scene_revision =
+      request.expected_snapshot_identity.revision;
+}
+
+/// Runtime-owned (provider) pose evidence; it needs no admission claim.
+core::SceneObjectProviderEvidenceDTO StreamedPoseEvidence() {
+  return {core::ProviderInstanceId("stream-provider"),
+          core::ProviderManifestId("stream-manifest"),
+          core::ProviderManifestRevision(Digest('7').value()),
+          "stream-epoch"};
 }
 
 struct SceneProductAdoptionFixture final {
@@ -3534,6 +3554,87 @@ TEST(CanonicalEmptySceneOwner,
   VerifyProductAdoptionPreservesObjectsAttachmentsAndLogicalIdentity(true);
 }
 
+// Apply binds identity and structure, never streamed state: pose-only commits
+// after the request and after staging do not fail adoption, which adopts the
+// latest Scene. The request's revision stays evidence of its moment.
+TEST(CanonicalEmptySceneOwner,
+     PoseOnlyCommitsBetweenApplyRequestAndAdoptionDoNotFailApply) {
+  SceneProductAdoptionFixture fixture(true);
+  ASSERT_TRUE(fixture.owner
+                  ->Commit(AddBoxRequest(fixture.owner->CurrentProjectionRevision(),
+                                         fixture.admission.cell_id(), "stream-add"))
+                  .success);
+  std::uint64_t sequence = 0U;
+  const auto stream_pose = [&](const double x_m) {
+    auto pose = fixture.owner->GetObjectPose(core::SceneResourceId("scene-box"));
+    ASSERT_TRUE(pose.ok());
+    pose.value().position_m.x_m = x_m;
+    ++sequence;
+    const core::SceneTransactionRequestDTO update{
+        core::PublicRequestContextDTO{
+            core::RequestId("stream-pose-" + std::to_string(sequence)),
+            fixture.owner->CurrentRequestOwnerEpoch(), "scene-owner-test", std::nullopt},
+        {},
+        fixture.owner->CurrentProjectionRevision(),
+        core::UpdateObjectPoseRequestDTO{
+            core::SceneResourceId("scene-box"), pose.value(),
+            core::CellSceneFrameRefDTO{fixture.admission.cell_id()},
+            StreamedPoseEvidence(), false},
+        std::nullopt};
+    const auto committed = fixture.owner->Commit(update);
+    ASSERT_TRUE(committed.success)
+        << (committed.error.has_value() ? committed.error->message : "missing error");
+  };
+
+  const auto request = fixture.CaptureRequest();
+  ASSERT_NO_FATAL_FAILURE(stream_pose(0.30));  // after the Apply request
+  const auto at_stage = fixture.owner->CurrentProjectionRevision();
+  ASSERT_NE(at_stage.scene_revision, request.expected_snapshot_identity.revision);
+  fixture.PrepareCandidateClients();
+  const auto staged = fixture.owner->StageOriginalManagerProductAdoption(
+      request, fixture.fence, fixture.fence.OriginalAttemptQuery());
+  const ProjectionRevisionDTO staged_target{
+      request.candidate_retained_bundle.retained_bundle_id,
+      request.candidate_retained_bundle.cell_graph.graph_revision, at_stage.scene_revision};
+  ASSERT_EQ(staged.size(), request.native_runtime_bindings.size());
+  for (const auto &row : staged) {
+    EXPECT_TRUE(row.healthy_for_target(staged_target));
+  }
+
+  ASSERT_NO_FATAL_FAILURE(stream_pose(0.35));  // after staging, before adoption
+  const auto latest = fixture.owner->LogicalSnapshot();
+  const auto latest_bytes = EncodeLogicalSceneSnapshot(*latest);
+  const auto ready = fixture.Begin(request);
+  ASSERT_TRUE(ready.ready_for_publication());
+  EXPECT_EQ(ready.target_projection_revision.scene_revision, latest->revision);
+  EXPECT_EQ(ready.authoritative_snapshot_identity, latest->identity());
+  EXPECT_FALSE(fixture.owner->ReadAccessStatus().scene_writes_open);
+  // Candidates staged at the earlier revision moved to the adopted Scene.
+  for (const auto &projection : fixture.candidate_projections) {
+    ASSERT_EQ(projection->rebuild_calls(), 2U);
+    const auto &successor = projection->rebuild_requests().back();
+    EXPECT_EQ(successor.target_projection_revision, ready.target_projection_revision);
+    EXPECT_EQ(successor.maintenance_predecessor, std::optional{staged_target});
+    EXPECT_EQ(EncodeLogicalSceneSnapshot(*successor.logical_scene), latest_bytes);
+  }
+
+  // Publication carries the request's revision as evidence only.
+  const auto publication = fixture.Publication(request);
+  fixture.publication_reader.SetCurrent(publication);
+  const auto completed = fixture.Complete(request, publication);
+  EXPECT_EQ(completed.state, core::ProjectionMaintenanceInitializationState::kCompleted);
+  EXPECT_EQ(fixture.owner->CurrentProjectionRevision(), ready.target_projection_revision);
+  EXPECT_EQ(EncodeLogicalSceneSnapshot(*fixture.owner->LogicalSnapshot()), latest_bytes);
+  ASSERT_NO_FATAL_FAILURE(stream_pose(0.40));  // streaming continues on the new Deployment
+
+  const auto after = fixture.owner->CurrentProjectionRevision();
+  fixture.owner.reset();
+  fixture.owner = std::make_unique<LogicalSceneOwner>(
+      fixture.database_path, fixture.admission, fixture.publication_reader, fixture.bundle_source,
+      fixture.resolver, fixture.cell_admission);
+  EXPECT_EQ(fixture.owner->CurrentProjectionRevision(), after);
+}
+
 // Holds the store's write lock from a second connection until destroyed.
 class HeldSqliteWriteLock final {
 public:
@@ -3589,8 +3690,7 @@ TEST(CanonicalEmptySceneOwner,
   altered.expected_predecessor_publication.durable_public_pointer_content_digest = Digest('a');
   EXPECT_THROW(fixture.Begin(altered), LogicalSceneOwnerConflictError);
   altered = request;
-  ++altered.expected_snapshot_identity.revision.revision_id;
-  altered.expected_active_projection_revision.scene_revision = altered.expected_snapshot_identity.revision;
+  NameForeignScene(altered);
   EXPECT_THROW(fixture.Begin(altered), LogicalSceneOwnerConflictError);
   altered = request;
   altered.candidate_retained_bundle.cell_graph.graph_revision = core::GraphRevision("forged-graph");
@@ -3972,10 +4072,7 @@ TEST(CanonicalEmptySceneOwner, ConfigurationAdoptionRefusesForeignClaimIntentFen
     case 2U: request.authority.held_cell_claim.claim_generation = core::CellAdmissionClaimGeneration(99U); break;
     case 3U: request.authority.held_fence_query.configuration_fence_id = core::ConfigurationFenceId("foreign-fence"); break;
     case 4U: request.expected_predecessor_publication.durable_public_pointer_content_digest = Digest('a'); break;
-    case 5U:
-      ++request.expected_snapshot_identity.revision.revision_id;
-      request.expected_active_projection_revision.scene_revision = request.expected_snapshot_identity.revision;
-      break;
+    case 5U: NameForeignScene(request); break;
     case 6U: fixture.cell_admission.ProveHeldClaimHadNoEffect(); break;
     case 7U: request.candidate_retained_bundle.cell_graph.graph_revision = GraphRevision("foreign-candidate"); break;
     case 8U: request.native_runtime_bindings.pop_back(); break;
@@ -4057,8 +4154,10 @@ TEST(CanonicalEmptySceneOwner, EqualConfigurationAdoptionRequiresExactCurrentPro
   for (const auto &projection : fixture.predecessor_projections) {
     EXPECT_EQ(projection->rebuild_calls(), 0U);
   }
+  // A projection on another Scene is not healthy for this one.
   auto stale = request.expected_active_projection_revision;
-  ++stale.scene_revision.revision_id;
+  stale.scene_revision.scene_id = core::SceneId(
+      Digest(stale.scene_revision.scene_id.value() == Digest('e').value() ? 'f' : 'e').value());
   fixture.predecessor_projections.front()->Reset(stale, FakePlannerSceneProjection::Mode::kCommit);
   std::vector<std::size_t> rebuilds_before;
   for (const auto &projection : fixture.predecessor_projections) {
@@ -4356,8 +4455,7 @@ TEST(CanonicalEmptySceneOwner,
   foreign.expected_predecessor_publication.durable_public_pointer_content_digest = Digest('9');
   EXPECT_THROW(fixture.Begin(foreign), LogicalSceneOwnerConflictError);
   foreign = request;
-  ++foreign.expected_snapshot_identity.revision.revision_id;
-  foreign.expected_active_projection_revision.scene_revision = foreign.expected_snapshot_identity.revision;
+  NameForeignScene(foreign);
   EXPECT_THROW(fixture.Begin(foreign), LogicalSceneOwnerConflictError);
   foreign = request;
   foreign.native_runtime_bindings.pop_back();
@@ -5557,10 +5655,6 @@ TEST(CanonicalEmptySceneOwner,
       core::ProviderManifestId("provider-manifest"),
       core::ProviderManifestRevision(Digest('7').value()),
       "provider-epoch",
-      1U,
-      1000,
-      900,
-      5000,
   };
   core::SceneTransactionRequestDTO freshness{
       SceneRequestContext("scene-request-freshness", projection),
@@ -5591,36 +5685,6 @@ TEST(CanonicalEmptySceneOwner,
 
   auto moved_pose = pose.value();
   moved_pose.position_m.y_m += 0.125;
-  auto stale_evidence = evidence;
-  core::SceneTransactionRequestDTO stale_provider{
-      SceneRequestContext("scene-request-stale-provider", projection),
-      {},
-      projection,
-      core::UpdateObjectPoseRequestDTO{
-          core::SceneResourceId("scene-box"),
-          moved_pose,
-          core::CellSceneFrameRefDTO{admission.cell_id()},
-          stale_evidence,
-          false,
-      },
-      std::nullopt,
-  };
-  const auto stale_provider_result = owner.Commit(stale_provider);
-  ASSERT_FALSE(stale_provider_result.success);
-  ASSERT_TRUE(stale_provider_result.error.has_value());
-  EXPECT_EQ(stale_provider_result.error->code, "scene_object_state_conflict");
-  EXPECT_EQ(stale_provider_result.error->details.at("reason"),
-            "provider_source_sequence_not_increasing");
-  EXPECT_EQ(stale_provider_result.error->details.at(
-                "previous_provider_source_sequence"),
-            "1");
-  EXPECT_EQ(stale_provider_result.error->details.at(
-                "received_provider_source_sequence"),
-            "1");
-
-  auto next_evidence = evidence;
-  next_evidence.provider_source_sequence = 2U;
-  next_evidence.received_at_ns = 1100;
   core::SceneTransactionRequestDTO geometry{
       SceneRequestContext("scene-request-geometry", projection),
       {},
@@ -5629,7 +5693,7 @@ TEST(CanonicalEmptySceneOwner,
           core::SceneResourceId("scene-box"),
           moved_pose,
           core::CellSceneFrameRefDTO{admission.cell_id()},
-          next_evidence,
+          evidence,
           false,
       },
       std::nullopt,
@@ -5668,23 +5732,20 @@ TEST(CanonicalEmptySceneOwner,
             "strict-diagnostics");
 
   // A pose update naming an older revision of this Scene is admitted to its
-  // own identity checks; the provider sequence still refuses this replay.
+  // own identity checks; repeating the committed pose and origin is a no-op.
+  // Observation order is the scene runtime's, not the logical scene's.
   auto stale = geometry;
   stale.request_context.request_id = core::RequestId("scene-request-stale");
-  const auto rejected = owner.Commit(stale);
-  EXPECT_FALSE(rejected.success);
-  ASSERT_TRUE(rejected.error.has_value());
-  EXPECT_EQ(rejected.error->code, "scene_object_state_conflict");
-  EXPECT_EQ(rejected.error->details.at("reason"),
-            "provider_source_sequence_not_increasing");
-  EXPECT_EQ(rejected.projection_status,
-            core::SceneProjectionCommitStatusDTO::kNotAttempted);
-  EXPECT_EQ(owner.VerifyIntegrity().transaction_intent_count, 5);
+  const auto replayed = owner.Commit(stale);
+  ASSERT_TRUE(replayed.success);
+  EXPECT_EQ(replayed.update_status, core::SceneUpdateStatusDTO::kNoOp);
+  EXPECT_EQ(replayed.committed_projection_revision, projection);
+  EXPECT_EQ(owner.VerifyIntegrity().transaction_intent_count, 6);
 }
 
 TEST(CanonicalEmptySceneOwner,
-     IdentityCheckedOperationsAcceptAnOlderRevisionOfTheSameScene) {
-  TemporaryDirectory directory("scene-older-revision");
+     SceneOperationsTakeNoRevisionPrecondition) {
+  TemporaryDirectory directory("scene-no-revision-precondition");
   const auto database = directory.path() / "logical-scene.sqlite3";
   const auto admission = LoadAdmission();
   ControlledPublicationReader publication_reader;
@@ -5728,26 +5789,39 @@ TEST(CanonicalEmptySceneOwner,
       EXPECT_FALSE(result.success);
       return result.error.has_value() ? result.error->code : std::string{};
     };
+    const auto upsert_from = [&](std::string request_id,
+                                 const ProjectionRevisionDTO &expected,
+                                 const core::Pose3DTO &pose) {
+      auto upsert =
+          AddBoxRequest(expected, admission.cell_id(), std::move(request_id));
+      const auto add = std::get<core::AddObjectRequestDTO>(upsert.operation);
+      upsert.operation = core::UpsertObjectRequestDTO{
+          core::SceneResourceId("scene-box-2"), add.shape, pose, add.frame_ref,
+          add.support_contacts};
+      return upsert;
+    };
 
-    // Structural/authoring edits keep their exact predecessor.
-    auto upsert = AddBoxRequest(older, admission.cell_id(),
-                                "scene-request-older-upsert");
-    const auto add = std::get<core::AddObjectRequestDTO>(upsert.operation);
-    upsert.operation = core::UpsertObjectRequestDTO{
-        add.scene_resource_id, add.shape, add.pose, add.frame_ref,
-        add.support_contacts};
-    EXPECT_EQ(stale_code(upsert), "stale_revision");
+    // Ordinary authoring takes no revision precondition either: the last
+    // arrival wins.
+    core::Pose3DTO authored;
+    authored.position_m = {0.25, 0.25, 0.25};
+    const auto authored_upsert = owner.Commit(
+        upsert_from("scene-request-older-upsert", older, authored));
+    ASSERT_TRUE(authored_upsert.success)
+        << (authored_upsert.error.has_value() ? authored_upsert.error->message
+                                              : "");
+    active = *authored_upsert.committed_projection_revision;
 
-    // A revision the owner has not reached, or another Scene, is refused.
-    auto ahead = active;
-    ++ahead.scene_revision.revision_id;
+    // Another Scene, graph or bundle is refused; the revision is not compared.
     auto other_scene = older;
     other_scene.scene_revision.scene_id = core::SceneId(Digest('e').value());
-    auto same_revision_other_content = active;
-    same_revision_other_content.scene_revision.content_hash = Digest('e');
+    auto other_graph = older;
+    other_graph.graph_revision = core::GraphRevision(Digest('d').value());
+    auto other_bundle = older;
+    other_bundle.retained_bundle_id =
+        core::RetainedBundleId(Digest('c').value());
     int foreign_index = 0;
-    for (const auto &foreign :
-         {ahead, other_scene, same_revision_other_content}) {
+    for (const auto &foreign : {other_scene, other_graph, other_bundle}) {
       EXPECT_EQ(stale_code(request(
                     "scene-request-foreign-" + std::to_string(++foreign_index),
                     foreign,
@@ -5755,6 +5829,13 @@ TEST(CanonicalEmptySceneOwner,
                         core::SceneResourceId("scene-box")})),
                 "stale_revision");
     }
+
+    // An older revision, one the owner has not reached, and the same revision
+    // with other content are all accepted.
+    auto ahead = active;
+    ahead.scene_revision.revision_id += 5U;
+    auto same_revision_other_content = active;
+    same_revision_other_content.scene_revision.content_hash = Digest('e');
 
     core::Pose3DTO moved;
     moved.position_m = {1.5, -0.5, 0.75};
@@ -5768,8 +5849,25 @@ TEST(CanonicalEmptySceneOwner,
         << (updated.error.has_value() ? updated.error->message : "");
     EXPECT_EQ(updated.committed_projection_revision->scene_revision.revision_id,
               active.scene_revision.revision_id + 1U);
+
+    // A Program scene node upsert is accepted the same way.
+    core::Pose3DTO declared;
+    declared.position_m = {1.25, -0.25, 0.5};
+    auto node_upsert =
+        upsert_from("scene-request-node-upsert", ahead, declared);
+    node_upsert.program_node_evidence = core::ProgramNodeAdmissionEvidenceDTO{
+        RequestOwnerEpoch("runner.2"),
+        core::ProgramRunId("program.2"),
+        core::CellAdmissionClaimGeneration(9U),
+        "upsert",
+        "upsert:attempt.1",
+        "scene.transaction"};
+    const auto node_upserted = owner.Commit(node_upsert);
+    ASSERT_TRUE(node_upserted.success)
+        << (node_upserted.error.has_value() ? node_upserted.error->message : "");
+
     const auto removed = owner.Commit(request(
-        "scene-request-older-remove", older,
+        "scene-request-other-content-remove", same_revision_other_content,
         core::RemoveObjectRequestDTO{core::SceneResourceId("scene-box")}));
     ASSERT_TRUE(removed.success)
         << (removed.error.has_value() ? removed.error->message : "");
@@ -5778,53 +5876,222 @@ TEST(CanonicalEmptySceneOwner,
     ASSERT_EQ(objects.size(), 1U);
     EXPECT_EQ(objects.front().scene_resource_id,
               core::SceneResourceId("scene-box-2"));
-    EXPECT_EQ(owner.VerifyIntegrity().transaction_intent_count, 4);
+    EXPECT_EQ(owner.VerifyIntegrity().transaction_intent_count, 6);
+
+    // Exact replay of an accepted request is unchanged.
+    const auto replay = owner.Commit(request(
+        "scene-request-older-update", older,
+        core::UpdateObjectPoseRequestDTO{
+            core::SceneResourceId("scene-box-2"), moved,
+            core::CellSceneFrameRefDTO{admission.cell_id()}, std::nullopt,
+            false}));
+    EXPECT_TRUE(replay.success);
+    EXPECT_EQ(replay.replay_status,
+              core::RequestReplayStatusDTO::kReplayedExact);
   }
 
-  // The durable intents of older-revision requests reconstruct after restart.
+  // The durable intents of requests naming another revision reconstruct after
+  // restart.
   LogicalSceneOwner restarted(database, admission, publication_reader,
                               cell_admission);
   EXPECT_EQ(restarted.CurrentProjectionRevision(), active);
-  EXPECT_EQ(restarted.VerifyIntegrity().transaction_intent_count, 4);
+  EXPECT_EQ(restarted.VerifyIntegrity().transaction_intent_count, 6);
   const auto pose = restarted.GetObjectPose(core::SceneResourceId("scene-box-2"));
   ASSERT_TRUE(pose.ok());
-  EXPECT_DOUBLE_EQ(pose.value().position_m.x_m, 1.5);
+  EXPECT_DOUBLE_EQ(pose.value().position_m.x_m, 1.25);
 }
 
-TEST(CanonicalEmptySceneOwner, LongServiceProviderEvidenceSurvivesRealJournalRestart) {
+// Rewrites a current store into the v9 provider-evidence format. Every
+// provider evidence also carries the retired observation fields; each content
+// hash of a snapshot with evidence and each pose-update request digest gets a
+// stand-in legacy value, since v9 hashed those fields. Conversion never
+// verifies old hashes, so stand-ins exercise exactly the v9 -> v10 path.
+void RewriteAsV9ProviderEvidenceStore(const std::filesystem::path &path) {
+  sqlite3 *database = nullptr;
+  Require(sqlite3_open_v2(path.c_str(), &database,
+                          SQLITE_OPEN_READWRITE | SQLITE_OPEN_FULLMUTEX,
+                          nullptr) == SQLITE_OK,
+          "cannot open the test store");
+  const auto rows = [&](const std::string &sql) {
+    std::vector<std::pair<std::string, std::string>> result;
+    sqlite3_stmt *statement = nullptr;
+    Require(sqlite3_prepare_v2(database, sql.c_str(), -1, &statement,
+                               nullptr) == SQLITE_OK,
+            "cannot prepare test SQL");
+    while (sqlite3_step(statement) == SQLITE_ROW) {
+      result.emplace_back(
+          reinterpret_cast<const char *>(sqlite3_column_text(statement, 0)),
+          reinterpret_cast<const char *>(sqlite3_column_text(statement, 1)));
+    }
+    sqlite3_finalize(statement);
+    return result;
+  };
+  const auto exec = [&](const std::string &sql,
+                        const std::vector<std::string> &values) {
+    sqlite3_stmt *statement = nullptr;
+    Require(sqlite3_prepare_v2(database, sql.c_str(), -1, &statement,
+                               nullptr) == SQLITE_OK,
+            "cannot prepare test SQL");
+    for (std::size_t index = 0U; index < values.size(); ++index) {
+      sqlite3_bind_text(statement, static_cast<int>(index + 1U),
+                        values[index].c_str(), -1, SQLITE_TRANSIENT);
+    }
+    Require(sqlite3_step(statement) == SQLITE_DONE, "test SQL failed");
+    sqlite3_finalize(statement);
+  };
+  exec("BEGIN IMMEDIATE", {});
+  const auto triggers =
+      rows("SELECT name,sql FROM sqlite_master WHERE type='trigger'");
+  for (const auto &trigger : triggers) {
+    exec("DROP TRIGGER " + trigger.first, {});
+  }
+  const std::string identity_end =
+      "\"provider_source_epoch\":\"provider-epoch\"}";
+  const std::string legacy_end =
+      "\"provider_source_epoch\":\"provider-epoch\","
+      "\"provider_source_sequence\":7,\"received_at_ns\":1000,"
+      "\"source_freshness_budget_ns\":2000000000,\"source_timestamp_ns\":900}";
+  const auto legacy = [](const std::string &value) {
+    return manyforge::content_identity::sha256_digest("v9:" + value);
+  };
+  const auto hashes = rows(
+      "SELECT proposed_scene_content_hash,'' FROM "
+      "logical_scene_transaction_intents WHERE candidate_snapshot_json LIKE "
+      "'%\"provider_evidence\":{%'");
+  Require(!hashes.empty(), "test store has no snapshot with evidence");
+  const auto digests = rows(
+      "SELECT request_digest,'' FROM logical_scene_transaction_intents WHERE "
+      "request_json LIKE '%\"provider_evidence\":{%'");
+  Require(!digests.empty(), "test store has no request with evidence");
+  for (const auto &column :
+       {"candidate_snapshot_json", "request_json", "resolved_operation_json"}) {
+    exec(std::string("UPDATE logical_scene_transaction_intents SET ") +
+             column + "=replace(" + column + ",?,?)",
+         {identity_end, legacy_end});
+  }
+  for (const auto &row : hashes) {
+    const auto &hash = row.first;
+    for (const auto &column :
+         {"candidate_snapshot_json", "request_json", "prior_scene_content_hash",
+          "proposed_scene_content_hash"}) {
+      exec(std::string("UPDATE logical_scene_transaction_intents SET ") +
+               column + "=replace(" + column + ",?,?)",
+           {hash, legacy(hash)});
+    }
+    exec("UPDATE logical_scene_projection_results SET "
+         "acknowledged_scene_content_hash=? WHERE "
+         "acknowledged_scene_content_hash=?",
+         {legacy(hash), hash});
+  }
+  for (const auto &row : digests) {
+    const auto &digest = row.first;
+    for (const auto &table :
+         {"logical_scene_transaction_intents", "logical_scene_request_outcomes"}) {
+      exec(std::string("UPDATE ") + table +
+               " SET request_digest=? WHERE request_digest=?",
+           {legacy(digest), digest});
+    }
+  }
+  for (const auto &trigger : triggers) {
+    exec(trigger.second, {});
+  }
+  exec("PRAGMA user_version = 9", {});
+  exec("COMMIT", {});
+  sqlite3_close(database);
+}
+
+TEST(CanonicalEmptySceneOwner, ConvertsV9ProviderEvidenceStoreOnOpen) {
   TemporaryDirectory directory;
   const auto database = directory.path() / "logical-scene.sqlite3";
   const auto admission = LoadAdmission();
   ControlledPublicationReader publication_reader;
   TestCellAdmissionPort cell_admission;
-  constexpr std::int64_t years31 = 31LL * 366 * 86400 * 1000000000;
-  core::SceneObjectProviderEvidenceDTO evidence{
+  const core::SceneObjectProviderEvidenceDTO evidence{
       core::ProviderInstanceId("provider-instance"),
       core::ProviderManifestId("provider-manifest"),
       core::ProviderManifestRevision(Digest('7').value()),
-      "provider-epoch", 1U, years31 + 1, years31 - 1, 5000,
+      "provider-epoch",
   };
+  const auto pose_update = [&](LogicalSceneOwner &owner,
+                               const std::string &request_id,
+                               const double x_m) {
+    const auto projection = owner.CurrentProjectionRevision();
+    auto pose = owner.GetObjectPose(core::SceneResourceId("scene-box"));
+    Require(pose.ok(), "test box has no pose");
+    pose.value().position_m.x_m = x_m;
+    return owner.Commit(core::SceneTransactionRequestDTO{
+        SceneRequestContext(request_id, projection), {}, projection,
+        core::UpdateObjectPoseRequestDTO{
+            core::SceneResourceId("scene-box"), pose.value(),
+            core::CellSceneFrameRefDTO{admission.cell_id()}, evidence, false},
+        std::nullopt});
+  };
+  ProjectionRevisionDTO expected_projection;
+  std::optional<core::LogicalSceneSnapshotDTO> expected_snapshot;
   {
-    LogicalSceneOwner owner(database, admission, publication_reader, cell_admission);
-    const auto bootstrap = FinalizeCanonicalBootstrap(owner, publication_reader, admission);
-    const auto added = owner.Commit(AddBoxRequest(bootstrap.canonical_empty_target, admission.cell_id()));
-    ASSERT_TRUE(added.success);
-    const auto projection = *added.committed_projection_revision;
-    const auto pose = owner.GetObjectPose(core::SceneResourceId("scene-box"));
-    ASSERT_TRUE(pose.ok());
-    core::SceneTransactionRequestDTO request{
-        SceneRequestContext("scene-request-long-clock", projection), {}, projection,
-        core::UpdateObjectPoseRequestDTO{core::SceneResourceId("scene-box"), pose.value(),
-            core::CellSceneFrameRefDTO{admission.cell_id()}, evidence, false}, std::nullopt,
-    };
-    const auto committed = owner.Commit(request);
-    ASSERT_TRUE(committed.success) << (committed.error ? committed.error->message : "missing error");
-    EXPECT_EQ(owner.GetObjectState(core::SceneResourceId("scene-box")).provider_evidence, evidence);
-    EXPECT_EQ(owner.VerifyIntegrity().transaction_intent_count, 2);
+    LogicalSceneOwner owner(database, admission, publication_reader,
+                            cell_admission);
+    const auto bootstrap =
+        FinalizeCanonicalBootstrap(owner, publication_reader, admission);
+    ASSERT_TRUE(owner
+                    .Commit(AddBoxRequest(bootstrap.canonical_empty_target,
+                                          admission.cell_id()))
+                    .success);
+    ASSERT_TRUE(pose_update(owner, "scene-request-observed-1", 0.5).success);
+    ASSERT_TRUE(pose_update(owner, "scene-request-observed-2", 0.75).success);
+    expected_projection = owner.CurrentProjectionRevision();
+    expected_snapshot.emplace(*owner.LogicalSnapshot());
+    owner.Close();
   }
-  LogicalSceneOwner replacement(database, admission, publication_reader, cell_admission);
-  EXPECT_EQ(replacement.GetObjectState(core::SceneResourceId("scene-box")).provider_evidence, evidence);
-  EXPECT_EQ(replacement.VerifyIntegrity().transaction_intent_count, 2);
+  RewriteAsV9ProviderEvidenceStore(database);
+  const auto retired_field_rows = [&] {
+    sqlite3 *raw = nullptr;
+    Require(sqlite3_open_v2(database.c_str(), &raw, SQLITE_OPEN_READONLY,
+                            nullptr) == SQLITE_OK,
+            "cannot open the test store");
+    sqlite3_stmt *statement = nullptr;
+    Require(sqlite3_prepare_v2(
+                raw,
+                "SELECT count(*) FROM logical_scene_transaction_intents WHERE "
+                "candidate_snapshot_json LIKE '%provider_source_sequence%' OR "
+                "request_json LIKE '%provider_source_sequence%' OR "
+                "resolved_operation_json LIKE '%provider_source_sequence%'",
+                -1, &statement, nullptr) == SQLITE_OK &&
+                sqlite3_step(statement) == SQLITE_ROW,
+            "cannot count retired fields");
+    const auto count = sqlite3_column_int64(statement, 0);
+    sqlite3_finalize(statement);
+    sqlite3_close(raw);
+    return count;
+  };
+  ASSERT_GT(retired_field_rows(), 0);
+
+  {
+    LogicalSceneOwner converted(database, admission, publication_reader,
+                                cell_admission);
+    const auto integrity = converted.VerifyIntegrity();
+    EXPECT_EQ(integrity.schema_version, kLogicalSceneStoreSchemaVersion);
+    EXPECT_EQ(integrity.transaction_intent_count, 3);
+    EXPECT_EQ(converted.CurrentProjectionRevision(), expected_projection);
+    EXPECT_TRUE(*converted.LogicalSnapshot() == *expected_snapshot);
+    EXPECT_EQ(converted.GetObjectState(core::SceneResourceId("scene-box"))
+                  .provider_evidence,
+              evidence);
+    EXPECT_EQ(retired_field_rows(), 0);
+
+    // Later commits work on the converted store.
+    const auto moved = pose_update(converted, "scene-request-observed-3", 1.0);
+    ASSERT_TRUE(moved.success)
+        << (moved.error.has_value() ? moved.error->message : "missing error");
+    EXPECT_EQ(moved.update_status,
+              core::SceneUpdateStatusDTO::kGeometryChanged);
+    expected_projection = converted.CurrentProjectionRevision();
+    converted.Close();
+  }
+  LogicalSceneOwner reopened(database, admission, publication_reader,
+                             cell_admission);
+  EXPECT_EQ(reopened.CurrentProjectionRevision(), expected_projection);
+  EXPECT_EQ(reopened.VerifyIntegrity().transaction_intent_count, 4);
 }
 
 TEST(CanonicalEmptySceneOwner,
@@ -6212,24 +6479,6 @@ public:
     return committed_evidence_;
   }
 
-  [[nodiscard]] core::SceneObjectProviderEvidenceDTO
-  Evidence(const std::uint64_t sequence,
-           const std::int64_t received_at_ns) const {
-    auto evidence = committed_evidence_;
-    evidence.provider_source_sequence = sequence;
-    evidence.received_at_ns = received_at_ns;
-    evidence.source_timestamp_ns = received_at_ns - 100;
-    return evidence;
-  }
-
-  [[nodiscard]] core::ProviderFreshnessConfirmationDTO
-  Confirmation(const std::uint64_t sequence,
-               const std::int64_t received_at_ns) {
-    return {owner_.CurrentProjectionRevision(),
-            core::SceneResourceId("scene-box"), pose_,
-            Evidence(sequence, received_at_ns)};
-  }
-
   [[nodiscard]] core::SceneTransactionRequestDTO
   PoseUpdate(std::string request_id,
              const core::SceneObjectProviderEvidenceDTO &evidence) {
@@ -6279,134 +6528,8 @@ private:
       core::ProviderManifestId("provider-manifest"),
       core::ProviderManifestRevision(Digest('7').value()),
       "provider-epoch",
-      1U,
-      1000,
-      900,
-      5000,
   };
 };
-
-void ExpectNoDurableSceneEffect(
-    const CanonicalEmptySceneStoreIntegrityReport &before,
-    const CanonicalEmptySceneStoreIntegrityReport &after) {
-  EXPECT_EQ(after.transaction_intent_count, before.transaction_intent_count);
-  EXPECT_EQ(after.request_outcome_count, before.request_outcome_count);
-  EXPECT_EQ(after.owner_event_count, before.owner_event_count);
-  EXPECT_EQ(after.projection_attempt_count, before.projection_attempt_count);
-  EXPECT_EQ(after.projection_result_count, before.projection_result_count);
-}
-
-TEST(CanonicalEmptySceneOwnerProviderFreshness,
-     ConfirmationFansOutWithoutAnOwnerTransactionOrRevision) {
-  ProviderFreshnessScene scene;
-  auto &owner = scene.owner();
-  const auto revision = owner.CurrentProjectionRevision();
-  const auto epoch = owner.CurrentRequestOwnerEpoch();
-  const auto transaction_sequence =
-      owner.LogicalSnapshot()->transaction_sequence;
-  const auto integrity = owner.VerifyIntegrity();
-
-  const auto confirmation = scene.Confirmation(2U, 1250);
-  const auto confirmed = owner.ConfirmProviderFreshness(confirmation);
-  ASSERT_TRUE(confirmed.ok())
-      << confirmed.error().code << ": " << confirmed.error().message;
-  EXPECT_EQ(confirmed.value(), revision);
-  EXPECT_EQ(owner.CurrentProjectionRevision(), revision);
-  EXPECT_EQ(owner.CurrentRequestOwnerEpoch(), epoch);
-  EXPECT_EQ(owner.LogicalSnapshot()->transaction_sequence,
-            transaction_sequence);
-  EXPECT_EQ(owner.GetObjectState(core::SceneResourceId("scene-box"))
-                .provider_evidence,
-            scene.committed_evidence());
-  ExpectNoDurableSceneEffect(integrity, owner.VerifyIntegrity());
-  for (const auto &projection : scene.projections()) {
-    EXPECT_TRUE(projection->transactions().empty());
-    ASSERT_EQ(projection->freshness_confirmations().size(), 1U);
-    const auto &received = projection->freshness_confirmations().front();
-    EXPECT_EQ(received.expected_projection_revision, revision);
-    EXPECT_EQ(received.scene_resource_id,
-              core::SceneResourceId("scene-box"));
-    EXPECT_EQ(received.pose_in_cell, confirmation.pose_in_cell);
-    EXPECT_EQ(received.evidence, confirmation.evidence);
-  }
-}
-
-TEST(CanonicalEmptySceneOwnerProviderFreshness,
-     RejectedConfirmationsRecordNothing) {
-  ProviderFreshnessScene scene;
-  auto &owner = scene.owner();
-  const auto initial_revision = owner.CurrentProjectionRevision();
-  ASSERT_TRUE(owner.ConfirmProviderFreshness(scene.Confirmation(5U, 1500)).ok());
-  const auto integrity = owner.VerifyIntegrity();
-
-  const auto expect_rejected =
-      [&](const core::ProviderFreshnessConfirmationDTO &confirmation,
-          const std::string_view code, const std::string_view reason) {
-        const auto rejected = owner.ConfirmProviderFreshness(confirmation);
-        ASSERT_FALSE(rejected.ok());
-        EXPECT_EQ(rejected.error().code, code);
-        if (!reason.empty()) {
-          EXPECT_EQ(rejected.error().details.at("reason"), reason);
-        }
-      };
-
-  expect_rejected(scene.Confirmation(5U, 1500), "scene_object_state_conflict",
-                  "provider_freshness_sequence_not_increasing");
-  expect_rejected(scene.Confirmation(4U, 1600), "scene_object_state_conflict",
-                  "provider_freshness_sequence_not_increasing");
-  expect_rejected(scene.Confirmation(6U, 1400), "scene_object_state_conflict",
-                  "provider_freshness_received_at_regressed");
-
-  auto moved = scene.Confirmation(6U, 1600);
-  moved.pose_in_cell.position_m.y_m += 0.125;
-  expect_rejected(moved, "scene_object_state_conflict",
-                  "provider_freshness_pose_changed");
-
-  auto other_origin = scene.Confirmation(6U, 1600);
-  other_origin.evidence.provider_source_epoch = "provider-epoch-restarted";
-  expect_rejected(other_origin, "scene_object_state_conflict",
-                  "provider_freshness_origin_changed");
-
-  auto other_budget = scene.Confirmation(6U, 1600);
-  other_budget.evidence.source_freshness_budget_ns = 6000;
-  expect_rejected(other_budget, "scene_object_state_conflict",
-                  "provider_freshness_budget_changed");
-
-  auto missing = scene.Confirmation(6U, 1600);
-  missing.scene_resource_id = core::SceneResourceId("missing-object");
-  expect_rejected(missing, "object_not_found", {});
-
-  auto wrong_projection = scene.Confirmation(6U, 1600);
-  auto stale_projection = initial_revision;
-  stale_projection.scene_revision.revision_id += 1U;
-  wrong_projection.expected_projection_revision = stale_projection;
-  expect_rejected(wrong_projection, "stale_revision", {});
-
-  for (const auto &projection : scene.projections()) {
-    EXPECT_EQ(projection->freshness_attempts(), 1U);
-    ASSERT_EQ(projection->freshness_confirmations().size(), 1U);
-    EXPECT_EQ(projection->freshness_confirmations()
-                  .front()
-                  .evidence.provider_source_sequence,
-              5U);
-  }
-  // The accepted sequence 5 still bounds replays; none of the rejected
-  // sequence-6 confirmations was recorded.
-  expect_rejected(scene.Confirmation(5U, 1600), "scene_object_state_conflict",
-                  "provider_freshness_sequence_not_increasing");
-  ASSERT_TRUE(owner.ConfirmProviderFreshness(scene.Confirmation(6U, 1600)).ok());
-  expect_rejected(scene.Confirmation(6U, 1600), "scene_object_state_conflict",
-                  "provider_freshness_sequence_not_increasing");
-  for (const auto &projection : scene.projections()) {
-    ASSERT_EQ(projection->freshness_confirmations().size(), 2U);
-    EXPECT_EQ(projection->freshness_confirmations()
-                  .back()
-                  .evidence.provider_source_sequence,
-              6U);
-  }
-  EXPECT_EQ(owner.CurrentProjectionRevision(), initial_revision);
-  ExpectNoDurableSceneEffect(integrity, owner.VerifyIntegrity());
-}
 
 TEST(CanonicalEmptySceneOwnerProviderFreshness,
      ContinuousPoseUpdatePreservesAttachmentAndUsesCurrentCarrier) {
@@ -6468,7 +6591,7 @@ TEST(CanonicalEmptySceneOwnerProviderFreshness,
   const auto apply = [&](const std::string &id, const double x,
                          const bool require_detached) {
     const auto expected = owner.CurrentProjectionRevision();
-    auto evidence = scene.Confirmation(2U, 1250).evidence;
+    const auto &evidence = scene.committed_evidence();
     return owner.Commit(core::SceneTransactionRequestDTO{
         SceneRequestContext(id, expected),
         {},
@@ -6501,7 +6624,7 @@ TEST(CanonicalEmptySceneOwnerProviderFreshness,
   EXPECT_TRUE(
       owner.GetObjectState(core::SceneResourceId("carried-box")).attached);
   const auto current = owner.CurrentProjectionRevision();
-  auto evidence = scene.Confirmation(3U, 1300).evidence;
+  const auto &evidence = scene.committed_evidence();
   const auto unchanged = owner.Commit(core::SceneTransactionRequestDTO{
       SceneRequestContext("continuous-attached-freshness", current),
       {},
@@ -6511,8 +6634,7 @@ TEST(CanonicalEmptySceneOwnerProviderFreshness,
           core::CellSceneFrameRefDTO{scene.cell_id()}, evidence, std::nullopt},
       std::nullopt});
   ASSERT_TRUE(unchanged.success) << unchanged.error->message;
-  EXPECT_EQ(unchanged.update_status,
-            core::SceneUpdateStatusDTO::kFreshnessOnly);
+  EXPECT_EQ(unchanged.update_status, core::SceneUpdateStatusDTO::kNoOp);
   const auto revision = owner.CurrentProjectionRevision();
   const auto authored = owner.Commit(core::SceneTransactionRequestDTO{
       SceneRequestContext("authored-attached-pose", revision),
@@ -6532,8 +6654,7 @@ TEST(CanonicalEmptySceneOwnerProviderFreshness,
 
   // A pose in the attachment's own carrier frame is the carried offset.
   const auto carrier_update = [&](const std::string &id,
-                                  const core::SceneTransactionFrameRefDTO &frame,
-                                  const std::uint64_t sequence) {
+                                  const core::SceneTransactionFrameRefDTO &frame) {
     const auto expected = owner.CurrentProjectionRevision();
     return owner.Commit(core::SceneTransactionRequestDTO{
         SceneRequestContext(id, expected),
@@ -6542,15 +6663,12 @@ TEST(CanonicalEmptySceneOwnerProviderFreshness,
         core::UpdateObjectPoseRequestDTO{
             core::SceneResourceId("carried-box"),
             core::Pose3DTO{{0.5, 0.0, 0.1}, {0, 0, 0, 1}}, frame,
-            scene.Confirmation(sequence,
-                               1300 + 100 * static_cast<std::int64_t>(sequence))
-                .evidence,
-            true},
+            scene.committed_evidence(), true},
         std::nullopt});
   };
   const auto carrier_frame =
       core::ToSceneTransactionFrameRef(before.carrier_frame_ref);
-  const auto relative = carrier_update("carrier-frame-offset", carrier_frame, 4U);
+  const auto relative = carrier_update("carrier-frame-offset", carrier_frame);
   ASSERT_TRUE(relative.success) << relative.error->message;
   const auto offset =
       owner.LogicalSnapshot()->carried_object_attachments.front();
@@ -6561,22 +6679,21 @@ TEST(CanonicalEmptySceneOwnerProviderFreshness,
   ASSERT_TRUE(carried.ok());
   EXPECT_DOUBLE_EQ(carried.value().position_m.x_m, 1.5);
   EXPECT_DOUBLE_EQ(carried.value().position_m.z_m, 3.1);
-  const auto same = carrier_update("carrier-frame-freshness", carrier_frame, 5U);
+  const auto same = carrier_update("carrier-frame-unchanged", carrier_frame);
   ASSERT_TRUE(same.success) << same.error->message;
-  EXPECT_EQ(same.update_status, core::SceneUpdateStatusDTO::kFreshnessOnly);
+  EXPECT_EQ(same.update_status, core::SceneUpdateStatusDTO::kNoOp);
   const auto foreign = carrier_update(
       "carrier-frame-foreign",
       core::ComponentSceneFrameRefDTO{core::ControllableComponentId("component.1"),
                                       core::ModelInstanceId("model.1"),
-                                      core::FrameRoleId("other_frame")},
-      6U);
+                                      core::FrameRoleId("other_frame")});
   ASSERT_FALSE(foreign.success);
   EXPECT_EQ(foreign.error->code, "missing_reference");
   scene.VerifyRestart();
 }
 
 TEST(CanonicalEmptySceneOwnerProviderFreshness,
-     AttachedObjectCannotBeConfirmed) {
+     AttachKeepsGraspLostBoundWithAttachTimeOffset) {
   ProviderFreshnessScene scene;
   auto &owner = scene.owner();
   const core::ComponentAttachmentRevision structural_revision(
@@ -6587,182 +6704,79 @@ TEST(CanonicalEmptySceneOwnerProviderFreshness,
         {structural_revision});
   }
   auto add = AddBoxRequest(owner.CurrentProjectionRevision(), scene.cell_id(),
-                           "scene-request-freshness-carried-add");
+                           "scene-request-grasp-bound-add");
   auto &added_object = std::get<core::AddObjectRequestDTO>(add.operation);
   added_object.scene_resource_id = core::SceneResourceId("carried-box");
-  added_object.frame_ref = core::ComponentSceneFrameRefDTO{
-      core::ControllableComponentId("component.1"),
-      core::ModelInstanceId("model.1"), core::FrameRoleId("tool_frame")};
-  const auto added = owner.Commit(add);
-  ASSERT_TRUE(added.success)
-      << (added.error.has_value() ? added.error->message : "missing error");
-  for (auto &participant : scene.projections()) {
-    participant->SetResolvedFrameRoleOverride(
-        core::FrameRoleId("asset_tool_frame"));
-  }
-  const auto active = owner.CurrentProjectionRevision();
-  core::SceneTransactionRequestDTO attach{
-      SceneRequestContext("scene-request-freshness-attach", active),
-      {},
-      active,
-      core::AttachCarriedObjectRequestDTO{
-          core::CarriedObjectAttachmentId("attachment.1"),
-          core::SceneResourceId("carried-box"),
-          core::ControllableComponentId("component.1"),
-          core::CommandTargetId("arm"),
-          core::FrameRoleId("tool_frame"),
-          {core::CollisionBodyRoleId("finger")},
-          {structural_revision},
-      },
-      core::AdmissionGeneration(1U),
+  added_object.pose = core::Pose3DTO{{1.5, 2.0, 3.25}, {0, 0, 0, 1}};
+  ASSERT_TRUE(owner.Commit(add).success);
+  const auto attach_with = [&](const std::string &id,
+                               const core::CarriedObjectGraspLostBoundDTO &bound) {
+    const auto active = owner.CurrentProjectionRevision();
+    core::SceneTransactionRequestDTO attach{
+        SceneRequestContext(id, active),
+        {},
+        active,
+        core::AttachCarriedObjectRequestDTO{
+            core::CarriedObjectAttachmentId("attachment.1"),
+            core::SceneResourceId("carried-box"),
+            core::ControllableComponentId("component.1"),
+            core::CommandTargetId("arm"),
+            core::FrameRoleId("tool_frame"),
+            {core::CollisionBodyRoleId("finger")},
+            {structural_revision},
+            bound,
+        },
+        core::AdmissionGeneration(1U),
+    };
+    attach.program_node_evidence = core::ProgramNodeAdmissionEvidenceDTO{
+        RequestOwnerEpoch("runner.2"),
+        core::ProgramRunId("program.2"),
+        core::CellAdmissionClaimGeneration(9U),
+        "attach",
+        "attach:attempt.1",
+        "scene.carried_attachment"};
+    return owner.Commit(attach);
   };
-  attach.program_node_evidence = core::ProgramNodeAdmissionEvidenceDTO{
-      RequestOwnerEpoch("runner.2"),
-      core::ProgramRunId("program.2"),
-      core::CellAdmissionClaimGeneration(9U),
-      "attach",
-      "attach:attempt.1",
-      "scene.carried_attachment"};
-  const auto attached = owner.Commit(attach);
+  const auto invalid = attach_with("grasp-bound-invalid", {0.0, 0.26});
+  ASSERT_FALSE(invalid.success);
+  EXPECT_FALSE(
+      owner.GetObjectState(core::SceneResourceId("carried-box")).attached);
+
+  const auto attached = attach_with("grasp-bound-attach", {0.03, 0.26});
   ASSERT_TRUE(attached.success)
       << (attached.error.has_value() ? attached.error->message
                                      : "missing error");
-  ASSERT_TRUE(owner.GetObjectState(core::SceneResourceId("carried-box"))
-                  .attached);
+  const core::Pose3DTO attach_offset{{0.5, 0.0, 0.25}, {0, 0, 0, 1}};
+  const auto row = owner.LogicalSnapshot()->carried_object_attachments.front();
+  EXPECT_EQ(row.pose_in_carrier_frame, attach_offset);
+  ASSERT_TRUE(row.grasp_lost_check.has_value());
+  EXPECT_EQ(row.grasp_lost_check->bound,
+            (core::CarriedObjectGraspLostBoundDTO{0.03, 0.26}));
+  EXPECT_EQ(row.grasp_lost_check->attach_pose_in_carrier_frame, attach_offset);
 
-  const auto integrity = owner.VerifyIntegrity();
-  auto confirmation = scene.Confirmation(2U, 1250);
-  confirmation.scene_resource_id = core::SceneResourceId("carried-box");
-  const auto rejected = owner.ConfirmProviderFreshness(confirmation);
-  ASSERT_FALSE(rejected.ok());
-  EXPECT_EQ(rejected.error().code, "scene_object_state_conflict");
-  EXPECT_EQ(rejected.error().details.at("reason"),
-            "provider_freshness_object_attached");
-  for (const auto &projection : scene.projections()) {
-    EXPECT_TRUE(projection->freshness_confirmations().empty());
-  }
-  ExpectNoDurableSceneEffect(integrity, owner.VerifyIntegrity());
+  // A measured update moves the offset; the attach-time offset stays.
+  const auto expected = owner.CurrentProjectionRevision();
+  const auto updated = owner.Commit(core::SceneTransactionRequestDTO{
+      SceneRequestContext("grasp-bound-update", expected),
+      {},
+      expected,
+      core::UpdateObjectPoseRequestDTO{
+          core::SceneResourceId("carried-box"),
+          core::Pose3DTO{{0.51, 0.0, 0.25}, {0, 0, 0, 1}},
+          core::ToSceneTransactionFrameRef(row.carrier_frame_ref),
+          scene.committed_evidence(), true},
+      std::nullopt});
+  ASSERT_TRUE(updated.success) << updated.error->message;
+  const auto moved = owner.LogicalSnapshot()->carried_object_attachments.front();
+  EXPECT_DOUBLE_EQ(moved.pose_in_carrier_frame.position_m.x_m, 0.51);
+  EXPECT_EQ(moved.grasp_lost_check, row.grasp_lost_check);
+  scene.VerifyRestart();
 }
 
 TEST(CanonicalEmptySceneOwnerProviderFreshness,
-     ConfirmationsDoNotCountTowardTheTransactionCap) {
+     HistoryCompactionIsTransparentToCallers) {
   ProviderFreshnessScene scene;
   auto &owner = scene.owner();
-  const auto revision = owner.CurrentProjectionRevision();
-  const auto epoch = owner.CurrentRequestOwnerEpoch();
-  const auto integrity = owner.VerifyIntegrity();
-  constexpr std::uint64_t kConfirmations = 300U;
-  for (std::uint64_t sequence = 2U; sequence < 2U + kConfirmations;
-       ++sequence) {
-    const auto confirmed = owner.ConfirmProviderFreshness(scene.Confirmation(
-        sequence, 1000 + static_cast<std::int64_t>(sequence)));
-    ASSERT_TRUE(confirmed.ok())
-        << sequence << " " << confirmed.error().code << ": "
-        << confirmed.error().message;
-  }
-  EXPECT_EQ(owner.CurrentProjectionRevision(), revision);
-  EXPECT_EQ(owner.CurrentRequestOwnerEpoch(), epoch);
-  ExpectNoDurableSceneEffect(integrity, owner.VerifyIntegrity());
-  for (const auto &projection : scene.projections()) {
-    EXPECT_EQ(projection->freshness_confirmations().size(), kConfirmations);
-  }
-
-  const auto committed = owner.Commit(scene.PoseUpdate(
-      "scene-request-freshness-after-cap", scene.Evidence(400U, 5000)));
-  ASSERT_TRUE(committed.success)
-      << (committed.error.has_value() ? committed.error->message
-                                      : "missing error");
-  EXPECT_EQ(committed.replay_status,
-            core::RequestReplayStatusDTO::kAcceptedNew);
-  EXPECT_EQ(owner.CurrentRequestOwnerEpoch(), epoch);
-}
-
-TEST(CanonicalEmptySceneOwnerProviderFreshness,
-     OnlyACommitTouchingTheObjectClearsItsConfirmation) {
-  ProviderFreshnessScene scene;
-  auto &owner = scene.owner();
-  ASSERT_TRUE(
-      owner.ConfirmProviderFreshness(scene.Confirmation(10U, 2000)).ok());
-
-  // A commit to a different object keeps the confirmation record.
-  auto other = AddBoxRequest(owner.CurrentProjectionRevision(),
-                             scene.cell_id(), "scene-request-freshness-other");
-  std::get<core::AddObjectRequestDTO>(other.operation).scene_resource_id =
-      core::SceneResourceId("other-box");
-  const auto unrelated = owner.Commit(other);
-  ASSERT_TRUE(unrelated.success)
-      << (unrelated.error.has_value() ? unrelated.error->message
-                                      : "missing error");
-  const auto after_unrelated = *unrelated.committed_projection_revision;
-  const auto replay = owner.ConfirmProviderFreshness(scene.Confirmation(10U, 2000));
-  ASSERT_FALSE(replay.ok());
-  EXPECT_EQ(replay.error().details.at("reason"),
-            "provider_freshness_sequence_not_increasing");
-  // The record itself (received_at 2000) still applies.
-  const auto regressed =
-      owner.ConfirmProviderFreshness(scene.Confirmation(11U, 1500));
-  ASSERT_FALSE(regressed.ok());
-  EXPECT_EQ(regressed.error().details.at("reason"),
-            "provider_freshness_received_at_regressed");
-  const auto integrity = owner.VerifyIntegrity();
-  const auto next = owner.ConfirmProviderFreshness(scene.Confirmation(11U, 2100));
-  ASSERT_TRUE(next.ok()) << next.error().code << ": " << next.error().message;
-  EXPECT_EQ(next.value(), after_unrelated);
-  EXPECT_EQ(owner.CurrentProjectionRevision(), after_unrelated);
-  ExpectNoDurableSceneEffect(integrity, owner.VerifyIntegrity());
-
-  // The accepted confirmation also bounds committed same-origin evidence.
-  const auto replayed_commit = owner.Commit(scene.PoseUpdate(
-      "scene-request-freshness-replayed-commit", scene.Evidence(5U, 2500)));
-  ASSERT_FALSE(replayed_commit.success);
-  ASSERT_TRUE(replayed_commit.error.has_value());
-  EXPECT_EQ(replayed_commit.error->code, "scene_object_state_conflict");
-  EXPECT_EQ(replayed_commit.error->details.at("reason"),
-            "provider_source_sequence_not_increasing");
-  EXPECT_EQ(replayed_commit.error->details.at(
-                "previous_provider_source_sequence"),
-            "11");
-  EXPECT_EQ(replayed_commit.error->details.at(
-                "received_provider_source_sequence"),
-            "5");
-  EXPECT_EQ(owner.CurrentProjectionRevision(), after_unrelated);
-
-  // Commit semantics are otherwise unchanged: newer evidence for the same
-  // pose commits as freshness-only and advances SceneRevision, superseding
-  // the record. Its received_at deliberately precedes the confirmation's.
-  const auto committed = owner.Commit(scene.PoseUpdate(
-      "scene-request-freshness-recommit", scene.Evidence(12U, 2050)));
-  ASSERT_TRUE(committed.success)
-      << (committed.error.has_value() ? committed.error->message
-                                      : "missing error");
-  EXPECT_EQ(committed.update_status,
-            core::SceneUpdateStatusDTO::kFreshnessOnly);
-  ASSERT_TRUE(committed.committed_projection_revision.has_value());
-  EXPECT_NE(*committed.committed_projection_revision, after_unrelated);
-  EXPECT_EQ(owner.GetObjectState(core::SceneResourceId("scene-box"))
-                .provider_evidence,
-            scene.Evidence(12U, 2050));
-
-  // Cleared: the cleared record (received_at 2100) no longer bounds the
-  // next confirmation; only the committed evidence and watermark do.
-  const auto fresh =
-      owner.ConfirmProviderFreshness(scene.Confirmation(13U, 2060));
-  ASSERT_TRUE(fresh.ok()) << fresh.error().code << ": "
-                          << fresh.error().message;
-  EXPECT_EQ(fresh.value(), *committed.committed_projection_revision);
-  const auto fresh_replay =
-      owner.ConfirmProviderFreshness(scene.Confirmation(13U, 2060));
-  ASSERT_FALSE(fresh_replay.ok());
-  EXPECT_EQ(fresh_replay.error().details.at("reason"),
-            "provider_freshness_sequence_not_increasing");
-}
-
-TEST(CanonicalEmptySceneOwnerProviderFreshness,
-     HistoryCompactionKeepsTheRecordAndTheReplayWatermark) {
-  ProviderFreshnessScene scene;
-  auto &owner = scene.owner();
-  ASSERT_TRUE(
-      owner.ConfirmProviderFreshness(scene.Confirmation(10U, 2000)).ok());
   auto other = AddBoxRequest(owner.CurrentProjectionRevision(),
                              scene.cell_id(), "scene-request-compaction-add");
   std::get<core::AddObjectRequestDTO>(other.operation).scene_resource_id =
@@ -6772,10 +6786,14 @@ TEST(CanonicalEmptySceneOwnerProviderFreshness,
   auto other_pose = owner.GetObjectPose(core::SceneResourceId("other-box"));
   ASSERT_TRUE(other_pose.ok());
 
+  // Compaction is transparent: every commit succeeds, the commit that
+  // triggers it included, and the request owner epoch never changes.
   const auto initial_epoch = owner.CurrentRequestOwnerEpoch();
-  bool rotated = false;
+  const auto resident = static_cast<std::size_t>(
+      owner.VerifyIntegrity().transaction_intent_count);
+  ASSERT_LT(resident, kMaximumLogicalSceneTransactions);
   for (std::size_t index = 0U;
-       !rotated && index <= kMaximumLogicalSceneTransactions; ++index) {
+       index <= kMaximumLogicalSceneTransactions - resident; ++index) {
     auto pose = other_pose.value();
     pose.position_m.x_m += 0.001 * static_cast<double>(index + 1U);
     const auto current = owner.CurrentProjectionRevision();
@@ -6790,39 +6808,18 @@ TEST(CanonicalEmptySceneOwnerProviderFreshness,
         core::UpdateObjectPoseRequestDTO{
             core::SceneResourceId("other-box"), pose,
             core::CellSceneFrameRefDTO{scene.cell_id()},
-            scene.Evidence(index + 1U,
-                           3000 + static_cast<std::int64_t>(index)),
-            false},
+            scene.committed_evidence(), false},
         std::nullopt,
     };
     const auto moved = owner.Commit(move);
-    if (!moved.success && moved.error.has_value() &&
-        moved.error->code == "stale_request_owner_epoch") {
-      rotated = true;
-      break;
-    }
     ASSERT_TRUE(moved.success)
         << index << " "
         << (moved.error.has_value() ? moved.error->message : "missing error");
+    EXPECT_EQ(owner.CurrentRequestOwnerEpoch(), initial_epoch);
   }
-  ASSERT_TRUE(rotated);
-  EXPECT_NE(owner.CurrentRequestOwnerEpoch(), initial_epoch);
-
-  const auto revision = owner.CurrentProjectionRevision();
-  const auto old = owner.ConfirmProviderFreshness(scene.Confirmation(5U, 2500));
-  ASSERT_FALSE(old.ok());
-  EXPECT_EQ(old.error().details.at("reason"),
-            "provider_freshness_sequence_not_increasing");
-  EXPECT_EQ(old.error().details.at("previous_provider_source_sequence"), "10");
-  // The record (received_at 2000) still applies across the rotation.
-  const auto regressed =
-      owner.ConfirmProviderFreshness(scene.Confirmation(11U, 1500));
-  ASSERT_FALSE(regressed.ok());
-  EXPECT_EQ(regressed.error().details.at("reason"),
-            "provider_freshness_received_at_regressed");
-  const auto next = owner.ConfirmProviderFreshness(scene.Confirmation(11U, 2100));
-  ASSERT_TRUE(next.ok()) << next.error().code << ": " << next.error().message;
-  EXPECT_EQ(next.value(), revision);
+  // The last commit compacted the resident history and then committed itself.
+  EXPECT_EQ(owner.VerifyIntegrity().transaction_intent_count, 1);
+  EXPECT_EQ(owner.VerifyIntegrity().request_outcome_count, 1);
 }
 
 TEST(CanonicalEmptySceneOwner,
@@ -7066,57 +7063,65 @@ TEST(CanonicalEmptySceneOwner,
     EXPECT_EQ(still_held.value().status,
               core::CellAdmissionRecoveryReceiptStatusDTO::kHeldExact);
 
+    // Compaction is transparent: the triggering request settles the held
+    // claim, prunes, and then continues in the unchanged epoch. Settling
+    // advanced the admission generation, so this request's own claim gets
+    // the ordinary no-effect admission refusal; compaction asks no refresh.
+    const auto revision_before_compaction = owner.CurrentProjectionRevision();
     const auto cleanup_started = std::chrono::steady_clock::now();
-    const auto rotated = owner.Commit(compaction_probe);
+    const auto compacted = owner.Commit(compaction_probe);
     const auto cleanup_elapsed =
         std::chrono::steady_clock::now() - cleanup_started;
     RecordProperty(
         "scene_compaction_settlement_us",
         std::chrono::duration_cast<std::chrono::microseconds>(cleanup_elapsed)
             .count());
-    ASSERT_FALSE(rotated.success);
-    ASSERT_TRUE(rotated.error.has_value());
-    EXPECT_EQ(rotated.error->code, "stale_request_owner_epoch");
-    EXPECT_EQ(rotated.error->details.at("reason"),
-              "scene_history_compaction_no_effect");
-    EXPECT_EQ(rotated.error->details.at("previous_request_owner_epoch"),
-              old_request_epoch.value());
-    EXPECT_EQ(rotated.error->details.at("expected_request_owner_epoch"),
-              owner.CurrentRequestOwnerEpoch().value());
-    EXPECT_EQ(rotated.projection_status,
+    ASSERT_FALSE(compacted.success);
+    ASSERT_TRUE(compacted.error.has_value());
+    EXPECT_EQ(compacted.error->code, "stale_generation");
+    EXPECT_EQ(compacted.error->details.at("reason"),
+              "expected_generation_stale");
+    EXPECT_EQ(compacted.replay_status,
+              core::RequestReplayStatusDTO::kAcceptedNew);
+    EXPECT_EQ(compacted.projection_status,
               core::SceneProjectionCommitStatusDTO::kNotAttempted);
-    EXPECT_FALSE(rotated.transaction_sequence.has_value());
-    EXPECT_NE(owner.CurrentRequestOwnerEpoch(), old_request_epoch);
+    EXPECT_EQ(owner.CurrentRequestOwnerEpoch(), old_request_epoch);
+    EXPECT_EQ(owner.CurrentProjectionRevision(), revision_before_compaction);
+    const auto after_compaction = owner.VerifyIntegrity();
+    EXPECT_EQ(after_compaction.transaction_intent_count, 1);
+    EXPECT_EQ(after_compaction.request_outcome_count, 1);
     const auto released_before_prune =
         cell_admission.GetCellAdmissionRecoveryReceipt(
             {scene_claim_intent(unknown_release), std::nullopt, std::nullopt});
     ASSERT_TRUE(released_before_prune.ok());
     EXPECT_EQ(released_before_prune.value().status,
               core::CellAdmissionRecoveryReceiptStatusDTO::kReleasedExact);
-    const auto stale_replay = owner.Commit(compaction_probe);
-    ASSERT_FALSE(stale_replay.success);
-    ASSERT_TRUE(stale_replay.error.has_value());
-    EXPECT_EQ(stale_replay.error->code, "stale_request_owner_epoch");
-    EXPECT_FALSE(stale_replay.error->details.contains("reason"));
 
-    compaction_probe.request_context.request_owner_epoch =
-        owner.CurrentRequestOwnerEpoch();
-    compaction_probe.expected_projection_revision =
-        owner.CurrentProjectionRevision();
-    compaction_probe.expected_admission_generation =
-        cell_admission.GetAuthoringAdmission().admission_generation;
-    const auto retried = owner.Commit(compaction_probe);
-    ASSERT_TRUE(retried.success)
-        << (retried.error.has_value() ? retried.error->message
-                                      : "missing error");
+    // The next request reads the current admission generation and commits
+    // in the same epoch; its resend replays exactly.
+    const auto next = make_pose_update(owner, "scene-program-compaction-next",
+                                       "pose:attempt.compaction-next");
+    EXPECT_EQ(next.request_context.request_owner_epoch, old_request_epoch);
+    const auto committed_next = owner.Commit(next);
+    ASSERT_TRUE(committed_next.success)
+        << (committed_next.error.has_value() ? committed_next.error->message
+                                             : "missing error");
+    const auto exact_replay = owner.Commit(next);
+    ASSERT_TRUE(exact_replay.success);
+    EXPECT_EQ(exact_replay.replay_status,
+              core::RequestReplayStatusDTO::kReplayedExact);
+    EXPECT_EQ(exact_replay.transaction_sequence,
+              committed_next.transaction_sequence);
 
+    // A request ID whose outcome was pruned is evaluated as a new request
+    // against the latest scene.
     ASSERT_TRUE(reused_external_request.has_value());
     auto reused_id = make_pose_update(
         owner, reused_external_request->request_context.request_id.value(),
-        "pose:attempt.cross-epoch-id-reuse");
+        "pose:attempt.cross-compaction-id-reuse");
     EXPECT_EQ(reused_id.request_context.request_id,
               reused_external_request->request_context.request_id);
-    EXPECT_NE(reused_id.request_context.request_owner_epoch,
+    EXPECT_EQ(reused_id.request_context.request_owner_epoch,
               reused_external_request->request_context.request_owner_epoch);
     const auto reused = owner.Commit(reused_id);
     ASSERT_TRUE(reused.success)
@@ -7302,114 +7307,6 @@ TEST(CanonicalEmptySceneOwner,
   ASSERT_TRUE(legacy_released.ok());
   EXPECT_EQ(legacy_released.value().status,
             core::CellAdmissionRecoveryReceiptStatusDTO::kReleasedExact);
-}
-
-TEST(CanonicalEmptySceneOwnerProviderFreshness,
-     PartialFanOutKeepsTheAcceptedObservationAndReportsEveryProjection) {
-  ProviderFreshnessScene scene;
-  auto &owner = scene.owner();
-  auto &projections = scene.projections();
-  ASSERT_GE(projections.size(), 2U);
-  const auto revision = owner.CurrentProjectionRevision();
-  const auto integrity = owner.VerifyIntegrity();
-  projections[1]->RejectProviderFreshness(
-      ErrorDTO{"native_freshness_publication_failed",
-               "injected native freshness refusal", {}});
-
-  const auto failed = owner.ConfirmProviderFreshness(scene.Confirmation(5U, 1500));
-  ASSERT_FALSE(failed.ok());
-  EXPECT_EQ(failed.error().code, "provider_freshness_projection_failed");
-  EXPECT_EQ(failed.error().details.at("reason"),
-            "provider_freshness_projection_failed");
-  EXPECT_EQ(failed.error().details.at("failed_projection_ordinals"), "1");
-  EXPECT_EQ(failed.error().details.at("failed_runtime_unit_ids"),
-            projections[1]->binding().runtime_unit_id.value());
-  EXPECT_EQ(failed.error().details.at("projection_error_code"),
-            "native_freshness_publication_failed");
-  std::string applied;
-  for (std::size_t index = 0U; index < projections.size(); ++index) {
-    EXPECT_EQ(projections[index]->freshness_attempts(), 1U);
-    EXPECT_EQ(projections[index]->freshness_confirmations().size(),
-              index == 1U ? 0U : 1U);
-    if (index != 1U) {
-      applied += (applied.empty() ? "" : ",") + std::to_string(index);
-    }
-  }
-  EXPECT_EQ(failed.error().details.at("applied_projection_ordinals"), applied);
-  // A definite refusal is not an uncertain outcome.
-  EXPECT_EQ(failed.error().details.at("uncertain_projection_ordinals"), "");
-  projections[1]->RejectProviderFreshness(std::nullopt);
-
-  const auto replay = owner.ConfirmProviderFreshness(scene.Confirmation(5U, 1500));
-  ASSERT_FALSE(replay.ok());
-  EXPECT_EQ(replay.error().details.at("reason"),
-            "provider_freshness_sequence_not_increasing");
-  for (const auto &projection : projections) {
-    EXPECT_EQ(projection->freshness_attempts(), 1U);
-  }
-  const auto next = owner.ConfirmProviderFreshness(scene.Confirmation(6U, 1600));
-  ASSERT_TRUE(next.ok()) << next.error().code << ": " << next.error().message;
-  EXPECT_EQ(next.value(), revision);
-  ASSERT_EQ(projections[1]->freshness_confirmations().size(), 1U);
-  EXPECT_EQ(projections[1]
-                ->freshness_confirmations()
-                .front()
-                .evidence.provider_source_sequence,
-            6U);
-  EXPECT_EQ(owner.CurrentProjectionRevision(), revision);
-  ExpectNoDurableSceneEffect(integrity, owner.VerifyIntegrity());
-}
-
-
-TEST(CanonicalEmptySceneOwnerProviderFreshness,
-     UncertainProjectionOutcomeIsReportedAsUncertain) {
-  ProviderFreshnessScene scene;
-  auto &owner = scene.owner();
-  auto &projections = scene.projections();
-  ASSERT_GE(projections.size(), 1U);
-  projections[0]->RejectProviderFreshness(
-      ErrorDTO{"projection_state_uncertain", "acknowledgement lost", {}});
-  const auto failed = owner.ConfirmProviderFreshness(scene.Confirmation(5U, 1500));
-  ASSERT_FALSE(failed.ok());
-  EXPECT_EQ(failed.error().code, "provider_freshness_projection_failed");
-  EXPECT_EQ(failed.error().details.at("uncertain_projection_ordinals"), "0");
-  EXPECT_EQ(failed.error().details.at("uncertain_runtime_unit_ids"),
-            projections[0]->binding().runtime_unit_id.value());
-  // The observation stays accepted: a replay never renews freshness.
-  projections[0]->RejectProviderFreshness(std::nullopt);
-  const auto replay = owner.ConfirmProviderFreshness(scene.Confirmation(5U, 1500));
-  ASSERT_FALSE(replay.ok());
-  EXPECT_EQ(replay.error().details.at("reason"),
-            "provider_freshness_sequence_not_increasing");
-}
-
-TEST(CanonicalEmptySceneOwnerProviderFreshness,
-     UnsupportedEverywhereRestoresStateForTheCommitFallback) {
-  ProviderFreshnessScene scene;
-  auto &owner = scene.owner();
-  for (auto &projection : scene.projections()) {
-    projection->RejectProviderFreshness(
-        ErrorDTO{"provider_freshness_unsupported", "injected", {}});
-  }
-  const auto unsupported =
-      owner.ConfirmProviderFreshness(scene.Confirmation(5U, 1500));
-  ASSERT_FALSE(unsupported.ok());
-  EXPECT_EQ(unsupported.error().code, "provider_freshness_unsupported");
-  EXPECT_EQ(unsupported.error().details.at("reason"),
-            "provider_freshness_unsupported");
-  for (const auto &projection : scene.projections()) {
-    EXPECT_EQ(projection->freshness_attempts(), 1U);
-  }
-
-  // Nothing was published and nothing remains recorded, so the ordinary
-  // Commit fallback carries the same sequence.
-  const auto committed = owner.Commit(scene.PoseUpdate(
-      "scene-request-freshness-fallback", scene.Evidence(5U, 1500)));
-  ASSERT_TRUE(committed.success)
-      << (committed.error.has_value() ? committed.error->message
-                                      : "missing error");
-  EXPECT_EQ(committed.update_status,
-            core::SceneUpdateStatusDTO::kFreshnessOnly);
 }
 
 } // namespace

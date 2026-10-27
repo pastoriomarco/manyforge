@@ -1,7 +1,9 @@
 #include "logical_scene_codec_internal.hpp"
 
 #include <cmath>
+#include <algorithm>
 #include <cstdint>
+#include <iterator>
 #include <limits>
 #include <manyforge_content_identity/canonical_value.hpp>
 #include <manyforge_core/logical_scene_identity.hpp>
@@ -30,14 +32,6 @@ constexpr std::uint64_t kMaximumSafeIntegral = 9007199254740991ULL;
 CanonicalValue Unsigned(const std::uint64_t value,
                         const std::string_view label) {
   if (value > kMaximumSafeIntegral) {
-    Fail(std::string(label) + " exceeds the safe-integral range");
-  }
-  return CanonicalValue(static_cast<double>(value));
-}
-
-CanonicalValue Integer(const std::int64_t value, const std::string_view label) {
-  constexpr auto kMaximum = static_cast<std::int64_t>(kMaximumSafeIntegral);
-  if (value < -kMaximum || value > kMaximum) {
     Fail(std::string(label) + " exceeds the safe-integral range");
   }
   return CanonicalValue(static_cast<double>(value));
@@ -92,16 +86,6 @@ std::uint64_t DecodeUnsigned(const CanonicalValue &value,
     Fail(std::string(label) + " must be an unsigned safe integer");
   }
   return static_cast<std::uint64_t>(number);
-}
-
-std::int64_t DecodeInteger(const CanonicalValue &value,
-                           const std::string_view label) {
-  const auto number = Number(value, label);
-  constexpr auto kMaximum = static_cast<double>(kMaximumSafeIntegral);
-  if (number < -kMaximum || number > kMaximum || std::floor(number) != number) {
-    Fail(std::string(label) + " must be a signed safe integer");
-  }
-  return static_cast<std::int64_t>(number);
 }
 
 const CanonicalValue::Array &Array(const CanonicalValue &value,
@@ -617,30 +601,14 @@ ProviderEvidence(const core::SceneObjectProviderEvidenceDTO &value) {
       {"provider_manifest_revision",
        CanonicalValue(value.provider_manifest_revision.value())},
       {"provider_source_epoch", CanonicalValue(value.provider_source_epoch)},
-      {"provider_source_sequence",
-       Unsigned(value.provider_source_sequence, "provider_source_sequence")},
-      {"received_at_ns", content_identity::nonnegative_int64_value(value.received_at_ns)},
   };
-  if (value.source_timestamp_ns.has_value()) {
-    object.emplace_back(
-        "source_timestamp_ns",
-        content_identity::nonnegative_int64_value(*value.source_timestamp_ns));
-  }
-  if (value.source_freshness_budget_ns.has_value()) {
-    object.emplace_back("source_freshness_budget_ns",
-                        Integer(*value.source_freshness_budget_ns,
-                                "source_freshness_budget_ns"));
-  }
   return CanonicalValue(std::move(object));
 }
 
 core::SceneObjectProviderEvidenceDTO
 DecodeProviderEvidence(const CanonicalValue &value) {
-  if (!value.is_object() || value.as_object().size() < 6U ||
-      value.as_object().size() > 8U) {
-    Fail("provider evidence has an unknown or missing field");
-  }
-  core::SceneObjectProviderEvidenceDTO result{
+  ExactObject(value, 4U, "provider evidence");
+  return core::SceneObjectProviderEvidenceDTO{
       core::ProviderInstanceId(String(Member(value, "provider_instance_id"),
                                       "provider_instance_id")),
       core::ProviderManifestId(String(Member(value, "provider_manifest_id"),
@@ -649,22 +617,41 @@ DecodeProviderEvidence(const CanonicalValue &value) {
           String(Member(value, "provider_manifest_revision"),
                  "provider_manifest_revision")),
       String(Member(value, "provider_source_epoch"), "provider_source_epoch"),
-      DecodeUnsigned(Member(value, "provider_source_sequence"),
-                     "provider_source_sequence"),
-      content_identity::parse_nonnegative_int64(Member(value, "received_at_ns")),
-      std::nullopt,
-      std::nullopt,
   };
-  if (const auto *timestamp = value.find_object_member("source_timestamp_ns")) {
-    result.source_timestamp_ns =
-        content_identity::parse_nonnegative_int64(*timestamp);
+}
+
+// Observation fields that v9 stores kept in provider evidence.
+constexpr std::string_view kRetiredProviderEvidenceFields[] = {
+    "provider_source_sequence", "received_at_ns", "source_freshness_budget_ns",
+    "source_timestamp_ns"};
+
+CanonicalValue WithoutRetiredProviderEvidenceFields(
+    const CanonicalValue &value, bool &changed,
+    const bool provider_evidence = false) {
+  if (value.is_array()) {
+    CanonicalValue::Array result;
+    for (const auto &item : value.as_array()) {
+      result.push_back(WithoutRetiredProviderEvidenceFields(item, changed));
+    }
+    return CanonicalValue(std::move(result));
   }
-  if (const auto *budget =
-          value.find_object_member("source_freshness_budget_ns")) {
-    result.source_freshness_budget_ns =
-        DecodeInteger(*budget, "source_freshness_budget_ns");
+  if (!value.is_object()) {
+    return value;
   }
-  return result;
+  CanonicalValue::Object result;
+  for (const auto &[name, member] : value.as_object()) {
+    if (provider_evidence &&
+        std::find(std::begin(kRetiredProviderEvidenceFields),
+                  std::end(kRetiredProviderEvidenceFields),
+                  name) != std::end(kRetiredProviderEvidenceFields)) {
+      changed = true;
+      continue;
+    }
+    result.emplace_back(name, WithoutRetiredProviderEvidenceFields(
+                                  member, changed,
+                                  name == "provider_evidence"));
+  }
+  return CanonicalValue(std::move(result));
 }
 
 CanonicalValue Placement(const core::SceneObjectPlacementDTO &placement) {
@@ -757,8 +744,25 @@ core::SceneObjectSnapshotDTO DecodeObject(const CanonicalValue &value) {
   return result;
 }
 
-CanonicalValue Attachment(const core::CarriedObjectAttachmentDTO &value) {
+CanonicalValue
+GraspLostBound(const core::CarriedObjectGraspLostBoundDTO &value) {
   return CanonicalValue(CanonicalValue::Object{
+      {"rotation_rad", CanonicalValue(value.rotation_rad)},
+      {"translation_m", CanonicalValue(value.translation_m)},
+  });
+}
+
+core::CarriedObjectGraspLostBoundDTO
+DecodeGraspLostBound(const CanonicalValue &value) {
+  // Positivity is the scene owner's attach rule; a durably recorded
+  // rejected request must still decode.
+  ExactObject(value, 2U, "grasp-lost bound");
+  return {Number(Member(value, "translation_m"), "grasp-lost translation_m"),
+          Number(Member(value, "rotation_rad"), "grasp-lost rotation_rad")};
+}
+
+CanonicalValue Attachment(const core::CarriedObjectAttachmentDTO &value) {
+  CanonicalValue::Object result{
       {"carried_object_attachment_id",
        CanonicalValue(value.carried_object_attachment_id.value())},
       {"carried_object_attachment_revision",
@@ -770,11 +774,30 @@ CanonicalValue Attachment(const core::CarriedObjectAttachmentDTO &value) {
       {"pose_in_carrier_frame", Pose(value.pose_in_carrier_frame)},
       {"scene_resource_id", CanonicalValue(value.scene_resource_id.value())},
       {"touch_body_roles", StrongArray(value.touch_body_roles)},
-  });
+  };
+  // Absent for attachments without a bound, so older rows encode unchanged.
+  if (value.grasp_lost_check) {
+    result.emplace_back(
+        "grasp_lost_check",
+        CanonicalValue(CanonicalValue::Object{
+            {"attach_pose_in_carrier_frame",
+             Pose(value.grasp_lost_check->attach_pose_in_carrier_frame)},
+            {"bound", GraspLostBound(value.grasp_lost_check->bound)},
+        }));
+  }
+  return CanonicalValue(std::move(result));
 }
 
 core::CarriedObjectAttachmentDTO DecodeAttachment(const CanonicalValue &value) {
-  ExactObject(value, 8U, "carried attachment");
+  const auto *check = value.find_object_member("grasp_lost_check");
+  ExactObject(value, check ? 9U : 8U, "carried attachment");
+  std::optional<core::CarriedObjectGraspLostCheckDTO> grasp_lost_check;
+  if (check) {
+    ExactObject(*check, 2U, "grasp-lost check");
+    grasp_lost_check = core::CarriedObjectGraspLostCheckDTO{
+        DecodeGraspLostBound(Member(*check, "bound")),
+        DecodePose(Member(*check, "attach_pose_in_carrier_frame"))};
+  }
   return {
       core::CarriedObjectAttachmentId(
           String(Member(value, "carried_object_attachment_id"),
@@ -793,6 +816,7 @@ core::CarriedObjectAttachmentDTO DecodeAttachment(const CanonicalValue &value) {
       DecodePose(Member(value, "pose_in_carrier_frame")),
       DecodeStrongArray<core::CollisionBodyRoleId>(
           Member(value, "touch_body_roles"), "touch_body_roles"),
+      std::move(grasp_lost_check),
   };
 }
 
@@ -984,7 +1008,7 @@ CanonicalValue RequestOperation(const core::SceneOperationRequestDTO &value) {
           return CanonicalValue(std::move(object));
         } else if constexpr (std::is_same_v<
                                  T, core::AttachCarriedObjectRequestDTO>) {
-          return CanonicalValue(CanonicalValue::Object{
+          CanonicalValue::Object object{
               {"carried_object_attachment_id",
                CanonicalValue(request.carried_object_attachment_id.value())},
               {"command_target_id",
@@ -998,7 +1022,12 @@ CanonicalValue RequestOperation(const core::SceneOperationRequestDTO &value) {
               {"scene_resource_id",
                CanonicalValue(request.scene_resource_id.value())},
               {"touch_body_roles", StrongArray(request.touch_body_roles)},
-          });
+          };
+          if (request.grasp_lost_bound) {
+            object.emplace_back("grasp_lost_bound",
+                                GraspLostBound(*request.grasp_lost_bound));
+          }
+          return CanonicalValue(std::move(object));
         } else if constexpr (std::is_same_v<
                                  T, core::DetachCarriedObjectRequestDTO>) {
           return CanonicalValue(CanonicalValue::Object{
@@ -1108,7 +1137,8 @@ DecodeRequestOperation(const CanonicalValue &value) {
     };
   }
   if (kind == "attach_carried_object") {
-    ExactObject(value, 8U, "attach-carried-object request");
+    const auto *bound = value.find_object_member("grasp_lost_bound");
+    ExactObject(value, bound ? 9U : 8U, "attach-carried-object request");
     return core::AttachCarriedObjectRequestDTO{
         core::CarriedObjectAttachmentId(
             String(Member(value, "carried_object_attachment_id"),
@@ -1127,6 +1157,7 @@ DecodeRequestOperation(const CanonicalValue &value) {
         DecodeStrongArray<core::ComponentAttachmentRevision>(
             Member(value, "expected_component_attachment_revisions"),
             "expected_component_attachment_revisions"),
+        bound ? std::optional(DecodeGraspLostBound(*bound)) : std::nullopt,
     };
   }
   if (kind == "detach_carried_object") {
@@ -1663,7 +1694,8 @@ std::string EncodeSnapshot(const core::LogicalSceneSnapshotDTO &snapshot) {
   return ci::canonical_json(Snapshot(snapshot));
 }
 
-core::LogicalSceneSnapshotDTO DecodeSnapshot(const std::string_view bytes) {
+core::LogicalSceneSnapshotDTO DecodeSnapshot(const std::string_view bytes,
+                                             const bool verify_content_hash) {
   const auto parsed = deployment::parse_strict_json_model_yaml(bytes);
   const auto &root = parsed.root();
   if (ci::canonical_json(root) != bytes) {
@@ -1698,8 +1730,9 @@ core::LogicalSceneSnapshotDTO DecodeSnapshot(const std::string_view bytes) {
         DecodeAttachment(attachment));
   }
   if (!snapshot.locally_valid() ||
-      core::logical_scene_identity::ComputeLogicalSceneContentHash(snapshot) !=
-          snapshot.revision.content_hash ||
+      (verify_content_hash &&
+       core::logical_scene_identity::ComputeLogicalSceneContentHash(
+           snapshot) != snapshot.revision.content_hash) ||
       core::logical_scene_identity::ComputeCollisionPolicyContentDigest(
           snapshot.configured_collision_policy)
               .value() !=
@@ -1713,6 +1746,18 @@ core::LogicalSceneSnapshotDTO DecodeSnapshot(const std::string_view bytes) {
     }
   }
   return snapshot;
+}
+
+std::optional<std::string>
+StripRetiredProviderEvidenceFields(const std::string_view bytes) {
+  const auto parsed = deployment::parse_strict_json_model_yaml(bytes);
+  bool changed = false;
+  auto stripped =
+      WithoutRetiredProviderEvidenceFields(parsed.root(), changed);
+  if (!changed) {
+    return std::nullopt;
+  }
+  return ci::canonical_json(stripped);
 }
 
 std::string

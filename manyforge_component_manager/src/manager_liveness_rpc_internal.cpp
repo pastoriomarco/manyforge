@@ -322,8 +322,6 @@ std::string_view NativeShutdownPhaseName(const NativeShutdownPhase phase) {
     return "active-composition-destruction";
   case NativeShutdownPhase::kFailedCompositionDestruction:
     return "failed-composition-destruction";
-  case NativeShutdownPhase::kCellProcessesDestruction:
-    return "cell-processes-destruction";
   case NativeShutdownPhase::kProjectionDestruction:
     return "projection-destruction";
   case NativeShutdownPhase::kLivenessReceiverDestruction:

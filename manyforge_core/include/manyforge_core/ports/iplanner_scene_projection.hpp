@@ -64,7 +64,8 @@ public:
   /// Implementations with multiple models resolve the selected retained bundle
   /// and graph, returning their actual health (including a predecessor Scene
   /// revision during maintenance). The default has no such lookup and refuses
-  /// a conflicting active revision instead of silently selecting current.
+  /// another Deployment or Scene instead of silently selecting current; any
+  /// revision of the selected Scene is its actual health.
   [[nodiscard]] virtual ProjectionHealthDTO ProjectionHealthForRevision(
       const ProjectionRevisionDTO &selected_revision) const {
     if (!selected_revision.valid()) {
@@ -72,22 +73,11 @@ public:
     }
     auto health = ProjectionHealth();
     if (health.active_projection_revision.has_value() &&
-        *health.active_projection_revision != selected_revision) {
+        !SameProjectionIdentity(*health.active_projection_revision,
+                                selected_revision)) {
       throw std::invalid_argument("projection health selector conflicts with active revision");
     }
     return health;
-  }
-
-  /// Publish a freshness-only runtime update for one unchanged committed
-  /// object at the exact expected projection: the collision world, policy
-  /// and SceneRevision are retained; only the freshness sidecar, lease
-  /// inventory freshness and runtime bundle epoch advance.
-  [[nodiscard]] virtual Result<void>
-  ApplyProviderFreshness(const ProviderFreshnessConfirmationDTO & /*confirmation*/) {
-    return Result<void>::Err(ErrorDTO{
-        "provider_freshness_unsupported",
-        "native projection does not support freshness-only publication",
-        {}});
   }
 
   [[nodiscard]] virtual ProjectionCommitResultDTO

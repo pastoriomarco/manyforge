@@ -885,10 +885,10 @@ def test_capability_definition_registry_and_qualified_referent_are_exact():
     )
     registry = core.BUILTIN_CAPABILITY_DEFINITION_REGISTRY
     assert isinstance(registry, tuple)
-    assert len(registry) == 67
-    assert len({row.capability_id for row in registry}) == 67
+    assert len(registry) == 68
+    assert len({row.capability_id for row in registry}) == 68
     assert (
-        sum(row.scope == core.CapabilityScope.kTargetBinding for row in registry) == 31
+        sum(row.scope == core.CapabilityScope.kTargetBinding for row in registry) == 32
     )
     assert sum(row.scope == core.CapabilityScope.kCellGlobal for row in registry) == 28
     assert (
@@ -900,7 +900,7 @@ def test_capability_definition_registry_and_qualified_referent_are_exact():
             == core.CapabilityProviderBindingKind.kCapabilityProviderBinding
             for row in registry
         )
-        == 50
+        == 51
     )
     assert (
         sum(
@@ -912,7 +912,7 @@ def test_capability_definition_registry_and_qualified_referent_are_exact():
     )
     assert all(row.requirement_parameters_schema_ref is None for row in registry)
     assert core.BUILTIN_CAPABILITY_DEFINITION_REGISTRY_DIGEST == (
-        "sha256:f16fbfaf20185c184fee1ed014592eb443f2c5f5144de84eaae685504c0d38f9"
+        "sha256:55fed7ca63f9fe8617e4bc18d23180964bf4cdac5b7ea1cce20aa4c6557110ec"
     )
     assert core.find_builtin_capability_definition("context.state.current") is None
 
@@ -1852,11 +1852,15 @@ target: 0.5
         ),
         (
             "manyforge.value_schema.runtime.ros2_control_execution.v1",
-            "sha256:d60c4f1e7196f4eb6c4ebf4fd8d99980f4aa6b93f83de3e747f5253d7ea4795a",
+            "sha256:eb4a5f93825a6aede99963d3910f981c5159bdadcb7d48e1c8df1b2356fe2173",
         ),
         (
             "manyforge.value_schema.runtime.io_provider_execution.v1",
             "sha256:94036272387dd8c604e9b2f54485fb87fb3ed904e1364024e10e526b37dd0776",
+        ),
+        (
+            "manyforge.value_schema.runtime.pose_source_execution.v1",
+            "sha256:215719ac12d81134cf371e1c7675775cddb11f3c62e49ada02b4ed2ff59a4706",
         ),
     }
     assert (

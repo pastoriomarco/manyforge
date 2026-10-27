@@ -13,7 +13,6 @@ import type {
   ObservedGripperTarget,
   ObservedMotionTarget,
   Pose3Value,
-  SceneRevisionValue,
 } from '../types/robotControl';
 import { cartesianMoveOffsetsFromTarget, computeCartesianMoveDraft, DEFAULT_MOVE_TO_OPTIONS } from '../utils/moveTo';
 import type { CartesianMoveDraftOptions, MoveToDraft, MoveToDraftSource } from '../utils/moveTo';
@@ -482,41 +481,8 @@ function gripperPositionIsValid(
       && position <= maxPosition;
 }
 
-function sameSceneRevision(
-  left: SceneRevisionValue,
-  right: SceneRevisionValue,
-): boolean {
-  return left.scene_id === right.scene_id
-    && left.revision_id === right.revision_id
-    && left.content_hash === right.content_hash;
-}
-
-/** A later owner-minted revision of the same Scene. */
-function laterSceneRevision(
-  candidate: SceneRevisionValue,
-  base: SceneRevisionValue,
-): boolean {
-  return candidate.scene_id === base.scene_id
-    && candidate.revision_id > base.revision_id;
-}
-
 /**
- * Motion previews may be computed on a revision the owner latched before
- * planning, so the receipt can name the intent's Scene revision or a later
- * one. Capability-command previews do not latch and echo it exactly.
- */
-function receiptSceneMatchesIntent(
-  intent: DirectControlOperationIntent,
-  receipt: DirectControlPreviewReceipt,
-): boolean {
-  return sameSceneRevision(receipt.sceneRevision, intent.expected_scene_revision)
-    || (!isCapabilityCommandReceipt(receipt)
-      && laterSceneRevision(receipt.sceneRevision, intent.expected_scene_revision));
-}
-
-/**
- * Evidence computed on any revision of the displayed Scene may be approved:
- * pose updates advance the revision continuously, and the runtime collision
+ * Evidence computed on the latest Scene may be approved: the runtime collision
  * monitor checks the newer Scene during the motion. Owner, bundle, graph and
  * target changes discard the preview before this is asked.
  */
@@ -524,8 +490,7 @@ export function robotControlPreviewApprovable(state: RobotControlState): boolean
   return state.phase === 'ready'
     && state.preview !== null
     && state.intent !== null
-    && state.status !== null
-    && state.preview.sceneRevision.scene_id === state.status.sceneRevision.scene_id;
+    && state.status !== null;
 }
 
 function commonReceiptMatches(
@@ -543,7 +508,6 @@ function commonReceiptMatches(
     && receipt.programRunId === intent.program_run_id
     && receipt.graphRevision === intent.expected_graph_revision
     && receipt.retainedBundleId === intent.expected_retained_bundle_id
-    && receiptSceneMatchesIntent(intent, receipt)
     && receipt.componentRoleId === participant.component_role_id
     && receipt.targetRoleId === participant.target_role_id
     && receipt.requiredCapabilityId === participant.required_capability_id;
@@ -812,15 +776,6 @@ function resolveStatus(
   const alreadyPresentedTerminal = resolvedOperation !== null && !resolvedOperation.resident
     && state.status.manualOperations.some((previous) => !previous.resident
       && previous.operationId === resolvedOperation.operationId);
-  if ((resolvedOperation === null || alreadyPresentedTerminal)
-    && (state.phase === 'ready' || state.phase === 'planning'
-      || (state.phase === 'blocked' && state.intent === null))
-    && state.status.sceneRevision.scene_id !== status.sceneRevision.scene_id) {
-    // Same owner/binding and authored target, another Scene. A new revision
-    // of the same Scene keeps the draft and its preview. Reuse the normal
-    // trailing preview debounce; never retry approval or an operation.
-    return invalidateDraft(state, { status });
-  }
   if (alreadyPresentedTerminal) {
     return { ...state, status };
   }
@@ -1241,13 +1196,6 @@ export function robotControlReducer(
           error: 'The preview evidence does not match the current draft.',
         };
       }
-      if (
-        state.status !== null
-        && action.receipt.sceneRevision.scene_id !== state.status.sceneRevision.scene_id
-      ) {
-        // Status already shows another Scene than this evidence: preview again.
-        return invalidateDraft(state, {});
-      }
       return {
         ...state,
         phase: 'ready',
@@ -1431,7 +1379,7 @@ function buildMotionIntent(
     program_run_id: requireSelectedMotion(status).motion.programRunId,
     expected_graph_revision: status.graphRevision,
     expected_retained_bundle_id: status.retainedBundleId,
-    expected_scene_revision: { ...status.sceneRevision },
+    expected_scene_revision: null,
     participants: [{
       component_role_id: requireSelectedMotion(status).motion.targetDescriptor.componentRoleId,
       target_role_id: requireSelectedMotion(status).motion.targetDescriptor.targetRoleId,
@@ -1585,7 +1533,7 @@ export function buildGripperCommandIntent(
     program_run_id: gripper.programRunId,
     expected_graph_revision: status.graphRevision,
     expected_retained_bundle_id: status.retainedBundleId,
-    expected_scene_revision: { ...status.sceneRevision },
+    expected_scene_revision: null,
     participants: [{
       component_role_id: descriptor.componentRoleId,
       target_role_id: descriptor.targetRoleId,

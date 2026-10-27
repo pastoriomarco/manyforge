@@ -36,7 +36,6 @@ struct GeometricContactInputBinding final {
   std::shared_ptr<core::IScheduler> scheduler;
   core::Duration sample_period_ns{};
   core::Duration query_timeout_ns{};
-  std::optional<core::Duration> dynamic_body_max_age_cap_ns;
 };
 
 struct GeometricContactInputBaseline final {

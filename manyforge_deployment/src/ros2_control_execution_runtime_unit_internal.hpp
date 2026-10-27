@@ -44,7 +44,7 @@ inline constexpr std::string_view
 inline constexpr std::string_view
     kRos2ControlExecutionRuntimeConfigurationSchemaRevision =
         "sha256:"
-        "d60c4f1e7196f4eb6c4ebf4fd8d99980f4aa6b93f83de3e747f5253d7ea4795a";
+        "eb4a5f93825a6aede99963d3910f981c5159bdadcb7d48e1c8df1b2356fe2173";
 inline constexpr std::string_view kRos2ControlExecutionRuntimeRoleId =
     ros2_control_execution_runtime_contract::kRuntimeRoleId;
 inline constexpr std::string_view
@@ -101,8 +101,12 @@ void require_no_exclusive_ros_controller_topic_collision(
 [[nodiscard]] bool ros_gripper_delivery_result_timeout_is_valid(
     std::string_view actuation_kind, double timeout_s) noexcept;
 
-/// Strict active ROS thirteen-field row, with an optional pneumatic-only
-/// delivery_result_timeout_s field (fourteen fields when present). The archival
+/// Required ROS gripper feedback staleness threshold, shared like the timeout.
+[[nodiscard]] bool ros_gripper_state_freshness_timeout_is_valid(
+    double timeout_s) noexcept;
+
+/// Strict active ROS fourteen-field row, with an optional pneumatic-only
+/// delivery_result_timeout_s field (fifteen fields when present). The archival
 /// neutral twelve-field decoder receives only its exact private data projection.
 [[nodiscard]] std::vector<
     ros2_control_execution_runtime_contract::Configuration::GripperTargetConfiguration>

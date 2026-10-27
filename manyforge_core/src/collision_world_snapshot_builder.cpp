@@ -298,13 +298,6 @@ CanonicalValue body_content(const CollisionWorldBody& body) {
   if (body.parent_body_id.has_value()) {
     result.emplace_back("parent_body_id", CanonicalValue(*body.parent_body_id));
   }
-  if (body.source_id.has_value()) {
-    result.emplace_back("source_id", CanonicalValue(*body.source_id));
-  }
-  if (body.source_freshness_budget_ns.has_value()) {
-    result.emplace_back("source_freshness_budget_ns",
-                        safe_integer(*body.source_freshness_budget_ns));
-  }
   CanonicalValue::Array geometries;
   geometries.reserve(body.geometries.size());
   for (const auto& geometry : body.geometries) {
@@ -482,29 +475,6 @@ Result<CollisionWorldSnapshot> CollisionWorldSnapshotBuilder::build() {
       std::ostringstream oss;
       oss << "frame_id must be non-empty for body: " << body.body_id;
       return err(oss.str());
-    }
-    if (body.source_timestamp_ns.has_value() && *body.source_timestamp_ns < 0) {
-      std::ostringstream oss;
-      oss << "source_timestamp_ns must be non-negative for body: " << body.body_id;
-      return err(oss.str());
-    }
-    if (body.source_freshness_budget_ns.has_value()) {
-      if (!body.source_timestamp_ns.has_value()) {
-        std::ostringstream oss;
-        oss << "source_freshness_budget_ns requires source_timestamp_ns for body: " << body.body_id;
-        return err(oss.str());
-      }
-      if (*body.source_freshness_budget_ns <= 0) {
-        std::ostringstream oss;
-        oss << "source_freshness_budget_ns must be positive for body: " << body.body_id;
-        return err(oss.str());
-      }
-      if (*body.source_freshness_budget_ns > kMaximumSafeInteger) {
-        return err(
-            "source_freshness_budget_ns exceeds the RFC 8785 safe "
-            "range for body: " +
-            body.body_id);
-      }
     }
     if (!seen_ids.insert(body.body_id).second) {
       std::ostringstream oss;

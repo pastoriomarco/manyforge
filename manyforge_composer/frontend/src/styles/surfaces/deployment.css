@@ -750,6 +750,14 @@
   white-space: nowrap;
 }
 
+/* CP9 stream health: second line of the row, under the identity. */
+.cclc-row-streams {
+  grid-column: 2 / -1;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
 .cclc-current-state {
   display: grid;
   gap: 0.6rem;

@@ -109,18 +109,6 @@ struct ExecutionKernelConfig {
   // forever on a wedged validation worker. Must be > 0.
   Duration validation_collision_wall_timeout_ns = 5'000'000'000;  // 5 s
 
-  // Maximum age of the observed-scene snapshot lease captured at execute
-  // admission. Dispatch accepts a newer scene for every object; the lease
-  // bounds how old the validation may be. Structural divergence (a re-Apply)
-  // and stale sources still fail closed.
-  Duration scene_snapshot_lease_max_age_ns = 5'000'000'000;  // 5 s
-
-  // When true, an accepted dispatch on a newer scene also records bounded
-  // per-object divergence detail (`object_divergence.*`). Default OFF: only
-  // the revision-level `accepted_live_*` evidence is kept and no per-object
-  // comparison runs. Hosts set it from MANYFORGE_DEBUG_SCENE_DIVERGENCE=1.
-  bool record_scene_divergence_detail = false;
-
   // When true, a collision-validation rejection re-runs the failing waypoint
   // through the dedicated non-authoritative diagnostic comparator and appends
   // `collision_diagnostic_compare_*` engine-parity keys to the error details.
@@ -180,13 +168,6 @@ struct ExecutionKernelConfig {
   // the collision engine is queried. Zero disables the age check for
   // deterministic tests only; production deployments must keep this positive.
   Duration runtime_observed_state_max_age_ns = 100'000'000;  // 100 ms
-
-  // Dynamic bodies in CollisionWorldSnapshot may carry their own freshness
-  // budget. Static authored/fixture bodies leave that metadata unset and do
-  // not expire. This kernel-level cap prevents a dynamic source from declaring
-  // an unbounded budget silently; zero disables only the cap, not body-local
-  // freshness checks.
-  Duration runtime_dynamic_body_max_age_cap_ns = 500'000'000;  // 500 ms
 
   /// Exact implementation revision of the Kernel-owned validation pipeline
   /// recorded in every prepared motion participant. A changed pipeline
@@ -509,7 +490,6 @@ class ExecutionKernel : public IResolvedParticipantExecutionEngine,
     ValidationResultDTO noncollision_result;
     CollisionDecision collision_decision;
     TrajectoryDTO collision_trajectory;
-    std::optional<SceneSnapshotLease> scene_snapshot_lease;
     ParallelValidationTelemetry telemetry;
     std::size_t dynamically_discovered_start_contact_count = 0;
   };
@@ -517,11 +497,9 @@ class ExecutionKernel : public IResolvedParticipantExecutionEngine,
   Result<CollisionValidationSuccess> validate_trajectory(
       const TrajectoryDTO& trajectory, const ExecuteRequestDTO& request,
       CollisionWorldLeaseInventory& scene_snapshot_lease_inventory,
-      const std::optional<SceneSnapshotLease>& scene_snapshot_lease,
       const RobotStateDTO* start_state_override = nullptr, std::stop_token external_stop_token = {},
       bool* conclusive_collision_failure = nullptr,
       std::shared_ptr<CollisionCancellationToken> validation_cancellation = {},
-      std::optional<std::uint64_t> validation_execution_id = std::nullopt,
       const MovingReplacementInputDTO* replacement = nullptr);
 
   /// Shared computation only. The caller owns planner serialization, the
@@ -532,16 +510,13 @@ class ExecutionKernel : public IResolvedParticipantExecutionEngine,
       const RobotStateDTO& start_state, std::uint32_t planning_attempt_index,
       std::int64_t planning_start_ns, std::int64_t planning_timeout_ns, std::stop_token stop_token,
       std::shared_ptr<CollisionCancellationToken> validation_cancellation = {},
-      std::optional<std::uint64_t> validation_execution_id = std::nullopt,
       const MovingReplacementInputDTO* replacement = nullptr,
       std::optional<std::int64_t> suffix_planning_deadline_ns = std::nullopt);
 
   /// Async execution worker function.
   void async_execute_worker(std::stop_token st, ExecuteRequestDTO request, uint64_t exec_id,
                             std::optional<TrajectoryDTO> cached_trajectory,
-                            bool cache_revalidation_candidate,
                             RetainedSceneSnapshotLease retained_scene,
-                            std::optional<SceneSnapshotLease> scene_snapshot_lease,
                             std::shared_ptr<PreparedMotionSession> prepared_session = {});
 
   /// Build immutable authority/evidence only; no backend Prepare, session,
@@ -615,14 +590,12 @@ class ExecutionKernel : public IResolvedParticipantExecutionEngine,
   void set_runtime_collision_state_projection(RuntimeCollisionStateProjection projection);
   void clear_runtime_collision_state_projection();
   void clear_runtime_collision_state_projection_unlocked();
-  CollisionWorldRevision current_authoritative_collision_world_revision() const;
   Result<RetainedSceneSnapshotLease> retain_current_scene_snapshot_lease_inventory(
       std::uint64_t exec_id, const std::string& move_id);
   Result<std::optional<ProjectionRevisionDTO>> synchronize_scene_before_planning();
-  std::optional<SceneSnapshotLease> build_scene_snapshot_lease(
-      const CollisionWorldLeaseInventory& inventory, std::uint64_t exec_id) const;
-  std::optional<SceneSnapshotLeaseValidationContext>
-  current_scene_snapshot_lease_validation_context() const;
+  /// Judge per-body freshness (source timestamp against its declared budget)
+  /// on the latest published scene. Typed refusal when a source is stale or
+  /// the latest scene is unavailable.
   std::shared_ptr<CollisionCancellationToken> install_validation_cancel_token();
   void clear_validation_cancel_token(const std::shared_ptr<CollisionCancellationToken>& token);
   void request_active_validation_cancel(std::string reason);
@@ -661,7 +634,6 @@ class ExecutionKernel : public IResolvedParticipantExecutionEngine,
     ExecuteRequestDTO request;
     std::uint64_t execution_id{};
     RetainedSceneSnapshotLease retained_scene;
-    std::optional<SceneSnapshotLease> scene_snapshot_lease;
     std::shared_ptr<PreparedMotionSession> prepared_session;
     ExecutionHandle execution_handle;
     std::int64_t exec_start_ns{};
@@ -698,13 +670,11 @@ class ExecutionKernel : public IResolvedParticipantExecutionEngine,
     std::optional<PlanRequestDTO> plan_request;
     std::optional<PlanResultDTO> planning_result;
     bool active_trajectory_from_cache = false;
-    bool cache_revalidation_candidate = false;
   };
 
   struct ExecuteWorkerValidationPhaseResult {
     ExecuteWorkerPhaseStatus status = ExecuteWorkerPhaseStatus::kContinue;
     CollisionWorldRevision collision_world_revision;
-    std::optional<SceneSnapshotLease> scene_snapshot_lease;
     std::shared_ptr<const TrajectoryDTO> collision_trajectory;
     std::optional<PreparedMotionValidationEvidenceDTO> validation_evidence;
   };
@@ -740,36 +710,27 @@ class ExecutionKernel : public IResolvedParticipantExecutionEngine,
   ExecuteWorkerPlanPhaseResult execute_worker_plan_phase(
       std::stop_token st, ExecuteRequestDTO& request,
       const CollisionWorldLeaseInventory& projection_inventory, std::uint64_t exec_id,
-      std::optional<TrajectoryDTO> cached_trajectory, bool cache_revalidation_candidate,
-      ActiveMotionExecution& motion_state,
+      std::optional<TrajectoryDTO> cached_trajectory, ActiveMotionExecution& motion_state,
       const std::shared_ptr<PreparedMotionSession>& prepared_session);
 
   ExecuteWorkerValidationPhaseResult execute_worker_validate_replan_phase(
       std::stop_token st, const ExecuteRequestDTO& request, std::uint64_t exec_id,
       TrajectoryDTO& trajectory, std::optional<PlanRequestDTO>& plan_request,
       std::optional<PlanResultDTO>& planning_result, bool& active_trajectory_from_cache,
-      bool& cache_revalidation_candidate,
       CollisionWorldLeaseInventory& scene_snapshot_lease_inventory,
-      const std::optional<SceneSnapshotLease>& scene_snapshot_lease,
       ActiveMotionExecution& motion_state,
       const std::shared_ptr<PreparedMotionSession>& prepared_session);
 
   ExecuteWorkerDispatchPhaseResult execute_worker_dispatch_phase(
       const ExecuteRequestDTO& request, std::uint64_t exec_id, const TrajectoryDTO& trajectory,
-      bool active_trajectory_from_cache, bool cache_revalidation_candidate,
-      const ProjectionLeaseBindingDTO& projection_binding,
+      bool active_trajectory_from_cache,
       const CollisionWorldLeaseInventory& scene_snapshot_lease_inventory,
-      const CollisionWorldRevision& validation_world_revision,
-      const std::optional<SceneSnapshotLease>& scene_snapshot_lease,
       std::shared_ptr<const TrajectoryDTO> collision_trajectory,
       std::shared_ptr<const PreparedOperationParticipantDTO> prepared_participant,
       ActiveMotionExecution& motion_state);
 
-  void store_validated_candidate(const ExecuteRequestDTO& request, std::uint64_t exec_id,
-                                 const TrajectoryDTO& trajectory,
-                                 const ProjectionRevisionDTO& projection_revision,
-                                 const CollisionWorldRevision& validation_revision,
-                                 bool revalidated_cache_candidate);
+  void store_validated_trajectory(const ExecuteRequestDTO& request,
+                                  const TrajectoryDTO& trajectory);
 
   void execute_worker_finalize_phase(const ExecuteRequestDTO& request, std::uint64_t exec_id,
                                      ExecutionHandle& execution_handle,

@@ -209,7 +209,7 @@ ResourceAddressedExecutionKernel::qualify_io_output_recovery_operation_locked(
   };
   if (active_operations_.size() != 1U || pending_program_run_admission_ ||
       operation_control_reconfiguration_busy_locked() || motion_admission_unreconciled_ ||
-      motion_admission_closed_.restrictive() || manager_liveness_motion_inhibited_ ||
+      motion_admission_closed_ || manager_liveness_motion_inhibited_ ||
       operation_journal_write_fault_ || is_active_stop_fault_latch(active_stop_fault_latch_) ||
       (!config_.operation_admission_gate ||
        config_.operation_admission_gate->has_held_configuration_fences()) ||
@@ -362,7 +362,7 @@ Result<void> ResourceAddressedExecutionKernel::validate_io_output_recovery_claim
                    binding.io_output_binding.has_value();
           });
       if (registration == registrations_.end() ||
-          !validate_manual_program_handover_locked(*operation.manual_handover, &*registration).ok())
+          !validate_manual_program_handover_locked(*operation.manual_handover).ok())
         return refuse();
     } else if (cycle.state == ProgramCycleStateDTO::kRunning) {
       const auto fence = std::find_if(
@@ -2100,6 +2100,21 @@ void ResourceAddressedExecutionKernel::attribute_containment_stop_locked(
     attributed_containment_stops_.erase(attributed_containment_stops_.begin());
   }
   attributed_containment_stops_.push_back({stopped.stop_id, stopped.stop_generation, origin});
+}
+
+Result<void> ResourceAddressedExecutionKernel::PublishComponentStreamHold(
+    const ControllableComponentId& component, const std::optional<ErrorDTO>& hold,
+    const bool cell_wide) {
+  // Same order as readiness publication: readers hold either mutex.
+  std::lock_guard admission_lock(*admission_mutex_);
+  std::lock_guard state_lock(state_mutex_);
+  component_stream_holds_.erase(component);
+  cell_stream_holds_.erase(component);
+  if (hold) {
+    (cell_wide ? cell_stream_holds_ : component_stream_holds_)
+        .insert_or_assign(component, *hold);
+  }
+  return Result<void>::Ok();
 }
 
 Result<ComponentIncidentContainmentReceiptDTO>

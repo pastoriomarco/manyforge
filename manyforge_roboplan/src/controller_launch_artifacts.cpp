@@ -871,7 +871,11 @@ controller_launch_artifacts_evidence(const ControllerLaunchArtifacts &value) {
   out += "\"controllable_component_id\":" +
          json_string(value.controllable_component_id);
   out += ",\"lane\":" +
-         json_string(value.lane == ControllerLaunchLane::kMock ? "mock" : "isaac");
+         json_string(value.lane == ControllerLaunchLane::kMock    ? "mock"
+                     : value.lane == ControllerLaunchLane::kIsaac ? "isaac"
+                     : value.lane == ControllerLaunchLane::kSimulatedPlc
+                         ? "simulated_plc"
+                         : "pose_source");
   out += ",\"controller_profile\":" + json_string(value.controller_profile);
   out += ",\"robot_description_file\":" +
          json_string(value.robot_description_file.string());

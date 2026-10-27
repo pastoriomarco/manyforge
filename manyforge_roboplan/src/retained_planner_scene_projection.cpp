@@ -44,43 +44,13 @@ bool exact_scene_content(const core::LogicalSceneSnapshotDTO &scene) {
   }
 }
 
-core::CollisionWorldMutationSource
-mutation_source(const core::ResolvedSceneOperationDTO &operation) {
-  return std::visit(
-      [](const auto &value) {
-        using T = std::decay_t<decltype(value)>;
-        if constexpr (std::is_same_v<T, core::ResolvedAttachCarriedObjectDTO>) {
-          return core::CollisionWorldMutationSource::kCarriedObjectAttach;
-        } else if constexpr (std::is_same_v<
-                                 T, core::ResolvedDetachCarriedObjectDTO>) {
-          return core::CollisionWorldMutationSource::kCarriedObjectDetach;
-        } else if constexpr (std::is_same_v<T,
-                                            core::ResolvedCollisionPolicyDTO>) {
-          return core::CollisionWorldMutationSource::kPolicyUpdate;
-        } else if constexpr (std::is_same_v<
-                                 T, core::ResolvedUpsertSceneObjectDTO>) {
-          return value.object.provider_evidence.has_value()
-                     ? core::CollisionWorldMutationSource::kPoseSourceApply
-                     : core::CollisionWorldMutationSource::kSceneEdit;
-        } else {
-          return core::CollisionWorldMutationSource::kSceneEdit;
-        }
-      },
-      operation);
-}
-
-std::optional<core::ContentDigest> publisher_digest(
-    const std::shared_ptr<RetainedCollisionWorldPublisher> &publisher) {
-  if (!publisher) {
-    return std::nullopt;
-  }
-  const auto revision = publisher->published_collision_world_revision();
-  if (revision.revision_id == 0U || revision.content_hash.empty()) {
-    return std::nullopt;
-  }
-  std::string preimage("manyforge.native-projection-content.v1");
+/// Projection content identity: the collision world is derived from the
+/// logical scene over one fixed retained model, so the scene content names it.
+core::ContentDigest
+projection_digest(const core::LogicalSceneSnapshotDTO &scene) {
+  std::string preimage("manyforge.native-projection-content.v2");
   preimage.push_back('\0');
-  preimage.append(revision.content_hash);
+  preimage.append(scene.revision.content_hash.value());
   return core::ContentDigest(
       manyforge::content_identity::sha256_digest(preimage));
 }
@@ -185,7 +155,89 @@ RetainedPlannerSceneProjection::RetainedPlannerSceneProjection(
               std::nullopt,
               std::nullopt,
               std::nullopt,
-              std::nullopt} {}
+              std::nullopt} {
+  build_worker_ = std::thread([this] { RunCollisionWorldBuilds(); });
+}
+
+RetainedPlannerSceneProjection::~RetainedPlannerSceneProjection() {
+  stopping_.store(true, std::memory_order_release);
+  build_wake_.fetch_add(1U, std::memory_order_acq_rel);
+  build_wake_.notify_one();
+  if (build_worker_.joinable()) {
+    build_worker_.join();
+  }
+}
+
+void RetainedPlannerSceneProjection::RunCollisionWorldBuilds() {
+  std::uint64_t seen = 0U;
+  for (;;) {
+    build_wake_.wait(seen, std::memory_order_acquire);
+    seen = build_wake_.load(std::memory_order_acquire);
+    if (stopping_.load(std::memory_order_acquire)) {
+      return;
+    }
+    std::lock_guard lock(mutex_);
+    BuildCollisionWorldLocked();
+  }
+}
+
+void RetainedPlannerSceneProjection::BuildCollisionWorldLocked() {
+  const auto change = scene_change_.load(std::memory_order_acquire);
+  if (built_change_.load(std::memory_order_acquire) == change ||
+      health_.state != core::ProjectionHealthState::kHealthy ||
+      !logical_snapshot_ || !health_.active_projection_revision) {
+    return;
+  }
+  auto publisher = active_publisher_.load(std::memory_order_acquire);
+  if (!publisher) {
+    return;
+  }
+  std::optional<std::string> failure;
+  try {
+    const auto observed_at = clock_();
+    const auto published =
+        publisher->publish(*logical_snapshot_, std::max<std::int64_t>(observed_at, 0));
+    if (!published.ok()) {
+      failure = published.error().message;
+    }
+  } catch (const std::exception &exception) {
+    failure = exception.what();
+  } catch (...) {
+    failure = "collision-world build ended without a result";
+  }
+  if (failure.has_value()) {
+    static_cast<void>(Desynchronize(
+        std::nullopt, *health_.active_projection_revision,
+        error("projection_state_uncertain",
+              "collision-world build failed: " + *failure,
+              "native_projection_collision_world_build_failed")));
+    return;
+  }
+  built_change_.store(change, std::memory_order_release);
+}
+
+void RetainedPlannerSceneProjection::RefreshCollisionWorld() const {
+  if (built_change_.load(std::memory_order_acquire) ==
+      scene_change_.load(std::memory_order_acquire)) {
+    return;
+  }
+  // The cache is logically const: rebuilding it never changes the scene.
+  auto &self = const_cast<RetainedPlannerSceneProjection &>(*this);
+  std::lock_guard lock(self.mutex_);
+  self.BuildCollisionWorldLocked();
+}
+
+void RetainedPlannerSceneProjection::RequestCollisionWorldBuild()
+    const noexcept {
+  const auto change = scene_change_.load(std::memory_order_acquire);
+  if (built_change_.load(std::memory_order_acquire) == change ||
+      requested_change_.exchange(change, std::memory_order_acq_rel) ==
+          change) {
+    return;
+  }
+  build_wake_.fetch_add(1U, std::memory_order_acq_rel);
+  build_wake_.notify_one();
+}
 
 core::Result<std::shared_ptr<RetainedPlannerSceneProjection>>
 RetainedPlannerSceneProjection::CreateUninitialized(
@@ -201,9 +253,7 @@ RetainedPlannerSceneProjection::CreateUninitialized(
       planning_collision_model.product_contract_revision.empty() ||
       !native_runtime_binding.valid() || config.publisher_id.empty() ||
       config.transaction_replay_capacity == 0U ||
-      config.transaction_replay_capacity > 4096U ||
-      config.collision_ledger_capacity == 0U ||
-      config.collision_ledger_capacity > 4096U || !clock) {
+      config.transaction_replay_capacity > 4096U || !clock) {
     return projection_error<std::shared_ptr<RetainedPlannerSceneProjection>>(
         "retained planner projection configuration is incomplete or "
         "unbounded",
@@ -249,23 +299,16 @@ RetainedPlannerSceneProjection::CreateInitialized(
         "initial logical scene does not match the exact retained projection",
         "native_projection_initial_scene_mismatch");
   }
-  auto publisher = projection->BuildPublisher(
-      projection->projector_, initial_scene,
-      core::CollisionWorldMutationSource::kDeploymentApply,
-      "native_projection_initialize");
+  auto publisher =
+      projection->BuildPublisher(projection->projector_, initial_scene);
   if (!publisher.ok()) {
     return projection_error<std::shared_ptr<RetainedPlannerSceneProjection>>(
         publisher.error().message,
         "native_projection_initial_publication_failed");
   }
+  const auto digest = projection_digest(initial_scene);
   auto snapshot = std::make_shared<const core::LogicalSceneSnapshotDTO>(
       std::move(initial_scene));
-  const auto digest = publisher_digest(publisher.value());
-  if (!digest.has_value()) {
-    return projection_error<std::shared_ptr<RetainedPlannerSceneProjection>>(
-        "initial collision projection has no immutable content digest",
-        "native_projection_initial_digest_missing");
-  }
   projection->logical_snapshot_ = std::move(snapshot);
   projection->health_ = {
       projection->native_runtime_binding_,
@@ -273,7 +316,7 @@ RetainedPlannerSceneProjection::CreateInitialized(
       core::ProjectionHealthState::kHealthy,
       revision,
       1U,
-      *digest,
+      digest,
       std::nullopt,
   };
   projection->active_publisher_.store(std::move(publisher.value()),
@@ -294,9 +337,9 @@ core::Result<void> RetainedPlannerSceneProjection::InstallActiveFrameResolver(
         "retained product",
         "native_projection_active_frame_resolver_invalid");
   }
-  if (!health_.healthy_for_target(expected_active_revision) ||
-      !logical_snapshot_ ||
-      logical_snapshot_->revision != expected_active_revision.scene_revision) {
+  // The resolver is structural; any revision of the same Scene is current.
+  if (!health_.healthy_for_identity(expected_active_revision) ||
+      !logical_snapshot_) {
     return projection_error<void>(
         "active native frame resolver does not name the exact active "
         "projection revision",
@@ -309,9 +352,7 @@ core::Result<void> RetainedPlannerSceneProjection::InstallActiveFrameResolver(
 core::Result<std::shared_ptr<RetainedCollisionWorldPublisher>>
 RetainedPlannerSceneProjection::BuildPublisher(
     const RetainedCollisionWorldProjector &projector,
-    const core::LogicalSceneSnapshotDTO &snapshot,
-    const core::CollisionWorldMutationSource source,
-    std::string source_label) const {
+    const core::LogicalSceneSnapshotDTO &snapshot) const {
   std::int64_t observed_at = 0;
   try {
     observed_at = clock_();
@@ -336,11 +377,8 @@ RetainedPlannerSceneProjection::BuildPublisher(
   }
   const auto publisher_id = config_.publisher_id + ".incarnation." +
                             std::to_string(next_publisher_incarnation_++);
-  return RetainedCollisionWorldPublisher::create(
-      projector, publisher_id, snapshot,
-      RetainedCollisionWorldPublicationContext{
-          source, {}, observed_at, {}, std::move(source_label), std::nullopt},
-      clock_, config_.collision_ledger_capacity);
+  return RetainedCollisionWorldPublisher::create(projector, publisher_id,
+                                                 snapshot, observed_at, clock_);
 }
 
 bool RetainedPlannerSceneProjection::HealthyAt(
@@ -483,111 +521,20 @@ RetainedPlannerSceneProjection::ApplyTransaction(
                        TransactionRecord{transaction, success});
 
   if (!no_native_change) {
-    std::int64_t observed_at = 0;
-    try {
-      observed_at = clock_();
-      if (observed_at < 0) {
-        return invalid("native projection clock returned a negative "
-                       "transaction timestamp",
-                       "native_projection_clock_invalid");
-      }
-      const auto published = publisher->publish(
-          *candidate_snapshot,
-          RetainedCollisionWorldPublicationContext{
-              mutation_source(transaction.resolved_operation),
-              {},
-              observed_at,
-              transaction.attribution,
-              "logical_scene_transaction",
-              transaction.request_id.value(),
-          });
-      if (!published.ok()) {
-        return invalid(published.error().message,
-                       "native_projection_publication_rejected");
-      }
-    } catch (const std::exception &exception) {
-      return Desynchronize(
-          transaction.transaction_sequence,
-          transaction.proposed_projection_revision,
-          error("projection_state_uncertain",
-                "native projection transaction effect is uncertain: " +
-                    std::string(exception.what()),
-                "native_projection_effect_uncertain"));
-    } catch (...) {
-      return Desynchronize(
-          transaction.transaction_sequence,
-          transaction.proposed_projection_revision,
-          error("projection_state_uncertain",
-                "native projection transaction effect is uncertain",
-                "native_projection_effect_uncertain"));
-    }
-    const auto digest = publisher_digest(publisher);
-    if (!digest.has_value()) {
-      return Desynchronize(
-          transaction.transaction_sequence,
-          transaction.proposed_projection_revision,
-          error("projection_state_uncertain",
-                "committed native projection has no immutable digest",
-                "native_projection_digest_missing"));
-    }
-    next_health.projection_content_digest = *digest;
+    // The collision world is rebuilt lazily by its next consumer.
+    next_health.projection_content_digest =
+        projection_digest(*candidate_snapshot);
     success.resulting_health = next_health;
-    success.native_projection_generation =
-        next_health.native_projection_generation;
     next_records.at(transaction.transaction_sequence).result = success;
   }
 
   logical_snapshot_ = std::move(candidate_snapshot);
   health_ = std::move(next_health);
   transaction_records_.swap(next_records);
+  if (!no_native_change) {
+    scene_change_.fetch_add(1U, std::memory_order_acq_rel);
+  }
   return success;
-}
-
-core::Result<void> RetainedPlannerSceneProjection::ApplyProviderFreshness(
-    const core::ProviderFreshnessConfirmationDTO &confirmation) {
-  std::lock_guard lock(mutex_);
-  if (!confirmation.valid()) {
-    return projection_error<void>(
-        "native projection received an incomplete provider freshness "
-        "confirmation",
-        "provider_freshness_invalid");
-  }
-  if (!HealthyAt(confirmation.expected_projection_revision)) {
-    return projection_error<void>(
-        "native projection is not healthy at the exact provider freshness "
-        "projection revision",
-        "provider_freshness_projection_unavailable");
-  }
-  if (auto refusal = ValidateProviderFreshnessAgainstCommittedScene(
-          *logical_snapshot_, confirmation);
-      refusal.has_value()) {
-    return core::Result<void>::Err(std::move(*refusal));
-  }
-  auto publisher = active_publisher_.load(std::memory_order_acquire);
-  if (!publisher) {
-    return projection_error<void>(
-        "native projection publisher became unavailable",
-        "provider_freshness_projection_unavailable");
-  }
-  try {
-    // The publisher re-validates against its own committed publication and
-    // swaps atomically; a refusal or exception leaves the prior publication,
-    // projection health and SceneRevision untouched.
-    auto published = publisher->publish_freshness(confirmation);
-    if (!published.ok()) {
-      return core::Result<void>::Err(published.error());
-    }
-  } catch (const std::exception &exception) {
-    return projection_error<void>(
-        "native projection freshness publication failed: " +
-            std::string(exception.what()),
-        "provider_freshness_publication_failed");
-  } catch (...) {
-    return projection_error<void>(
-        "native projection freshness publication failed",
-        "provider_freshness_publication_failed");
-  }
-  return core::Result<void>::Ok();
 }
 
 core::Result<core::CollisionWorldLeaseInventory>
@@ -618,15 +565,10 @@ RetainedPlannerSceneProjection::RetainProjectionLocked(
           "health is closed",
           "native_projection_lease_unavailable");
     }
-    auto inventory =
-        retained->second.publisher->retain_scene_snapshot_lease_inventory_at(
-            projection_lease_id, retained->second.captured_at_ns);
-    if (inventory.has_value() &&
-        inventory->projection_binding.projection_revision ==
-            projection_revision) {
-      inventory->captured_at_ns = retained->second.captured_at_ns;
+    if (retained->second.projection_binding.projection_revision ==
+        projection_revision) {
       return core::Result<core::CollisionWorldLeaseInventory>::Ok(
-          std::move(*inventory));
+          retained->second);
     }
     return projection_error<core::CollisionWorldLeaseInventory>(
         "native projection lease ID is already bound to another revision",
@@ -638,12 +580,12 @@ RetainedPlannerSceneProjection::RetainProjectionLocked(
         "revision",
         "native_projection_lease_unavailable");
   }
-  if (retained_lease_publishers_.size() >=
-      RetainedCollisionWorldPublisher::kRuntimeRetirementCapacity) {
+  if (retained_lease_publishers_.size() >= kMaxRetainedProjectionLeases) {
     return projection_error<core::CollisionWorldLeaseInventory>(
         "native projection lease retention reached its fixed capacity",
         "native_projection_lease_capacity_exhausted");
   }
+  BuildCollisionWorldLocked();
   auto publisher = active_publisher_.load(std::memory_order_acquire);
   if (!publisher) {
     return projection_error<core::CollisionWorldLeaseInventory>(
@@ -668,37 +610,27 @@ RetainedPlannerSceneProjection::RetainProjectionLocked(
         "native projection lease clock returned a negative timestamp",
         "native_projection_lease_clock_invalid");
   }
-  auto inventory = publisher->retain_scene_snapshot_lease_inventory_at(
-      projection_lease_id, captured_at_ns);
-  if (!inventory.has_value() ||
+  auto inventory = publisher->current_scene_snapshot_lease_inventory();
+  if (!inventory.has_value() || !inventory->logical_scene ||
       inventory->projection_binding.projection_revision !=
           projection_revision) {
-    if (inventory.has_value()) {
-      publisher->release_scene_snapshot_lease_inventory(projection_lease_id);
-    }
     return projection_error<core::CollisionWorldLeaseInventory>(
         "native projection publisher could not retain the exact revision",
         "native_projection_lease_unavailable");
   }
+  inventory->projection_binding.projection_lease_id = projection_lease_id;
   inventory->captured_at_ns = captured_at_ns;
+  const auto [inserted, was_inserted] =
+      retained_lease_publishers_.emplace(projection_lease_id, *inventory);
+  if (!was_inserted) {
+    return projection_error<core::CollisionWorldLeaseInventory>(
+        "native projection lease ID could not be retained uniquely",
+        "native_projection_lease_conflict");
+  }
   try {
-    const auto [inserted, was_inserted] = retained_lease_publishers_.emplace(
-        projection_lease_id,
-        RetainedProjectionLease{publisher, captured_at_ns, inventory->logical_scene});
-    if (!was_inserted) {
-      publisher->release_scene_snapshot_lease_inventory(projection_lease_id);
-      return projection_error<core::CollisionWorldLeaseInventory>(
-          "native projection lease ID could not be retained uniquely",
-          "native_projection_lease_conflict");
-    }
-    try {
-      retained_lease_order_.push_back(projection_lease_id);
-    } catch (...) {
-      retained_lease_publishers_.erase(inserted);
-      throw;
-    }
+    retained_lease_order_.push_back(projection_lease_id);
   } catch (...) {
-    publisher->release_scene_snapshot_lease_inventory(projection_lease_id);
+    retained_lease_publishers_.erase(inserted);
     throw;
   }
   return core::Result<core::CollisionWorldLeaseInventory>::Ok(
@@ -736,8 +668,6 @@ void RetainedPlannerSceneProjection::ReleaseProjection(
   if (retained == retained_lease_publishers_.end()) {
     return;
   }
-  retained->second.publisher->release_scene_snapshot_lease_inventory(
-      projection_lease_id);
   retained_lease_publishers_.erase(retained);
   retained_lease_order_.erase(std::remove(retained_lease_order_.begin(),
                                           retained_lease_order_.end(),
@@ -822,30 +752,22 @@ RetainedPlannerSceneProjection::RebuildProjectionLocked(
         return invalid("maintenance clock returned a negative timestamp",
                        "native_projection_maintenance_clock_invalid");
       }
-      const auto published = publisher->publish(
-          *request.logical_scene,
-          RetainedCollisionWorldPublicationContext{
-              core::CollisionWorldMutationSource::kDeploymentApply, {},
-              observed_at, {}, "initial_scene_maintenance", std::nullopt});
+      const auto published =
+          publisher->publish(*request.logical_scene, observed_at);
       if (!published.ok()) {
         return Desynchronize(
             std::nullopt, request.target_projection_revision,
             error("projection_state_uncertain", published.error().message,
                   "native_projection_maintenance_publication_uncertain"));
       }
-      const auto digest = publisher_digest(publisher);
-      if (!digest.has_value()) {
-        return Desynchronize(std::nullopt,
-                             request.target_projection_revision,
-                             error("projection_state_uncertain",
-                                   "maintenance publisher has no digest",
-                                   "native_projection_maintenance_digest_missing"));
-      }
       ++health_.source_sequence;
       health_.active_projection_revision = request.target_projection_revision;
       health_.native_projection_generation =
           health_.native_projection_generation.value_or(0U) + 1U;
-      health_.projection_content_digest = *digest;
+      health_.projection_content_digest =
+          projection_digest(*request.logical_scene);
+      built_change_.store(scene_change_.load(std::memory_order_acquire),
+                          std::memory_order_release);
       logical_snapshot_ = request.logical_scene;
       transaction_records_.clear();
       maintenance_successor_ = request;
@@ -893,25 +815,13 @@ RetainedPlannerSceneProjection::RebuildProjectionLocked(
           : "rebuild",
       native_runtime_binding_);
 #endif
-  auto rebuilt =
-      BuildPublisher(projector_, *request.logical_scene,
-                     core::CollisionWorldMutationSource::kDeploymentApply,
-                     "native_projection_rebuild");
+  auto rebuilt = BuildPublisher(projector_, *request.logical_scene);
   if (!rebuilt.ok()) {
     return Desynchronize(std::nullopt, request.target_projection_revision,
                          error("projection_state_uncertain",
                                rebuilt.error().message,
                                "native_projection_rebuild_failed"));
   }
-  const auto digest = publisher_digest(rebuilt.value());
-  if (!digest.has_value()) {
-    return Desynchronize(
-        std::nullopt, request.target_projection_revision,
-        error("projection_state_uncertain",
-              "rebuilt native projection has no immutable digest",
-              "native_projection_rebuild_digest_missing"));
-  }
-
   auto next_snapshot = request.logical_scene;
   auto next_health = health_;
   ++next_health.source_sequence;
@@ -922,7 +832,8 @@ RetainedPlannerSceneProjection::RebuildProjectionLocked(
           ? std::optional<std::uint64_t>(*health_.native_projection_generation +
                                          1U)
           : std::optional<std::uint64_t>(1U);
-  next_health.projection_content_digest = *digest;
+  next_health.projection_content_digest =
+      projection_digest(*request.logical_scene);
   next_health.error = std::nullopt;
   core::ProjectionCommitResultDTO success{
       std::nullopt,
@@ -939,6 +850,8 @@ RetainedPlannerSceneProjection::RebuildProjectionLocked(
   health_ = std::move(next_health);
   active_publisher_.store(std::move(rebuilt.value()),
                           std::memory_order_release);
+  built_change_.store(scene_change_.load(std::memory_order_acquire),
+                      std::memory_order_release);
   return success;
 }
 
@@ -1291,12 +1204,7 @@ RetainedPlannerSceneProjection::ProjectSceneCandidate(
                                   std::move(candidate_lease_id)};
   inventory.logical_scene = candidate.logical_scene;
   inventory.captured_at_ns = now_ns;
-  inventory.bundle = {world_snapshot, std::move(policy.value()),
-                      projector_.project_body_freshness(*world_snapshot)};
-  inventory.topology_epoch = candidate.logical_scene->topology_epoch;
-  inventory.policy_epoch = candidate.logical_scene->policy_epoch;
-  inventory.live_objects = projector_.project_live_objects(
-      *candidate.logical_scene, *world_snapshot);
+  inventory.bundle = {world_snapshot, std::move(policy.value())};
   return core::Result<core::CollisionWorldLeaseInventory>::Ok(
       std::move(inventory));
 }
@@ -1335,12 +1243,14 @@ RetainedPlannerSceneProjection::collision_shared_model() const {
 
 core::CollisionWorldSnapshotPtr
 RetainedPlannerSceneProjection::snapshot() const {
+  RefreshCollisionWorld();
   auto publisher = active_publisher_.load(std::memory_order_acquire);
   return publisher ? publisher->snapshot() : nullptr;
 }
 
 core::CollisionWorldRevision
 RetainedPlannerSceneProjection::published_collision_world_revision() const {
+  RefreshCollisionWorld();
   auto publisher = active_publisher_.load(std::memory_order_acquire);
   return publisher ? publisher->published_collision_world_revision()
                    : core::CollisionWorldRevision{};
@@ -1348,12 +1258,14 @@ RetainedPlannerSceneProjection::published_collision_world_revision() const {
 
 std::optional<core::CollisionPolicySnapshot>
 RetainedPlannerSceneProjection::collision_policy_snapshot() const {
+  RefreshCollisionWorld();
   auto publisher = active_publisher_.load(std::memory_order_acquire);
   return publisher ? publisher->collision_policy_snapshot() : std::nullopt;
 }
 
 core::CollisionWorldPolicySnapshotBundle
 RetainedPlannerSceneProjection::collision_world_policy_snapshot_bundle() const {
+  RefreshCollisionWorld();
   auto publisher = active_publisher_.load(std::memory_order_acquire);
   return publisher ? publisher->collision_world_policy_snapshot_bundle()
                    : core::CollisionWorldPolicySnapshotBundle{};
@@ -1361,6 +1273,7 @@ RetainedPlannerSceneProjection::collision_world_policy_snapshot_bundle() const {
 
 std::optional<core::CollisionWorldLeaseInventory>
 RetainedPlannerSceneProjection::current_scene_snapshot_lease_inventory() const {
+  RefreshCollisionWorld();
   auto publisher = active_publisher_.load(std::memory_order_acquire);
   return publisher ? publisher->current_scene_snapshot_lease_inventory()
                    : std::nullopt;
@@ -1391,8 +1304,7 @@ RetainedPlannerSceneProjection::scene_snapshot_lease_retention_stats() const {
   std::lock_guard lock(mutex_);
   core::CollisionWorldLeaseRetentionStats result;
   result.retained_count = retained_lease_publishers_.size();
-  result.retained_capacity =
-      RetainedCollisionWorldPublisher::kRuntimeRetirementCapacity;
+  result.retained_capacity = kMaxRetainedProjectionLeases;
   result.retained_ids_oldest_first.reserve(retained_lease_order_.size());
   for (const auto &lease_id : retained_lease_order_) {
     result.retained_ids_oldest_first.push_back(lease_id);
@@ -1403,9 +1315,13 @@ RetainedPlannerSceneProjection::scene_snapshot_lease_retention_stats() const {
 core::RuntimeCollisionQueryBundlePtr
 RetainedPlannerSceneProjection::published_runtime_collision_query_bundle()
     const {
+  // Runtime-monitor path: keep the previous world until the off-real-time
+  // build of a changed scene is published.
   auto publisher = active_publisher_.load(std::memory_order_acquire);
-  return publisher ? publisher->published_runtime_collision_query_bundle()
-                   : nullptr;
+  auto bundle = publisher ? publisher->published_runtime_collision_query_bundle()
+                          : nullptr;
+  RequestCollisionWorldBuild();
+  return bundle;
 }
 
 } // namespace manyforge::roboplan_backend

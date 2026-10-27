@@ -114,6 +114,7 @@ launch_arguments=(
     "runtime_namespace:=${runtime_namespace}"
     "controller_manager_lock_memory:=${MANYFORGE_CONTROLLER_MANAGER_LOCK_MEMORY:-false}"
     "controller_manager_thread_priority:=${MANYFORGE_CONTROLLER_MANAGER_THREAD_PRIORITY:-50}"
+    "gripper_state_freshness_timeout_s:=${ISAAC_GRIPPER_STATE_FRESHNESS_TIMEOUT_S:-1.0}"
 )
 if [[ -n "${ISAAC_JOINT_COMMANDS_TOPIC:-}" ]]; then
     launch_arguments+=("joint_commands_topic:=${ISAAC_JOINT_COMMANDS_TOPIC}")
@@ -124,18 +125,6 @@ fi
 if [[ -n "${MANYFORGE_CONTROLLER_MANAGER_CPU_AFFINITY:-}" ]]; then
     launch_arguments+=(
         "controller_manager_cpu_affinity:=${MANYFORGE_CONTROLLER_MANAGER_CPU_AFFINITY}"
-    )
-fi
-if [[ -n "${MANYFORGE_MANAGER_RUN_ROOT:-}" || \
-      -n "${ISAAC_POSE_OBSERVER_SITE_CONFIG:-}" ]]; then
-    if [[ -z "${MANYFORGE_MANAGER_RUN_ROOT:-}" || \
-          -z "${ISAAC_POSE_OBSERVER_SITE_CONFIG:-}" ]]; then
-        printf 'MANYFORGE_MANAGER_RUN_ROOT and ISAAC_POSE_OBSERVER_SITE_CONFIG must be set together.\n' >&2
-        exit 2
-    fi
-    launch_arguments+=(
-        "manager_run_root:=${MANYFORGE_MANAGER_RUN_ROOT}"
-        "pose_observer_site_config:=${ISAAC_POSE_OBSERVER_SITE_CONFIG}"
     )
 fi
 if [[ -n "${ISAAC_POINTCLOUD_TOPIC:-}" ]]; then

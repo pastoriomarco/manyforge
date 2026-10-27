@@ -8056,6 +8056,66 @@
                 "additionalProperties": false,
                 "allOf": [
                   {
+                    "not": {
+                      "allOf": [
+                        {
+                          "properties": {
+                            "parameters": {
+                              "required": [
+                                "grasp_lost_rotation_rad"
+                              ]
+                            }
+                          },
+                          "required": [
+                            "parameters"
+                          ]
+                        },
+                        {
+                          "properties": {
+                            "value_sources": {
+                              "required": [
+                                "grasp_lost_rotation_rad"
+                              ]
+                            }
+                          },
+                          "required": [
+                            "value_sources"
+                          ]
+                        }
+                      ]
+                    }
+                  },
+                  {
+                    "not": {
+                      "allOf": [
+                        {
+                          "properties": {
+                            "parameters": {
+                              "required": [
+                                "grasp_lost_translation_m"
+                              ]
+                            }
+                          },
+                          "required": [
+                            "parameters"
+                          ]
+                        },
+                        {
+                          "properties": {
+                            "value_sources": {
+                              "required": [
+                                "grasp_lost_translation_m"
+                              ]
+                            }
+                          },
+                          "required": [
+                            "value_sources"
+                          ]
+                        }
+                      ]
+                    }
+                  },
+                  {
                     "$ref": "#/$defs/s_f32141df5dcacbc2"
                   },
                   {
@@ -8101,6 +8161,14 @@
                         "x-manyforge-semantic-scope-parameter": "target_role",
                         "x-manyforge-semantic-type": "frame_role"
                       },
+                      "grasp_lost_rotation_rad": {
+                        "exclusiveMinimum": 0.0,
+                        "type": "number"
+                      },
+                      "grasp_lost_translation_m": {
+                        "exclusiveMinimum": 0.0,
+                        "type": "number"
+                      },
                       "scene_resource_id": {
                         "type": "string",
                         "x-manyforge-semantic-type": "scene_resource"
@@ -8126,6 +8194,12 @@
                     "additionalProperties": false,
                     "minProperties": 1,
                     "properties": {
+                      "grasp_lost_rotation_rad": {
+                        "$ref": "#/$defs/s_239060e26cdf11f6"
+                      },
+                      "grasp_lost_translation_m": {
+                        "$ref": "#/$defs/s_239060e26cdf11f6"
+                      },
                       "scene_resource_id": {
                         "$ref": "#/$defs/s_239060e26cdf11f6"
                       },
@@ -10852,6 +10926,66 @@
                 "additionalProperties": false,
                 "allOf": [
                   {
+                    "not": {
+                      "allOf": [
+                        {
+                          "properties": {
+                            "parameters": {
+                              "required": [
+                                "grasp_lost_rotation_rad"
+                              ]
+                            }
+                          },
+                          "required": [
+                            "parameters"
+                          ]
+                        },
+                        {
+                          "properties": {
+                            "value_sources": {
+                              "required": [
+                                "grasp_lost_rotation_rad"
+                              ]
+                            }
+                          },
+                          "required": [
+                            "value_sources"
+                          ]
+                        }
+                      ]
+                    }
+                  },
+                  {
+                    "not": {
+                      "allOf": [
+                        {
+                          "properties": {
+                            "parameters": {
+                              "required": [
+                                "grasp_lost_translation_m"
+                              ]
+                            }
+                          },
+                          "required": [
+                            "parameters"
+                          ]
+                        },
+                        {
+                          "properties": {
+                            "value_sources": {
+                              "required": [
+                                "grasp_lost_translation_m"
+                              ]
+                            }
+                          },
+                          "required": [
+                            "value_sources"
+                          ]
+                        }
+                      ]
+                    }
+                  },
+                  {
                     "$ref": "#/$defs/s_f32141df5dcacbc2"
                   },
                   {
@@ -10941,6 +11075,14 @@
                         "x-manyforge-semantic-scope-parameter": "target_role",
                         "x-manyforge-semantic-type": "frame_role"
                       },
+                      "grasp_lost_rotation_rad": {
+                        "exclusiveMinimum": 0.0,
+                        "type": "number"
+                      },
+                      "grasp_lost_translation_m": {
+                        "exclusiveMinimum": 0.0,
+                        "type": "number"
+                      },
                       "scene_resource_id": {
                         "type": "string",
                         "x-manyforge-semantic-type": "scene_resource"
@@ -10970,6 +11112,12 @@
                     "additionalProperties": false,
                     "minProperties": 1,
                     "properties": {
+                      "grasp_lost_rotation_rad": {
+                        "$ref": "#/$defs/s_239060e26cdf11f6"
+                      },
+                      "grasp_lost_translation_m": {
+                        "$ref": "#/$defs/s_239060e26cdf11f6"
+                      },
                       "scene_resource_id": {
                         "$ref": "#/$defs/s_239060e26cdf11f6"
                       },
@@ -15710,6 +15858,66 @@
                 "additionalProperties": false,
                 "allOf": [
                   {
+                    "not": {
+                      "allOf": [
+                        {
+                          "properties": {
+                            "parameters": {
+                              "required": [
+                                "grasp_lost_rotation_rad"
+                              ]
+                            }
+                          },
+                          "required": [
+                            "parameters"
+                          ]
+                        },
+                        {
+                          "properties": {
+                            "value_sources": {
+                              "required": [
+                                "grasp_lost_rotation_rad"
+                              ]
+                            }
+                          },
+                          "required": [
+                            "value_sources"
+                          ]
+                        }
+                      ]
+                    }
+                  },
+                  {
+                    "not": {
+                      "allOf": [
+                        {
+                          "properties": {
+                            "parameters": {
+                              "required": [
+                                "grasp_lost_translation_m"
+                              ]
+                            }
+                          },
+                          "required": [
+                            "parameters"
+                          ]
+                        },
+                        {
+                          "properties": {
+                            "value_sources": {
+                              "required": [
+                                "grasp_lost_translation_m"
+                              ]
+                            }
+                          },
+                          "required": [
+                            "value_sources"
+                          ]
+                        }
+                      ]
+                    }
+                  },
+                  {
                     "$ref": "#/$defs/s_f32141df5dcacbc2"
                   },
                   {
@@ -15799,6 +16007,14 @@
                         "x-manyforge-semantic-scope-parameter": "target_role",
                         "x-manyforge-semantic-type": "frame_role"
                       },
+                      "grasp_lost_rotation_rad": {
+                        "exclusiveMinimum": 0.0,
+                        "type": "number"
+                      },
+                      "grasp_lost_translation_m": {
+                        "exclusiveMinimum": 0.0,
+                        "type": "number"
+                      },
                       "scene_resource_id": {
                         "type": "string",
                         "x-manyforge-semantic-type": "scene_resource"
@@ -15828,6 +16044,12 @@
                     "additionalProperties": false,
                     "minProperties": 1,
                     "properties": {
+                      "grasp_lost_rotation_rad": {
+                        "$ref": "#/$defs/s_239060e26cdf11f6"
+                      },
+                      "grasp_lost_translation_m": {
+                        "$ref": "#/$defs/s_239060e26cdf11f6"
+                      },
                       "scene_resource_id": {
                         "$ref": "#/$defs/s_239060e26cdf11f6"
                       },
@@ -22384,6 +22606,66 @@
             "additionalProperties": false,
             "allOf": [
               {
+                "not": {
+                  "allOf": [
+                    {
+                      "properties": {
+                        "parameters": {
+                          "required": [
+                            "grasp_lost_rotation_rad"
+                          ]
+                        }
+                      },
+                      "required": [
+                        "parameters"
+                      ]
+                    },
+                    {
+                      "properties": {
+                        "value_sources": {
+                          "required": [
+                            "grasp_lost_rotation_rad"
+                          ]
+                        }
+                      },
+                      "required": [
+                        "value_sources"
+                      ]
+                    }
+                  ]
+                }
+              },
+              {
+                "not": {
+                  "allOf": [
+                    {
+                      "properties": {
+                        "parameters": {
+                          "required": [
+                            "grasp_lost_translation_m"
+                          ]
+                        }
+                      },
+                      "required": [
+                        "parameters"
+                      ]
+                    },
+                    {
+                      "properties": {
+                        "value_sources": {
+                          "required": [
+                            "grasp_lost_translation_m"
+                          ]
+                        }
+                      },
+                      "required": [
+                        "value_sources"
+                      ]
+                    }
+                  ]
+                }
+              },
+              {
                 "$ref": "#/$defs/s_f32141df5dcacbc2"
               },
               {
@@ -22458,6 +22740,14 @@
                     "x-manyforge-semantic-scope-parameter": "target_role",
                     "x-manyforge-semantic-type": "frame_role"
                   },
+                  "grasp_lost_rotation_rad": {
+                    "exclusiveMinimum": 0.0,
+                    "type": "number"
+                  },
+                  "grasp_lost_translation_m": {
+                    "exclusiveMinimum": 0.0,
+                    "type": "number"
+                  },
                   "scene_resource_id": {
                     "type": "string",
                     "x-manyforge-semantic-type": "scene_resource"
@@ -22483,6 +22773,12 @@
                 "additionalProperties": false,
                 "minProperties": 1,
                 "properties": {
+                  "grasp_lost_rotation_rad": {
+                    "$ref": "#/$defs/s_239060e26cdf11f6"
+                  },
+                  "grasp_lost_translation_m": {
+                    "$ref": "#/$defs/s_239060e26cdf11f6"
+                  },
                   "scene_resource_id": {
                     "$ref": "#/$defs/s_239060e26cdf11f6"
                   },

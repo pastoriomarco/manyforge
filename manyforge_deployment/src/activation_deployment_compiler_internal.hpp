@@ -10,6 +10,7 @@
 #include "activation_component_profile_internal.hpp"
 #include "activation_deployment_intent_internal.hpp"
 #include "activation_io_provider_internal.hpp"
+#include "activation_pose_source_internal.hpp"
 #include "activation_prepared_model_internal.hpp"
 
 namespace manyforge::deployment::detail {

@@ -52,8 +52,8 @@ namespace core = manyforge::core;
   const auto &publication_receipt = publication.publication.publication_receipt;
   if (!status.matches(query))
     return "fence identity/scope";
-  if (evidence.active_projection_revision !=
-      completed.target_projection_revision)
+  if (!core::SameProjectionIdentity(evidence.active_projection_revision,
+                                    completed.target_projection_revision))
     return "active projection";
   if (evidence.active_graph_revision !=
       completed.target_projection_revision.graph_revision)
@@ -78,7 +78,8 @@ PersistTerminal(SqliteManagerApplyJournal &journal,
   return journal.EnsureTerminalOutcome({
       completed.apply_id,
       completed.apply_generation,
-      completed.target_projection_revision,
+      // The published candidate; its Scene revision is Apply-time evidence.
+      publication.publication.publication_receipt.request.candidate_projection_revision,
       publication.publication_receipt_digest,
       publication.publication_receipt_digest,
       released.fence_released_digest,
@@ -167,9 +168,8 @@ ManagerApplyFenceReleaseResult ManagerApplyFenceReleaseCoordinator::ReleaseOrRec
           core::ProjectionMaintenanceInitializationState::kCompleted ||
       !completed->initial_scene_installed ||
       !publication.has_value() || !acceptance.has_value() ||
-      completed->publication_receipt !=
-          std::optional<core::ActiveBundlePublicationReceiptDTO>{
-              publication->publication.publication_receipt}) {
+      !core::SamePublicationIdentity(completed->publication_receipt,
+                                     publication->publication.publication_receipt)) {
     Fail(
         "fence release requires exact durable acceptance, publication, and "
         "Scene completion evidence");

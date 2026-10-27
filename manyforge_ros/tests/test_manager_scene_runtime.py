@@ -330,7 +330,7 @@ def test_client_parses_and_cross_checks_committed_scene_application(
     assert rejected.value.code == "manager_scene_runtime_response_invalid"
 
 
-def test_client_accepts_freshness_confirmation_with_unchanged_projection(
+def test_client_accepts_unchanged_sample_with_unchanged_projection(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -347,7 +347,7 @@ def test_client_accepts_freshness_confirmation_with_unchanged_projection(
         {
             "disposition": "apply_now",
             "policy_id": "continuous_unattached",
-            "scene_application_status": "freshness_confirmed",
+            "scene_application_status": "unchanged",
             "scene_projection_revision": _projection_revision(),
             "scene_request_id": "scene-runtime-pose-" + "e" * 71,
             "scene_update_status": None,
@@ -379,7 +379,7 @@ def test_client_accepts_freshness_confirmation_with_unchanged_projection(
         )
 
     result = observe("continuous_unattached")
-    assert result.scene_application_status == "freshness_confirmed"
+    assert result.scene_application_status == "unchanged"
     assert result.scene_update_status is None
     assert result.scene_projection_revision is not None
     assert result.scene_projection_revision.revision_id == 4
@@ -388,7 +388,7 @@ def test_client_accepts_freshness_confirmation_with_unchanged_projection(
     latched.update({"disposition": "observed_only", "policy_id": "before_planning"})
     monkeypatch.setattr(client, "_exchange", lambda _command: latched)
     assert observe("before_planning").scene_application_status == (
-        "freshness_confirmed"
+        "unchanged"
     )
 
     for field, value in (

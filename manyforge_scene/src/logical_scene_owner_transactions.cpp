@@ -52,22 +52,9 @@ ErrorDTO SceneError(const std::string_view code, const std::string_view message,
 
 bool ExpectedProjectionAdmitsActive(const SceneTransactionRequestDTO &request,
                                     const ProjectionRevisionDTO &active) {
-  if (request.expected_projection_revision == active) {
-    return true;
-  }
-  const bool identity_checked =
-      std::holds_alternative<core::AttachCarriedObjectRequestDTO>(
-          request.operation) ||
-      std::holds_alternative<core::DetachCarriedObjectRequestDTO>(
-          request.operation) ||
-      std::holds_alternative<core::DetachCarriedObjectAtCurrentPoseRequestDTO>(
-          request.operation) ||
-      std::holds_alternative<core::RemoveObjectRequestDTO>(request.operation) ||
-      std::holds_alternative<core::UpdateObjectPoseRequestDTO>(
-          request.operation);
-  return identity_checked &&
-         core::ProjectionIsSameOrForwardInLineage(
-             active, request.expected_projection_revision);
+  const auto &expected = request.expected_projection_revision;
+  return core::SameActiveDeployment(active, expected) &&
+         active.scene_revision.scene_id == expected.scene_revision.scene_id;
 }
 
 SceneCommitResultDTO
@@ -115,26 +102,6 @@ bool SamePose(const core::Pose3DTO &left,
 
 namespace manyforge::scene::logical_scene_owner_detail {
 namespace {
-
-bool SameProviderEvidence(
-    const std::optional<core::SceneObjectProviderEvidenceDTO> &left,
-    const std::optional<core::SceneObjectProviderEvidenceDTO> &right) {
-  if (left.has_value() != right.has_value()) {
-    return false;
-  }
-  if (!left.has_value()) {
-    return true;
-  }
-  return left->provider_instance_id == right->provider_instance_id &&
-         left->provider_manifest_id == right->provider_manifest_id &&
-         left->provider_manifest_revision ==
-             right->provider_manifest_revision &&
-         left->provider_source_epoch == right->provider_source_epoch &&
-         left->provider_source_sequence == right->provider_source_sequence &&
-         left->received_at_ns == right->received_at_ns &&
-         left->source_timestamp_ns == right->source_timestamp_ns &&
-         left->source_freshness_budget_ns == right->source_freshness_budget_ns;
-}
 
 struct ResolvedSceneCandidate final {
   LogicalSceneSnapshotDTO snapshot;
@@ -718,30 +685,6 @@ ResolveSceneCandidate(const SceneTransactionRequestDTO &request,
                  {"current_attached", attached ? "true" : "false"},
                  {"current_frame_id", CurrentFrameId(current, *found)}});
           }
-          if (operation.provider_evidence.has_value() &&
-              found->provider_evidence.has_value()) {
-            const auto &next = *operation.provider_evidence;
-            const auto &previous = *found->provider_evidence;
-            if (next.provider_instance_id == previous.provider_instance_id &&
-                next.provider_manifest_id == previous.provider_manifest_id &&
-                next.provider_manifest_revision ==
-                    previous.provider_manifest_revision &&
-                next.provider_source_epoch == previous.provider_source_epoch &&
-                next.provider_source_sequence <=
-                    previous.provider_source_sequence) {
-              throw SceneRequestRejectionError(
-                  "scene_object_state_conflict",
-                  "provider source sequence did not advance",
-                  {{"reason", "provider_source_sequence_not_increasing"},
-                   {"scene_resource_id", operation.scene_resource_id.value()},
-                   {"provider_instance_id", next.provider_instance_id.value()},
-                   {"provider_source_epoch", next.provider_source_epoch},
-                   {"previous_provider_source_sequence",
-                    std::to_string(previous.provider_source_sequence)},
-                   {"received_provider_source_sequence",
-                    std::to_string(next.provider_source_sequence)}});
-            }
-          }
           if (attached) {
             if (!operation.provider_evidence)
               throw SceneRequestRejectionError(
@@ -789,8 +732,8 @@ ResolveSceneCandidate(const SceneTransactionRequestDTO &request,
                           normalized.pose_in_cell);
             const bool pose_changed =
                 !SamePose(attachment->pose_in_carrier_frame, next_pose);
-            const bool evidence_changed = !SameProviderEvidence(
-                found->provider_evidence, operation.provider_evidence);
+            const bool evidence_changed =
+                found->provider_evidence != operation.provider_evidence;
             attachment->pose_in_carrier_frame = next_pose;
             attachment->carried_object_attachment_revision =
                 core::logical_scene_identity::
@@ -817,8 +760,8 @@ ResolveSceneCandidate(const SceneTransactionRequestDTO &request,
                   .pose_in_cell;
           const bool pose_changed =
               !SamePose(previous_pose, normalized.pose_in_cell);
-          const bool evidence_changed = !SameProviderEvidence(
-              found->provider_evidence, operation.provider_evidence);
+          const bool evidence_changed =
+              found->provider_evidence != operation.provider_evidence;
           found->placement = core::CellFixedSceneObjectPlacementDTO{
               current.cell_id, normalized.pose_in_cell};
           found->provider_evidence = operation.provider_evidence;
@@ -923,6 +866,14 @@ ResolveSceneCandidate(const SceneTransactionRequestDTO &request,
                 {{"reason", "scene_object_is_attached"},
                  {"scene_resource_id", operation.scene_resource_id.value()}});
           }
+          if (operation.grasp_lost_bound &&
+              !operation.grasp_lost_bound->valid()) {
+            throw std::invalid_argument(
+                "grasp_lost_bound must be finite and positive");
+          }
+          const auto pose_in_carrier = core::multiply_poses(
+              core::inverse_pose(frame_resolution->frame_pose_in_cell),
+              fixed->pose_in_cell);
           core::CarriedObjectAttachmentDTO attachment{
               operation.carried_object_attachment_id,
               core::CarriedObjectAttachmentRevision(std::string{}),
@@ -932,10 +883,12 @@ ResolveSceneCandidate(const SceneTransactionRequestDTO &request,
               core::ComponentSceneFrameRefDTO{
                   carrier->controllable_component_id,
                   carrier->model_instance_id, carrier->frame_role_id},
-              core::multiply_poses(
-                  core::inverse_pose(frame_resolution->frame_pose_in_cell),
-                  fixed->pose_in_cell),
-              std::move(touch_roles)};
+              pose_in_carrier,
+              std::move(touch_roles),
+              operation.grasp_lost_bound
+                  ? std::optional(core::CarriedObjectGraspLostCheckDTO{
+                        *operation.grasp_lost_bound, pose_in_carrier})
+                  : std::nullopt};
           attachment.carried_object_attachment_revision =
               core::logical_scene_identity::
                   ComputeCarriedObjectAttachmentRevision(attachment);
@@ -1286,10 +1239,12 @@ std::uint64_t NextSceneOwnerEventSequence(sqlite3 *database) {
   return watermark + 1U;
 }
 
-RequestOwnerEpoch
-CompactSceneTransactionHistory(sqlite3 *database,
-                               const DurableState &durable_state,
-                               const SceneTransactionStoreState &transactions) {
+// Compaction is transparent to callers: it prunes the resident ledger behind
+// a checkpoint of the active head and keeps the request owner epoch in force,
+// so neither the triggering request nor any other caller has to refresh.
+void CompactSceneTransactionHistory(
+    sqlite3 *database, const DurableState &durable_state,
+    const SceneTransactionStoreState &transactions) {
   const auto access = AccessStatus(durable_state);
   if (!access.scene_writes_open || !access.projection_leases_open ||
       durable_state.projection_desynchronized ||
@@ -1304,19 +1259,19 @@ CompactSceneTransactionHistory(sqlite3 *database,
         "logical-scene history compaction requires a settled quiescent head");
   }
   const auto history = ReadBoundedHistoryState(database);
-  if (history.compaction_generation >= kMaximumSafeIntegral ||
-      history.request_epoch_generation >= kMaximumSafeIntegral) {
+  if (history.compaction_generation >= kMaximumSafeIntegral) {
     throw LogicalSceneOwnerLimitError(
         "logical-scene history compaction generation is exhausted");
   }
   const auto next_compaction_generation = history.compaction_generation + 1U;
-  const auto next_request_epoch_generation =
+  // The epoch never advances here. The first compaction records the bootstrap
+  // epoch (generation 2 is the schema's first compacted generation); a store
+  // that rotated before this rule keeps its last rotated epoch.
+  const auto request_epoch_generation =
       history.request_epoch_generation == 0U
           ? 2U
-          : history.request_epoch_generation + 1U;
-  const auto next_request_owner_epoch =
-      CompactedRequestOwnerEpoch(transactions.active_snapshot.revision.scene_id,
-                                 next_request_epoch_generation);
+          : history.request_epoch_generation;
+  const auto &request_owner_epoch = transactions.request_owner_epoch;
   const auto snapshot_json = logical_scene_codec_internal::EncodeSnapshot(
       transactions.active_snapshot);
   if (snapshot_json.empty() ||
@@ -1340,9 +1295,9 @@ CompactSceneTransactionHistory(sqlite3 *database,
       "compaction_in_progress=0");
   update.Bind(1, CheckedSafeCounter(next_compaction_generation,
                                     "compaction generation"));
-  update.Bind(2, CheckedSafeCounter(next_request_epoch_generation,
+  update.Bind(2, CheckedSafeCounter(request_epoch_generation,
                                     "request epoch generation"));
-  update.Bind(3, next_request_owner_epoch.value());
+  update.Bind(3, request_owner_epoch.value());
   update.Bind(4, CheckedSafeCounter(transactions.next_transaction_sequence - 1U,
                                     "compacted transaction sequence"));
   update.Bind(5, CheckedSafeCounter(transactions.next_owner_event_sequence - 1U,
@@ -1381,7 +1336,7 @@ CompactSceneTransactionHistory(sqlite3 *database,
       ReadSceneTransactionStoreState(database, durable_state);
   if (compacted.active_projection != transactions.active_projection ||
       compacted.active_snapshot != transactions.active_snapshot ||
-      compacted.request_owner_epoch != next_request_owner_epoch ||
+      compacted.request_owner_epoch != request_owner_epoch ||
       compacted.next_transaction_sequence !=
           transactions.next_transaction_sequence ||
       compacted.next_owner_event_sequence !=
@@ -1390,7 +1345,6 @@ CompactSceneTransactionHistory(sqlite3 *database,
     throw LogicalSceneOwnerIntegrityError(
         "logical-scene history compaction changed authoritative state");
   }
-  return next_request_owner_epoch;
 }
 
 void InsertSceneTransactionOwnerEvent(
@@ -2381,7 +2335,7 @@ LogicalSceneOwner::Commit(const SceneTransactionRequestDTO &request) {
                                         *observed_state.active_projection)) {
       return reject(
           core::RequestReplayStatusDTO::kAcceptedNew, "stale_revision",
-          "expected composite projection revision is no longer active");
+          "expected projection names another Deployment or Scene");
     }
     if (observed_transactions->resident_transaction_count >=
         kMaximumLogicalSceneTransactions) {
@@ -2403,26 +2357,15 @@ LogicalSceneOwner::Commit(const SceneTransactionRequestDTO &request) {
                       "logical-scene state changed before history compaction");
       }
       impl_->InvalidateSceneCommitState();
-      const auto next_epoch = CompactSceneTransactionHistory(
-          database, observed_state, *observed_transactions);
+      CompactSceneTransactionHistory(database, observed_state,
+                                     *observed_transactions);
       compaction.Commit();
-      observed_transactions->request_owner_epoch = next_epoch;
       observed_transactions->resident_transaction_count = 0U;
-      impl_->StoreSceneCommitState(observed_state,
-                                   std::move(observed_transactions),
+      impl_->StoreSceneCommitState(observed_state, observed_transactions,
                                    external_data_version);
-      return reject(
-          core::RequestReplayStatusDTO::kStaleRequestOwnerEpoch,
-          "stale_request_owner_epoch",
-          "logical-scene request owner epoch rotated after bounded history "
-          "compaction",
-          {{"reason", "scene_history_compaction_no_effect"},
-           {"previous_request_owner_epoch", request.request_context.request_owner_epoch.value()},
-           {"expected_request_owner_epoch", next_epoch.value()}});
+      // The triggering request continues below in the same epoch.
     }
   }
-
-  impl_->PruneProviderFreshnessState(*observed_state.active_scene_snapshot);
 
   std::vector<RequiredSceneProjection> projections;
   const auto required_bindings = ActiveNativeRuntimeBindings(observed_state);
@@ -2452,7 +2395,7 @@ LogicalSceneOwner::Commit(const SceneTransactionRequestDTO &request) {
   }
 
   try {
-    // An identity-checked request may name an older revision of this Scene;
+    // A request may name any revision of this Scene;
     // its frames and candidate always resolve against the active revision.
     auto active_request = request;
     active_request.expected_projection_revision =
@@ -2484,28 +2427,6 @@ LogicalSceneOwner::Commit(const SceneTransactionRequestDTO &request) {
   } catch (const std::exception &error) {
     return reject(core::RequestReplayStatusDTO::kAcceptedNew,
                   "live_scene_snapshot_unavailable", error.what());
-  }
-
-  const auto *pose_update =
-      std::get_if<core::UpdateObjectPoseRequestDTO>(&request.operation);
-  if (pose_update != nullptr && pose_update->provider_evidence.has_value()) {
-    // Accepted freshness confirmations also bound later committed evidence.
-    const auto &next = *pose_update->provider_evidence;
-    if (const auto watermark = impl_->ProviderSequenceWatermark(
-            pose_update->scene_resource_id, next);
-        watermark.has_value() && next.provider_source_sequence <= *watermark) {
-      return reject(
-          core::RequestReplayStatusDTO::kAcceptedNew,
-          "scene_object_state_conflict",
-          "provider source sequence did not advance",
-          {{"reason", "provider_source_sequence_not_increasing"},
-           {"scene_resource_id", pose_update->scene_resource_id.value()},
-           {"provider_instance_id", next.provider_instance_id.value()},
-           {"provider_source_epoch", next.provider_source_epoch},
-           {"previous_provider_source_sequence", std::to_string(*watermark)},
-           {"received_provider_source_sequence",
-            std::to_string(next.provider_source_sequence)}});
-    }
   }
 
   if (program_reset_mutation) {
@@ -2733,17 +2654,6 @@ LogicalSceneOwner::Commit(const SceneTransactionRequestDTO &request) {
   }
   impl_->StoreSceneCommitState(observed_state, observed_transactions,
                                external_data_version);
-  // A committed write that touches a confirmed object supersedes its
-  // freshness-only confirmation; removal also resets its watermark.
-  impl_->PruneProviderFreshnessState(candidate->snapshot);
-  std::erase_if(impl_->provider_freshness_records_, [&](const auto &entry) {
-    return *FindSceneObject(candidate->snapshot, entry.first) !=
-           entry.second.confirmed_against;
-  });
-  if (pose_update != nullptr && pose_update->provider_evidence.has_value()) {
-    impl_->AdvanceProviderSequenceWatermark(pose_update->scene_resource_id,
-                                            *pose_update->provider_evidence);
-  }
 
   SceneCommitResultDTO result{
       request.request_context.request_id,

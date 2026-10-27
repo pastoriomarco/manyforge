@@ -1078,16 +1078,14 @@ Result<void> ResourceAddressedExecutionKernel::release_prepared_dispatch_barrier
                                     participant->stop_cancelled_pre_dispatch;
         const bool handover_stale =
             operation->manual_handover &&
-            !validate_manual_program_handover_locked(*operation->manual_handover,
-                registration_for(participant->binding)).ok();
+            !validate_manual_program_handover_locked(*operation->manual_handover).ok();
         const auto* current_registration = registration_for(participant->binding);
         const auto provider_refusal = participant->binding.value().io_output_binding
             ? (current_registration ? component_command_refusal_locked(*current_registration)
                                     : std::optional(error("missing_reference", "Output registration retired",
                                                           "io_output_registration_missing")))
             : std::nullopt;
-        const bool admission_closed = motion_admission_closed_.restrictive() || provider_refusal.has_value() ||
-            (motion_admission_closed_ && !participant->non_motion_transaction());
+        const bool admission_closed = motion_admission_closed_ || provider_refusal.has_value();
         if ((admission_closed || handover_stale) && participant->non_motion_transaction()) {
           participant->stop_cancelled_pre_dispatch = true;
           participant->last_subordinate_error = error(
@@ -2093,10 +2091,6 @@ void ResourceAddressedExecutionKernel::on_engine_event(IResolvedParticipantExecu
         if (const auto reason = collision_details.find("reason");
             reason != collision_details.end()) {
           collision_details["runtime_collision_reason"] = reason->second;
-          if (reason->second == "stale_dynamic_collision_body") {
-            collision_message =
-                "Scene pose evidence is stale or invalid; runtime collision containment stopped the operation";
-          }
         }
         collision_details["reason"] = "runtime_collision_fault";
         ErrorDTO collision_error{std::string(to_string(ErrorCode::kExecutionAborted)),

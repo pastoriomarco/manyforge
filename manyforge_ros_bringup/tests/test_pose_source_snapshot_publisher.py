@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import importlib.util
 import json
 from pathlib import Path
 import threading
@@ -13,7 +14,6 @@ from rclpy.node import Node
 from sensor_msgs.msg import JointState
 
 from manyforge_ros.isaac_pose_observer import (
-    MAX_SITE_CONFIG_BYTES,
     ObservationDispatchSnapshot,
     SITE_CONFIG_VERSION,
     load_isaac_pose_observer_site_config,
@@ -57,6 +57,26 @@ class _FakeDispatcher:
         )
 
 
+class _FakeSink:
+    def __init__(self, _node: object, component: str, stream_id: str) -> None:
+        self.component = component
+        self.stream_id = stream_id
+        self.stamps: list[int | None] = []
+
+    def record(self, stamp_ns: int | None = None) -> None:
+        self.stamps.append(stamp_ns)
+
+
+class _FakeSinks:
+    def __init__(self) -> None:
+        self.by_stream: dict[str, _FakeSink] = {}
+
+    def __call__(self, node: object, component: str, stream_id: str) -> _FakeSink:
+        sink = _FakeSink(node, component, stream_id)
+        self.by_stream[stream_id] = sink
+        return sink
+
+
 def _write_joint_config(path: Path) -> None:
     path.write_text(
         json.dumps(
@@ -81,99 +101,6 @@ def _write_joint_config(path: Path) -> None:
         ),
         encoding="utf-8",
     )
-
-
-def _forbid_check_runtime(monkeypatch) -> None:
-    def forbidden(*args, **kwargs):
-        raise AssertionError("configuration check must not construct ROS runtime")
-
-    monkeypatch.setattr(pose_source_snapshot_publisher, "Context", forbidden)
-    monkeypatch.setattr(pose_source_snapshot_publisher.rclpy, "init", forbidden)
-    monkeypatch.setattr(
-        pose_source_snapshot_publisher, "PoseSourceSnapshotPublisher", forbidden
-    )
-
-
-def test_check_config_returns_only_exact_metadata_without_ros_runtime(
-    tmp_path, monkeypatch, capsys
-) -> None:
-    path = tmp_path / "captured.json"
-    _write_joint_config(path)
-    record = json.loads(path.read_text())
-    record["source_id"] = "configured.observer.é"
-    path.write_text(json.dumps(record, ensure_ascii=False), encoding="utf-8")
-    config = load_isaac_pose_observer_site_config(path)
-    _forbid_check_runtime(monkeypatch)
-    assert pose_source_snapshot_publisher.main(["--check-config", str(path)]) == 0
-    output = capsys.readouterr()
-    assert output.err == ""
-    assert json.loads(output.out) == {
-        "cell_id": config.cell_id,
-        "source_id": config.source_id,
-        "bindings": [binding.to_value() for binding in config.observer_bindings],
-        "expected_joint_state": {
-            "object_id": config.joint_state.object_id,
-            "policy_id": config.joint_state.policy_id,
-            "topic": config.joint_state.topic,
-        },
-    }
-
-
-def test_check_config_accepts_existing_full_file_bound_from_console_argv(
-    tmp_path, monkeypatch, capsys
-) -> None:
-    path = tmp_path / "captured.json"
-    _write_joint_config(path)
-    document = path.read_bytes()
-    path.write_bytes(document + b" " * (MAX_SITE_CONFIG_BYTES - len(document)))
-    _forbid_check_runtime(monkeypatch)
-    monkeypatch.setattr(
-        pose_source_snapshot_publisher.sys,
-        "argv",
-        ["pose_source_snapshot_publisher", "--check-config", str(path)],
-    )
-    assert pose_source_snapshot_publisher.main() == 0
-    output = capsys.readouterr()
-    assert output.err == ""
-    assert json.loads(output.out)["source_id"] == "isaac.observer"
-
-
-@pytest.mark.parametrize("invalid", ["missing", "duplicate", "source_id", "symlink"])
-def test_check_config_refuses_strict_loader_errors_before_ros_runtime(
-    tmp_path, monkeypatch, capsys, invalid
-) -> None:
-    path = tmp_path / "captured.json"
-    if invalid != "missing":
-        _write_joint_config(path)
-        if invalid == "duplicate":
-            path.write_text('{"cell_id":"first","cell_id":"second"}')
-        elif invalid == "source_id":
-            record = json.loads(path.read_text())
-            del record["source_id"]
-            path.write_text(json.dumps(record))
-        elif invalid == "symlink":
-            link = tmp_path / "link.json"
-            link.symlink_to(path)
-            path = link
-    _forbid_check_runtime(monkeypatch)
-    assert pose_source_snapshot_publisher.main(["--check-config", str(path)]) == 78
-    output = capsys.readouterr()
-    assert output.out == ""
-    assert "isaac_pose_observer_failed:" in output.err
-
-
-@pytest.mark.parametrize(
-    "arguments",
-    [["--check-config"], ["--check-config", "site.json", "extra"]],
-)
-def test_check_config_refuses_ambiguous_arguments_without_ros_runtime(
-    monkeypatch, capsys, arguments
-) -> None:
-    _forbid_check_runtime(monkeypatch)
-    assert pose_source_snapshot_publisher.main(arguments) == 78
-    output = capsys.readouterr()
-    assert output.out == ""
-    assert "requires exactly one site config path" in output.err
 
 
 @pytest.mark.parametrize("epoch_base", ["", "manager.base.27"])
@@ -220,6 +147,7 @@ def test_ros_joint_state_adapter_forwards_good_and_unknown_manager_intents(
     config_path = tmp_path / "site.json"
     _write_joint_config(config_path)
     dispatcher = _FakeDispatcher()
+    sinks = _FakeSinks()
     rclpy.init()
     publisher: pose_source_snapshot_publisher.PoseSourceSnapshotPublisher | None = (
         None
@@ -231,7 +159,12 @@ def test_ros_joint_state_adapter_forwards_good_and_unknown_manager_intents(
             site_config_path=config_path,
             manager_run_root=tmp_path,
             dispatcher_factory=lambda _root, _config, _callback: dispatcher,
+            stream_sink_factory=sinks,
         )
+        # One sink per binding, on the component's (source_id) streams.
+        assert set(sinks.by_stream) == {"poses/robot.1/viewer.measured_robot"}
+        sink = sinks.by_stream["poses/robot.1/viewer.measured_robot"]
+        assert sink.component == "isaac.observer"
         source = Node("manyforge_pose_observer_joint_test_source")
         joint_publisher = source.create_publisher(
             JointState, "/isaac_joint_states", 1
@@ -241,10 +174,14 @@ def test_ros_joint_state_adapter_forwards_good_and_unknown_manager_intents(
         publisher.start()
 
         valid = JointState()
+        valid.header.stamp.sec = 12
+        valid.header.stamp.nanosec = 34
         valid.name = ["joint_b", "extra", "joint_a"]
         valid.position = [0.2, 9.0, 0.1]
         joint_publisher.publish(valid)
         _spin_until(executor, lambda: len(dispatcher.intents) >= 1)
+        # The submitted good observation is one sample at its header stamp.
+        assert sink.stamps == [12_000_000_034]
 
         observed = dispatcher.intents[0]
         assert observed.quality == "good"
@@ -264,6 +201,8 @@ def test_ros_joint_state_adapter_forwards_good_and_unknown_manager_intents(
         assert unknown.payload_value()["source_error"]["code"] == (
             "joint_set_incomplete"
         )
+        # An unknown intent is no stream sample.
+        assert sink.stamps == [12_000_000_034]
     finally:
         if publisher is not None:
             assert publisher.stop()
@@ -380,8 +319,29 @@ def test_simulation_capture_waits_for_attached_private_executor_spin(
             rclpy.shutdown(context=context)
 
 
+class _RecordingStreamSinks:
+    """Real ``ComponentStreamSink`` objects whose wire messages are kept."""
+
+    def __init__(self) -> None:
+        self.published: dict[str, list[int]] = {}
+
+    def __call__(self, node: object, component: str, stream_id: str) -> object:
+        from manyforge_ros.component_stream_health import ComponentStreamSink
+
+        published = self.published.setdefault(stream_id, [])
+
+        class _Sink(ComponentStreamSink):
+            def _publish(self, level, code, stamp_ns, detail) -> None:
+                del level, code, detail
+                published.append(stamp_ns)
+
+        return _Sink(node, component, stream_id, heartbeat_period_ns=0)
+
+
+@pytest.mark.parametrize("entity_stamp_ns", [None, 0])
 def test_relative_reference_is_read_with_its_object_in_one_batch(
     tmp_path: Path,
+    entity_stamp_ns: int | None,
 ) -> None:
     from types import SimpleNamespace
 
@@ -403,7 +363,10 @@ def test_relative_reference_is_read_with_its_object_in_one_batch(
                     SimpleNamespace(
                         name=gripper,
                         pose=PoseSnapshot(
-                            "robotiq_arg2f_base_link", None, (1.0, 0.0, 0.5), quarter
+                            "robotiq_arg2f_base_link",
+                            entity_stamp_ns,
+                            (1.0, 0.0, 0.5),
+                            quarter,
                         ),
                         errors=(),
                     ),
@@ -411,7 +374,7 @@ def test_relative_reference_is_read_with_its_object_in_one_batch(
                         name="/mac_n_cheese_centered",
                         pose=PoseSnapshot(
                             "mac_n_cheese_centered",
-                            None,
+                            entity_stamp_ns,
                             (1.0, 0.02, 0.25),
                             (0.0, 0.0, 0.0, 1.0),
                         ),
@@ -426,6 +389,7 @@ def test_relative_reference_is_read_with_its_object_in_one_batch(
     context = Context()
     rclpy.init(context=context)
     dispatcher = _FakeDispatcher()
+    sinks = _RecordingStreamSinks()
     executor = SingleThreadedExecutor(context=context)
     publisher = pose_source_snapshot_publisher.PoseSourceSnapshotPublisher(
         site_config_path=(
@@ -435,6 +399,7 @@ def test_relative_reference_is_read_with_its_object_in_one_batch(
         manager_run_root=tmp_path,
         dispatcher_factory=lambda _root, _config, _callback: dispatcher,
         simulation_client_factory=lambda _node, _timeout_s: _BatchClient(),
+        stream_sink_factory=sinks,
         context=context,
     )
     spin_thread = threading.Thread(target=executor.spin, daemon=True)
@@ -444,9 +409,14 @@ def test_relative_reference_is_read_with_its_object_in_one_batch(
             executor.add_node(auxiliary)
         publisher.start()
         spin_thread.start()
-        deadline = time.monotonic() + 2.0
-        while time.monotonic() < deadline and not any(
-            intent.object_id == "isaac_cheese_box" for intent in dispatcher.intents
+        deadline = time.monotonic() + 5.0
+        while (
+            time.monotonic() < deadline
+            and sum(
+                intent.object_id == "isaac_cheese_box"
+                for intent in dispatcher.intents
+            )
+            < 3
         ):
             time.sleep(0.01)
     finally:
@@ -484,6 +454,16 @@ def test_relative_reference_is_read_with_its_object_in_one_batch(
         if intent.policy_id == "viewer.measured_tcp"
     )
     assert tcp["kind"] == "simulation_entity_pose"
+    # Each submitted simulation pose is one sample of its own binding's
+    # stream. These entity poses carry no stamp (live Isaac: stamp 0), so
+    # every poll is an arrival sample ("0" on the wire); a zero stamp must
+    # not freeze the stream after its first sample (live r10-E: stale).
+    for stream_id in (
+        "poses/isaac_cheese_box/continuous_unattached",
+        "poses/isaac_ur10e_light_robot/viewer.measured_tcp",
+    ):
+        published = sinks.published[stream_id]
+        assert len(published) >= 3 and set(published) == {0}
 
 
 def test_entrypoint_does_not_teardown_nodes_while_polling_worker_is_live(
@@ -630,6 +610,8 @@ def test_entrypoint_has_no_retired_composer_or_deployment_owner_surface() -> Non
     assert "ObservationDispatcher.for_manager_root" in source
     assert "DepthOneSubscriptionAdapter" in source
     assert "capture_simulation_entity_poses" in source
+    # The Manager-side configuration check is gone with its only caller.
+    assert "--check-config" not in source
 
 
 @pytest.mark.parametrize(
@@ -788,3 +770,42 @@ def _spin_until(
         if predicate():
             return
     raise AssertionError("ROS pose observer did not receive the expected sample")
+
+
+def _pose_source_launch_module():
+    spec = importlib.util.spec_from_file_location(
+        "pose_source_launch",
+        _REPOSITORY_ROOT / "manyforge_ros_bringup/launch/pose_source.launch.py",
+    )
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    return module
+
+
+def test_pose_source_launch_runs_the_observer_with_the_host_parameters() -> None:
+    module = _pose_source_launch_module()
+    kwargs = module.node_kwargs(
+        "/run/x/pose_source.json", "/run/manager", "isaac_scene_objects.ab12"
+    )
+    assert kwargs["executable"] == "pose_source_snapshot_publisher"
+    assert kwargs["output"] == "screen"
+    assert kwargs["parameters"] == [
+        {
+            "site_config_path": "/run/x/pose_source.json",
+            "manager_run_root": "/run/manager",
+            "source_epoch_base": "isaac_scene_objects.ab12",
+        }
+    ]
+    for arguments in (
+        ("relative.json", "/run/manager", "base"),
+        ("/run/x/pose_source.json", "", "base"),
+        ("/run/x/pose_source.json", "/run/manager", ""),
+    ):
+        with pytest.raises(ValueError):
+            module.node_kwargs(*arguments)
+    assert (
+        "pose_source_snapshot_publisher = "
+        "manyforge_ros_bringup.pose_source_snapshot_publisher:main"
+    ) in (_REPOSITORY_ROOT / "manyforge_ros_bringup/setup.py").read_text(
+        encoding="utf-8"
+    )

@@ -833,6 +833,16 @@ template <typename StrongCounter>
       recovered.emplace_back("closure_reason", CanonicalValue("cell_closed_by_operator"));
     fields.emplace_back("incident_recovery", CanonicalValue(std::move(recovered)));
   }
+  // Present only for a Recover that cleared a latched stream condition.
+  if (value.stream_acknowledgement) {
+    fields.emplace_back(
+        "stream_acknowledgement",
+        CanonicalValue(CanonicalValue::Object{
+            {"acknowledged_at_ns", content_identity::nonnegative_int64_value(
+                                       value.stream_acknowledgement->acknowledged_at_ns)},
+            {"controllable_component_id",
+             CanonicalValue(value.stream_acknowledgement->controllable_component_id.value())}}));
+  }
   return CanonicalValue(std::move(fields));
 }
 
@@ -1174,6 +1184,29 @@ template <typename StrongCounter>
   return fields;
 }
 
+/// CP9 `stream_health` rows (contract (c)); times clamp to the safe range.
+[[nodiscard]] CanonicalValue stream_health_value(const std::vector<StreamHealthDTO>& rows) {
+  const auto clamped = [](const std::int64_t ns) {
+    return safe_unsigned(std::min<std::uint64_t>(static_cast<std::uint64_t>(std::max<std::int64_t>(ns, 0)),
+                                                 kMaximumSafeUnsignedInteger));
+  };
+  CanonicalValue::Array array;
+  array.reserve(rows.size());
+  for (const auto& row : rows) {
+    array.emplace_back(CanonicalValue::Object{
+        {"acknowledgement_required", CanonicalValue(row.acknowledgement_required)},
+        {"age_ns", row.age_ns ? clamped(*row.age_ns) : CanonicalValue(nullptr)},
+        {"budget_ns", clamped(row.budget_ns)},
+        {"error", row.error ? error_value(*row.error) : CanonicalValue(nullptr)},
+        {"recovery", CanonicalValue(std::string(to_string(row.recovery)))},
+        {"severity", CanonicalValue(std::string(to_string(row.severity)))},
+        {"state", CanonicalValue(std::string(to_string(row.state)))},
+        {"stream_id", CanonicalValue(row.stream_id)},
+        {"timestamp_source", CanonicalValue(std::string(to_string(row.timestamp_source)))}});
+  }
+  return CanonicalValue(std::move(array));
+}
+
 [[nodiscard]] CanonicalValue component_snapshot_value(
     const ComponentLifecycleCurrentSnapshotDTO& value,
     const ComponentLifecycleTargetViewDTO& target_view,
@@ -1192,6 +1225,8 @@ template <typename StrongCounter>
     fields.emplace_back("dropped_output_lines", count_value(*target_view.dropped_output_lines));
     fields.emplace_back("dropped_output_bytes", count_value(*target_view.dropped_output_bytes));
   }
+  if (!target_view.stream_health.empty())
+    fields.emplace_back("stream_health", stream_health_value(target_view.stream_health));
   return CanonicalValue(std::move(fields));
 }
 

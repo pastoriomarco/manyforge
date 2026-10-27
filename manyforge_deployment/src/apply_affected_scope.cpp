@@ -1,5 +1,6 @@
 #include "manyforge_deployment/apply_affected_scope.hpp"
 #include <manyforge_deployment/execution_runtime_contract.hpp>
+#include <manyforge_core/io_provider_lifecycle_catalog.hpp>
 #include <manyforge_deployment/io_signal_catalog.hpp>
 
 #include "apply_affected_scope_internal.hpp"
@@ -343,6 +344,12 @@ ProviderSources(const core::RetainedBundleDTO &bundle) {
     if (!provider)
       continue;
     ProviderFenceSource source{&domain, {}};
+    // CP9 pose sources: members are stream ids, no I/O signal or output.
+    if (provider->provider_manifest_id.value() ==
+        core::kPoseSourceLifecycleManifestId) {
+      result.emplace(domain.control_domain_id, std::move(source));
+      continue;
+    }
     std::vector<std::string> members;
     for (const auto &row : catalog.value()) {
       if (row.runtime_unit_id != provider->provider_runtime_unit_id ||

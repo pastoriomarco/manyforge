@@ -124,8 +124,9 @@ ManagerSelectedBundleTransitionCoordinator::Advance(
       !initialized->initial_scene_installed) {
     Fail("selected-bundle publication requires the final initial Scene");
   }
-  if (initialized->predecessor_projection_revision !=
-          apply->intent.expected_active_projection_revision ||
+  if (!core::SameProjectionIdentity(
+          initialized->predecessor_projection_revision,
+          apply->intent.expected_active_projection_revision) ||
       initialized->target_projection_revision.retained_bundle_id !=
           apply->intent.candidate_retained_bundle_id ||
       initialized->target_projection_revision.graph_revision !=
@@ -154,11 +155,18 @@ ManagerSelectedBundleTransitionCoordinator::Advance(
           static_cast<std::size_t>(std::numeric_limits<std::uint64_t>::max())) {
     Fail("selected retained bundle has an invalid canonical byte extent");
   }
+  // Publication names the Apply's recorded Scene revision as evidence; the
+  // Scene owner's own row holds the Scene it actually adopted.
+  const auto &request_scene =
+      apply->intent.expected_active_projection_revision.scene_revision;
+  const core::ProjectionRevisionDTO candidate_projection{
+      apply->intent.candidate_retained_bundle_id,
+      apply->intent.candidate_graph_revision, request_scene};
   const ManagerApplyPrivateMaterializationDTO expected_materialization{
-      initialized->authoritative_snapshot_identity.revision.content_hash,
+      request_scene.content_hash,
       apply_id,
       apply_generation,
-      initialized->target_projection_revision,
+      candidate_projection,
       core::ContentDigest(deployment::sha256_digest(canonical_bytes)),
       static_cast<std::uint64_t>(canonical_bytes.size()),
   };
@@ -174,9 +182,9 @@ ManagerSelectedBundleTransitionCoordinator::Advance(
   const core::ActiveBundlePublicationRequestDTO publication_request{
       core::NamedApplyPublicationTransactionDTO{
           apply_id, apply_generation},
-      initialized->target_projection_revision,
-      initialized->target_projection_revision.retained_bundle_id,
-      initialized->target_projection_revision.graph_revision,
+      candidate_projection,
+      candidate_projection.retained_bundle_id,
+      candidate_projection.graph_revision,
       ready->staged_ready.predecessor_publication_generation,
       materialization.record.private_materialization_content_digest,
   };
@@ -272,9 +280,9 @@ ManagerSelectedBundleTransitionCoordinator::Advance(
 
   if (initialized->state ==
       core::ProjectionMaintenanceInitializationState::kCompleted) {
-    if (initialized->publication_receipt !=
-        std::optional<core::ActiveBundlePublicationReceiptDTO>{
-            durable_publication.record.publication.publication_receipt}) {
+    if (!core::SamePublicationIdentity(
+            initialized->publication_receipt,
+            durable_publication.record.publication.publication_receipt)) {
       Fail("completed Scene state differs from durable publication");
     }
     return {materialization, durable_publication, true,
@@ -301,9 +309,9 @@ ManagerSelectedBundleTransitionCoordinator::Advance(
   if (!completed.valid() ||
       completed.state !=
           core::ProjectionMaintenanceInitializationState::kCompleted ||
-      completed.publication_receipt !=
-          std::optional<core::ActiveBundlePublicationReceiptDTO>{
-              durable_publication.record.publication.publication_receipt}) {
+      !core::SamePublicationIdentity(
+          completed.publication_receipt,
+          durable_publication.record.publication.publication_receipt)) {
     throw ManagerSelectedBundleTransitionEffectUncertainError(
         "Scene returned foreign completion evidence", publication_request,
         scene_query, durable_publication.record.publication.publication_receipt,

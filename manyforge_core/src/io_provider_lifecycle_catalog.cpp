@@ -71,7 +71,8 @@ Result<std::vector<LifecycleIntentPlanDTO>> MakeIoProviderLifecyclePlans() {
 Result<BrandLifecyclePlanCatalogDTO> MakeIoProviderLifecycleCatalog(
     const ProviderManifestDTO& manifest) {
   using Reply = Result<BrandLifecyclePlanCatalogDTO>;
-  if (manifest.provider_manifest_id.value() != kIoProviderLifecycleManifestId)
+  if (manifest.provider_manifest_id.value() != kIoProviderLifecycleManifestId &&
+      manifest.provider_manifest_id.value() != kPoseSourceLifecycleManifestId)
     return Reply::Err({"io_provider_lifecycle_manifest_invalid",
                        "I/O driver catalog requires its exact maintained provider manifest",
                        {}});

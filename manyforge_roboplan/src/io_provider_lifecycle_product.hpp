@@ -1,6 +1,7 @@
 #pragma once
 
 #include <functional>
+#include <manyforge_core/component_stream_health.hpp>
 #include <manyforge_core/fixed_cclc_port_registry.hpp>
 #include <manyforge_core/io_provider_lifecycle_catalog.hpp>
 #include <manyforge_deployment/io_signal_catalog.hpp>
@@ -109,13 +110,22 @@ public:
   Dispatch(const core::BrandLifecyclePrimitiveIntentDTO &intent,
            std::stop_token cancellation);
 
-  // sim-plc: the exact Manager-owned simulated PLC process serving this
-  // device. Its exit reason (absent while it runs or after an ordered stop)
-  // is a driver fault: prepare/enable/recover are refused and the standard
-  // cause is `fault`. A later Apply installs the restarted process's source,
+  // sim-plc / pose source: the exact supervised process serving this
+  // component. Its typed exit fault (absent while it runs or after an ordered
+  // stop; the source names the code, e.g. `simulated_plc_exited`) is a driver
+  // fault: prepare/enable/recover are refused and the standard cause is
+  // `fault`. A later Apply installs the restarted process's source,
   // replacing this one; an empty source removes it.
   void SetSupervisedProcessFaultSource(
-      std::function<std::optional<std::string>()> source);
+      std::function<std::optional<core::ErrorDTO>()> source);
+
+  // CP9 pose source (`kPoseSourceLifecycleManifestId`): no I/O members. Its
+  // resources are the declared stream recorders (one per binding, ids equal
+  // to the domain's signal names); installed means resources and transport
+  // ready. The recorders live until Shutdown (destruction undeclares).
+  [[nodiscard]] bool pose_source() const noexcept;
+  core::Result<void> InstallPoseSourceLocked(
+      std::vector<std::unique_ptr<core::StreamRecorder>> streams);
 
   // Only the actual retiring driver owner calls this. An old activation that
   // transferred this retained record must release its pointer without it.

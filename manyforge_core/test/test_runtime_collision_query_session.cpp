@@ -281,8 +281,7 @@ class FixedRuntimeEngine final : public ICollisionQueryEngine {
   bool return_oversized_clearance_observations_ = false;
 };
 
-RuntimeCollisionQueryBundlePtr make_bundle(CollisionPolicySnapshot policy,
-                                           std::uint64_t epoch = 1) {
+RuntimeCollisionQueryBundlePtr make_bundle(CollisionPolicySnapshot policy) {
   auto world = std::make_shared<CollisionWorldSnapshot>();
   world->revision = {1, "runtime-world"};
   world->snapshot_format_version = 1;
@@ -298,7 +297,7 @@ RuntimeCollisionQueryBundlePtr make_bundle(CollisionPolicySnapshot policy,
   };
   world->body_count = static_cast<std::int64_t>(world->bodies.size());
   return build_runtime_collision_query_bundle(
-      CollisionWorldPolicySnapshotBundle{world, std::move(policy)}, epoch);
+      CollisionWorldPolicySnapshotBundle{world, std::move(policy)});
 }
 
 RuntimeCollisionStateProjection make_projection() {
@@ -912,34 +911,6 @@ TEST(RuntimeCollisionQuerySessionTest,
 }
 
 TEST(RuntimeCollisionQuerySessionTest,
-     OversizedFreshnessSidecarFailsBeforeMonitorArm) {
-  CollisionPolicySnapshot policy;
-  policy.revision = {11, "runtime-policy"};
-  const auto coherent = make_bundle(std::move(policy));
-  auto oversized_bundle =
-      std::make_shared<RuntimeCollisionQueryBundle>(*coherent);
-  for (std::size_t i = 0; i <= 32; ++i) {
-    oversized_bundle->body_freshness.push_back(
-        {"scene/part_" + std::to_string(i) + "/shape/0", std::nullopt,
-         std::nullopt, std::nullopt});
-  }
-  oversized_bundle->lookup_order_valid = true;
-  StaticRuntimePublisher publisher;
-  publisher.bundle = std::move(oversized_bundle);
-  auto engine = std::make_shared<FixedRuntimeEngine>();
-  RuntimeCollisionQuerySession session(make_projection(), publisher, engine, {},
-                                       10'000'000);
-
-  const auto error = session.prepare(publisher.bundle);
-
-  ASSERT_TRUE(error.has_value());
-  EXPECT_EQ(error->details.at("reason"),
-            "runtime_collision_bundle_capacity_exceeded");
-  EXPECT_EQ(engine->prepared_joint_count_, 0u);
-  EXPECT_EQ(engine->query_count_, 0u);
-}
-
-TEST(RuntimeCollisionQuerySessionTest,
      InvalidProjectionIndexFailsBeforeMonitorArm) {
   CollisionPolicySnapshot policy;
   policy.revision = {12, "runtime-policy"};
@@ -1206,9 +1177,8 @@ TEST(RuntimeCollisionQuerySessionTest,
   StaticRuntimePublisher publisher;
   publisher.bundle = admission_bundle;
   auto engine = std::make_shared<FixedRuntimeEngine>();
-  RuntimeCollisionQuerySession session(
-      make_projection(), publisher, engine, {}, 10'000'000,
-      admission_revision);
+  RuntimeCollisionQuerySession session(make_projection(), publisher, engine, {},
+                                       10'000'000);
   ASSERT_FALSE(session.prepare(admission_bundle).has_value());
   const std::array<double, 2> positions{0.0, 0.0};
 
@@ -1226,7 +1196,7 @@ TEST(RuntimeCollisionQuerySessionTest,
   extended_policy.revision = {6, "attach-adds-support-contact"};
   extended_policy.support_contacts = {release, added};
   publisher.bundle = with_projection_revision(
-      make_bundle(std::move(extended_policy), 2U),
+      make_bundle(std::move(extended_policy)),
       make_projection_revision(2U, 'e'));
   engine->collide(added_pair, -0.002);
   const auto rebound = session.tick(publisher.bundle, positions, 3);
@@ -1258,7 +1228,7 @@ TEST(RuntimeCollisionQuerySessionTest,
   changed.max_start_penetration_m = 0.02;
   changed_policy.support_contacts = {changed};
   publisher.bundle = with_projection_revision(
-      make_bundle(std::move(changed_policy), 3U),
+      make_bundle(std::move(changed_policy)),
       make_projection_revision(3U, 'f'));
   engine->collide(released_pair, -0.001);
   EXPECT_EQ(session.tick(publisher.bundle, positions, 5).status,

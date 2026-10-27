@@ -129,11 +129,11 @@ private:
   core::CollisionEngineCapabilityDescriptor capability_;
 };
 
-core::ProviderManifestDTO manifest() {
+core::ProviderManifestDTO manifest(
+    std::string_view manifest_id = core::kIoProviderLifecycleManifestId) {
   const auto plans = core::MakeIoProviderLifecyclePlans();
   EXPECT_TRUE(plans.ok());
-  const core::ProviderManifestId id{
-      std::string(core::kIoProviderLifecycleManifestId)};
+  const core::ProviderManifestId id{std::string(manifest_id)};
   const auto semantic =
       core::ComputeBrandLifecyclePlanCatalogSemanticDigest(id, plans.value());
   EXPECT_TRUE(semantic.ok());
@@ -178,8 +178,11 @@ cause(const std::vector<core::LifecycleFactDTO> &facts) {
 class IoProviderLifecycleProductTest : public ::testing::Test {
 protected:
   void TearDown() override { driver.reset(); }
-  void Build(bool output_only = false, std::string epoch = "runtime.1") {
-    auto provider_manifest = manifest();
+  void Build(bool output_only = false, std::string epoch = "runtime.1",
+             std::vector<std::string> pose_streams = {}) {
+    const bool pose = !pose_streams.empty();
+    auto provider_manifest =
+        pose ? manifest(core::kPoseSourceLifecycleManifestId) : manifest();
     const auto catalog =
         core::MakeIoProviderLifecycleCatalog(provider_manifest);
     ASSERT_TRUE(catalog.ok());
@@ -191,7 +194,7 @@ protected:
         provider_manifest.provider_manifest_revision,
         catalog.value().catalog_digest,
         kDigest,
-        {kSignal.name},
+        pose ? pose_streams : std::vector<std::string>{kSignal.name},
         30'000'000'000LL};
     std::vector<core::ResourceId> resources;
     if (output_only)
@@ -1158,8 +1161,7 @@ TEST_F(IoProviderLifecycleProductTest,
       engine,
       scheduler,
       10,
-      5,
-      std::nullopt};
+      5};
 
   std::map<core::InterruptSourceId, HostIoSignalRuntime::SourceInput> sources;
   sources.emplace(kSource,
@@ -1321,11 +1323,94 @@ TEST_F(IoProviderLifecycleProductTest,
 }
 
 TEST_F(IoProviderLifecycleProductTest,
+       PoseSourceDriverOwnsItsStreamsAndReportsTheTypedProcessFault) {
+  const std::vector<std::string> streams{"poses/box/latch",
+                                         "poses/robot/viewer"};
+  Build(false, "runtime.1", streams);
+  ASSERT_TRUE(driver->pose_source());
+  EXPECT_FALSE(driver->resources_installed());
+  EXPECT_EQ(Step("prepare").dispatch,
+            core::LifecyclePrimitiveDispatchStateDTO::kNotDispatched);
+
+  core::ManualScheduler scheduler;
+  core::ComponentStreamHealth health(*clock, scheduler);
+  const auto declare = [&](const std::string &id) {
+    auto declared = health.Declare(
+        kSignal.controllable_component_id,
+        {id, 1'000'000'000LL, core::StreamSeverityDTO::kWarning,
+         core::StreamRecoveryDTO::kAuto,
+         core::StreamTimestampSourceDTO::kMessageStamp});
+    EXPECT_TRUE(declared.ok());
+    return std::move(declared.value());
+  };
+  {
+    // The recorders must close exactly the domain's stream membership.
+    std::vector<std::unique_ptr<core::StreamRecorder>> partial;
+    partial.push_back(declare(streams.front()));
+    auto lock = driver->AcquireDelivery();
+    const auto refused = driver->InstallPoseSourceLocked(std::move(partial));
+    ASSERT_FALSE(refused.ok());
+    EXPECT_EQ(refused.error().details.at("reason"),
+              "driver_resource_closure_not_exact");
+  }
+  {
+    std::vector<std::unique_ptr<core::StreamRecorder>> recorders;
+    recorders.push_back(declare(streams.back()));
+    recorders.push_back(declare(streams.front()));
+    auto lock = driver->AcquireDelivery();
+    const auto installed = driver->InstallPoseSourceLocked(std::move(recorders));
+    ASSERT_TRUE(installed.ok()) << installed.error().message;
+  }
+  EXPECT_TRUE(driver->resources_installed());
+  EXPECT_EQ(health.Read(kSignal.controllable_component_id).size(), 2U);
+
+  auto exit_fault = std::make_shared<std::optional<core::ErrorDTO>>();
+  driver->SetSupervisedProcessFaultSource([exit_fault] { return *exit_fault; });
+  ASSERT_EQ(Step("prepare").known,
+            core::LifecyclePrimitiveKnownResultDTO::kSucceeded);
+  ASSERT_EQ(Step("enable").known,
+            core::LifecyclePrimitiveKnownResultDTO::kSucceeded);
+  const auto running = driver->ReadLifecycleHealth(kDomain, clock->now());
+  ASSERT_TRUE(running.ok());
+  EXPECT_EQ(running.value().observed_state,
+            core::ComponentLifecycleStateDTO::kActive);
+  EXPECT_EQ(cause(running.value().facts),
+            core::LifecycleBlockingCauseClassDTO::kNone);
+
+  // The observer exits on a configuration error: the fault source names
+  // the typed code and carries the output tail.
+  *exit_fault = core::ErrorDTO{"pose_source_config_invalid",
+                               "pose source exited with status 78",
+                               {{"output_tail", "isaac_pose_observer_failed"}}};
+  const auto faulted = driver->ReadLifecycleHealth(kDomain, clock->now());
+  ASSERT_TRUE(faulted.ok());
+  EXPECT_EQ(faulted.value().observed_state,
+            core::ComponentLifecycleStateDTO::kFaulted);
+  EXPECT_EQ(cause(faulted.value().facts),
+            core::LifecycleBlockingCauseClassDTO::kFault);
+  ASSERT_TRUE(faulted.value().diagnostic.has_value());
+  EXPECT_EQ(faulted.value().diagnostic->code, "pose_source_config_invalid");
+  EXPECT_EQ(faulted.value().diagnostic->details.at("output_tail"),
+            "isaac_pose_observer_failed");
+  EXPECT_EQ(Step("recover").dispatch,
+            core::LifecyclePrimitiveDispatchStateDTO::kNotDispatched);
+
+  // Retirement releases the recorders, which undeclares the streams.
+  driver->Shutdown();
+  EXPECT_TRUE(health.Read(kSignal.controllable_component_id).empty());
+}
+
+TEST_F(IoProviderLifecycleProductTest,
        SupervisedSimulatedPlcExitIsADriverFaultUntilItsSourceIsReplaced) {
   Build();
   InstallInput();
   auto exit_reason = std::make_shared<std::optional<std::string>>();
-  driver->SetSupervisedProcessFaultSource([exit_reason] { return *exit_reason; });
+  driver->SetSupervisedProcessFaultSource(
+      [exit_reason]() -> std::optional<core::ErrorDTO> {
+        if (!*exit_reason)
+          return std::nullopt;
+        return core::ErrorDTO{"simulated_plc_exited", **exit_reason, {}};
+      });
   ASSERT_EQ(Step("prepare").known,
             core::LifecyclePrimitiveKnownResultDTO::kSucceeded);
   ASSERT_EQ(Step("enable").known,
@@ -1368,7 +1453,7 @@ TEST_F(IoProviderLifecycleProductTest,
 
   // The next Apply installs the restarted process's source.
   driver->SetSupervisedProcessFaultSource(
-      [] { return std::optional<std::string>{}; });
+      [] { return std::optional<core::ErrorDTO>{}; });
   const auto restarted = driver->ReadLifecycleHealth(kDomain, clock->now());
   ASSERT_TRUE(restarted.ok());
   EXPECT_EQ(restarted.value().observed_state,

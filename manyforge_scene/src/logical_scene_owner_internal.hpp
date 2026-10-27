@@ -169,6 +169,8 @@ constexpr std::int64_t kBoundedHistoryStoreSchemaVersion = 7;
 
 constexpr std::int64_t kMaintenanceInitializationSchemaVersion = 8;
 
+constexpr std::int64_t kInitialSceneBaselineSchemaVersion = 9;
+
 constexpr std::int64_t kNativeProjectionHandoffStoreSchemaVersion = 5;
 
 constexpr std::uint64_t kMaximumSafeIntegral = 9007199254740991ULL;
@@ -415,11 +417,11 @@ DecodeProjectionStatus(std::string_view value);
 [[nodiscard]] bool IsAuthoredSceneMutation(
     const SceneTransactionRequestDTO &request);
 
-/// Whether a request's expected projection admits the active one. Attach,
-/// both detach kinds, remove and pose updates check their own identities
-/// (object, attachment, carrier) against the current Scene, so they accept
-/// any same-or-older revision of the same Scene. Add, upsert and collision
-/// policy edits keep the exact predecessor.
+/// Whether a request's expected projection admits the active one. The Scene
+/// revision is never a precondition: any revision of the same active
+/// Deployment (bundle and graph) and Scene id is accepted, and the operation
+/// applies to the latest Scene (last arrival wins). Operations still check
+/// their own identities (object, attachment, carrier).
 [[nodiscard]] bool ExpectedProjectionAdmitsActive(
     const SceneTransactionRequestDTO &request,
     const ProjectionRevisionDTO &active);
@@ -620,6 +622,16 @@ void ValidateMaintenanceDatabase(
     const ProjectionBootstrapPrerequisiteQueryDTO &fixed_query,
     const ContentDigest &admission_digest);
 
+/// Schema and metadata of a v9 store, without decoding its content: v9
+/// documents fail current decoding until `ConvertProviderObservationEvidence`.
+void ValidateInitialSceneBaselineDatabase(
+    sqlite3 *database,
+    const ProjectionBootstrapPrerequisiteQueryDTO &fixed_query,
+    const ContentDigest &admission_digest);
+
+/// One-time v9 -> v10 conversion inside the caller's write transaction.
+void ConvertProviderObservationEvidence(sqlite3 *database);
+
 void InsertMetadata(sqlite3 *database,
                     const ProjectionBootstrapPrerequisiteQueryDTO &fixed_query,
                     const ContentDigest &admission_digest);
@@ -643,21 +655,6 @@ bool IsExactUninitializedDatabase(sqlite3 *database);
 void FsyncDatabaseDirectory(const std::filesystem::path &database_path);
 
 CanonicalEmptySceneAccessStatus AccessStatus(const DurableState &state);
-
-/// Process-local latest accepted provider freshness confirmation for one
-/// object. It applies only while the retained bundle, graph and the committed
-/// object snapshot it was confirmed against are all unchanged; request-epoch
-/// rotation alone does not affect it.
-struct ProviderFreshnessRecord final {
-  core::RetainedBundleId retained_bundle_id;
-  GraphRevision graph_revision;
-  SceneObjectSnapshotDTO confirmed_against;
-  core::SceneObjectProviderEvidenceDTO accepted;
-};
-
-[[nodiscard]] bool
-SameProviderOrigin(const core::SceneObjectProviderEvidenceDTO &left,
-                   const core::SceneObjectProviderEvidenceDTO &right) noexcept;
 
 [[nodiscard]] const SceneObjectSnapshotDTO *
 FindSceneObject(const LogicalSceneSnapshotDTO &snapshot,

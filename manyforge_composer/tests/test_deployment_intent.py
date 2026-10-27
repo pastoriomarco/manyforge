@@ -475,6 +475,68 @@ def test_io_device_component_has_no_model_source_closure(tmp_path: Path) -> None
         )
 
 
+def _pose_source() -> dict:
+    return {
+        "component_id": "isaac_scene_objects",
+        "component_profile_id": "pose_source_v0",
+        "target_settings": {},
+        "configuration": {
+            "runtime_kind": "pose_source",
+            "runtime_configuration": {
+                "pose_sources": [
+                    {
+                        "controllable_component_id": "isaac_scene_objects",
+                        "simulation_poll_period_ms": 250,
+                        "simulation_entities": [],
+                        "detection3d_sources": [],
+                    }
+                ]
+            },
+        },
+    }
+
+
+def test_pose_source_component_is_model_free_and_preserved() -> None:
+    intent = _intent()
+    intent["components"].append(_pose_source())
+    normalized = validate_deployment_intent(intent, source="test")
+    rows = {row["component_id"]: row for row in normalized["components"]}
+    assert rows["isaac_scene_objects"] == _pose_source()
+    # It contributes no source reference (normalization sorts components, so
+    # compare the references without their component index).
+    assert [ref for _, ref, _ in iter_source_references(intent)] == [
+        ref for _, ref, _ in iter_source_references(_intent())
+    ]
+
+
+@pytest.mark.parametrize(
+    ("mutate", "message"),
+    [
+        (lambda row: row.update(model_source={}), "model_source"),
+        (lambda row: row.update(root_pose_in_cell={}), "root_pose_in_cell"),
+        (lambda row: row.update(frame_prefix="poses/"), "frame_prefix"),
+        (lambda row: row.update(target_settings={"poses": {}}), "target_settings"),
+    ],
+)
+def test_pose_source_component_refuses_physical_fields(mutate, message: str) -> None:
+    intent = _intent()
+    pose_source = _pose_source()
+    mutate(pose_source)
+    intent["components"].append(pose_source)
+    with pytest.raises(DeploymentIntentError, match=message):
+        validate_deployment_intent(intent, source="test")
+
+
+def test_appending_model_free_components_is_a_composition_change() -> None:
+    from manyforge_composer.backend.state import _controllable_composition_change_kinds
+    before = validate_deployment_intent(_intent(), source="test")
+    after = validate_deployment_intent(_intent(), source="test")
+    after["components"] += [_io_device(), _pose_source()]
+    assert _controllable_composition_change_kinds(before, after) == (
+        "controllable_components",
+    )
+
+
 def _with_fallbacks(primary: str, fallbacks: object) -> dict:
     intent = _intent()
     stop = intent["components"][0]["target_settings"]["arm"]["controlled_stop"]

@@ -15,6 +15,7 @@
 #include <controller_manager_msgs/msg/controller_manager_activity.hpp>
 #include <controller_manager_msgs/srv/switch_controller.hpp>
 #include <lifecycle_msgs/msg/state.hpp>
+#include <manyforge_roboplan/host_component_stream_health.hpp>
 #include <manyforge_roboplan/retained_native_runtime.hpp>
 #include <manyforge_ros2_control_execution/selected_ros_endpoint_facts.hpp>
 #include <sensor_msgs/msg/joint_state.hpp>
@@ -431,10 +432,11 @@ struct PreparedMeasuredStateSources::Storage final {
   Storage(std::vector<core::MeasuredStateSourceDescriptor> descriptors,
           std::shared_ptr<core::IClock> clock, rclcpp::Node::SharedPtr node,
           std::shared_ptr<RetainedObservationWake> observation_wake,
-          std::shared_ptr<RetainedObservationWake> render_wake)
+          std::shared_ptr<RetainedObservationWake> render_wake,
+          std::shared_ptr<core::StreamRecorder> stream)
       : descriptors(std::move(descriptors)), clock(std::move(clock)),
         node(std::move(node)), observation_wake(std::move(observation_wake)),
-        render_wake(std::move(render_wake)) {}
+        render_wake(std::move(render_wake)), stream(std::move(stream)) {}
   ~Storage() {
     std::lock_guard lock(mutex);
     active = false;
@@ -447,6 +449,8 @@ struct PreparedMeasuredStateSources::Storage final {
   const rclcpp::Node::SharedPtr node;
   const std::shared_ptr<RetainedObservationWake> observation_wake;
   const std::shared_ptr<RetainedObservationWake> render_wake;
+  /// CP9 liveness of the component's measured joints (may be null).
+  const std::shared_ptr<core::StreamRecorder> stream;
   std::vector<Channel> channels;
   rclcpp::Subscription<sensor_msgs::msg::JointState>::SharedPtr subscription;
 };
@@ -568,11 +572,24 @@ RetainedRos2ControlRuntimeHandle::StageMeasuredStateSources(
           "measured_state_physical_source_mismatch",
           "Measured source differs from the actual bound physical lane.");
   }
+  if (!measured_stream_) {
+    // CP9: one `measured_joints` stream per bound component, kept across
+    // restaging; the lane carries the adapter-kind defaults.
+    const auto &owner = motion_binding_ ? *motion_binding_ : *gripper_binding_;
+    auto declared = host_component_stream_health()->Declare(
+        owner.value().controllable_component_id,
+        core::StreamDeclarationDTO{"measured_joints", lane.freshness_budget_ns,
+                                   lane.stream_severity, lane.stream_recovery,
+                                   core::StreamTimestampSourceDTO::kMessageStamp});
+    if (!declared.ok())
+      return core::Result<Sources>::Err(declared.error());
+    measured_stream_ = std::move(declared.value());
+  }
   auto replacement = std::make_shared<PreparedMeasuredStateSources::Storage>(
       std::move(descriptors), std::move(receiver_clock), resources_->node(),
       arm_ && arm_->transport.mock_reset_position ? reset_observation_wake_
                                                   : nullptr,
-      std::move(render_wake));
+      std::move(render_wake), measured_stream_);
   Readers readers;
   replacement->channels.reserve(replacement->descriptors.size());
   readers.reserve(replacement->descriptors.size());
@@ -603,6 +620,11 @@ RetainedRos2ControlRuntimeHandle::StageMeasuredStateSources(
             const auto channels = weak_channels.lock();
             if (!channels)
               return;
+            // CP9 liveness: lock-free, no allocation.
+            if (channels->stream)
+              channels->stream->Record(
+                  static_cast<std::int64_t>(message->header.stamp.sec) * 1'000'000'000LL +
+                  message->header.stamp.nanosec);
             std::unique_lock publication_lock(channels->mutex);
             if (!channels->active)
               return;

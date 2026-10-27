@@ -271,6 +271,19 @@ struct CCLCJournalRecoveryDTO final {
   [[nodiscard]] bool locally_valid() const noexcept;
 };
 
+/// CP9: an operator Recover of a component with no open incident that
+/// cleared an `ack` stream latch. No transaction, journal row or primitive.
+struct ComponentStreamAcknowledgementDTO final {
+  ControllableComponentId controllable_component_id;
+  std::int64_t acknowledged_at_ns{};
+
+  [[nodiscard]] bool locally_valid() const noexcept {
+    return !controllable_component_id.empty() && acknowledged_at_ns >= 0;
+  }
+  friend bool operator==(const ComponentStreamAcknowledgementDTO&,
+                         const ComponentStreamAcknowledgementDTO&) = default;
+};
+
 /// Atomic outcome of lifecycle request-ledger admission.
 ///
 /// Accepted-new and exact-replay describe membership in the request journal:
@@ -287,6 +300,8 @@ struct CCLCLifecycleRequestResultDTO final {
   /// open component incident (addendum 2): no transaction was minted and no
   /// vendor primitive is dispatched.
   std::optional<ComponentIncidentRecoveryDTO> incident_recovery{};
+  /// CP9: the operator's Recover only cleared a latched stream condition.
+  std::optional<ComponentStreamAcknowledgementDTO> stream_acknowledgement{};
 
   [[nodiscard]] bool locally_valid() const noexcept;
 };

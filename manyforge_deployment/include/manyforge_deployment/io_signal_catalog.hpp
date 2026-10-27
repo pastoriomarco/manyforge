@@ -3,6 +3,10 @@
 #include <manyforge_core/types/cell_graph.hpp>
 #include <manyforge_core/types/deployment_applicability.hpp>
 #include <manyforge_core/types/io_signal.hpp>
+#include <optional>
+#include <string>
+#include <string_view>
+#include <vector>
 
 namespace manyforge::deployment {
 
@@ -76,9 +80,36 @@ ResolveRetainedIoSignalCatalog(
     const core::CellGraphDTO &graph,
     const std::optional<core::RuntimeUnitId> &runtime_unit_id = std::nullopt);
 
+/// CP9: one model-free pose-source row (`pose_sources`) of a runtime unit.
+struct RetainedPoseSourceConfiguration final {
+  core::RuntimeUnitId runtime_unit_id;
+  core::ControllableComponentId controllable_component_id;
+  /// Sorted, unique `poses/<object_id>/<policy_id>` of every binding.
+  std::vector<std::string> stream_ids;
+  /// The normalized unit-configuration row.
+  core::JsonValueDTO row;
+};
+
+/// `poses/<object_id>/<policy_id>`: one stream (and provider-domain member)
+/// per pose-source binding.
+[[nodiscard]] std::string PoseSourceStreamId(std::string_view object_id,
+                                             std::string_view policy_id);
+
+/// Reads and checks the normalized `pose_sources` rows: hosted owner, at least
+/// one binding, ids of `[a-z0-9_.-]+` with a stream id of at most 64 bytes,
+/// unique (object_id, policy_id), unique required joint names. Typed reasons:
+/// `pose_source_owner_mismatch`, `pose_source_bindings_empty`,
+/// `pose_source_binding_id_invalid`, `pose_source_binding_duplicate`,
+/// `pose_source_joint_names_duplicate`, `pose_source_configuration_invalid`.
+[[nodiscard]] core::Result<std::vector<RetainedPoseSourceConfiguration>>
+ResolveRetainedPoseSources(
+    const core::CellGraphDTO &graph,
+    const std::optional<core::RuntimeUnitId> &runtime_unit_id = std::nullopt);
+
 /// Rechecks direct provider scope against the retained component and actual
 /// configured signal owners. Component-type role classification is proved by
-/// the ordinary applicability qualifier before sealing.
+/// the ordinary applicability qualifier before sealing. `scene.pose.observe`
+/// on the `poses` target of a configured pose source has no endpoint.
 [[nodiscard]] core::Result<void> ValidateNonCoordinateProviderTarget(
     const core::CellGraphDTO &graph,
     const core::CapabilityProviderBindingDTO &provider);

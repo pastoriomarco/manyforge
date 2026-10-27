@@ -25,6 +25,8 @@
 #include <unistd.h>
 
 #include <algorithm>
+#include <array>
+#include <charconv>
 #include <set>
 #include <sstream>
 
@@ -43,11 +45,12 @@ constexpr std::string_view kMockLaunchFile = "mock_control.launch.py";
 constexpr std::string_view kIsaacLaunchFile =
     "isaac_topic_based_control.launch.py";
 constexpr std::string_view kSimulatedPlcLaunchFile = "sim_plc.launch.py";
+constexpr std::string_view kPoseSourceLaunchFile = "pose_source.launch.py";
 
 [[nodiscard]] int parent_death_signal(const ControllerLaunchCommand &command) {
   const auto &argv = command.argv;
-  // Q116 applies only to these qualified ROS launch roles. Cell launches and
-  // arbitrary controller commands retain their existing SIGTERM policy.
+  // Q116 applies only to these qualified ROS launch roles. Arbitrary
+  // controller commands retain their existing SIGTERM policy.
   if (argv.size() >= 4U && argv[0] == kRos2 && argv[1] == "launch" &&
       argv[2] == kBringupPackage &&
       ((command.lane == ControllerLaunchLane::kMock &&
@@ -55,7 +58,9 @@ constexpr std::string_view kSimulatedPlcLaunchFile = "sim_plc.launch.py";
        (command.lane == ControllerLaunchLane::kIsaac &&
         argv[3] == kIsaacLaunchFile) ||
        (command.lane == ControllerLaunchLane::kSimulatedPlc &&
-        argv[3] == kSimulatedPlcLaunchFile)))
+        argv[3] == kSimulatedPlcLaunchFile) ||
+       (command.lane == ControllerLaunchLane::kPoseSource &&
+        argv[3] == kPoseSourceLaunchFile)))
     return SIGINT;
   return SIGTERM;
 }
@@ -128,9 +133,8 @@ resolve_executable(const std::string &name) {
   return std::nullopt;
 }
 
-[[nodiscard]] std::string describe_status(const int status,
-                                         const bool cell = false) {
-  const std::string subject = cell ? "cell launch" : "controller launch";
+[[nodiscard]] std::string describe_status(const int status) {
+  const std::string subject = "controller launch";
   if (WIFEXITED(status)) {
     return subject + " exited with status " +
            std::to_string(WEXITSTATUS(status));
@@ -180,14 +184,6 @@ resolve_executable(const std::string &name) {
   std::ostringstream out;
   out << std::quoted(escaped);
   return out.str();
-}
-
-[[nodiscard]] std::string cell_launch_fields(const CellLaunchCommand &command) {
-  return " cell=" + log_field(command.cell_id.value()) +
-         " role=pose_observer" +
-         (command.observer_source_id.has_value()
-              ? " source=" + log_field(*command.observer_source_id)
-              : std::string());
 }
 
 [[nodiscard]] std::string bounded_text(std::string text,
@@ -459,7 +455,8 @@ mock_controller_launch_command(const ControllerLaunchArtifacts &artifacts) {
 
 ControllerLaunchCommand
 isaac_controller_launch_command(const ControllerLaunchArtifacts &artifacts,
-                                const IsaacControllerLane &lane) {
+                                const IsaacControllerLane &lane,
+                                const std::optional<double> gripper_state_freshness_timeout_s) {
   require_artifacts(artifacts, ControllerLaunchLane::kIsaac);
   if (lane.joint_commands_topic.empty() || lane.joint_states_topic.empty()) {
     fail("Isaac lane facts have no joint topics");
@@ -479,6 +476,15 @@ isaac_controller_launch_command(const ControllerLaunchArtifacts &artifacts,
   if (!artifacts.frame_prefix.empty()) {
     host_owned.push_back("frame_prefix:=" + artifacts.frame_prefix);
   }
+  std::vector<std::string> further;
+  if (gripper_state_freshness_timeout_s.has_value()) {
+    std::array<char, 64> text{};
+    const auto written = std::to_chars(text.data(), text.data() + text.size(),
+                                       *gripper_state_freshness_timeout_s);
+    further.push_back("gripper_state_freshness_timeout_s:=" +
+                      std::string(text.data(), written.ptr));
+    host_owned.push_back(further.back());
+  }
   ControllerLaunchCommand command;
   command.controllable_component_id = artifacts.controllable_component_id;
   command.lane = ControllerLaunchLane::kIsaac;
@@ -491,7 +497,7 @@ isaac_controller_launch_command(const ControllerLaunchArtifacts &artifacts,
     }
     command.argv.push_back(argument);
   }
-  command.identity = identity_of(artifacts, {});
+  command.identity = identity_of(artifacts, further);
   command.robot_description_sha256 = artifacts.robot_description_sha256;
   command.controllers_sha256 = artifacts.controllers_sha256;
   command.controller_profile = artifacts.controller_profile;
@@ -575,11 +581,6 @@ struct ControllerLaunchProcess::Output final {
                        log_field(component) + " pid=" + std::to_string(pid) +
                        " "),
         totals(std::move(counters)) {
-    snapshot.tail.reserve(kTailBytes);
-  }
-
-  explicit Output(std::string cell_tag)
-      : tag(std::move(cell_tag)), totals() {
     snapshot.tail.reserve(kTailBytes);
   }
 
@@ -783,28 +784,7 @@ ControllerLaunchProcess::ControllerLaunchProcess(
                                      false, std::move(counters));
 }
 
-ControllerLaunchProcess::ControllerLaunchProcess(
-    CellLaunchCommand command, const int pid,
-    std::filesystem::path upstream_log_directory, std::string context)
-    : command_(std::move(command)), pid_(pid),
-      upstream_log_directory_(std::move(upstream_log_directory)),
-      start_context_(std::move(context)),
-      current_request_context_(start_context_) {
-  output_ = std::make_shared<Output>(
-      "manyforge_cell_output" +
-      cell_launch_fields(std::get<CellLaunchCommand>(command_)) +
-      " pid=" + std::to_string(pid_) + " ");
-}
-
 void ControllerLaunchProcess::append_start_header() {
-  if (const auto *cell = std::get_if<CellLaunchCommand>(&command_)) {
-    output_->append("manyforge_cell_launch_start observed_utc=" +
-                    observed_utc_now() + cell_launch_fields(*cell) +
-                    " pid=" + std::to_string(pid_) + " request_context=" +
-                    log_field(start_context_) + " launch_identity=" +
-                    bounded_log_field(cell->identity, 4096U) + "\n");
-    return;
-  }
   const auto line =
       "manyforge_controller_launch_start observed_utc=" + observed_utc_now() +
       " component=" + log_field(command().controllable_component_id) +
@@ -822,8 +802,7 @@ ControllerLaunchProcess::~ControllerLaunchProcess() {
 void ControllerLaunchProcess::observe_exit_locked() {
   if (!group_owned_)
     return;
-  const std::string subject = std::holds_alternative<CellLaunchCommand>(command_)
-                                  ? "cell launch" : "controller launch";
+  const std::string subject = "controller launch";
   siginfo_t status{};
   int result = 0;
   do {
@@ -864,15 +843,8 @@ void ControllerLaunchProcess::observe_exit_locked() {
 void ControllerLaunchProcess::capture_exit_locked(
     const std::optional<int> exit_status, const std::optional<int> signal,
     const bool core_dumped) {
-  if (exit_evidence_.has_value() || cell_exit_evidence_.has_value())
+  if (exit_evidence_.has_value())
     return;
-  if (const auto *cell = std::get_if<CellLaunchCommand>(&command_)) {
-    cell_exit_evidence_ = CellLaunchExitEvidence{
-        pid_, exit_status, signal, core_dumped, observed_utc_now(), *cell,
-        upstream_log_directory_, exit_.value_or("cell launch ended"),
-        current_request_context_};
-    return;
-  }
   exit_evidence_ =
       ControllerLaunchExitEvidence{pid_,
                                    exit_status,
@@ -894,20 +866,6 @@ ControllerLaunchProcess::exit_evidence() {
   std::lock_guard lock(mutex_);
   observe_exit_locked();
   return exit_evidence_;
-}
-
-std::optional<CellLaunchExitEvidence> CellLaunchProcess::exit_evidence() {
-  std::lock_guard lock(occurrence_->mutex_);
-  occurrence_->observe_exit_locked();
-  return occurrence_->cell_exit_evidence_;
-}
-
-bool CellLaunchProcess::group_drained() const {
-  std::lock_guard lock(occurrence_->mutex_);
-  // stop_complete_ publishes the retirement lane's scan before the same
-  // mutex release; unfinished retirement never reads its in-flight scan.
-  return occurrence_->stop_complete_ && occurrence_->exact_leader_reaped_ &&
-         occurrence_->stop_scanned_drained_;
 }
 
 void ControllerLaunchProcess::update_request_context(std::string context) {
@@ -1033,8 +991,7 @@ bool ControllerLaunchProcess::poll_stop() noexcept {
       if (result == pid_) {
         exact_leader_reaped_ = true;
         if (!exit_)
-          exit_ = describe_status(
-              status, std::holds_alternative<CellLaunchCommand>(command_));
+          exit_ = describe_status(status);
         capture_exit_locked(
             WIFEXITED(status) ? std::optional<int>(WEXITSTATUS(status))
                               : std::nullopt,
@@ -1043,10 +1000,7 @@ bool ControllerLaunchProcess::poll_stop() noexcept {
             WIFSIGNALED(status) && WCOREDUMP(status));
       } else {
         if (!exit_)
-          exit_ = std::holds_alternative<CellLaunchCommand>(command_)
-                      ? "cell launch process is no longer a child of this host"
-                      : "controller launch process is no longer a child of "
-                        "this host";
+          exit_ = "controller launch process is no longer a child of this host";
         capture_exit_locked(std::nullopt, std::nullopt, false);
       }
       group_owned_ = false;
@@ -1054,16 +1008,13 @@ bool ControllerLaunchProcess::poll_stop() noexcept {
     if (cleanup_.state != ControllerLaunchCleanupState::kDrained) {
       cleanup_.state = ControllerLaunchCleanupState::kUnknown;
       if (stop_scanned_drained_ && exact_leader_reaped_) {
-        if (const auto *component =
-                std::get_if<ControllerLaunchCommand>(&command_)) {
-          try {
-            cleanup_.receipt = ControllerLaunchGroupDrainReceipt{
-                pid_, component->controllable_component_id, component->identity,
-                observed_utc_now()};
-            cleanup_.state = ControllerLaunchCleanupState::kDrained;
-          } catch (...) {
-            // Missing receipt stays Unknown, independently of exit evidence.
-          }
+        try {
+          cleanup_.receipt = ControllerLaunchGroupDrainReceipt{
+              pid_, command_.controllable_component_id, command_.identity,
+              observed_utc_now()};
+          cleanup_.state = ControllerLaunchCleanupState::kDrained;
+        } catch (...) {
+          // Missing receipt stays Unknown, independently of exit evidence.
         }
       }
     }
@@ -1071,19 +1022,12 @@ bool ControllerLaunchProcess::poll_stop() noexcept {
   }
   if (owned) {
     try {
-      if (const auto *cell = std::get_if<CellLaunchCommand>(&command_)) {
-        output_->append("manyforge_cell_launch_end observed_utc=" +
-                        observed_utc_now() + cell_launch_fields(*cell) +
-                        " pid=" + std::to_string(pid_) + " request_context=" +
-                        log_field(context) + "\n");
-      } else {
-        output_->append("manyforge_controller_launch_end observed_utc=" +
-                        observed_utc_now() + " component=" +
-                        log_field(command().controllable_component_id) +
-                        " pid=" + std::to_string(pid_) +
-                        " request_context=" + log_field(context) +
-                        " incident_id=" + log_field(incident_id) + "\n");
-      }
+      output_->append("manyforge_controller_launch_end observed_utc=" +
+                      observed_utc_now() + " component=" +
+                      log_field(command().controllable_component_id) +
+                      " pid=" + std::to_string(pid_) +
+                      " request_context=" + log_field(context) +
+                      " incident_id=" + log_field(incident_id) + "\n");
     } catch (...) {
       // Containment completed; optional output loss cannot terminate the host.
     }
@@ -1429,30 +1373,6 @@ ControllerLaunchSupervisor::ensure(const ControllerLaunchCommand &command,
   }
 }
 
-std::shared_ptr<CellLaunchProcess> ControllerLaunchSupervisor::start_cell_process(
-    const CellLaunchCommand &command,
-    const std::filesystem::path &artifacts_root, std::string context) {
-  if (command.cell_id.empty() || command.identity.empty() || command.argv.empty())
-    fail("cell launch requires an exact cell, launch identity and argv");
-  if (command.role != CellLaunchRole::kPoseObserver ||
-      !command.observer_source_id.has_value() ||
-      command.observer_source_id->empty())
-    fail("cell pose observer requires its exact configured source identity");
-  prepare_upstream_log_directory(artifacts_root);
-  std::lock_guard submission_lock(mutex_);
-  if (host_shutdown_started_)
-    fail("cell launch submission is closed for host shutdown");
-  const auto spawned = spawner_->spawn(command.argv, artifacts_root);
-  auto occurrence = std::shared_ptr<ControllerLaunchProcess>(
-      new ControllerLaunchProcess(command, spawned.pid, artifacts_root / "ros",
-                                  std::move(context)));
-  occurrence->output_->attach_wake(spawner_->wake_fd);
-  spawner_->register_output(spawned.output_read_fd, occurrence->output_);
-  occurrence->append_start_header();
-  return std::shared_ptr<CellLaunchProcess>(
-      new CellLaunchProcess(std::move(occurrence)));
-}
-
 bool ControllerLaunchSupervisor::discard_candidate(
     const Ensured &candidate_launch) {
   if (candidate_launch.decision == ControllerLaunchDecision::kKeep ||
@@ -1484,8 +1404,7 @@ bool ControllerLaunchSupervisor::retire_exact(
 }
 
 ControllerLaunchSupervisor::HostShutdownSnapshot
-ControllerLaunchSupervisor::BeginHostShutdown(
-    const std::vector<std::shared_ptr<CellLaunchProcess>> &cells) {
+ControllerLaunchSupervisor::BeginHostShutdown() {
   HostShutdownSnapshot snapshot;
   {
     std::lock_guard lock(mutex_);
@@ -1494,11 +1413,6 @@ ControllerLaunchSupervisor::BeginHostShutdown(
       static_cast<void>(component);
       if (slot.current)
         snapshot.push_back(slot.current);
-    }
-    for (const auto &cell : cells) {
-      if (cell && std::find(snapshot.begin(), snapshot.end(),
-                            cell->occurrence_) == snapshot.end())
-        snapshot.push_back(cell->occurrence_);
     }
   }
   for (const auto &process : snapshot)
@@ -1530,14 +1444,11 @@ ControllerLaunchSupervisor::PollHostShutdown(
       }
     }
     if (complete) {
-      if (const auto *component =
-              std::get_if<ControllerLaunchCommand>(&process->command_)) {
-        std::lock_guard lock(mutex_);
-        const auto found =
-            processes_.find(component->controllable_component_id);
-        if (found != processes_.end() && found->second.current == process)
-          found->second.current.reset();
-      }
+      std::lock_guard lock(mutex_);
+      const auto found =
+          processes_.find(process->command_.controllable_component_id);
+      if (found != processes_.end() && found->second.current == process)
+        found->second.current.reset();
     }
   }
   return progress;
@@ -1734,14 +1645,6 @@ bool ControllerLaunchSupervisor::request_unexpected_exit_cleanup(
       expected->cleanup_.state = ControllerLaunchCleanupState::kUnknown;
     return false;
   }
-}
-
-bool ControllerLaunchSupervisor::retire_cell_process(
-    const std::shared_ptr<CellLaunchProcess> &process) {
-  if (!process) return false;
-  process->occurrence_->stop(stop_grace_);
-  std::lock_guard lock(process->occurrence_->mutex_);
-  return process->occurrence_->exact_leader_reaped_;
 }
 
 ControllerLaunchSupervisor &host_controller_launch_supervisor() {

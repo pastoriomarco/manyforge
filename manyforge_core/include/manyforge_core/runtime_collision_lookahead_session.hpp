@@ -86,7 +86,6 @@ struct RuntimeCollisionLookaheadResult {
   std::uint64_t execution_generation = 0;
   std::uint64_t arm_generation = 0;
   std::uint64_t permit_generation = 0;
-  std::uint64_t runtime_bundle_epoch = 0;
   std::optional<ProjectionRevisionDTO> projection_revision;
   CollisionWorldRevision collision_world_revision;
   std::int64_t requested_at_ns = 0;
@@ -182,7 +181,6 @@ class RuntimeCollisionLookaheadSession final {
     int workers = 2;
     int min_waypoints_for_parallel = 8;
     std::int64_t query_budget_ns = 75'000'000;
-    std::int64_t dynamic_body_max_age_cap_ns = 500'000'000;
   };
 
   /// Observer callback invoked only after any required authority callback and
@@ -214,24 +212,20 @@ class RuntimeCollisionLookaheadSession final {
     std::uint64_t execution_generation{};
     std::shared_ptr<const TrajectoryDTO> trajectory;
     std::string contact_policy_id;
-    std::optional<ProjectionRevisionDTO> admission_projection_revision;
-    std::optional<ProjectionRevisionDTO> latest_projection_revision;
     std::string active_cancel_reason;
     std::string pending_cancel_reason;
   };
 
   [[nodiscard]] static PreparedArm prepare_arm(
       std::uint64_t execution_id, std::uint64_t execution_generation,
-      std::shared_ptr<const TrajectoryDTO> trajectory, std::string contact_policy_id,
-      std::optional<ProjectionRevisionDTO> admission_projection_revision = std::nullopt);
+      std::shared_ptr<const TrajectoryDTO> trajectory, std::string contact_policy_id);
   /// Only accepts the product of prepare_arm. The owning Kernel rechecks its
   /// source/Stop/scene fence before its CAS and publishes while holding the
   /// existing protection mutex, after backend adoption exposes new progress.
   void publish_prepared_arm(PreparedArm prepared) noexcept;
 
   void arm(std::uint64_t execution_id, std::uint64_t execution_generation,
-           std::shared_ptr<const TrajectoryDTO> trajectory, std::string contact_policy_id,
-           std::optional<ProjectionRevisionDTO> admission_projection_revision = std::nullopt);
+           std::shared_ptr<const TrajectoryDTO> trajectory, std::string contact_policy_id);
   void disarm() noexcept;
 
   /// True only when this generation has no arm, queued/in-flight job, or
@@ -266,8 +260,6 @@ class RuntimeCollisionLookaheadSession final {
     std::uint64_t arm_generation = 0;
     std::shared_ptr<const TrajectoryDTO> trajectory;
     std::string contact_policy_id;
-    std::optional<ProjectionRevisionDTO> admission_projection_revision;
-    std::optional<ProjectionRevisionDTO> latest_projection_revision;
   };
 
   struct Job {

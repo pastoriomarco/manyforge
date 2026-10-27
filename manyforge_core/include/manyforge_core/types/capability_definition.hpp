@@ -15,7 +15,7 @@ namespace manyforge::core {
 inline constexpr std::string_view kCapabilityDefinitionApiVersion =
     "manyforge.capability_definition.v1";
 inline constexpr std::string_view kBuiltinCapabilityDefinitionRegistryDigest =
-    "sha256:f16fbfaf20185c184fee1ed014592eb443f2c5f5144de84eaae685504c0d38f9";
+    "sha256:55fed7ca63f9fe8617e4bc18d23180964bf4cdac5b7ea1cce20aa4c6557110ec";
 
 enum class CapabilityScope : std::uint8_t {
   kCellGlobal = 0,
@@ -79,7 +79,7 @@ struct CapabilityDefinitionDescriptor {
 
 /// Exact spec-240 active registry. Frozen legacy replacement rows are not
 /// capability definitions.
-inline constexpr std::array<CapabilityDefinitionDescriptor, 67>
+inline constexpr std::array<CapabilityDefinitionDescriptor, 68>
     kBuiltinCapabilityDefinitionRegistry{{
         {"planning.motion.joint_goal",
          "sha256:0f6cb2fda7e1d05f20a5867203b84c0e0427440f4b11657941a907c2e2a23dce",
@@ -180,6 +180,10 @@ inline constexpr std::array<CapabilityDefinitionDescriptor, 67>
         {"perception.pose_updates",
          "sha256:5256349a9ce767297f6d74b0fc290ba11f48afd42c7443599d5f623545575a57",
          CapabilityScope::kCellGlobal, CapabilityProviderBindingKind::kCapabilityProviderBinding,
+         std::nullopt},
+        {"scene.pose.observe",
+         "sha256:7ce48309e3a8f884850dd1285cbd66e19da631fbbfd27d269828fb7048832a57",
+         CapabilityScope::kTargetBinding, CapabilityProviderBindingKind::kCapabilityProviderBinding,
          std::nullopt},
         {"collision.query.pre_execution",
          "sha256:c45cdcea2f79fbef5d1bc95db064078560c7d5d161b72667a5ce2c72a7432eca",
@@ -413,13 +417,13 @@ inline constexpr std::array<CapabilityDefinitionDescriptor, 67>
   return count;
 }
 
-static_assert(kBuiltinCapabilityDefinitionRegistry.size() == 67U);
+static_assert(kBuiltinCapabilityDefinitionRegistry.size() == 68U);
 static_assert(capability_definition_ids_are_unique());
-static_assert(capability_scope_count(CapabilityScope::kTargetBinding) == 31U);
+static_assert(capability_scope_count(CapabilityScope::kTargetBinding) == 32U);
 static_assert(capability_scope_count(CapabilityScope::kCellGlobal) == 28U);
 static_assert(capability_scope_count(CapabilityScope::kControlDomain) == 8U);
 static_assert(capability_provider_binding_kind_count(
-                  CapabilityProviderBindingKind::kCapabilityProviderBinding) == 50U);
+                  CapabilityProviderBindingKind::kCapabilityProviderBinding) == 51U);
 static_assert(
     capability_provider_binding_kind_count(CapabilityProviderBindingKind::kControlBinding) == 17U);
 

@@ -15,29 +15,38 @@
 #include <mutex>
 #include <optional>
 #include <string>
+#include <thread>
 
 namespace manyforge::roboplan_backend {
 
 struct RetainedPlannerSceneProjectionConfig final {
   std::string publisher_id;
   std::size_t transaction_replay_capacity{256U};
-  std::size_t collision_ledger_capacity{
-      RetainedCollisionWorldPublisher::kDefaultLedgerCapacity};
 };
 
 /// One exact host-owned native projection state machine.
 ///
 /// The logical scene remains externally owned. This adapter accepts only
-/// owner-normalized transactions, verifies their deterministic successor
-/// snapshot before effects, and publishes an immutable collision projection.
-/// It also acts as the stable publisher handle used by a runtime composition,
-/// so explicit rebuild may replace the concrete publisher without leaving
-/// consumers attached to a stale instance.
+/// owner-normalized transactions and verifies their deterministic successor
+/// snapshot before effects. The collision world is a lazily derived cache of
+/// the latest logical scene: a commit only records the scene and advances a
+/// change counter; the world, policy and runtime bundle are rebuilt when a
+/// consumer is about to compute collisions (planning, validation, the
+/// runtime monitor) and the scene changed since the last build. It also acts
+/// as the stable publisher handle used by a runtime composition, so explicit
+/// rebuild may replace the concrete publisher without leaving consumers
+/// attached to a stale instance.
 class RetainedPlannerSceneProjection final
     : public core::IPlannerSceneProjection,
       public core::ICollisionWorldSnapshotPublisher {
 public:
   using Clock = std::function<std::int64_t()>;
+
+  ~RetainedPlannerSceneProjection() override;
+  RetainedPlannerSceneProjection(const RetainedPlannerSceneProjection &) =
+      delete;
+  RetainedPlannerSceneProjection &
+  operator=(const RetainedPlannerSceneProjection &) = delete;
 
   [[nodiscard]] static core::Result<
       std::shared_ptr<RetainedPlannerSceneProjection>>
@@ -69,13 +78,6 @@ public:
 
   [[nodiscard]] core::ProjectionCommitResultDTO
   ApplyTransaction(const core::SceneTransactionDTO &transaction) override;
-  /// Freshness-only publication for one unchanged committed object. Requires
-  /// health at exactly the expected projection revision and an unattached
-  /// cell-fixed object whose committed pose and evidence origin/budget match
-  /// with an older committed sequence; never changes projection health,
-  /// SceneRevision, the collision world or the effective policy.
-  [[nodiscard]] core::Result<void> ApplyProviderFreshness(
-      const core::ProviderFreshnessConfirmationDTO &confirmation) override;
   [[nodiscard]] core::Result<core::CollisionWorldLeaseInventory>
   RetainProjection(const core::ProjectionRevisionDTO &projection_revision,
                    core::ProjectionLeaseId projection_lease_id) override;
@@ -154,11 +156,9 @@ private:
   [[nodiscard]] std::shared_ptr<const core::LogicalSceneSnapshotDTO>
   RetainedScene(const core::ProjectionLeaseBindingDTO &binding) const;
 
-  struct RetainedProjectionLease final {
-    std::shared_ptr<RetainedCollisionWorldPublisher> publisher;
-    std::int64_t captured_at_ns{};
-    std::shared_ptr<const core::LogicalSceneSnapshotDTO> logical_scene;
-  };
+  /// Bounds the projection leases held for local and remote planners; a
+  /// leaked lease cannot grow memory without limit.
+  static constexpr std::size_t kMaxRetainedProjectionLeases = 64U;
 
   RetainedPlannerSceneProjection(
       RetainedCollisionWorldProjector projector,
@@ -167,11 +167,20 @@ private:
       RetainedPlannerSceneProjectionConfig config, Clock clock,
       std::shared_ptr<const RetainedSceneFrameResolver> frame_resolver);
 
+  /// Rebuild the collision world from the latest logical scene if it changed
+  /// since the last build. Runs under mutex_ on the single publication writer;
+  /// a failed build desynchronizes the projection (consumers fail closed).
+  void BuildCollisionWorldLocked();
+  /// NRT consumer entry: bring the collision world up to date before use.
+  void RefreshCollisionWorld() const;
+  /// Runtime-monitor entry: never builds; asks the build worker to rebuild
+  /// off the real-time thread when the scene changed.
+  void RequestCollisionWorldBuild() const noexcept;
+  void RunCollisionWorldBuilds();
+
   [[nodiscard]] core::Result<std::shared_ptr<RetainedCollisionWorldPublisher>>
   BuildPublisher(const RetainedCollisionWorldProjector &projector,
-                 const core::LogicalSceneSnapshotDTO &snapshot,
-                 core::CollisionWorldMutationSource source,
-                 std::string source_label) const;
+                 const core::LogicalSceneSnapshotDTO &snapshot) const;
   [[nodiscard]] core::ProjectionCommitResultDTO
   RollbackProven(std::optional<std::uint64_t> transaction_sequence,
                  const core::ProjectionRevisionDTO &proposed,
@@ -207,11 +216,23 @@ private:
   std::map<std::uint64_t, TransactionRecord> transaction_records_;
   std::optional<BootstrapRecord> bootstrap_record_;
   std::optional<core::NativeProjectionRebuildDTO> maintenance_successor_;
-  std::map<core::ProjectionLeaseId, RetainedProjectionLease>
+  /// Retained inventories by lease id: the exact scene and world a planner
+  /// started from. Their handles stay valid across later publications.
+  std::map<core::ProjectionLeaseId, core::CollisionWorldLeaseInventory>
       retained_lease_publishers_;
   std::deque<core::ProjectionLeaseId> retained_lease_order_;
   std::atomic<std::shared_ptr<RetainedCollisionWorldPublisher>>
       active_publisher_;
+  /// Change notification only: commits advance scene_change_ and a build
+  /// records the change it covered in built_change_. Never a precondition.
+  std::atomic<std::uint64_t> scene_change_{0U};
+  std::atomic<std::uint64_t> built_change_{0U};
+  mutable std::atomic<std::uint64_t> requested_change_{0U};
+  mutable std::atomic<std::uint64_t> build_wake_{0U};
+  std::atomic<bool> stopping_{false};
+  /// Off-real-time builder woken by the runtime monitor. Declared last so it
+  /// starts after, and is joined before, every member it touches.
+  std::thread build_worker_;
 };
 
 } // namespace manyforge::roboplan_backend

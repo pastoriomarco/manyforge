@@ -447,7 +447,6 @@ describe('execution targets io_signal_bindings', () => {
   const identity = {
     active_publication_generation: 1, cell_id: 'cell', control_management_mode: 'direct',
     graph_revision: REVISION, owner_epoch: 'owner.1', retained_bundle_id: 'bundle.1',
-    scene_revision: { scene_id: REVISION, revision_id: 1, content_hash: REVISION },
     schema_version: 'manyforge.execution_identity.v2',
   };
   const targets = (extra: Record<string, unknown>) => ({

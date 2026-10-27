@@ -105,8 +105,6 @@ interface Environment {
   savedDeployment?: string;
   /** The native execution owner (Robot Control) epoch. */
   executionOwnerEpoch?: string;
-  /** The execution owner's Scene revision; scene 1 by default. */
-  sceneRevision?: { scene_id: string; revision_id: number; content_hash: string };
 }
 
 /** The holds in which nothing moves and nothing can start. */
@@ -308,7 +306,6 @@ function headlessSnapshot(environment: Environment): ComposerHeadlessState {
     receiverEpoch: 'receiver.1',
     executionControlStatus: {
       ownerEpoch: environment.executionOwnerEpoch ?? 'execution.epoch.1',
-      sceneRevision: environment.sceneRevision ?? { scene_id: 'scene', revision_id: 1, content_hash: digest('5') },
       manualOperations: environment.hold === 'manual_operation'
         ? [{ resident: true, state: 'executing', operationId: 'manual.1', programRunId: 'manual-run' }]
         : [],
@@ -1163,36 +1160,6 @@ describe('Advisory preview of the failed node in the ordinary editor', () => {
       await flush();
       expect(hooks!.preview.preview?.status).toBe('ready');
       await render({ ...HELD, authoring, executionOwnerEpoch: 'execution.epoch.2' });
-      expect(hooks!.preview.preview?.status).toBe('pending');
-      await act(async () => { vi.advanceTimersByTime(1_000); });
-      expect(apiMock.programs.nodeCorrectionPreview).toHaveBeenCalledTimes(2);
-    } finally {
-      vi.useRealTimers();
-    }
-  });
-
-  it('keeps its reply across pose-only Scene revisions and re-plans only for another Scene', async () => {
-    vi.useFakeTimers({ toFake: ['setTimeout', 'clearTimeout'] });
-    try {
-      const authoring = heldAuthoring();
-      authoring.forest[0].children[0].parameters.speed = 0.5;
-      apiMock.programs.nodeCorrectionPreview.mockResolvedValueOnce({
-        unavailableReason: null, target: null,
-        preview: { ok: false, error: { code: 'ik_failed', message: 'unreachable' } },
-      });
-      const render = await mount({ ...HELD, authoring });
-      await act(async () => { vi.advanceTimersByTime(1_000); });
-      await flush();
-      expect(hooks!.preview.preview?.status).toBe('ready');
-      for (const revision of [2, 3, 4]) {
-        await render({ ...HELD, authoring,
-          sceneRevision: { scene_id: 'scene', revision_id: revision, content_hash: digest(String(revision)) } });
-        await act(async () => { vi.advanceTimersByTime(1_000); });
-        expect(hooks!.preview.preview?.status).toBe('ready');
-      }
-      expect(apiMock.programs.nodeCorrectionPreview).toHaveBeenCalledTimes(1);
-      await render({ ...HELD, authoring,
-        sceneRevision: { scene_id: 'scene.other', revision_id: 1, content_hash: digest('6') } });
       expect(hooks!.preview.preview?.status).toBe('pending');
       await act(async () => { vi.advanceTimersByTime(1_000); });
       expect(apiMock.programs.nodeCorrectionPreview).toHaveBeenCalledTimes(2);

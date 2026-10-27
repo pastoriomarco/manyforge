@@ -453,8 +453,7 @@ def _position_capability_response():
             "ok": True, "reset_robot_position": {"available": True, "reason": None},
             "identity": {"schema_version": "manyforge.execution_identity.v2", "owner_epoch": "kernel.1",
                          "active_publication_generation": 3, "retained_bundle_id": digest, "graph_revision": digest,
-                         "cell_id": "cell.1", "control_management_mode": "component_lifecycle",
-                         "scene_revision": {"scene_id": digest, "revision_id": 1, "content_hash": digest}}}
+                         "cell_id": "cell.1", "control_management_mode": "component_lifecycle"}}
 
 
 def _position_request():

@@ -305,37 +305,6 @@ ExistingRegularFile(std::filesystem::path path, std::string_view label,
   return result;
 }
 
-[[nodiscard]] component_manager::IsaacSiteSettings
-LoadManagedIsaacSiteSettings(const std::filesystem::path &path) {
-  FileDescriptor file(::open(path.c_str(),
-                             O_RDONLY | O_CLOEXEC | O_NONBLOCK | O_NOFOLLOW));
-  if (file.get() < 0) {
-    FailErrno("open managed Isaac site snapshot " + path.string());
-  }
-  struct stat status {};
-  if (::fstat(file.get(), &status) != 0) {
-    FailErrno("inspect managed Isaac site snapshot " + path.string());
-  }
-  Require(S_ISREG(status.st_mode),
-          "managed Isaac site snapshot must be a regular file: " + path.string());
-  std::string document;
-  std::array<char, 4096U> buffer{};
-  while (true) {
-    const auto count = ::read(file.get(), buffer.data(), buffer.size());
-    if (count < 0 && errno == EINTR) {
-      continue;
-    }
-    if (count < 0) {
-      FailErrno("read managed Isaac site snapshot " + path.string());
-    }
-    if (count == 0) {
-      break;
-    }
-    document.append(buffer.data(), static_cast<std::size_t>(count));
-  }
-  return component_manager::ParseIsaacSiteSettings(document);
-}
-
 [[nodiscard]] bool
 IsPortableRuntimeIdentity(const std::string_view value) noexcept {
   if (value.empty() || value.size() > 128U ||
@@ -388,27 +357,6 @@ ParseManagedRuntimeArguments(const int argc, char **argv) {
       config.program_artifact_root_fd = ParseFileDescriptor(value);
     } else if (option == "--manyforge-managed-scene-asset-root-fd") {
       config.scene_asset_root_fd = ParseFileDescriptor(value);
-    } else if (option == "--manyforge-managed-isaac-site-settings") {
-      config.isaac_site_settings = LoadManagedIsaacSiteSettings(value);
-    } else if (option == "--manyforge-managed-isaac-pose-observer-executable") {
-      Require(!value.empty(), "managed observer executable path is empty");
-      config.isaac_pose_observer_executable = value;
-    } else if (option == "--manyforge-managed-isaac-observer-snapshot" ||
-               option == "--manyforge-managed-isaac-observer-source-id" ||
-               option == "--manyforge-managed-isaac-observer-epoch-base") {
-      if (!config.isaac_pose_observer_launch_facts)
-        config.isaac_pose_observer_launch_facts.emplace();
-      auto &facts = *config.isaac_pose_observer_launch_facts;
-      if (option == "--manyforge-managed-isaac-observer-snapshot")
-        facts.retained_snapshot_path = value;
-      else if (option == "--manyforge-managed-isaac-observer-source-id") {
-        const auto decoded = deployment::parse_strict_json_model_yaml(value).root();
-        const auto *source = std::get_if<std::string>(&decoded.storage());
-        Require(source != nullptr, "managed observer source must be a JSON string");
-        facts.source_id = *source;
-      }
-      else
-        facts.source_epoch_base = value;
     } else if (option == "--manyforge-managed-manager-state-root") {
       config.manager_state_root = value;
     } else if (option == "--manyforge-managed-manager-run-root") {
@@ -441,7 +389,7 @@ ParseManagedRuntimeArguments(const int argc, char **argv) {
       Fail("unknown managed runtime option " + option);
     }
   }
-  Require(seen.size() >= 15U && seen.size() <= 24U &&
+  Require(seen.size() >= 15U && seen.size() <= 19U &&
               config.manager_channel_fd >= 0 &&
               config.manager_liveness_channel_fd >= 0 &&
               config.manager_liveness_channel_fd != config.manager_channel_fd &&
@@ -453,10 +401,6 @@ ParseManagedRuntimeArguments(const int argc, char **argv) {
               IsPortableRuntimeIdentity(config.runtime_unit_id) &&
               IsPortableRuntimeIdentity(config.runtime_epoch),
           "managed runtime identity is invalid");
-  Require(!config.isaac_pose_observer_launch_facts ||
-              (config.isaac_pose_observer_launch_facts->valid() &&
-               config.isaac_pose_observer_executable.has_value()),
-          "managed observer launch facts are incomplete or invalid");
   Require(!config.retained_bundle_id.empty() && !config.graph_revision.empty(),
           "managed runtime retained descriptor is invalid");
   Require(core::IsExactLowercaseSha256Digest(config.product_identity) &&

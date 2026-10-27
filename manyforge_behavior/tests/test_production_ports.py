@@ -101,11 +101,6 @@ class _Transport:
                 "program_binding_id": _DIGEST_F,
                 "graph_revision": _DIGEST_C,
                 "retained_bundle_id": _DIGEST_B,
-                "scene_revision": {
-                    "scene_id": _DIGEST_D,
-                    "revision_id": 4,
-                    "content_hash": _DIGEST_E,
-                },
             },
         }
 
@@ -905,7 +900,7 @@ def test_relative_pose_submission_uses_capture_and_preserves_portable_roles() ->
     request = transport.submissions[0]
     assert request["program_id"] == "lite6_program"
     assert request["program_binding_id"] == _DIGEST_A
-    assert request["expected_scene_revision"]["revision_id"] == 4
+    assert request["expected_scene_revision"] is None
     participant = request["participants"][0]
     assert participant["component_role_id"] == "robot"
     assert participant["target_role_id"] == "arm"
@@ -4164,6 +4159,8 @@ def test_prepared_scene_verification_accepts_a_newer_revision_of_the_same_scene(
     context = _scene_context()
     scene = [_authored_scene()[0]]
     proof = port.prepare_initial_scene(context, scene)
+    # The proof names the prepared scene, never one revision of it.
+    assert "projection_revision" not in proof
     # A continuous pose source advances the revision of the prepared scene.
     revision_id = transport.revision["scene_revision"]["revision_id"] + 1
     scene_id = transport.revision["scene_revision"]["scene_id"]
@@ -4192,7 +4189,14 @@ def test_scene_context_can_bind_atomically_before_initialization_and_release() -
     port.prepare_initial_scene(context, _authored_scene())
     first_submission_count = len(transport.submissions)
     port.prepare_initial_scene(context, _authored_scene())
-    assert len(transport.submissions) == first_submission_count
+    # Without a remembered proof the port compares the current objects. Only
+    # the component-frame object, which the native owner resolves, is
+    # committed again; the matching cell-frame object is not.
+    repeated = transport.submissions[first_submission_count:]
+    assert [
+        (body["operation"]["kind"], body["operation"]["scene_resource_id"])
+        for body in repeated
+    ] == [("upsert_object", "table")]
 
     port.release(context.program_run_id)
     result = port.invoke(
@@ -4459,6 +4463,50 @@ def test_scene_nodes_translate_roles_and_detach_at_current_pose() -> None:
     assert detach["kind"] == "detach_carried_object_at_current_pose"
     assert detach["expected_scene_resource_id"] == "graspable"
     assert transport.attachments == []
+
+
+def test_attach_node_sends_its_grasp_lost_bound_with_the_attachment() -> None:
+    transport = _SceneTransport()
+    transport.objects["graspable"] = _fixed_scene_object("graspable")
+    port = _scene_port(transport)
+    port.prepare_initial_scene(_scene_context(), [_authored_scene()[0]])
+    transport.submissions.clear()
+    parameters = {
+        "scene_resource_id": "graspable",
+        "target_role": "arm",
+        "carrier_frame_role": "tcp",
+        "touch_body_roles": ["tool_collision"],
+    }
+
+    plain = port.invoke(
+        "scene.attach_carried_object",
+        _identity("attach-plain"),
+        OwnerNodeInputs(parameters=parameters),
+    )
+    assert plain.succeeded is True
+    assert "grasp_lost_bound" not in transport.submissions[0]["operation"]
+    port.invoke(
+        "scene.detach_carried_object",
+        _identity("detach-plain"),
+        OwnerNodeInputs(parameters={"scene_resource_id": "graspable", "target_role": "arm"}),
+    )
+
+    bounded = port.invoke(
+        "scene.attach_carried_object",
+        _identity("attach-bounded"),
+        OwnerNodeInputs(
+            parameters={
+                **parameters,
+                "grasp_lost_translation_m": 0.03,
+                "grasp_lost_rotation_rad": 0.26,
+            }
+        ),
+    )
+    assert bounded.succeeded is True
+    assert transport.submissions[-1]["operation"]["grasp_lost_bound"] == {
+        "translation_m": 0.03,
+        "rotation_rad": 0.26,
+    }
 
 
 def test_scene_node_failure_keeps_the_owner_reason() -> None:

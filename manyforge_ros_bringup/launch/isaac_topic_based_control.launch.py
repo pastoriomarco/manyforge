@@ -45,32 +45,6 @@ def generate_launch_description() -> LaunchDescription:
                 ),
             ),
             DeclareLaunchArgument(
-                "pose_observer_site_config",
-                default_value="",
-                description=(
-                    "Absolute path to the exact retained-cell pose-observer "
-                    "site config. Empty disables observation."
-                ),
-            ),
-            DeclareLaunchArgument(
-                "manager_run_root",
-                default_value="",
-                description=(
-                    "Absolute Manager run root. Required exactly when the "
-                    "pose observer is enabled."
-                ),
-            ),
-            DeclareLaunchArgument(
-                "pose_observer_manager_timeout_s", default_value="2.0"
-            ),
-            DeclareLaunchArgument(
-                "pose_observer_simulation_service_timeout_s",
-                default_value="2.0",
-            ),
-            DeclareLaunchArgument(
-                "pose_observer_retry_log_period_s", default_value="5.0"
-            ),
-            DeclareLaunchArgument(
                 "pointcloud_topic",
                 default_value="",
                 description=(
@@ -142,6 +116,15 @@ def generate_launch_description() -> LaunchDescription:
                 default_value="manyforge/isaac_gripper_bridge/ready",
             ),
             DeclareLaunchArgument(
+                "gripper_state_freshness_timeout_s",
+                default_value="",
+                description=(
+                    "Host-passed feedback staleness threshold [s] of the "
+                    "gripper target configuration; required when the gripper "
+                    "action adapter starts."
+                ),
+            ),
+            DeclareLaunchArgument(
                 "start_gripper_action_bridge",
                 default_value="auto",
                 description=(
@@ -179,19 +162,6 @@ def _launch_setup(context, *_, **__) -> list[object]:
         LaunchConfiguration("joint_states_topic").perform(context),
         name="joint_states_topic",
     )
-    pose_observer_site_config = _optional_absolute_path(
-        LaunchConfiguration("pose_observer_site_config").perform(context),
-        name="pose_observer_site_config",
-    )
-    manager_run_root = _optional_absolute_path(
-        LaunchConfiguration("manager_run_root").perform(context),
-        name="manager_run_root",
-    )
-    if bool(pose_observer_site_config) != bool(manager_run_root):
-        raise ValueError(
-            "pose_observer_site_config and manager_run_root must be "
-            "configured together"
-        )
     robot_description_path = Path(
         LaunchConfiguration("robot_description_file").perform(context)
     )
@@ -376,51 +346,17 @@ def _launch_setup(context, *_, **__) -> list[object]:
                             runtime_namespace=runtime_namespace,
                             name="gripper_readiness_topic",
                         ),
+                        "state_freshness_timeout_s": _bounded_float(
+                            LaunchConfiguration(
+                                "gripper_state_freshness_timeout_s"
+                            ).perform(context),
+                            name="gripper_state_freshness_timeout_s",
+                            minimum=0.01,
+                            maximum=60.0,
+                        ),
                     },
                 ],
                 on_exit=_shutdown("Isaac gripper transport adapter exited"),
-            )
-        )
-    if pose_observer_site_config:
-        control_actions.append(
-            Node(
-                package="manyforge_ros_bringup",
-                executable="pose_source_snapshot_publisher",
-                name="manyforge_isaac_pose_observer",
-                namespace=runtime_namespace,
-                output="screen",
-                ros_arguments=["--disable-external-lib-logs"],
-                parameters=[
-                    {
-                        "site_config_path": pose_observer_site_config,
-                        "manager_run_root": manager_run_root,
-                        "manager_timeout_s": _bounded_float(
-                            LaunchConfiguration(
-                                "pose_observer_manager_timeout_s"
-                            ).perform(context),
-                            name="pose_observer_manager_timeout_s",
-                            minimum=0.05,
-                            maximum=5.0,
-                        ),
-                        "simulation_service_timeout_s": _bounded_float(
-                            LaunchConfiguration(
-                                "pose_observer_simulation_service_timeout_s"
-                            ).perform(context),
-                            name="pose_observer_simulation_service_timeout_s",
-                            minimum=0.05,
-                            maximum=30.0,
-                        ),
-                        "retry_log_period_s": _bounded_float(
-                            LaunchConfiguration(
-                                "pose_observer_retry_log_period_s"
-                            ).perform(context),
-                            name="pose_observer_retry_log_period_s",
-                            minimum=0.1,
-                            maximum=300.0,
-                        ),
-                    }
-                ],
-                on_exit=_shutdown("Isaac pose-observer adapter exited"),
             )
         )
     pointcloud_topic_raw = LaunchConfiguration("pointcloud_topic").perform(
@@ -641,19 +577,6 @@ def _scoped_ros_name(
         runtime_namespace,
         _relative_ros_path(value, name=name),
     )
-
-
-def _optional_absolute_path(value: str, *, name: str) -> str:
-    normalized = value.strip()
-    if not normalized:
-        return ""
-    if (
-        not normalized.startswith("/")
-        or "\x00" in normalized
-        or len(normalized.encode("utf-8")) > 4096
-    ):
-        raise ValueError(f"{name} must be one bounded absolute path")
-    return normalized
 
 
 def _bounded_observer_identity(

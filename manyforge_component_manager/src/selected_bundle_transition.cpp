@@ -4,31 +4,13 @@
 #include "selected_runtime_composition_rpc_internal.hpp"
 
 #include <algorithm>
-#include <limits>
-#include <manyforge_content_identity/content_identity.hpp>
 #include <manyforge_core/component_lifecycle_value_codec.hpp>
 #include <manyforge_core/types/component_incident.hpp>
 #include <manyforge_core/types/projection_common.hpp>
-#include <manyforge_deployment/artifact_codec.hpp>
 #include <stdexcept>
-#include <sys/types.h>
 #include <tuple>
-#include <variant>
 
 namespace manyforge::component_manager {
-namespace {
-
-bool ObserverSourceIdentityIsValid(const std::string_view source_id,
-                                  const std::string_view source_epoch_base) noexcept {
-  // Preserve the checked launch-facts byte grammar, including source-ID NUL.
-  constexpr std::string_view suffix = ".9007199254740991";
-  return !source_id.empty() && source_id.size() <= 256U &&
-         !source_epoch_base.empty() &&
-         source_epoch_base.size() <= 256U - suffix.size() &&
-         source_epoch_base.find('\0') == std::string_view::npos;
-}
-
-}  // namespace
 
 bool ManagerComponentProcessStopRequestDTO::valid() const noexcept {
   using namespace manyforge::core;
@@ -222,7 +204,7 @@ bool ManagerComponentBringUpPlanningFactsDTO::valid() const noexcept {
 }
 
 bool ManagerComponentBringUpInspectionResultDTO::valid() const noexcept {
-  if (!request.valid() || (cell_observer && !cell_observer->valid()) ||
+  if (!request.valid() ||
       !std::all_of(configured_components.begin(), configured_components.end(),
                    [](const auto &row) { return row.valid(); }) ||
       std::adjacent_find(configured_components.begin(), configured_components.end(),
@@ -235,99 +217,6 @@ bool ManagerComponentBringUpInspectionResultDTO::valid() const noexcept {
       std::any_of(configured_components.begin(), configured_components.end(), [&](const auto &row) {
         return row.controllable_component_id == planning_facts->component_id;
       });
-}
-
-bool ManagerCellObserverExitDTO::valid() const noexcept {
-  return pid > 0 && (exit_status.has_value() != signal.has_value()) &&
-         observed_utc.size() <= 128U && detected_at_ns >= 0;
-}
-
-bool ManagerCellObserverObservationDTO::valid() const noexcept {
-  if (cell_id.empty() || cell_id.value().size() > kMaximumIdentifierBytes ||
-      !ObserverSourceIdentityIsValid(source_id, source_epoch_base) ||
-      (process_presence != ProcessPresenceState::kUnknown &&
-       process_presence != ProcessPresenceState::kAbsent &&
-       process_presence != ProcessPresenceState::kPresent)) {
-    return false;
-  }
-  if (!exit) {
-    return !incident_id &&
-           incident_persistence == ManagerCellObserverIncidentPersistenceDTO::kNotApplicable;
-  }
-  if (!exit->valid() ||
-      (incident_id && (incident_id->empty() ||
-                       incident_id->size() > manyforge::core::kMaxComponentIncidentIdBytes))) {
-    return false;
-  }
-  // An exact real exit closes availability even when the same-owner incident
-  // slot could not be read. Absence here is uncertainty, never a new-slot or
-  // durable-reference fact.
-  if (!incident_id)
-    return incident_persistence == ManagerCellObserverIncidentPersistenceDTO::kUnknown;
-  return incident_persistence == ManagerCellObserverIncidentPersistenceDTO::kPending ||
-         incident_persistence == ManagerCellObserverIncidentPersistenceDTO::kPersisted ||
-         incident_persistence == ManagerCellObserverIncidentPersistenceDTO::kFailed ||
-         incident_persistence == ManagerCellObserverIncidentPersistenceDTO::kUnknown;
-}
-
-bool ManagerIsaacPoseObserverLaunchFactsDTO::valid() const noexcept {
-  // The parser/check owns config semantics. Q94 uses the existing Open source
-  // budget; the Manager base reserves the full existing rotation suffix.
-  return !retained_snapshot_path.empty() && retained_snapshot_path.front() == '/' &&
-         retained_snapshot_path.find('\0') == std::string::npos &&
-         ObserverSourceIdentityIsValid(source_id, source_epoch_base);
-}
-
-bool ManagerIsaacPoseObserverLaunchFactsDTO::accepts_source_epoch(
-    const std::string_view epoch) const noexcept {
-  if (!valid() || epoch.size() > 256U ||
-      !epoch.starts_with(source_epoch_base) ||
-      epoch.size() <= source_epoch_base.size() + 1U ||
-      epoch[source_epoch_base.size()] != '.') return false;
-  const auto counter = epoch.substr(source_epoch_base.size() + 1U);
-  if (counter.front() == '0') return false;
-  std::uint64_t value = 0U;
-  constexpr std::uint64_t maximum = 9007199254740991ULL;
-  for (const char digit : counter) {
-    if (digit < '0' || digit > '9') return false;
-    const auto add = static_cast<std::uint64_t>(digit - '0');
-    if (value > (maximum - add) / 10U) return false;
-    value = value * 10U + add;
-  }
-  return value != 0U;
-}
-
-std::string EncodeManagerIsaacPoseObserverLaunchFacts(
-    const ManagerIsaacPoseObserverLaunchFactsDTO &facts) {
-  if (!facts.valid()) throw std::invalid_argument("checked observer launch facts are invalid");
-  using manyforge::content_identity::CanonicalValue;
-  return manyforge::content_identity::canonical_json(CanonicalValue(
-      CanonicalValue::Object{
-          {"retained_snapshot_path", CanonicalValue(facts.retained_snapshot_path)},
-          {"source_id", CanonicalValue(facts.source_id)},
-          {"source_epoch_base", CanonicalValue(facts.source_epoch_base)}}));
-}
-
-ManagerIsaacPoseObserverLaunchFactsDTO
-DecodeManagerIsaacPoseObserverLaunchFacts(const std::string_view bytes) {
-  using manyforge::content_identity::CanonicalValue;
-  const auto root = manyforge::deployment::parse_strict_json_model_yaml(bytes).root();
-  const auto *object = std::get_if<CanonicalValue::Object>(&root.storage());
-  if (object == nullptr || object->size() != 3U ||
-      manyforge::content_identity::canonical_json(root) != bytes)
-    throw std::invalid_argument("checked observer facts must be one closed canonical value");
-  const auto string_field = [&](const std::string_view name) -> std::string {
-    const auto *member = root.find_object_member(name);
-    const auto *text = member ? std::get_if<std::string>(&member->storage()) : nullptr;
-    if (text == nullptr)
-      throw std::invalid_argument("checked observer facts require three named strings");
-    return *text;
-  };
-  ManagerIsaacPoseObserverLaunchFactsDTO result{
-      string_field("retained_snapshot_path"), string_field("source_id"),
-      string_field("source_epoch_base")};
-  if (!result.valid()) throw std::invalid_argument("checked observer launch facts are invalid");
-  return result;
 }
 
 bool ManagerSelectedRuntimeCompositionRequestDTO::valid() const noexcept {
@@ -349,8 +238,7 @@ bool ManagerSelectedRuntimeCompositionRequestDTO::valid() const noexcept {
          configuration_fence_scope.valid() && component_delta.valid() &&
          manyforge::deployment::apply_component_delta_is_fenced(
              component_delta, configuration_fence_scope) &&
-         predecessor_projection_revision.valid() &&
-         (!isaac_pose_observer_launch_facts || isaac_pose_observer_launch_facts->valid());
+         predecessor_projection_revision.valid();
 }
 
 bool ManagerRuntimeComponentReceiptDTO::valid() const noexcept {
@@ -411,22 +299,7 @@ bool ComponentReceiptsMatchRequest(
   return next == receipts.size();
 }
 
-bool ManagerIsaacPoseObserverRetirementReceiptDTO::valid() const noexcept {
-  return predecessor.valid() && leader_pid > 0 &&
-         leader_pid <= std::numeric_limits<pid_t>::max() &&
-         leader_pid <= std::numeric_limits<std::int32_t>::max();
-}
-
 bool ManagerSelectedRuntimeCompositionResultDTO::valid() const noexcept {
-  if (isaac_pose_observer_retirement_receipt &&
-      (!isaac_pose_observer_retirement_receipt->valid() ||
-       request.phase != ManagerSelectedRuntimeCompositionPhase::kPrepare ||
-       state != ManagerSelectedRuntimeCompositionState::kInstalled ||
-       (request.isaac_pose_observer_launch_facts &&
-        isaac_pose_observer_retirement_receipt->predecessor.source_epoch_base ==
-            request.isaac_pose_observer_launch_facts->source_epoch_base))) {
-    return false;
-  }
   return request.valid() &&
          (state == ManagerSelectedRuntimeCompositionState::kPreparing ||
           state == ManagerSelectedRuntimeCompositionState::kInstalled) &&

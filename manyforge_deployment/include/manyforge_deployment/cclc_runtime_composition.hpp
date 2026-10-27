@@ -200,30 +200,6 @@ public:
   /// Call outside their threads; the host must separately drain managed callers and work.
   void StopRequestFollowingAndTransports() noexcept;
 
-  /// Store checked observer exit evidence through this facade's existing journal.
-  /// This grants no component lifecycle or containment authority.
-  [[nodiscard]] core::Result<core::CellObserverIncidentRecordDTO>
-  RecordCellObserverIncident(const core::CellObserverIncidentRecordDTO &record);
-
-  /// Observe the first open record in the existing single cell observer slot.
-  [[nodiscard]] core::Result<std::optional<core::CellObserverIncidentRecordDTO>>
-  LoadOpenCellObserverIncident();
-  /// The actual existing row association for explicit bring-up admission CAS.
-  [[nodiscard]] core::Result<std::optional<core::CellObserverLossAssociationDTO>>
-  LoadOpenCellObserverLossAssociation();
-
-  [[nodiscard]] core::Result<std::optional<core::CellObserverBringUpRecordDTO>>
-  LoadLatestCellObserverBringUp();
-  [[nodiscard]] core::Result<core::CellObserverBringUpAdmissionDTO>
-  BeginLatestCellObserverBringUp(const core::CellObserverBringUpRecordDTO& admitted,
-      const std::optional<core::CellObserverBringUpRecordDTO>& expected_latest);
-  [[nodiscard]] core::Result<core::CellObserverBringUpRecordDTO>
-  UpdateLatestCellObserverBringUp(const core::CellObserverBringUpRecordDTO& expected,
-      const core::CellObserverBringUpRecordDTO& updated);
-  [[nodiscard]] core::Result<core::CellObserverBringUpRecordDTO>
-  CloseCellObserverIncidentByOperatorBringUp(const core::CellObserverBringUpRecordDTO& expected_started,
-      const core::CellObserverBringUpOpenDTO& first_open);
-
   /// Observe this genuine owner's Q97 component generation selection. The
   /// journal verifies its current owner and later acceptance repeats the CAS.
   [[nodiscard]] core::Result<core::ApplyComponentGenerationSelectionDTO>
@@ -291,6 +267,10 @@ private:
   // to the one immutable context and its owning installed-product pin.
   core::ICCLCKernelRouteConfigurationFencePort &kernel_route_fence_port_;
   core::IClock &clock_;
+  // CP9: the Kernel receives stream holds; the token names this owner's
+  // listener on `config_.lifecycle_target_driver.stream_health`.
+  core::IKernelCellAdmissionPort &kernel_cell_admission_port_;
+  std::uint64_t stream_listener_token_{};
   // Constructor-only root. After coordinator aliasing ownership is installed,
   // this is reset; the coordinator has the sole current-context slot.
   std::shared_ptr<const ProductContext> initial_product_context_;

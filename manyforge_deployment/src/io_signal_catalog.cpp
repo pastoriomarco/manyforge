@@ -611,6 +611,90 @@ ResolveRetainedIoProviderDevices(
   }
 }
 
+std::string PoseSourceStreamId(std::string_view object_id,
+                               std::string_view policy_id) {
+  return "poses/" + std::string(object_id) + "/" + std::string(policy_id);
+}
+
+core::Result<std::vector<RetainedPoseSourceConfiguration>>
+ResolveRetainedPoseSources(
+    const core::CellGraphDTO &graph,
+    const std::optional<core::RuntimeUnitId> &runtime_unit_id) {
+  using Reply = core::Result<std::vector<RetainedPoseSourceConfiguration>>;
+  const auto invalid = [](const char *reason) {
+    return InvalidConfiguration(reason);
+  };
+  const auto binding_id = [&](const Object &binding, std::string_view key) {
+    const auto *id = std::get_if<std::string>(&member(binding, key).value);
+    if (!id || id->empty() ||
+        !std::all_of(id->begin(), id->end(), [](unsigned char c) {
+          return (c >= 'a' && c <= 'z') || (c >= '0' && c <= '9') ||
+                 c == '_' || c == '.' || c == '-';
+        }))
+      throw invalid("pose_source_binding_id_invalid");
+    return *id;
+  };
+  try {
+    std::vector<RetainedPoseSourceConfiguration> result;
+    for (const auto &unit : graph.runtime_units) {
+      if (runtime_unit_id && unit.runtime_unit_id != *runtime_unit_id)
+        continue;
+      const auto declared = unit.configuration.find("pose_sources");
+      if (declared == unit.configuration.end())
+        continue;
+      for (const auto &item : value<Array>(declared->second)) {
+        const auto &row = value<Object>(item);
+        const core::ControllableComponentId component(
+            text(row, "controllable_component_id"));
+        const auto owner = std::find_if(
+            graph.controllable_components.begin(),
+            graph.controllable_components.end(), [&](const auto &candidate) {
+              return candidate.controllable_component_id == component &&
+                     std::find(candidate.runtime_unit_ids.begin(),
+                               candidate.runtime_unit_ids.end(),
+                               unit.runtime_unit_id) !=
+                         candidate.runtime_unit_ids.end();
+            });
+        if (owner == graph.controllable_components.end())
+          throw invalid("pose_source_owner_mismatch");
+        std::vector<const Object *> bindings;
+        if (const auto joint = row.find("joint_state"); joint != row.end()) {
+          const auto &joint_state = value<Object>(joint->second);
+          std::set<std::string> names;
+          for (const auto &name :
+               value<Array>(member(joint_state, "required_joint_names")))
+            if (!names.insert(value<std::string>(name)).second)
+              throw invalid("pose_source_joint_names_duplicate");
+          bindings.push_back(&joint_state);
+        }
+        for (const auto key : {"simulation_entities", "detection3d_sources"})
+          for (const auto &binding : value<Array>(member(row, key)))
+            bindings.push_back(&value<Object>(binding));
+        if (bindings.empty())
+          throw invalid("pose_source_bindings_empty");
+        std::vector<std::string> streams;
+        for (const auto *binding : bindings) {
+          auto stream = PoseSourceStreamId(binding_id(*binding, "object_id"),
+                                           binding_id(*binding, "policy_id"));
+          if (stream.size() > 64U)
+            throw invalid("pose_source_binding_id_invalid");
+          streams.push_back(std::move(stream));
+        }
+        std::sort(streams.begin(), streams.end());
+        if (std::adjacent_find(streams.begin(), streams.end()) != streams.end())
+          throw invalid("pose_source_binding_duplicate");
+        result.push_back({unit.runtime_unit_id, component, std::move(streams),
+                          item});
+      }
+    }
+    return Reply::Ok(std::move(result));
+  } catch (const InvalidConfiguration &error) {
+    return Reply::Err({"invalid_request",
+                       "Retained pose-source configuration is invalid",
+                       {{"reason", error.what()}}});
+  }
+}
+
 core::Result<void> ValidateNonCoordinateProviderTarget(
     const core::CellGraphDTO &graph,
     const core::CapabilityProviderBindingDTO &provider) {
@@ -624,8 +708,7 @@ core::Result<void> ValidateNonCoordinateProviderTarget(
   const auto *target =
       std::get_if<core::ComponentTargetCapabilityProviderTargetDTO>(
           &provider.target);
-  if (!target || provider.scope != core::CapabilityScope::kTargetBinding ||
-      provider.endpoint_bindings.empty())
+  if (!target || provider.scope != core::CapabilityScope::kTargetBinding)
     return invalid();
   const auto component =
       std::find_if(graph.controllable_components.begin(),
@@ -635,6 +718,22 @@ core::Result<void> ValidateNonCoordinateProviderTarget(
                    });
   if (component == graph.controllable_components.end() ||
       component->component_type_revision != target->component_type_revision)
+    return invalid();
+  if (provider.capability_id.value() == "scene.pose.observe") {
+    const auto sources = ResolveRetainedPoseSources(graph);
+    if (!sources.ok())
+      return core::Result<void>::Err(sources.error());
+    const bool configured = std::any_of(
+        sources.value().begin(), sources.value().end(), [&](const auto &row) {
+          return row.controllable_component_id ==
+                 target->controllable_component_id;
+        });
+    return configured && target->command_target_id.value() == "poses" &&
+                   provider.endpoint_bindings.empty()
+               ? core::Result<void>::Ok()
+               : invalid();
+  }
+  if (provider.endpoint_bindings.empty())
     return invalid();
   const auto catalog = ResolveRetainedIoSignalCatalog(graph);
   if (!catalog.ok())

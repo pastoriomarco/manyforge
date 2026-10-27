@@ -21,7 +21,7 @@ namespace {
 namespace core = manyforge::core;
 namespace scene = manyforge::scene;
 
-// Version 4 adds the provider-freshness request/response kinds (17). Both
+// Version 4 added the provider-freshness kinds (17), now retired. Both
 // endpoints compile this unit; a mixed-version peer fails closed on magic.
 constexpr std::array<std::uint8_t, 8U> kMagic{'M', 'F', 'N', 'P',
                                               'R', 'P', 'C', '4'};
@@ -1063,105 +1063,6 @@ ReadBootstrapStatus(Reader &reader) {
   return status;
 }
 
-void WriteProviderEvidence(
-    Writer &writer, const core::SceneObjectProviderEvidenceDTO &evidence) {
-  WriteStrong(writer, evidence.provider_instance_id);
-  WriteStrong(writer, evidence.provider_manifest_id);
-  WriteStrong(writer, evidence.provider_manifest_revision);
-  writer.String(evidence.provider_source_epoch);
-  writer.U64(evidence.provider_source_sequence);
-  writer.U64(static_cast<std::uint64_t>(evidence.received_at_ns));
-  WriteOptional(writer, evidence.source_timestamp_ns,
-                [](Writer &output, const std::int64_t value) {
-                  output.U64(static_cast<std::uint64_t>(value));
-                });
-  WriteOptional(writer, evidence.source_freshness_budget_ns,
-                [](Writer &output, const std::int64_t value) {
-                  output.U64(static_cast<std::uint64_t>(value));
-                });
-}
-
-[[nodiscard]] std::int64_t ReadNonnegativeI64(Reader &reader) {
-  const auto value = reader.U64();
-  if (value > static_cast<std::uint64_t>(
-                  std::numeric_limits<std::int64_t>::max())) {
-    Fail("signed timestamp field is negative or out of range");
-  }
-  return static_cast<std::int64_t>(value);
-}
-
-[[nodiscard]] core::SceneObjectProviderEvidenceDTO
-ReadProviderEvidence(Reader &reader) {
-  core::SceneObjectProviderEvidenceDTO evidence{
-      ReadStrong<core::ProviderInstanceId>(reader),
-      ReadStrong<core::ProviderManifestId>(reader),
-      ReadStrong<core::ProviderManifestRevision>(reader),
-      reader.String(),
-      reader.U64(),
-      ReadNonnegativeI64(reader),
-      ReadOptional<std::int64_t>(reader, ReadNonnegativeI64),
-      ReadOptional<std::int64_t>(reader, ReadNonnegativeI64)};
-  if (!evidence.valid()) {
-    Fail("decoded provider evidence is invalid");
-  }
-  return evidence;
-}
-
-void WriteProviderFreshness(
-    Writer &writer, const NativeProjectionProviderFreshnessRequest &request) {
-  const auto &evidence = request.confirmation.evidence;
-  if (!request.valid() || evidence.received_at_ns < 0 ||
-      (evidence.source_timestamp_ns.has_value() &&
-       *evidence.source_timestamp_ns < 0)) {
-    Fail("cannot encode invalid provider freshness request");
-  }
-  WriteBinding(writer, request.native_runtime_binding);
-  WriteProjectionRevision(writer,
-                          request.confirmation.expected_projection_revision);
-  WriteStrong(writer, request.confirmation.scene_resource_id);
-  WritePose(writer, request.confirmation.pose_in_cell);
-  WriteProviderEvidence(writer, evidence);
-}
-
-[[nodiscard]] NativeProjectionProviderFreshnessRequest
-ReadProviderFreshness(Reader &reader) {
-  auto binding = ReadBinding(reader);
-  auto revision = ReadProjectionRevision(reader);
-  auto scene_resource_id = ReadStrong<core::SceneResourceId>(reader);
-  const auto pose = ReadPose(reader);
-  auto evidence = ReadProviderEvidence(reader);
-  NativeProjectionProviderFreshnessRequest request{
-      std::move(binding),
-      core::ProviderFreshnessConfirmationDTO{
-          std::move(revision), std::move(scene_resource_id), pose,
-          std::move(evidence)}};
-  if (!request.valid()) {
-    Fail("decoded provider freshness request is invalid");
-  }
-  return request;
-}
-
-void WriteProviderFreshnessResult(
-    Writer &writer, const NativeProjectionProviderFreshnessResult &result) {
-  if (!result.valid()) {
-    Fail("cannot encode invalid provider freshness result");
-  }
-  WriteProjectionRevision(writer, result.projection_revision);
-  WriteStrong(writer, result.scene_resource_id);
-  writer.U64(result.provider_source_sequence);
-}
-
-[[nodiscard]] NativeProjectionProviderFreshnessResult
-ReadProviderFreshnessResult(Reader &reader) {
-  NativeProjectionProviderFreshnessResult result{
-      ReadProjectionRevision(reader), ReadStrong<core::SceneResourceId>(reader),
-      reader.U64()};
-  if (!result.valid()) {
-    Fail("decoded provider freshness result is invalid");
-  }
-  return result;
-}
-
 enum class RequestKind : std::uint8_t {
   kPrepare = 1U,
   kHealth = 2U,
@@ -1173,7 +1074,7 @@ enum class RequestKind : std::uint8_t {
   kRelease = 14U,
   kSceneFrame = 15U,
   kEffectivePolicy = 16U,
-  kProviderFreshness = 17U,
+  // 17 retired (provider freshness).
 };
 
 enum class ResponseKind : std::uint8_t {
@@ -1187,7 +1088,7 @@ enum class ResponseKind : std::uint8_t {
   kReleased = 14U,
   kSceneFrame = 15U,
   kEffectivePolicy = 16U,
-  kProviderFreshness = 17U,
+  // 17 retired (provider freshness).
 };
 
 } // namespace
@@ -1264,11 +1165,6 @@ EncodeNativeProjectionRpcRequest(const NativeProjectionRpcRequest &request) {
           writer.Byte(static_cast<std::uint8_t>(RequestKind::kSceneFrame));
           WriteBinding(writer, value.native_runtime_binding);
           WriteSceneFrameQuery(writer, value.query);
-        } else if constexpr (std::is_same_v<
-                                 T, NativeProjectionProviderFreshnessRequest>) {
-          writer.Byte(
-              static_cast<std::uint8_t>(RequestKind::kProviderFreshness));
-          WriteProviderFreshness(writer, value);
         } else {
           static_assert(
               std::is_same_v<T, NativeProjectionEffectivePolicyRequest>);
@@ -1327,8 +1223,6 @@ DecodeNativeProjectionRpcRequest(const std::string_view bytes) {
       return NativeProjectionEffectivePolicyRequest{
           ReadBinding(reader),
           scene::DecodeLogicalSceneSnapshot(reader.String()), reader.U64()};
-    case RequestKind::kProviderFreshness:
-      return ReadProviderFreshness(reader);
     }
     Fail("request kind is unknown");
   }();
@@ -1381,11 +1275,6 @@ EncodeNativeProjectionRpcResponse(const NativeProjectionRpcResponse &response) {
                                  T, core::SceneFrameResolutionReceiptDTO>) {
           writer.Byte(static_cast<std::uint8_t>(ResponseKind::kSceneFrame));
           WriteSceneFrameReceipt(writer, value);
-        } else if constexpr (std::is_same_v<
-                                 T, NativeProjectionProviderFreshnessResult>) {
-          writer.Byte(
-              static_cast<std::uint8_t>(ResponseKind::kProviderFreshness));
-          WriteProviderFreshnessResult(writer, value);
         } else {
           static_assert(std::is_same_v<T, core::CollisionPolicySnapshot>);
           writer.Byte(
@@ -1423,8 +1312,6 @@ DecodeNativeProjectionRpcResponse(const std::string_view bytes) {
       return ReadSceneFrameReceipt(reader);
     case ResponseKind::kEffectivePolicy:
       return ReadCollisionPolicy(reader);
-    case ResponseKind::kProviderFreshness:
-      return ReadProviderFreshnessResult(reader);
     }
     Fail("response kind is unknown");
   }();

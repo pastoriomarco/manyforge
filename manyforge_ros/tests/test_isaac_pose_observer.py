@@ -15,9 +15,11 @@ from manyforge_ros.isaac_pose_observer import (
     joint_state_observation_intent,
     load_isaac_pose_observer_site_config,
     manager_source_epoch_factory,
+    pose_source_stream_id,
     simulation_entity_observation_intent,
     unknown_observation_intent,
 )
+from manyforge_ros.component_stream_health import valid_stream_id
 from manyforge_ros.manager_scene_runtime import (
     PoseObservationIntent,
     PoseObservationResult,
@@ -695,3 +697,17 @@ def test_q94_identity_budget_does_not_narrow_unrelated_authored_text(
     _write_config(path, value)
     config = load_isaac_pose_observer_site_config(path)
     assert config.joint_state.required_joint_names == ("joint_" + "a" * 300,)
+
+
+def test_each_binding_has_its_own_valid_pose_stream(tmp_path: Path) -> None:
+    path = tmp_path / "site.json"
+    path.write_text(json.dumps(_config_value()), encoding="utf-8")
+    config = load_isaac_pose_observer_site_config(path)
+    streams = [pose_source_stream_id(binding) for binding in config.bindings]
+    # Object ids repeat across policies; the policy keeps the streams apart.
+    assert streams == [
+        f"poses/{binding.object_id}/{binding.policy_id}"
+        for binding in config.bindings
+    ]
+    assert len(set(streams)) == len(streams)
+    assert all(valid_stream_id(stream) for stream in streams)

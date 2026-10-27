@@ -126,8 +126,9 @@ struct ControllerLaunchArtifactsRequest final {
 };
 
 /// kSimulatedPlc: a ManyForge-owned simulated PLC process (sim-plc design);
-/// never produced by controller artifact generation.
-enum class ControllerLaunchLane { kMock, kIsaac, kSimulatedPlc };
+/// kPoseSource: the observer process of a `pose_source` component (CP9).
+/// Neither is produced by controller artifact generation.
+enum class ControllerLaunchLane { kMock, kIsaac, kSimulatedPlc, kPoseSource };
 
 /// One configuration-scoped stock writer. Its topic is never reused for a
 /// different provider, ordered joint set or Deployment initial target.

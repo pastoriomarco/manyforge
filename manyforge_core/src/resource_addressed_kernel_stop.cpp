@@ -1035,6 +1035,19 @@ Result<StopAcceptedDTO> ResourceAddressedExecutionKernel::accept_stop_locked(
                            StopGeneration(0U), malformed_ingress->attribution);
     full = &*malformed_full;
   }
+  // The Kernel resolves a Stop against its own current owner epoch. A stale
+  // request epoch survives only as the resolver's stale diagnostic; the
+  // accepted, replayed and journaled intent carries the current epoch.
+  std::optional<RequestOwnerEpoch> received_owner_epoch;
+  if (malformed_ingress == nullptr) {
+    auto& received = ordinary != nullptr
+                         ? std::get<StopIntentDTO>(projected_intent).request_context
+                         : std::get<FullStopIntentDTO>(projected_intent).request_context;
+    if (received.request_owner_epoch != config_.request_owner_epoch) {
+      received_owner_epoch =
+          std::exchange(received.request_owner_epoch, config_.request_owner_epoch);
+    }
+  }
   const auto& context = ordinary != nullptr ? ordinary->request_context : full->request_context;
   const bool runtime_collision_containment =
       ordinary != nullptr &&
@@ -1122,8 +1135,16 @@ Result<StopAcceptedDTO> ResourceAddressedExecutionKernel::accept_stop_locked(
     std::optional<StopIntentDTO> physical_intent;
     std::vector<StopScopeStaleDiagnosticDTO> alias_stale;
     bool has_motion_alias = false;
+    std::optional<FullStopIntentDTO> received_full;
+    if (full != nullptr && received_owner_epoch.has_value()) {
+      received_full = *full;
+      received_full->request_context.request_owner_epoch = *received_owner_epoch;
+    }
     if (ordinary) {
       physical_intent = *ordinary;
+      if (received_owner_epoch.has_value()) {
+        physical_intent->request_context.request_owner_epoch = *received_owner_epoch;
+      }
       if (auto* targets = std::get_if<std::vector<StopOperationTargetDTO>>(&physical_intent->selector)) {
         for (auto& target : *targets) {
           for (const auto& [id, owner] : active_operations_) {
@@ -1173,7 +1194,8 @@ Result<StopAcceptedDTO> ResourceAddressedExecutionKernel::accept_stop_locked(
       }
     }
     auto resolution = ordinary != nullptr ? resolve_stop_scope(*physical_intent, resolver_snapshot)
-                                          : resolve_full_stop_scope(*full, resolver_snapshot);
+                                          : resolve_full_stop_scope(received_full ? *received_full : *full,
+                                                                    resolver_snapshot);
     if (!resolution.ok()) {
       return Result<StopAcceptedDTO>::Err(resolution.error());
     }
@@ -1372,15 +1394,15 @@ Result<StopAcceptedDTO> ResourceAddressedExecutionKernel::accept_stop_locked(
                                             [&](const auto& row) {
                                               return row.participant_id == participant_id;
                                             });
+        // The earlier certificate's own row is the proof, whatever kind of
+        // Stop wrote it: this exact dispatched motion was physically
+        // contained and its participant settled. The one exception is an
+        // interrupt source lost under that Stop (the same fact that ended the
+        // participant Failed in ProgressStop): it is stopped physically again.
         if (entry == certificate.scope_entries.end() || state_row == operation->state.participants.end() ||
             !std::holds_alternative<StopParticipantScopeFactsDTO>(entry->facts) ||
-            !state_row->terminal_fact.has_value() ||
-            state_row->terminal_fact->effect != ParticipantEffectKnowledge::kEffectSettled ||
-            (state_row->terminal_fact->error.has_value() &&
-             !(certificate.result == StopCertificateResultDTO::kSucceededEscalated &&
-               participant.degraded_stop_terminal.has_value() &&
-               participant.degraded_stop_terminal->key == key &&
-               participant.degraded_stop_terminal->error == *state_row->terminal_fact->error)) ||
+            std::any_of(state_row->io_rule_outcomes.begin(), state_row->io_rule_outcomes.end(),
+                        [](const auto& outcome) { return !outcome.evidence.source_losses.empty(); }) ||
             std::find(certificate.unsettled.begin(), certificate.unsettled.end(), key) !=
                 certificate.unsettled.end() ||
             std::find(certificate.failed.begin(), certificate.failed.end(), key) !=
@@ -2300,12 +2322,6 @@ Result<StopAcceptedDTO> ResourceAddressedExecutionKernel::accept_stop_locked(
       // stage completion.
       next_stop_id_ = proposed_number + 1U;
       cell_stop_generation_ = std::max(cell_stop_generation_, outcome.stop_generation);
-      if (outcome.full_stop ||
-          accepted->resolution_disposition == StopResolutionDispositionDTO::kPromotedToFull) {
-        // Promotion/incident faults already made the restrictive assignment.
-        // A genuine FullStop alone closes motion while ordinary I/O survives.
-        motion_admission_closed_.close_for_stop();
-      }
     }
 
     if (outcome.replay_status == RequestReplayStatusDTO::kAcceptedNew &&
@@ -3536,6 +3552,13 @@ void ResourceAddressedExecutionKernel::ProgressStop(const StopControlWorkToken t
           ordinary_stop != nullptr &&
           ordinary_stop->reason == std::optional<std::string>{"runtime_collision_fault"} &&
           ordinary_stop->request_context.source_label == "kernel.runtime_collision";
+      // The Manager stopped a motion whose carried object was lost: a settled
+      // participant ends Failed with that typed cause, so the Program node
+      // fails through its normal failure handling.
+      const bool carried_object_lost_stop =
+          ordinary_stop != nullptr &&
+          ordinary_stop->reason == std::optional<std::string>{"carried_object_lost"} &&
+          ordinary_stop->request_context.source_label == "manager.carried_object_lost";
       const auto internal_stop = internal_stop_kind(ordinary_stop);
       // Neither a Reset nor a hold-timeout Stop is a degraded Stop.
       const bool internal_control_stop = internal_stop != InternalStopKind::kNone;
@@ -4185,7 +4208,8 @@ void ResourceAddressedExecutionKernel::ProgressStop(const StopControlWorkToken t
         participant_state->state =
             item.participant_failure_preserved ? OperationStateKind::kFailed :
             participant_settled && !runtime_collision_participant
-                ? (io_source_failed ? OperationStateKind::kFailed : OperationStateKind::kStopped)
+                ? (io_source_failed || carried_object_lost_stop ? OperationStateKind::kFailed
+                                                                : OperationStateKind::kStopped)
                 : OperationStateKind::kInterventionRequired;
         if (item.stop_path_collision.has_value()) {
           // The collision on the Stop path is the participant's cause.
@@ -4198,6 +4222,11 @@ void ResourceAddressedExecutionKernel::ProgressStop(const StopControlWorkToken t
           participant_state->terminal_error =
               error("interrupt_source_unavailable", "A required motion interrupt source failed",
                     "io_rule_required_source_lost");
+        } else if (carried_object_lost_stop && participant_settled &&
+                   !runtime_collision_participant) {
+          participant_state->terminal_error =
+              error("carried_object_lost", "The carried object was lost from its grasp",
+                    "carried_object_lost");
         } else if (runtime_collision_participant) {
           participant_state->terminal_error = active_participant->runtime_collision_error;
         } else if (runtime_collision_containment &&
@@ -4218,12 +4247,6 @@ void ResourceAddressedExecutionKernel::ProgressStop(const StopControlWorkToken t
               *item.escalation_cause, item.plan,
               containing != item.retained_results.rend() ? containing->result.request.stage_index
                                                          : item.plan.stage_commands.size());
-          active_participant->degraded_stop_terminal =
-              ActiveOperationParticipant::DegradedStopTerminal{
-                  StopScopeEntryKeyDTO{
-                      stop_id, stop_generation,
-                      StopParticipantScopeKeyDTO{item.operation_id, item.plan.participant_id}},
-                  *participant_state->terminal_error};
         }
         const bool all_participants_terminal =
             std::all_of(operation->state.participants.begin(), operation->state.participants.end(),
@@ -4571,8 +4594,9 @@ void ResourceAddressedExecutionKernel::ProgressStop(const StopControlWorkToken t
         }
       }
       if (!settled.ok()) {
+        // Operation-scoped: the participant ends InterventionRequired and
+        // its resources stay owned until Reset; the cell stays admissible.
         item->participant_settlement_error = settled.error();
-        motion_admission_closed_ = true;
       }
     }
     for (const auto& cancellation : prepared_cancellations) {

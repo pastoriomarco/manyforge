@@ -29,8 +29,10 @@ inline constexpr std::string_view kCanonicalEmptySceneStoreSchemaId =
     "manyforge.internal.logical-scene.i4.v2";
 inline constexpr std::int64_t kCanonicalEmptySceneStoreSchemaVersion = 2;
 inline constexpr std::string_view kLogicalSceneStoreSchemaId =
-    "manyforge.internal.logical-scene.ua7s.v9";
-inline constexpr std::int64_t kLogicalSceneStoreSchemaVersion = 9;
+    "manyforge.internal.logical-scene.r8f2.v10";
+/// v10: provider evidence holds provider identity only (see
+/// `ConvertProviderObservationEvidence`); no schema object changed.
+inline constexpr std::int64_t kLogicalSceneStoreSchemaVersion = 10;
 inline constexpr std::int64_t kCanonicalEmptySceneSqliteApplicationId =
     1296454467; // "MFSC"
 inline constexpr std::size_t kMaximumSceneStoreIdentifierBytes = 256U;
@@ -364,29 +366,6 @@ public:
   [[nodiscard]] manyforge::core::Result<manyforge::core::Pose3DTO>
   GetObjectPose(
       const manyforge::core::SceneResourceId &scene_resource_id) const override;
-  /// Confirms that a newer same-origin provider observation still matches an
-  /// unchanged, unattached, cell-fixed committed object. It writes no durable
-  /// row and leaves SceneRevision, the request epoch and the transaction cap
-  /// unchanged; on success it returns that unchanged projection revision.
-  ///
-  /// Precondition or projection-resolution failures record nothing. Once all
-  /// preconditions hold, the owner first raises the object's in-memory
-  /// provider-sequence watermark and stores the confirmation record, then
-  /// synchronously attempts ApplyProviderFreshness on every required native
-  /// projection. If any projection fails, the error lists the failed and
-  /// applied projections and nothing is rolled back: a replay of the same
-  /// sequence is rejected, applied projections stay fresh, projections that
-  /// definitely refused keep their older freshness and age out fail-closed,
-  /// and projections whose outcome is unknown (`projection_state_uncertain`
-  /// or a throwing call) are listed as uncertain: they may already publish
-  /// the confirmed freshness. The single exception
-  /// is when no projection applied and each failure was
-  /// `provider_freshness_unsupported`: the prior state is restored and that
-  /// code is returned so the caller can fall back to Commit.
-  [[nodiscard]] manyforge::core::Result<manyforge::core::ProjectionRevisionDTO>
-  ConfirmProviderFreshness(
-      const manyforge::core::ProviderFreshnessConfirmationDTO &confirmation)
-      override;
   /// Returns the current immutable logical-scene snapshot after bootstrap has
   /// established a real active projection. During maintenance initialization
   /// the snapshot remains immutable and admission stays closed until the

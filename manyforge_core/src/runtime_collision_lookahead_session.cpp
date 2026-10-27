@@ -83,9 +83,6 @@ const char* runtime_collision_lookahead_termination_name(
 }
 
 const char* runtime_collision_lookahead_error_message(std::string_view reason) noexcept {
-  if (reason == "stale_dynamic_collision_body") {
-    return "Scene pose evidence is stale or invalid; the bounded future could not be collision-checked";
-  }
   if (reason == "runtime_lookahead_deadline_exceeded") {
     return "Runtime trajectory lookahead missed its cycle deadline";
   }
@@ -429,32 +426,25 @@ RuntimeCollisionLookaheadSession::~RuntimeCollisionLookaheadSession() {
 
 RuntimeCollisionLookaheadSession::PreparedArm RuntimeCollisionLookaheadSession::prepare_arm(
     std::uint64_t execution_id, std::uint64_t execution_generation,
-    std::shared_ptr<const TrajectoryDTO> trajectory, std::string contact_policy_id,
-    std::optional<ProjectionRevisionDTO> admission_projection_revision) {
-  if (execution_id == 0 || !trajectory || trajectory->waypoints.empty() ||
-      (admission_projection_revision.has_value() && !admission_projection_revision->valid())) {
+    std::shared_ptr<const TrajectoryDTO> trajectory, std::string contact_policy_id) {
+  if (execution_id == 0 || !trajectory || trajectory->waypoints.empty()) {
     throw std::invalid_argument("runtime collision lookahead arm invalid");
   }
-  auto latest_projection_revision = admission_projection_revision;
   return PreparedArm{execution_id,
                      execution_generation,
                      std::move(trajectory),
                      std::move(contact_policy_id),
-                     std::move(admission_projection_revision),
-                     std::move(latest_projection_revision),
                      "lookahead_rearmed",
                      "lookahead_rearmed"};
 }
 
 void RuntimeCollisionLookaheadSession::arm(
     std::uint64_t execution_id, std::uint64_t execution_generation,
-    std::shared_ptr<const TrajectoryDTO> trajectory, std::string contact_policy_id,
-    std::optional<ProjectionRevisionDTO> admission_projection_revision) {
+    std::shared_ptr<const TrajectoryDTO> trajectory, std::string contact_policy_id) {
   if (execution_generation == 0)
     throw std::invalid_argument("runtime collision lookahead arm invalid");
   publish_prepared_arm(prepare_arm(execution_id, execution_generation, std::move(trajectory),
-                                   std::move(contact_policy_id),
-                                   std::move(admission_projection_revision)));
+                                   std::move(contact_policy_id)));
 }
 
 void RuntimeCollisionLookaheadSession::publish_prepared_arm(PreparedArm prepared) noexcept {
@@ -471,9 +461,7 @@ void RuntimeCollisionLookaheadSession::publish_prepared_arm(PreparedArm prepared
                   prepared.execution_generation,
                   next_arm_generation_++,
                   std::move(prepared.trajectory),
-                  std::move(prepared.contact_policy_id),
-                  std::move(prepared.admission_projection_revision),
-                  std::move(prepared.latest_projection_revision)};
+                  std::move(prepared.contact_policy_id)};
   pending_job_.reset();
   indexed_arm_generation_ = 0;
   // A stop/reset revocation can invalidate the permit generation without
@@ -544,14 +532,6 @@ void RuntimeCollisionLookaheadSession::request(
   pending.arm.execution_id = arm_.execution_id;
   pending.arm.execution_generation = arm_.execution_generation;
   pending.arm.arm_generation = arm_.arm_generation;
-  pending.arm.admission_projection_revision = arm_.admission_projection_revision;
-  pending.arm.latest_projection_revision = arm_.latest_projection_revision;
-  if (arm_.latest_projection_revision.has_value() && bundle->projection_revision.has_value() &&
-      ProjectionIsSameOrForwardInLineage(*bundle->projection_revision,
-                                               *arm_.latest_projection_revision)) {
-    arm_.latest_projection_revision = bundle->projection_revision;
-    pending.arm.latest_projection_revision = bundle->projection_revision;
-  }
   pending.requested_at_ns = requested_at_ns;
   pending.bundle = std::move(bundle);
   pending.contact_state = std::move(contact_state);
@@ -830,7 +810,6 @@ RuntimeCollisionLookaheadResult RuntimeCollisionLookaheadSession::run_job(const 
 
   result.checked_input_details["lookahead_bundle_present"] = job.bundle ? "true" : "false";
   if (job.bundle) {
-    result.checked_input_details["runtime_bundle_epoch"] = std::to_string(job.bundle->epoch);
     result.checked_input_details["lookahead_world_present"] = job.bundle->world ? "true" : "false";
     result.checked_input_details["lookahead_policy_present"] = job.bundle->policy ? "true" : "false";
     result.checked_input_details["lookahead_policy_index_present"] =
@@ -849,35 +828,7 @@ RuntimeCollisionLookaheadResult RuntimeCollisionLookaheadSession::run_job(const 
     result.reason = "runtime_lookahead_bundle_invalid";
     return finish(std::move(result));
   }
-  if (job.arm.admission_projection_revision.has_value()) {
-    const auto record_projection = [&](const std::string& prefix,
-                                       const std::optional<ProjectionRevisionDTO>& revision) {
-      result.checked_input_details[prefix + "present"] = revision ? "true" : "false";
-      if (!revision) {
-        return;
-      }
-      result.checked_input_details[prefix + "retained_bundle_id"] =
-          revision->retained_bundle_id.value();
-      result.checked_input_details[prefix + "graph_revision"] = revision->graph_revision.value();
-      result.checked_input_details[prefix + "scene_id"] = revision->scene_revision.scene_id.value();
-      result.checked_input_details[prefix + "scene_revision_id"] =
-          std::to_string(revision->scene_revision.revision_id);
-      result.checked_input_details[prefix + "scene_content_hash"] =
-          revision->scene_revision.content_hash.value();
-    };
-    record_projection("lookahead_admission_projection_", job.arm.admission_projection_revision);
-    record_projection("lookahead_latest_projection_", job.arm.latest_projection_revision);
-    record_projection("lookahead_observed_projection_", job.bundle->projection_revision);
-    if (!job.bundle->projection_revision.has_value() ||
-        !job.arm.latest_projection_revision.has_value() ||
-        !ProjectionIsSameOrForwardInLineage(*job.bundle->projection_revision,
-                                                  *job.arm.admission_projection_revision) ||
-        *job.bundle->projection_revision != *job.arm.latest_projection_revision) {
-      result.reason = "runtime_lookahead_projection_revision_mismatch";
-      return finish(std::move(result));
-    }
-    result.projection_revision = job.bundle->projection_revision;
-  }
+  result.projection_revision = job.bundle->projection_revision;
   const auto policy_bundle =
       job.contact_state.binding_owner ? job.contact_state.binding_owner : job.bundle;
   result.checked_input_details["lookahead_policy_binding_present"] =
@@ -892,15 +843,7 @@ RuntimeCollisionLookaheadResult RuntimeCollisionLookaheadSession::run_job(const 
     result.reason = "runtime_lookahead_policy_binding_unavailable";
     return finish(std::move(result));
   }
-  result.runtime_bundle_epoch = job.bundle->epoch;
   result.collision_world_revision = job.bundle->world->revision;
-  const auto freshness = check_runtime_dynamic_body_freshness(
-      *job.bundle->world, job.bundle->body_freshness, now_ns, config_.dynamic_body_max_age_cap_ns,
-      job.bundle->lookup_order_valid);
-  if (freshness.status != RuntimeDynamicBodyFreshnessStatus::kFresh) {
-    result.reason = runtime_dynamic_body_freshness_reason(freshness.status);
-    return finish(std::move(result));
-  }
 
   if (indexed_arm_generation_ != job.arm.arm_generation) {
     std::string index_error;
@@ -1073,24 +1016,11 @@ RuntimeCollisionLookaheadResult RuntimeCollisionLookaheadSession::run_job(const 
     result.reason = "runtime_lookahead_deadline_exceeded";
     return finish(std::move(result));
   }
-  if (!latest || latest->epoch != job.bundle->epoch || !latest->world ||
+  // A different handle is a newer publication; its world may have moved.
+  if (!latest || latest != job.bundle || !latest->world ||
       !revisions_equal(latest->world->revision, job.bundle->world->revision)) {
     result.status = RuntimeCollisionLookaheadResultStatus::kSupersededRevision;
     result.reason = "runtime_lookahead_revision_superseded";
-    return finish(std::move(result));
-  }
-  if (job.arm.admission_projection_revision.has_value() &&
-      (!latest->projection_revision.has_value() ||
-       latest->projection_revision != job.bundle->projection_revision)) {
-    result.status = RuntimeCollisionLookaheadResultStatus::kSupersededRevision;
-    result.reason = "runtime_lookahead_projection_revision_superseded";
-    return finish(std::move(result));
-  }
-  const auto completion_freshness = check_runtime_dynamic_body_freshness(
-      *job.bundle->world, job.bundle->body_freshness, clock_->now(),
-      config_.dynamic_body_max_age_cap_ns, job.bundle->lookup_order_valid);
-  if (completion_freshness.status != RuntimeDynamicBodyFreshnessStatus::kFresh) {
-    result.reason = runtime_dynamic_body_freshness_reason(completion_freshness.status);
     return finish(std::move(result));
   }
   result.status = RuntimeCollisionLookaheadResultStatus::kClear;

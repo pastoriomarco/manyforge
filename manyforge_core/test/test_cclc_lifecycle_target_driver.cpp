@@ -6,6 +6,7 @@
 #include <manyforge_content_identity/canonical_value.hpp>
 #include <manyforge_core/cclc_lifecycle_target_driver.hpp>
 #include <manyforge_core/cclc_open_request.hpp>
+#include <manyforge_core/component_stream_health.hpp>
 #include <manyforge_core/component_lifecycle_plan_catalog_codec.hpp>
 #include <manyforge_core/time/fake_clock.hpp>
 #include <manyforge_core/time/manual_scheduler.hpp>
@@ -3056,7 +3057,7 @@ TEST_F(LifecycleIncidentTest, IncidentDetectedOnFactsARecoverReplacedIsNotRecord
 TEST_F(LifecycleTargetDriverTest, WorkerWakesOnEventsAndFallsBackOnTheScheduler) {
   Target(LifecycleTargetStateDTO::kActive, LifecycleTargetOriginDTO::kStartup);
   ASSERT_TRUE(Driver().Start().ok());
-  // The initial pass runs on the worker and arms the ~1 s fallback.
+  // The initial pass runs on the worker; the waiting target arms the ~1 s re-check.
   for (int spin = 0; spin < 2000 && scheduler_.pending_count(SchedulerPriority::Lifecycle) == 0U;
        ++spin) {
     std::this_thread::yield();
@@ -3069,6 +3070,22 @@ TEST_F(LifecycleTargetDriverTest, WorkerWakesOnEventsAndFallsBackOnTheScheduler)
   }
   Driver().Stop();
   EXPECT_EQ(ports_.submitted.size(), 1U);
+}
+
+TEST_F(LifecycleTargetDriverTest, SettledCellArmsNoRecheckTimer) {
+  Target(LifecycleTargetStateDTO::kActive, LifecycleTargetOriginDTO::kStartup);
+  ports_.achieved = ComponentLifecycleStateDTO::kActive;
+  ports_.BecomeReady();
+  ASSERT_TRUE(Driver().Start().ok());
+  for (int spin = 0; spin < 2000000 && !store_.targets.at(kComponent).reached; ++spin) {
+    std::this_thread::yield();
+  }
+  ASSERT_TRUE(store_.targets.at(kComponent).reached);
+  // Let the worker finish the pass and decide its re-check.
+  for (int spin = 0; spin < 20000; ++spin) std::this_thread::yield();
+  // CP9: a satisfied cell is not polled; adapters push bad news.
+  EXPECT_EQ(scheduler_.pending_count(SchedulerPriority::Lifecycle), 0U);
+  Driver().Stop();
 }
 
 }  // namespace
@@ -3214,4 +3231,157 @@ TEST_F(LifecycleIncidentTest, ObserverIncidentBlocksTheGuardWithoutAComponentTar
   EXPECT_EQ(ports_.observations, 0U);
   EXPECT_TRUE(ports_.submitted.empty());
 }
+
+// CP9: pushed stream health reaches the driver per pass (no observation pull).
+class StreamHealthIncidentTest : public LifecycleIncidentTest {
+ protected:
+  static constexpr std::int64_t kMs = 1'000'000LL;
+  StreamHealthIncidentTest() {
+    CCLCLifecycleTargetDriverConfig config;
+    config.stream_health = health_;
+    driver_.emplace(config, store_, ports_, clock_, scheduler_);
+  }
+  std::unique_ptr<StreamRecorder> Declare(StreamSeverityDTO severity) {
+    auto declared = health_->Declare(
+        kComponent, {"measured_joints", 100 * kMs, severity, StreamRecoveryDTO::kAck,
+                     StreamTimestampSourceDTO::kMessageStamp});
+    EXPECT_TRUE(declared.ok());
+    return std::move(declared.value());
+  }
+  void Settle() { scheduler_.advance_to(clock_.now(), SchedulerPriority::Monitoring); }
+
+  std::shared_ptr<ComponentStreamHealth> health_ =
+      std::make_shared<ComponentStreamHealth>(clock_, scheduler_);
+};
+
+TEST_F(StreamHealthIncidentTest, FaultStreamLossAfterReachedIsProviderLostNamingTheStream) {
+  auto recorder = Declare(StreamSeverityDTO::kFault);
+  recorder->Record(1);
+  Settle();
+  ReachTarget();
+  clock_.advance(101 * kMs);
+  Settle();
+  ASSERT_TRUE(health_->Verdict(kComponent).fault_loss);
+  Driver().RunOnce();
+  Driver().RunOnce();
+  const auto progress = Progress();
+  ASSERT_TRUE(progress.incident.has_value());
+  EXPECT_EQ(progress.incident->cause_class, LifecycleBlockingCauseClassDTO::kProviderLost);
+  EXPECT_NE(progress.incident->summary.find("stream measured_joints is stale"), std::string::npos);
+  ASSERT_TRUE(progress.incident->diagnostic);
+  EXPECT_EQ(progress.incident->diagnostic->code, kComponentStreamStaleCode);
+  EXPECT_EQ(ports_.containments.size(), 1U);
+  ExpectNoMotionOrRecoverySubmitted();
+  // Fresh again: the incident stays until the operator's Recover.
+  recorder->Record(2);
+  Settle();
+  Driver().RunOnce();
+  EXPECT_TRUE(Progress().incident.has_value());
+  EXPECT_EQ(ports_.containments.size(), 1U);
+}
+
+TEST_F(StreamHealthIncidentTest, FaultStreamLossBeforeReachedIsWaitingAndKeepsTargetUnreached) {
+  auto recorder = Declare(StreamSeverityDTO::kFault);
+  clock_.advance(100 * kMs);
+  Settle();
+  ASSERT_TRUE(health_->Verdict(kComponent).fault_loss);
+  Target(LifecycleTargetStateDTO::kActive, LifecycleTargetOriginDTO::kStartup);
+  ports_.achieved = ComponentLifecycleStateDTO::kActive;
+  ports_.BecomeReady();
+  Driver().RunOnce();
+  EXPECT_EQ(Progress().phase, LifecycleProgressPhaseDTO::kSatisfied);
+  EXPECT_EQ(Progress().blocking_cause_class, LifecycleBlockingCauseClassDTO::kAvailability);
+  ASSERT_TRUE(Progress().blocking_reason);
+  EXPECT_NE(Progress().blocking_reason->find("measured_joints"), std::string::npos);
+  EXPECT_FALSE(Progress().incident.has_value());
+  EXPECT_FALSE(store_.targets.at(kComponent).reached);
+  EXPECT_TRUE(ports_.containments.empty());
+  // The first advancing sample lets the target be reached.
+  recorder->Record(1);
+  Settle();
+  Driver().RunOnce();
+  EXPECT_TRUE(store_.targets.at(kComponent).reached);
+  EXPECT_EQ(Progress().blocking_cause_class, LifecycleBlockingCauseClassDTO::kNone);
+}
+
+TEST_F(StreamHealthIncidentTest, BlockingAndWarningStreamsNeverOpenAnIncident) {
+  auto blocking = Declare(StreamSeverityDTO::kBlocking);
+  auto declared = health_->Declare(kComponent, {"sim_clock", 100 * kMs, StreamSeverityDTO::kWarning,
+                                                StreamRecoveryDTO::kAuto});
+  ASSERT_TRUE(declared.ok());
+  blocking->Record(1);
+  declared.value()->Record(1);
+  Settle();
+  ReachTarget();
+  clock_.advance(kSecond);
+  Settle();
+  EXPECT_TRUE(health_->Verdict(kComponent).motion_hold);
+  Driver().RunOnce();
+  EXPECT_FALSE(Progress().incident.has_value());
+  EXPECT_EQ(Progress().phase, LifecycleProgressPhaseDTO::kSatisfied);
+  EXPECT_TRUE(ports_.containments.empty());
+  const auto view = Driver().ReadTargetView(kComponent);
+  ASSERT_TRUE(view.ok());
+  ASSERT_EQ(view.value().stream_health.size(), 2U);
+  EXPECT_EQ(view.value().stream_health[0].stream_id, "measured_joints");
+  EXPECT_EQ(view.value().stream_health[0].state, StreamLivenessStateDTO::kStale);
+  EXPECT_EQ(view.value().stream_health[1].stream_id, "sim_clock");
+  EXPECT_EQ(view.value().stream_health[1].severity, StreamSeverityDTO::kWarning);
+}
+
+TEST_F(StreamHealthIncidentTest, RecoverWithoutIncidentClearsALatchedStreamAndSucceeds) {
+  auto declared = health_->Declare(kComponent, {"measured_joints", 100 * kMs,
+                                                StreamSeverityDTO::kBlocking,
+                                                StreamRecoveryDTO::kAck});
+  ASSERT_TRUE(declared.ok());
+  auto& recorder = *declared.value();
+  recorder.Record(1);
+  Settle();
+  ReachTarget();
+  clock_.advance(101 * kMs);
+  Settle();
+  recorder.Record(2);  // live again, but the `ack` latch holds
+  Settle();
+  ASSERT_TRUE(health_->Verdict(kComponent).motion_hold);
+  Driver().RunOnce();
+  ASSERT_FALSE(Progress().incident.has_value());
+  const auto recovered = Driver().RecoverIncident(OperatorRecover("operator.recover.latch"));
+  ASSERT_TRUE(recovered.ok()) << recovered.error().message;
+  ASSERT_TRUE(recovered.value().has_value());
+  const auto& result = *recovered.value();
+  EXPECT_TRUE(result.locally_valid());
+  ASSERT_TRUE(result.stream_acknowledgement.has_value());
+  EXPECT_EQ(result.stream_acknowledgement->controllable_component_id, kComponent);
+  EXPECT_FALSE(result.acceptance.has_value());
+  Settle();
+  EXPECT_FALSE(health_->Verdict(kComponent).motion_hold);
+  EXPECT_TRUE(ports_.submitted.empty() ||
+              ports_.submitted.back().intent != ComponentLifecycleIntentKindDTO::kRecover);
+  // Nothing latched any more: the next Recover goes to ordinary admission.
+  const auto again = Driver().RecoverIncident(OperatorRecover("operator.recover.again"));
+  ASSERT_TRUE(again.ok());
+  EXPECT_FALSE(again.value().has_value());
+}
+
+TEST_F(StreamHealthIncidentTest, FaultEventIsAnImmediateIncidentAcknowledgedByRecover) {
+  auto recorder = Declare(StreamSeverityDTO::kWarning);
+  recorder->Record(1);
+  Settle();
+  ReachTarget();
+  recorder->ReportFault("xarm_joint_value_invalid", "joint 3 reported exactly 0 rad");
+  Settle();
+  Driver().RunOnce();
+  Driver().RunOnce();
+  ASSERT_TRUE(Progress().incident.has_value());
+  EXPECT_EQ(Progress().incident->cause_class, LifecycleBlockingCauseClassDTO::kFault);
+  ASSERT_TRUE(Progress().incident->diagnostic);
+  EXPECT_EQ(Progress().incident->diagnostic->code, "xarm_joint_value_invalid");
+  EXPECT_NE(Progress().incident->summary.find("joint 3 reported exactly 0 rad"), std::string::npos);
+  EXPECT_EQ(ports_.containments.size(), 1U);
+  const auto recovered = Driver().RecoverIncident(OperatorRecover("operator.recover.stream"));
+  ASSERT_TRUE(recovered.ok()) << recovered.error().message;
+  Settle();
+  EXPECT_FALSE(health_->Verdict(kComponent).fault_event);
+}
+
 }  // namespace manyforge::core

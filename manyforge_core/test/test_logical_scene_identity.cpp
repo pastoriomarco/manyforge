@@ -106,10 +106,6 @@ LogicalSceneSnapshotDTO RichSnapshot() {
               ProviderManifestId("manifest-a"),
               ProviderManifestRevision(kDigestA),
               "epoch-a",
-              9U,
-              1000,
-              900,
-              5000,
           },
       },
       SceneObjectSnapshotDTO{
@@ -273,7 +269,7 @@ TEST(LogicalSceneIdentity, SceneHashCoversPortableContent) {
         .pose_in_cell.position_m.x_m += 0.01;
   });
   expect_changed([](auto& value) {
-    value.objects[0].provider_evidence->provider_source_sequence += 1U;
+    value.objects[0].provider_evidence->provider_source_epoch = "epoch-b";
   });
   expect_changed([](auto& value) {
     value.objects[1].support_contacts = {
@@ -305,9 +301,6 @@ TEST(LogicalSceneIdentity,
   auto& fixed =
       std::get<CellFixedSceneObjectPlacementDTO>(changed.placement);
   fixed.pose_in_cell.position_m.x_m += 0.5;
-  changed.provider_evidence->provider_source_sequence += 1U;
-  changed.provider_evidence->received_at_ns += 100;
-  changed.provider_evidence->source_timestamp_ns = 1234;
   EXPECT_EQ(ComputeSceneObjectCollisionIdentity(changed, snapshot.cell_id),
             identity);
 
@@ -368,14 +361,8 @@ TEST(LogicalSceneIdentity, RejectsStalePolicyAndAttachmentInconsistency) {
                LogicalSceneIdentityError);
 }
 
-TEST(LogicalSceneIdentity, RejectsUnsafeProviderIntegralAndNegativeZero) {
+TEST(LogicalSceneIdentity, RejectsNegativeZero) {
   auto snapshot = RichSnapshot();
-  snapshot.objects[0].provider_evidence->provider_source_sequence =
-      9007199254740992ULL;
-  EXPECT_THROW(ComputeLogicalSceneContentHash(snapshot),
-               LogicalSceneIdentityError);
-
-  snapshot = RichSnapshot();
   std::get<CellFixedSceneObjectPlacementDTO>(snapshot.objects[0].placement)
       .pose_in_cell.position_m.x_m = -0.0;
   EXPECT_THROW(ComputeLogicalSceneContentHash(snapshot),

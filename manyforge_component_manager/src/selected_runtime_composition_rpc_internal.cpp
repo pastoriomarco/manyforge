@@ -54,9 +54,6 @@ constexpr std::uint8_t kInstalledLifecycleRequestTail = 6U;
 constexpr std::string_view kInstalledLifecycleMagic =
     "MFNSRC4-INSTALLED-LIFECYCLE-V1";
 
-constexpr std::uint8_t kObserverRetirementTail = 3U;
-constexpr std::string_view kObserverRetirementMagic = "MFNSRC4-OBSERVER-RETIREMENT-V1";
-
 [[noreturn]] void Fail(const std::string &detail) {
   throw std::invalid_argument("selected-runtime composition RPC codec: " +
                               detail);
@@ -371,21 +368,6 @@ void WriteRequest(Writer &writer,
   WriteProjectionRevision(writer, request.predecessor_projection_revision);
 }
 
-// Optional facts extend only the whole ordinary packet tail. With no facts,
-// the request/result retain their exact existing MFNSRC4 bytes.
-void WriteObserverLaunchFacts(Writer &writer,
-    const std::optional<ManagerIsaacPoseObserverLaunchFactsDTO> &facts) {
-  if (facts) writer.String(EncodeManagerIsaacPoseObserverLaunchFacts(*facts));
-}
-
-[[nodiscard]] std::optional<ManagerIsaacPoseObserverLaunchFactsDTO>
-ReadObserverLaunchFacts(Reader &reader, const bool allow_retirement_tail = false) {
-  // A bounded string length starts with zero; the closed result marker cannot
-  // be confused with the existing canonical launch-facts string.
-  if (reader.AtEnd() || (allow_retirement_tail && reader.Peek() == kObserverRetirementTail)) return std::nullopt;
-  return DecodeManagerIsaacPoseObserverLaunchFacts(reader.String());
-}
-
 [[nodiscard]] ManagerSelectedRuntimeCompositionRequestDTO
 ReadRequest(Reader &reader) {
   return {
@@ -575,29 +557,6 @@ ReadInspectionRequest(Reader &reader) {
           ReadStrong<core::RuntimeUnitId>(reader),
           ReadStrong<core::RuntimeEpoch>(reader),
           ReadStrong<core::RuntimeEpoch>(reader)};
-}
-
-void WriteObserverRetirementTail(Writer &writer,
-    const std::optional<ManagerIsaacPoseObserverRetirementReceiptDTO> &receipt) {
-  if (!receipt) return;
-  writer.Byte(kObserverRetirementTail);
-  writer.String(kObserverRetirementMagic);
-  writer.String(EncodeManagerIsaacPoseObserverLaunchFacts(receipt->predecessor));
-  writer.U64(static_cast<std::uint64_t>(receipt->leader_pid));
-}
-
-[[nodiscard]] std::optional<ManagerIsaacPoseObserverRetirementReceiptDTO>
-ReadObserverRetirementTail(Reader &reader) {
-  if (reader.AtEnd()) return std::nullopt;
-  if (reader.Byte() != kObserverRetirementTail || reader.String() != kObserverRetirementMagic)
-    Fail("observer retirement extension is not a closed supported result value");
-  auto predecessor = DecodeManagerIsaacPoseObserverLaunchFacts(reader.String());
-  const auto pid = reader.U64();
-  if (pid > static_cast<std::uint64_t>(std::numeric_limits<std::int64_t>::max()))
-    Fail("observer retirement PID exceeds its signed value domain");
-  ManagerIsaacPoseObserverRetirementReceiptDTO receipt{std::move(predecessor), static_cast<std::int64_t>(pid)};
-  if (!receipt.valid()) Fail("observer retirement receipt is invalid");
-  return receipt;
 }
 
 void WriteInspectionPlanningRequestTail(Writer &writer,
@@ -842,71 +801,6 @@ ReadProcessObservations(Reader &reader) {
       });
 }
 
-void WriteCellObserverTail(Writer &writer,
-                          const ManagerCellObserverObservationDTO &observer) {
-  // Absence has no byte representation. The optional extension is one closed
-  // whole-packet tail, bounded by the existing Writer packet limit.
-  writer.Boolean(true);
-  WriteStrong(writer, observer.cell_id);
-  writer.String(observer.source_id);
-  writer.String(observer.source_epoch_base);
-  writer.Byte(static_cast<std::uint8_t>(observer.process_presence));
-  writer.Boolean(observer.exit.has_value());
-  if (observer.exit) {
-    const auto &exit = *observer.exit;
-    writer.U32(static_cast<std::uint32_t>(exit.pid));
-    writer.Boolean(exit.exit_status.has_value());
-    if (exit.exit_status) writer.Byte(*exit.exit_status);
-    writer.Boolean(exit.signal.has_value());
-    if (exit.signal) writer.Byte(*exit.signal);
-    writer.Boolean(exit.core_dumped);
-    writer.String(exit.observed_utc);
-    writer.U64(static_cast<std::uint64_t>(exit.detected_at_ns));
-  }
-  writer.Boolean(observer.incident_id.has_value());
-  if (observer.incident_id) writer.String(*observer.incident_id);
-  writer.Byte(static_cast<std::uint8_t>(observer.incident_persistence));
-}
-
-[[nodiscard]] std::optional<ManagerCellObserverObservationDTO>
-ReadCellObserverTail(Reader &reader) {
-  if (reader.AtEnd() || reader.Peek() == kInspectionPlanningTail ||
-      reader.Peek() == kPneumaticNoneOwnersTail) return std::nullopt;
-  if (!reader.Boolean()) Fail("observer extension must be present or omitted");
-  ManagerCellObserverObservationDTO observer{
-      ReadStrong<core::CellId>(reader), reader.String(), reader.String()};
-  const auto presence = reader.Byte();
-  if (presence > static_cast<std::uint8_t>(ProcessPresenceState::kPresent))
-    Fail("observer process presence is unknown");
-  observer.process_presence = static_cast<ProcessPresenceState>(presence);
-  if (reader.Boolean()) {
-    ManagerCellObserverExitDTO exit;
-    const auto pid = reader.U32();
-    if (pid > static_cast<std::uint32_t>(
-                  std::numeric_limits<std::int32_t>::max()))
-      Fail("observer PID exceeds its signed domain");
-    exit.pid = static_cast<std::int32_t>(pid);
-    if (reader.Boolean()) exit.exit_status = reader.Byte();
-    if (reader.Boolean()) exit.signal = reader.Byte();
-    exit.core_dumped = reader.Boolean();
-    exit.observed_utc = reader.String();
-    const auto detected_at_ns = reader.U64();
-    if (detected_at_ns > static_cast<std::uint64_t>(
-                             std::numeric_limits<std::int64_t>::max()))
-      Fail("observer detection time exceeds its nonnegative signed domain");
-    exit.detected_at_ns = static_cast<std::int64_t>(detected_at_ns);
-    observer.exit = std::move(exit);
-  }
-  if (reader.Boolean()) observer.incident_id = reader.String();
-  const auto persistence = reader.Byte();
-  if (persistence > static_cast<std::uint8_t>(
-                        ManagerCellObserverIncidentPersistenceDTO::kUnknown))
-    Fail("observer incident persistence is unknown");
-  observer.incident_persistence =
-      static_cast<ManagerCellObserverIncidentPersistenceDTO>(persistence);
-  return observer;
-}
-
 void WriteReceipts(Writer &writer,
                    const std::vector<ManagerRuntimeComponentReceiptDTO> &receipts) {
   WriteVector(writer, receipts, [](Writer &output, const auto &receipt) {
@@ -1006,7 +900,6 @@ std::string EncodeSelectedRuntimeCompositionRpcRequest(
   Writer writer(kRequestTag,
                 UsesProviderDomains(request.configuration_fence_scope));
   WriteRequest(writer, request);
-  WriteObserverLaunchFacts(writer, request.isaac_pose_observer_launch_facts);
   return std::move(writer).Finish();
 }
 
@@ -1017,7 +910,6 @@ DecodeSelectedRuntimeCompositionRpcRequest(const std::string_view bytes) {
     Fail("packet is not a request");
   }
   auto request = ReadRequest(reader);
-  request.isaac_pose_observer_launch_facts = ReadObserverLaunchFacts(reader);
   reader.Finish(UsesProviderDomains(request.configuration_fence_scope));
   if (!request.valid()) {
     Fail("decoded request is invalid");
@@ -1107,11 +999,8 @@ DecodeSelectedRuntimeCompositionRpcRequestVariant(
       return ReadProcessStopRequest(reader);
     if (tag == kProcessStopReadTag)
       return ManagerComponentProcessStopReadRequestDTO{ReadProcessStopRequest(reader)};
-    if (tag == kRequestTag) {
-      auto ordinary = ReadRequest(reader);
-      ordinary.isaac_pose_observer_launch_facts = ReadObserverLaunchFacts(reader);
-      return ordinary;
-    }
+    if (tag == kRequestTag)
+      return ReadRequest(reader);
     if (tag == kSelectedSubmitTag)
       return ReadSelectedRequest(reader);
     if (tag == kSelectedReadTag) {
@@ -1163,8 +1052,6 @@ std::string EncodeSelectedRuntimeCompositionRpcResponse(
               UsesProviderDomains(value.request.configuration_fence_scope));
           WriteRequest(writer, value.request);
           WriteReceipts(writer, value.component_receipts);
-          WriteObserverLaunchFacts(writer, value.request.isaac_pose_observer_launch_facts);
-          WriteObserverRetirementTail(writer, value.isaac_pose_observer_retirement_receipt);
           return std::move(writer).Finish();
         } else if constexpr (std::is_same_v<
                                  Value,
@@ -1197,8 +1084,6 @@ std::string EncodeSelectedRuntimeCompositionRpcResponse(
           Writer writer(kInspectionResultTag, UsesProviderPlanning(value));
           WriteInspectionRequest(writer, value.request);
           WriteProcessObservations(writer, value.configured_components);
-          if (value.cell_observer)
-            WriteCellObserverTail(writer, *value.cell_observer);
           WriteInspectionPlanningResultTail(writer, value);
           WriteInspectionNoneOwnersTail(writer, value.configured_components);
           return std::move(writer).Finish();
@@ -1330,7 +1215,7 @@ DecodeSelectedRuntimeCompositionRpcResponse(const std::string_view bytes) {
     auto request = ReadInspectionRequest(reader);
     auto observations = ReadProcessObservations(reader);
     ManagerComponentBringUpInspectionResultDTO result{
-        std::move(request), std::move(observations), ReadCellObserverTail(reader)};
+        std::move(request), std::move(observations)};
     ReadInspectionPlanningResultTail(reader, result);
     ReadInspectionNoneOwnersTail(reader, result.configured_components);
     reader.Finish(UsesProviderPlanning(result));
@@ -1344,13 +1229,12 @@ DecodeSelectedRuntimeCompositionRpcResponse(const std::string_view bytes) {
   }
   auto request = ReadRequest(reader);
   auto receipts = ReadReceipts(reader);
-  request.isaac_pose_observer_launch_facts = ReadObserverLaunchFacts(reader, true);
   ManagerSelectedRuntimeCompositionResultDTO result{
       std::move(request),
       tag == kPreparingTag
           ? ManagerSelectedRuntimeCompositionState::kPreparing
           : ManagerSelectedRuntimeCompositionState::kInstalled,
-      std::move(receipts), ReadObserverRetirementTail(reader)};
+      std::move(receipts)};
   reader.Finish(UsesProviderDomains(result.request.configuration_fence_scope));
   if (!result.valid()) {
     Fail("decoded result is invalid");

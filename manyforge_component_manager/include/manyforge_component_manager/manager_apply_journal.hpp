@@ -27,8 +27,8 @@
 namespace manyforge::component_manager {
 
 inline constexpr std::string_view kManagerApplyJournalSchemaId =
-    "manyforge.internal.component-manager.apply-journal.h1a.v18";
-inline constexpr std::int64_t kManagerApplyJournalSchemaVersion = 18;
+    "manyforge.internal.component-manager.apply-journal.h1a.v19";
+inline constexpr std::int64_t kManagerApplyJournalSchemaVersion = 19;
 inline constexpr std::int64_t kManagerApplyJournalSqliteApplicationId =
     1296450128;
 inline constexpr std::size_t kMaximumManagerApplyIntents = 256U;
@@ -148,8 +148,6 @@ struct ManagerApplyIntentDTO final {
       expected_admission_generation;
   std::optional<manyforge::core::CellAdmissionClaimDTO>
       parent_authoring_claim;
-  std::optional<ManagerIsaacPoseObserverLaunchFactsDTO>
-      isaac_pose_observer_launch_facts{};
   ManagerSceneInitialization scene_initialization{
       ManagerSceneInitialization::kPreserve};
 

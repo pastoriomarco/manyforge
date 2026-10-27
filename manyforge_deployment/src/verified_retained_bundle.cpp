@@ -1452,6 +1452,40 @@ verify_structural_applicability_projection(
   return verified;
 }
 
+// CP9 stream parameter overrides: the exact normalized, non-empty Deployment
+// table whose rows name retained controllable components.
+void verify_retained_component_streams(const CanonicalValue &value,
+                                       const core::CellGraphDTO &graph) {
+  std::vector<core::StreamParameterOverrideDTO> rows;
+  try {
+    rows = decode_component_stream_overrides(value);
+  } catch (const DeploymentApplicabilityCodecError &error) {
+    detail::fail_retained_bundle(
+        std::string("retained component_streams is invalid: ") +
+        error.what());
+  }
+  if (rows.empty()) {
+    detail::fail_retained_bundle(
+        "retained component_streams must be omitted when empty");
+  }
+  if (encode_component_stream_overrides(rows) != value) {
+    detail::fail_retained_bundle(
+        "retained component_streams differs from its normalized projection");
+  }
+  for (const auto &row : rows) {
+    if (std::none_of(graph.controllable_components.begin(),
+                     graph.controllable_components.end(),
+                     [&row](const auto &component) {
+                       return component.controllable_component_id ==
+                              row.controllable_component_id;
+                     })) {
+      detail::fail_retained_bundle(
+          "retained component_streams references an unknown controllable "
+          "component");
+    }
+  }
+}
+
 [[nodiscard]] core::RetainedBundleDTO
 verify_current_retained_bundle_projection(const CanonicalValue &root) {
   const auto &object = require_object(root, "retained_bundle");
@@ -1465,7 +1499,7 @@ verify_current_retained_bundle_projection(const CanonicalValue &root) {
       {"site_overlay_ref", "external_resources", "assistant",
        "motion_takeover_preparation_budget_s",
        "motion_takeover_planning_budget_s", "interrupt_policy_configuration",
-       "scene_pose_sources"},
+       "scene_pose_sources", "component_streams"},
       "retained_bundle");
   if (require_string(require_member(object, "api_version", "retained_bundle"),
                      "retained_bundle.api_version") !=
@@ -1589,6 +1623,9 @@ verify_current_retained_bundle_projection(const CanonicalValue &root) {
   const auto verified_graph = verify_structural_graph_projection(
       require_member(object, "cell_graph", "retained_bundle"),
       runtime_profiles);
+  if (const auto *streams = root.find_object_member("component_streams")) {
+    verify_retained_component_streams(*streams, verified_graph.graph());
+  }
   const auto applicability = verify_structural_applicability_projection(
       require_member(object, "desired_control_configurations",
                      "retained_bundle"),
@@ -2449,6 +2486,14 @@ bool verify_retained_bundle_identity(const RetainedBundle &bundle) {
   bundle.identity_verification_.store(verified ? kVerified : kRejected,
                                       std::memory_order_release);
   return verified;
+}
+
+std::vector<core::StreamParameterOverrideDTO>
+ComponentStreamParameterOverrides(const RetainedBundle &bundle) {
+  const auto *streams =
+      bundle.normalized_root().find_object_member("component_streams");
+  return streams == nullptr ? std::vector<core::StreamParameterOverrideDTO>{}
+                            : decode_component_stream_overrides(*streams);
 }
 
 std::shared_ptr<const RetainedBundle>

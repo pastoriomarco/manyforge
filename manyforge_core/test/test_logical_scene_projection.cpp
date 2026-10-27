@@ -135,11 +135,7 @@ TEST(LogicalSceneProjection, DistinguishesFreshnessFromTopology) {
       SceneObjectProviderEvidenceDTO{ProviderInstanceId("camera"),
                                      ProviderManifestId("camera-manifest"),
                                      ProviderManifestRevision(std::string(kZeroDigest)),
-                                     "camera-epoch",
-                                     7U,
-                                     100,
-                                     90,
-                                     1'000'000};
+                                     "camera-epoch"};
   SealSuccessor(freshness, 3U);
   const auto refreshed = ApplyResolvedSceneTransaction(
       current,

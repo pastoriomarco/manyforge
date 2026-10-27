@@ -11,7 +11,6 @@ namespace manyforge::core {
 
 struct PreparedExecutionStart {
   bool cache_hit = false;
-  bool cache_revalidation_candidate = false;
   bool cache_miss = false;
   bool cache_invalidated = false;
   std::string cache_invalidation_reason;

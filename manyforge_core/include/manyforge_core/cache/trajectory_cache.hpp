@@ -2,8 +2,6 @@
 
 #include <deque>
 #include <manyforge_core/cache/cache_policy.hpp>
-#include <manyforge_core/types/collision.hpp>
-#include <manyforge_core/types/projection_common.hpp>
 #include <manyforge_core/types/strong_id.hpp>
 #include <manyforge_core/types/trajectory_dto.hpp>
 #include <memory>
@@ -38,39 +36,9 @@ struct TrajectoryCacheKey final {
   friend bool operator==(const TrajectoryCacheKey&, const TrajectoryCacheKey&) = default;
 };
 
-/// Exact immutable evidence against which a trajectory was admitted.
-/// `ProjectionRevisionDTO` prevents a cache entry from silently crossing a
-/// retained bundle, graph, logical-scene lineage, or scene revision. The
-/// collision-world revision additionally identifies the concrete normalized
-/// geometry/policy publication used by authoritative validation.
-struct TrajectoryCacheRevisionEvidence final {
-  ProjectionRevisionDTO projection_revision;
-  CollisionWorldRevision collision_world_revision;
-
-  [[nodiscard]] bool valid() const noexcept {
-    return projection_revision.valid() && collision_world_revision.revision_id != 0U &&
-           !collision_world_revision.content_hash.empty();
-  }
-
-  friend bool operator==(const TrajectoryCacheRevisionEvidence& left,
-                         const TrajectoryCacheRevisionEvidence& right) {
-    return left.projection_revision == right.projection_revision &&
-           left.collision_world_revision.revision_id ==
-               right.collision_world_revision.revision_id &&
-           left.collision_world_revision.content_hash ==
-               right.collision_world_revision.content_hash;
-  }
-};
-
 enum class TrajectoryCacheLookupDisposition {
-  kHit,
-  /// Same canonical intent, but validated against an older authoritative
-  /// revision. The trajectory carries no authority until current validation
-  /// succeeds and atomically restamps it.
-  kRevalidationCandidate,
+  kFound,
   kMiss,
-  kAuthoritativeRevisionUnavailable,
-  kRevisionMismatch,
   kIntentMismatch,
 };
 
@@ -79,49 +47,36 @@ struct TrajectoryCacheLookupResult {
   std::optional<TrajectoryDTO> trajectory;
 };
 
-/// Trajectory cache indexed by the complete stable Program/move slot and
-/// admitted only when both the exact projection evidence and full canonical
-/// planner-intent identity match (spec 210 §3.10 and spec 230 §3.1).
+/// Trajectory cache indexed by the complete stable Program/move slot and the
+/// full canonical planner-intent identity (spec 210 §3.10 and spec 230 §3.1).
 /// One trajectory per exact slot. No LRU, no TTL.
 /// Thread-safe.
 ///
-/// Planner-intent mismatches remove the stale entry atomically. A strictly
-/// newer authoritative revision retains a same-intent entry as an immutable
-/// revalidation candidate; rollback and same-revision/hash conflicts evict.
+/// A stored trajectory carries no authority: the caller validates it against
+/// the latest scene and limits before use, exactly like a fresh plan, and
+/// re-plans when that fails. A planner-intent mismatch removes the entry
+/// atomically. Robot or model changes are covered by clearing the whole cache
+/// at every Apply.
 class TrajectoryCache {
  public:
   explicit TrajectoryCache(CacheConfig config = {});
 
-  /// Store a trajectory with the complete immutable projection evidence it
-  /// was validated against (overwrites the same exact slot). There is
-  /// deliberately no evidence-less overload.
-  void store(const TrajectoryCacheKey& key, TrajectoryDTO trajectory,
-             TrajectoryCacheRevisionEvidence evidence, std::string intent_identity);
+  /// Store a trajectory with the planner intent that produced it (overwrites
+  /// the same exact slot).
+  void store(const TrajectoryCacheKey& key, TrajectoryDTO trajectory, std::string intent_identity);
 
-  /// Whether an entry exists for an exact slot, regardless of revision. Existence
-  /// probe only (e.g. invalidate-if-present); never use to serve a hit.
+  /// Whether an entry exists for an exact slot. Existence probe only (e.g.
+  /// invalidate-if-present); never use to serve a trajectory.
   bool contains(const TrajectoryCacheKey& key) const;
 
-  /// Revision-UNCHECKED read for observability/debug surfaces only. The
-  /// returned trajectory may be stale relative to the live collision world;
-  /// planning/execution callers must use lookup_with_revision.
+  /// Unvalidated read for observability/debug surfaces only. Planning and
+  /// execution callers must use lookup and validate the result.
   std::optional<TrajectoryDTO> peek_unvalidated(const TrajectoryCacheKey& key) const;
 
-  /// Look up trajectory by move_id. Exact revision+intent returns kHit;
-  /// same-intent older revision returns kRevalidationCandidate; intent mismatch
-  /// is removed while holding the cache mutex.
-  ///
-  /// An expected revision with both `revision_id == 0` and an empty
-  /// `content_hash` is treated as "no authoritative revision available";
-  /// callers in that state MUST NOT serve a cache hit — this method
-  /// returns kAuthoritativeRevisionUnavailable regardless of the stored entry.
-  TrajectoryCacheLookupResult lookup_with_revision(
-      const TrajectoryCacheKey& key, const TrajectoryCacheRevisionEvidence& expected_evidence,
-      const std::string& expected_intent_identity);
-
-  /// Stored revision for an entry, when present. Returns std::nullopt if
-  /// the entry is missing or was stored without a revision tag.
-  std::optional<TrajectoryCacheRevisionEvidence> revision_of(const TrajectoryCacheKey& key) const;
+  /// Stored trajectory for an exact slot and intent. An intent mismatch is
+  /// removed while holding the cache mutex.
+  TrajectoryCacheLookupResult lookup(const TrajectoryCacheKey& key,
+                                     const std::string& expected_intent_identity);
 
   /// Invalidate one exact slot.
   void invalidate(const TrajectoryCacheKey& key);
@@ -142,8 +97,6 @@ class TrajectoryCache {
     /// mutex and copy the payload after releasing it, so the lock hold
     /// time is O(1) instead of O(waypoints).
     std::shared_ptr<const TrajectoryDTO> trajectory;
-    /// Projection evidence the trajectory was validated against.
-    TrajectoryCacheRevisionEvidence evidence;
     /// Canonical identity of the resolved motion, frames, tolerances, speed
     /// profile, and request-level dynamics limits that produced this trajectory.
     std::string intent_identity;

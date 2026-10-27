@@ -201,8 +201,7 @@ GeometricContactInputBinding geometric_contact_binding(
           std::move(engine),
           scheduler,
           view.runtime->collision_monitor_period_ns,
-          view.runtime->runtime_collision_immediate_query_budget_ns,
-          view.runtime->runtime_dynamic_body_max_age_cap_ns};
+          view.runtime->runtime_collision_immediate_query_budget_ns};
 }
 bool same_aliases(const std::vector<IoOutputAliasIdentity> &left,
                   const std::vector<IoOutputAliasIdentity> &right) {

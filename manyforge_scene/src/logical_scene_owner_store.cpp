@@ -28,6 +28,9 @@ constexpr std::string_view kLogicalSceneTransactionStoreSchemaId =
 constexpr std::string_view kMaintenanceInitializationSchemaId =
     "manyforge.internal.logical-scene.ua4.v8";
 
+constexpr std::string_view kInitialSceneBaselineSchemaId =
+    "manyforge.internal.logical-scene.ua7s.v9";
+
 constexpr std::string_view kBoundedHistoryStoreSchemaId =
     "manyforge.internal.logical-scene.ui6i.v7";
 
@@ -207,7 +210,7 @@ SchemaObjects BuildExpectedSchemaObjects(const std::int64_t schema_version) {
     if (schema_version >= kMaintenanceInitializationSchemaVersion) {
       Exec(database, detail::kEmbeddedMaintenanceInitializationMigration);
     }
-    if (schema_version >= kLogicalSceneStoreSchemaVersion) {
+    if (schema_version >= kInitialSceneBaselineSchemaVersion) {
       Exec(database, detail::kEmbeddedInitialSceneBaselineMigration);
     }
     auto objects = ReadSchemaObjects(database);
@@ -577,15 +580,20 @@ namespace manyforge::scene::logical_scene_owner_detail {
       throw LogicalSceneOwnerIntegrityError(
           "uncompacted logical-scene history carries a request epoch");
     }
-  } else if (state.compaction_generation >= kMaximumSafeIntegral ||
-             state.request_epoch_generation !=
-                 state.compaction_generation + 1U ||
-             *state.request_owner_epoch !=
-                 CompactedRequestOwnerEpoch(
-                     state.checkpoint_projection->scene_revision.scene_id,
-                     state.request_epoch_generation)) {
-    throw LogicalSceneOwnerIntegrityError(
-        "compacted logical-scene request epoch is not deterministic");
+  } else {
+    // Compaction keeps the epoch in force: the bootstrap epoch, or the last
+    // epoch rotated by a store compacted before compaction became transparent.
+    const auto &scene_id = state.checkpoint_projection->scene_revision.scene_id;
+    if (state.compaction_generation >= kMaximumSafeIntegral ||
+        state.request_epoch_generation < 2U ||
+        state.request_epoch_generation > state.compaction_generation + 1U ||
+        (*state.request_owner_epoch != RequestOwnerEpoch(scene_id.value()) &&
+         *state.request_owner_epoch !=
+             CompactedRequestOwnerEpoch(scene_id,
+                                        state.request_epoch_generation))) {
+      throw LogicalSceneOwnerIntegrityError(
+          "compacted logical-scene request epoch is not deterministic");
+    }
   }
   return state;
 }
@@ -1841,7 +1849,7 @@ ReadMaintenanceInitializations(sqlite3 *database,
     }
 
     if (ScalarInteger(database, "PRAGMA user_version") >=
-        kLogicalSceneStoreSchemaVersion) {
+        kInitialSceneBaselineSchemaVersion) {
       Statement baseline_request(
           database,
           "SELECT request_digest FROM logical_scene_initial_baseline_requests "
@@ -2426,8 +2434,9 @@ void ValidateInitialSceneBaselineMigrationMetadata(sqlite3 *database) {
       database,
       "SELECT schema_id,schema_version,migration_artifact_digest FROM "
       "logical_scene_initial_baseline_migrations WHERE singleton=1 LIMIT 2");
-  if (!statement.Step() || statement.Text(0) != kLogicalSceneStoreSchemaId ||
-      statement.Integer(1) != kLogicalSceneStoreSchemaVersion ||
+  if (!statement.Step() ||
+      statement.Text(0) != kInitialSceneBaselineSchemaId ||
+      statement.Integer(1) != kInitialSceneBaselineSchemaVersion ||
       statement.Text(2) != InitialSceneBaselineMigrationArtifactDigest() ||
       statement.Step()) {
     throw LogicalSceneOwnerIntegrityError(
@@ -2522,7 +2531,7 @@ void ValidateDatabase(
   ValidateMechanicalDatabaseIntegrity(database);
   if (ReadSchemaObjects(database) != ExpectedSchemaObjects()) {
     throw LogicalSceneOwnerIntegrityError(
-        "logical-scene schema differs from its exact v9 artifacts");
+        "logical-scene schema differs from its exact v10 artifacts");
   }
   ValidateMetadata(database, fixed_query, admission_digest);
   ValidateMigrationMetadata(database);
@@ -2582,6 +2591,170 @@ void ValidateMaintenanceDatabase(
   if (durable.finalization_receipt.has_value()) {
     static_cast<void>(ReadSceneTransactionStoreState(database, durable));
   }
+}
+
+void ValidateInitialSceneBaselineDatabase(
+    sqlite3 *database,
+    const ProjectionBootstrapPrerequisiteQueryDTO &fixed_query,
+    const ContentDigest &admission_digest) {
+  if (ScalarInteger(database, "PRAGMA application_id") !=
+          kCanonicalEmptySceneSqliteApplicationId ||
+      ScalarInteger(database, "PRAGMA user_version") !=
+          kInitialSceneBaselineSchemaVersion ||
+      ReadSchemaObjects(database) != ExpectedSchemaObjects()) {
+    throw LogicalSceneOwnerIntegrityError(
+        "logical-scene v9 schema is invalid");
+  }
+  ValidateMechanicalDatabaseIntegrity(database);
+  ValidateMetadata(database, fixed_query, admission_digest);
+  ValidateMigrationMetadata(database);
+  ValidateNativeHandoffMigrationMetadata(database);
+  ValidateBoundedHistoryMigrationMetadata(database);
+  ValidateMaintenanceInitializationMigrationMetadata(database);
+  ValidateInitialSceneBaselineMigrationMetadata(database);
+}
+
+// v9 provider evidence also carried the provider observation sequence, receive
+// time, source timestamp and freshness budget, and every stored content hash
+// and pose-update request digest covered them. Strip those fields from every
+// stored document, recompute the content hash of each changed snapshot and the
+// digest of each changed request, and rename every column value that names an
+// old hash or digest. The immutability triggers are dropped for this rewrite
+// and recreated verbatim, so the schema objects stay exactly the v9 ones.
+void ConvertProviderObservationEvidence(sqlite3 *database) {
+  std::vector<std::pair<std::string, std::string>> triggers;
+  {
+    Statement statement(
+        database, "SELECT name,sql FROM sqlite_master WHERE type='trigger'");
+    while (statement.Step()) {
+      triggers.emplace_back(statement.Text(0), statement.Text(1));
+    }
+  }
+  for (const auto &[name, sql] : triggers) {
+    Exec(database, "DROP TRIGGER " + name);
+  }
+
+  // Rewrites `column` of every row whose document carries retired fields.
+  const auto rewrite = [&](const std::string &table, const std::string &key,
+                           const std::string &column, const auto &convert) {
+    std::vector<std::pair<std::int64_t, std::string>> rows;
+    {
+      Statement select(database, "SELECT " + key + "," + column + " FROM " +
+                                     table + " WHERE " + column +
+                                     " IS NOT NULL");
+      while (select.Step()) {
+        rows.emplace_back(select.Integer(0), select.Text(1));
+      }
+    }
+    for (const auto &[row, document] : rows) {
+      const auto stripped =
+          logical_scene_codec_internal::StripRetiredProviderEvidenceFields(
+              document);
+      if (!stripped.has_value()) {
+        continue;
+      }
+      Statement update(database, "UPDATE " + table + " SET " + column +
+                                     "=? WHERE " + key + "=?");
+      update.Bind(1, convert(*stripped, row));
+      update.Bind(2, row);
+      if (update.Step()) {
+        throw LogicalSceneOwnerIntegrityError(
+            "provider evidence conversion update returned a row");
+      }
+    }
+  };
+  const auto unchanged = [](const std::string &document, std::int64_t) {
+    return document;
+  };
+
+  std::map<std::string, std::string> content_hashes;
+  const auto snapshot = [&](const std::string &document, std::int64_t) {
+    auto value = logical_scene_codec_internal::DecodeSnapshot(document, false);
+    auto content_hash =
+        core::logical_scene_identity::ComputeLogicalSceneContentHash(value);
+    content_hashes.insert_or_assign(value.revision.content_hash.value(),
+                                    content_hash.value());
+    value.revision.content_hash = std::move(content_hash);
+    return logical_scene_codec_internal::EncodeSnapshot(value);
+  };
+  rewrite("logical_scene_transaction_intents", "transaction_sequence",
+          "candidate_snapshot_json", snapshot);
+  rewrite("logical_scene_history_state", "singleton",
+          "checkpoint_snapshot_json", snapshot);
+  rewrite("logical_scene_maintenance_initialization_intents",
+          "initialization_sequence", "authoritative_snapshot_json", snapshot);
+  rewrite("logical_scene_initial_baseline_intents", "initialization_sequence",
+          "snapshot_json", snapshot);
+  rewrite("logical_scene_transaction_intents", "transaction_sequence",
+          "resolved_operation_json", unchanged);
+
+  std::map<std::string, std::string> request_digests;
+  const auto request = [&](const std::string &document,
+                           const std::int64_t sequence) {
+    Statement digest(database,
+                     "SELECT request_digest FROM "
+                     "logical_scene_transaction_intents WHERE "
+                     "transaction_sequence=?");
+    digest.Bind(1, sequence);
+    if (!digest.Step()) {
+      throw LogicalSceneOwnerIntegrityError(
+          "converted scene request has no stored digest");
+    }
+    const auto converted = manyforge::content_identity::sha256_digest(
+        logical_scene_codec_internal::EncodeRequestDigestInput(
+            logical_scene_codec_internal::DecodeRequest(document)));
+    request_digests.insert_or_assign(digest.Text(0), converted);
+    return document;
+  };
+  rewrite("logical_scene_transaction_intents", "transaction_sequence",
+          "request_json", request);
+
+  const auto rename = [&](const std::map<std::string, std::string> &values,
+                          const std::vector<std::pair<std::string_view,
+                                                      std::string_view>>
+                              &columns) {
+    for (const auto &[before, after] : values) {
+      for (const auto &[table, column] : columns) {
+        Statement update(database, "UPDATE " + std::string(table) + " SET " +
+                                       std::string(column) + "=? WHERE " +
+                                       std::string(column) + "=?");
+        update.Bind(1, after);
+        update.Bind(2, before);
+        if (update.Step()) {
+          throw LogicalSceneOwnerIntegrityError(
+              "provider evidence conversion rename returned a row");
+        }
+      }
+    }
+  };
+  rename(content_hashes,
+         {
+             {"logical_scene_transaction_intents", "prior_scene_content_hash"},
+             {"logical_scene_transaction_intents",
+              "proposed_scene_content_hash"},
+             {"logical_scene_projection_results",
+              "acknowledged_scene_content_hash"},
+             {"logical_scene_maintenance_initialization_intents",
+              "predecessor_scene_content_hash"},
+             {"logical_scene_maintenance_initialization_intents",
+              "target_scene_content_hash"},
+             {"logical_scene_migrated_structural_completions",
+              "target_scene_content_hash"},
+             {"logical_scene_history_state", "checkpoint_scene_content_hash"},
+             {"logical_scene_initial_baseline_intents",
+              "target_scene_content_hash"},
+         });
+  rename(request_digests,
+         {
+             {"logical_scene_transaction_intents", "request_digest"},
+             {"logical_scene_request_outcomes", "request_digest"},
+         });
+
+  for (const auto &trigger : triggers) {
+    Exec(database, trigger.second);
+  }
+  Exec(database, "PRAGMA user_version = " +
+                     std::to_string(kLogicalSceneStoreSchemaVersion));
 }
 
 void InsertMetadata(sqlite3 *database,
@@ -2695,8 +2868,8 @@ void InsertInitialSceneBaselineMigrationMetadata(sqlite3 *database) {
       "INSERT INTO logical_scene_initial_baseline_migrations("
       "singleton,schema_id,schema_version,migration_artifact_digest) "
       "VALUES(1,?,?,?)");
-  statement.Bind(1, kLogicalSceneStoreSchemaId);
-  statement.Bind(2, kLogicalSceneStoreSchemaVersion);
+  statement.Bind(1, kInitialSceneBaselineSchemaId);
+  statement.Bind(2, kInitialSceneBaselineSchemaVersion);
   statement.Bind(3, InitialSceneBaselineMigrationArtifactDigest());
   if (statement.Step()) {
     throw LogicalSceneOwnerIntegrityError(
@@ -3199,15 +3372,6 @@ FailedFinalizeResult(const ProjectionBootstrapFinalizeDTO &request,
 } // namespace manyforge::scene::logical_scene_owner_detail
 
 namespace manyforge::scene::logical_scene_owner_detail {
-
-[[nodiscard]] bool
-SameProviderOrigin(const core::SceneObjectProviderEvidenceDTO &left,
-                   const core::SceneObjectProviderEvidenceDTO &right) noexcept {
-  return left.provider_instance_id == right.provider_instance_id &&
-         left.provider_manifest_id == right.provider_manifest_id &&
-         left.provider_manifest_revision == right.provider_manifest_revision &&
-         left.provider_source_epoch == right.provider_source_epoch;
-}
 
 [[nodiscard]] const SceneObjectSnapshotDTO *
 FindSceneObject(const LogicalSceneSnapshotDTO &snapshot,

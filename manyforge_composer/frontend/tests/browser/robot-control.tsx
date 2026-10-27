@@ -197,9 +197,6 @@ const harness = {
   },
   refresh() { publish({ ...currentStatus, observedMotion: { ...currentStatus.observedMotion,
     sequence: currentStatus.observedMotion.sequence + 1 } }); },
-  sceneChanged() { publish({ ...currentStatus, sceneRevision: {
-    ...currentStatus.sceneRevision, revision_id: currentStatus.sceneRevision.revision_id + 1,
-  } }); },
   operation(id: string, state: OperationObservation['state'] = 'executing', error: string | null = null,
     target: 'motion' | 'gripper' = 'motion') {
     publish({ ...currentStatus, manualOperations: [{

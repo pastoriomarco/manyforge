@@ -207,6 +207,16 @@ TEST(ControllerLaunchCommand, IsaacCommandCarriesTheContractArguments) {
   for (const auto &argument : single.argv) {
     EXPECT_NE(argument.rfind("frame_prefix:=", 0), 0U) << argument;
   }
+  // The gripper target configuration's freshness reaches the gripper adapter
+  // as one host-owned argument; a changed value is another launch identity.
+  const auto with_gripper = isaac_controller_launch_command(
+      isaac_artifacts(root.path()), isaac_lane(), 0.75);
+  EXPECT_EQ(with_gripper.argv.back(), "gripper_state_freshness_timeout_s:=0.75");
+  EXPECT_NE(with_gripper.identity, single.identity);
+  EXPECT_NE(isaac_controller_launch_command(isaac_artifacts(root.path()),
+                                            isaac_lane(), 1.0)
+                .identity,
+            with_gripper.identity);
 }
 
 TEST(ControllerLaunchCommand,
@@ -458,17 +468,8 @@ void check_parent_death(const std::string &role, const std::string &selector,
     const std::filesystem::path root(root_value);
     const std::string host_role(::getenv("MANYFORGE_Q116_HOST_ROLE"));
     ControllerLaunchSupervisor supervisor;
-    std::shared_ptr<CellLaunchProcess> cell;
     int pid = -1;
-    if (host_role == "cell") {
-      const CellLaunchCommand command{
-          manyforge::core::CellId("q116_fixture"), CellLaunchRole::kPoseObserver,
-          std::nullopt,
-          {"ros2", "launch", "manyforge_ros_bringup", "mock_control.launch.py"},
-          "q116_cell_fixture"};
-      cell = supervisor.start_cell_process(command, root / "artifacts");
-      pid = cell->pid();
-    } else if (host_role == "sim_plc") {
+    if (host_role == "sim_plc") {
       const auto plan = plan_simulated_plc(
           "commanded_sim", "plc_io",
           {{"ros_bool", "/plc_io/ready", std::nullopt}}, root / "sim_plc");
@@ -639,7 +640,7 @@ TEST(ControllerLaunchSupervisor,
 }
 
 TEST(ControllerLaunchSupervisor, OtherLaunchRolesKeepParentDeathSigterm) {
-  for (const auto *role : {"other", "foreign_package", "mismatched_lane", "cell"}) {
+  for (const auto *role : {"other", "foreign_package", "mismatched_lane"}) {
     SCOPED_TRACE(role);
     check_parent_death(role, "ControllerLaunchSupervisor."
                              "OtherLaunchRolesKeepParentDeathSigterm",
@@ -1699,7 +1700,7 @@ TEST(ControllerLaunchSupervisor,
   EXPECT_FALSE(supervisor.retire_exact(replacement.process));
 }
 
-TEST(ControllerLaunchSupervisor, HostShutdownSignalsAllGroupsAndOwnsCellLease) {
+TEST(ControllerLaunchSupervisor, HostShutdownSignalsAllGroups) {
   FakeLaunch fake;
   ControllerLaunchSupervisor supervisor(10s);
   const auto probe = [&](const std::string &name) {
@@ -1721,38 +1722,20 @@ TEST(ControllerLaunchSupervisor, HostShutdownSignalsAllGroupsAndOwnsCellLease) {
   b.argv = probe("b");
   const auto first = supervisor.ensure(a, fake.root() / "a-artifacts");
   const auto second = supervisor.ensure(b, fake.root() / "b-artifacts");
-  auto cell = supervisor.start_cell_process(
-      CellLaunchCommand{manyforge::core::CellId("cell.shutdown"),
-                        CellLaunchRole::kPoseObserver,
-                        std::optional<std::string>("shutdown_pose_source"),
-                        probe("cell"), "cell.shutdown.barrier"},
-      fake.root() / "cell-artifacts");
   ASSERT_TRUE(fake.wait_for(fake.root() / "a.ready"));
   ASSERT_TRUE(fake.wait_for(fake.root() / "b.ready"));
-  ASSERT_TRUE(fake.wait_for(fake.root() / "cell.ready"));
-  const auto snapshot = supervisor.BeginHostShutdown({cell});
-  const int cell_pid = cell->pid();
-  cell.reset(); // the complete cut retains the actual cell occurrence
+  const auto snapshot = supervisor.BeginHostShutdown();
   EXPECT_TRUE(fake.wait_for(fake.root() / "a.int"));
   EXPECT_TRUE(fake.wait_for(fake.root() / "b.int"));
-  EXPECT_TRUE(fake.wait_for(fake.root() / "cell.int"));
   auto progress = supervisor.PollHostShutdown(snapshot);
-  EXPECT_EQ(progress.total, 3U);
-  EXPECT_EQ(progress.signalled, 3U);
-  EXPECT_EQ(progress.pending, 3U);
+  EXPECT_EQ(progress.total, 2U);
+  EXPECT_EQ(progress.signalled, 2U);
+  EXPECT_EQ(progress.pending, 2U);
   EXPECT_EQ(progress.escalated, 0U);
-  EXPECT_TRUE(alive(cell_pid));
+  EXPECT_TRUE(alive(first.process->pid()));
   EXPECT_THROW(static_cast<void>(
                    supervisor.ensure(a, fake.root() / "refused-artifacts")),
                ControllerLaunchProcessError);
-  EXPECT_THROW(
-      static_cast<void>(supervisor.start_cell_process(
-          CellLaunchCommand{manyforge::core::CellId("cell.shutdown"),
-                            CellLaunchRole::kPoseObserver,
-                            std::optional<std::string>("shutdown_pose_source"),
-                            probe("foreign"), "cell.shutdown.foreign"},
-          fake.root() / "refused-cell-artifacts")),
-      ControllerLaunchProcessError);
   {
     std::ofstream release(fake.root() / "release");
     release << "release";
@@ -1762,12 +1745,11 @@ TEST(ControllerLaunchSupervisor, HostShutdownSignalsAllGroupsAndOwnsCellLease) {
     progress = supervisor.PollHostShutdown(snapshot);
   }
   EXPECT_EQ(progress.pending, 0U);
-  EXPECT_EQ(progress.reaped, 3U);
-  EXPECT_EQ(progress.drained, 3U);
+  EXPECT_EQ(progress.reaped, 2U);
+  EXPECT_EQ(progress.drained, 2U);
   EXPECT_EQ(progress.unknown, 0U);
   EXPECT_FALSE(alive(first.process->pid()));
   EXPECT_FALSE(alive(second.process->pid()));
-  EXPECT_FALSE(alive(cell_pid));
 }
 
 TEST(ControllerLaunchSupervisor,
@@ -1792,7 +1774,7 @@ TEST(ControllerLaunchSupervisor,
   started.process->update_request_context("later-retain-context");
   ASSERT_TRUE(started.process->append_incident_correlation(
       "existing.later.incident", "later-retain-context", "later retain"));
-  const auto snapshot = supervisor.BeginHostShutdown({});
+  const auto snapshot = supervisor.BeginHostShutdown();
   auto progress = supervisor.PollHostShutdown(snapshot);
   for (int i = 0; i < 100 && progress.pending != 0U; ++i) {
     std::this_thread::sleep_for(10ms);
@@ -2372,222 +2354,6 @@ TEST(ControllerLaunchSupervisor,
   EXPECT_FALSE(supervisor.observe("ui6i_lite6").has_value());
   EXPECT_TRUE(alive(ur5e.process->pid()));
   EXPECT_TRUE(supervisor.observe("ui6i_ur5e")->running);
-}
-
-
-[[nodiscard]] CellLaunchCommand cell_command(
-    const CellLaunchRole role = CellLaunchRole::kPoseObserver) {
-  return {manyforge::core::CellId("cell_a"), role,
-          role == CellLaunchRole::kPoseObserver
-              ? std::optional<std::string>("configured_pose_source")
-              : std::nullopt,
-          {"ros2", "run", "manyforge_ros_bringup", "cell_process"},
-          "exact_cell_launch_identity"};
-}
-
-TEST(CellLaunchProcess, StartHeaderBoundsDisplayButRetainsFullLaunchIdentity) {
-  FakeLaunch fake;
-  ControllerLaunchSupervisor supervisor(100ms);
-  auto command = cell_command();
-  command.identity.clear();
-  for (int repeat = 0; repeat < 1000; ++repeat) command.identity += "Café\\\"\n";
-  const auto process = supervisor.start_cell_process(command, fake.root() / "cell.artifacts");
-  ASSERT_TRUE(fake.wait_for(fake.out(process->pid(), ".args")));
-  const auto tail = process->output_snapshot().tail;
-  EXPECT_NE(tail.find("[truncated]"), std::string::npos);
-  const auto field_begin = tail.find(" launch_identity=");
-  ASSERT_NE(field_begin, std::string::npos);
-  const auto value_begin = field_begin + std::string(" launch_identity=").size();
-  const auto value_end = tail.find('\n', value_begin);
-  ASSERT_NE(value_end, std::string::npos);
-  const auto rendered = tail.substr(value_begin, value_end - value_begin);
-  EXPECT_LE(rendered.size(), 4096U);
-  EXPECT_TRUE(rendered.ends_with("[truncated]\""));
-  std::istringstream quoted_field(rendered);
-  std::string decoded;
-  quoted_field >> std::quoted(decoded);
-  EXPECT_TRUE(quoted_field);
-  quoted_field >> std::ws;
-  EXPECT_TRUE(quoted_field.eof());
-  EXPECT_TRUE(decoded.ends_with("[truncated]"));
-
-  EXPECT_EQ(tail.find(command.identity), std::string::npos);
-  EXPECT_EQ(process->command().identity, command.identity);
-  process->stop(100ms);
-  const auto evidence = process->exit_evidence();
-  ASSERT_TRUE(evidence);
-  EXPECT_EQ(evidence->command.identity, command.identity);
-}
-
-TEST(CellLaunchProcess, BarrierExitEvidenceDistinguishesSuccessAndFailure) {
-  FakeLaunch fake;
-  ControllerLaunchSupervisor supervisor(100ms);
-  for (const int status : {0, 3}) {
-    ::setenv("FAKE_LAUNCH_EXIT", std::to_string(status).c_str(), 1);
-    const auto root = fake.root() / ("barrier-" + std::to_string(status));
-    const auto process = supervisor.start_cell_process(
-        cell_command(), root, "Apply parent=actual_request");
-    std::optional<CellLaunchExitEvidence> evidence;
-    for (int attempt = 0; attempt < 200 && !evidence; ++attempt) {
-      evidence = process->exit_evidence();
-      if (!evidence) std::this_thread::sleep_for(10ms);
-    }
-    ASSERT_TRUE(evidence.has_value());
-    EXPECT_EQ(evidence->exit_status, status);
-    EXPECT_FALSE(evidence->signal.has_value());
-    EXPECT_EQ(evidence->command.cell_id.value(), "cell_a");
-    EXPECT_EQ(evidence->command.role, CellLaunchRole::kPoseObserver);
-    EXPECT_EQ(evidence->command.observer_source_id, "configured_pose_source");
-    EXPECT_EQ(evidence->command.identity, "exact_cell_launch_identity");
-    EXPECT_EQ(evidence->request_context, "Apply parent=actual_request");
-    EXPECT_EQ(evidence->upstream_log_directory, root / "ros");
-    EXPECT_NE(process->output_snapshot().tail.find("manyforge_cell_launch_start"),
-              std::string::npos);
-    EXPECT_EQ(process->output_snapshot().tail.find(" component="),
-              std::string::npos);
-    EXPECT_FALSE(supervisor.observe("cell_a").has_value());
-    EXPECT_FALSE(supervisor.component_output_counters("cell_a").has_value());
-    process->stop(0ms);
-    EXPECT_FALSE(alive(process->pid()));
-    EXPECT_EQ(process->exit_evidence()->observed_utc, evidence->observed_utc);
-  }
-}
-
-TEST(CellLaunchProcess, CellObserverSurvivesComponentRemovalAndFreshAddition) {
-  FakeLaunch fake;
-  ControllerLaunchSupervisor supervisor(100ms);
-  const auto observer = supervisor.start_cell_process(
-      cell_command(CellLaunchRole::kPoseObserver), fake.root() / "observer");
-  ASSERT_TRUE(fake.wait_for(fake.out(observer->pid(), ".args")));
-  EXPECT_EQ(observer->command().observer_source_id, "configured_pose_source");
-  EXPECT_EQ(read_file(fake.out(observer->pid(), ".roslog")),
-            (fake.root() / "observer/ros").string());
-  const auto first = supervisor.ensure(
-      mock_controller_launch_command(mock_artifacts(fake.root())),
-      fake.root() / "first_component");
-  ASSERT_TRUE(supervisor.retire_exact(first.process));
-  EXPECT_TRUE(alive(observer->pid()));
-  supervisor.stop_all();
-  EXPECT_TRUE(alive(observer->pid()));
-  const auto next = supervisor.ensure(
-      mock_controller_launch_command(mock_artifacts(fake.root())),
-      fake.root() / "next_component");
-  ASSERT_TRUE(fake.wait_for(fake.out(next.process->pid(), ".args")));
-  observer->update_request_context("Apply parent=next_request");
-  EXPECT_TRUE(supervisor.retire_cell_process(observer));
-  EXPECT_TRUE(supervisor.retire_cell_process(observer)); // Exact positive receipt replays.
-  EXPECT_FALSE(alive(observer->pid()));
-  EXPECT_TRUE(alive(next.process->pid()));
-  EXPECT_TRUE(supervisor.observe("ui6i_lite6")->running);
-  const auto evidence = observer->exit_evidence();
-  ASSERT_TRUE(evidence.has_value());
-  EXPECT_EQ(evidence->request_context, "Apply parent=next_request");
-  EXPECT_EQ(evidence->command.observer_source_id, "configured_pose_source");
-}
-
-TEST(CellLaunchProcess, CachedExitNeverClaimsAnExternallyReapedLeader) {
-  FakeLaunch fake;
-  ControllerLaunchSupervisor supervisor(100ms);
-  const auto process = supervisor.start_cell_process(
-      cell_command(CellLaunchRole::kPoseObserver), fake.root() / "observer");
-  ASSERT_TRUE(fake.wait_for(fake.out(process->pid(), ".args")));
-  ASSERT_EQ(::kill(process->pid(), SIGKILL), 0);
-  std::optional<CellLaunchExitEvidence> evidence;
-  for (int attempt = 0; attempt < 200 && !evidence; ++attempt) {
-    evidence = process->exit_evidence();
-    if (!evidence) std::this_thread::sleep_for(10ms);
-  }
-  ASSERT_TRUE(evidence.has_value());
-  ASSERT_EQ(evidence->signal, SIGKILL);
-  ASSERT_EQ(::waitpid(process->pid(), nullptr, 0), process->pid());
-  EXPECT_FALSE(supervisor.retire_cell_process(process));
-  EXPECT_FALSE(supervisor.retire_cell_process(process));
-  // Keep the real earlier diagnostic, but never promote it to a reap receipt.
-  EXPECT_EQ(process->exit_evidence()->observed_utc, evidence->observed_utc);
-}
-
-TEST(CellLaunchProcess, GroupDrainRequiresTheActualOwnedRetirement) {
-  FakeLaunch fake;
-  ControllerLaunchSupervisor supervisor(100ms);
-  const auto owned =
-      supervisor.start_cell_process(cell_command(CellLaunchRole::kPoseObserver),
-                                    fake.root() / "owned-observer");
-  ASSERT_TRUE(fake.wait_for(fake.out(owned->pid(), ".args")));
-  EXPECT_FALSE(owned->group_drained());
-  ASSERT_TRUE(supervisor.retire_cell_process(owned));
-  EXPECT_TRUE(owned->group_drained());
-  EXPECT_TRUE(owned->group_drained());
-
-  const auto foreign_reap =
-      supervisor.start_cell_process(cell_command(CellLaunchRole::kPoseObserver),
-                                    fake.root() / "foreign-reap");
-  ASSERT_TRUE(fake.wait_for(fake.out(foreign_reap->pid(), ".args")));
-  ASSERT_EQ(::kill(foreign_reap->pid(), SIGKILL), 0);
-  ASSERT_EQ(::waitpid(foreign_reap->pid(), nullptr, 0), foreign_reap->pid());
-  EXPECT_FALSE(supervisor.retire_cell_process(foreign_reap));
-  EXPECT_FALSE(foreign_reap->group_drained());
-  EXPECT_TRUE(owned->group_drained());
-}
-
-TEST(CellLaunchProcess, InvalidTypedInputsAndLogRootRefuseBeforeSpawn) {
-  FakeLaunch fake;
-  ControllerLaunchSupervisor supervisor(100ms);
-  const auto root = fake.root() / "cell";
-  auto invalid = cell_command();
-  invalid = cell_command(CellLaunchRole::kPoseObserver);
-  invalid.observer_source_id.reset();
-  EXPECT_THROW((void)supervisor.start_cell_process(invalid, root),
-               ControllerLaunchProcessError);
-  invalid.observer_source_id = "";
-  EXPECT_THROW((void)supervisor.start_cell_process(invalid, root),
-               ControllerLaunchProcessError);
-  invalid = cell_command();
-  invalid.role = static_cast<CellLaunchRole>(42);
-  EXPECT_THROW((void)supervisor.start_cell_process(invalid, root),
-               ControllerLaunchProcessError);
-  invalid = cell_command();
-  invalid.argv.clear();
-  EXPECT_THROW((void)supervisor.start_cell_process(invalid, root),
-               ControllerLaunchProcessError);
-  invalid = cell_command();
-  invalid.identity.clear();
-  EXPECT_THROW((void)supervisor.start_cell_process(invalid, root),
-               ControllerLaunchProcessError);
-  EXPECT_THROW((void)supervisor.start_cell_process(cell_command(), {}),
-               ControllerLaunchProcessError);
-  EXPECT_THROW((void)supervisor.start_cell_process(cell_command(), "relative"),
-               ControllerLaunchProcessError);
-  EXPECT_FALSE(std::filesystem::exists(fake.root() / "out"));
-  EXPECT_FALSE(std::filesystem::exists(root));
-  EXPECT_FALSE(supervisor.observe("cell_a").has_value());
-}
-
-TEST(CellLaunchProcess, ZombieLeaderPinsGroupUntilExactCellStop) {
-  FakeLaunch fake;
-  ControllerLaunchSupervisor supervisor(100ms);
-  const auto process = supervisor.start_cell_process(
-      cell_command(CellLaunchRole::kPoseObserver), fake.root() / "observer");
-  ASSERT_TRUE(fake.wait_for(fake.out(process->pid(), ".args")));
-  GroupChild child(process->pid());
-  ASSERT_EQ(::kill(process->pid(), SIGKILL), 0);
-  std::optional<CellLaunchExitEvidence> evidence;
-  for (int attempt = 0; attempt < 200 && !evidence; ++attempt) {
-    evidence = process->exit_evidence();
-    if (!evidence) std::this_thread::sleep_for(10ms);
-  }
-  ASSERT_TRUE(evidence.has_value());
-  EXPECT_EQ(evidence->signal, SIGKILL);
-  EXPECT_FALSE(evidence->exit_status.has_value());
-  EXPECT_TRUE(child.running());
-  siginfo_t status{};
-  ASSERT_EQ(::waitid(P_PID, process->pid(), &status,
-                    WEXITED | WNOHANG | WNOWAIT), 0);
-  EXPECT_EQ(status.si_pid, process->pid());
-  process->stop(0ms);
-  EXPECT_TRUE(child.reap_killed());
-  EXPECT_FALSE(alive(process->pid()));
-  EXPECT_EQ(process->exit_evidence()->observed_utc, evidence->observed_utc);
-  process->stop(0ms);
 }
 
 } // namespace

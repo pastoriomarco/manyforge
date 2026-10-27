@@ -594,6 +594,14 @@ catalogs_projection(std::span<const core::CatalogRecordRefDTO> records,
           deployment.applicability_inputs().value().scene_pose_sources;
       !sources.empty())
     root.emplace_back("scene_pose_sources", EncodeScenePoseSources(sources));
+  // CP9 stream parameter overrides travel only from the revision-verified
+  // deployment projection; the normalized policies omit an empty table.
+  if (const auto &policies =
+          deployment.applicability_inputs().normalized_policies();
+      policies.has_value()) {
+    if (const auto *streams = policies->find_object_member("component_streams"))
+      root.emplace_back("component_streams", *streams);
+  }
   return CanonicalValue(std::move(root));
 }
 

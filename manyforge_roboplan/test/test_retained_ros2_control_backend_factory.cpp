@@ -249,7 +249,8 @@ deployment::ros2_control_execution_runtime_contract::Configuration::
            "attach",
            "tcp",
            {}},
-          core::GripperOutputMode::kCommanded};
+          core::GripperOutputMode::kCommanded,
+          0.75};
 }
 
 [[nodiscard]]
@@ -661,6 +662,7 @@ TEST(RetainedRos2ControlBackendFactoryTest,
     auto config = test_factory_config(true);
     config.measured_receiver_clock = clock;
     config.gripper.emplace();
+    config.gripper->state_freshness_timeout_s = 1.0;
     config.gripper->action_name =
         config.node_namespace + "/gripper_controller/gripper_cmd";
     config.gripper->group_id = "gripper";
@@ -837,6 +839,7 @@ struct InitialRosInstallationFixture final {
         std::make_unique<ros2_control_execution::Ros2GripperCommandBackend>(
             *resources, sink, clock, scheduler, true);
     ros2_control_execution::Ros2GripperActionConfig gripper_config;
+    gripper_config.state_freshness_timeout_s = 1.0;
     gripper_config.group_id = "gripper";
     gripper_config.joint_name = "gripper_joint";
     owned_gripper->configure_gripper_action(
@@ -996,6 +999,7 @@ TEST(RetainedRos2ControlBackendFactoryTest,
   config.arm.gripper_controller = RetainedRos2ControlArmController{
       config.node_namespace + "/controller_manager", "gripper_controller", "TestSystem"};
   ros2_control_execution::Ros2GripperActionConfig gripper;
+  gripper.state_freshness_timeout_s = 1.0;
   gripper.action_name = config.node_namespace + "/gripper_controller/gripper_cmd";
   gripper.group_id = "gripper";
   gripper.joint_name = "gripper_joint";
@@ -1727,6 +1731,10 @@ TEST(RetainedRos2ControlBackendFactoryTest,
   EXPECT_EQ(ur10e.arm.controller.hardware_component_name, "IsaacUR10eTopicBasedSystem");
   EXPECT_EQ(lite6.gripper->completion_policy, "output_delivery");
   EXPECT_EQ(ur10e.gripper->completion_policy, "position_reached");
+  // The feedback staleness threshold is the gripper row's data, not a code
+  // default.
+  EXPECT_DOUBLE_EQ(lite6.gripper->state_freshness_timeout_s, 0.75);
+  EXPECT_DOUBLE_EQ(ur10e.gripper->state_freshness_timeout_s, 0.75);
   // The offline mock lane is built by its own builder (phase 2b); an unknown
   // component has no profile at all.
   EXPECT_THROW(static_cast<void>(make_retained_isaac_ros2_control_backend_config(
@@ -1807,6 +1815,11 @@ TEST(RetainedRos2ControlBackendFactoryTest,
               kMeasuredJointStateAuthorityId);
     EXPECT_EQ(lane->measured_source_profile_id, kMeasuredJointStateProfileId);
   }
+  // CP9: a paused simulator is only shown (`warning` + `auto`).
+  EXPECT_EQ(isaac.arm.measured_joint_state_lane->stream_severity,
+            core::StreamSeverityDTO::kWarning);
+  EXPECT_EQ(isaac.arm.measured_joint_state_lane->stream_recovery,
+            core::StreamRecoveryDTO::kAuto);
   // The separate measured role never changes the execution/Stop authority.
   EXPECT_EQ(mock.participant.stop.trip_authority,
             core::StateAuthorityClass::kCommanded);

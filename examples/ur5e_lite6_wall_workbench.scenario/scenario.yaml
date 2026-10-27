@@ -8,12 +8,12 @@
   "description": "Editable development workbench for the UR5e + Lite6 wall cell. Started as a copy of the generated ur5e_lite6_wall_grouped qualification Scenario.",
   "members": {
     "assignment.yaml": "sha256:f44d0d3f0adf5a93854e73a414393a779a4a5704a910f29b2500a491cf3a3ebe",
-    "deployment.yaml": "sha256:c95037136eabbc315747163a9e68860c2d917aaf2d8b7565b256c86ab5aa0d4f",
+    "deployment.yaml": "sha256:42043c9ce79ca0c327b3c5cb093489943850497dee070002d30d617316a3fcf4",
     "program.yaml": "sha256:0cad1bbfc63730accd973fb479ec152f902a2519a9729e3a5e81828a9cfbb7d9"
   },
   "name": "ur5e_lite6_wall_workbench",
   "saved_status": {
-    "checked_content_digest": "sha256:d6b810e7a4196c082cc6a12a79d669e7eab405ddbcf0844b28139f1dcd310599",
+    "checked_content_digest": "sha256:1b1e6adf5cccf92bb7a885a3a55c6c3e0fff2396a844723d74cc3fac113fa4f4",
     "last_known_status": "unknown",
     "manyforge_version": "0.1.0"
   },

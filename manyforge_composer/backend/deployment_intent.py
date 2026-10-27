@@ -306,24 +306,29 @@ def _validate_controlled_stop(value: Any, label: str) -> dict[str, Any]:
 
 IO_DEVICE_PROFILE_ID = "io_device_v0"
 IO_PROVIDER_RUNTIME_KIND = "io_provider"
+POSE_SOURCE_PROFILE_ID = "pose_source_v0"
+POSE_SOURCE_RUNTIME_KIND = "pose_source"
+# Runtime kinds of model-free components (I/O device, pose source).
+MODEL_FREE_RUNTIME_KINDS = frozenset({IO_PROVIDER_RUNTIME_KIND, POSE_SOURCE_RUNTIME_KIND})
 
 
-def _is_io_provider_component(component: dict[str, Any]) -> bool:
+def _is_model_free_component(component: dict[str, Any]) -> bool:
     configuration = component.get("configuration")
     return (
         isinstance(configuration, dict)
-        and configuration.get("runtime_kind") == IO_PROVIDER_RUNTIME_KIND
+        and configuration.get("runtime_kind") in MODEL_FREE_RUNTIME_KINDS
     )
 
 
-def _validate_io_provider_component(
+def _validate_model_free_component(
     component: dict[str, Any], label: str
 ) -> dict[str, Any]:
-    """Validate a model-free I/O device envelope (runtime_kind io_provider).
+    """Validate a model-free component envelope (runtime_kind io_provider or
+    pose_source).
 
     It has no model source, root pose, frame prefix or Stop fields and empty
     target settings; its runtime configuration stays opaque here (the closed
-    io_provider execution schema owns it).
+    runtime-kind schema checked by the activation compiler owns it).
     """
 
     _require_exact_fields(
@@ -337,7 +342,7 @@ def _validate_io_provider_component(
         label=label,
     )
     if component["target_settings"] != {}:
-        _fail(f"{label}.target_settings must be empty for an I/O device")
+        _fail(f"{label}.target_settings must be empty for a model-free component")
     return {
         "component_id": _require_id(component["component_id"], f"{label}.component_id"),
         "component_profile_id": _require_id(
@@ -393,8 +398,8 @@ def validate_deployment_intent(value: Any, *, source: str) -> dict[str, Any]:
     for index, raw_component in enumerate(components):
         label = f"{source}: components[{index}]"
         component = _require_object(raw_component, label)
-        if _is_io_provider_component(component):
-            normalized = _validate_io_provider_component(component, label)
+        if _is_model_free_component(component):
+            normalized = _validate_model_free_component(component, label)
             if normalized["component_id"] in component_ids:
                 _fail(f"{source}: duplicate component_id {normalized['component_id']!r}")
             component_ids.add(normalized["component_id"])
@@ -506,7 +511,7 @@ def iter_source_references(
     normalized = validate_deployment_intent(intent, source="<Deployment intent>")
     for component_index, component in enumerate(normalized["components"]):
         if "model_source" not in component:
-            continue  # A model-free I/O device references no source.
+            continue  # A model-free component references no source.
         base: tuple[str | int, ...] = (
             "components",
             component_index,

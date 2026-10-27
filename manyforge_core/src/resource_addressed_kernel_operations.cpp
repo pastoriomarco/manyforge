@@ -584,9 +584,7 @@ Result<OperationAcceptedDTO> ResourceAddressedExecutionKernel::execute(
     // A retained receipt is observation of the original decision, not fresh
     // motion admission. Keep it readable while Stop/fault fences reject every
     // request absent from the replay ledger.
-    if (motion_admission_closed_.restrictive() ||
-        (motion_admission_closed_ && std::any_of(intent.participants.begin(), intent.participants.end(),
-            [](const auto& row) { return std::holds_alternative<MotionParticipantIntentDTO>(row.payload); }))) {
+    if (motion_admission_closed_) {
       return reject<OperationAcceptedDTO>(
           "new motion admission is closed by an active emergency Stop or fault",
           "motion_admission_closed", ErrorCode::kInvalidStateTransition);
@@ -654,10 +652,7 @@ Result<OperationAcceptedDTO> ResourceAddressedExecutionKernel::execute(
   auto resolved = resolve_registration(intent, 0U);
   {
     std::lock_guard state_lock(state_mutex_);
-    if (motion_admission_closed_ &&
-        (motion_admission_closed_.restrictive() || !resolved.ok() ||
-         !std::holds_alternative<CapabilityCommandIntentDTO>(intent.participants.front().payload) ||
-         !non_motion_registration(resolved.value())))
+    if (motion_admission_closed_)
       return reject<OperationAcceptedDTO>(
           "new motion admission is closed by an active emergency Stop or fault",
           "motion_admission_closed", ErrorCode::kInvalidStateTransition);
@@ -839,8 +834,7 @@ Result<OperationAcceptedDTO> ResourceAddressedExecutionKernel::execute(
                         parent->claim_generation != manual_handover->capture.claim_generation)
                       return reject<void>("manual parent changed", "manual_handover_scope_stale");
                     std::lock_guard state_lock(state_mutex_);
-                    return validate_manual_program_handover_locked(*manual_handover,
-                                                                   &resolved.value());
+                    return validate_manual_program_handover_locked(*manual_handover);
                   })
             : cell_admission_owner_->AcquireCellAdmissionClaim(claim_intent);
     if (!claim.ok()) return Result<OperationAcceptedDTO>::Err(claim.error());
@@ -1143,9 +1137,7 @@ Result<OperationAcceptedDTO> ResourceAddressedExecutionKernel::execute(
     if (auto refusal = component_command_refusal_locked(resolved.value())) {
       return Result<OperationAcceptedDTO>::Err(std::move(*refusal));
     }
-    if (motion_admission_closed_.restrictive() ||
-        (motion_admission_closed_ &&
-         !prepared_operation.mapped()->participants.front().non_motion_transaction())) {
+    if (motion_admission_closed_) {
       return reject<OperationAcceptedDTO>(
           "new motion admission closed while the operation was being prepared",
           "motion_admission_closed", ErrorCode::kInvalidStateTransition);
@@ -1164,7 +1156,7 @@ Result<OperationAcceptedDTO> ResourceAddressedExecutionKernel::execute(
     }
     if (manual_handover) {
       const auto current_hold =
-          validate_manual_program_handover_locked(*manual_handover, &resolved.value());
+          validate_manual_program_handover_locked(*manual_handover);
       if (!current_hold.ok()) return Result<OperationAcceptedDTO>::Err(current_hold.error());
     }
     if (emergency_stop_reserve_.find(intent.request_context.request_id.value()).has_value()) {
@@ -1570,10 +1562,7 @@ ResourceAddressedExecutionKernel::execute_coordinated_motion_after_preflight(
     auto resolved = resolve_registration(intent, index);
     {
       std::lock_guard state_lock(state_mutex_);
-      if (motion_admission_closed_ && (motion_admission_closed_.restrictive() || !resolved.ok() ||
-                                       !std::holds_alternative<CapabilityCommandIntentDTO>(
-                                           intent.participants[index].payload) ||
-                                       !non_motion_registration(resolved.value())))
+      if (motion_admission_closed_)
         return reject<OperationAcceptedDTO>(
             "new motion admission is closed by an active emergency Stop or fault",
             "motion_admission_closed", ErrorCode::kInvalidStateTransition);
@@ -1936,11 +1925,7 @@ ResourceAddressedExecutionKernel::execute_coordinated_motion_after_preflight(
         return Result<OperationAcceptedDTO>::Err(std::move(*refusal));
       }
     }
-    if (motion_admission_closed_.restrictive() ||
-        (motion_admission_closed_ &&
-         !std::all_of(prepared_operation.mapped()->participants.begin(),
-                      prepared_operation.mapped()->participants.end(),
-                      [](const auto& row) { return row.non_motion_transaction(); }))) {
+    if (motion_admission_closed_) {
       return reject<OperationAcceptedDTO>(
           "new motion admission closed while the operation was being prepared",
           "motion_admission_closed", ErrorCode::kInvalidStateTransition);
@@ -3411,11 +3396,10 @@ ResourceAddressedExecutionKernel::get_manual_control_availability(
   for (const auto& resource : binding.resources) resources.push_back(resource.resource_id);
   std::sort(resources.begin(), resources.end());
   std::lock_guard state_lock(state_mutex_);
-  if (motion_admission_closed_.restrictive() ||
-      (motion_admission_closed_ && !non_motion_registration(found.value())) || motion_admission_unreconciled_)
+  if (motion_admission_closed_ || motion_admission_unreconciled_)
     return unavailable({"motion_admission_closed", "motion admission is closed", {}});
   if (handover) {
-    const auto held = validate_manual_program_handover_locked(*handover, &found.value());
+    const auto held = validate_manual_program_handover_locked(*handover);
     if (!held.ok()) return unavailable(held.error());
   } else if (program_cycle_claim_run_) {
     return unavailable({"manual_handover_scope_stale", "a Program acquired the target", {}});
@@ -3479,8 +3463,7 @@ ResourceAddressedExecutionKernel::resolve_manual_program_handover(
   std::optional<ResolvedManualProgramHandover> captured;
   {
     std::lock_guard lock(state_mutex_);
-    if (motion_admission_closed_.restrictive() ||
-        (motion_admission_closed_ && !non_motion_registration(registration)) || motion_admission_unreconciled_) {
+    if (motion_admission_closed_ || motion_admission_unreconciled_) {
       return reject<std::optional<ResolvedManualProgramHandover>>(
           "motion admission is closed or unreconciled", "motion_admission_closed");
     }
@@ -3546,21 +3529,18 @@ ResourceAddressedExecutionKernel::resolve_manual_program_handover(
 
   {
     std::lock_guard lock(state_mutex_);
-    const auto valid_hold = validate_manual_program_handover_locked(result, &registration);
+    const auto valid_hold = validate_manual_program_handover_locked(result);
     if (!valid_hold.ok()) return Reply::Err(valid_hold.error());
   }
   return Reply::Ok(std::move(result));
 }
 
 Result<void> ResourceAddressedExecutionKernel::validate_manual_program_handover_locked(
-    const ResolvedManualProgramHandover& result,
-    const RuntimeParticipantExecutionRegistration* manual_registration) const {
+    const ResolvedManualProgramHandover& result) const {
   const auto fence = std::find_if(
       program_run_stop_fences_.begin(), program_run_stop_fences_.end(),
       [&](const auto& item) { return item.program_run_id == result.capture.program_run_id; });
-  if (motion_admission_closed_.restrictive() ||
-      (motion_admission_closed_ && (!manual_registration || !non_motion_registration(*manual_registration))) ||
-      motion_admission_unreconciled_ || !program_cycle_claim_run_ ||
+  if (motion_admission_closed_ || motion_admission_unreconciled_ || !program_cycle_claim_run_ ||
       program_cycle_claim_run_->claim_generation != result.capture.claim_generation ||
       !program_cycle_claim_run_->capture ||
       program_cycle_claim_run_->capture->table != result.capture.table ||
@@ -3780,21 +3760,7 @@ Result<void> ResourceAddressedExecutionKernel::register_program_run_capture(
 Result<void> ResourceAddressedExecutionKernel::validate_program_node_claim(
     const ProgramNodeAdmissionEvidenceDTO& evidence) const {
   std::lock_guard state_lock(state_mutex_);
-  bool source_non_motion = false;
-  if (motion_admission_closed_ && !motion_admission_closed_.restrictive() &&
-      program_cycle_claim_run_ && program_cycle_claim_run_->capture &&
-      program_cycle_claim_run_->capture->table &&
-      program_cycle_claim_run_->program_run_id == evidence.program_run_id) {
-    const auto& captured = program_cycle_claim_run_->capture->table->nodes;
-    const auto candidate = std::lower_bound(captured.begin(), captured.end(), evidence.node_instance_id,
-        [](const auto& row, const auto& id) { return row.instance_id.value() < id; });
-    if (candidate != captured.end() && candidate->instance_id.value() == evidence.node_instance_id &&
-        candidate->owner_api == evidence.owner_api)
-      source_non_motion = program_node_non_motion_locked(evidence.program_run_id,
-          static_cast<std::size_t>(candidate - captured.begin()));
-  }
-  if (motion_admission_closed_.restrictive() ||
-      (motion_admission_closed_ && !source_non_motion) || motion_admission_unreconciled_ ||
+  if (motion_admission_closed_ || motion_admission_unreconciled_ ||
       !program_cycle_claim_run_.has_value() || !program_cycle_claim_run_->capture.has_value() ||
       program_cycle_claim_run_->program_run_id != evidence.program_run_id ||
       program_cycle_claim_run_->program_runner_owner_epoch != evidence.program_runner_owner_epoch ||

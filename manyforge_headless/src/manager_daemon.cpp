@@ -10,7 +10,6 @@
 
 #include <manyforge_component_manager/canonical_empty_bootstrap_coordinator.hpp>
 #include <manyforge_component_manager/durable_store_set.hpp>
-#include <manyforge_component_manager/isaac_site_settings.hpp>
 #include <manyforge_component_manager/manager_active_runtime_coordinator.hpp>
 #include <manyforge_component_manager/manager_liveness_transport.hpp>
 #include <manyforge_component_manager/manager_named_apply_coordinator.hpp>
@@ -33,6 +32,7 @@
 #include <manyforge_scene/logical_scene_owner.hpp>
 #include <manyforge_scene/logical_scene_value_codec.hpp>
 #include <manyforge_scene/scene_transaction_codec.hpp>
+#include <manyforge_core/types/carried_object_lost.hpp>
 
 #include <fcntl.h>
 #include <poll.h>
@@ -102,6 +102,7 @@ constexpr std::string_view kProgramRunnerLocalSafeStateContractId =
     "manyforge.program-runner.manager-loss-containment.v1";
 constexpr std::string_view kProgramRunnerLocalSafeStateContractRevision = "1";
 constexpr std::size_t kMaximumProgramRunnerLivenessPacketBytes = 16U * 1024U;
+constexpr std::size_t kMaximumKernelStopResponseBytes = 1024U * 1024U;
 constexpr std::size_t kMaximumCommandBytes =
     2U * scene::kMaximumLogicalSceneTransactionBytes + 8U * 1024U;
 constexpr std::size_t kMaximumResponseBytes =
@@ -411,37 +412,8 @@ struct DaemonConfig final {
   /// Optional approved root for relative Program scene meshes. The native
   /// runtime adapter opens it once; empty means relative meshes fail closed.
   std::filesystem::path scene_asset_root;
-  std::optional<std::filesystem::path> isaac_site_settings_path;
-  std::optional<std::filesystem::path> isaac_pose_observer_executable;
   std::chrono::milliseconds reconciliation_period{500};
 };
-
-struct LoadedIsaacSiteSettings final {
-  std::string document;
-  component_manager::IsaacSiteSettings value;
-};
-
-[[nodiscard]] std::optional<LoadedIsaacSiteSettings>
-LoadIsaacSiteSettings(const std::optional<std::filesystem::path> &path) {
-  if (!path.has_value()) return std::nullopt;
-  FileDescriptor file(::open(path->c_str(), O_RDONLY | O_CLOEXEC | O_NONBLOCK));
-  if (file.get() < 0) FailErrno("open Isaac site settings " + path->string());
-  struct stat status {};
-  if (::fstat(file.get(), &status) != 0)
-    FailErrno("inspect Isaac site settings " + path->string());
-  Require(S_ISREG(status.st_mode), "Isaac site settings must be a regular file: " + path->string());
-  std::string document;
-  std::array<char, 4096U> buffer{};
-  while (true) {
-    const auto count = ::read(file.get(), buffer.data(), buffer.size());
-    if (count < 0 && errno == EINTR) continue;
-    if (count < 0) FailErrno("read Isaac site settings " + path->string());
-    if (count == 0) break;
-    document.append(buffer.data(), static_cast<std::size_t>(count));
-  }
-  auto value = component_manager::ParseIsaacSiteSettings(document);
-  return LoadedIsaacSiteSettings{std::move(document), std::move(value)};
-}
 
 enum class CommandKind {
   kCanonicalEmptySelection,
@@ -932,21 +904,26 @@ RequiredProgramCycleStatus(const CanonicalValue &value) {
   return result;
 }
 
-CanonicalValue
-ExchangeProgramRunnerLivenessPacket(const std::filesystem::path &path,
-                                    const CanonicalValue &request) {
+// One request and one reply over an exact same-user SEQPACKET socket.
+CanonicalValue ExchangeLocalPacket(const std::filesystem::path &path,
+                                   const CanonicalValue &request,
+                                   const std::string_view peer_name,
+                                   const content_identity::CanonicalJsonParseLimits
+                                       &limits) {
+  const std::string label(peer_name);
+  const auto maximum_bytes = limits.maximum_bytes;
   const auto spelling = path.string();
   Require(!spelling.empty() && spelling.size() < sizeof(sockaddr_un::sun_path),
-          "Program Runner liveness socket path is invalid");
+          label + " socket path is invalid");
   struct stat path_status {};
   Require(::lstat(path.c_str(), &path_status) == 0 &&
               S_ISSOCK(path_status.st_mode) &&
               path_status.st_uid == ::geteuid(),
-          "Program Runner liveness socket is not an exact same-user socket");
+          label + " socket is not an exact same-user socket");
   FileDescriptor connection(
       ::socket(AF_UNIX, SOCK_SEQPACKET | SOCK_CLOEXEC | SOCK_NONBLOCK, 0));
   if (!connection) {
-    FailErrno("create Program Runner liveness connection");
+    FailErrno("create " + label + " connection");
   }
   sockaddr_un address{};
   address.sun_family = AF_UNIX;
@@ -954,7 +931,7 @@ ExchangeProgramRunnerLivenessPacket(const std::filesystem::path &path,
   if (::connect(connection.get(), reinterpret_cast<sockaddr *>(&address),
                 sizeof(address)) != 0 &&
       errno != EINPROGRESS) {
-    FailErrno("connect Program Runner liveness socket");
+    FailErrno("connect " + label + " socket");
   }
   pollfd ready{connection.get(), POLLOUT, 0};
   int polled = -1;
@@ -962,34 +939,34 @@ ExchangeProgramRunnerLivenessPacket(const std::filesystem::path &path,
     polled = ::poll(&ready, 1, kClientReadTimeoutMilliseconds);
   } while (polled < 0 && errno == EINTR);
   Require(polled == 1 && (ready.revents & POLLOUT) != 0,
-          "Program Runner liveness connection timed out");
+          label + " connection timed out");
   int socket_error = 0;
   socklen_t socket_error_size = sizeof(socket_error);
   Require(::getsockopt(connection.get(), SOL_SOCKET, SO_ERROR, &socket_error,
                        &socket_error_size) == 0 &&
               socket_error == 0,
-          "Program Runner liveness connection was rejected");
+          label + " connection was rejected");
   struct ucred peer {};
   socklen_t peer_size = sizeof(peer);
   Require(::getsockopt(connection.get(), SOL_SOCKET, SO_PEERCRED, &peer,
                        &peer_size) == 0 &&
               peer_size == sizeof(peer) && peer.uid == ::geteuid(),
-          "Program Runner liveness peer uid is foreign");
+          label + " peer uid is foreign");
 
   const auto encoded = content_identity::canonical_json(request);
-  Require(encoded.size() <= kMaximumProgramRunnerLivenessPacketBytes,
-          "Program Runner liveness request exceeds its byte bound");
+  Require(encoded.size() <= maximum_bytes,
+          label + " request exceeds its byte bound");
   const auto sent =
       ::send(connection.get(), encoded.data(), encoded.size(), MSG_NOSIGNAL);
   Require(sent == static_cast<ssize_t>(encoded.size()),
-          "Program Runner liveness request was not sent exactly");
+          label + " request was not sent exactly");
   ready = pollfd{connection.get(), POLLIN, 0};
   do {
     polled = ::poll(&ready, 1, kClientReadTimeoutMilliseconds);
   } while (polled < 0 && errno == EINTR);
   Require(polled == 1 && (ready.revents & POLLIN) != 0,
-          "Program Runner liveness acknowledgement timed out");
-  std::array<char, kMaximumProgramRunnerLivenessPacketBytes + 1U> response{};
+          label + " acknowledgement timed out");
+  std::vector<char> response(maximum_bytes + 1U);
   iovec vector{response.data(), response.size()};
   msghdr message{};
   message.msg_iov = &vector;
@@ -997,20 +974,28 @@ ExchangeProgramRunnerLivenessPacket(const std::filesystem::path &path,
   const auto received = ::recvmsg(connection.get(), &message, 0);
   Require(received > 0 &&
               received <= static_cast<ssize_t>(
-                              kMaximumProgramRunnerLivenessPacketBytes) &&
+                              maximum_bytes) &&
               (message.msg_flags & MSG_TRUNC) == 0,
-          "Program Runner liveness acknowledgement is empty or oversized");
+          label + " acknowledgement is empty or oversized");
   const std::string_view bytes(response.data(),
                                static_cast<std::size_t>(received));
   CanonicalValue decoded;
   try {
     decoded = content_identity::parse_canonical_json(
-        bytes, {kMaximumProgramRunnerLivenessPacketBytes, 4U, 64U});
+        bytes, limits);
   } catch (const std::exception &error) {
-    Fail("Program Runner liveness acknowledgement is invalid: " +
+    Fail(label + " acknowledgement is invalid: " +
          std::string(error.what()));
   }
   return decoded;
+}
+
+CanonicalValue
+ExchangeProgramRunnerLivenessPacket(const std::filesystem::path &path,
+                                    const CanonicalValue &request) {
+  return ExchangeLocalPacket(
+      path, request, "Program Runner liveness",
+      {kMaximumProgramRunnerLivenessPacketBytes, 4U, 64U});
 }
 
 ProgramRunnerLivenessIdentity
@@ -1761,66 +1746,39 @@ SceneRuntimeOwnerReadResponse(const std::string_view cell_id,
   });
 }
 
-struct ManagedIsaacPoseObserverJointState final {
-  std::string object_id;
-  std::string policy_id;
-  std::string topic;
-};
+using ConfiguredPoseSource = deployment::ros2_control_execution_runtime_contract::
+    Configuration::PoseSource;
 
-struct ManagedIsaacPoseObserverExpectation final {
-  component_manager::ManagerIsaacPoseObserverLaunchFactsDTO launch_facts;
-  std::vector<PoseObserverBinding> bindings;
-  std::optional<ManagedIsaacPoseObserverJointState> expected_joint_state{};
-  bool available{true};
-  bool inspection_current{false};
-  // Only the current configured bindings, updated after actual pose commits.
-  std::map<PoseObservationKey, core::SceneObjectProviderEvidenceDTO>
-      provider_origins{};
-  std::optional<component_manager::ManagerCellObserverObservationDTO>
-      observation{};
-};
-
-[[nodiscard]] ManagedIsaacPoseObserverExpectation
-DecodeCheckedIsaacPoseObserverConfiguration(
-    const component_manager::IsaacPoseObserverCheckedConfiguration &checked,
-    const core::CellId &cell_id, const SceneRuntimeIdentity &runtime_identity,
-    std::string source_epoch_base) {
-  const auto root = deployment::parse_strict_json_model_yaml(checked.metadata).root();
-  RequireExactObjectSize(root, 4U, "checked observer metadata");
-  Require(RequiredString(root, "cell_id") == cell_id.value(),
-          "checked observer cell differs from the verified deployment");
-  const auto &joint_state = RequiredMember(root, "expected_joint_state");
-  std::optional<ManagedIsaacPoseObserverJointState> expected_joint_state;
-  if (!std::holds_alternative<std::nullptr_t>(joint_state.storage())) {
-    RequireExactObjectSize(joint_state, 3U, "checked expected joint state");
-    expected_joint_state = ManagedIsaacPoseObserverJointState{
-        RequiredString(joint_state, "object_id"),
-        RequiredString(joint_state, "policy_id"),
-        RequiredString(joint_state, "topic")};
+/// CP9: the active bundle's pose-source component rows (source_id =
+/// component id) across its ROS execution runtime units.
+[[nodiscard]] std::vector<ConfiguredPoseSource>
+ConfiguredPoseSources(const deployment::RetainedBundle &bundle) {
+  std::vector<ConfiguredPoseSource> result;
+  for (const auto &unit : bundle.value().cell_graph.runtime_units) {
+    if (unit.runtime_profile_id.value() !=
+        deployment::ros2_control_execution_runtime_contract::kRuntimeProfileId)
+      continue;
+    auto configuration =
+        deployment::ros2_control_execution_runtime_contract::require_configuration(
+            bundle, unit.runtime_unit_id);
+    for (auto &source : configuration.pose_sources)
+      result.push_back(std::move(source));
   }
-  ManagedIsaacPoseObserverExpectation result{
-      {checked.retained_snapshot.string(), RequiredString(root, "source_id"),
-       std::move(source_epoch_base)},
-      RequiredPoseObserverBindings(RequiredMember(root, "bindings")),
-      std::move(expected_joint_state)};
-  Require(result.launch_facts.valid(), "checked observer launch facts are invalid");
-  // Exercise the unchanged Open grammar and total packet cap with the widest
-  // existing generation encodings. This is only a local grammar probe; the
-  // actual runtime identity remains the already-qualified startup input.
-  auto maximum_identity = runtime_identity;
-  maximum_identity.deployment_generation = 9007199254740991ULL;
-  maximum_identity.program_generation = 9007199254740991ULL;
-  maximum_identity.runtime_generation = 9007199254740991ULL;
-  const CanonicalValue open(CanonicalValue::Object{
-      {"api_version", CanonicalValue(std::string(kManagerCommandApiVersion))},
-      {"command", CanonicalValue("scene_runtime_observer_open")},
-      {"expected_runtime_identity", SceneRuntimeIdentityResponseValue(maximum_identity)},
-      {"source_id", CanonicalValue(result.launch_facts.source_id)},
-      {"source_epoch", CanonicalValue(result.launch_facts.source_epoch_base +
-                                      ".9007199254740991")},
-      {"bindings", RequiredMember(root, "bindings")}});
-  static_cast<void>(DecodeCommand(content_identity::canonical_json(open)));
   return result;
+}
+
+[[nodiscard]] bool
+IsConfiguredPoseBinding(const std::vector<ConfiguredPoseSource> &sources,
+                        const PoseObservationKey &key, const bool eligible) {
+  return std::any_of(sources.begin(), sources.end(), [&](const auto &source) {
+    return source.controllable_component_id.value() == key.source_id &&
+           std::any_of(source.bindings.begin(), source.bindings.end(),
+                       [&](const auto &binding) {
+                         return binding.object_id == key.object_id &&
+                                binding.policy_id == key.policy_id &&
+                                binding.eligible == eligible;
+                       });
+  });
 }
 
 CanonicalValue SceneRuntimeObserverOpenResponse(
@@ -1902,8 +1860,8 @@ struct BeforePlanningLatchResult final {
   std::uint64_t latched_observation_count{};
   std::uint64_t committed_observation_count{};
   /// Observations whose exact pose was already in the logical scene; this
-  /// includes freshness-only confirmations, which leave the projection
-  /// revision unchanged.
+  /// includes unchanged samples, which leave the projection revision
+  /// unchanged.
   std::uint64_t already_applied_observation_count{};
   std::uint64_t skipped_attached_observation_count{};
   std::uint64_t scene_runtime_source_generation{};
@@ -3044,7 +3002,6 @@ class ManagerDaemon final {
 public:
   explicit ManagerDaemon(DaemonConfig config)
       : config_(ValidateConfig(std::move(config))),
-        isaac_site_settings_(LoadIsaacSiteSettings(config_.isaac_site_settings_path)),
         started_at_(std::chrono::steady_clock::now()),
         package_generation_(config_.install_root,
                             deployment::runtime_contract_declaration_registry()
@@ -3069,11 +3026,7 @@ public:
                     deployment::ros2_control_execution_runtime_contract::
                         kLaunchEnvironmentContract)},
             config_.logical_scene_database, config_.program_cycle_journal,
-            config_.activation_root, config_.scene_asset_root,
-            isaac_site_settings_.has_value()
-                ? std::optional<std::string>(isaac_site_settings_->document)
-                : std::nullopt,
-            config_.isaac_pose_observer_executable),
+            config_.activation_root, config_.scene_asset_root),
         stores_(config_.manager_state_root, admission_),
         scene_owner_(config_.logical_scene_database, admission_,
                      stores_.active_bundle_publication_store(),
@@ -3087,6 +3040,9 @@ public:
                    const std::string &reference_link) {
               return verified_package_.CarrierInReferenceLink(
                   retained_bundle_id, carrier, reference_link);
+            },
+            [this](const SceneRuntimeCarriedObjectLoss &loss) {
+              return RequestCarrierStop(loss);
             }),
         plan_source_(stores_.active_bundle_publication_store(),
                      stores_.apply_journal(),
@@ -3399,8 +3355,9 @@ private:
         {named->apply_id, named->apply_generation});
     Require(
         maintenance.has_value() && maintenance->valid() &&
-            maintenance->target_projection_revision ==
-                active_publication.request.candidate_projection_revision &&
+            core::SameProjectionIdentity(
+                maintenance->target_projection_revision,
+                active_publication.request.candidate_projection_revision) &&
             maintenance->target_projection_revision.retained_bundle_id ==
                 active_publication.request.candidate_retained_bundle_id &&
             maintenance->target_projection_revision.graph_revision ==
@@ -3412,9 +3369,8 @@ private:
     if (maintenance->state ==
         core::ProjectionMaintenanceInitializationState::kCompleted) {
       Require(
-          maintenance->publication_receipt ==
-              std::optional<core::ActiveBundlePublicationReceiptDTO>{
-                  active_publication},
+          core::SamePublicationIdentity(maintenance->publication_receipt,
+                                        active_publication),
           "Scene completion differs from the active publication");
       return {maintenance->target_projection_revision,
               active_publication.publication_generation};
@@ -3454,97 +3410,7 @@ private:
   /// dependency order.
   PublicationGenerations InitializeRuntimeAndPublish() {
     RequireCurrentPackageGeneration();
-    const auto plan = plan_source_.ReadCurrentPlan();
-    const auto bundle = verified_package_.get_verified(
-        plan.active_publication.request.candidate_retained_bundle_id);
-    Require(bundle != nullptr, "initial observer preflight has no verified active bundle");
-    const auto generation = plan.active_publication.publication_generation.value();
-    const SceneRuntimeIdentity identity{
-        bundle->retained_bundle_id().value(),
-        bundle->value().cell_graph.graph_revision.value(), generation, 0U, generation};
-    auto expectation = CheckConfiguredIsaacPoseObserver(*bundle, identity);
-    native_runtime_adapter_.SetIsaacPoseObserverStartupLaunchFacts(
-        expectation ? std::optional(expectation->launch_facts) : std::nullopt);
-    {
-      std::lock_guard lock(manager_source_mutex_);
-      managed_pose_observer_expectation_ = std::move(expectation);
-    }
     return PublishActiveRuntime(active_runtime_.Initialize());
-  }
-
-  [[nodiscard]] std::optional<ManagedIsaacPoseObserverExpectation>
-  CheckConfiguredIsaacPoseObserver(const deployment::RetainedBundle &bundle,
-                                  const SceneRuntimeIdentity &identity) {
-    bool uses_isaac = false;
-    for (const auto &unit : bundle.value().cell_graph.runtime_units) {
-      if (unit.runtime_profile_id.value() !=
-          deployment::ros2_control_execution_runtime_contract::kRuntimeProfileId)
-        continue;
-      const auto configuration =
-          deployment::ros2_control_execution_runtime_contract::require_configuration(
-              bundle, unit.runtime_unit_id);
-      uses_isaac = std::any_of(
-          configuration.controller_profiles.begin(),
-          configuration.controller_profiles.end(), [](const auto &profile) {
-            return profile.isaac_profile.has_value();
-          });
-      if (uses_isaac) break;
-    }
-    if (!uses_isaac || !isaac_site_settings_)
-      return std::nullopt;
-    const auto *observer = isaac_site_settings_->value.FindPoseObserver(
-        bundle.value().cell_graph.cell_id.value());
-    if (!observer)
-      return std::nullopt;
-    const auto checked = native_runtime_adapter_.CheckIsaacPoseObserverConfiguration(
-        observer->site_config,
-        isaac_site_settings_->value.observer_configuration_timeout_s());
-    return DecodeCheckedIsaacPoseObserverConfiguration(
-        checked, bundle.value().cell_graph.cell_id, identity,
-        RandomToken("isaac-source-"));
-  }
-
-  [[nodiscard]] std::optional<ManagedIsaacPoseObserverExpectation>
-  CaptureOriginalApplyPoseObserver(
-      const deployment::RetainedBundle &predecessor,
-      const deployment::RetainedBundle &candidate) {
-    const auto uses_isaac = [](const deployment::RetainedBundle &bundle) {
-      for (const auto &unit : bundle.value().cell_graph.runtime_units) {
-        if (unit.runtime_profile_id.value() ==
-            deployment::ros2_control_execution_runtime_contract::kRuntimeProfileId) {
-          const auto configuration = deployment::ros2_control_execution_runtime_contract::
-              require_configuration(bundle, unit.runtime_unit_id);
-          return std::any_of(
-              configuration.controller_profiles.begin(),
-              configuration.controller_profiles.end(), [](const auto &profile) {
-                return profile.isaac_profile.has_value();
-              });
-        }
-      }
-      return false;
-    };
-    const bool candidate_uses_isaac = uses_isaac(candidate);
-    if (candidate_uses_isaac == uses_isaac(predecessor)) {
-      if (!candidate_uses_isaac)
-        return std::nullopt;
-      // Robot-only Apply retains the original immutable observer input and
-      // Manager base, including when the last robot is removed. Availability
-      // is observation, never permission to restart the observer here.
-      std::lock_guard lock(manager_source_mutex_);
-      return managed_pose_observer_expectation_;
-    }
-    if (!candidate_uses_isaac)
-      return std::nullopt;
-    const auto current = scene_runtime_owner_.Snapshot();
-    Require(current.runtime_identity.has_value(),
-            "Apply observer preflight has no current Scene runtime identity");
-    auto grammar_identity = *current.runtime_identity;
-    grammar_identity.retained_bundle_id = candidate.retained_bundle_id().value();
-    grammar_identity.graph_revision =
-        candidate.value().cell_graph.graph_revision.value();
-    // This identity is only the existing Open grammar/cap probe. No successor
-    // runtime generation or source expectation is published before Prepare.
-    return CheckConfiguredIsaacPoseObserver(candidate, grammar_identity);
   }
 
   [[nodiscard]] CanonicalValue ApplyErrorResponseFromJournalEvidence(
@@ -3563,78 +3429,6 @@ private:
     return ApplyErrorResponse(command, code, message);
   }
 
-  // Only the first managed observer for this live Manager. A predecessor
-  // observer requires the separately qualified retirement transition; this
-  // initial continuation grants no replacement or process authority.
-  void ActivateInitialApplyPoseObserver(
-      ManagedIsaacPoseObserverExpectation checked,
-      const SceneRuntimeIdentity &expected_runtime,
-      const component_manager::ManagerApplyIntentDTO &intent,
-      const deployment::RetainedBundle &candidate,
-      const component_manager::ManagerSelectedRuntimeCompositionResultDTO
-          &prepared) {
-    Require(
-        intent.valid() && prepared.valid() &&
-            prepared.request.phase ==
-                component_manager::ManagerSelectedRuntimeCompositionPhase::
-                    kPrepare &&
-            prepared.state ==
-                component_manager::ManagerSelectedRuntimeCompositionState::
-                    kInstalled &&
-            !prepared.isaac_pose_observer_retirement_receipt &&
-            prepared.request.apply_id == intent.apply_id &&
-            prepared.request.apply_generation == intent.apply_generation &&
-            prepared.request.manager_runtime_epoch == manager_runtime_epoch_ &&
-            intent.cell_id == admission_.cell_id() &&
-            candidate.value().cell_graph.cell_id == intent.cell_id &&
-            candidate.retained_bundle_id() ==
-                intent.candidate_retained_bundle_id &&
-            candidate.value().cell_graph.graph_revision ==
-                intent.candidate_graph_revision &&
-            prepared.request.candidate_projection_revision.retained_bundle_id ==
-                intent.candidate_retained_bundle_id &&
-            prepared.request.candidate_projection_revision.graph_revision ==
-                intent.candidate_graph_revision &&
-            expected_runtime.retained_bundle_id ==
-                intent.expected_active_projection_revision.retained_bundle_id
-                    .value() &&
-            expected_runtime.graph_revision ==
-                intent.expected_active_projection_revision.graph_revision
-                    .value() &&
-            intent.isaac_pose_observer_launch_facts ==
-                std::optional(checked.launch_facts) &&
-            prepared.request.isaac_pose_observer_launch_facts ==
-                intent.isaac_pose_observer_launch_facts,
-        "initial observer activation lacks its exact original Prepare "
-        "acknowledgement");
-    std::lock_guard lock(manager_source_mutex_);
-    Require(!managed_pose_observer_expectation_ &&
-                scene_runtime_owner_.Snapshot().runtime_identity ==
-                    std::optional(expected_runtime),
-            "initial observer activation predecessor changed before Prepare "
-            "acknowledgement");
-    // Configure the existing source freshness latch before Finalize can spawn.
-    // Publication adopts the successor identity; observer Open then returns
-    // through the ordinary listener. Never wait for it in this callback.
-    scene_runtime_owner_.ConfigurePoseSourceAvailability(
-        expected_runtime, checked.launch_facts.source_id,
-        checked.launch_facts.source_epoch_base);
-    managed_pose_observer_expectation_ = std::move(checked);
-  }
-
-  // Caller holds manager_source_mutex_; no transport or process IO here.
-  [[nodiscard]] bool ManagedPoseObserverCommandMatchesLocked(
-      const ManagerCommand &command, const bool opening) const {
-    if (!managed_pose_observer_expectation_ ||
-        *command.pose_source_id != managed_pose_observer_expectation_->launch_facts.source_id)
-      return true;  // Existing unmanaged source acceptance is unchanged.
-    const auto &expected = *managed_pose_observer_expectation_;
-    return expected.available &&
-           expected.launch_facts.accepts_source_epoch(
-               *command.pose_source_epoch) &&
-           (!opening || expected.bindings == command.pose_observer_bindings);
-  }
-
   // An owned replay copy may outlive a transport call. Never write its result
   // back to a session retired or replaced by the Apply progression lane.
   [[nodiscard]] bool PoseReplayIsCurrentLocked(
@@ -3644,13 +3438,6 @@ private:
         *runtime.runtime_identity != record.runtime_identity)
       return false;
     const auto &observation = record.observation;
-    if (managed_pose_observer_expectation_ &&
-        managed_pose_observer_expectation_->launch_facts.source_id ==
-            observation.key.source_id &&
-        (!managed_pose_observer_expectation_->available ||
-         !managed_pose_observer_expectation_->launch_facts.accepts_source_epoch(
-             observation.source_epoch)))
-      return false;
     const auto session = pose_observer_sessions_.find(observation.key.source_id);
     const auto replay = pose_observation_replays_.find(observation.key);
     return session != pose_observer_sessions_.end() &&
@@ -3662,129 +3449,21 @@ private:
            replay->second.observation == observation;
   }
 
-  // Ordinary Inspect is observation-only. The original checked identity is
-  // retained independently of producer sessions and incident persistence.
-  bool ReconcileManagedPoseObserver(
-      const component_manager::ManagerActiveRuntimeConvergenceResult &runtime,
-      const deployment::RetainedBundle &bundle) {
-    std::optional<ManagedIsaacPoseObserverExpectation> expected;
-    {
-      std::lock_guard lock(manager_source_mutex_);
-      if (managed_pose_observer_expectation_)
-        managed_pose_observer_expectation_->inspection_current = false;
-      expected = managed_pose_observer_expectation_;
-    }
-    if (!expected)
-      return true;
-    const auto owner = scene_runtime_owner_.Snapshot();
-    if (!owner.runtime_identity ||
-        owner.state != SceneInitializationState::kOpen)
-      return false;
-    const auto &identity = *owner.runtime_identity;
-    {
-      std::lock_guard lock(manager_source_mutex_);
-      if (!managed_pose_observer_expectation_ ||
-          managed_pose_observer_expectation_->launch_facts !=
-              expected->launch_facts ||
-          scene_runtime_owner_.Snapshot().runtime_identity !=
-              owner.runtime_identity)
-        return false;
-      scene_runtime_owner_.ConfigurePoseSourceAvailability(
-          identity, expected->launch_facts.source_id,
-          expected->launch_facts.source_epoch_base);
-    }
-    const auto &publication = runtime.plan.active_publication;
-    if (bundle.retained_bundle_id() !=
-            publication.request.candidate_retained_bundle_id ||
-        bundle.value().cell_graph.graph_revision.value() !=
-            identity.graph_revision ||
-        bundle.retained_bundle_id().value() != identity.retained_bundle_id)
-      return false;
-    for (const auto &unit : bundle.value().cell_graph.runtime_units) {
-      if (unit.runtime_profile_id.value() !=
-          deployment::ros2_control_execution_runtime_contract::
-              kRuntimeProfileId)
-        continue;
-      const auto *host =
-          runtime.observations.observation(unit.runtime_unit_id.value());
-      if (!host ||
-          host->process_presence() !=
-              component_manager::ProcessPresenceState::kPresent ||
-          host->runtime_epoch().empty())
-        return false;
-      const component_manager::ManagerComponentBringUpInspectionRequestDTO
-          request{publication.request.candidate_projection_revision,
-                  core::ContentDigest(content_identity::sha256_digest(
-                      bundle.canonical_bytes())),
-                  bundle.canonical_bytes().size(),
-                  publication.request.candidate_projection_revision,
-                  publication.publication_generation,
-                  publication.durable_public_pointer_content_digest,
-                  unit.runtime_unit_id,
-                  core::RuntimeEpoch(host->runtime_epoch()),
-                  manager_runtime_epoch_};
-      const auto inspected =
-          native_runtime_adapter_.InspectComponentBringUp(request);
-      if (!inspected.ok() || !inspected.value().valid() ||
-          inspected.value().request != request ||
-          !inspected.value().cell_observer)
-        return false;
-      const auto &observed = *inspected.value().cell_observer;
-      if (observed.cell_id != admission_.cell_id() ||
-          observed.source_id != expected->launch_facts.source_id ||
-          observed.source_epoch_base !=
-              expected->launch_facts.source_epoch_base)
-        return false;
-      // Recheck after RPC; no source lock spans child IO.
-      std::lock_guard lock(manager_source_mutex_);
-      if (!managed_pose_observer_expectation_ ||
-          managed_pose_observer_expectation_->launch_facts !=
-              expected->launch_facts ||
-          scene_runtime_owner_.Snapshot().runtime_identity !=
-              owner.runtime_identity)
-        return false;
-      auto &current = *managed_pose_observer_expectation_;
-      current.inspection_current = true;
-      if (observed.exit) {
-        // Close freshness first, even for pending/failed/unknown durable
-        // writes.
-        scene_runtime_owner_.MarkPoseSourceUnavailable(
-            identity, observed.source_id, observed.source_epoch_base);
-        current.available = false;
-      }
-      if (!current.observation || !current.observation->exit || observed.exit)
-        current.observation = observed;
-      return current.available &&
-             observed.process_presence ==
-                 component_manager::ProcessPresenceState::kPresent;
-    }
-    return false;
-  }
-
+  // Only the active bundle's configured bindings, updated after actual pose
+  // commits.
   void
-  RetainManagedPoseProviderOrigin(const PoseSourceObservation &observation) {
+  RetainConfiguredPoseProviderOrigin(const PoseSourceObservation &observation) {
     const auto object = scene_owner_.GetObjectState(
         core::SceneResourceId(observation.key.object_id));
     if (!object.provider_evidence || object.attached ||
         object.provider_evidence->provider_source_epoch !=
-            SceneRuntimePoseProviderSourceEpoch(observation) ||
-        object.provider_evidence->provider_source_sequence !=
-            observation.source_sequence)
+            SceneRuntimePoseProviderSourceEpoch(observation))
       return;
     std::lock_guard lock(manager_source_mutex_);
-    if (!managed_pose_observer_expectation_)
-      return;
-    auto &expected = *managed_pose_observer_expectation_;
-    const PoseObserverBinding binding{observation.key.object_id,
-                                      observation.key.policy_id,
-                                      observation.eligible};
-    if (expected.launch_facts.source_id == observation.key.source_id &&
-        expected.launch_facts.accepts_source_epoch(observation.source_epoch) &&
-        std::find(expected.bindings.begin(), expected.bindings.end(),
-                  binding) != expected.bindings.end()) {
-      expected.provider_origins.insert_or_assign(observation.key,
-                                                 *object.provider_evidence);
-    }
+    if (IsConfiguredPoseBinding(configured_pose_sources_, observation.key,
+                                observation.eligible))
+      pose_provider_origins_.insert_or_assign(observation.key,
+                                              *object.provider_evidence);
   }
 
   struct OriginalConfiguredBringUpInput final {
@@ -4000,7 +3679,8 @@ private:
     Require(observed_components.size() == graph.controllable_components.size(),
             "component bring-up preflight has no complete actual process inventory");
     Require(plan_source_.ReadCurrentPlan().active_publication == active.active_publication &&
-                scene_owner_.CurrentProjectionRevision() == current_scene,
+                core::SameProjectionIdentity(scene_owner_.CurrentProjectionRevision(),
+                                             current_scene),
             "component bring-up preflight current publication or Scene changed");
     CanonicalValue::Array needed;
     for (const auto &component : needed_components) needed.emplace_back(component.value());
@@ -4038,7 +3718,9 @@ private:
         content_identity::sha256_digest(candidate.canonical_bytes()));
     std::vector<component_manager::ManagerApplyBringUpChildRequestDTO> children;
     for (const auto &input : inputs) {
-      Require(input.request.candidate_projection_revision == target &&
+      // The preflight and the Apply each recorded the Scene revision of their
+      // own moment; only the Deployment and Scene identity must agree.
+      Require(core::SameProjectionIdentity(input.request.candidate_projection_revision, target) &&
                   input.request.candidate_retained_bundle_digest == digest &&
                   input.request.candidate_retained_bundle_bytes ==
                       candidate.canonical_bytes().size() &&
@@ -4115,8 +3797,8 @@ private:
     std::sort(plan.configured_components.begin(), plan.configured_components.end());
     Require(plan.valid() &&
                 plan_source_.ReadCurrentPlan().active_publication == head &&
-                scene_owner_.CurrentProjectionRevision() ==
-                    intent.expected_active_projection_revision,
+                core::SameProjectionIdentity(scene_owner_.CurrentProjectionRevision(),
+                                             intent.expected_active_projection_revision),
             "original bring-up plan lost its exact current owner inputs");
     return plan;
   }
@@ -4156,6 +3838,15 @@ private:
             "active publication has no independently verified retained bundle");
     {
       std::lock_guard source_lock(manager_source_mutex_);
+      if (last_active_bundle_ == nullptr ||
+          last_active_bundle_->retained_bundle_id() !=
+              active_bundle->retained_bundle_id()) {
+        configured_pose_sources_ = ConfiguredPoseSources(*active_bundle);
+        std::erase_if(pose_provider_origins_, [&](const auto &origin) {
+          return !IsConfiguredPoseBinding(configured_pose_sources_,
+                                          origin.first, true);
+        });
+      }
       last_active_bundle_ = active_bundle;
     }
     const bool all_runtime_processes_present = std::all_of(
@@ -4208,7 +3899,6 @@ private:
         }
       }
     }
-    ReconcileManagedPoseObserver(runtime, *active_bundle);
     const auto manager = [&] {
       // One lock spans the journal read, the build and the write, so every
       // Manager source value pairs one active publication with the Apply
@@ -5062,72 +4752,22 @@ private:
         admission_.cell_id().value(), scene_runtime_owner_.Snapshot());
     {
       std::lock_guard lock(manager_source_mutex_);
-      if (managed_pose_observer_expectation_) {
-        const auto &expected = *managed_pose_observer_expectation_;
-        const auto &observation = expected.observation;
-        const bool present =
-            expected.inspection_current && observation &&
-            observation->process_presence ==
-                component_manager::ProcessPresenceState::kPresent;
-        const auto availability = !expected.available ? "unavailable"
-                                  : present           ? "available"
-                                  : !observation      ? "pending"
-                                                      : "unknown";
-        CanonicalValue expected_joint_state(nullptr);
-        if (expected.expected_joint_state) {
-          expected_joint_state = CanonicalValue(CanonicalValue::Object{
-              {"object_id", CanonicalValue(expected.expected_joint_state->object_id)},
-              {"policy_id", CanonicalValue(expected.expected_joint_state->policy_id)},
-              {"topic", CanonicalValue(expected.expected_joint_state->topic)},
-          });
-        }
-        CanonicalValue exit(nullptr);
-        if (observation && observation->exit) {
-          const auto &fact = *observation->exit;
-          exit = CanonicalValue(CanonicalValue::Object{
-              {"pid", CanonicalValue(static_cast<double>(fact.pid))},
-              {"exit_status",
-               fact.exit_status
-                   ? CanonicalValue(static_cast<double>(*fact.exit_status))
-                   : CanonicalValue(nullptr)},
-              {"signal", fact.signal
-                             ? CanonicalValue(static_cast<double>(*fact.signal))
-                             : CanonicalValue(nullptr)},
-              {"core_dumped", CanonicalValue(fact.core_dumped)},
-              {"observed_utc", CanonicalValue(fact.observed_utc)},
-              {"detected_at_ns", content_identity::nonnegative_int64_value(
-                                     fact.detected_at_ns)}});
-        }
-        auto object = std::get<CanonicalValue::Object>(payload.storage());
-        object.emplace_back(
-            "cell_observer",
-            CanonicalValue(CanonicalValue::Object{
-                {"cell_id", CanonicalValue(admission_.cell_id().value())},
-                {"source_id", CanonicalValue(expected.launch_facts.source_id)},
-                {"source_epoch_base",
-                 CanonicalValue(expected.launch_facts.source_epoch_base)},
-                {"availability", CanonicalValue(availability)},
-                {"expected_joint_state", std::move(expected_joint_state)},
-                {"observation_current",
-                 CanonicalValue(expected.inspection_current)},
-                {"process_presence",
-                 observation
-                     ? CanonicalValue(std::string(component_manager::ToString(
-                           observation->process_presence)))
-                     : CanonicalValue("unknown")},
-                {"exit", std::move(exit)},
-                {"incident_id", observation && observation->incident_id
-                                    ? CanonicalValue(*observation->incident_id)
-                                    : CanonicalValue(nullptr)},
-                {"incident_persistence",
-                 CanonicalValue(static_cast<double>(
-                     observation
-                         ? observation->incident_persistence
-                         : component_manager::
-                               ManagerCellObserverIncidentPersistenceDTO::
-                                   kUnknown))}}));
-        payload = CanonicalValue(std::move(object));
+      CanonicalValue::Array joint_states;
+      for (const auto &source : configured_pose_sources_) {
+        if (!source.joint_state)
+          continue;
+        joint_states.emplace_back(CanonicalValue::Object{
+            {"object_id", CanonicalValue(source.joint_state->object_id)},
+            {"policy_id", CanonicalValue(source.joint_state->policy_id)},
+            {"source_id",
+             CanonicalValue(source.controllable_component_id.value())},
+            {"topic", CanonicalValue(source.joint_state->topic)},
+        });
       }
+      auto object = std::get<CanonicalValue::Object>(payload.storage());
+      object.emplace_back("configured_joint_states",
+                          CanonicalValue(std::move(joint_states)));
+      payload = CanonicalValue(std::move(object));
     }
     return scene_runtime_channel_
         .Publish("scene_runtime", scene_runtime_owner_id_,
@@ -5184,37 +4824,6 @@ private:
       // readiness closed and leave ordinary active reconciliation alone.
       if (HasIncompleteApply()) {
         TrySubmitFailClosedReadiness();
-        std::optional<component_manager::ManagerActiveRuntimeConvergenceResult>
-            runtime;
-        std::shared_ptr<const deployment::RetainedBundle> bundle;
-        {
-          std::lock_guard source_lock(manager_source_mutex_);
-          if (managed_pose_observer_expectation_) {
-            managed_pose_observer_expectation_->inspection_current = false;
-            runtime = last_runtime_;
-            bundle = last_active_bundle_;
-          }
-        }
-        // Read only the independent cell occurrence while component Apply
-        // remains excluded. Inspect never spans the Manager source lock and
-        // cannot converge or restart a process. Its exact identity checks
-        // leave a changed publication unknown while preserving known loss.
-        if (runtime && bundle) {
-          try {
-            static_cast<void>(ReconcileManagedPoseObserver(*runtime, *bundle));
-          } catch (...) {
-            // Publish current observation uncertainty through the existing
-            // Scene path before the ordinary fail-closed handler reports it.
-            try {
-              static_cast<void>(
-                  PublishSceneRuntime(static_cast<std::int64_t>(ElapsedNs())));
-            } catch (...) {
-              // Preserve the first inspection failure if publication also
-              // fails; the ordinary handler keeps readiness closed.
-            }
-            throw;
-          }
-        }
         TryPublishApplyTransition();
         RequestApplyProgress();
         return;
@@ -5403,6 +5012,81 @@ private:
                : std::string_view(selected->apply_policy);
   }
 
+  static SceneRuntimePoseDeadband
+  PoseDeadband(const deployment::RetainedBundle &bundle,
+               const PoseObservationKey &key) {
+    const auto &bindings = bundle.value().scene_pose_sources;
+    const auto selected =
+        std::find_if(bindings.begin(), bindings.end(), [&](const auto &row) {
+          return row.source_id == key.source_id &&
+                 row.scene_resource_id == key.object_id;
+        });
+    return selected == bindings.end()
+               ? SceneRuntimePoseDeadband{}
+               : SceneRuntimePoseDeadband{selected->deadband_translation_m,
+                                          selected->deadband_rotation_rad};
+  }
+
+  // Requests the normal operational Stop of the carrier's motion through the
+  // Kernel's Stop control socket, as the public Stop route does. A carrier
+  // with no running motion is a no-effect Stop.
+  std::optional<core::ErrorDTO>
+  RequestCarrierStop(const SceneRuntimeCarriedObjectLoss &loss) {
+    constexpr std::string_view source = "manager.carried_object_lost";
+    try {
+      const auto response = ExchangeLocalPacket(
+          config_.execution_run_root / "execution-control.sock",
+          CanonicalValue(CanonicalValue::Object{
+              {"api_version", CanonicalValue("manyforge.execution_command.v1")},
+              {"attribution",
+               CanonicalValue(CanonicalValue::Object{
+                   {"assurance", CanonicalValue("unverified")},
+                   {"principal_id", CanonicalValue(nullptr)},
+                   {"transport", CanonicalValue("internal")}})},
+              {"command", CanonicalValue("stop")},
+              {"request",
+               CanonicalValue(CanonicalValue::Object{
+                   {"components",
+                    CanonicalValue(CanonicalValue::Array{
+                        CanonicalValue(CanonicalValue::Object{
+                            {"controllable_component_id",
+                             CanonicalValue(
+                                 loss.controllable_component_id.value())},
+                            {"expected_component_lifecycle_generation",
+                             CanonicalValue(1.0)},
+                            {"expected_graph_revision",
+                             CanonicalValue(loss.graph_revision.value())}})})},
+                   {"reason", CanonicalValue(std::string(
+                                  core::kCarriedObjectLostReason))},
+                   {"request_context",
+                    CanonicalValue(CanonicalValue::Object{
+                        {"correlation_id",
+                         CanonicalValue(
+                             loss.carried_object_attachment_id.value())},
+                        {"request_id", CanonicalValue(loss.request_id)},
+                        // The Manager does not track the Kernel's owner
+                        // epoch: the Kernel records and journals a Stop with
+                        // a foreign epoch under its own current epoch.
+                        {"request_owner_epoch", CanonicalValue(std::string(source))},
+                        {"source_label", CanonicalValue(std::string(source))}})}})}}),
+          "Kernel Stop control", {kMaximumKernelStopResponseBytes, 32U});
+      const auto *ok = response.find_object_member("ok");
+      if (ok != nullptr && std::get_if<bool>(&ok->storage()) != nullptr &&
+          std::get<bool>(ok->storage())) {
+        return std::nullopt;
+      }
+      const auto *error = response.find_object_member("error");
+      const auto *code =
+          error != nullptr ? error->find_object_member("code") : nullptr;
+      return core::ErrorDTO{
+          code != nullptr && code->is_string() ? code->as_string()
+                                               : "carrier_stop_refused",
+          "Kernel refused the carried-object-lost Stop", {}};
+    } catch (const std::exception &error) {
+      return core::ErrorDTO{"carrier_stop_unavailable", error.what(), {}};
+    }
+  }
+
   core::Result<SceneRuntimePoseApplicationResult>
   ResolvePoseApplication(const SceneRuntimeIdentity &runtime_identity,
                          const PoseSourceObservation &observation,
@@ -5472,10 +5156,27 @@ private:
               {{"initialization_state", std::string(ToString(owner.state))}}});
     }
 
-    return scene_runtime_pose_projector_.Apply(
+    auto application = scene_runtime_pose_projector_.Apply(
         bundle->value().capability_provider_bindings,
         bundle->retained_bundle_id(), bundle->value().cell_graph.graph_revision,
-        observation, std::nullopt, policy);
+        observation, std::nullopt, policy,
+        PoseDeadband(*bundle, observation.key));
+    RecordCarriedObjectLoss(application, observation.key.object_id);
+    return application;
+  }
+
+  void RecordCarriedObjectLoss(
+      const core::Result<SceneRuntimePoseApplicationResult> &application,
+      const std::string &object_id) {
+    if (application.ok() ||
+        application.error().code != core::kCarriedObjectLostReason)
+      return;
+    // Stopped and detached by the projector; publish the detach and the
+    // event for the operator alarm.
+    const auto &details = application.error().details;
+    scene_runtime_owner_.RecordCarriedObjectLoss(
+        {details.at("event_id"), object_id, application.error().message});
+    TryPublishLogicalScene();
   }
 
   core::Result<BeforePlanningLatchResult> LatchBeforePlanningObservations(
@@ -5530,38 +5231,30 @@ private:
           "scene-runtime identity has no exact verified active bundle");
     }
 
-    std::optional<component_manager::ManagerActiveRuntimeConvergenceResult>
-        runtime;
-    std::optional<ManagedIsaacPoseObserverExpectation> expected;
-    {
-      std::lock_guard lock(manager_source_mutex_);
-      runtime = last_runtime_;
-      expected = managed_pose_observer_expectation_;
+    std::vector<ConfiguredPoseSource> configured_sources;
+    try {
+      configured_sources = ConfiguredPoseSources(*bundle);
+    } catch (const std::exception &error) {
+      return failure("scene_runtime_pose_bundle_unavailable", error.what());
     }
-    bool observed_available = true;
-    if (expected) {
-      observed_available =
-          runtime && ReconcileManagedPoseObserver(*runtime, *bundle);
-      owner = scene_runtime_owner_.Snapshot();
-      {
-        std::lock_guard lock(manager_source_mutex_);
-        expected = managed_pose_observer_expectation_;
-      }
-      if (!owner.runtime_identity ||
-          *owner.runtime_identity != runtime_identity)
-        return failure("scene_runtime_identity_changed",
-                       "runtime changed during observer inspection");
-    }
+    struct LatchCandidate final {
+      PoseObservationReplay *replay{};
+      PoseSourceObservation observation;
+      std::string apply_policy;
+    };
+    std::vector<LatchCandidate> candidates;
     std::map<std::string, PoseObserverSession> sessions;
     std::map<PoseObservationKey, PoseObservationReplay> replays;
-    bool requires_managed_source = false;
+    std::map<PoseObservationKey, core::SceneObjectProviderEvidenceDTO>
+        provider_origins;
     {
       std::lock_guard lock(manager_source_mutex_);
       sessions = pose_observer_sessions_;
       replays = pose_observation_replays_;
+      provider_origins = pose_provider_origins_;
     }
-    if (expected) {
-      for (const auto &binding : expected->bindings) {
+    for (const auto &source : configured_sources) {
+      for (const auto &binding : source.bindings) {
         if (!binding.eligible || !selected_resource(binding.object_id))
           continue;
         core::SceneObjectStateDTO object{
@@ -5576,16 +5269,16 @@ private:
         if (!object.exists ||
             (object.attached && latch_policy == "before_planning"))
           continue;
-        const PoseObservationKey key{expected->launch_facts.source_id,
+        const PoseObservationKey key{source.controllable_component_id.value(),
                                      binding.object_id, binding.policy_id};
         const auto policy = EffectivePosePolicy(*bundle, key);
         bool depends_on_source = policy == latch_policy;
         if ((policy == "continuous_unattached" || policy == "continuous" ||
              policy == "continuous_relative_to_attached") &&
             object.provider_evidence) {
-          const auto origin = expected->provider_origins.find(key);
+          const auto origin = provider_origins.find(key);
           depends_on_source =
-              origin != expected->provider_origins.end() &&
+              origin != provider_origins.end() &&
               object.provider_evidence->provider_instance_id ==
                   origin->second.provider_instance_id &&
               object.provider_evidence->provider_manifest_id ==
@@ -5597,17 +5290,9 @@ private:
         }
         if (!depends_on_source)
           continue;
-        requires_managed_source = true;
-        if (!expected->available || !observed_available)
-          return failure(
-              "scene_runtime_pose_source_unavailable",
-              "configured observer cannot provide fresh planning evidence",
-              {{"source_id", key.source_id}, {"object_id", key.object_id}});
         const auto session = sessions.find(key.source_id);
         if (session == sessions.end() ||
-            session->second.runtime_identity != runtime_identity ||
-            !expected->launch_facts.accepts_source_epoch(
-                session->second.source_epoch))
+            session->second.runtime_identity != runtime_identity)
           return failure(
               "scene_runtime_pose_observation_missing",
               "required configured binding has no current observer session",
@@ -5632,15 +5317,24 @@ private:
         if (policy == "continuous_unattached" || policy == "continuous" ||
             policy == "continuous_relative_to_attached") {
           const auto replay = replays.find(key);
+          // The current fresh sample whose application did not complete (for
+          // example a carried-object loss that detached the object at this
+          // observed pose) is applied now, so planning sees it.
+          if (replay != replays.end() &&
+              replay->second.runtime_identity == runtime_identity &&
+              replay->second.observation == observation->observation &&
+              !replay->second.application) {
+            candidates.push_back(LatchCandidate{
+                &replay->second, observation->observation, std::string(policy)});
+            continue;
+          }
           if (replay == replays.end() ||
               replay->second.runtime_identity != runtime_identity ||
               replay->second.observation != observation->observation ||
               !replay->second.application ||
               !object.provider_evidence ||
               !SceneRuntimePoseApplicationRetainsPlanningEvidence(
-                  replay->second.application->status,
-                  object.provider_evidence->provider_source_sequence,
-                  observation->observation.source_sequence))
+                  replay->second.application->status))
             return failure(
                 "scene_runtime_pose_observation_unretained",
                 "continuous planning evidence has no successful exact pose "
@@ -5650,11 +5344,6 @@ private:
       }
     }
 
-    struct LatchCandidate final {
-      PoseObservationReplay *replay{};
-      PoseSourceObservation observation;
-    };
-    std::vector<LatchCandidate> candidates;
     for (const auto &[source_id, session] : sessions) {
       if (session.runtime_identity != runtime_identity) {
         continue;
@@ -5665,7 +5354,11 @@ private:
                                           binding.policy_id}) != latch_policy) {
           continue;
         }
-        if (expected && source_id == expected->launch_facts.source_id) {
+        if (std::any_of(configured_sources.begin(), configured_sources.end(),
+                        [&](const auto &source) {
+                          return source.controllable_component_id.value() ==
+                                 source_id;
+                        })) {
           const auto object = scene_owner_.GetObjectState(
               core::SceneResourceId(binding.object_id));
           if (object.attached && latch_policy == "before_planning")
@@ -5705,8 +5398,8 @@ private:
               "before-planning pose observation has no exact replay record",
               {{"object_id", binding.object_id}, {"source_id", source_id}});
         }
-        candidates.push_back(
-            LatchCandidate{&replay->second, observed->observation});
+        candidates.push_back(LatchCandidate{
+            &replay->second, observed->observation, std::string(latch_policy)});
       }
     }
 
@@ -5740,7 +5433,9 @@ private:
           bundle->value().capability_provider_bindings,
           bundle->retained_bundle_id(),
           bundle->value().cell_graph.graph_revision, candidate.observation,
-          candidate.replay->application, latch_policy);
+          candidate.replay->application, candidate.apply_policy,
+          PoseDeadband(*bundle, candidate.observation.key));
+      RecordCarriedObjectLoss(application, candidate.observation.key.object_id);
       if (!application.ok()) {
         try {
           publish_results();
@@ -5756,9 +5451,9 @@ private:
         ++result.committed_observation_count;
         break;
       case SceneRuntimePoseApplicationStatus::kAlreadyApplied:
-      case SceneRuntimePoseApplicationStatus::kFreshnessConfirmed:
-        // A freshness confirmation keeps the exact current projection, so
-        // the planner synchronizes against the unchanged revision.
+      case SceneRuntimePoseApplicationStatus::kUnchanged:
+        // An unchanged sample keeps the exact current projection, so the
+        // planner synchronizes against the unchanged revision.
         ++result.already_applied_observation_count;
         break;
       case SceneRuntimePoseApplicationStatus::kSkippedAttached:
@@ -5788,7 +5483,7 @@ private:
       }
       if (application.value().status !=
           SceneRuntimePoseApplicationStatus::kSkippedAttached)
-        RetainManagedPoseProviderOrigin(candidate.observation);
+        RetainConfiguredPoseProviderOrigin(candidate.observation);
       candidate.replay->publication_generation.reset();
       applied_records.push_back(candidate.replay);
       ++result.latched_observation_count;
@@ -5804,19 +5499,10 @@ private:
     {
       std::lock_guard lock(manager_source_mutex_);
       const auto current = scene_runtime_owner_.Snapshot();
-      const auto facts = [](const auto &value) {
-        return value
-            ? std::optional<component_manager::ManagerIsaacPoseObserverLaunchFactsDTO>(
-                  value->launch_facts)
-            : std::nullopt;
-      };
       if (!current.runtime_identity ||
-          *current.runtime_identity != runtime_identity ||
-          (requires_managed_source &&
-           (facts(expected) != facts(managed_pose_observer_expectation_) ||
-            !managed_pose_observer_expectation_->available)))
+          *current.runtime_identity != runtime_identity)
         return failure("scene_runtime_observer_session_stale",
-                       "runtime or managed source changed during pose latching");
+                       "runtime changed during pose latching");
     }
     return core::Result<BeforePlanningLatchResult>::Ok(std::move(result));
   }
@@ -6120,9 +5806,6 @@ private:
                     "equal to its summary"));
             return false;
           }
-          std::optional<ManagedIsaacPoseObserverExpectation>
-              original_checked_observer;
-          std::optional<SceneRuntimeIdentity> original_initial_observer_runtime;
           if (!existing.has_value()) {
             if (std::find(deployment_candidate_receipts_.begin(),
                           deployment_candidate_receipts_.end(),
@@ -6195,36 +5878,12 @@ private:
                       "exact preview digest"));
               return false;
             }
-            original_checked_observer = CaptureOriginalApplyPoseObserver(
-                *current_bundle, *candidate_bundle);
-            if (original_checked_observer) {
-              std::lock_guard source_lock(manager_source_mutex_);
-              if (!managed_pose_observer_expectation_) {
-                original_initial_observer_runtime =
-                    scene_runtime_owner_.Snapshot().runtime_identity;
-                Require(original_initial_observer_runtime.has_value(),
-                        "initial Apply observer has no current Scene runtime");
-              }
-            }
           }
           const auto candidate_retained_bundle_id =
               existing.has_value()
                   ? existing->intent.candidate_retained_bundle_id
                   : candidate_receipt.candidate_retained_bundle_id;
           // Q106: configuration Apply never creates/advances lifecycle children.
-          // The old producer remains unwired until the post-M deletion inventory.
-          component_manager::ManagerNamedApplyCoordinator::
-              OriginalPrepareAcknowledgement original_prepare_acknowledgement;
-          if (!existing && original_initial_observer_runtime) {
-            original_prepare_acknowledgement =
-                [this, checked = *original_checked_observer,
-                 expected_runtime = *original_initial_observer_runtime](
-                    const auto &intent, const auto &candidate,
-                    const auto &prepared) {
-                  ActivateInitialApplyPoseObserver(checked, expected_runtime,
-                                                   intent, candidate, prepared);
-                };
-          }
           const auto result = named_apply_.AcceptOrReplay(
               {
                   core::PublicRequestContextDTO{
@@ -6241,14 +5900,9 @@ private:
                   *command.prepared_activation,
                   command.expected_admission_generation,
                   command.parent_authoring_claim,
-                  existing.has_value()
-                      ? existing->intent.isaac_pose_observer_launch_facts
-                  : original_checked_observer
-                      ? std::optional(original_checked_observer->launch_facts)
-                      : std::nullopt,
                   command.scene_initialization,
               },
-              {}, std::move(original_prepare_acknowledgement));
+              {});
           TrySendResponse(client.get(), ApplyResponse(command, result));
           if (result.state ==
                   component_manager::ManagerNamedApplyResultState::kPending &&
@@ -6417,13 +6071,6 @@ private:
                   "scene-runtime observer targets an inactive runtime"));
           return false;
         }
-        if (!ManagedPoseObserverCommandMatchesLocked(command, true)) {
-          source_lock.unlock();
-          TrySendResponse(client.get(),
-              ErrorResponse("scene_runtime_observer_session_stale",
-                            "managed observer Open differs from its checked source, bindings or current base"));
-          return false;
-        }
         auto found = pose_observer_sessions_.find(*command.pose_source_id);
         if (found == pose_observer_sessions_.end() &&
             pose_observer_sessions_.size() >= kMaximumPoseObserverSessions) {
@@ -6525,13 +6172,6 @@ private:
               ErrorResponse(
                   "scene_runtime_identity_changed",
                   "pose observation targets an inactive scene runtime"));
-          return false;
-        }
-        if (!ManagedPoseObserverCommandMatchesLocked(command, false)) {
-          source_lock.unlock();
-          TrySendResponse(client.get(),
-              ErrorResponse("scene_runtime_observer_session_stale",
-                            "managed observation names an obsolete source epoch base"));
           return false;
         }
         const auto session =
@@ -6681,8 +6321,8 @@ private:
             record.application->status ==
                 SceneRuntimePoseApplicationStatus::kAlreadyApplied ||
             record.application->status ==
-                SceneRuntimePoseApplicationStatus::kFreshnessConfirmed))
-          RetainManagedPoseProviderOrigin(record.observation);
+                SceneRuntimePoseApplicationStatus::kUnchanged))
+          RetainConfiguredPoseProviderOrigin(record.observation);
         if (applied_now && record.application->status ==
             SceneRuntimePoseApplicationStatus::kCommitted)
           TryPublishLogicalScene();
@@ -6784,8 +6424,6 @@ private:
   }
 
   DaemonConfig config_;
-  // Own the startup value and exact document before constructing child adapters.
-  std::optional<LoadedIsaacSiteSettings> isaac_site_settings_;
   std::chrono::steady_clock::time_point started_at_;
   ManagerPackageGeneration package_generation_;
   DaemonLock daemon_lock_;
@@ -6814,9 +6452,12 @@ private:
   std::shared_ptr<const deployment::RetainedBundle> last_active_bundle_;
   core::RuntimeEpoch manager_runtime_epoch_;
   component_manager::ManagerNamedApplyCoordinator named_apply_;
-  // Guarded by manager_source_mutex_. Publication/session adoption does not
-  // retire the cell observer or erase its checked per-spawn expectation.
-  std::optional<ManagedIsaacPoseObserverExpectation> managed_pose_observer_expectation_;
+  // Guarded by manager_source_mutex_. The active bundle's pose-source rows
+  // and the provider origins of their configured bindings, updated after
+  // actual pose commits.
+  std::vector<ConfiguredPoseSource> configured_pose_sources_;
+  std::map<PoseObservationKey, core::SceneObjectProviderEvidenceDTO>
+      pose_provider_origins_;
   SceneRuntimeStateOwner scene_runtime_owner_;
   AtomicSourceSnapshotChannel manager_channel_;
   AtomicSourceSnapshotChannel scene_channel_;
@@ -6894,8 +6535,6 @@ DaemonConfig ParseArguments(const int argc, char **argv) {
   bool program_runner_liveness = false;
   bool period = false;
   bool scene_asset = false;
-  bool isaac_site_settings = false;
-  bool isaac_pose_observer_executable = false;
   for (int index = 1; index < argc; index += 2) {
     Require(index + 1 < argc, "every option requires one value");
     const std::string_view option(argv[index]);
@@ -6937,14 +6576,6 @@ DaemonConfig ParseArguments(const int argc, char **argv) {
     } else if (option == "--scene-asset-root" && !scene_asset) {
       config.scene_asset_root = value;
       scene_asset = true;
-    } else if (option == "--isaac-site-settings" && !isaac_site_settings) {
-      Require(!value.empty(), "--isaac-site-settings requires one explicit path");
-      config.isaac_site_settings_path = value;
-      isaac_site_settings = true;
-    } else if (option == "--isaac-pose-observer-executable" && !isaac_pose_observer_executable) {
-      Require(!value.empty(), "--isaac-pose-observer-executable requires the installed executable path");
-      config.isaac_pose_observer_executable = value;
-      isaac_pose_observer_executable = true;
     } else if (option == "--reconciliation-period-ms" && !period) {
       config.reconciliation_period =
           std::chrono::milliseconds(ParsePeriod(value));

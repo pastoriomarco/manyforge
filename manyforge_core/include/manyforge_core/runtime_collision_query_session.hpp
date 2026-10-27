@@ -25,7 +25,6 @@ enum class RuntimeCollisionTickReason {
   kBundleUnavailable,
   kBundleCapacityExceeded,
   kBundleLookupOrderInvalid,
-  kProjectionMismatch,
   kPolicyUnavailable,
   kPolicyIndexMismatch,
   kPolicyCapacityExceeded,
@@ -116,8 +115,7 @@ class RuntimeCollisionQuerySession final {
   RuntimeCollisionQuerySession(
       RuntimeCollisionStateProjection projection, ICollisionWorldSnapshotPublisher& publisher,
       std::shared_ptr<ICollisionQueryEngine> engine, std::string active_contact_policy_id,
-      std::int64_t query_timeout_ns,
-      std::optional<ProjectionRevisionDTO> admission_projection_revision = std::nullopt);
+      std::int64_t query_timeout_ns);
 
   [[nodiscard]] std::optional<ErrorDTO> prepare(
       const RuntimeCollisionQueryBundlePtr& initial_bundle);
@@ -162,8 +160,6 @@ class RuntimeCollisionQuerySession final {
   const CollisionEngineCapabilityDescriptor* capability_ = nullptr;
   std::string active_contact_policy_id_;
   std::int64_t query_timeout_ns_ = 0;
-  std::optional<ProjectionRevisionDTO> admission_projection_revision_;
-  std::optional<ProjectionRevisionDTO> latest_projection_revision_;
   std::vector<double> query_positions_rad_;
   // Pin the publisher's complete reclamation unit. Keeping only policy/index
   // sub-handles would hide their last-owner transition from NRT bundle

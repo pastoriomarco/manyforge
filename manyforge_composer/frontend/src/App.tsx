@@ -531,12 +531,17 @@ export default function App() {
     try {
       const preparation: ClosePreparationInputs | undefined = confirmed === undefined ? undefined : { confirmed,
         reset: (options) => latestProgramRuntime.current.reset(options),
-        readResetSnapshot: () => resetCloseSnapshot(headlessStateSource.getShellSnapshot()),
+        // Close detaches with the latest attachment and Scene revisions; the
+        // shell snapshot does not follow pose-only Scene commits.
+        readResetSnapshot: () => resetCloseSnapshot({
+          ...headlessStateSource.getShellSnapshot(), snapshot: headlessStateSource.getLatestSnapshot(),
+        }),
         readSnapshot: () => {
           const current = headlessStateSource.getShellSnapshot();
-          if (current.snapshot === null || current.transportStatus !== 'connected' || current.semanticStatus !== 'current')
+          const latest = headlessStateSource.getLatestSnapshot();
+          if (latest === null || current.transportStatus !== 'connected' || current.semanticStatus !== 'current')
             throw new Error('Control source is unavailable; Close is unresolved.');
-          return current.snapshot;
+          return latest;
         },
       };
       return await closeCurrentScenario({ expected, signal: abort.signal,

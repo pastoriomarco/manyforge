@@ -6,6 +6,7 @@
 #include <cstdint>
 #include <functional>
 #include <manyforge_core/component_lifecycle_coordinator.hpp>
+#include <manyforge_core/component_stream_health.hpp>
 #include <manyforge_core/ports/icclc_brand_lifecycle_port_resolver.hpp>
 #include <manyforge_core/ports/icclc_current_component_snapshot_source.hpp>
 #include <manyforge_core/ports/icclc_journal.hpp>
@@ -37,8 +38,11 @@ namespace manyforge::core {
 
 struct CCLCLifecycleTargetDriverConfig final {
   bool enabled{true};
-  /// Low-rate fallback re-evaluation when no event arrives.
-  std::int64_t fallback_period_ns{1'000'000'000LL};
+  /// Re-evaluation period while a component waits for its target (not yet
+  /// satisfied, no open incident) or a durable write is pending. A settled
+  /// cell has no timer: adapter bad news is pushed (CP9 stream health wakes
+  /// the driver).
+  std::int64_t waiting_poll_period_ns{1'000'000'000LL};
   /// Status re-read period while one of the driver's transactions is open.
   std::int64_t in_flight_poll_period_ns{100'000'000LL};
   /// Readiness expectation ("slower than expected"): presentation only.
@@ -55,6 +59,12 @@ struct CCLCLifecycleTargetDriverConfig final {
   std::vector<LifecycleIncidentRecoveryPolicyDTO> incident_recovery_policy{
       DefaultLifecycleIncidentRecoveryPolicy()};
 
+  /// CP9 stream health of this process's adapters (optional). The driver
+  /// reads verdicts per pass, reports health in the target view and clears
+  /// `ack` latches on the operator's Recover; the composition wires its
+  /// listener (Kernel hold + `Wake`).
+  std::shared_ptr<ComponentStreamHealth> stream_health{};
+
   /// Optional host-owned scalar counts, read only by explicit status requests.
   /// No tail capture, lifecycle authority or health consequence; unavailable
   /// and throwing sources omit both informational fields.
@@ -63,7 +73,7 @@ struct CCLCLifecycleTargetDriverConfig final {
       read_output_drop_counts{};
 
   [[nodiscard]] bool locally_valid() const noexcept {
-    return fallback_period_ns > 0 && in_flight_poll_period_ns > 0 &&
+    return waiting_poll_period_ns > 0 && in_flight_poll_period_ns > 0 &&
            readiness_expectation_ns > 0 && maximum_attempts_per_step > 0U &&
            rejection_retry_after_ns > 0;
   }
@@ -267,9 +277,10 @@ using CCLCProgramResetPositionAction =
 /// nothing changed submits and writes nothing.
 ///
 /// Evaluation runs on one owned worker thread. Wakeups are event-driven
-/// (`Wake`: observation publication, transaction terminal, target change)
-/// with a scheduler-timed fallback; `RunOnce` performs one pass inline for
-/// deterministic tests.
+/// (`Wake`: operator request, stream-health verdict, target change). A
+/// scheduler-timed re-check runs only while a transaction is in flight or a
+/// component still waits; a settled cell is not polled. `RunOnce` performs
+/// one pass inline for deterministic tests.
 class CCLCLifecycleTargetDriver final {
  public:
   CCLCLifecycleTargetDriver(CCLCLifecycleTargetDriverConfig config,
@@ -281,10 +292,10 @@ class CCLCLifecycleTargetDriver final {
   CCLCLifecycleTargetDriver(const CCLCLifecycleTargetDriver&) = delete;
   CCLCLifecycleTargetDriver& operator=(const CCLCLifecycleTargetDriver&) = delete;
 
-  /// Start the worker and the fallback timer. A disabled driver starts
+  /// Start the worker (first pass at once). A disabled driver starts
   /// nothing and only answers target reads.
   [[nodiscard]] Result<void> Start();
-  /// Stop the worker and cancel the fallback timer. Idempotent.
+  /// Stop the worker and cancel the re-check timer. Idempotent.
   void Stop() noexcept;
 
   /// One synchronous evaluation pass over every present target.
@@ -302,10 +313,9 @@ class CCLCLifecycleTargetDriver final {
   [[nodiscard]] Result<ComponentLifecycleReadinessTargetFactsDTO> ReadReadinessFacts(
       const ControllableComponentId& component);
 
-  /// Recovery guard across all component and cell-observer incidents in the
-  /// same journal/owner (134), including removed/unrecorded components. Pure
-  /// read; no configured-product subset, fabricated generation or new owner.
-  /// Component Recover and observer BringUp retain their distinct authority.
+  /// Recovery guard across all component incidents in the same journal/owner
+  /// (134), including removed/unrecorded components. Pure read; no
+  /// configured-product subset, fabricated generation or new owner.
   [[nodiscard]] Result<void> CheckNoOpenIncidents();
 
   /// The operator's Recover of an open incident (contract item 3): an
@@ -412,6 +422,8 @@ class CCLCLifecycleTargetDriver final {
     /// Positive target-fence refusal of the original marker; owner-local
     /// presentation only, retained until the other obligations settle.
     bool retired_reached_observation{};
+    /// CP9 stream verdict read at the start of this pass.
+    ComponentStreamVerdictDTO streams;
   };
   /// The Kernel's answer to one incident's containment request.
   struct ContainmentOutcome final {
@@ -496,7 +508,11 @@ class CCLCLifecycleTargetDriver final {
                              std::map<ControlDomainId, LifecycleBlockingCauseClassDTO>& retained);
   [[nodiscard]] Result<bool> WriteReached(const ComponentLifecycleTargetExpectationDTO& expected_target,
                                           std::uint64_t recovery_generation);
-  void ScheduleFallback(std::int64_t delay_ns);
+  /// Arms the re-check timer, or cancels it when `delay_ns` is absent.
+  void ScheduleRecheck(std::optional<std::int64_t> delay_ns);
+  /// True while the component's state can progress without an event
+  /// (waiting for its target, or a durable write to retry).
+  [[nodiscard]] static bool Waiting(const ComponentState& state) noexcept;
   void WorkerLoop();
 
   struct WakeState final {
@@ -516,6 +532,7 @@ class CCLCLifecycleTargetDriver final {
   mutable std::mutex state_mutex_;
   std::map<ControllableComponentId, ComponentState> components_;
   bool any_in_flight_{};
+  bool any_waiting_{};
   // Protected by run_mutex_ for use/mutation, state_mutex_ for readiness reads.
   std::shared_ptr<ProgramResetPositionScope> program_reset_position_scope_;
   /// Containment outcomes of incidents this driver already contained (run
@@ -523,8 +540,8 @@ class CCLCLifecycleTargetDriver final {
   std::map<std::string, ContainmentOutcome> containments_;
 
   std::shared_ptr<WakeState> wake_;
-  std::mutex fallback_mutex_;
-  std::optional<ScheduleHandle> fallback_handle_;
+  std::mutex recheck_mutex_;
+  std::optional<ScheduleHandle> recheck_handle_;
   std::thread worker_;
 };
 

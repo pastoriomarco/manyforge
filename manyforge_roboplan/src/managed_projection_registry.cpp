@@ -253,10 +253,6 @@ public:
                   resolved.error()};
             }
             return std::move(resolved.value());
-          } else if constexpr (
-              std::is_same_v<T, component_manager::detail::
-                                    NativeProjectionProviderFreshnessRequest>) {
-            return ApplyProviderFreshness(value);
           } else {
             static_assert(
                 std::is_same_v<T, component_manager::detail::
@@ -468,7 +464,7 @@ public:
       }
       const auto health = projection->ProjectionHealth();
       if (health.native_runtime_binding != binding ||
-          !health.healthy_for_target(expected)) {
+          !health.healthy_for_identity(expected)) {
         ReportProjectionReadiness("not healthy " + key.first.value());
         return false;
       }
@@ -551,7 +547,7 @@ public:
     for (const auto &[binding, projection] : required) {
       const auto health = projection->ProjectionHealth();
       Require(health.native_runtime_binding == binding &&
-                  health.healthy_for_target(expected),
+                  health.healthy_for_identity(expected),
               "active frame-resolver set contains a stale projection");
     }
     for (const auto &[_, projection] : required) {
@@ -1006,36 +1002,6 @@ private:
     return result;
   }
 
-  /// Freshness-only publication on the exact projection revision. It never
-  /// waits for or overtakes progressing projection work: a pending rebuild or
-  /// bootstrap on that projection refuses the confirmation, which the owner
-  /// then does not record.
-  [[nodiscard]] component_manager::detail::NativeProjectionRpcResponse
-  ApplyProviderFreshness(
-      const component_manager::detail::NativeProjectionProviderFreshnessRequest
-          &request) {
-    Require(request.valid(),
-            "native projection provider freshness request is invalid");
-    const auto &confirmation = request.confirmation;
-    auto projection =
-        RevisionHandle(request.native_runtime_binding,
-                       confirmation.expected_projection_revision);
-    if (WorkPendingFor(Key(request.native_runtime_binding), projection)) {
-      return component_manager::detail::NativeProjectionRpcFailure{
-          PendingOperationError("provider_freshness",
-                                request.native_runtime_binding)};
-    }
-    auto applied = projection->ApplyProviderFreshness(confirmation);
-    if (!applied.ok()) {
-      return component_manager::detail::NativeProjectionRpcFailure{
-          applied.error()};
-    }
-    return component_manager::detail::NativeProjectionProviderFreshnessResult{
-        confirmation.expected_projection_revision,
-        confirmation.scene_resource_id,
-        confirmation.evidence.provider_source_sequence};
-  }
-
   [[nodiscard]] core::NativeProjectionBootstrapRebuildResultDTO
   BootstrapRebuild(const core::NativeProjectionBootstrapRebuildDTO &request) {
     Require(request.valid(), "native projection bootstrap rebuild is invalid");
@@ -1433,7 +1399,7 @@ private:
                 request.native_runtime_binding.provider_binding_id.value() +
                 ".epoch." + config_.runtime_epoch + ".model." +
                 std::to_string(incarnation),
-            256U, RetainedCollisionWorldPublisher::kDefaultLedgerCapacity},
+            256U},
         clock_);
     if (!created.ok()) {
       Fail("native projection construction failed: " +

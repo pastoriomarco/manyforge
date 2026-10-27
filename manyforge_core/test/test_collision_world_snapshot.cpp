@@ -235,34 +235,6 @@ TEST(CollisionWorldSnapshotBuilder, ContentHashChangesWhenBoxDimensionsChange) {
   EXPECT_NE(r1.value().revision.content_hash, r2.value().revision.content_hash);
 }
 
-TEST(CollisionWorldSnapshotBuilder, SourceTimestampDoesNotChangeContentHash) {
-  CollisionWorldBody a = make_component_body("link1");
-  a.source_timestamp_ns = 100;
-  a.source_freshness_budget_ns = 50'000'000;
-  CollisionWorldBody b = a;
-  b.source_timestamp_ns = 200;
-
-  auto r1 = fresh_builder().add_body(std::move(a)).build();
-  auto r2 = fresh_builder().add_body(std::move(b)).build();
-  ASSERT_TRUE(r1.ok());
-  ASSERT_TRUE(r2.ok());
-  EXPECT_EQ(r1.value().revision.content_hash, r2.value().revision.content_hash);
-}
-
-TEST(CollisionWorldSnapshotBuilder, ContentHashChangesWhenFreshnessBudgetChanges) {
-  CollisionWorldBody a = make_component_body("link1");
-  a.source_timestamp_ns = 100;
-  a.source_freshness_budget_ns = 50'000'000;
-  CollisionWorldBody b = a;
-  b.source_freshness_budget_ns = 100'000'000;
-
-  auto r1 = fresh_builder().add_body(std::move(a)).build();
-  auto r2 = fresh_builder().add_body(std::move(b)).build();
-  ASSERT_TRUE(r1.ok());
-  ASSERT_TRUE(r2.ok());
-  EXPECT_NE(r1.value().revision.content_hash, r2.value().revision.content_hash);
-}
-
 TEST(CollisionWorldSnapshotBuilder, RecomputesCallerProvidedBodyContentHash) {
   CollisionWorldBody body = make_component_body("link1");
   const auto body_hash = compute_collision_world_body_content_hash(body);
@@ -394,31 +366,6 @@ TEST(CollisionWorldSnapshotBuilder, RejectsNegativeEmissionTime) {
   auto result =
       fresh_builder().set_emitted_at_ns(-1).add_body(make_component_body("link1")).build();
   ASSERT_FALSE(result.ok());
-}
-
-TEST(CollisionWorldSnapshotBuilder, RejectsBodyFreshnessBudgetWithoutTimestamp) {
-  CollisionWorldBody body = make_component_body("link1");
-  body.source_freshness_budget_ns = 50'000'000;
-  auto result = fresh_builder().add_body(std::move(body)).build();
-  ASSERT_FALSE(result.ok());
-  EXPECT_EQ(result.error().code, "invariant_violation");
-}
-
-TEST(CollisionWorldSnapshotBuilder, RejectsNegativeBodySourceTimestamp) {
-  CollisionWorldBody body = make_component_body("link1");
-  body.source_timestamp_ns = -1;
-  auto result = fresh_builder().add_body(std::move(body)).build();
-  ASSERT_FALSE(result.ok());
-  EXPECT_EQ(result.error().code, "invariant_violation");
-}
-
-TEST(CollisionWorldSnapshotBuilder, RejectsNonPositiveBodyFreshnessBudget) {
-  CollisionWorldBody body = make_component_body("link1");
-  body.source_timestamp_ns = 100;
-  body.source_freshness_budget_ns = 0;
-  auto result = fresh_builder().add_body(std::move(body)).build();
-  ASSERT_FALSE(result.ok());
-  EXPECT_EQ(result.error().code, "invariant_violation");
 }
 
 TEST(CollisionWorldSnapshotBuilder, RejectsInvalidComponentModelFrame) {
@@ -623,59 +570,6 @@ TEST(CollisionWorldSnapshotBuilder, PerBodyContentHashChangesIndependentlyOfOthe
   EXPECT_NE(r1.value().bodies[1].body_content_hash, r2.value().bodies[1].body_content_hash);
   // World hash differs because link_b changed.
   EXPECT_NE(r1.value().revision.content_hash, r2.value().revision.content_hash);
-}
-
-TEST(CollisionWorldSnapshotBuilder, RuntimeFreshnessSidecarOverridesSnapshotTimestamp) {
-  auto body = make_scene_resource("dynamic_box");
-  body.source_id = "vision";
-  body.source_timestamp_ns = 0;
-  body.source_freshness_budget_ns = 100;
-  auto result = fresh_builder().add_body(body).build();
-  ASSERT_TRUE(result.ok());
-
-  CollisionWorldBodyFreshness freshness;
-  freshness.body_id = body.body_id;
-  freshness.source_id = "vision";
-  freshness.source_timestamp_ns = 950;
-  freshness.source_freshness_budget_ns = 100;
-  std::vector<CollisionWorldBodyFreshness> sidecar{freshness};
-
-  std::map<std::string, std::string> details;
-  EXPECT_FALSE(
-      validate_dynamic_body_freshness(result.value(), sidecar, 1'000, 1'000, details).has_value());
-  EXPECT_EQ(details.at("dynamic_body_source_timestamp_ns"), "950");
-}
-
-TEST(CollisionWorldSnapshotBuilder, RuntimeFreshnessSidecarFailsClosedWhenUnsorted) {
-  auto body_a = make_scene_resource("dynamic_box_a");
-  body_a.source_id = "vision";
-  body_a.source_timestamp_ns = 0;
-  body_a.source_freshness_budget_ns = 100;
-  auto body_b = make_scene_resource("dynamic_box_b");
-  body_b.source_id = "vision";
-  body_b.source_timestamp_ns = 0;
-  body_b.source_freshness_budget_ns = 100;
-  auto result = fresh_builder().add_body(body_a).add_body(body_b).build();
-  ASSERT_TRUE(result.ok());
-
-  CollisionWorldBodyFreshness freshness_b;
-  freshness_b.body_id = body_b.body_id;
-  freshness_b.source_id = "vision";
-  freshness_b.source_timestamp_ns = 950;
-  freshness_b.source_freshness_budget_ns = 100;
-  CollisionWorldBodyFreshness freshness_a;
-  freshness_a.body_id = body_a.body_id;
-  freshness_a.source_id = "vision";
-  freshness_a.source_timestamp_ns = 950;
-  freshness_a.source_freshness_budget_ns = 100;
-  std::vector<CollisionWorldBodyFreshness> sidecar{freshness_b, freshness_a};
-
-  std::map<std::string, std::string> details;
-  const auto reason =
-      validate_dynamic_body_freshness(result.value(), sidecar, 1'000, 1'000, details);
-  ASSERT_TRUE(reason.has_value());
-  EXPECT_EQ(*reason, "dynamic_body_freshness_sidecar_not_sorted");
-  EXPECT_EQ(details.at("dynamic_body_freshness_sidecar_status"), "unsorted");
 }
 
 }  // namespace

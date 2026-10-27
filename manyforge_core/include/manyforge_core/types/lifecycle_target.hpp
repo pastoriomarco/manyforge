@@ -1,5 +1,6 @@
 #pragma once
 
+#include <manyforge_core/component_stream_health.hpp>
 #include <cstdint>
 #include <limits>
 #include <manyforge_core/types/component_incident.hpp>
@@ -216,6 +217,8 @@ struct ComponentLifecycleTargetViewDTO final {
   /// resets them. Both absent when unavailable, with no lifecycle/health effect.
   std::optional<std::uint64_t> dropped_output_lines{};
   std::optional<std::uint64_t> dropped_output_bytes{};
+  /// CP9 health of the component's declared streams; empty when none.
+  std::vector<StreamHealthDTO> stream_health{};
 
   friend bool operator==(const ComponentLifecycleTargetViewDTO&,
                          const ComponentLifecycleTargetViewDTO&) = default;

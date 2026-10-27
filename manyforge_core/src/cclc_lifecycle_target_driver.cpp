@@ -257,9 +257,12 @@ struct DomainObservation final {
 
 [[nodiscard]] std::string IncidentSummary(const ControllableComponentId& component,
                                           const LifecycleBlockingCauseClassDTO cause,
-                                          const std::vector<std::string>& vendor_codes) {
+                                          const std::vector<std::string>& vendor_codes,
+                                          const std::string& stream_condition = {}) {
   std::string summary = "Component " + component.value() + " " +
                         std::string(IncidentDescription(cause)) + ".";
+  // CP9: name the stream (its condition text already names the component).
+  if (!stream_condition.empty()) summary += " " + stream_condition;
   if (!vendor_codes.empty()) {
     summary += " Vendor codes:";
     for (const auto& code : vendor_codes) summary += " " + code;
@@ -494,11 +497,7 @@ void CCLCLifecycleTargetDriver::Stop() noexcept {
   }
   wake_->condition.notify_all();
   if (worker_.joinable()) worker_.join();
-  std::lock_guard lock(fallback_mutex_);
-  if (fallback_handle_) {
-    scheduler_.cancel(*fallback_handle_);
-    fallback_handle_.reset();
-  }
+  ScheduleRecheck(std::nullopt);
 }
 
 void CCLCLifecycleTargetDriver::Wake() noexcept {
@@ -509,17 +508,18 @@ void CCLCLifecycleTargetDriver::Wake() noexcept {
   wake_->condition.notify_all();
 }
 
-void CCLCLifecycleTargetDriver::ScheduleFallback(const std::int64_t delay_ns) {
-  std::lock_guard lock(fallback_mutex_);
-  if (fallback_handle_) scheduler_.cancel(*fallback_handle_);
-  fallback_handle_.reset();
+void CCLCLifecycleTargetDriver::ScheduleRecheck(const std::optional<std::int64_t> delay_ns) {
+  std::lock_guard lock(recheck_mutex_);
+  if (recheck_handle_) scheduler_.cancel(*recheck_handle_);
+  recheck_handle_.reset();
+  if (!delay_ns) return;
   const std::int64_t now = clock_.now();
   const std::int64_t deadline =
-      now > std::numeric_limits<std::int64_t>::max() - delay_ns ? now : now + delay_ns;
+      now > std::numeric_limits<std::int64_t>::max() - *delay_ns ? now : now + *delay_ns;
   // The callback only signals the worker; it never evaluates on the
   // scheduler lane and survives the driver through the shared wake state.
   std::weak_ptr<WakeState> weak = wake_;
-  fallback_handle_ = scheduler_.schedule(
+  recheck_handle_ = scheduler_.schedule(
       deadline,
       [weak] {
         if (const auto wake = weak.lock()) {
@@ -533,6 +533,24 @@ void CCLCLifecycleTargetDriver::ScheduleFallback(const std::int64_t delay_ns) {
       SchedulerPriority::Lifecycle);
 }
 
+bool CCLCLifecycleTargetDriver::Waiting(const ComponentState& state) noexcept {
+  if (state.unrecorded_incident || !state.unrecorded_causes.empty() || state.unrecorded_reached)
+    return true;
+  if (!state.progress) return false;
+  switch (state.progress->phase) {
+    case LifecycleProgressPhaseDTO::kSatisfied:
+      // At the target with a cause: not reached yet (still waiting).
+      return state.progress->blocking_cause_class != LifecycleBlockingCauseClassDTO::kNone;
+    case LifecycleProgressPhaseDTO::kCancelled:
+      return false;
+    case LifecycleProgressPhaseDTO::kBlocked:
+      // An open incident waits for the operator's Recover (an event).
+      return !state.progress->incident.has_value();
+    default:
+      return true;
+  }
+}
+
 void CCLCLifecycleTargetDriver::WorkerLoop() {
   for (;;) {
     {
@@ -544,15 +562,16 @@ void CCLCLifecycleTargetDriver::WorkerLoop() {
     try {
       RunOnce();
     } catch (...) {
-      // A failed pass is retried on the next event or fallback tick.
+      // A failed pass is retried on the next event or re-check.
     }
-    bool in_flight = false;
+    std::optional<std::int64_t> recheck;
     {
       std::lock_guard lock(state_mutex_);
-      in_flight = any_in_flight_;
+      if (any_in_flight_) recheck = config_.in_flight_poll_period_ns;
+      else if (any_waiting_) recheck = config_.waiting_poll_period_ns;
     }
     try {
-      ScheduleFallback(in_flight ? config_.in_flight_poll_period_ns : config_.fallback_period_ns);
+      ScheduleRecheck(recheck);
     } catch (...) {
     }
   }
@@ -734,6 +753,7 @@ void CCLCLifecycleTargetDriver::RunOnce() {
   if (pinned.ok()) return;
   const auto now = clock_.now();
   std::lock_guard lock(state_mutex_);
+  any_waiting_ = true;  // re-checked until the product is available again
   // Preserve in-flight and unrecorded facts. Pending product exchange grants
   // no new step; journal/status ports remain available independently.
   for (auto& [component, state] : components_) {
@@ -758,6 +778,7 @@ void CCLCLifecycleTargetDriver::RunOncePinned(ICCLCLifecycleTargetDriverPorts& p
     // component shows why nothing progresses, and its in-memory retries
     // (unrecorded causes, reached marker, incident record) are kept.
     std::lock_guard lock(state_mutex_);
+    any_waiting_ = true;  // re-checked until the targets are readable again
     for (auto& [component, state] : components_) {
       // `blocked` always names its next intent (spec 210 §3.17): the one in
       // progress, otherwise the one toward the last target read.
@@ -782,6 +803,7 @@ void CCLCLifecycleTargetDriver::RunOncePinned(ICCLCLifecycleTargetDriverPorts& p
   }
   std::map<ControllableComponentId, ComponentState> next;
   bool in_flight = false;
+  bool waiting = false;
   for (const auto& target : targets.value()) {
     auto [found, inserted] = states.try_emplace(target.controllable_component_id);
     if (inserted) {
@@ -793,11 +815,13 @@ void CCLCLifecycleTargetDriver::RunOncePinned(ICCLCLifecycleTargetDriverPorts& p
   for (auto& [component, state] : states) {
     if (!EvaluateComponent(ports, component, state, now)) continue;
     in_flight = in_flight || state.in_flight.has_value() || state.pending_intent.has_value();
+    waiting = waiting || Waiting(state);
     next.emplace(component, std::move(state));
   }
   std::lock_guard lock(state_mutex_);
   components_ = std::move(next);
   any_in_flight_ = in_flight;
+  any_waiting_ = waiting;
 }
 
 void CCLCLifecycleTargetDriver::Publish(ComponentState& state, const LifecycleProgressPhaseDTO phase,
@@ -1172,6 +1196,17 @@ bool CCLCLifecycleTargetDriver::EvaluateIncident(
                                           value.facts});
     }
   }
+  // CP9 bad news pushed by an adapter: a fresh `fault` in every state, like
+  // a vendor fault; it is kept until the operator's Recover.
+  bool stream_diagnostic = false;
+  if (state.streams.fault_event && !intervention_fresh) {
+    stream_diagnostic = true;
+    intervention = LifecycleBlockingCauseClassDTO::kFault;
+    intervention_fresh = true;
+    diagnostic = state.streams.fault_event;
+    diagnostic_snapshot = nullptr;
+    codes.clear();
+  }
   if (!trigger && !conditions.empty()) trigger = conditions.front().control_domain_id;
   // Whether a loss is attributable follows the durable `reached` marker
   // (`kAny`), which a component retained unchanged across an Apply or an
@@ -1187,6 +1222,13 @@ bool CCLCLifecycleTargetDriver::EvaluateIncident(
                    ? intervention
                : any_mode && lost ? LifecycleBlockingCauseClassDTO::kProviderLost
                                   : LifecycleBlockingCauseClassDTO::kNone;
+  // CP9: a `fault` stream that is not live is a loss of the component.
+  if (cause == LifecycleBlockingCauseClassDTO::kNone && any_mode && state.streams.fault_loss) {
+    cause = LifecycleBlockingCauseClassDTO::kProviderLost;
+    stream_diagnostic = true;
+    diagnostic = state.streams.fault_loss;
+    diagnostic_snapshot = nullptr;
+  }
   bool loss = cause == LifecycleBlockingCauseClassDTO::kProviderLost;
   // A verified loss the observations do not explain is still an incident.
   if (cause == LifecycleBlockingCauseClassDTO::kNone && any_mode &&
@@ -1285,7 +1327,8 @@ bool CCLCLifecycleTargetDriver::EvaluateIncident(
       cause,
       codes,
       now_ns,
-      IncidentSummary(target.controllable_component_id, cause, codes),
+      IncidentSummary(target.controllable_component_id, cause, codes,
+                      stream_diagnostic && diagnostic ? diagnostic->message : std::string()),
       std::nullopt,
       {},
       ComponentIncidentContainmentStateDTO::kPending,
@@ -1496,6 +1539,9 @@ bool CCLCLifecycleTargetDriver::EvaluateComponent(ICCLCLifecycleTargetDriverPort
   const auto& actual_target = facts.value().target;
   const bool retired = !actual_target || actual_target->target_generation != state.target_generation;
   state.recovery_generation = facts.value().recovery_generation;
+  // CP9: pushed stream health, read once per pass (no observation pull).
+  state.streams = config_.stream_health ? config_.stream_health->Verdict(component)
+                                        : ComponentStreamVerdictDTO{};
 
   // Retry what earlier passes observed but could not record (fail closed).
   // An intervention class keeps blocking from memory until it is durable; a
@@ -1705,6 +1751,15 @@ bool CCLCLifecycleTargetDriver::EvaluateComponent(ICCLCLifecycleTargetDriverPort
     // retained cause: from now on a loss or an unexpected change is an
     // incident (and a recovered incident is over).
     std::optional<std::string> reached_reason;
+    // CP9: a `fault` stream that is not live (or a pending fault event)
+    // keeps the target unreached; before that it is ordinary waiting.
+    if (state.streams.fault_loss || state.streams.fault_event) {
+      all_fresh_without_cause = false;
+      if (state.streams.fault_loss) {
+        cause = Worst(cause, LifecycleBlockingCauseClassDTO::kAvailability);
+        reached_reason = state.streams.fault_loss->message;
+      }
+    }
     if (following && !target.reached && all_fresh_without_cause) {
       const auto written = WriteReached({component, target.target_generation}, state.recovery_generation);
       if (!written.ok() && ReachedTargetRetired(written.error())) {
@@ -1903,7 +1958,7 @@ Result<void> CCLCLifecycleTargetDriver::CheckNoOpenIncidents() {
   if (!open.ok()) return Result<void>::Err(open.error());
   if (open.value())
     return Result<void>::Err(driver_error("incident_open",
-        "A component or cell-observer incident remains open", "incident_open"));
+        "A component incident remains open", "incident_open"));
   std::vector<std::pair<ControllableComponentId, std::uint64_t>> unrecorded;
   {
     std::lock_guard state_lock(state_mutex_);
@@ -1991,6 +2046,7 @@ Result<ComponentLifecycleTargetViewDTO> CCLCLifecycleTargetDriver::ReadTargetVie
     }
   }
   view.target = target.value();
+  if (config_.stream_health) view.stream_health = config_.stream_health->Read(component);
   {
     std::lock_guard lock(state_mutex_);
     const auto found = components_.find(component);
@@ -2070,6 +2126,11 @@ Result<std::optional<CCLCLifecycleRequestResultDTO>> CCLCLifecycleTargetDriver::
     // Ordinary CCLC admission decides (and rejects an invalid one).
     return Result<Value>::Ok(std::nullopt);
   }
+  // CP9: the operator's Recover acknowledges the component's stream
+  // conditions (`ack` latches, pending fault events). A stream that is still
+  // not live keeps holding by itself.
+  const bool stream_latch_cleared =
+      config_.stream_health && config_.stream_health->Acknowledge(intent.controllable_component_id);
   auto result = Result<Value>::Ok(std::nullopt);
   const auto pinned = ports_.WithPinnedProduct([&](ICCLCLifecycleTargetDriverPorts& ports) {
     const auto recover = [&]() -> Result<Value> {
@@ -2090,6 +2151,17 @@ Result<std::optional<CCLCLifecycleRequestResultDTO>> CCLCLifecycleTargetDriver::
         return Result<Value>::Err(driver_error("component_lifecycle_close_incident_mismatch",
             "Close recovery has no exact open incident", "close_incident_mismatch"));
       if (recovered.ok() && recovered.value()) Wake();
+      // No open incident, but a latched stream (`blocking`/`warning` +
+      // `ack`): clearing the latch is the whole Recover.
+      if (recovered.ok() && !recovered.value() && stream_latch_cleared &&
+          !intent.close_incident_recovery) {
+        Wake();
+        CCLCLifecycleRequestResultDTO acknowledged{RequestReplayStatusDTO::kAcceptedNew,
+                                                   std::nullopt, std::nullopt};
+        acknowledged.stream_acknowledgement =
+            ComponentStreamAcknowledgementDTO{intent.controllable_component_id, now};
+        return Result<Value>::Ok(std::move(acknowledged));
+      }
       return recovered;
     };
     result = recover();

@@ -6,6 +6,7 @@
 #include <utility>
 
 #include <manyforge_content_identity/content_identity.hpp>
+#include <manyforge_core/types/carried_object_lost.hpp>
 
 namespace manyforge::headless {
 namespace {
@@ -390,62 +391,6 @@ void SceneRuntimeStateOwner::RetirePoseSource(
   std::erase_if(pose_records_, [&](const auto &entry) {
     return entry.first.source_id == source_id;
   });
-  if (configured_pose_source_ &&
-      configured_pose_source_->source_id == source_id)
-    configured_pose_source_.reset();
-}
-
-void SceneRuntimeStateOwner::ConfigurePoseSourceAvailability(
-    const SceneRuntimeIdentity &expected_runtime_identity,
-    std::string source_id, std::string source_epoch_base) {
-  ValidateIdentity(expected_runtime_identity);
-  ValidateText(source_id, "pose source_id", kMaximumIdentifierBytes);
-  constexpr std::string_view suffix = ".9007199254740991";
-  ValidateText(source_epoch_base, "pose source_epoch_base",
-               kMaximumIdentifierBytes - suffix.size());
-  Require(source_epoch_base.find('\0') == std::string::npos,
-          "pose source_epoch_base contains NUL");
-  const auto now = Now();
-  std::lock_guard lock(mutex_);
-  if (!runtime_identity_ || *runtime_identity_ != expected_runtime_identity ||
-      state_ != SceneInitializationState::kOpen) {
-    throw SceneRuntimeStateConflictError(
-        "scene runtime state owner: configured pose source requires current "
-        "open runtime");
-  }
-  if (configured_pose_source_) {
-    if (configured_pose_source_->source_id != source_id ||
-        configured_pose_source_->source_epoch_base != source_epoch_base) {
-      throw SceneRuntimeStateConflictError(
-          "scene runtime state owner: configured pose source transition is not "
-          "admitted");
-    }
-    return; // Publication/session loss must never reopen an exited occurrence.
-  }
-  configured_pose_source_ = ConfiguredPoseSourceAvailability{
-      std::move(source_id), std::move(source_epoch_base), true};
-  updated_at_ns_ = now;
-}
-
-void SceneRuntimeStateOwner::MarkPoseSourceUnavailable(
-    const SceneRuntimeIdentity &expected_runtime_identity,
-    const std::string_view source_id,
-    const std::string_view source_epoch_base) {
-  ValidateIdentity(expected_runtime_identity);
-  const auto now = Now();
-  std::lock_guard lock(mutex_);
-  if (!runtime_identity_ || *runtime_identity_ != expected_runtime_identity ||
-      !configured_pose_source_ ||
-      configured_pose_source_->source_id != source_id ||
-      configured_pose_source_->source_epoch_base != source_epoch_base) {
-    throw SceneRuntimeStateConflictError(
-        "scene runtime state owner: loss does not name current configured pose "
-        "source");
-  }
-  if (configured_pose_source_->available) {
-    configured_pose_source_->available = false;
-    updated_at_ns_ = now;
-  }
 }
 
 std::string SceneRuntimeStateOwner::BeginInitialization(
@@ -481,6 +426,21 @@ std::string SceneRuntimeStateOwner::BeginInitialization(
   }
   ++counters_.closed;
   return token;
+}
+
+void SceneRuntimeStateOwner::RecordCarriedObjectLoss(
+    CarriedObjectLossEvent event) {
+  ValidateText(event.event_id, "event_id", kMaximumIdentifierBytes);
+  ValidateText(event.scene_resource_id, "scene_resource_id",
+               kMaximumIdentifierBytes);
+  ValidateText(event.full_text, "full_text", kMaximumErrorBytes);
+  const auto now = Now();
+  std::lock_guard lock(mutex_);
+  if (carried_object_losses_.size() == kMaximumCarriedObjectLossEvents) {
+    carried_object_losses_.erase(carried_object_losses_.begin());
+  }
+  carried_object_losses_.push_back(std::move(event));
+  updated_at_ns_ = now;
 }
 
 void SceneRuntimeStateOwner::RequireCurrentTokenLocked(
@@ -691,11 +651,6 @@ SceneRuntimeStateOwner::ObservePose(PoseSourceObservation observation,
   const auto observation_key = observation.key;
   const auto now = Now();
   std::lock_guard lock(mutex_);
-  if (configured_pose_source_ && !configured_pose_source_->available &&
-      configured_pose_source_->source_id == observation.key.source_id) {
-    throw SceneRuntimeStateConflictError(
-        "scene runtime state owner: configured pose source is unavailable");
-  }
   auto found = pose_records_.find(observation_key);
   if (found != pose_records_.end()) {
     const auto &current = found->second.observation;
@@ -767,10 +722,7 @@ SceneRuntimeStateSnapshot SceneRuntimeStateOwner::Snapshot() const {
     pose_sources.push_back(PoseSourceLifetimeSnapshot{
         record.observation,
         record.observation.payload_quality == PoseSourceQuality::kGood &&
-            record.observation.expires_at_ns >= now &&
-            (!configured_pose_source_ || configured_pose_source_->available ||
-             configured_pose_source_->source_id !=
-                 record.observation.key.source_id),
+            record.observation.expires_at_ns >= now,
         record.buffered,
     });
   }
@@ -787,7 +739,7 @@ SceneRuntimeStateSnapshot SceneRuntimeStateOwner::Snapshot() const {
       active_replay_id_,
       counters_,
       std::move(pose_sources),
-      configured_pose_source_,
+      carried_object_losses_,
   };
 }
 
@@ -829,14 +781,18 @@ SceneRuntimeStateValue(const SceneRuntimeStateSnapshot &snapshot) {
       {"state", CanonicalValue(std::string(ToString(snapshot.state)))},
       {"updated_at_ns", Number(snapshot.updated_at_ns, "updated_at_ns")},
   };
-  if (snapshot.configured_pose_source) {
-    const auto &source = *snapshot.configured_pose_source;
-    result.emplace_back(
-        "configured_pose_source",
-        CanonicalValue(CanonicalValue::Object{
-            {"source_id", CanonicalValue(source.source_id)},
-            {"source_epoch_base", CanonicalValue(source.source_epoch_base)},
-            {"freshness_open", CanonicalValue(source.available)}}));
+  if (!snapshot.carried_object_losses.empty()) {
+    CanonicalValue::Array losses;
+    for (const auto &loss : snapshot.carried_object_losses) {
+      losses.emplace_back(CanonicalValue::Object{
+          {"code", CanonicalValue(std::string(
+                       core::kCarriedObjectLostRow.code))},
+          {"event_id", CanonicalValue(loss.event_id)},
+          {"full_text", CanonicalValue(loss.full_text)},
+          {"scene_resource_id", CanonicalValue(loss.scene_resource_id)}});
+    }
+    result.emplace_back("carried_object_losses",
+                        CanonicalValue(std::move(losses)));
   }
   return CanonicalValue(std::move(result));
 }

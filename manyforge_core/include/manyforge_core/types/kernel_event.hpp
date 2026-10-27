@@ -18,9 +18,7 @@ enum class KernelEventType {
   kPlanCompleted,    // planning phase completed
   kCacheHit,         // trajectory found in cache
   kCacheMiss,        // cache lookup returned empty
-  kCacheRevalidationCandidate,
-  kCacheRevalidated,
-  kCacheRevalidationFailed,
+  kCacheRevalidationFailed,  // cached trajectory failed current validation; re-planned
   kCacheInvalidated, // cached trajectory invalidated
   kValidationStarted,  // validation phase started
   kValidationPassed,   // validation passed

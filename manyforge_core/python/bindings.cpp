@@ -793,19 +793,6 @@ PYBIND11_MODULE(manyforge_core_py, m) {
             .format(r.revision_id, r.content_hash);
       });
 
-  py::enum_<manyforge::core::CollisionWorldMutationSource>(m, "CollisionWorldMutationSource")
-      .value("kSceneInitialize", manyforge::core::CollisionWorldMutationSource::kSceneInitialize)
-      .value("kSceneEdit", manyforge::core::CollisionWorldMutationSource::kSceneEdit)
-      .value("kCarriedObjectAttach",
-             manyforge::core::CollisionWorldMutationSource::kCarriedObjectAttach)
-      .value("kCarriedObjectDetach",
-             manyforge::core::CollisionWorldMutationSource::kCarriedObjectDetach)
-      .value("kComponentAttachmentApply",
-             manyforge::core::CollisionWorldMutationSource::kComponentAttachmentApply)
-      .value("kPoseSourceApply", manyforge::core::CollisionWorldMutationSource::kPoseSourceApply)
-      .value("kDeploymentApply", manyforge::core::CollisionWorldMutationSource::kDeploymentApply)
-      .value("kPolicyUpdate", manyforge::core::CollisionWorldMutationSource::kPolicyUpdate);
-
   py::enum_<manyforge::core::RequestTransportDTO>(m, "RequestTransportDTO")
       .value("kRos", manyforge::core::RequestTransportDTO::kRos)
       .value("kHttp", manyforge::core::RequestTransportDTO::kHttp)
@@ -822,26 +809,6 @@ PYBIND11_MODULE(manyforge_core_py, m) {
       .def_readwrite("assurance", &manyforge::core::RequestAttributionDTO::assurance)
       .def_readwrite("principal_id", &manyforge::core::RequestAttributionDTO::principal_id)
       .def("locally_valid", &manyforge::core::RequestAttributionDTO::locally_valid);
-
-  py::class_<manyforge::core::CollisionWorldLedgerEntry>(m, "CollisionWorldLedgerEntry")
-      .def(py::init<>())
-      .def_readwrite("revision", &manyforge::core::CollisionWorldLedgerEntry::revision)
-      .def_readwrite("previous_revision_id",
-                     &manyforge::core::CollisionWorldLedgerEntry::previous_revision_id)
-      .def_readwrite("mutation_source",
-                     &manyforge::core::CollisionWorldLedgerEntry::mutation_source)
-      .def_readwrite("affected_body_ids",
-                     &manyforge::core::CollisionWorldLedgerEntry::affected_body_ids)
-      .def_readwrite("owner_sequence", &manyforge::core::CollisionWorldLedgerEntry::owner_sequence)
-      .def_readwrite("observed_timestamp_ns",
-                     &manyforge::core::CollisionWorldLedgerEntry::observed_timestamp_ns)
-      .def_readwrite("attribution", &manyforge::core::CollisionWorldLedgerEntry::attribution)
-      .def_readwrite("source_label", &manyforge::core::CollisionWorldLedgerEntry::source_label)
-      .def_readwrite("correlation_id", &manyforge::core::CollisionWorldLedgerEntry::correlation_id)
-      .def("__repr__", [](const manyforge::core::CollisionWorldLedgerEntry& e) {
-        return py::str("CollisionWorldLedgerEntry(revision_id={}, source='{}')")
-            .format(e.revision.revision_id, e.source_label);
-      });
 
   py::class_<manyforge::core::CollisionPairId>(m, "CollisionPairId")
       .def(py::init<>())
@@ -995,11 +962,6 @@ PYBIND11_MODULE(manyforge_core_py, m) {
       .def_readwrite("parent_body_id", &manyforge::core::CollisionWorldBody::parent_body_id)
       .def_readwrite("frame_id", &manyforge::core::CollisionWorldBody::frame_id)
       .def_readwrite("pose", &manyforge::core::CollisionWorldBody::pose)
-      .def_readwrite("source_id", &manyforge::core::CollisionWorldBody::source_id)
-      .def_readwrite("source_timestamp_ns",
-                     &manyforge::core::CollisionWorldBody::source_timestamp_ns)
-      .def_readwrite("source_freshness_budget_ns",
-                     &manyforge::core::CollisionWorldBody::source_freshness_budget_ns)
       .def_readwrite("geometries", &manyforge::core::CollisionWorldBody::geometries)
       .def_readwrite("body_content_hash", &manyforge::core::CollisionWorldBody::body_content_hash)
       .def("__repr__", [](const manyforge::core::CollisionWorldBody& b) {

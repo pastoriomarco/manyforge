@@ -22,37 +22,6 @@ enum class ManagerSelectedRuntimeCompositionPhase {
   kFinalize,
 };
 
-/// Exact outputs of the Manager-owned observer check and per-spawn epoch mint.
-/// These are private accepted operation inputs; no config bytes or new proof.
-struct ManagerIsaacPoseObserverLaunchFactsDTO final {
-  std::string retained_snapshot_path;
-  std::string source_id;
-  std::string source_epoch_base;
-
-  [[nodiscard]] bool valid() const noexcept;
-  [[nodiscard]] bool accepts_source_epoch(std::string_view epoch) const noexcept;
-  friend bool operator==(const ManagerIsaacPoseObserverLaunchFactsDTO &,
-                         const ManagerIsaacPoseObserverLaunchFactsDTO &) = default;
-};
-
-/// One closed canonical three-string value shared by accepted journal inputs
-/// and checked launch plumbing; absent optional values have no encoding here.
-[[nodiscard]] std::string EncodeManagerIsaacPoseObserverLaunchFacts(
-    const ManagerIsaacPoseObserverLaunchFactsDTO &facts);
-[[nodiscard]] ManagerIsaacPoseObserverLaunchFactsDTO
-DecodeManagerIsaacPoseObserverLaunchFacts(std::string_view bytes);
-
-/// Exact predecessor occurrence positively reaped by the Prepare producer.
-/// The enclosing request supplies the operation join; this value alone grants
-/// no process or process-group authority.
-struct ManagerIsaacPoseObserverRetirementReceiptDTO final {
-  ManagerIsaacPoseObserverLaunchFactsDTO predecessor;
-  std::int64_t leader_pid{};
-  [[nodiscard]] bool valid() const noexcept;
-  friend bool operator==(const ManagerIsaacPoseObserverRetirementReceiptDTO &,
-                         const ManagerIsaacPoseObserverRetirementReceiptDTO &) = default;
-};
-
 /// Exact Manager-to-managed-host request to install the already selected
 /// product composition while its durable Kernel configuration fence is held.
 /// This is a private Apply effect, not caller authorization or a command
@@ -90,9 +59,6 @@ struct ManagerSelectedRuntimeCompositionRequestDTO final {
   /// The active product the retained controllers are currently sealed to.
   /// The host verifies its live registrations against it before re-sealing.
   manyforge::core::ProjectionRevisionDTO predecessor_projection_revision;
-  /// Persisted with the original operation and echoed exactly. Robot-only
-  /// changes retain the same snapshot/source/base, including zero membership.
-  std::optional<ManagerIsaacPoseObserverLaunchFactsDTO> isaac_pose_observer_launch_facts{};
 
   [[nodiscard]] bool valid() const noexcept;
 
@@ -144,9 +110,6 @@ struct ManagerSelectedRuntimeCompositionResultDTO final {
   /// Canonical per-component receipts, sorted by component id. Required and
   /// checked by Manager once a finalize request reports kInstalled.
   std::vector<ManagerRuntimeComponentReceiptDTO> component_receipts;
-  /// Present only on the exact Prepare ACK after positive predecessor reap.
-  /// Absence is not reap evidence; required closure belongs to the consumer.
-  std::optional<ManagerIsaacPoseObserverRetirementReceiptDTO> isaac_pose_observer_retirement_receipt{};
 
   [[nodiscard]] bool valid() const noexcept;
 
@@ -337,45 +300,6 @@ struct ManagerComponentProcessObservationDTO final {
                          const ManagerComponentProcessObservationDTO &) = default;
 };
 
-enum class ManagerCellObserverIncidentPersistenceDTO : std::uint8_t {
-  kNotApplicable = 0,
-  kPending = 1,
-  kPersisted = 2,
-  kFailed = 3,
-  kUnknown = 4,
-};
-
-/// Actual terminal wait evidence, separate from process presence and readiness.
-struct ManagerCellObserverExitDTO final {
-  std::int32_t pid{};
-  std::optional<std::uint8_t> exit_status{};
-  std::optional<std::uint8_t> signal{};
-  bool core_dumped{};
-  std::string observed_utc;
-  std::int64_t detected_at_ns{};
-
-  [[nodiscard]] bool valid() const noexcept;
-  friend bool operator==(const ManagerCellObserverExitDTO &,
-                         const ManagerCellObserverExitDTO &) = default;
-};
-
-/// One configured observer occurrence. An incident ID remains stable even if
-/// persistence fails; only kPersisted identifies a committed durable record.
-struct ManagerCellObserverObservationDTO final {
-  manyforge::core::CellId cell_id;
-  std::string source_id;
-  std::string source_epoch_base;
-  ProcessPresenceState process_presence{ProcessPresenceState::kUnknown};
-  std::optional<ManagerCellObserverExitDTO> exit{};
-  std::optional<std::string> incident_id{};
-  ManagerCellObserverIncidentPersistenceDTO incident_persistence{
-      ManagerCellObserverIncidentPersistenceDTO::kNotApplicable};
-
-  [[nodiscard]] bool valid() const noexcept;
-  friend bool operator==(const ManagerCellObserverObservationDTO &,
-                         const ManagerCellObserverObservationDTO &) = default;
-};
-
 /// Original owner preview and verified candidate compiler input only. This is
 /// neither installed readback nor parent/fence/acceptance authority.
 struct ManagerComponentBringUpPlanningFactsDTO final {
@@ -397,7 +321,6 @@ struct ManagerComponentBringUpInspectionResultDTO final {
   /// Exactly the verified candidate's configured components, sorted by ID.
   /// Presence is observation only; it grants no lifecycle or effect permission.
   std::vector<ManagerComponentProcessObservationDTO> configured_components;
-  std::optional<ManagerCellObserverObservationDTO> cell_observer{};
   std::optional<ManagerComponentBringUpPlanningFactsDTO> planning_facts{};
   [[nodiscard]] bool valid() const noexcept;
   friend bool operator==(const ManagerComponentBringUpInspectionResultDTO &,

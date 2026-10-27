@@ -4307,7 +4307,7 @@ TEST(ManagerDaemonProcess,
         {"expected_graph_revision", RequiredMember(identity, "graph_revision")},
         {"expected_retained_bundle_id",
          RequiredMember(identity, "retained_bundle_id")},
-        {"expected_scene_revision", RequiredMember(identity, "scene_revision")},
+        {"expected_scene_revision", CanonicalValue(nullptr)},
         {"participants", CanonicalValue(CanonicalValue::Array{
                              CanonicalValue(std::move(participant))})},
         {"coordination_policy", CanonicalValue("independent")}});

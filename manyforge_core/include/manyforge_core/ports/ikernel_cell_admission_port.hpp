@@ -87,6 +87,21 @@ class IKernelCellAdmissionPort {
                  "Kernel component-incident containment is unsupported",
                  {{"reason", "incident_containment_unsupported"}}});
   }
+  /// CP9 stream health: while `hold` is set, new commands of the component
+  /// are refused with it (a `fault`/`blocking` stream is not live). With
+  /// `cell_wide` (a component without motion of its own, e.g. a pose source)
+  /// new commands of every component are refused with it. `nullopt` lifts
+  /// it. No incident, Stop or claim; running work is not touched.
+  [[nodiscard]] virtual Result<void> PublishComponentStreamHold(
+      const ControllableComponentId& component, const std::optional<ErrorDTO>& hold,
+      bool cell_wide = false) {
+    static_cast<void>(component);
+    static_cast<void>(hold);
+    static_cast<void>(cell_wide);
+    return Result<void>::Err(ErrorDTO{"cell_admission_stream_hold_unsupported",
+                                      "Kernel component stream holds are unsupported",
+                                      {}});
+  }
   [[nodiscard]] virtual Result<CellAdmissionClaimDTO> AcquireCellAdmissionClaim(
       const CellAdmissionClaimIntentDTO& intent) = 0;
   /// Existing CCLC owner only: exact local Disable/Prepare/Enable while its

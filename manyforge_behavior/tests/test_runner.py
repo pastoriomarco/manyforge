@@ -30,11 +30,6 @@ class RecordingTransport:
                 "control_management_mode": "component_lifecycle",
                 "graph_revision": "sha256:" + "2" * 64,
                 "retained_bundle_id": "sha256:" + "3" * 64,
-                "scene_revision": {
-                    "scene_id": "scene-1",
-                    "revision_id": 1,
-                    "content_hash": "sha256:" + "4" * 64,
-                },
             },
         }
 

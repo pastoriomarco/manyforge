@@ -4513,8 +4513,7 @@ void check_selected_core_lite6_aggregate(const Lite6AggregateCheck check) {
   auto projection_result = RetainedPlannerSceneProjection::CreateInitialized(
       std::move(collision_projector), products.planning_collision_model,
       native_binding, *initial_scene.shared(),
-      RetainedPlannerSceneProjectionConfig{"retained-lite6-native-runtime", 32U,
-                                           32U},
+      RetainedPlannerSceneProjectionConfig{"retained-lite6-native-runtime", 32U},
       [&projection_clock] { return projection_clock++; });
   ASSERT_TRUE(projection_result.ok()) << projection_result.error().message;
   auto projection = std::move(projection_result.value());
@@ -4830,8 +4829,6 @@ void check_selected_core_lite6_aggregate(const Lite6AggregateCheck check) {
       runtime_config.kernel.collision_monitor_period_ns;
   const auto configured_immediate_query_budget_ns =
       runtime_config.kernel.runtime_collision_immediate_query_budget_ns;
-  const auto configured_dynamic_body_max_age_cap_ns =
-      runtime_config.kernel.runtime_dynamic_body_max_age_cap_ns;
   auto runtime =
       (moving_budget_check || mixed_output_check || geometric_host_check)
           ? create_retained_native_runtime_participants(
@@ -4843,11 +4840,6 @@ void check_selected_core_lite6_aggregate(const Lite6AggregateCheck check) {
         configured_collision_monitor_period_ns;
     runtime->runtime_collision_immediate_query_budget_ns =
         configured_immediate_query_budget_ns;
-    runtime->runtime_dynamic_body_max_age_cap_ns =
-        configured_dynamic_body_max_age_cap_ns > 0
-            ? std::optional<core::Duration>(
-                  configured_dynamic_body_max_age_cap_ns)
-            : std::nullopt;
   }
   // Match managed composition: one stable cell Kernel, subordinate engines,
   // and an already sealed cell policy in its current registration snapshot.
@@ -5119,9 +5111,19 @@ void check_selected_core_lite6_aggregate(const Lite6AggregateCheck check) {
             &logical_target.placement);
     ASSERT_NE(logical_fixed, nullptr);
     EXPECT_DOUBLE_EQ(logical_fixed->pose_in_cell.position_m.x_m, 100.0);
-    const auto separated_bundle =
+    // Runtime reads keep the previous world until the off-thread build of
+    // the changed scene lands.
+    auto separated_bundle =
         geometric->collision_publisher
             ->published_runtime_collision_query_bundle();
+    for (const auto deadline =
+             std::chrono::steady_clock::now() + std::chrono::seconds(10);
+         separated_bundle == initial_bundle &&
+         std::chrono::steady_clock::now() < deadline;) {
+      std::this_thread::sleep_for(std::chrono::milliseconds(1));
+      separated_bundle = geometric->collision_publisher
+                             ->published_runtime_collision_query_bundle();
+    }
     ASSERT_NE(separated_bundle, nullptr);
     ASSERT_NE(separated_bundle->world, nullptr);
     EXPECT_NE(separated_bundle, initial_bundle);
@@ -7270,7 +7272,7 @@ TEST(RetainedProductCrossConsumer,
     auto projection_result = RetainedPlannerSceneProjection::CreateInitialized(
         std::move(collision_projector), products.planning_collision_model,
         native_binding, *initial_scene.shared(),
-        RetainedPlannerSceneProjectionConfig{runtime_name, 32U, 32U},
+        RetainedPlannerSceneProjectionConfig{runtime_name, 32U},
         [projection_clock] { return (*projection_clock)++; });
     ASSERT_TRUE(projection_result.ok())
         << projection_result.error().message;
@@ -8190,11 +8192,7 @@ TEST(RetainedProductCrossConsumer,
           core::ProviderInstanceId("isaac.pose.observer"),
           core::ProviderManifestId("manyforge.provider.logical_scene"),
           core::ProviderManifestRevision("sha256:" + std::string(64U, 'b')),
-          "sha256:" + std::string(64U, 'a'),
-          7U,
-          1'000,
-          std::nullopt,
-          10'000'000'000};
+          "sha256:" + std::string(64U, 'a')};
   observed_carried_scene.revision.content_hash =
       core::logical_scene_identity::ComputeLogicalSceneContentHash(
           observed_carried_scene);
@@ -8211,12 +8209,6 @@ TEST(RetainedProductCrossConsumer,
   ASSERT_NE(observed_body, observed_carried_world.value().bodies.end());
   EXPECT_EQ(observed_body->parent_body_id, carried_body->parent_body_id);
   EXPECT_EQ(observed_body->pose, carried_body->pose);
-  EXPECT_FALSE(observed_body->source_freshness_budget_ns.has_value());
-  const auto observed_live = collision_projector.project_live_objects(
-      observed_carried_scene, observed_carried_world.value());
-  ASSERT_EQ(observed_live.size(), carried_scene.objects.size());
-  EXPECT_FALSE(observed_live.front().source_freshness_budget_ns.has_value());
-  EXPECT_FALSE(observed_live.front().source_timestamp_ns.has_value());
 
   auto carried_policy_result =
       collision_projector.project_effective_policy(carried_scene, 2U);
@@ -8272,15 +8264,7 @@ TEST(RetainedProductCrossConsumer,
   std::int64_t publisher_lease_clock = 6'000'000'010;
   auto publisher_result = RetainedCollisionWorldPublisher::create(
       collision_projector, "retained-lite6-publisher", initial_publish_scene,
-      RetainedCollisionWorldPublicationContext{
-          core::CollisionWorldMutationSource::kDeploymentApply,
-          {},
-          10,
-          {},
-          "retained_product_consumer",
-          std::nullopt,
-      },
-      [&publisher_lease_clock] { return publisher_lease_clock++; });
+      10, [&publisher_lease_clock] { return publisher_lease_clock++; });
   ASSERT_TRUE(publisher_result.ok()) << publisher_result.error().message;
   const auto publisher = publisher_result.value();
   const auto initial_world = publisher->snapshot();
@@ -8308,21 +8292,8 @@ TEST(RetainedProductCrossConsumer,
             operation_lease);
   EXPECT_EQ(retained_inventory->captured_at_ns, 6'000'000'010);
   EXPECT_EQ(retained_inventory->bundle.world, initial_world);
-  auto retention_stats = publisher->scene_snapshot_lease_retention_stats();
-  EXPECT_EQ(retention_stats.retained_count, 1U);
-  ASSERT_EQ(retention_stats.retained_ids_oldest_first.size(), 1U);
-  EXPECT_EQ(retention_stats.retained_ids_oldest_first.front(), operation_lease);
 
-  auto attached_publication = publisher->publish(
-      carried_scene,
-      RetainedCollisionWorldPublicationContext{
-          core::CollisionWorldMutationSource::kCarriedObjectAttach,
-          {core::CollisionBodyId("scene/carried-part/shape/0")},
-          20,
-          {},
-          "scene_attach_carried",
-          std::string("attach-correlation"),
-      });
+  auto attached_publication = publisher->publish(carried_scene, 20);
   ASSERT_TRUE(attached_publication.ok())
       << attached_publication.error().message;
   EXPECT_EQ(attached_publication.value().revision_id, 2U);
@@ -8332,12 +8303,13 @@ TEST(RetainedProductCrossConsumer,
   ASSERT_TRUE(advanced_inventory.has_value());
   EXPECT_NE(advanced_inventory->bundle.world, initial_world);
   EXPECT_EQ(advanced_inventory->bundle.world->revision.revision_id, 2U);
-  const auto repeated_retention =
+  // The publisher keeps no lease: an earlier retained inventory still holds
+  // its own world, and a new retention reads the latest publication.
+  EXPECT_EQ(retained_inventory->bundle.world, initial_world);
+  const auto later_retention =
       publisher->retain_scene_snapshot_lease_inventory(operation_lease);
-  ASSERT_TRUE(repeated_retention.has_value());
-  EXPECT_EQ(repeated_retention->projection_binding,
-            retained_inventory->projection_binding);
-  EXPECT_EQ(repeated_retention->bundle.world, initial_world);
+  ASSERT_TRUE(later_retention.has_value());
+  EXPECT_EQ(later_retention->bundle.world, advanced_inventory->bundle.world);
   const auto published_runtime =
       publisher->published_runtime_collision_query_bundle();
   ASSERT_NE(published_runtime, nullptr);
@@ -8348,34 +8320,12 @@ TEST(RetainedProductCrossConsumer,
   EXPECT_EQ(published_runtime->policy->allowed_touch_link_pairs,
             carried_policy.allowed_touch_link_pairs);
 
-  const auto ledger = publisher->recent_ledger();
-  ASSERT_EQ(ledger.size(), 2U);
-  EXPECT_EQ(ledger[0].revision.revision_id, 2U);
-  EXPECT_EQ(ledger[0].previous_revision_id, 1U);
-  EXPECT_EQ(ledger[0].mutation_source,
-            core::CollisionWorldMutationSource::kCarriedObjectAttach);
-  EXPECT_EQ(ledger[0].owner_sequence, 2U);
-  EXPECT_EQ(ledger[1].revision.revision_id, 1U);
-  EXPECT_EQ(ledger[1].previous_revision_id, 0U);
-
-  auto stale_publication = publisher->publish(
-      carried_scene, RetainedCollisionWorldPublicationContext{
-                         core::CollisionWorldMutationSource::kSceneEdit,
-                         {},
-                         30,
-                         {},
-                         "stale_scene_replay",
-                         std::nullopt,
-                     });
-  EXPECT_FALSE(stale_publication.ok());
-  EXPECT_EQ(publisher->published_collision_world_revision().revision_id, 2U);
-  EXPECT_EQ(publisher->recent_ledger().size(), 2U);
-
-  publisher->release_scene_snapshot_lease_inventory(operation_lease);
-  publisher->release_scene_snapshot_lease_inventory(operation_lease);
-  retention_stats = publisher->scene_snapshot_lease_retention_stats();
-  EXPECT_EQ(retention_stats.retained_count, 0U);
-  EXPECT_TRUE(retention_stats.retained_ids_oldest_first.empty());
+  // The latest scene is always published: no revision ordering is enforced.
+  auto republished = publisher->publish(initial_publish_scene, 30);
+  ASSERT_TRUE(republished.ok()) << republished.error().message;
+  EXPECT_EQ(republished.value().revision_id, 3U);
+  EXPECT_EQ(publisher->published_collision_world_revision().revision_id, 3U);
+  EXPECT_FALSE(publisher->snapshot()->bodies.back().parent_body_id.has_value());
 }
 
 TEST(RetainedProductCrossConsumer,
@@ -8418,7 +8368,6 @@ TEST(RetainedProductCrossConsumer,
           shared_collision_model, *materialized.bundle, model_map, retained);
 
   constexpr std::int64_t kReceiverTimestampNs = 4'000'000'000;
-  constexpr std::int64_t kRawSourceTimestampNs = 1'250'000'000;
   const auto initial_scene = make_collision_scene_snapshot(
       materialized.bundle->value().cell_graph.cell_id, 2U,
       core::SceneResourceId("first-object"), 10.0, 0.1,
@@ -8429,8 +8378,7 @@ TEST(RetainedProductCrossConsumer,
                                          "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"
                                          "bbbbbbbbbbbbbbbbbbbbbbbbbbb"),
           "sha256:"
-          "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
-          7U, kReceiverTimestampNs, kRawSourceTimestampNs, 10'000'000'000});
+          "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"});
   const core::ProjectionRevisionDTO initial_revision{
       materialized.bundle->retained_bundle_id(),
       materialized.bundle->value().cell_graph.graph_revision,
@@ -8446,7 +8394,7 @@ TEST(RetainedProductCrossConsumer,
       collision_projector, products.planning_collision_model, native_binding,
       initial_scene,
       RetainedPlannerSceneProjectionConfig{
-          "retained-lite6-transactional-projection", 2U, 8U},
+          "retained-lite6-transactional-projection", 2U},
       [&clock_value, &fail_clock] {
         if (fail_clock) {
           throw std::runtime_error("injected projection clock failure");
@@ -8461,15 +8409,6 @@ TEST(RetainedProductCrossConsumer,
       projection->current_scene_snapshot_lease_inventory();
   ASSERT_TRUE(publication_inventory.has_value());
   EXPECT_EQ(publication_inventory->captured_at_ns, kReceiverTimestampNs + 10);
-  ASSERT_EQ(publication_inventory->bundle.body_freshness.size(), 1U);
-  EXPECT_EQ(
-      publication_inventory->bundle.body_freshness.front().source_timestamp_ns,
-      kReceiverTimestampNs);
-  ASSERT_EQ(publication_inventory->live_objects.size(), 1U);
-  EXPECT_EQ(publication_inventory->live_objects.front().source_timestamp_ns,
-            kReceiverTimestampNs);
-  EXPECT_NE(publication_inventory->live_objects.front().source_timestamp_ns,
-            kRawSourceTimestampNs);
 
   const core::ProjectionLeaseId predecessor_lease(
       "z.operation.predecessor.oldest");
@@ -8479,14 +8418,6 @@ TEST(RetainedProductCrossConsumer,
   ASSERT_TRUE(retained_predecessor.ok())
       << retained_predecessor.error().message;
   EXPECT_EQ(retained_predecessor.value().captured_at_ns, 6'000'000'010);
-  ASSERT_EQ(retained_predecessor.value().live_objects.size(),
-            publication_inventory->live_objects.size());
-  for (std::size_t index = 0;
-       index < retained_predecessor.value().live_objects.size(); ++index) {
-    EXPECT_EQ(
-        retained_predecessor.value().live_objects[index].source_timestamp_ns,
-        publication_inventory->live_objects[index].source_timestamp_ns);
-  }
   const auto predecessor_world = retained_predecessor.value().bundle.world;
   ASSERT_NE(predecessor_world, nullptr);
   clock_value = 9'000'000'010;
@@ -8569,7 +8500,6 @@ TEST(RetainedProductCrossConsumer,
   EXPECT_GT(private_candidate.value().bundle.world->revision.revision_id,
             predecessor_world->revision.revision_id);
   EXPECT_EQ(private_candidate.value().bundle.policy, candidate_policy.value());
-  EXPECT_EQ(private_candidate.value().live_objects.size(), 2U);
   EXPECT_EQ(*projection->logical_snapshot(), initial_scene);
   EXPECT_EQ(projection->snapshot(), predecessor_world);
 
@@ -8701,13 +8631,18 @@ TEST(RetainedProductCrossConsumer,
       core::ContentDigest(std::string(kZeroDigest)),
       core::ResolvedUpsertSceneObjectDTO{third_object},
       core::ContentDigest(std::string(kZeroDigest))};
-  fail_clock = true;
+  // A commit records the scene only; the collision world is built by its
+  // next consumer, and a failed build desynchronizes the projection.
   const auto uncertain = projection->ApplyTransaction(uncertain_transaction);
+  EXPECT_EQ(uncertain.result, core::ProjectionCommitResultStateDTO::kCommitted);
+  fail_clock = true;
+  EXPECT_EQ(projection->snapshot(), nullptr);
   fail_clock = false;
-  EXPECT_EQ(uncertain.result,
-            core::ProjectionCommitResultStateDTO::kFailedProjectionUncertain);
   EXPECT_EQ(projection->ProjectionHealth().state,
             core::ProjectionHealthState::kDesynchronized);
+  ASSERT_TRUE(projection->ProjectionHealth().error.has_value());
+  EXPECT_EQ(projection->ProjectionHealth().error->details.at("reason"),
+            "native_projection_collision_world_build_failed");
   EXPECT_EQ(projection->snapshot(), nullptr);
   EXPECT_FALSE(projection->collision_policy_snapshot().has_value());
   EXPECT_FALSE(
@@ -8776,7 +8711,7 @@ TEST(RetainedProductCrossConsumer,
           collision_projector, products.planning_collision_model,
           native_binding,
           RetainedPlannerSceneProjectionConfig{
-              "retained-lite6-rebuilt-projection", 8U, 8U},
+              "retained-lite6-rebuilt-projection", 8U},
           [&rebuild_clock] { return rebuild_clock++; });
   ASSERT_TRUE(uninitialized_result.ok())
       << uninitialized_result.error().message;
@@ -8833,7 +8768,7 @@ TEST(RetainedProductCrossConsumer,
           collision_projector, products.planning_collision_model,
           native_binding,
           RetainedPlannerSceneProjectionConfig{
-              "retained-lite6-bootstrap-projection", 8U, 8U},
+              "retained-lite6-bootstrap-projection", 8U},
           [&bootstrap_clock] { return bootstrap_clock++; });
   ASSERT_TRUE(bootstrap_projection_result.ok())
       << bootstrap_projection_result.error().message;
@@ -8882,7 +8817,7 @@ TEST(RetainedProductCrossConsumer,
       RetainedPlannerSceneProjection::CreateUninitialized(
           collision_projector, products.planning_collision_model, added_binding,
           RetainedPlannerSceneProjectionConfig{
-              "retained-lite6-added-projection", 8U, 8U},
+              "retained-lite6-added-projection", 8U},
           [&added_clock] { return added_clock++; });
   ASSERT_TRUE(added_projection_result.ok())
       << added_projection_result.error().message;
@@ -9626,7 +9561,7 @@ TEST(
       predecessor.bundle->value().compiled_products.planning_collision_model,
       binding, initial_scene,
       RetainedPlannerSceneProjectionConfig{
-          "cross-bundle-transactional-projection", 8U, 8U},
+          "cross-bundle-transactional-projection", 8U},
       [&clock] { return clock++; });
   ASSERT_TRUE(projection_result.ok()) << projection_result.error().message;
   auto projection = std::move(projection_result.value());
@@ -9668,7 +9603,7 @@ TEST(
       std::move(candidate_projector), request.planning_collision_model,
       binding, initial_scene,
       RetainedPlannerSceneProjectionConfig{
-          "cross-bundle-candidate-projection", 8U, 8U},
+          "cross-bundle-candidate-projection", 8U},
       [&clock] { return clock++; });
   ASSERT_TRUE(candidate_result.ok()) << candidate_result.error().message;
   auto candidate_projection = std::move(candidate_result.value());
@@ -9694,9 +9629,9 @@ TEST(
       candidate_lease.value().projection_binding.projection_lease_id);
 }
 
-/// Exact Lite6 retained collision projector for provider-freshness tests.
-struct ProviderFreshnessFixture final {
-  ProviderFreshnessFixture() {
+/// Exact Lite6 retained collision projector for lazy-projection tests.
+struct SceneProjectionFixture final {
+  SceneProjectionFixture() {
     const auto package_root = temporary.path() / "retained-package";
     const auto staging_parent = temporary.path() / "private-stages";
     std::filesystem::create_directory(package_root);
@@ -9706,7 +9641,7 @@ struct ProviderFreshnessFixture final {
                      package_root)
                      .bundle;
     if (bundle == nullptr) {
-      throw std::logic_error("Lite6 freshness fixture has no retained bundle");
+      throw std::logic_error("Lite6 scene projection fixture has no retained bundle");
     }
     const auto &products = bundle->value().compiled_products;
     planning_collision_model = products.planning_collision_model;
@@ -9723,10 +9658,10 @@ struct ProviderFreshnessFixture final {
             std::string(deployment::test::kLite6ControllableComponentId)),
         core::CommandTargetId(std::string(deployment::test::kLite6ArmTargetId)));
     if (target == nullptr || target->model_groups.empty()) {
-      throw std::logic_error("Lite6 freshness fixture has no arm group");
+      throw std::logic_error("Lite6 scene projection fixture has no arm group");
     }
     auto shared_model = ManyForgeCollisionEngine::load_shared_model(
-        "retained_lite6_provider_freshness", stage.loader_urdf_path(),
+        "retained_lite6_lazy_scene_projection", stage.loader_urdf_path(),
         stage.srdf_path(), stage.package_paths(),
         target->model_groups.front().compiled_group_name);
     projector.emplace(RetainedCollisionWorldProjector::create_verified(
@@ -9754,396 +9689,51 @@ struct ProviderFreshnessFixture final {
 constexpr std::string_view kObservedObject = "a-observed";
 constexpr std::string_view kOtherObject = "b-other";
 
-[[nodiscard]] core::SceneObjectProviderEvidenceDTO
-freshness_evidence(const std::string &instance, const std::uint64_t sequence,
-                   const std::int64_t received_at_ns) {
+[[nodiscard]] core::SceneObjectProviderEvidenceDTO observed_evidence() {
   return core::SceneObjectProviderEvidenceDTO{
-      core::ProviderInstanceId(instance),
+      core::ProviderInstanceId("isaac.pose.observer"),
       core::ProviderManifestId("manyforge.provider.logical_scene"),
       core::ProviderManifestRevision("sha256:" + std::string(64U, 'b')),
-      "sha256:" + std::string(64U, 'a'),
-      sequence,
-      received_at_ns,
-      1'250'000'000,
-      10'000'000'000};
+      "sha256:" + std::string(64U, 'a')};
 }
 
-struct FreshnessSceneObject final {
-  std::string_view object_id;
-  double x_m;
-  std::optional<core::SceneObjectProviderEvidenceDTO> evidence;
-};
-
-[[nodiscard]] core::Pose3DTO freshness_pose(const double x_m) {
+[[nodiscard]] core::Pose3DTO observed_pose(const double x_m) {
   return {{x_m, 0.0, 0.0}, {0.0, 0.0, 0.0, 1.0}};
 }
 
-/// Objects must be supplied in scene-resource-id order.
+/// Observed object at `x_m` plus one unobserved object.
 [[nodiscard]] core::LogicalSceneSnapshotDTO
-make_freshness_scene(const core::CellId &cell_id,
-                     const std::uint64_t scene_revision_id,
-                     const std::vector<FreshnessSceneObject> &objects) {
+make_lazy_scene(const core::CellId &cell_id, const std::uint64_t scene_revision_id,
+                const double x_m) {
   auto base = make_projection_runtime_shadow_snapshot(cell_id);
   core::LogicalSceneSnapshotDTO snapshot = *base.shared();
   snapshot.revision.revision_id = scene_revision_id;
   snapshot.transaction_sequence = scene_revision_id - 1U;
   snapshot.topology_epoch = scene_revision_id - 1U;
-  for (const auto &object : objects) {
-    snapshot.objects.push_back(core::SceneObjectSnapshotDTO{
-        core::SceneResourceId(std::string(object.object_id)),
-        {core::BoxShapeDTO{{0.1, 0.1, 0.1}}},
-        core::CellFixedSceneObjectPlacementDTO{cell_id,
-                                               freshness_pose(object.x_m)},
-        object.evidence,
-    });
-  }
+  snapshot.objects.push_back(core::SceneObjectSnapshotDTO{
+      core::SceneResourceId(std::string(kObservedObject)),
+      {core::BoxShapeDTO{{0.1, 0.1, 0.1}}},
+      core::CellFixedSceneObjectPlacementDTO{cell_id, observed_pose(x_m)},
+      observed_evidence(),
+  });
+  snapshot.objects.push_back(core::SceneObjectSnapshotDTO{
+      core::SceneResourceId(std::string(kOtherObject)),
+      {core::BoxShapeDTO{{0.1, 0.1, 0.1}}},
+      core::CellFixedSceneObjectPlacementDTO{cell_id, observed_pose(12.0)},
+      std::nullopt,
+  });
   snapshot.revision.content_hash =
       core::logical_scene_identity::ComputeLogicalSceneContentHash(snapshot);
   if (!snapshot.locally_valid()) {
-    throw std::logic_error("test freshness logical-scene snapshot is invalid");
+    throw std::logic_error("test lazy logical-scene snapshot is invalid");
   }
   return snapshot;
 }
 
-[[nodiscard]] core::ProviderFreshnessConfirmationDTO
-freshness_confirmation(const core::ProjectionRevisionDTO &revision,
-                       const double x_m,
-                       core::SceneObjectProviderEvidenceDTO evidence) {
-  return {revision, core::SceneResourceId(std::string(kObservedObject)),
-          freshness_pose(x_m), std::move(evidence)};
-}
-
-[[nodiscard]] bool observed_body(const std::string &body_id) {
-  return body_id.starts_with("scene/" + std::string(kObservedObject) +
-                             "/shape/");
-}
-
-/// Freshness of the observed object in a sidecar; every one of its bodies
-/// must carry the same timestamp.
-[[nodiscard]] std::optional<std::int64_t> observed_sidecar_timestamp(
-    const std::vector<core::CollisionWorldBodyFreshness> &sidecar) {
-  std::optional<std::int64_t> result;
-  bool seen = false;
-  for (const auto &entry : sidecar) {
-    if (!observed_body(entry.body_id)) {
-      continue;
-    }
-    if (seen && entry.source_timestamp_ns != result) {
-      throw std::logic_error("observed bodies disagree on freshness");
-    }
-    seen = true;
-    result = entry.source_timestamp_ns;
-  }
-  return result;
-}
-
-[[nodiscard]] const core::SceneSnapshotLiveObject &
-live_object(const core::CollisionWorldLeaseInventory &inventory,
-            const std::string_view object_id) {
-  for (const auto &live : inventory.live_objects) {
-    if (live.object_id == object_id) {
-      return live;
-    }
-  }
-  throw std::logic_error("lease inventory has no such live object");
-}
-
-[[nodiscard]] RetainedCollisionWorldPublicationContext
-freshness_commit_context(const std::int64_t observed_at_ns) {
-  return RetainedCollisionWorldPublicationContext{
-      core::CollisionWorldMutationSource::kPoseSourceApply,
-      {},
-      observed_at_ns,
-      {},
-      "provider_freshness_test_commit",
-      std::nullopt};
-}
-
-TEST(RetainedProductCrossConsumer,
-     ProviderFreshnessPublishesSidecarOnlyAndKeepsLeasesImmutable) {
-  ProviderFreshnessFixture fixture;
-  const auto committed = freshness_evidence("isaac.pose.observer", 7U,
-                                            4'000'000'000);
-  const auto other = freshness_evidence("isaac.other.observer", 3U,
-                                        3'000'000'000);
-  const auto initial = make_freshness_scene(
-      fixture.cell_id(), 2U,
-      {{kObservedObject, 10.0, committed}, {kOtherObject, 12.0, other}});
-  std::int64_t clock_value = 4'500'000'000;
-  auto publisher_result = RetainedCollisionWorldPublisher::create(
-      *fixture.projector, "retained-lite6-freshness-publisher", initial,
-      RetainedCollisionWorldPublicationContext{
-          core::CollisionWorldMutationSource::kDeploymentApply,
-          {},
-          10,
-          {},
-          "provider_freshness_initialize",
-          std::nullopt},
-      [&clock_value] { return clock_value++; });
-  ASSERT_TRUE(publisher_result.ok()) << publisher_result.error().message;
-  const auto publisher = publisher_result.value();
-  const auto revision = fixture.revision(initial);
-
-  const core::ProjectionLeaseId earlier_lease("operation.before.freshness");
-  const auto earlier = publisher->retain_scene_snapshot_lease_inventory(
-      earlier_lease);
-  ASSERT_TRUE(earlier.has_value());
-  const auto before = publisher->published_runtime_collision_query_bundle();
-  ASSERT_NE(before, nullptr);
-  ASSERT_EQ(observed_sidecar_timestamp(before->body_freshness),
-            std::optional<std::int64_t>(4'000'000'000));
-  const auto world_revision = publisher->published_collision_world_revision();
-  const auto ledger_size = publisher->recent_ledger().size();
-
-  auto confirmed = committed;
-  confirmed.provider_source_sequence = 8U;
-  confirmed.received_at_ns = 5'000'000'000;
-  confirmed.source_timestamp_ns = 1'500'000'000;
-  const auto applied = publisher->publish_freshness(
-      freshness_confirmation(revision, 10.0, confirmed));
-  ASSERT_TRUE(applied.ok()) << applied.error().message;
-  EXPECT_EQ(applied.value(), before->epoch + 1U);
-
-  const auto after = publisher->published_runtime_collision_query_bundle();
-  ASSERT_NE(after, nullptr);
-  EXPECT_NE(after, before);
-  EXPECT_EQ(after->epoch, before->epoch + 1U);
-  EXPECT_EQ(after->world, before->world);
-  EXPECT_EQ(after->policy, before->policy);
-  EXPECT_EQ(after->policy_index, before->policy_index);
-  EXPECT_EQ(after->projection_revision, before->projection_revision);
-  EXPECT_EQ(after->selected_distance_pairs, before->selected_distance_pairs);
-  EXPECT_TRUE(after->lookup_order_valid);
-  EXPECT_TRUE(after->distance_selection_order_valid);
-  ASSERT_EQ(after->body_freshness.size(), before->body_freshness.size());
-  std::size_t observed_entries = 0U;
-  for (std::size_t index = 0U; index < after->body_freshness.size(); ++index) {
-    const auto &entry = after->body_freshness[index];
-    const auto &prior = before->body_freshness[index];
-    ASSERT_EQ(entry.body_id, prior.body_id);
-    if (index > 0U) {
-      EXPECT_LT(after->body_freshness[index - 1U].body_id, entry.body_id);
-    }
-    if (observed_body(entry.body_id)) {
-      ++observed_entries;
-      EXPECT_EQ(entry.source_timestamp_ns,
-                std::optional<std::int64_t>(5'000'000'000));
-      EXPECT_EQ(entry.source_id, std::optional<std::string>(
-                                     "isaac.pose.observer"));
-      EXPECT_EQ(entry.source_freshness_budget_ns,
-                committed.source_freshness_budget_ns);
-    } else {
-      EXPECT_EQ(entry.source_timestamp_ns, prior.source_timestamp_ns);
-      EXPECT_EQ(entry.source_id, prior.source_id);
-    }
-  }
-  EXPECT_GT(observed_entries, 0U);
-  // Freshness-only: no world, revision or ledger change.
-  EXPECT_EQ(publisher->published_collision_world_revision().revision_id,
-            world_revision.revision_id);
-  EXPECT_EQ(publisher->published_collision_world_revision().content_hash,
-            world_revision.content_hash);
-  EXPECT_EQ(publisher->recent_ledger().size(), ledger_size);
-
-  const auto current = publisher->current_scene_snapshot_lease_inventory();
-  ASSERT_TRUE(current.has_value());
-  EXPECT_EQ(current->bundle.world, before->world);
-  EXPECT_EQ(observed_sidecar_timestamp(current->bundle.body_freshness),
-            std::optional<std::int64_t>(5'000'000'000));
-  EXPECT_EQ(live_object(*current, kObservedObject).source_timestamp_ns,
-            std::optional<std::int64_t>(5'000'000'000));
-  EXPECT_EQ(live_object(*current, kObservedObject).source_id,
-            std::optional<std::string>(
-                "isaac.pose.observer@sha256:" + std::string(64U, 'a')));
-  EXPECT_EQ(live_object(*current, kOtherObject).source_timestamp_ns,
-            std::optional<std::int64_t>(3'000'000'000));
-  // The committed logical scene is unchanged.
-  EXPECT_EQ(*current->logical_scene, initial);
-
-  // An already-retained lease is an immutable copy.
-  const auto earlier_again =
-      publisher->retain_scene_snapshot_lease_inventory(earlier_lease);
-  ASSERT_TRUE(earlier_again.has_value());
-  EXPECT_EQ(observed_sidecar_timestamp(earlier_again->bundle.body_freshness),
-            std::optional<std::int64_t>(4'000'000'000));
-  EXPECT_EQ(live_object(*earlier_again, kObservedObject).source_timestamp_ns,
-            std::optional<std::int64_t>(4'000'000'000));
-  // A lease retained afterwards captures the confirmation.
-  const auto later = publisher->retain_scene_snapshot_lease_inventory(
-      core::ProjectionLeaseId("operation.after.freshness"));
-  ASSERT_TRUE(later.has_value());
-  EXPECT_EQ(live_object(*later, kObservedObject).source_timestamp_ns,
-            std::optional<std::int64_t>(5'000'000'000));
-
-  // Replays, older sequences, mismatched pose/origin/revision are refused
-  // without any publication.
-  const auto refused_reason =
-      [&](const core::ProviderFreshnessConfirmationDTO &confirmation) {
-        const auto result = publisher->publish_freshness(confirmation);
-        EXPECT_FALSE(result.ok());
-        return result.ok() ? std::string("accepted")
-                           : result.error().details.at("reason");
-      };
-  auto replay = confirmed;
-  replay.received_at_ns = 5'500'000'000;
-  EXPECT_EQ(refused_reason(freshness_confirmation(revision, 10.0, replay)),
-            "provider_freshness_not_newer");
-  auto older = committed;
-  older.provider_source_sequence = 6U;
-  EXPECT_EQ(refused_reason(freshness_confirmation(revision, 10.0, older)),
-            "provider_freshness_not_newer");
-  auto newer = confirmed;
-  newer.provider_source_sequence = 9U;
-  newer.received_at_ns = 6'000'000'000;
-  EXPECT_EQ(refused_reason(freshness_confirmation(revision, 10.25, newer)),
-            "provider_freshness_pose_mismatch");
-  auto foreign_epoch = newer;
-  foreign_epoch.provider_source_epoch = "sha256:" + std::string(64U, 'f');
-  EXPECT_EQ(
-      refused_reason(freshness_confirmation(revision, 10.0, foreign_epoch)),
-      "provider_freshness_origin_mismatch");
-  auto other_budget = newer;
-  other_budget.source_freshness_budget_ns = 5'000'000'000;
-  EXPECT_EQ(
-      refused_reason(freshness_confirmation(revision, 10.0, other_budget)),
-      "provider_freshness_origin_mismatch");
-  auto stale_revision = revision;
-  stale_revision.scene_revision.revision_id = 1U;
-  EXPECT_EQ(
-      refused_reason(freshness_confirmation(stale_revision, 10.0, newer)),
-      "provider_freshness_revision_mismatch");
-  auto other_object = freshness_confirmation(revision, 12.0, newer);
-  other_object.scene_resource_id =
-      core::SceneResourceId(std::string(kOtherObject));
-  EXPECT_EQ(refused_reason(other_object),
-            "provider_freshness_origin_mismatch");
-  EXPECT_EQ(publisher->published_runtime_collision_query_bundle(), after);
-
-  const auto accepted_newer = publisher->publish_freshness(
-      freshness_confirmation(revision, 10.0, newer));
-  ASSERT_TRUE(accepted_newer.ok()) << accepted_newer.error().message;
-  EXPECT_EQ(accepted_newer.value(), after->epoch + 1U);
-  EXPECT_EQ(observed_sidecar_timestamp(
-                publisher->published_runtime_collision_query_bundle()
-                    ->body_freshness),
-            std::optional<std::int64_t>(6'000'000'000));
-
-  publisher->release_scene_snapshot_lease_inventory(earlier_lease);
-  publisher->release_scene_snapshot_lease_inventory(
-      core::ProjectionLeaseId("operation.after.freshness"));
-}
-
-TEST(RetainedProductCrossConsumer,
-     ProviderFreshnessOverrideFollowsExactCommittedEvidence) {
-  ProviderFreshnessFixture fixture;
-  const auto committed = freshness_evidence("isaac.pose.observer", 7U,
-                                            4'000'000'000);
-  const auto other = freshness_evidence("isaac.other.observer", 3U,
-                                        3'000'000'000);
-  const auto cell = fixture.cell_id();
-  std::uint64_t scene_revision = 2U;
-  auto scene = make_freshness_scene(
-      cell, scene_revision,
-      {{kObservedObject, 10.0, committed}, {kOtherObject, 12.0, other}});
-  std::int64_t clock_value = 4'500'000'000;
-  auto publisher_result = RetainedCollisionWorldPublisher::create(
-      *fixture.projector, "retained-lite6-freshness-override", scene,
-      RetainedCollisionWorldPublicationContext{
-          core::CollisionWorldMutationSource::kDeploymentApply,
-          {},
-          10,
-          {},
-          "provider_freshness_initialize",
-          std::nullopt},
-      [&clock_value] { return clock_value++; });
-  ASSERT_TRUE(publisher_result.ok()) << publisher_result.error().message;
-  const auto publisher = publisher_result.value();
-  const auto commit =
-      [&](const std::vector<FreshnessSceneObject> &objects) {
-        scene = make_freshness_scene(cell, ++scene_revision, objects);
-        const auto published = publisher->publish(
-            scene, freshness_commit_context(
-                       static_cast<std::int64_t>(scene_revision) * 100));
-        ASSERT_TRUE(published.ok()) << published.error().message;
-      };
-  const auto observed_now = [&] {
-    return observed_sidecar_timestamp(
-        publisher->published_runtime_collision_query_bundle()->body_freshness);
-  };
-  const auto observed_live_now = [&] {
-    return live_object(*publisher->current_scene_snapshot_lease_inventory(),
-                       kObservedObject)
-        .source_timestamp_ns;
-  };
-  const auto confirm = [&](const double x_m, const std::uint64_t sequence,
-                           const std::int64_t received_at_ns,
-                           const core::SceneObjectProviderEvidenceDTO &base) {
-    auto evidence = base;
-    evidence.provider_source_sequence = sequence;
-    evidence.received_at_ns = received_at_ns;
-    return publisher->publish_freshness(
-        freshness_confirmation(fixture.revision(scene), x_m, evidence));
-  };
-
-  ASSERT_TRUE(confirm(10.0, 8U, 5'000'000'000, committed).ok());
-  ASSERT_EQ(observed_now(), std::optional<std::int64_t>(5'000'000'000));
-
-  // An unrelated commit (another object moves) re-applies the override while
-  // the observed object's committed evidence and placement are exact.
-  commit({{kObservedObject, 10.0, committed}, {kOtherObject, 12.5, other}});
-  EXPECT_EQ(observed_now(), std::optional<std::int64_t>(5'000'000'000));
-  EXPECT_EQ(observed_live_now(), std::optional<std::int64_t>(5'000'000'000));
-  // The override still orders later confirmations.
-  const auto replay = confirm(10.0, 8U, 5'100'000'000, committed);
-  ASSERT_FALSE(replay.ok());
-  EXPECT_EQ(replay.error().details.at("reason"),
-            "provider_freshness_not_newer");
-
-  // A newer committed evidence for the object discards the override, even
-  // when the committed receive time is older than the confirmed one: the
-  // owner's committed evidence is authoritative.
-  auto newer_committed = committed;
-  newer_committed.provider_source_sequence = 9U;
-  newer_committed.received_at_ns = 4'500'000'000;
-  commit({{kObservedObject, 10.0, newer_committed},
-          {kOtherObject, 12.5, other}});
-  EXPECT_EQ(observed_now(), std::optional<std::int64_t>(4'500'000'000));
-  EXPECT_EQ(observed_live_now(), std::optional<std::int64_t>(4'500'000'000));
-  // The next ordering domain is the new committed evidence.
-  EXPECT_FALSE(confirm(10.0, 9U, 7'000'000'000, newer_committed).ok());
-  ASSERT_TRUE(confirm(10.0, 10U, 7'000'000'000, newer_committed).ok());
-  EXPECT_EQ(observed_now(), std::optional<std::int64_t>(7'000'000'000));
-
-  // A committed pose change with otherwise identical evidence discards it.
-  commit({{kObservedObject, 10.5, newer_committed},
-          {kOtherObject, 12.5, other}});
-  EXPECT_EQ(observed_now(), std::optional<std::int64_t>(4'500'000'000));
-
-  // Object removal discards it; re-adding the identical object does not
-  // resurrect a stale confirmation.
-  ASSERT_TRUE(confirm(10.5, 11U, 8'000'000'000, newer_committed).ok());
-  EXPECT_EQ(observed_now(), std::optional<std::int64_t>(8'000'000'000));
-  commit({{kOtherObject, 12.5, other}});
-  EXPECT_FALSE(observed_now().has_value());
-  commit({{kObservedObject, 10.5, newer_committed},
-          {kOtherObject, 12.5, other}});
-  EXPECT_EQ(observed_now(), std::optional<std::int64_t>(4'500'000'000));
-  EXPECT_EQ(observed_live_now(), std::optional<std::int64_t>(4'500'000'000));
-}
-
-TEST(RetainedProductCrossConsumer,
-     ProviderFreshnessProjectionRequiresExactHealthyCommittedObject) {
-  ProviderFreshnessFixture fixture;
-  const auto committed = freshness_evidence("isaac.pose.observer", 7U,
-                                            4'000'000'000);
-  const auto initial = make_freshness_scene(
-      fixture.cell_id(), 2U,
-      {{kObservedObject, 10.0, committed},
-       {kOtherObject, 12.0,
-        freshness_evidence("isaac.other.observer", 3U, 3'000'000'000)}});
-  const auto revision = fixture.revision(initial);
-  std::int64_t clock_value = 4'500'000'000;
-  auto projection_result = RetainedPlannerSceneProjection::CreateInitialized(
+[[nodiscard]] std::shared_ptr<RetainedPlannerSceneProjection>
+make_lazy_projection(const SceneProjectionFixture &fixture,
+                     const core::LogicalSceneSnapshotDTO &initial) {
+  auto created = RetainedPlannerSceneProjection::CreateInitialized(
       *fixture.projector, fixture.planning_collision_model,
       core::ProjectionNativeRuntimeBindingDTO{
           core::CapabilityProviderBindingId("lite6_joint_planner_binding"),
@@ -10151,93 +9741,130 @@ TEST(RetainedProductCrossConsumer,
           core::RuntimeUnitId("native-execution-host"),
           core::RuntimeEpoch("native-execution-host-epoch-1")},
       initial,
-      RetainedPlannerSceneProjectionConfig{
-          "retained-lite6-freshness-projection", 4U, 8U},
-      [&clock_value] { return clock_value++; });
-  ASSERT_TRUE(projection_result.ok()) << projection_result.error().message;
-  const auto projection = projection_result.value();
-  const auto health_before = projection->ProjectionHealth();
-  const auto bundle_before =
-      projection->published_runtime_collision_query_bundle();
-  ASSERT_NE(bundle_before, nullptr);
+      RetainedPlannerSceneProjectionConfig{"retained-lite6-lazy-projection",
+                                           8U},
+      [] { return std::int64_t{5'000'000'000}; });
+  if (!created.ok()) {
+    throw std::logic_error(created.error().message);
+  }
+  return created.value();
+}
 
-  const auto refused_reason =
-      [&](const core::ProviderFreshnessConfirmationDTO &confirmation) {
-        const auto result = projection->ApplyProviderFreshness(confirmation);
-        EXPECT_FALSE(result.ok());
-        return result.ok() ? std::string("accepted")
-                           : result.error().details.at("reason");
-      };
-  auto newer = committed;
-  newer.provider_source_sequence = 8U;
-  newer.received_at_ns = 5'000'000'000;
+/// Commit one move of the observed object as an ordinary pose transaction.
+core::LogicalSceneSnapshotDTO
+commit_observed_move(const SceneProjectionFixture &fixture,
+                     RetainedPlannerSceneProjection &projection,
+                     const core::LogicalSceneSnapshotDTO &current,
+                     const double x_m) {
+  auto next = make_lazy_scene(fixture.cell_id(),
+                              current.revision.revision_id + 1U, x_m);
+  const core::SceneTransactionDTO transaction{
+      core::RequestId("lazy-move-" + std::to_string(next.revision.revision_id)),
+      {},
+      next.transaction_sequence,
+      fixture.revision(current),
+      fixture.revision(next),
+      core::ContentDigest(std::string(kZeroDigest)),
+      core::ResolvedUpsertSceneObjectDTO{next.objects.front()},
+      core::ContentDigest(std::string(kZeroDigest))};
+  const auto committed = projection.ApplyTransaction(transaction);
+  if (committed.result != core::ProjectionCommitResultStateDTO::kCommitted) {
+    throw std::logic_error("lazy projection move was not committed: " +
+                           (committed.error ? committed.error->message
+                                            : std::string("no error")));
+  }
+  return next;
+}
 
-  auto foreign_revision = revision;
-  foreign_revision.scene_revision.content_hash =
-      core::ContentDigest("sha256:" + std::string(64U, 'e'));
-  EXPECT_EQ(
-      refused_reason(freshness_confirmation(foreign_revision, 10.0, newer)),
-      "provider_freshness_projection_unavailable");
-  auto foreign_graph = revision;
-  foreign_graph.graph_revision = core::GraphRevision("another-graph");
-  EXPECT_EQ(refused_reason(freshness_confirmation(foreign_graph, 10.0, newer)),
-            "provider_freshness_projection_unavailable");
-  EXPECT_EQ(refused_reason(freshness_confirmation(revision, 9.0, newer)),
-            "provider_freshness_pose_mismatch");
-  auto foreign_instance = newer;
-  foreign_instance.provider_instance_id =
-      core::ProviderInstanceId("another.observer");
-  EXPECT_EQ(
-      refused_reason(freshness_confirmation(revision, 10.0, foreign_instance)),
-      "provider_freshness_origin_mismatch");
-  auto foreign_manifest = newer;
-  foreign_manifest.provider_manifest_revision =
-      core::ProviderManifestRevision("sha256:" + std::string(64U, 'd'));
-  EXPECT_EQ(
-      refused_reason(freshness_confirmation(revision, 10.0, foreign_manifest)),
-      "provider_freshness_origin_mismatch");
-  auto older = committed;
-  older.provider_source_sequence = 6U;
-  EXPECT_EQ(refused_reason(freshness_confirmation(revision, 10.0, older)),
-            "provider_freshness_not_newer");
-  EXPECT_EQ(refused_reason(freshness_confirmation(revision, 10.0, committed)),
-            "provider_freshness_not_newer");
-  auto earlier_receipt = newer;
-  earlier_receipt.received_at_ns = 3'000'000'000;
-  EXPECT_EQ(
-      refused_reason(freshness_confirmation(revision, 10.0, earlier_receipt)),
-      "provider_freshness_not_newer");
-  auto absent = freshness_confirmation(revision, 10.0, newer);
-  absent.scene_resource_id = core::SceneResourceId("absent-object");
-  EXPECT_EQ(refused_reason(absent), "provider_freshness_object_absent");
-  EXPECT_EQ(projection->published_runtime_collision_query_bundle(),
-            bundle_before);
+TEST(RetainedProductCrossConsumer,
+     CommitsLeaveTheCollisionWorldToItsNextConsumer) {
+  SceneProjectionFixture fixture;
+  auto scene = make_lazy_scene(fixture.cell_id(), 2U, 10.0);
+  const auto projection = make_lazy_projection(fixture, scene);
+  const auto initial = projection->current_scene_snapshot_lease_inventory();
+  ASSERT_TRUE(initial.has_value());
+  ASSERT_NE(initial->bundle.world, nullptr);
+  const auto initial_world_revision = initial->bundle.world->revision.revision_id;
 
-  const auto applied = projection->ApplyProviderFreshness(
-      freshness_confirmation(revision, 10.0, newer));
-  ASSERT_TRUE(applied.ok()) << applied.error().message;
-  const auto health_after = projection->ProjectionHealth();
-  EXPECT_TRUE(health_after.healthy_for_target(revision));
-  EXPECT_EQ(health_after.source_sequence, health_before.source_sequence);
-  EXPECT_EQ(health_after.native_projection_generation,
-            health_before.native_projection_generation);
-  EXPECT_EQ(health_after.projection_content_digest,
-            health_before.projection_content_digest);
-  EXPECT_EQ(*projection->logical_snapshot(), initial);
-  const auto bundle_after =
-      projection->published_runtime_collision_query_bundle();
-  ASSERT_NE(bundle_after, nullptr);
-  EXPECT_EQ(bundle_after->epoch, bundle_before->epoch + 1U);
-  EXPECT_EQ(bundle_after->world, bundle_before->world);
-  EXPECT_EQ(observed_sidecar_timestamp(bundle_after->body_freshness),
-            std::optional<std::int64_t>(5'000'000'000));
-  const auto lease = projection->RetainProjection(
-      revision, core::ProjectionLeaseId("freshness.projection.lease"));
+  for (const double x_m : {10.1, 10.2, 10.3}) {
+    scene = commit_observed_move(fixture, *projection, scene, x_m);
+  }
+  EXPECT_EQ(projection->logical_snapshot()->revision, scene.revision);
+  EXPECT_TRUE(projection->ProjectionHealth().healthy_for_target(
+      fixture.revision(scene)));
+
+  // The first consumer builds once for all three commits.
+  const auto built = projection->current_scene_snapshot_lease_inventory();
+  ASSERT_TRUE(built.has_value());
+  ASSERT_NE(built->bundle.world, nullptr);
+  EXPECT_EQ(built->projection_binding.projection_revision,
+            fixture.revision(scene));
+  EXPECT_EQ(built->bundle.world->revision.revision_id,
+            initial_world_revision + 1U);
+  const auto observed = std::find_if(
+      built->bundle.world->bodies.begin(), built->bundle.world->bodies.end(),
+      [](const core::CollisionWorldBody &body) {
+        return body.body_id == "scene/" + std::string(kObservedObject) +
+                                   "/shape/0";
+      });
+  ASSERT_NE(observed, built->bundle.world->bodies.end());
+  EXPECT_DOUBLE_EQ(observed->pose.position_m.x_m, 10.3);
+
+  // Unchanged scene: every consumer reuses the cache.
+  EXPECT_EQ(projection->current_scene_snapshot_lease_inventory()->bundle.world,
+            built->bundle.world);
+  EXPECT_EQ(projection->snapshot(), built->bundle.world);
+  const auto lease = projection->RetainCurrentProjection(
+      core::ProjectionLeaseId("lazy.plan.after-build"));
   ASSERT_TRUE(lease.ok()) << lease.error().message;
-  EXPECT_EQ(live_object(lease.value(), kObservedObject).source_timestamp_ns,
-            std::optional<std::int64_t>(5'000'000'000));
-  projection->ReleaseProjection(
-      core::ProjectionLeaseId("freshness.projection.lease"));
+  EXPECT_EQ(lease.value().bundle.world, built->bundle.world);
+  projection->ReleaseProjection(lease.value().projection_binding.projection_lease_id);
+
+  // A planner starting after a further change gets the rebuilt world.
+  scene = commit_observed_move(fixture, *projection, scene, 10.4);
+  const auto planned = projection->RetainCurrentProjection(
+      core::ProjectionLeaseId("lazy.plan.after-change"));
+  ASSERT_TRUE(planned.ok()) << planned.error().message;
+  EXPECT_EQ(planned.value().projection_binding.projection_revision,
+            fixture.revision(scene));
+  EXPECT_EQ(planned.value().bundle.world->revision.revision_id,
+            initial_world_revision + 2U);
+  projection->ReleaseProjection(planned.value().projection_binding.projection_lease_id);
+}
+
+TEST(RetainedProductCrossConsumer,
+     RuntimeMonitorReadKeepsThePreviousWorldUntilTheOffThreadBuild) {
+  SceneProjectionFixture fixture;
+  auto scene = make_lazy_scene(fixture.cell_id(), 2U, 10.0);
+  const auto projection = make_lazy_projection(fixture, scene);
+  const auto before = projection->published_runtime_collision_query_bundle();
+  ASSERT_NE(before, nullptr);
+  ASSERT_NE(before->world, nullptr);
+
+  scene = commit_observed_move(fixture, *projection, scene, 10.5);
+  // The monitor read never projects: it returns the previous world and asks
+  // the build worker for the changed scene.
+  EXPECT_EQ(projection->published_runtime_collision_query_bundle(), before);
+
+  auto latest = before;
+  const auto deadline =
+      std::chrono::steady_clock::now() + std::chrono::seconds(10);
+  while (latest == before && std::chrono::steady_clock::now() < deadline) {
+    std::this_thread::sleep_for(std::chrono::milliseconds(1));
+    latest = projection->published_runtime_collision_query_bundle();
+  }
+  ASSERT_NE(latest, before) << "off-thread collision-world build never landed";
+  ASSERT_TRUE(latest->projection_revision.has_value());
+  EXPECT_EQ(*latest->projection_revision, fixture.revision(scene));
+  EXPECT_EQ(latest->world->revision.revision_id,
+            before->world->revision.revision_id + 1U);
+  EXPECT_TRUE(latest->lookup_order_valid);
+
+  // No further change: later monitor reads keep the same world.
+  std::this_thread::sleep_for(std::chrono::milliseconds(20));
+  EXPECT_EQ(projection->published_runtime_collision_query_bundle(), latest);
+  EXPECT_EQ(projection->current_scene_snapshot_lease_inventory()->bundle.world,
+            latest->world);
 }
 
 namespace io_resolver_tests {

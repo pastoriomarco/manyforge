@@ -1,8 +1,9 @@
 #!/usr/bin/env python3
-"""Derive the component I/O wrapper from the shared-host I/O row definitions.
+"""Derive the model-free component wrappers from the shared-host row definitions.
 
-The ROS runtime descriptor is the single authored row source. This projection
-adds component-level cardinality only; it creates no runtime unit or process.
+The ROS runtime descriptor is the single authored row source. Each projection
+(I/O device, pose source) adds component-level cardinality only; it creates no
+runtime unit or process.
 """
 
 from __future__ import annotations
@@ -18,9 +19,19 @@ from manyforge_behavior.canonical_artifact import (
 from generate_maintained_deployment_occurrences import semantic_revision
 
 
-SCHEMA_ID = "manyforge.value_schema.runtime.io_provider_execution.v1"
 SOURCE = "manyforge_deployment/resources/closed_schema/value/manyforge.value_schema.runtime.ros2_control_execution.v1.yaml"
-OUTPUT = "manyforge_deployment/resources/closed_schema/value/manyforge.value_schema.runtime.io_provider_execution.v1.yaml"
+VALUE_DIRECTORY = "manyforge_deployment/resources/closed_schema/value"
+# schema id -> (root definition id, {selected field: max_items or None}).
+WRAPPERS = {
+    "manyforge.value_schema.runtime.io_provider_execution.v1": (
+        "io_provider_component_configuration",
+        {"io_signals": None, "io_provider_devices": 1},
+    ),
+    "manyforge.value_schema.runtime.pose_source_execution.v1": (
+        "pose_source_component_configuration",
+        {"pose_sources": 1},
+    ),
+}
 
 
 def normalize_schema(document: dict) -> dict:
@@ -51,30 +62,49 @@ def normalize_schema(document: dict) -> dict:
     return result
 
 
-def derive_schema(source: dict) -> dict:
+def local_references(value: object) -> set[str]:
+    if isinstance(value, dict):
+        found = {value["definition_id"]} if value.get("kind") == "local_ref" else set()
+        for item in value.values():
+            found |= local_references(item)
+        return found
+    if isinstance(value, list):
+        return set().union(*(local_references(item) for item in value))
+    return set()
+
+
+def derive_schema(source: dict, schema_id: str) -> dict:
+    root_id, selection = WRAPPERS[schema_id]
     definitions = {row["definition_id"]: row for row in source["definitions"]}
     root = definitions[source["root_definition_id"]]["value_schema"]
     fields = {row["field_id"]: row for row in root["fields"]}
     selected = []
-    for name in ("io_signals", "io_provider_devices"):
+    for name, max_items in selection.items():
         field = copy.deepcopy(fields[name])
         field["presence"] = "required"
         field["default"] = {"kind": "absent"}
         field["value_schema"]["min_items"] = 1
-        if name == "io_provider_devices":
-            field["value_schema"]["max_items"] = 1
+        if max_items is not None:
+            field["value_schema"]["max_items"] = max_items
         selected.append(field)
-    # All local definitions are copied once from the authoritative row source.
-    # The wrapper's semantic component check rejects xArm and foreign components.
+    # Local definitions are copied once from the authoritative row source.
+    # The wrapper's semantic component check rejects foreign components.
+    pending = local_references(selected)
+    used: set[str] = set()
+    while pending:
+        key = pending.pop()
+        if key not in used:
+            used.add(key)
+            pending |= local_references(definitions[key])
     nested = [copy.deepcopy(row) for key, row in definitions.items()
-              if key != source["root_definition_id"]]
+              if key != source["root_definition_id"] and key in used]
     result = normalize_schema({
         "api_version": "manyforge.closed_schema.v1",
-        "schema_id": SCHEMA_ID,
+        "schema_id": schema_id,
         "schema_revision": "sha256:" + "0" * 64,
         "schema_purpose": "value",
-        "root_definition_id": "io_provider_component_configuration",
-        "definitions": [{"definition_id": "io_provider_component_configuration",
+        "root_definition_id": root_id,
+        "definitions": [{"definition_id": root_id,
                          "value_schema": {"kind": "object", "fields": selected}},
                         *nested],
     })
@@ -93,12 +123,13 @@ def main() -> int:
     args = parser.parse_args()
     source_path = args.workspace_root / SOURCE
     source = load_strict_json_yaml_bytes(source_path.read_bytes(), source=str(source_path))
-    payload = canonical_json_bytes(derive_schema(source)) + b"\n"
-    target = args.workspace_root / OUTPUT
-    if args.update:
-        target.write_bytes(payload)
-    elif not target.is_file() or target.read_bytes() != payload:
-        parser.error("component I/O schema is stale; run the normal --update")
+    for schema_id in WRAPPERS:
+        payload = canonical_json_bytes(derive_schema(source, schema_id)) + b"\n"
+        target = args.workspace_root / VALUE_DIRECTORY / f"{schema_id}.yaml"
+        if args.update:
+            target.write_bytes(payload)
+        elif not target.is_file() or target.read_bytes() != payload:
+            parser.error(f"{schema_id} is stale; run the normal --update")
     return 0
 
 

@@ -208,6 +208,39 @@ describe('CCLC closed response parsers', () => {
     }
   });
 
+  it('parses CP9 stream health rows and refuses malformed ones', () => {
+    expect(parseCCLCComponentSnapshot(componentSnapshot())).not.toHaveProperty('streamHealth');
+    const row = {
+      acknowledgement_required: false, age_ns: 1000, budget_ns: 250_000_000, error: null,
+      recovery: 'ack', severity: 'fault', state: 'live', stream_id: 'measured_joints',
+      timestamp_source: 'message_stamp',
+    };
+    const stale = {
+      ...row, stream_id: 'sim_clock', state: 'stale', severity: 'blocking', recovery: 'auto',
+      error: { code: 'component_stream_stale', message: 'stale', details: { stream_id: 'sim_clock' } },
+    };
+    const parsed = parseCCLCComponentSnapshot({ ...componentSnapshot(), stream_health: [row, stale] });
+    expect(parsed.streamHealth).toEqual([
+      {
+        streamId: 'measured_joints', state: 'live', ageNs: 1000, budgetNs: 250_000_000,
+        severity: 'fault', recovery: 'ack', timestampSource: 'message_stamp',
+        acknowledgementRequired: false, error: null,
+      },
+      {
+        streamId: 'sim_clock', state: 'stale', ageNs: 1000, budgetNs: 250_000_000,
+        severity: 'blocking', recovery: 'auto', timestampSource: 'message_stamp',
+        acknowledgementRequired: false,
+        error: { code: 'component_stream_stale', message: 'stale', details: { stream_id: 'sim_clock' } },
+      },
+    ]);
+    for (const invalid of [
+      [], [{ ...row, state: 'degraded' }], [{ ...row, budget_ns: 0 }], [{ ...row, age_ns: -1 }],
+      [{ ...row, extra: true }], [stale, row],
+    ]) {
+      expect(() => parseCCLCComponentSnapshot({ ...componentSnapshot(), stream_health: invalid })).toThrow();
+    }
+  });
+
   it('rejects unknown fields and malformed typed nullable evidence', () => {
     const invalidFacts: Array<[string[], unknown]> = [
       [['extra'], true],
@@ -526,6 +559,35 @@ describe('CCLC closed response parsers', () => {
       replay_status: 'accepted_new',
       status: mismatched,
     }, 'lifecycle')).toThrow('accepted transaction status');
+  });
+
+  it('accepts a Recover that only acknowledged a latched stream (CP9)', () => {
+    const acknowledged = { acknowledged_at_ns: 9_000, controllable_component_id: 'component.arm' };
+    expect(parseCCLCAdmission({
+      acceptance: null,
+      replay_status: 'accepted_new',
+      status: null,
+      stream_acknowledgement: acknowledged,
+    }, 'lifecycle')).toEqual({
+      replayStatus: 'accepted_new',
+      requestId: null,
+      transactionId: null,
+      status: null,
+      incidentRecovery: null,
+      streamAcknowledgement: { controllableComponentId: 'component.arm', acknowledgedAtNs: 9_000 },
+    });
+    expect(() => parseCCLCAdmission({
+      acceptance: null, replay_status: 'replayed_exact', status: null,
+      stream_acknowledgement: acknowledged,
+    }, 'lifecycle')).toThrow('without a transaction');
+    expect(() => parseCCLCAdmission({
+      acceptance: null, replay_status: 'accepted_new', status: null,
+      stream_acknowledgement: { ...acknowledged, stream_id: 'measured_joints' },
+    }, 'lifecycle')).toThrow('closed fields');
+    expect(() => parseCCLCAdmission({
+      acceptance: null, replay_status: 'accepted_new', status: null,
+      stream_acknowledgement: acknowledged,
+    }, 'route')).toThrow('closed fields');
   });
 
   it('accepts the authorization-only Recover of an open incident and nothing looser', () => {

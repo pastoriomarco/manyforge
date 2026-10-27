@@ -544,8 +544,8 @@ def test_pick_place_requests_preserve_defaults_and_phase_boundaries() -> None:
         operation = missing_scene[phase]
         assert isinstance(operation, dict)
         operation["expected_scene_revision"] = None
-    with pytest.raises(ValidationError, match="requires one exact scene revision"):
-        PickSequencePlanningRequest.model_validate(missing_scene)
+    # Planning uses the latest Scene; no revision is required.
+    PickSequencePlanningRequest.model_validate(missing_scene)
 
     untyped_reference = _pick_request()
     synthesis = untyped_reference["synthesis"]
@@ -1627,6 +1627,41 @@ def test_scene_policy_and_attachment_sets_require_canonical_order() -> None:
     }
     with pytest.raises(ValidationError):
         SceneTransactionRequest.model_validate(body)
+
+
+def test_attach_grasp_lost_bound_is_optional_positive_and_absent_on_the_wire() -> None:
+    from manyforge_headless_api.manager import _transaction_body
+
+    body = _scene_transaction()
+    body["operation"] = {
+        "kind": "attach_carried_object",
+        "carried_object_attachment_id": "attachment.1",
+        "scene_resource_id": "part.1",
+        "controllable_component_id": "robot.1",
+        "command_target_id": "arm",
+        "frame_role_id": "tool0",
+        "touch_body_roles": [],
+        "expected_component_attachment_revisions": [],
+    }
+    plain = SceneTransactionRequest.model_validate(body)
+    assert plain.operation.grasp_lost_bound is None
+    assert "grasp_lost_bound" not in _transaction_body(plain)["operation"]
+
+    bound = {"translation_m": 0.03, "rotation_rad": 0.26}
+    body["operation"] = {**body["operation"], "grasp_lost_bound": bound}
+    bounded = SceneTransactionRequest.model_validate(body)
+    assert _transaction_body(bounded)["operation"]["grasp_lost_bound"] == bound
+
+    for invalid in (
+        {"translation_m": 0.0, "rotation_rad": 0.26},
+        {"translation_m": 0.03, "rotation_rad": -1.0},
+        {"translation_m": float("inf"), "rotation_rad": 0.26},
+        {"translation_m": 0.03},
+        {"translation_m": 0.03, "rotation_rad": 0.26, "extra": 1},
+    ):
+        body["operation"] = {**body["operation"], "grasp_lost_bound": invalid}
+        with pytest.raises(ValidationError):
+            SceneTransactionRequest.model_validate(body)
 
 
 def test_scene_upsert_and_current_pose_detach_are_closed_typed_operations() -> None:

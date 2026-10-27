@@ -11,6 +11,7 @@
 #include <optional>
 #include <set>
 #include <string>
+#include <string_view>
 #include <type_traits>
 #include <utility>
 
@@ -487,6 +488,10 @@ bool ros_gripper_delivery_result_timeout_is_valid(
          timeout_s > 0.0;
 }
 
+bool ros_gripper_state_freshness_timeout_is_valid(const double timeout_s) noexcept {
+  return std::isfinite(timeout_s) && timeout_s >= 0.01 && timeout_s <= 60.0;
+}
+
 namespace {
 
 // Shared by strict retained extraction and the pre-Draft required-row hook.
@@ -495,7 +500,7 @@ std::optional<double> require_ros_gripper_delivery_result_timeout(
     const core::JsonObjectDTO &fields, const std::string_view actuation_kind) {
   const auto timeout = fields.find("delivery_result_timeout_s");
   const bool present = timeout != fields.end();
-  if (fields.size() != (present ? 14U : 13U)) {
+  if (fields.size() != (present ? 15U : 14U)) {
     fail_retained_bundle(
         "ros2_control runtime has an invalid gripper target configuration");
   }
@@ -507,6 +512,18 @@ std::optional<double> require_ros_gripper_delivery_result_timeout(
       !ros_gripper_delivery_result_timeout_is_valid(actuation_kind, *seconds)) {
     fail_retained_bundle(
         "ros2_control runtime has invalid pneumatic delivery result timeout");
+  }
+  return *seconds;
+}
+
+double require_ros_gripper_state_freshness_timeout(const core::JsonObjectDTO &fields) {
+  const auto timeout = fields.find("state_freshness_timeout_s");
+  const auto *seconds = timeout == fields.end()
+                            ? nullptr
+                            : std::get_if<double>(&timeout->second.value);
+  if (seconds == nullptr || !ros_gripper_state_freshness_timeout_is_valid(*seconds)) {
+    fail_retained_bundle(
+        "ros2_control runtime has invalid gripper state freshness timeout");
   }
   return *seconds;
 }
@@ -535,15 +552,18 @@ decode_ros2_control_execution_gripper_target_configurations(
     }
     const auto delivery_timeout =
         require_ros_gripper_delivery_result_timeout(*fields, *kind);
+    const auto freshness_timeout = require_ros_gripper_state_freshness_timeout(*fields);
     auto common = *fields;
     common.erase("output_mode");
     common.erase("delivery_result_timeout_s");
+    common.erase("state_freshness_timeout_s");
     auto decoded = decode_execution_gripper_target_configurations(
         core::JsonValueDTO::Array{core::JsonValueDTO{std::move(common)}},
         "ros2_control runtime configuration");
     result.push_back(Typed{std::move(decoded.front()), *mode == "none"
                             ? core::GripperOutputMode::kNone
-                            : core::GripperOutputMode::kCommanded, delivery_timeout});
+                            : core::GripperOutputMode::kCommanded,
+                            freshness_timeout, delivery_timeout});
   }
   std::sort(result.begin(), result.end(), [](const auto &left, const auto &right) {
     return std::tie(left.controllable_component_id, left.command_target_id) <
@@ -761,6 +781,7 @@ bool require_ros2_control_execution_runtime_required_rows(
             "ros2_control runtime configuration has invalid gripper target semantics");
       }
       (void)require_ros_gripper_delivery_result_timeout(*fields, *kind);
+      (void)require_ros_gripper_state_freshness_timeout(*fields);
     }
   }
   const auto io_catalog =
@@ -776,6 +797,13 @@ bool require_ros2_control_execution_runtime_required_rows(
     fail_retained_bundle(
         "ros2_control runtime has invalid retained I/O devices: " +
         io_devices.error().details.at("reason"));
+  }
+  const auto pose_sources =
+      ResolveRetainedPoseSources(graph, unit.runtime_unit_id);
+  if (!pose_sources.ok()) {
+    fail_retained_bundle(
+        "ros2_control runtime has invalid retained pose sources: " +
+        pose_sources.error().details.at("reason"));
   }
   const bool has_actuator = std::any_of(
       graph.control_bindings.begin(), graph.control_bindings.end(),
@@ -794,6 +822,7 @@ bool require_ros2_control_execution_runtime_required_rows(
                                           component.runtime_unit_ids.end(),
                                           unit.runtime_unit_id) !=
                                 component.runtime_unit_ids.end();
+            // Model-free components: I/O devices and pose sources.
             return !hosted ||
                    std::any_of(
                        io_catalog.value().begin(), io_catalog.value().end(),
@@ -802,6 +831,12 @@ bool require_ros2_control_execution_runtime_required_rows(
                                     unit.runtime_unit_id &&
                                 signal.descriptor.signal_id.controllable_component_id ==
                                     component.controllable_component_id;
+                       }) ||
+                   std::any_of(
+                       pose_sources.value().begin(), pose_sources.value().end(),
+                       [&](const auto &source) {
+                         return source.controllable_component_id ==
+                                component.controllable_component_id;
                        });
           });
   const bool empty_host = std::none_of(
@@ -1084,10 +1119,51 @@ void require_ros2_control_execution_runtime_product_matches_retained_bundle(
   }
 }
 
+/// The same-TU bridge for the contract decoder below.
+[[nodiscard]] static CanonicalValue
+canonical_from_json(const core::JsonValueDTO &value) {
+  return json_value_to_canonical(value);
+}
+
 } // namespace manyforge::deployment::detail
 
 namespace manyforge::deployment::ros2_control_execution_runtime_contract {
 namespace {
+
+// The resolver already proved the ids, uniqueness and owner; the closed
+// schema proved every field. Bindings keep the observer's order.
+[[nodiscard]] Configuration::PoseSource
+decode_pose_source(const RetainedPoseSourceConfiguration &source) {
+  const auto row = detail::canonical_from_json(source.row);
+  CanonicalValue::Object observer;
+  for (const auto &[name, value] : row.as_object())
+    if (name != "controllable_component_id")
+      observer.emplace_back(name, value);
+  Configuration::PoseSource result{source.controllable_component_id,
+                                   CanonicalValue(std::move(observer)),
+                                   {},
+                                   std::nullopt};
+  const auto text = [](const CanonicalValue &value, std::string_view name) {
+    return value.find_object_member(name)->as_string();
+  };
+  const auto binding = [&](const CanonicalValue &value) {
+    result.bindings.push_back(
+        {text(value, "object_id"), text(value, "policy_id"),
+         value.find_object_member("eligible")->as_bool(),
+         static_cast<std::int64_t>(
+             value.find_object_member("lifetime_ns")->as_number())});
+  };
+  if (const auto *joint = row.find_object_member("joint_state")) {
+    binding(*joint);
+    result.joint_state = Configuration::PoseSource::JointState{
+        text(*joint, "object_id"), text(*joint, "policy_id"),
+        text(*joint, "topic")};
+  }
+  for (const auto name : {"simulation_entities", "detection3d_sources"})
+    for (const auto &value : row.find_object_member(name)->as_array())
+      binding(value);
+  return result;
+}
 
 [[noreturn]] void fail_fault_profile(const std::string_view reason) {
   throw RetainedBundleError(
@@ -1527,6 +1603,15 @@ require_configuration(const RetainedBundle &retained_bundle,
       result.default_fault_stop_profiles.push_back(std::move(decoded));
     }
   }
+  const auto pose_sources = ResolveRetainedPoseSources(
+      retained_bundle.value().cell_graph, runtime_unit_id);
+  if (!pose_sources.ok()) {
+    throw RetainedBundleError(
+        "ros2_control runtime has invalid pose sources: " +
+        pose_sources.error().details.at("reason"));
+  }
+  for (const auto &source : pose_sources.value())
+    result.pose_sources.push_back(decode_pose_source(source));
   result.planner_rng_seed = require_uint32("planner_rng_seed");
   result.execution_tick_hz = require_uint32("execution_tick_hz");
   result.collision_monitor_period_ms =
@@ -1594,6 +1679,7 @@ Configuration require_component_configuration(
     return row.controllable_component_id != component_id;
   };
   std::erase_if(result.controller_profiles, unrelated);
+  std::erase_if(result.pose_sources, unrelated);
   std::erase_if(result.default_fault_stop_profiles, unrelated);
   return result;
 }
@@ -1624,7 +1710,8 @@ CanonicalValue component_configuration_projection(
                  name == "motion_target_limits" ||
                  name == "default_fault_stop_profiles" ||
                  name == "gripper_target_configurations" ||
-                 name == "io_signals" || name == "io_provider_devices") {
+                 name == "io_signals" || name == "io_provider_devices" ||
+                 name == "pose_sources") {
         CanonicalValue::Array rows;
         for (const auto &row : value.as_array()) {
           const auto *owner = row.find_object_member("controllable_component_id");
@@ -1639,6 +1726,22 @@ CanonicalValue component_configuration_projection(
     return CanonicalValue(std::move(result));
   }
   throw RetainedBundleError("ROS component configuration has no runtime projection");
+}
+
+std::string
+pose_source_stream_id(const Configuration::PoseSource::Binding &binding) {
+  return PoseSourceStreamId(binding.object_id, binding.policy_id);
+}
+
+const Configuration::PoseSource *
+find_pose_source(const Configuration &configuration,
+                 const core::ControllableComponentId &component_id) {
+  const auto found = std::find_if(
+      configuration.pose_sources.begin(), configuration.pose_sources.end(),
+      [&](const auto &source) {
+        return source.controllable_component_id == component_id;
+      });
+  return found == configuration.pose_sources.end() ? nullptr : &*found;
 }
 
 const Configuration::ControllerProfile *

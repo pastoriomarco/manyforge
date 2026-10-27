@@ -1399,6 +1399,13 @@ std::optional<ErrorDTO> ResourceAddressedExecutionKernel::component_command_refu
     const RuntimeParticipantExecutionRegistration& registration) const {
   const auto& binding = registration.binding.value();
   if (const auto global = global_io_rule_command_refusal_locked(binding)) return global;
+  if (const auto hold = component_stream_holds_.find(binding.controllable_component_id);
+      hold != component_stream_holds_.end())
+    return hold->second;
+  // A component without motion of its own (e.g. a pose source) holds new
+  // motion of every component; I/O outputs stay governed by their own facts.
+  if (!binding.io_output_binding && !cell_stream_holds_.empty())
+    return cell_stream_holds_.begin()->second;
   if (binding.io_output_binding) {
     const auto& output = *binding.io_output_binding;
     const auto current =

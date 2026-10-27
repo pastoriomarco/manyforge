@@ -62,7 +62,7 @@ class OrchestratorRunner:
             )
         return matches[0]
 
-    def _selected_status(self) -> tuple[dict[str, Any], dict[str, Any]]:
+    def _selected_status(self) -> dict[str, Any]:
         status_envelope = self._kernel.identity()
         status = status_envelope.get("identity")
         if not isinstance(status, dict):
@@ -85,20 +85,7 @@ class OrchestratorRunner:
             raise KernelClientResponseError(
                 "execution owner product differs from the applied Program binding"
             )
-        scene_revision = status.get("scene_revision")
-        if (
-            not isinstance(scene_revision, dict)
-            or not isinstance(scene_revision.get("scene_id"), str)
-            or not scene_revision["scene_id"]
-            or type(scene_revision.get("revision_id")) is not int
-            or scene_revision["revision_id"] < 1
-            or not isinstance(scene_revision.get("content_hash"), str)
-            or not scene_revision["content_hash"]
-        ):
-            raise KernelClientResponseError(
-                "headless execution status has no valid scene revision"
-            )
-        return status, scene_revision
+        return status
 
     def submit_joint_goal(
         self,
@@ -121,7 +108,7 @@ class OrchestratorRunner:
             target_role_id=target_role_id,
             capability_id="execution.trajectory.execute",
         )
-        status, scene_revision = self._selected_status()
+        status = self._selected_status()
         span = ActionSpan(
             action_source="program_node",
             action_span_id=node_attempt_id,
@@ -142,7 +129,7 @@ class OrchestratorRunner:
             "program_run_id": program_run_id,
             "expected_graph_revision": status["graph_revision"],
             "expected_retained_bundle_id": status["retained_bundle_id"],
-            "expected_scene_revision": scene_revision,
+            "expected_scene_revision": None,
             "participants": [
                 {
                     "component_role_id": component_role_id,
@@ -245,7 +232,7 @@ class OrchestratorRunner:
             raise ValueError(
                 "applied Program binding has no gripper command schema revision"
             )
-        status, scene_revision = self._selected_status()
+        status = self._selected_status()
 
         if position_kind == "angular_rad":
             position_value: dict[str, Any] = {
@@ -288,7 +275,7 @@ class OrchestratorRunner:
             "program_run_id": program_run_id,
             "expected_graph_revision": status["graph_revision"],
             "expected_retained_bundle_id": status["retained_bundle_id"],
-            "expected_scene_revision": scene_revision,
+            "expected_scene_revision": None,
             "participants": [
                 {
                     "component_role_id": component_role_id,

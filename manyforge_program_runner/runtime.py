@@ -2217,9 +2217,6 @@ class ProgramRuntime:
     ) -> dict[str, int]:
         source = applied.get("source")
         status = execution.get("identity")
-        scene_revision = (
-            status.get("scene_revision") if isinstance(status, Mapping) else None
-        )
         if (
             execution.get("ok") is not True
             or not isinstance(source, Mapping)
@@ -2230,9 +2227,6 @@ class ProgramRuntime:
             or source["source_generation"] < 1
             or type(status.get("active_publication_generation")) is not int
             or status["active_publication_generation"] < 1
-            or not isinstance(scene_revision, Mapping)
-            or type(scene_revision.get("revision_id")) is not int
-            or scene_revision["revision_id"] < 1
         ):
             raise ProgramRunnerError(
                 "program_run_recovery_fence_unavailable",

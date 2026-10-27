@@ -54,11 +54,7 @@ constexpr char kDigest5[] =
           std::make_shared<const LogicalSceneSnapshotDTO>(std::move(logical_scene)),
           10,
           {std::move(world),
-           testing::make_test_logical_scene(binding)->configured_collision_policy,
-           {}},
-          1U,
-          1U,
-          {}};
+           testing::make_test_logical_scene(binding)->configured_collision_policy}};
 }
 
 [[nodiscard]] CollisionWorldLeaseInventory successor_projection(
@@ -1032,6 +1028,10 @@ TEST(AddressedPickPlacePlanningOwner,
                                         SceneResourceId("workpiece")}});
   auto retreat = motion_operation("public.pick.retreat", "retreat", CartesianPathDTO{});
   auto tool = tool_operation("public.pick.tool", 0.0);
+  // Callers name no Scene revision; planning uses the latest Scene.
+  for (auto* const operation : {&approach, &descend, &tool, &retreat}) {
+    operation->expected_scene_revision = std::nullopt;
+  }
 
   const PickSequencePlanningIntentDTO request{"public-pick-1",
                                               SceneResourceId("workpiece"),
@@ -1444,7 +1444,7 @@ TEST(AddressedPickPlacePlanningOwner, FailedPlanningRetainsOneBoundedLinkedMotio
   EXPECT_FALSE(result.value().reports.front().stages.front().succeeded);
 }
 
-TEST(AddressedPickPlacePlanningOwner, RejectsStaleOrCancelledPickBeforeRetainingAProjection) {
+TEST(AddressedPickPlacePlanningOwner, RejectsInvalidOrCancelledPickBeforeRetainingAProjection) {
   auto predecessor = predecessor_projection();
   FakeMotionPreviewOwner motion;
   FakeSceneCandidatePreview scene(predecessor);
@@ -1465,20 +1465,6 @@ TEST(AddressedPickPlacePlanningOwner, RejectsStaleOrCancelledPickBeforeRetaining
         tool_operation("public.pick2.tool", 0.0),
         motion_operation("public.pick2.retreat", "retreat", CartesianPathDTO{})};
   };
-  auto stale = make_intent();
-  ++stale.approach_operation.expected_scene_revision->revision_id;
-  stale.descend_operation.expected_scene_revision =
-      stale.approach_operation.expected_scene_revision;
-  stale.tool_operation.expected_scene_revision = stale.approach_operation.expected_scene_revision;
-  stale.retreat_operation.expected_scene_revision =
-      stale.approach_operation.expected_scene_revision;
-
-  auto stale_result = owner.PlanPick(std::move(stale));
-  ASSERT_FALSE(stale_result.ok());
-  EXPECT_EQ(stale_result.error().details.at("reason"), "pick_place_public_intent_invalid");
-  EXPECT_EQ(motion.begin_count, 0U);
-  EXPECT_EQ(projection.retain_call_count, 0U);
-
   auto oversized = make_intent();
   oversized.sequence_id = std::string(kMaxPickPlaceSequenceIdBytes + 1U, 'x');
   auto oversized_result = owner.PlanPick(std::move(oversized));

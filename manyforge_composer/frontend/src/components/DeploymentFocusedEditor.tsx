@@ -85,7 +85,11 @@ interface RuntimeConfiguration {
   framePrefix: string | null;
   /** A model-free I/O device (runtime_kind io_provider): I/O sections only. */
   ioProvider: boolean;
+  /** A model-free pose source (runtime_kind pose_source): shown read-only only. */
+  poseSource: boolean;
 }
+
+const POSE_SOURCE_RUNTIME_KIND = 'pose_source';
 
 interface MotionTargetLimit {
   runtimeIndex: number;
@@ -117,6 +121,7 @@ interface GripperTargetConfigurationDraft {
   closedStateRef: string;
   commandDurationS: number;
   deliveryResultTimeoutS?: number;
+  stateFreshnessTimeoutS: number;
   touchLinks: string[];
   mountFrame: string;
   attachFrame: string;
@@ -166,6 +171,7 @@ function runtimeConfigurations(
           ? (typeof component?.frame_prefix === 'string' ? component.frame_prefix : '')
           : null,
         ioProvider: isIoProviderComponent(component ?? undefined),
+        poseSource: configuration.runtime_kind === POSE_SOURCE_RUNTIME_KIND,
       }];
     });
   }
@@ -185,6 +191,7 @@ function runtimeConfigurations(
         intentTargetSettings: null,
         framePrefix: null,
         ioProvider: false,
+        poseSource: false,
       }]
       : [];
   });
@@ -260,6 +267,7 @@ function gripperTargetConfigurations(
       const closedStateRef = row?.closed_state_ref;
       const commandDurationS = numberValue(row?.command_duration_s);
       const deliveryResultTimeoutS = row?.delivery_result_timeout_s;
+      const stateFreshnessTimeoutS = numberValue(row?.state_freshness_timeout_s);
       const touchLinks = row?.touch_links;
       const mountFrame = row?.mount_frame;
       const attachFrame = row?.attach_frame;
@@ -279,6 +287,7 @@ function gripperTargetConfigurations(
             || typeof deliveryResultTimeoutS !== 'number'
             || !Number.isFinite(deliveryResultTimeoutS)
             || deliveryResultTimeoutS <= 0))
+        || stateFreshnessTimeoutS === null
         || !Array.isArray(touchLinks)
         || touchLinks.some((item) => typeof item !== 'string')
         || typeof mountFrame !== 'string'
@@ -299,6 +308,7 @@ function gripperTargetConfigurations(
         closedStateRef,
         commandDurationS,
         ...(deliveryResultTimeoutS === undefined ? {} : { deliveryResultTimeoutS }),
+        stateFreshnessTimeoutS,
         touchLinks: touchLinks as string[],
         mountFrame,
         attachFrame,
@@ -323,6 +333,7 @@ function gripperConfigurationValue(
     command_duration_s: draft.commandDurationS,
     ...(draft.actuationKind === 'pneumatic' && draft.deliveryResultTimeoutS !== undefined
       ? { delivery_result_timeout_s: draft.deliveryResultTimeoutS } : {}),
+    state_freshness_timeout_s: draft.stateFreshnessTimeoutS,
     touch_links: [...draft.touchLinks].sort(),
     mount_frame: draft.mountFrame,
     attach_frame: draft.attachFrame,
@@ -1555,6 +1566,36 @@ function GripperSection({
     );
     setError(result === null ? 'The Deployment owner rejected this gripper configuration.' : null);
   };
+  // Feedback timeout = Deployment override of the gripper's `gripper_feedback`
+  // stream budget; blank keeps the gripper row's `state_freshness_timeout_s`
+  // (the one default the host also reads), shown as the placeholder.
+  const policies = objectValue(controller.workspace?.draft.document?.policies) ?? {};
+  const streamRows = (Array.isArray(policies.component_streams)
+    ? policies.component_streams : []) as Array<Record<string, JsonValue>>;
+  const isFeedbackRow = (row: Record<string, JsonValue>) => (
+    row.controllable_component_id === descriptor?.controllableComponentId
+    && row.stream_id === 'gripper_feedback'
+  );
+  const feedbackBudgetNs = numberValue(streamRows.find(isFeedbackRow)?.budget_ns);
+  const updateFeedbackTimeout = async (timeoutMs: number | null) => {
+    if (descriptor === null) return null;
+    const rows = streamRows.filter((row) => !isFeedbackRow(row));
+    const row = { ...(streamRows.find(isFeedbackRow) ?? {
+      controllable_component_id: descriptor.controllableComponentId, stream_id: 'gripper_feedback',
+    }) };
+    if (timeoutMs === null) delete row.budget_ns;
+    else row.budget_ns = Math.max(1, Math.round(timeoutMs * 1e6));
+    // A row needs at least one override besides its identity.
+    if (Object.keys(row).length > 2) rows.push(row);
+    rows.sort((a, b) => (
+      String(a.controllable_component_id).localeCompare(String(b.controllable_component_id))
+      || String(a.stream_id).localeCompare(String(b.stream_id))
+    ));
+    const updated = { ...policies };
+    if (rows.length) updated.component_streams = rows;
+    else delete updated.component_streams;
+    return controller.mutate(['policies'], 'set', updated);
+  };
   return (
     <details className="dcard">
       <summary>Current gripper configuration</summary>
@@ -1586,6 +1627,16 @@ function GripperSection({
               <span><small>Presets</small><strong>{descriptor.namedPresets.map((preset) => preset.name).join(', ') || 'not declared'}</strong></span>
               <span><small>Mimic followers</small><strong>{descriptor.mimicFollowers.length}</strong></span>
             </div>
+            <OptionalNumberDraft
+              label="Feedback timeout"
+              value={feedbackBudgetNs === null ? null : feedbackBudgetNs / 1e6}
+              unit="ms"
+              placeholder={source === null
+                ? 'gripper profile default'
+                : `${format(source.stateFreshnessTimeoutS * 1000)} ms (profile default)`}
+              disabled={disabled}
+              onCommit={updateFeedbackTimeout}
+            />
             {draft === null ? (
               <p className="muted">This addressed gripper has no Deployment-owned configuration row to edit.</p>
             ) : (
@@ -1724,7 +1775,7 @@ function GripperSection({
                 </div>
               </fieldset>
             )}
-            <p className="field-help">The Deployment owns tool geometry, presets, and motion time. Transport, state authority, completion, and grasp confirmation above are exact addressed-owner facts and remain read-only.</p>
+            <p className="field-help">The Deployment owns tool geometry, presets, motion time, and the feedback timeout (how long gripper feedback may stay silent before the gripper is reported stale; blank uses the gripper profile default). Transport, state authority, completion, and grasp confirmation above are exact addressed-owner facts and remain read-only.</p>
           </>
         )}
       </div>
@@ -1764,11 +1815,13 @@ export function DeploymentFocusedEditor({
     ])).values()];
   }, [motionDescriptors, sourceModel]);
   const runtimes = useMemo(() => runtimeConfigurations(document), [document]);
-  // I/O devices have no model, motion, gripper, frame or Stop inputs.
-  const motionRuntimes = useMemo(() => runtimes.filter((runtime) => !runtime.ioProvider), [runtimes]);
+  // Model-free components (I/O devices, pose sources) have no model, motion,
+  // gripper, frame or Stop inputs.
+  const motionRuntimes = useMemo(
+    () => runtimes.filter((runtime) => !runtime.ioProvider && !runtime.poseSource), [runtimes]);
   const limits = useMemo(() => motionTargetLimits(motionRuntimes), [motionRuntimes]);
   const controlledStop = useMemo(() => controlledStopTargets(document), [document]);
-  const ioRuntimes = useMemo(() => runtimes.map((runtime) => ({
+  const ioRuntimes = useMemo(() => runtimes.filter((runtime) => !runtime.poseSource).map((runtime) => ({
     index: runtime.index,
     runtimeUnitId: runtime.runtimeUnitId,
     configuration: runtime.configuration,
@@ -1804,6 +1857,7 @@ export function DeploymentFocusedEditor({
       )}
       <IoSignalConfigurationSection controller={controller} runtimes={ioRuntimes}
         geometricContactEndpoints={geometricContactEndpoints} />
+      <PoseSourceComponentSection runtimes={runtimes} />
       {document.api_version === 'manyforge.deployment_intent.v2' && (
         <MotionTakeoverSection controller={controller} document={document} />
       )}
@@ -1876,6 +1930,92 @@ function MotionTakeoverSection({ controller, document }: {
           </p>
         )}
         {error && <p className="deployment-field-error inline-message severity-error">{error}</p>}
+      </div>
+    </details>
+  );
+}
+
+interface PoseSourceBinding {
+  source: string;
+  objectId: string;
+  policyId: string;
+  eligible: boolean | null;
+  lifetimeNs: number | null;
+}
+
+/** The bindings of one pose_sources row: joint state, simulation entities, detections. */
+function poseSourceBindings(row: Record<string, JsonValue>): PoseSourceBinding[] {
+  const binding = (source: string, value: JsonValue | undefined): PoseSourceBinding[] => {
+    const item = objectValue(value);
+    return item === null ? [] : [{
+      source,
+      objectId: String(item.object_id ?? ''),
+      policyId: String(item.policy_id ?? ''),
+      eligible: typeof item.eligible === 'boolean' ? item.eligible : null,
+      lifetimeNs: numberValue(item.lifetime_ns),
+    }];
+  };
+  const list = (value: JsonValue | undefined) => (Array.isArray(value) ? value : []);
+  return [
+    ...binding('joint state', row.joint_state),
+    ...list(row.simulation_entities).flatMap((item) => binding(
+      String(objectValue(item)?.entity ?? 'simulation entity'), item)),
+    ...list(row.detection3d_sources).flatMap((item) => binding('detection 3D', item)),
+  ];
+}
+
+/**
+ * Model-free pose-source components (pose_source_v0 / runtime_kind
+ * pose_source): read-only. Their configuration is authored in the Deployment
+ * file and kept unchanged by every Draft edit here (Check validates it).
+ */
+function PoseSourceComponentSection({ runtimes }: { runtimes: RuntimeConfiguration[] }) {
+  const sources = runtimes.filter((runtime) => runtime.poseSource);
+  if (sources.length === 0) return null;
+  return (
+    <details className="dcard">
+      <summary>Pose sources</summary>
+      <div className="deployment-focused-body">
+        {sources.map((runtime) => {
+          const runtimeConfiguration = objectValue(runtime.configuration.runtime_configuration);
+          const poseSources = runtimeConfiguration?.pose_sources;
+          const rows = Array.isArray(poseSources)
+            ? poseSources.flatMap((value) => {
+              const row = objectValue(value);
+              return row === null ? [] : [row];
+            })
+            : [];
+          return (
+            <section className="deployment-pose-source" key={runtime.runtimeUnitId}
+              aria-label={`${runtime.runtimeUnitId} pose source`}>
+              <header><strong>{runtime.runtimeUnitId}</strong><small>Read-only</small></header>
+              {rows.map((row, rowIndex) => (
+                <div key={rowIndex}>
+                  <p className="muted">Poll period: {numberValue(row.simulation_poll_period_ms) ?? 'not declared'} ms</p>
+                  <table aria-label={`${runtime.runtimeUnitId} pose bindings`}>
+                    <thead><tr><th>Object</th><th>Policy</th><th>Eligible</th><th>Lifetime</th><th>Source</th></tr></thead>
+                    <tbody>
+                      {poseSourceBindings(row).map((binding, index) => (
+                        <tr key={index}>
+                          <td>{binding.objectId}</td>
+                          <td>{binding.policyId}</td>
+                          <td>{binding.eligible === null ? '' : binding.eligible ? 'yes' : 'no'}</td>
+                          <td>{binding.lifetimeNs === null ? '' : `${format(binding.lifetimeNs / 1e9)} s`}</td>
+                          <td>{binding.source}</td>
+                        </tr>
+                      ))}
+                    </tbody>
+                  </table>
+                </div>
+              ))}
+              <details>
+                <summary>Configuration</summary>
+                <pre>{JSON.stringify(runtimeConfiguration, null, 2)}</pre>
+              </details>
+            </section>
+          );
+        })}
+        <p className="field-help">A pose source is a model-free component that publishes object poses (and optionally the measured robot joint state) from the simulator or 3D detections. Its configuration is edited in the Deployment file; it has no model, pose, frames or Stop settings.</p>
       </div>
     </details>
   );

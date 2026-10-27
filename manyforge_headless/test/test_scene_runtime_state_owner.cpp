@@ -78,115 +78,44 @@ TEST(SceneRuntimeStateOwner,
   EXPECT_EQ(owner.Snapshot().state, SceneInitializationState::kOpen);
 }
 
-TEST(SceneRuntimeStateOwner,
-     ConfiguredSourceLossClosesFreshnessWithoutErasingCoordinates) {
+TEST(SceneRuntimeStateOwner, ExactRetirementErasesOnlyThatSource) {
   std::int64_t now = 10;
   SceneRuntimeStateOwner owner([&] { return now; }, [] { return "token"; });
   const auto identity = RuntimeIdentity(4U);
   owner.EstablishOpenRuntime(identity, 4U, "bootstrap");
-  owner.ConfigurePoseSourceAvailability(identity, "source-1", "base");
-  const auto observation = Observation(1U, 10, 100, "historical", "base.1");
-  static_cast<void>(owner.ObservePose(observation));
+  static_cast<void>(
+      owner.ObservePose(Observation(1U, 10, 100, "old", "old-base.1")));
   auto other = Observation(1U, 10, 100, "unrelated");
   other.key.source_id = "other-source";
   static_cast<void>(owner.ObservePose(other));
-  const auto before = owner.Snapshot();
-  now = 20;
-  owner.MarkPoseSourceUnavailable(identity, "source-1", "base");
-  const auto unavailable = owner.Snapshot();
-  ASSERT_TRUE(unavailable.configured_pose_source);
-  EXPECT_FALSE(unavailable.configured_pose_source->available);
-  ASSERT_EQ(unavailable.pose_sources.size(), 2U);
-  EXPECT_EQ(unavailable.pose_sources.front().observation, other);
-  EXPECT_TRUE(unavailable.pose_sources.front().fresh);
-  EXPECT_EQ(unavailable.pose_sources.back().observation, observation);
-  EXPECT_FALSE(unavailable.pose_sources.back().fresh);
-  EXPECT_EQ(unavailable.runtime_identity, before.runtime_identity);
-  EXPECT_EQ(unavailable.initialization_generation,
-            before.initialization_generation);
-  EXPECT_EQ(unavailable.counters.retired, before.counters.retired);
-  EXPECT_EQ(unavailable.state, SceneInitializationState::kOpen);
-  EXPECT_THROW(static_cast<void>(owner.ObservePose(observation)),
-               SceneRuntimeStateConflictError);
-  other.source_sequence = 2U;
-  EXPECT_TRUE(owner.ObservePose(other).fresh);
-  const auto encoded = SceneRuntimeStateValue(owner.Snapshot());
-  ASSERT_NE(encoded.find_object_member("configured_pose_source"), nullptr);
-  EXPECT_NE(content_identity::canonical_json(encoded).find("historical"),
-            std::string::npos);
-}
-
-TEST(SceneRuntimeStateOwner,
-     SourceLossSurvivesExactConfigureAndRobotOnlyPublication) {
-  std::int64_t now = 10;
-  SceneRuntimeStateOwner owner([&] { return now; }, [] { return "token"; });
-  auto identity = RuntimeIdentity(4U);
-  owner.EstablishOpenRuntime(identity, 4U, "bootstrap");
-  owner.ConfigurePoseSourceAvailability(identity, "source-1", "base");
-  owner.MarkPoseSourceUnavailable(identity, "source-1", "base");
-  owner.ConfigurePoseSourceAvailability(identity, "source-1", "base");
-  EXPECT_FALSE(owner.Snapshot().configured_pose_source->available);
-  identity = RuntimeIdentity(5U);
-  ASSERT_TRUE(owner.AdoptFinalizedOpenRuntime(identity, 5U, "robot_apply"));
-  owner.ConfigurePoseSourceAvailability(identity, "source-1", "base");
-  EXPECT_FALSE(owner.Snapshot().configured_pose_source->available);
-  EXPECT_THROW(static_cast<void>(owner.ObservePose(
-                   Observation(1U, 10, 100, "old", "base.1"))),
-               SceneRuntimeStateConflictError);
-}
-
-TEST(SceneRuntimeStateOwner, ExactRetirementClearsLossBeforeCheckedSuccessor) {
-  std::int64_t now = 10;
-  SceneRuntimeStateOwner owner([&] { return now; }, [] { return "token"; });
-  const auto identity = RuntimeIdentity(4U);
-  owner.EstablishOpenRuntime(identity, 4U, "bootstrap");
-  owner.ConfigurePoseSourceAvailability(identity, "source-1", "old-base");
-  static_cast<void>(
-      owner.ObservePose(Observation(1U, 10, 100, "old", "old-base.1")));
-  owner.MarkPoseSourceUnavailable(identity, "source-1", "old-base");
-  owner.RetirePoseSource(identity, "other-source");
-  ASSERT_TRUE(owner.Snapshot().configured_pose_source);
-  EXPECT_FALSE(owner.Snapshot().configured_pose_source->available);
   owner.RetirePoseSource(identity, "source-1");
-  EXPECT_FALSE(owner.Snapshot().configured_pose_source);
-  EXPECT_TRUE(owner.Snapshot().pose_sources.empty());
-  owner.ConfigurePoseSourceAvailability(identity, "source-1", "new-base");
+  ASSERT_EQ(owner.Snapshot().pose_sources.size(), 1U);
+  EXPECT_EQ(owner.Snapshot().pose_sources.front().observation, other);
   EXPECT_TRUE(
       owner.ObservePose(Observation(1U, 10, 100, "new", "new-base.1")).fresh);
 }
 
-TEST(SceneRuntimeStateOwner,
-     ForeignLossAndConfigurationCannotMutateCurrentAvailability) {
+TEST(SceneRuntimeStateOwner, CarriedObjectLossEventsArePublishedAndBounded) {
   std::int64_t now = 10;
   SceneRuntimeStateOwner owner([&] { return now; }, [] { return "token"; });
-  const auto identity = RuntimeIdentity(4U);
-  owner.EstablishOpenRuntime(identity, 4U, "bootstrap");
-  const std::string source("source\0id", 9U);
-  EXPECT_THROW(owner.ConfigurePoseSourceAvailability(identity, source,
-                                                     std::string(240U, 'x')),
-               SceneRuntimeStateError);
-  EXPECT_THROW(owner.ConfigurePoseSourceAvailability(
-                   identity, source, std::string("base\0id", 7U)),
-               SceneRuntimeStateError);
-  owner.ConfigurePoseSourceAvailability(identity, source, "base");
-  const auto before = content_identity::canonical_json(
-      SceneRuntimeStateValue(owner.Snapshot()));
-  EXPECT_THROW(
-      owner.MarkPoseSourceUnavailable(RuntimeIdentity(5U), source, "base"),
-      SceneRuntimeStateConflictError);
-  EXPECT_THROW(owner.MarkPoseSourceUnavailable(identity, "foreign", "base"),
-               SceneRuntimeStateConflictError);
-  EXPECT_THROW(owner.MarkPoseSourceUnavailable(identity, source, "other-base"),
-               SceneRuntimeStateConflictError);
-  EXPECT_THROW(
-      owner.ConfigurePoseSourceAvailability(identity, source, "other-base"),
-      SceneRuntimeStateConflictError);
-  EXPECT_EQ(content_identity::canonical_json(
-                SceneRuntimeStateValue(owner.Snapshot())),
-            before);
-  owner.MarkPoseSourceUnavailable(identity, source, "base");
-  EXPECT_EQ(owner.Snapshot().configured_pose_source->source_id, source);
-  EXPECT_FALSE(owner.Snapshot().configured_pose_source->available);
+  owner.EstablishOpenRuntime(RuntimeIdentity(4U), 4U, "bootstrap");
+  EXPECT_EQ(SceneRuntimeStateValue(owner.Snapshot())
+                .find_object_member("carried_object_losses"),
+            nullptr);
+  owner.RecordCarriedObjectLoss({"event-0", "box", "box moved"});
+  EXPECT_NE(content_identity::canonical_json(
+                SceneRuntimeStateValue(owner.Snapshot()))
+                .find(R"("carried_object_losses":[{"code":"scene.carried_object_lost","event_id":"event-0","full_text":"box moved","scene_resource_id":"box"}])"),
+            std::string::npos);
+  for (std::size_t index = 1U; index <= kMaximumCarriedObjectLossEvents; ++index) {
+    owner.RecordCarriedObjectLoss(
+        {"event-" + std::to_string(index), "box", "box moved"});
+  }
+  const auto losses = owner.Snapshot().carried_object_losses;
+  ASSERT_EQ(losses.size(), kMaximumCarriedObjectLossEvents);
+  EXPECT_EQ(losses.front().event_id, "event-1");
+  EXPECT_EQ(losses.back().event_id,
+            "event-" + std::to_string(kMaximumCarriedObjectLossEvents));
 }
 
 TEST(SceneRuntimeStateOwner,

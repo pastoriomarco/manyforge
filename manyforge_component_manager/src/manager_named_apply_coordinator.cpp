@@ -29,6 +29,14 @@ constexpr std::size_t kMaximumSelectedBundleAdvances = 2U;
          left.graph_revision == right.graph_revision;
 }
 
+/// Same cell and Scene; the revision is Apply-time evidence only.
+[[nodiscard]] bool SameSnapshotScene(
+    const core::LogicalSceneSnapshotIdentityDTO &left,
+    const core::LogicalSceneSnapshotIdentityDTO &right) noexcept {
+  return left.cell_id == right.cell_id &&
+         left.revision.scene_id == right.revision.scene_id;
+}
+
 [[noreturn]] void Fail(const std::string &detail) {
   throw ManagerNamedApplyCoordinatorError(detail);
 }
@@ -344,9 +352,7 @@ public:
          intent.prepared_activation == request.prepared_activation &&
          intent.expected_admission_generation ==
              request.expected_admission_generation &&
-         intent.parent_authoring_claim == request.parent_authoring_claim &&
-         intent.isaac_pose_observer_launch_facts ==
-             request.isaac_pose_observer_launch_facts;
+         intent.parent_authoring_claim == request.parent_authoring_claim;
 }
 
 [[nodiscard]] core::CellAdmissionClaimIntentDTO
@@ -616,9 +622,7 @@ bool ManagerNamedApplyRequestDTO::valid() const noexcept {
          core::IsExactLowercaseSha256Digest(deployment_revision.value()) &&
          !expected_current_retained_bundle_id.empty() &&
          !expected_current_graph_revision.empty() &&
-         !candidate_retained_bundle_id.empty() && prepared_activation.valid() &&
-         (!isaac_pose_observer_launch_facts ||
-          isaac_pose_observer_launch_facts->valid());
+         !candidate_retained_bundle_id.empty() && prepared_activation.valid();
 }
 
 ManagerNamedApplyCoordinator::ManagerNamedApplyCoordinator(
@@ -991,7 +995,7 @@ ManagerNamedApplyResult ManagerNamedApplyCoordinator::ContinueOriginalConfigurat
         const auto &row = health[index];
         Require(row.valid() && row.native_runtime_binding == request.native_runtime_bindings[index] && !row.error,
                 "configuration staging returned foreign or failed native evidence");
-        if (!row.healthy_for_target(target)) {
+        if (!row.healthy_for_identity(target)) {
           Require(row.state == core::ProjectionHealthState::kRebuilding ||
                       row.state == core::ProjectionHealthState::kUninitialized,
                   "configuration staging returned unavailable native evidence");
@@ -1017,9 +1021,10 @@ ManagerNamedApplyResult ManagerNamedApplyCoordinator::ContinueOriginalConfigurat
       Require(begun.valid() && begun.apply_id == intent.apply_id && begun.apply_generation == intent.apply_generation &&
                   begun.state == core::ProjectionMaintenanceInitializationState::kInitialized &&
                   begun.ready_for_publication() && !begun.publication_receipt && !begun.effects_unknown && !begun.first_error &&
-                  begun.predecessor_projection_revision == intent.expected_active_projection_revision &&
-                  begun.target_projection_revision == target &&
-                  begun.authoritative_snapshot_identity == request.expected_snapshot_identity &&
+                  core::SameProjectionIdentity(begun.predecessor_projection_revision,
+                                               intent.expected_active_projection_revision) &&
+                  core::SameProjectionIdentity(begun.target_projection_revision, target) &&
+                  SameSnapshotScene(begun.authoritative_snapshot_identity, request.expected_snapshot_identity) &&
                   begun.native_runtime_bindings == request.native_runtime_bindings &&
                   CaptureOriginalConfigurationAdoption(intent) == request,
               "configuration Begin returned foreign or incomplete preservation evidence");
@@ -1064,11 +1069,14 @@ ManagerNamedApplyResult ManagerNamedApplyCoordinator::FinishOriginalConfiguratio
           *captured.original_configuration_adoption, receipt);
       Require(completed.valid() && completed.apply_id == intent.apply_id && completed.apply_generation == intent.apply_generation &&
                   completed.state == core::ProjectionMaintenanceInitializationState::kCompleted &&
-                  completed.publication_receipt == receipt && completed.initial_scene_installed &&
+                  core::SamePublicationIdentity(completed.publication_receipt, receipt) &&
+                  completed.initial_scene_installed &&
                   !completed.effects_unknown && !completed.first_error &&
-                  completed.predecessor_projection_revision == intent.expected_active_projection_revision &&
-                  completed.target_projection_revision == target &&
-                  completed.authoritative_snapshot_identity == captured.original_configuration_adoption->expected_snapshot_identity &&
+                  core::SameProjectionIdentity(completed.predecessor_projection_revision,
+                                               intent.expected_active_projection_revision) &&
+                  core::SameProjectionIdentity(completed.target_projection_revision, target) &&
+                  SameSnapshotScene(completed.authoritative_snapshot_identity,
+                                    captured.original_configuration_adoption->expected_snapshot_identity) &&
                   completed.native_runtime_bindings == captured.original_configuration_adoption->native_runtime_bindings &&
                   CaptureOriginalConfigurationAdoption(intent) == *captured.original_configuration_adoption,
               "configuration Scene Complete returned foreign or incomplete preservation evidence");
@@ -1235,11 +1243,15 @@ ManagerNamedApplyResult ManagerNamedApplyCoordinator::FinishOriginalBringUpPubli
           *captured.original_scene_adoption, receipt);
       Require(completed.valid() && completed.apply_id == intent.apply_id &&
                   completed.apply_generation == intent.apply_generation && completed.state == core::ProjectionMaintenanceInitializationState::kCompleted &&
-                  completed.publication_receipt == receipt && completed.initial_scene_installed &&
+                  core::SamePublicationIdentity(completed.publication_receipt, receipt) &&
+                  completed.initial_scene_installed &&
                   !completed.effects_unknown && !completed.first_error &&
-                  completed.predecessor_projection_revision == intent.expected_active_projection_revision &&
-                  completed.target_projection_revision == receipt.request.candidate_projection_revision &&
-                  completed.authoritative_snapshot_identity == captured.original_scene_adoption->expected_snapshot_identity &&
+                  core::SameProjectionIdentity(completed.predecessor_projection_revision,
+                                               intent.expected_active_projection_revision) &&
+                  core::SameProjectionIdentity(completed.target_projection_revision,
+                                               receipt.request.candidate_projection_revision) &&
+                  SameSnapshotScene(completed.authoritative_snapshot_identity,
+                                    captured.original_scene_adoption->expected_snapshot_identity) &&
                   completed.native_runtime_bindings == captured.original_scene_adoption->native_runtime_bindings,
               "original Scene Complete returned missing or foreign evidence");
       Require(CaptureOriginalSceneAdoption(intent) == *captured.original_scene_adoption,
@@ -1397,7 +1409,6 @@ ManagerNamedApplyResult ManagerNamedApplyCoordinator::AcceptOrReplay(
       request.prepared_activation,
       request.expected_admission_generation,
       request.parent_authoring_claim,
-      request.isaac_pose_observer_launch_facts,
       request.scene_initialization,
   };
   Require(intent.valid(), "Manager could not construct a valid Apply intent");
@@ -1448,7 +1459,8 @@ ManagerNamedApplyResult ManagerNamedApplyCoordinator::AcceptOrReplay(
     }
     Require(active_plan_source_.ReadCurrentPlan().active_publication ==
                 active_plan.active_publication &&
-                scene_owner_.CurrentProjectionRevision() == scene_revision,
+                core::SameProjectionIdentity(scene_owner_.CurrentProjectionRevision(),
+                                             scene_revision),
             "original configured bring-up predecessor changed before acceptance");
   }
   std::optional<PersistedManagerApplyBringUpPlan> durable_plan;
@@ -1747,7 +1759,7 @@ ManagerNamedApplyCoordinator::Continue(const ManagerApplyIntentDTO &intent,
           const auto &row = health[index];
           Require(row.valid() && row.native_runtime_binding == request.native_runtime_bindings[index] && !row.error,
                   "original Scene staging returned foreign or failed native evidence");
-          if (!row.healthy_for_target(target)) {
+          if (!row.healthy_for_identity(target)) {
             Require(row.state == core::ProjectionHealthState::kRebuilding ||
                         row.state == core::ProjectionHealthState::kUninitialized,
                     "original Scene staging lacks healthy or genuinely pending native evidence");
@@ -1806,9 +1818,11 @@ ManagerNamedApplyCoordinator::Continue(const ManagerApplyIntentDTO &intent,
         Require(begun.valid() && begun.apply_id == intent.apply_id &&
                     begun.apply_generation == intent.apply_generation && begun.state == core::ProjectionMaintenanceInitializationState::kInitialized &&
                     begun.ready_for_publication() && !begun.publication_receipt && !begun.effects_unknown && !begun.first_error &&
-                    begun.predecessor_projection_revision == intent.expected_active_projection_revision &&
-                    begun.target_projection_revision == captured_apply_inputs_->bring_up_plan->plan.expected_publication.candidate_projection_revision &&
-                    begun.authoritative_snapshot_identity == request.expected_snapshot_identity &&
+                    core::SameProjectionIdentity(begun.predecessor_projection_revision,
+                                                 intent.expected_active_projection_revision) &&
+                    core::SameProjectionIdentity(begun.target_projection_revision,
+                        captured_apply_inputs_->bring_up_plan->plan.expected_publication.candidate_projection_revision) &&
+                    SameSnapshotScene(begun.authoritative_snapshot_identity, request.expected_snapshot_identity) &&
                     begun.native_runtime_bindings == request.native_runtime_bindings,
                 "original Scene Begin returned missing or foreign adoption evidence");
         Require(CaptureOriginalSceneAdoption(intent) == request,

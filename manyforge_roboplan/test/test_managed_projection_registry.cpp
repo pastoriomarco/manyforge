@@ -333,26 +333,12 @@ TEST(ManagedProjectionRegistry,
                std::runtime_error);
 }
 
-[[nodiscard]] core::ProviderFreshnessConfirmationDTO FreshnessConfirmation() {
-  return core::ProviderFreshnessConfirmationDTO{
-      core::ProjectionRevisionDTO{
-          core::RetainedBundleId("bundle-1"), core::GraphRevision("graph-1"),
-          core::SceneRevision{core::SceneId("sha256:" + std::string(64U, 'd')), 3U,
-                              core::ContentDigest(
-                                  "sha256:" + std::string(64U, 'c'))}},
-      core::SceneResourceId("observed-box"),
-      core::Pose3DTO{{0.25, -1.5, 0.75}, {0.0, 0.0, 0.0, 1.0}},
-      core::SceneObjectProviderEvidenceDTO{
-          core::ProviderInstanceId("isaac.pose.observer"),
-          core::ProviderManifestId("manyforge.provider.logical_scene"),
-          core::ProviderManifestRevision("sha256:" + std::string(64U, 'b')),
-          "sha256:" + std::string(64U, 'a'), 42U, 5'000'000'000,
-          1'250'000'000, 2'000'000'000}};
-}
-
-[[nodiscard]] component_manager::detail::NativeProjectionProviderFreshnessRequest
-FreshnessRequest(const std::string &provider = "arm-a") {
-  return {Binding(provider), FreshnessConfirmation()};
+[[nodiscard]] core::ProjectionRevisionDTO SelectedRevision() {
+  return core::ProjectionRevisionDTO{
+      core::RetainedBundleId("bundle-1"), core::GraphRevision("graph-1"),
+      core::SceneRevision{core::SceneId("sha256:" + std::string(64U, 'd')), 3U,
+                          core::ContentDigest(
+                              "sha256:" + std::string(64U, 'c'))}};
 }
 
 TEST(NativeProjectionRpcCodec, HealthSelectorPreservesLegacyAndHasOneEncoding) {
@@ -390,8 +376,7 @@ TEST(NativeProjectionRpcCodec, HealthSelectorPreservesLegacyAndHasOneEncoding) {
       "\x00\x00\x00\x47"
       "sha256:"
       "cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc";
-  const auto selected_revision =
-      FreshnessConfirmation().expected_projection_revision;
+  const auto selected_revision = SelectedRevision();
   const detail::NativeProjectionHealthQuery selected{Binding("arm-a"),
                                                      selected_revision};
   const std::string canonical =
@@ -433,165 +418,6 @@ TEST(NativeProjectionRpcCodec, HealthSelectorPreservesLegacyAndHasOneEncoding) {
   EXPECT_THROW(
       static_cast<void>(detail::DecodeNativeProjectionRpcResponse(canonical)),
       std::invalid_argument);
-}
-
-TEST(NativeProjectionRpcCodec, ProviderFreshnessRequestRoundTripsExactly) {
-  const auto request = FreshnessRequest();
-  ASSERT_TRUE(request.valid());
-  const auto decoded = component_manager::detail::DecodeNativeProjectionRpcRequest(
-      component_manager::detail::EncodeNativeProjectionRpcRequest(request));
-  const auto *typed = std::get_if<
-      component_manager::detail::NativeProjectionProviderFreshnessRequest>(
-      &decoded);
-  ASSERT_NE(typed, nullptr);
-  EXPECT_EQ(typed->native_runtime_binding, request.native_runtime_binding);
-  EXPECT_EQ(typed->confirmation.expected_projection_revision,
-            request.confirmation.expected_projection_revision);
-  EXPECT_EQ(typed->confirmation.scene_resource_id,
-            request.confirmation.scene_resource_id);
-  EXPECT_EQ(typed->confirmation.pose_in_cell,
-            request.confirmation.pose_in_cell);
-  EXPECT_EQ(typed->confirmation.evidence, request.confirmation.evidence);
-
-  // Optional raw source timestamp absence also round-trips.
-  auto without_source_timestamp = request;
-  without_source_timestamp.confirmation.evidence.source_timestamp_ns.reset();
-  const auto decoded_without =
-      component_manager::detail::DecodeNativeProjectionRpcRequest(
-          component_manager::detail::EncodeNativeProjectionRpcRequest(
-              without_source_timestamp));
-  EXPECT_EQ(std::get<component_manager::detail::
-                         NativeProjectionProviderFreshnessRequest>(
-                decoded_without)
-                .confirmation.evidence,
-            without_source_timestamp.confirmation.evidence);
-}
-
-TEST(NativeProjectionRpcCodec, ProviderFreshnessResultRoundTripsExactly) {
-  const auto confirmation = FreshnessConfirmation();
-  const component_manager::detail::NativeProjectionProviderFreshnessResult
-      result{confirmation.expected_projection_revision,
-             confirmation.scene_resource_id,
-             confirmation.evidence.provider_source_sequence};
-  const auto decoded =
-      component_manager::detail::DecodeNativeProjectionRpcResponse(
-          component_manager::detail::EncodeNativeProjectionRpcResponse(result));
-  const auto *typed = std::get_if<
-      component_manager::detail::NativeProjectionProviderFreshnessResult>(
-      &decoded);
-  ASSERT_NE(typed, nullptr);
-  EXPECT_EQ(typed->projection_revision, result.projection_revision);
-  EXPECT_EQ(typed->scene_resource_id, result.scene_resource_id);
-  EXPECT_EQ(typed->provider_source_sequence, 42U);
-}
-
-TEST(NativeProjectionRpcCodec, ProviderFreshnessRejectsInvalidOrNoncanonical) {
-  namespace detail = component_manager::detail;
-  const auto encode = [](const detail::NativeProjectionRpcRequest &request) {
-    return detail::EncodeNativeProjectionRpcRequest(request);
-  };
-
-  auto missing_object = FreshnessRequest();
-  missing_object.confirmation.scene_resource_id = core::SceneResourceId("");
-  EXPECT_THROW(static_cast<void>(encode(missing_object)),
-               std::invalid_argument);
-  auto missing_budget = FreshnessRequest();
-  missing_budget.confirmation.evidence.source_freshness_budget_ns.reset();
-  EXPECT_THROW(static_cast<void>(encode(missing_budget)),
-               std::invalid_argument);
-  auto negative_received = FreshnessRequest();
-  negative_received.confirmation.evidence.received_at_ns = -1;
-  EXPECT_THROW(static_cast<void>(encode(negative_received)),
-               std::invalid_argument);
-  auto non_finite_pose = FreshnessRequest();
-  non_finite_pose.confirmation.pose_in_cell.position_m.x_m =
-      std::numeric_limits<double>::infinity();
-  EXPECT_THROW(static_cast<void>(encode(non_finite_pose)),
-               std::invalid_argument);
-  auto foreign_binding = FreshnessRequest();
-  foreign_binding.native_runtime_binding.runtime_epoch = core::RuntimeEpoch("");
-  EXPECT_THROW(static_cast<void>(encode(foreign_binding)),
-               std::invalid_argument);
-
-  const auto valid = encode(FreshnessRequest());
-  ASSERT_GT(valid.size(), 9U);
-  // Closed schema: trailing bytes, truncation, an earlier protocol version
-  // and an unknown kind are all refused.
-  EXPECT_THROW(static_cast<void>(
-                   detail::DecodeNativeProjectionRpcRequest(valid + '\0')),
-               std::invalid_argument);
-  EXPECT_THROW(static_cast<void>(detail::DecodeNativeProjectionRpcRequest(
-                   valid.substr(0U, valid.size() - 1U))),
-               std::invalid_argument);
-  auto previous_version = valid;
-  previous_version[7] = '3';
-  EXPECT_THROW(static_cast<void>(
-                   detail::DecodeNativeProjectionRpcRequest(previous_version)),
-               std::invalid_argument);
-  auto unknown_kind = valid;
-  unknown_kind[8] = static_cast<char>(18);
-  EXPECT_THROW(static_cast<void>(
-                   detail::DecodeNativeProjectionRpcRequest(unknown_kind)),
-               std::invalid_argument);
-  // The trailing evidence field is the freshness budget, encoded as a present
-  // optional (one flag byte plus eight value bytes); a zero budget violates
-  // provider-evidence validity and is refused by the decoder.
-  auto zero_budget = valid;
-  for (std::size_t index = zero_budget.size() - 8U; index < zero_budget.size();
-       ++index) {
-    zero_budget[index] = '\0';
-  }
-  EXPECT_THROW(static_cast<void>(
-                   detail::DecodeNativeProjectionRpcRequest(zero_budget)),
-               std::invalid_argument);
-  // A negative budget (sign bit set) is outside the non-negative domain.
-  auto negative_budget = valid;
-  negative_budget[negative_budget.size() - 8U] = static_cast<char>(0x80);
-  EXPECT_THROW(static_cast<void>(
-                   detail::DecodeNativeProjectionRpcRequest(negative_budget)),
-               std::invalid_argument);
-
-  const detail::NativeProjectionProviderFreshnessResult incomplete{
-      FreshnessConfirmation().expected_projection_revision,
-      core::SceneResourceId(""), 1U};
-  EXPECT_THROW(static_cast<void>(
-                   detail::EncodeNativeProjectionRpcResponse(incomplete)),
-               std::invalid_argument);
-}
-
-TEST(ManagedProjectionRegistry, ProviderFreshnessDispatchNamesExactProjection) {
-  std::latch entered(1);
-  std::promise<void> release;
-  release.set_value();
-  ManagedProjectionRegistry registry(
-      ManagedProjectionRegistryConfig{"/nonexistent-package", {},
-                                      "/nonexistent-run", "native-unit",
-                                      "epoch-1", std::nullopt},
-      std::make_unique<GatedAssetSource>(entered,
-                                         release.get_future().share()),
-      [] { return std::int64_t{1'000}; });
-
-  // A decoded wire request reaches the freshness branch, which resolves the
-  // exact binding and projection revision and never falls forward to another
-  // projection: an unprepared binding/revision is refused.
-  const auto decoded = component_manager::detail::DecodeNativeProjectionRpcRequest(
-      component_manager::detail::EncodeNativeProjectionRpcRequest(
-          FreshnessRequest()));
-  EXPECT_THROW(static_cast<void>(registry.Dispatch(decoded)),
-               std::runtime_error);
-
-  // A request for another runtime child is refused before any projection.
-  auto foreign = FreshnessRequest();
-  foreign.native_runtime_binding.runtime_unit_id =
-      core::RuntimeUnitId("another-unit");
-  EXPECT_THROW(static_cast<void>(registry.Dispatch(foreign)),
-               std::runtime_error);
-
-  // A locally invalid confirmation is refused by the dispatch branch itself.
-  auto invalid = FreshnessRequest();
-  invalid.confirmation.evidence.source_freshness_budget_ns.reset();
-  EXPECT_THROW(static_cast<void>(registry.Dispatch(invalid)),
-               std::runtime_error);
 }
 
 } // namespace

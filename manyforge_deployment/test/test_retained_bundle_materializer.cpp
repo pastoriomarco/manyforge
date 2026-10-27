@@ -3757,6 +3757,60 @@ TEST(RetainedBundleMaterializer, ScenePosePolicySelectionSurvivesSealedReload) {
 }
 
 TEST(RetainedBundleMaterializer,
+     ComponentStreamOverridesAreVerifiedAndExposedToTheHost) {
+  const auto fixture = test::make_lite6_ros2_control_motion_retention_fixture();
+  const test::Lite6ControllableCompilerInputArtifactSource input_source(
+      fixture);
+  test::InMemoryCatalogArtifactStoreFixture catalog_store;
+  test::InMemoryRawArtifactStoreFixture raw_store;
+  const auto bundle = detail::RetainedBundleMaterializer::materialize(
+      fixture.qualified,
+      detail::RetentionMaterializerTestAccess::make_context(), input_source,
+      fixture.structural_preparations(), catalog_store, raw_store);
+  ASSERT_NE(bundle, nullptr);
+  // A Deployment without overrides retains no member and exposes none.
+  EXPECT_EQ(bundle->normalized_root().find_object_member("component_streams"),
+            nullptr);
+  EXPECT_TRUE(ComponentStreamParameterOverrides(*bundle).empty());
+
+  ASSERT_FALSE(bundle->value().cell_graph.controllable_components.empty());
+  const auto component = bundle->value()
+                             .cell_graph.controllable_components.front()
+                             .controllable_component_id;
+  const std::vector<core::StreamParameterOverrideDTO> rows{
+      {component, "map_updates", std::nullopt, core::StreamSeverityDTO::kFault,
+       std::nullopt},
+      {component, "measured_joints", std::int64_t{300000000}, std::nullopt,
+       core::StreamRecoveryDTO::kAuto},
+  };
+  const auto with_streams = [&](CanonicalValue streams) {
+    CanonicalValue::Object root = bundle->normalized_root().as_object();
+    root.emplace_back("component_streams", std::move(streams));
+    return canonical_json(
+        reidentify_retained_bundle(CanonicalValue(std::move(root))));
+  };
+  const auto reloaded = detail::RetainedBundleReloadAuthority::reload(
+      with_streams(encode_component_stream_overrides(rows)));
+  ASSERT_NE(reloaded, nullptr);
+  EXPECT_TRUE(verify_retained_bundle_identity(*reloaded));
+  EXPECT_EQ(ComponentStreamParameterOverrides(*reloaded), rows);
+
+  const std::vector<core::StreamParameterOverrideDTO> unknown{
+      {core::ControllableComponentId("missing_component"), "map_updates",
+       std::nullopt, core::StreamSeverityDTO::kFault, std::nullopt}};
+  EXPECT_THROW(static_cast<void>(detail::RetainedBundleReloadAuthority::reload(
+                   with_streams(encode_component_stream_overrides(unknown)))),
+               RetainedBundleError);
+  EXPECT_THROW(static_cast<void>(detail::RetainedBundleReloadAuthority::reload(
+                   with_streams(CanonicalValue(CanonicalValue::Array{})))),
+               RetainedBundleError);
+  EXPECT_THROW(static_cast<void>(detail::RetainedBundleReloadAuthority::reload(
+                   with_streams(encode_component_stream_overrides(
+                       {rows[1], rows[0]})))),
+               RetainedBundleError);
+}
+
+TEST(RetainedBundleMaterializer,
      MovingTakeoverBudgetIsOptionalRetainedAndBoundByTheBundleIdentity) {
   test::InMemoryRawArtifactStoreFixture store;
   const auto ordinary = materialize_empty("i3_budget_cell", store);

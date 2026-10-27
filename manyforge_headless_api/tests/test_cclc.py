@@ -443,6 +443,54 @@ def test_rejects_invalid_or_unpaired_output_drop_counters(invalid: Any) -> None:
             _validate_lifecycle_target_facts(snapshot)
 
 
+def _stream_row(stream_id: str = "measured_joints", **changes: Any) -> dict[str, Any]:
+    row = {
+        "acknowledgement_required": False,
+        "age_ns": 1_000_000,
+        "budget_ns": 250_000_000,
+        "error": None,
+        "recovery": "ack",
+        "severity": "fault",
+        "state": "live",
+        "stream_id": stream_id,
+        "timestamp_source": "message_stamp",
+    }
+    row.update(changes)
+    return row
+
+
+def test_client_preserves_component_stream_health(tmp_path: Path) -> None:
+    snapshot = _target_snapshot()
+    snapshot["stream_health"] = [
+        _stream_row("measured_joints"),
+        _stream_row(
+            "sim_clock", state="stale", severity="blocking", recovery="auto",
+            error={"code": "component_stream_stale", "message": "stale",
+                   "details": {"stream_id": "sim_clock", "budget_ns": "250000000"}},
+        ),
+        _stream_row("vendor_status", state="absent", age_ns=None, timestamp_source="arrival"),
+    ]
+    assert _snapshot_through_client(tmp_path, snapshot) == snapshot
+
+
+@pytest.mark.parametrize("rows", [
+    [],
+    [_stream_row(state="degraded")],
+    [_stream_row(severity="fatal")],
+    [_stream_row(budget_ns=0)],
+    [_stream_row(age_ns=-1)],
+    [_stream_row(acknowledgement_required=1)],
+    [{**_stream_row(), "extra": True}],
+    [_stream_row("b"), _stream_row("a")],
+    [_stream_row("a"), _stream_row("a")],
+])
+def test_rejects_invalid_component_stream_health(rows: Any) -> None:
+    snapshot = _target_snapshot()
+    snapshot["stream_health"] = rows
+    with pytest.raises(HeadlessApiError, match="stream_health"):
+        _validate_lifecycle_target_facts(snapshot)
+
+
 def test_client_preserves_diagnostic_bom_and_literal_detail_keys(tmp_path: Path) -> None:
     snapshot = _incident_snapshot()
     diagnostic = _incident_diagnostic()
@@ -970,6 +1018,62 @@ def test_client_rejects_a_malformed_incident_recovery(
     assert captured.value.code == "cclc_open_response_invalid"
 
 
+def _stream_acknowledgement_result() -> dict[str, Any]:
+    return {
+        "acceptance": None,
+        "replay_status": "accepted_new",
+        "status": None,
+        "stream_acknowledgement": {
+            "acknowledged_at_ns": 9_000,
+            "controllable_component_id": "component.arm",
+        },
+    }
+
+
+def test_client_forwards_a_stream_acknowledgement(tmp_path: Path) -> None:
+    intent = _lifecycle_request(confirmed=True)
+    intent.pop("confirmed")
+    intent["intent"] = "recover"
+    submitted = _through_client(
+        tmp_path,
+        "lifecycle_submit",
+        _stream_acknowledgement_result(),
+        lambda client: client.submit_lifecycle(intent),
+    )
+    assert submitted == _stream_acknowledgement_result()
+
+
+@pytest.mark.parametrize(
+    "mutate",
+    [
+        lambda result: result["stream_acknowledgement"].update(
+            controllable_component_id="component.gripper"
+        ),
+        lambda result: result["stream_acknowledgement"].update(acknowledged_at_ns=-1),
+        lambda result: result["stream_acknowledgement"].update(stream_id="extra"),
+        lambda result: result.update(replay_status="replayed_exact"),
+        lambda result: result.update(incident_recovery={}),
+        lambda result: result.update(stream_acknowledgement=None),
+    ],
+)
+def test_client_rejects_a_malformed_stream_acknowledgement(
+    tmp_path: Path, mutate: Callable[[dict[str, Any]], None]
+) -> None:
+    intent = _lifecycle_request(confirmed=True)
+    intent.pop("confirmed")
+    intent["intent"] = "recover"
+    result = _stream_acknowledgement_result()
+    mutate(result)
+    with pytest.raises(HeadlessApiError) as captured:
+        _through_client(
+            tmp_path,
+            "lifecycle_submit",
+            result,
+            lambda client: client.submit_lifecycle(intent),
+        )
+    assert captured.value.code == "cclc_open_response_invalid"
+
+
 def _incident_event(sequence: int, kind: str = "component_incident") -> dict[str, Any]:
     return {
         "event_kind": kind,
@@ -1013,59 +1117,6 @@ def test_client_reads_ordered_incident_events(tmp_path: Path) -> None:
     assert empty == {"events": [], "through_sequence": 9}
     with pytest.raises(ValueError):
         CCLCOpenRequestClient(tmp_path).incident_events(0, 65)
-
-
-def test_client_preserves_cell_observer_incident_and_bounded_tail(tmp_path: Path) -> None:
-    event = _incident_event(3)
-    event["incident_id"] = "observer." + "a" * 64
-    event["payload"] = {
-        "event_kind": "component_incident",
-        "incident_id": event["incident_id"],
-        "target_kind": "cell_observer",
-        "target": {
-            "cell_id": "robot_cell",
-            "source_id": "observer\x00source",
-            "source_epoch_base": "manager-observer",
-        },
-        "cause_class": "provider_lost",
-        "detected_at_ns": "9223372036854775807",
-        "summary": "observer exited with signal 11",
-        "acknowledgement": None,
-        "diagnostic_snapshot": {
-            "exit": {
-                "status": None,
-                "signal": 11,
-                "core_dumped": False,
-                "observed_utc": "2026-10-12T14:00:00Z",
-            },
-            "context": {
-                "cell_id": "robot_cell",
-                "source_id": "observer\x00source",
-                "source_epoch_base": "manager-observer",
-                "pid": 1234,
-            },
-            "settings": {"retained_snapshot_path": "/run/observer-input.json"},
-            "generated": {},
-            "output": {
-                "tail": "x" * (128 * 1024 - 2),
-                "line_count": 1,
-                "truncated": True,
-                "dropped_forward_lines": 0,
-                "dropped_forward_bytes": 0,
-                "invalid_text_bytes": 0,
-            },
-            "core_dump_link": None,
-        },
-    }
-    page = {"events": [event], "through_sequence": 3}
-    result = _through_client(
-        tmp_path,
-        "incident_events",
-        page,
-        lambda client: client.incident_events(2, 64),
-    )
-    assert result == page
-    assert "controllable_component_id" not in result["events"][0]["payload"]
 
 
 @pytest.mark.parametrize(

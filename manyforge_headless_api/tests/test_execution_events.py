@@ -836,11 +836,7 @@ def _direct_motion_request() -> OperationIntentRequest:
             "program_run_id": "direct-control-owner-1",
             "expected_graph_revision": "sha256:graph",
             "expected_retained_bundle_id": "sha256:bundle",
-            "expected_scene_revision": {
-                "scene_id": "sha256:" + "1" * 64,
-                "revision_id": 3,
-                "content_hash": "sha256:" + "2" * 64,
-            },
+            "expected_scene_revision": None,
             "participants": [
                 {
                     "component_role_id": "controlled_component",
@@ -979,7 +975,6 @@ def _command_preview_response(operation: dict[str, Any]) -> dict[str, Any]:
         "request_owner_epoch": "owner-1",
         "required_capability_id": "tool.gripper.command",
         "retained_bundle_id": "sha256:bundle",
-        "scene_revision": operation["expected_scene_revision"],
         "schema_version": ("manyforge.direct_control_capability_command_preview.v1"),
         "source_coordinate_name": "finger_joint",
         "source_kind": "model_role",
@@ -1184,48 +1179,32 @@ def _with_scene_revision(
     return response
 
 
-@pytest.mark.parametrize(
-    ("revision_id", "scene_id", "accepted"),
-    [
-        (4, "sha256:" + "1" * 64, True),
-        (2, "sha256:" + "1" * 64, False),
-        (4, "sha256:" + "9" * 64, False),
-    ],
-)
-def test_motion_preview_receipt_may_name_a_newer_revision_of_the_same_scene(
-    monkeypatch: pytest.MonkeyPatch,
-    tmp_path: Path,
-    revision_id: int,
-    scene_id: str,
-    accepted: bool,
+def test_motion_preview_receipt_names_the_latest_scene_revision(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
 ) -> None:
     client = ExecutionCommandClient(tmp_path)
     request = _direct_motion_request()
-    latched = {
-        "scene_id": scene_id,
-        "revision_id": revision_id,
+    latest = {
+        "scene_id": "sha256:" + "9" * 64,
+        "revision_id": 40,
         "content_hash": "sha256:" + "3" * 64,
     }
 
     def exchange(command: dict[str, Any]) -> dict[str, Any]:
-        return _with_scene_revision(_preview_response(command["operation"]), latched)
+        return _with_scene_revision(_preview_response(command["operation"]), latest)
 
     monkeypatch.setattr(client, "_exchange", exchange)
-    if accepted:
-        response = client.preview_motion(request, trusted_principal_id=None)
-        assert response["preview_receipt"]["scene_revision"] == latched
-    else:
-        with pytest.raises(HeadlessApiError) as mismatch:
-            client.preview_motion(request, trusted_principal_id=None)
-        assert mismatch.value.code == "execution_command_response_identity_mismatch"
+    # The intent names no Scene revision; the owner plans on the latest one.
+    response = client.preview_motion(request, trusted_principal_id=None)
+    assert response["preview_receipt"]["scene_revision"] == latest
 
 
-def test_capability_command_preview_receipt_echoes_the_exact_scene_revision(
+def test_capability_command_preview_receipt_names_no_scene_revision(
     monkeypatch: pytest.MonkeyPatch, tmp_path: Path
 ) -> None:
     client = ExecutionCommandClient(tmp_path)
     request = _direct_command_request()
-    newer = {
+    revision = {
         "scene_id": "sha256:" + "1" * 64,
         "revision_id": 4,
         "content_hash": "sha256:" + "3" * 64,
@@ -1233,13 +1212,13 @@ def test_capability_command_preview_receipt_echoes_the_exact_scene_revision(
 
     def exchange(command: dict[str, Any]) -> dict[str, Any]:
         return _with_scene_revision(
-            _command_preview_response(command["operation"]), newer
+            _command_preview_response(command["operation"]), revision
         )
 
     monkeypatch.setattr(client, "_exchange", exchange)
-    with pytest.raises(HeadlessApiError) as mismatch:
+    with pytest.raises(HeadlessApiError) as undeclared:
         client.preview_capability_command(request, trusted_principal_id=None)
-    assert mismatch.value.code == "execution_command_response_identity_mismatch"
+    assert undeclared.value.code == "execution_command_response_invalid"
 
 
 def test_execution_client_verifies_capability_command_preview_receipt(

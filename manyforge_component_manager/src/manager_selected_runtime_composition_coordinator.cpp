@@ -131,7 +131,7 @@ ManagerSelectedRuntimeCompositionCoordinator::PrepareOriginalConfiguration(
       core::ContentDigest(deployment::sha256_digest(bytes)), static_cast<std::uint64_t>(bytes.size()),
       runtime.runtime_unit_id, runtime.runtime_epoch, manager_runtime_epoch_, accepted.configuration_fence_id,
       accepted.configuration_fence_generation, accepted.captured_scope, ManagerSelectedRuntimeCompositionPhase::kPrepare,
-      affected.affected_scope.component_delta, intent.expected_active_projection_revision, intent.isaac_pose_observer_launch_facts};
+      affected.affected_scope.component_delta, intent.expected_active_projection_revision};
   Require(request.valid(), "configuration preparation formed invalid Host input");
   const auto result = runtime_composition_.InstallOrObserve(request);
   Require(result.valid() && result.request == request,
@@ -233,7 +233,7 @@ ManagerSelectedRuntimeCompositionCoordinator::PrepareOriginalApplyComponentBring
       runtime_unit.runtime_unit_id, runtime_unit.runtime_epoch, manager_runtime_epoch_,
       accepted.configuration_fence_id, accepted.configuration_fence_generation, accepted.captured_scope,
       ManagerSelectedRuntimeCompositionPhase::kPrepare, affected.affected_scope.component_delta,
-      intent.expected_active_projection_revision, intent.isaac_pose_observer_launch_facts};
+      intent.expected_active_projection_revision};
   Require(request.valid(), "original linked preparation formed invalid Host input");
   const auto result = runtime_composition_.InstallOrObserve(request);
   Require(result.valid() && result.request == request,
@@ -294,8 +294,9 @@ ManagerSelectedRuntimeCompositionCoordinator::Advance(
                    core::ProjectionMaintenanceInitializationState::kInitialized ||
                initialized->state ==
                    core::ProjectionMaintenanceInitializationState::kCompleted) &&
-              initialized->predecessor_projection_revision ==
-                  apply->intent.expected_active_projection_revision,
+              core::SameProjectionIdentity(
+                  initialized->predecessor_projection_revision,
+                  apply->intent.expected_active_projection_revision),
           "selected runtime composition has invalid Scene initialization evidence");
   // Finalize runs before publication (Scene installed, not yet published) and
   // once more after it, while the parent fence is still held, so the runtime
@@ -332,11 +333,16 @@ ManagerSelectedRuntimeCompositionCoordinator::Advance(
                   static_cast<std::size_t>(
                       std::numeric_limits<std::uint64_t>::max()),
           "selected runtime composition bundle byte extent is invalid");
+  // The Scene revision recorded by the Apply is evidence of the request; the
+  // Scene owner adopts the latest Scene. Prepare and Finalize name the same one.
+  const auto &request_scene =
+      apply->intent.expected_active_projection_revision.scene_revision;
   const ManagerApplyPrivateMaterializationDTO materialization{
-      initialized->authoritative_snapshot_identity.revision.content_hash,
+      request_scene.content_hash,
       apply_id,
       apply_generation,
-      initialized->target_projection_revision,
+      {apply->intent.candidate_retained_bundle_id,
+       apply->intent.candidate_graph_revision, request_scene},
       core::ContentDigest(deployment::sha256_digest(canonical_bytes)),
       static_cast<std::uint64_t>(canonical_bytes.size()),
   };
@@ -361,7 +367,6 @@ ManagerSelectedRuntimeCompositionCoordinator::Advance(
       // The exact durable decision, never re-derived here.
       affected->affected_scope.component_delta,
       apply->intent.expected_active_projection_revision,
-      apply->intent.isaac_pose_observer_launch_facts,
   };
   Require(affected->affected_scope.scope == fence_intent.scope &&
               attempt->affected_scope_digest ==

@@ -445,11 +445,14 @@ make_retained_isaac_ros2_control_backend_config(
     participant.stop.max_deceleration_on_cancel_rad_s2.emplace(
         joint, profile.cancel_deceleration_rad_s2);
   }
+  // CP9: a paused simulator is shown (warning), with no hold, incident or
+  // Recover; the in-motion staleness check still stops a moving arm.
   config.arm.measured_joint_state_lane = RetainedMeasuredJointStateLane{
       std::string(kIsaacJointStatesTopic),
       config.participant.stop.controller_state_max_age_ns,
       core::StateAuthorityId(std::string(kMeasuredJointStateAuthorityId)),
-      std::string(kMeasuredJointStateProfileId)};
+      std::string(kMeasuredJointStateProfileId), core::StreamSeverityDTO::kWarning,
+      core::StreamRecoveryDTO::kAuto};
 
   const auto &gripper = *gripper_binding;
   if (gripper.value().resources.size() != 1U ||
@@ -480,7 +483,6 @@ make_retained_isaac_ros2_control_backend_config(
   gripper_config.close_effort = profile.gripper_close_effort;
   gripper_config.publish_nominal_position =
       profile.gripper_publish_nominal_position;
-  gripper_config.state_freshness_timeout_s = 1.0;
   gripper_config.wait_for_action_server_timeout_s = 2.0;
   gripper_config.result_timeout_s = profile.gripper_result_timeout_s;
 
@@ -523,6 +525,7 @@ void configure_retained_gripper_output_mode(
     throw std::invalid_argument("retained ROS gripper requires one exact authored output row");
   config.gripper->actuation_kind = retained_ros2_control_gripper_actuation_kind(configuration, binding);
   config.gripper->output_mode = found->output_mode;
+  config.gripper->state_freshness_timeout_s = found->state_freshness_timeout_s;
   if (config.gripper->actuation_kind ==
       core::GripperActuationKind::kPneumatic) {
     config.gripper->result_timeout_s =
@@ -579,7 +582,6 @@ void configure_retained_mock_gripper_action(
   // Open/closed positions and efforts drive only the Isaac effort topic
   // transport; the action transport carries the request's own target.
   gripper_config.publish_nominal_position = false;
-  gripper_config.state_freshness_timeout_s = 1.0;
   gripper_config.wait_for_action_server_timeout_s = 2.0;
   gripper_config.result_timeout_s = profile.gripper_result_timeout_s;
   config.gripper = std::move(gripper_config);

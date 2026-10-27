@@ -163,6 +163,95 @@ function state(
   };
 }
 
+function scenePose(x: number) {
+  return { position_m: { x, y: 0, z: 0 }, orientation_xyzw: [0, 0, 0, 1] };
+}
+
+interface TestSceneObject {
+  scene_resource_id: string;
+  collision_shapes: Array<Record<string, unknown>>;
+  support_contacts: unknown[];
+  placement: Record<string, unknown>;
+  provider_evidence: Record<string, unknown> | null;
+}
+
+/** A logical-scene source payload whose pose-only state follows ``sample``. */
+function logicalScenePayload(sample: number) {
+  const revision = { scene_id: 'scene-1', revision_id: sample, content_hash: `sha256:${sample}` };
+  const objects: TestSceneObject[] = [
+    {
+      scene_resource_id: 'cheese', collision_shapes: [{ type: 'box' }], support_contacts: [],
+      placement: { kind: 'cell_fixed', cell_id: 'cell-1', pose_in_cell: scenePose(sample) },
+      provider_evidence: { provider_instance_id: 'camera', provider_source_epoch: 'camera.1' },
+    },
+    {
+      scene_resource_id: 'table', collision_shapes: [{ type: 'box' }], support_contacts: [],
+      placement: { kind: 'cell_fixed', cell_id: 'cell-1', pose_in_cell: scenePose(0) },
+      provider_evidence: null,
+    },
+    {
+      scene_resource_id: 'cup', collision_shapes: [{ type: 'box' }], support_contacts: [],
+      placement: {
+        kind: 'carried', carried_object_attachment_id: 'attachment-1',
+        carried_object_attachment_revision: `sha256:attachment-${sample}`,
+      },
+      provider_evidence: null,
+    },
+  ];
+  const attachments: Array<Record<string, unknown>> = [{
+    carried_object_attachment_id: 'attachment-1',
+    carried_object_attachment_revision: `sha256:attachment-${sample}`,
+    scene_resource_id: 'cup', controllable_component_id: 'robot-1', command_target_id: 'arm',
+    carrier_frame_ref: {
+      kind: 'component', controllable_component_id: 'robot-1', model_instance_id: 'robot-1',
+      frame_role_id: 'tcp',
+    },
+    pose_in_carrier_frame: scenePose(sample),
+    touch_body_roles: [],
+  }];
+  return {
+    api_version: 'manyforge.logical_scene_source.v1',
+    access: {
+      active_projection: {
+        retained_bundle_id: 'bundle-1', graph_revision: 'graph-1', scene_revision: { ...revision },
+      },
+      phase: 'maintenance_completed', projection_leases_open: true, scene_writes_open: true,
+    },
+    snapshot: {
+      cell_id: 'cell-1', policy_epoch: 0,
+      configured_collision_policy: { policy_id: 'free_space' } as Record<string, unknown>,
+      revision: { ...revision }, topology_epoch: sample, transaction_sequence: sample,
+      objects,
+      carried_object_attachments: attachments,
+    },
+  };
+}
+
+/** A Scene-runtime payload whose pose sample follows ``sample``. */
+function sceneRuntimePayload(sample: number) {
+  return {
+    api_version: 'manyforge.scene_runtime_source.v1',
+    cell_id: 'cell-1',
+    state: {
+      state: 'open', updated_at_ns: String(sample), counters: { buffered: 0 },
+      pose_sources: [{
+        object_id: 'cheese', policy_id: 'continuous_unattached', source_id: 'camera',
+        source_epoch: 'camera.1', source_epoch_order: 1, source_sequence: sample,
+        observed_at_ns: String(sample), expires_at_ns: String(sample + 1),
+        payload_quality: 'good', fresh: true, eligible: true, buffered: false,
+        payload: {
+          api_version: 'manyforge.ros_pose_observation.v2', kind: 'simulation_entity_pose',
+          source: { entity: '/cheese' },
+          pose: {
+            frame_id: 'universe', frame_kind: 'cell_frame', position_m: [sample, 0, 0],
+            orientation_xyzw: [0, 0, 0, 1], source_stamp_ns: String(sample),
+          },
+        },
+      }],
+    },
+  };
+}
+
 describe('Headless owner-frame admission', () => {
   it('copies the current native owner fence only onto native commands', () => {
     expect(executionCommandPayload(
@@ -289,6 +378,8 @@ describe('Headless owner-frame admission', () => {
     diagnostic.runtime.sections.manager.receiverAgeNs = 99;
     diagnostic.runtime.sections.manager.sourceGeneration = 7;
     diagnostic.runtime.sections.sceneRuntime.sourceGeneration = 7;
+    // Pose-only Scene commits advance the logical-scene generation.
+    diagnostic.runtime.sections.logicalScene.sourceGeneration = 7;
     // Unchanged domains keep their identity in a merged delta.
     for (const name of [
       'alarms', 'componentOverview', 'programCycle', 'authoringAdmission',
@@ -300,7 +391,10 @@ describe('Headless owner-frame admission', () => {
 
     const visible = [
       (next: ComposerHeadlessState) => { next.runtime.sections.manager.freshness = 'stale'; },
-      (next: ComposerHeadlessState) => { next.runtime.sections.logicalScene.sourceGeneration = 9; },
+      (next: ComposerHeadlessState) => { next.runtime.sections.logicalScene.sourceGeneration = null; },
+      (next: ComposerHeadlessState) => {
+        next.runtime.sections.logicalScene.payload = { changed: true };
+      },
       (next: ComposerHeadlessState) => { next.runtime.sections.sceneRuntime.sourceGeneration = null; },
       (next: ComposerHeadlessState) => { next.runtime.reasons = ['manager_unavailable']; },
       (next: ComposerHeadlessState) => { next.alarms = { ...next.alarms, liveCount: 1 }; },
@@ -313,6 +407,76 @@ describe('Headless owner-frame admission', () => {
       change(next);
       expect(sameShellPublication(current, next)).toBe(false);
     }
+  });
+
+  it('compares the logical Scene by structure, so pose-only commits skip the shell', () => {
+    const base = state('receiver.epoch.1', 2);
+    // Unchanged domains keep their identity in a merged delta; only runtime moves.
+    const withScene = (sample: number): ComposerHeadlessState => {
+      const runtime = structuredClone(base.runtime);
+      runtime.projectionGeneration = sample;
+      runtime.sections.logicalScene.sourceGeneration = sample;
+      runtime.sections.logicalScene.payload = logicalScenePayload(sample);
+      runtime.sections.sceneRuntime.payload = sceneRuntimePayload(sample);
+      return { ...base, runtime };
+    };
+    const current = withScene(1);
+    // Provider-driven pose, carried pose, attachment revision, provider
+    // sample, scene revision, topology epoch and pose-source values moved.
+    expect(sameShellPublication(current, withScene(2))).toBe(true);
+    // The viewer still follows every pose-only commit.
+    expect(sameViewerProjection(current, withScene(2))).toBe(false);
+
+    type Scene = ReturnType<typeof logicalScenePayload>;
+    const structural: Array<[string, (scene: Scene) => void]> = [
+      ['an object is added', (scene) => {
+        scene.snapshot.objects.push({ ...scene.snapshot.objects[1], scene_resource_id: 'box' });
+      }],
+      ['an object is removed', (scene) => { scene.snapshot.objects.splice(1, 1); }],
+      ['the carried object is detached', (scene) => {
+        scene.snapshot.carried_object_attachments = [];
+        scene.snapshot.objects[2].placement = {
+          kind: 'cell_fixed', cell_id: 'cell-1', pose_in_cell: scenePose(2),
+        };
+      }],
+      ['another carrier', (scene) => {
+        scene.snapshot.carried_object_attachments[0].controllable_component_id = 'robot-2';
+      }],
+      ['a shape changes', (scene) => {
+        scene.snapshot.objects[1].collision_shapes = [{ type: 'sphere', radius_m: 0.1 }];
+      }],
+      ['an authored pose changes', (scene) => {
+        scene.snapshot.objects[1].placement.pose_in_cell = scenePose(5);
+      }],
+      ['provider evidence is cleared', (scene) => { scene.snapshot.objects[0].provider_evidence = null; }],
+      ['another provider', (scene) => {
+        scene.snapshot.objects[0].provider_evidence!.provider_instance_id = 'camera-2';
+      }],
+      ['another scene', (scene) => {
+        scene.snapshot.revision.scene_id = 'scene-2';
+        scene.access.active_projection.scene_revision.scene_id = 'scene-2';
+      }],
+      ['the policy changes', (scene) => { scene.snapshot.configured_collision_policy.policy_id = 'other'; }],
+      ['access closes', (scene) => { scene.access.scene_writes_open = false; }],
+    ];
+    for (const [name, change] of structural) {
+      const next = withScene(2);
+      change(next.runtime.sections.logicalScene.payload as Scene);
+      expect(sameShellPublication(current, next), name).toBe(false);
+    }
+    // A carried object becoming attached is structural too.
+    expect(sameShellPublication(withScene(2), (() => {
+      const detached = withScene(2);
+      const scene = detached.runtime.sections.logicalScene.payload as Scene;
+      structural[2][1](scene);
+      return detached;
+    })())).toBe(false);
+    // Pose-source freshness still publishes.
+    const stale = withScene(2);
+    const rows = (stale.runtime.sections.sceneRuntime.payload as ReturnType<typeof sceneRuntimePayload>)
+      .state.pose_sources;
+    rows[0].fresh = false;
+    expect(sameShellPublication(current, stale)).toBe(false);
   });
 
   it('keeps a retained viewer frame only while its owner and model identity holds', () => {
@@ -1363,6 +1527,94 @@ describe('HeadlessStateSource delivery scheduling', () => {
     vi.advanceTimersByTime(HEADLESS_SHELL_PUBLICATION_MS);
     expect(changed).toHaveBeenCalledTimes(1);
     expect(source.getViewerSnapshot()).toBe(viewerBaseline);
+    source.dispose();
+  });
+
+  it('keeps the shell on pose-only Scene commits while latest and the viewer follow them', () => {
+    vi.useFakeTimers();
+    const animationFrames: FrameRequestCallback[] = [];
+    class FakeWebSocket {
+      static shell: FakeWebSocket;
+      onopen: (() => void) | null = null;
+      onmessage: ((message: MessageEvent) => void) | null = null;
+      onerror: (() => void) | null = null;
+      onclose: (() => void) | null = null;
+      constructor(url: string) {
+        if (new URL(url).pathname === '/ws/control') FakeWebSocket.shell = this;
+      }
+      close(): void {}
+      send(): void {}
+    }
+    vi.stubGlobal('window', {
+      location: { href: 'http://composer.test/' },
+      requestAnimationFrame: (callback: FrameRequestCallback) => {
+        animationFrames.push(callback); return animationFrames.length;
+      },
+      cancelAnimationFrame: vi.fn(),
+    });
+    vi.stubGlobal('WebSocket', FakeWebSocket);
+    const source = new HeadlessStateSource();
+    source.setEnabled(true);
+    synchronizeControl(FakeWebSocket.shell);
+    const runtimeAt = (sample: number, scene = logicalScenePayload(sample)) => {
+      const runtime = structuredClone(wireState(sample).runtime) as Record<string, unknown>;
+      const sections = runtime.sections as Record<string, Record<string, unknown>>;
+      sections.logical_scene = { ...sections.logical_scene, payload: scene };
+      sections.scene_runtime = { ...sections.scene_runtime, payload: sceneRuntimePayload(sample) };
+      return runtime;
+    };
+    const first = wireState(1);
+    first.runtime = runtimeAt(1);
+    receiveControlSnapshot(FakeWebSocket.shell, first);
+    animationFrames.splice(0)[0]!(16);
+    vi.advanceTimersByTime(HEADLESS_SHELL_PUBLICATION_MS);
+    const shellBaseline = source.getShellSnapshot();
+    const shellChanged = vi.fn();
+    source.subscribeShell(shellChanged);
+    const delta = (runtime: Record<string, unknown>) => {
+      const sequence = nextControlServerSequence(FakeWebSocket.shell);
+      receiveControl(FakeWebSocket.shell, {
+        schema_version: 'manyforge.execution_control.v2',
+        message_kind: 'delta',
+        control_session_id: CONTROL_SESSION_ID,
+        server_sequence: sequence,
+        state_sequence: sequence,
+        received_client_sequence: '2',
+        control: {
+          receiver_incarnation: 'headless.receiver.1',
+          semantic_owner_epoch: 'runner.epoch.1',
+          execution_control_revision: 1,
+          freshness: controlFreshness(1),
+        },
+        shell: { complete: false, runtime },
+      });
+    };
+    const cheeseX = (snapshot: ComposerHeadlessState | null) => (
+      (snapshot?.runtime.sections.logicalScene.payload as ReturnType<typeof logicalScenePayload>)
+        .snapshot.objects[0].placement.pose_in_cell as ReturnType<typeof scenePose>
+    ).position_m.x;
+
+    delta(runtimeAt(2));
+    expect(source.getShellSnapshot().error).toBeNull();
+    expect(cheeseX(source.getLatestSnapshot())).toBe(2);
+    expect(animationFrames).toHaveLength(1);
+    animationFrames.splice(0)[0]!(32);
+    expect(cheeseX(source.getViewerSnapshot().snapshot)).toBe(2);
+    vi.advanceTimersByTime(HEADLESS_SHELL_PUBLICATION_MS);
+    expect(shellChanged).not.toHaveBeenCalled();
+    expect(source.getShellSnapshot()).toBe(shellBaseline);
+
+    // Detaching the carried object is structural: the shell publishes the latest.
+    const detached = logicalScenePayload(3);
+    detached.snapshot.carried_object_attachments = [];
+    detached.snapshot.objects[2].placement = {
+      kind: 'cell_fixed', cell_id: 'cell-1', pose_in_cell: scenePose(3),
+    };
+    delta(runtimeAt(3, detached));
+    vi.advanceTimersByTime(HEADLESS_SHELL_PUBLICATION_MS);
+    expect(shellChanged).toHaveBeenCalledTimes(1);
+    expect(source.getShellSnapshot().snapshot).toBe(source.getLatestSnapshot());
+    expect(cheeseX(source.getShellSnapshot().snapshot)).toBe(3);
     source.dispose();
   });
 

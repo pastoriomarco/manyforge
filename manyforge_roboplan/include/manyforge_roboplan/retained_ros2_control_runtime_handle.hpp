@@ -11,6 +11,7 @@
 #include <string_view>
 #include <vector>
 
+#include <manyforge_core/component_stream_health.hpp>
 #include <manyforge_core/configured_robot_measured_state.hpp>
 #include <manyforge_core/execution_port_participant.hpp>
 #include <manyforge_core/types/component_lifecycle.hpp>
@@ -134,6 +135,10 @@ struct RetainedMeasuredJointStateLane final {
   core::Duration freshness_budget_ns;
   core::StateAuthorityId measured_state_authority_id;
   std::string measured_source_profile_id;
+  /// CP9 adapter-kind defaults of the component's `measured_joints` stream
+  /// (budget = `freshness_budget_ns`, message-stamp liveness).
+  core::StreamSeverityDTO stream_severity{core::StreamSeverityDTO::kFault};
+  core::StreamRecoveryDTO stream_recovery{core::StreamRecoveryDTO::kAck};
 
   friend bool operator==(const RetainedMeasuredJointStateLane &,
                          const RetainedMeasuredJointStateLane &) = default;
@@ -527,6 +532,9 @@ private:
   std::unique_ptr<ros2_control_execution::Ros2GripperCommandBackend> gripper_;
   std::optional<core::RuntimeParticipantBinding> motion_binding_;
   std::optional<core::RuntimeParticipantBinding> gripper_binding_;
+  /// CP9 `measured_joints` stream of the bound component, declared with the
+  /// first staged measured source and recorded by every staged subscription.
+  std::shared_ptr<core::StreamRecorder> measured_stream_;
   std::weak_ptr<RetainedObservedStateChannel> gripper_display_channel_;
   std::optional<RetainedRos2ControlArmGuardHooks> guard_hooks_;
   std::function<std::optional<std::string>()> process_fault_source_;

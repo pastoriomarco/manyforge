@@ -543,7 +543,10 @@ def test_ros_bootstrap_captures_authored_program_and_uses_production_preparer(
     assert source.endswith("/examples/isaac-ur10e-light-scene.scenario")
     assert captured["program"]["api_version"] == "manyforge.program.v2"
     assert captured["model_source_closure"]["components"]
-    assert captured["deployment"]["components"][0]["configuration"]["runtime_kind"] == "ros2_control"
+    assert sorted(
+        component["configuration"]["runtime_kind"]
+        for component in captured["deployment"]["components"]
+    ) == ["pose_source", "ros2_control"]
     tool = tmp_path / "preparer"
     tool.write_bytes(b"current preparer")
     calls: list[tuple[dict[str, Any], dict[str, Any]]] = []
@@ -812,36 +815,17 @@ def test_cleanup_uses_bounded_reverse_owner_order(monkeypatch: Any) -> None:
     ]
 
 
-def test_g_static_composer_preserves_endpoint_and_forwards_exact_site_executable(tmp_path, monkeypatch):
+def test_g_static_composer_preserves_endpoint(tmp_path):
     static = tmp_path / "frontend"
     static.mkdir()
     (static / "index.html").write_text("built fixture frontend")
-    observer = tmp_path / "build/isaac/ros-overlay/install/manyforge_ros_bringup/lib/manyforge_ros_bringup/pose_source_snapshot_publisher"
-    observer.parent.mkdir(parents=True)
-    observer.write_text("#!/bin/sh\n")
-    observer.chmod(0o755)
-    monkeypatch.setattr(dev_workbench, "BUILD_ROOT", tmp_path / "build")
-    site = tmp_path / "site.json"
-    site.write_text("{}")
     workbench = dev_workbench.Workbench(project_path=None, ros2_control=True,
         headless_port=9010, runner_port=9011, composer_port=9000, frontend_port=3000,
-        composer_static_dir=static, composer_bind_host="0.0.0.0", isaac_site_settings=site)
+        composer_static_dir=static, composer_bind_host="0.0.0.0")
     command = workbench._composer_command("http://127.0.0.1:9010")
     assert command[command.index("--host") + 1] == "0.0.0.0"
     assert command[command.index("--port") + 1] == "9000"
     assert command[command.index("--static-dir") + 1] == str(static)
-    assert workbench._isaac_manager_arguments() == (
-        "--isaac-site-settings", str(site), "--isaac-pose-observer-executable", str(observer))
-    observer.unlink()
-    with pytest.raises(dev_workbench.WorkbenchError, match="installed Isaac pose observer"):
-        workbench._isaac_manager_arguments()
-    observer.write_text("#!/bin/sh\n")
-    observer.chmod(0o755)
-    site.unlink()
-    with pytest.raises(dev_workbench.WorkbenchError, match="Isaac site settings"):
-        workbench._isaac_manager_arguments()
-    workbench.isaac_site_settings = None
-    assert workbench._isaac_manager_arguments() == ()
 
 
 @pytest.mark.parametrize("fresh,manager_ready,expected", [(True, True, True), (False, True, False), (True, False, False)])

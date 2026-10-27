@@ -54,13 +54,6 @@ CanonicalValue Unsigned(const std::uint64_t value, const std::string_view label,
   return CanonicalValue(static_cast<double>(value));
 }
 
-CanonicalValue Integer(const std::int64_t value, const std::string_view label) {
-  Require(value >= -static_cast<std::int64_t>(kMaximumSafeInteger) &&
-              value <= static_cast<std::int64_t>(kMaximumSafeInteger),
-          std::string(label) + " must be an I-JSON safe integer");
-  return CanonicalValue(static_cast<double>(value));
-}
-
 CanonicalValue OptionalUnsigned(const std::optional<std::uint64_t> value,
                                 const std::string_view label) {
   return value.has_value() ? Unsigned(*value, label) : CanonicalValue(nullptr);
@@ -657,18 +650,6 @@ ProviderEvidence(const core::SceneObjectProviderEvidenceDTO &value) {
       {"provider_manifest_revision",
        CanonicalValue(value.provider_manifest_revision.value())},
       {"provider_source_epoch", CanonicalValue(value.provider_source_epoch)},
-      {"provider_source_sequence",
-       Unsigned(value.provider_source_sequence, "provider_source_sequence")},
-      {"received_at_ns", content_identity::nonnegative_int64_value(value.received_at_ns)},
-      {"source_freshness_budget_ns",
-       value.source_freshness_budget_ns.has_value()
-           ? Integer(*value.source_freshness_budget_ns,
-                     "source_freshness_budget_ns")
-           : CanonicalValue(nullptr)},
-      {"source_timestamp_ns",
-       value.source_timestamp_ns.has_value()
-           ? content_identity::nonnegative_int64_value(*value.source_timestamp_ns)
-           : CanonicalValue(nullptr)},
   });
 }
 

@@ -122,18 +122,15 @@ struct CarriedSceneObjectPlacementDTO final {
 using SceneObjectPlacementDTO = std::variant<CellFixedSceneObjectPlacementDTO,
                                              CarriedSceneObjectPlacementDTO>;
 
-/// Receiver-local evidence retained for one provider-backed object snapshot.
+/// Identity of the provider that owns one provider-backed object snapshot.
 /// Presence as one optional record prevents partial provider identity from
-/// being represented by the enclosing object.
+/// being represented by the enclosing object. Observation sequence, times and
+/// freshness live in the scene runtime, not in the logical scene.
 struct SceneObjectProviderEvidenceDTO final {
   ProviderInstanceId provider_instance_id;
   ProviderManifestId provider_manifest_id;
   ProviderManifestRevision provider_manifest_revision;
   std::string provider_source_epoch;
-  std::uint64_t provider_source_sequence;
-  std::int64_t received_at_ns;
-  std::optional<std::int64_t> source_timestamp_ns;
-  std::optional<std::int64_t> source_freshness_budget_ns;
 
   [[nodiscard]] bool valid() const noexcept;
   friend bool operator==(const SceneObjectProviderEvidenceDTO&,
@@ -155,6 +152,29 @@ struct SceneObjectSnapshotDTO final {
                          const SceneObjectSnapshotDTO&) = default;
 };
 
+/// Grasp-lost bound of a carried object whose offset is measured: a measured
+/// offset farther than either bound from the attach-time offset means the
+/// object is no longer held (`carried_object_lost`).
+struct CarriedObjectGraspLostBoundDTO final {
+  double translation_m{};
+  double rotation_rad{};
+
+  [[nodiscard]] bool valid() const noexcept {
+    return std::isfinite(translation_m) && translation_m > 0.0 &&
+           std::isfinite(rotation_rad) && rotation_rad > 0.0;
+  }
+  friend bool operator==(const CarriedObjectGraspLostBoundDTO&,
+                         const CarriedObjectGraspLostBoundDTO&) = default;
+};
+
+/// The attach node's bound with the offset the attachment started from.
+struct CarriedObjectGraspLostCheckDTO final {
+  CarriedObjectGraspLostBoundDTO bound;
+  Pose3DTO attach_pose_in_carrier_frame;
+  friend bool operator==(const CarriedObjectGraspLostCheckDTO&,
+                         const CarriedObjectGraspLostCheckDTO&) = default;
+};
+
 /// One canonical scene-owned carried-object attachment row.
 struct CarriedObjectAttachmentDTO final {
   CarriedObjectAttachmentId carried_object_attachment_id;
@@ -165,6 +185,8 @@ struct CarriedObjectAttachmentDTO final {
   SceneFrameRefDTO carrier_frame_ref;
   Pose3DTO pose_in_carrier_frame;
   std::vector<CollisionBodyRoleId> touch_body_roles;
+  /// Present when the attach request carried a grasp-lost bound.
+  std::optional<CarriedObjectGraspLostCheckDTO> grasp_lost_check{};
 
   [[nodiscard]] bool locally_valid() const noexcept;
   friend bool operator==(const CarriedObjectAttachmentDTO&,
@@ -386,9 +408,7 @@ inline bool IsCanonicalEmptyCollisionPolicy(
 inline bool SceneObjectProviderEvidenceDTO::valid() const noexcept {
   return !provider_instance_id.empty() && !provider_manifest_id.empty() &&
          !provider_manifest_revision.empty() &&
-         !provider_source_epoch.empty() &&
-         (!source_freshness_budget_ns.has_value() ||
-          *source_freshness_budget_ns > 0);
+         !provider_source_epoch.empty();
 }
 
 inline bool SceneObjectSnapshotDTO::locally_valid() const noexcept {
@@ -425,6 +445,10 @@ inline bool CarriedObjectAttachmentDTO::locally_valid() const noexcept {
       controllable_component_id.empty() || command_target_id.empty() ||
       !logical_scene_detail::ValidFrameRef(carrier_frame_ref) ||
       !logical_scene_detail::FinitePose(pose_in_carrier_frame) ||
+      (grasp_lost_check &&
+       (!grasp_lost_check->bound.valid() ||
+        !logical_scene_detail::FinitePose(
+            grasp_lost_check->attach_pose_in_carrier_frame))) ||
       !logical_scene_detail::StrictlyIncreasing(
           touch_body_roles,
           [](const CollisionBodyRoleId& role) -> const std::string& {

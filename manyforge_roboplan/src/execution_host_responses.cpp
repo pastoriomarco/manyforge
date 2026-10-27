@@ -175,8 +175,7 @@ SceneRevisionValue(const core::SceneRevision &value) {
   const auto &resource = binding.resources.front();
   const bool model_backed = resource.source_joint_name.has_value();
   Require(
-      intent.expected_scene_revision.has_value() &&
-          binding.command_schema.has_value() &&
+      binding.command_schema.has_value() &&
           preview.command_request.gripper_id ==
               binding.command_target_id.value() &&
           preview.command_request.joint_name ==
@@ -226,7 +225,6 @@ SceneRevisionValue(const core::SceneRevision &value) {
            intent.participants.front().required_capability_id.value())},
       {"retained_bundle_id",
        CanonicalValue(binding.retained_bundle_id.value())},
-      {"scene_revision", SceneRevisionValue(*intent.expected_scene_revision)},
       {"schema_version",
        CanonicalValue(
            "manyforge.direct_control_capability_command_preview.v1")},

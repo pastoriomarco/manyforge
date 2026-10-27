@@ -33,7 +33,7 @@ EXPECTED_API_VERSION = "manyforge.node_catalog.v2"
 EXPECTED_CONTENT_VERSION = "2.7.0"
 BUILTIN_CATALOG_ID = "manyforge_builtin"
 EXPECTED_BUILTIN_CATALOG_DIGEST = (
-    "sha256:376863946817c83ee0e92f3a72257bc2ac25e3f9cdbdca0029aab5af42c3d6e2"
+    "sha256:29eaa1447b105a20b4582b508938ac0ba97d77b9fcdc26cd97467b42b628dc93"
 )
 SEMVER_RE = re.compile(r"^\d+\.\d+\.\d+$")
 _COMPOSABLE_PROFILE_RE = re.compile(r"^composable-cell-v(\d+)$")
@@ -112,6 +112,7 @@ _TARGET_CAPABILITIES = {
     "planning.profile.first_feasible",
     "planning.profile.quality_bounded",
     "planning.trajectory.time_parameterized",
+    "scene.pose.observe",
     "state.observed.current",
     "tool.gripper.command",
     "tool.gripper.feedback",

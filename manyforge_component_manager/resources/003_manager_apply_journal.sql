@@ -1,4 +1,4 @@
--- ManyForge UA4 typed named-Apply journal, version 18.
+-- ManyForge UA4 typed named-Apply journal, version 19.
 --
 -- This schema stores immutable named-Apply intents, including the exact UA2A
 -- prepared activation each operation accepted (captured source-closure digest,
@@ -16,12 +16,12 @@
 -- It is deliberately not a mutable phase/event journal.
 
 PRAGMA application_id = 1296450128;
-PRAGMA user_version = 18;
+PRAGMA user_version = 19;
 
 CREATE TABLE IF NOT EXISTS apply_journal_metadata (
     singleton INTEGER PRIMARY KEY CHECK (singleton = 1),
     schema_id TEXT NOT NULL,
-    schema_version INTEGER NOT NULL CHECK (schema_version = 18),
+    schema_version INTEGER NOT NULL CHECK (schema_version = 19),
     schema_artifact_digest TEXT NOT NULL,
     cell_id TEXT NOT NULL,
     maximum_apply_intents INTEGER NOT NULL
@@ -136,10 +136,6 @@ CREATE TABLE IF NOT EXISTS manager_apply_intents (
             )
         ),
     parent_authoring_claim BLOB,
-    -- NULL when the accepted Apply has no checked observer launch inputs.
-    isaac_pose_observer_launch_facts BLOB
-        CHECK (isaac_pose_observer_launch_facts IS NULL
-               OR length(isaac_pose_observer_launch_facts) > 0),
     scene_initialization TEXT NOT NULL
         CHECK (scene_initialization IN ('preserve', 'initialize')),
     intent_digest TEXT NOT NULL,

@@ -340,7 +340,6 @@ python3 -m manyforge_operator \
   --remote-cache-root /mnt/nova_ssd/codex-manyforge/cache/isaac-runtime \
   --remote-runtime-root /mnt/nova_ssd/codex-manyforge/state/isaac-runtime \
   --remote-evidence-root /mnt/nova_ssd/codex-manyforge/evidence/isaac-runtime \
-  --remote-isaac-site-settings "$REMOTE_ISAAC_SITE_SETTINGS" \
   --remote-manager-executable /mnt/nova_ssd/codex-manyforge/builds/current/package/bin/manyforge_manager_daemon \
   --remote-install-root /mnt/nova_ssd/codex-manyforge/builds/current/package \
   --remote-node-catalog-path /mnt/nova_ssd/codex-manyforge/builds/current/package/share/node_catalog.yaml \

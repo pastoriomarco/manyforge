@@ -710,9 +710,9 @@ def _require_gripper_delivery_timeout_semantics(
 
     pneumatic = target(request, "lite6_robot")
     position = target(request, "ur5e_robot")
-    assert pneumatic["actuation_kind"] == "pneumatic" and len(pneumatic) == 14
+    assert pneumatic["actuation_kind"] == "pneumatic" and len(pneumatic) == 15
     assert pneumatic["delivery_result_timeout_s"] == 1.0
-    assert position["actuation_kind"] == "position_commanded" and len(position) == 13
+    assert position["actuation_kind"] == "position_commanded" and len(position) == 14
     assert "delivery_result_timeout_s" not in position
 
     for name, timeout in (("authored", 1.0), ("absent", None), ("override", 2.5)):
@@ -804,6 +804,36 @@ def _check_two_ros_robots(
     assert "gripper_target_configurations" not in configuration
 
 
+def _without_pose_sources(value: dict[str, object], key: str) -> dict[str, object]:
+    result = copy.deepcopy(value)
+    result[key]["components"] = [
+        component for component in result[key]["components"]
+        if component["configuration"]["runtime_kind"] != "pose_source"
+    ]
+    return result
+
+
+def _check_pose_source_preparation(
+    args: argparse.Namespace, request: dict[str, object], root: Path
+) -> None:
+    """CP9: the scenario's model-free pose source compiles beside the robot."""
+    sources = [
+        component for component in request["deployment"]["components"]
+        if component["configuration"]["runtime_kind"] == "pose_source"
+    ]
+    assert [row["component_id"] for row in sources] == ["isaac_scene_objects"]
+    prepared = _run(args, request, root / "ros-pose-source")
+    assert prepared is not None
+    graph = prepared["activation_payload"]["retained_bundle"]["cell_graph"]
+    configuration = graph["runtime_units"][0]["configuration"]
+    assert configuration["pose_sources"] == sources[0]["configuration"][
+        "runtime_configuration"]["pose_sources"]
+    domains = [row for row in graph["control_domains"] if row.get("kind") == "provider"]
+    assert [row["provider"]["provider_manifest_id"] for row in domains] == [
+        "manyforge.provider.pose_source"]
+    assert all(name.startswith("poses/") for name in domains[0]["provider"]["signal_names"])
+
+
 def _check_ros_preparation(
     args: argparse.Namespace,
     request: dict[str, object],
@@ -811,6 +841,11 @@ def _check_ros_preparation(
     document: dict[str, object],
     root: Path,
 ) -> None:
+    _check_pose_source_preparation(args, request, root)
+    # The robot checks below are about the one ROS robot component.
+    request = _without_pose_sources(request, "deployment")
+    _rehash_request(request)
+    document = _without_pose_sources(document, "deployment_draft")
     legacy_world = copy.deepcopy(request)
     legacy_world["deployment"]["isaac_world"] = "lite6_grf_ros2"
     _rehash_request(legacy_world)
@@ -841,11 +876,11 @@ def _check_ros_preparation(
     ]["runtime_configuration"])
     assert request["deployment"]["components"][0]["target_settings"]["arm"][
         "maximum_tcp_linear_speed_mps"
-    ] == 0.25
+    ] == 0.5
     expected_configuration["motion_target_limits"] = [{
         "controllable_component_id": component_id,
         "command_target_id": "arm",
-        "maximum_tcp_linear_speed_mps": 0.25,
+        "maximum_tcp_linear_speed_mps": 0.5,
     }]
     # Q68: the authored selector becomes the component's controller profile
     # row inside the one ROS runtime unit.
@@ -1032,6 +1067,7 @@ def _check_ros_preparation(
         ),
     ):
         _, additional, _ = _scenario_request(args.workspace, scenario)
+        additional = _without_pose_sources(additional, "deployment_draft")
         unsupported = copy.deepcopy(document)
         unsupported["deployment_draft"]["components"].extend(
             additional["deployment_draft"]["components"]
@@ -1099,6 +1135,7 @@ def _check_ros_preparation(
     _, lite6_document, _ = _scenario_request(
         args.workspace, "examples/isaac-lite6-pick-place.scenario"
     )
+    lite6_document = _without_pose_sources(lite6_document, "deployment_draft")
     lite6_robot = copy.deepcopy(lite6_document["deployment_draft"]["components"][0])
     lite6_robot["frame_prefix"] = "lite6/"
     lite6_robot["configuration"]["runtime_configuration"][

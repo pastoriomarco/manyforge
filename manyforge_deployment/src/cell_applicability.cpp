@@ -1938,6 +1938,14 @@ void qualify_capability_provider_target(
         fail("direct provider target has a stale component-type revision");
       const auto& target_type = require_type_target(composition, component, direct->command_target_id);
       require_target_capability(target_type, binding.capability_id, binding.capability_definition_revision);
+      if (binding.capability_id.value() == "scene.pose.observe") {
+        // CP9 pose-source target: observation only, no resource roles.
+        if (!target_type.resource_roles.empty())
+          fail("pose-source target declares resource roles");
+        const auto bound = ValidateNonCoordinateProviderTarget(graph, binding);
+        if (!bound.ok()) fail(bound.error().details.at("reason"));
+        break;
+      }
       const auto catalog = ResolveRetainedIoSignalCatalog(graph);
       if (!catalog.ok()) fail(catalog.error().details.at("reason"));
       if (target_type.resource_roles.empty()) fail("direct provider target declares no non-coordinate resource roles");

@@ -93,13 +93,9 @@ does not choose peers or load a simulator world. Those prerequisites remain
 separate, explicitly operated processes. Stop an existing Workbench before
 changing its selected runtime capabilities.
 
-For a development workbench with configured Isaac object observers, set
-`MANYFORGE_DEV_ISAAC_SITE_SETTINGS` to the absolute path of the caller-written
-site-settings file before `start`. The launcher mounts that file's directory
-read-only and forwards the existing Manager `--isaac-site-settings` input. It
-does not select an observer configuration or timeout by default, and this input
-does not start, load, Play, Pause, Reset, or qualify Isaac Sim. The operator
-opens the scene; ManyForge attaches its inactive controller infrastructure.
+Isaac object observers are pose-source components of the selected Deployment;
+the launcher needs no observer input. The operator opens the Isaac scene;
+ManyForge attaches its inactive controller infrastructure.
 
 The retained `examples/isaac-ur10e-light-scene.scenario` is an aggregate
 robot/gripper development input. Its explicit 0.25 m/s authored TCP ceiling is
@@ -215,12 +211,6 @@ files are limited to 3 MiB each and 64 MiB in total, with oldest-first eviction.
 These are snapshots of the bounded volatile window (16 goals, 1,024 controller
 samples), with explicit coverage and omission counts, not complete Run journals.
 Unavailable or invalid diagnostic files do not fail motion or the debug export.
-
-To record which scene objects changed between validation and dispatch, set
-`MANYFORGE_DEBUG_SCENE_DIVERGENCE=1` before starting. Motions still dispatch on
-the latest scene; the accepted-divergence event then carries up to 16
-`object_divergence.<object>.*` entries plus a truncated count. Leave it unset
-for revision-level evidence only.
 
 Frontend source edits update through HMR. Backend
 startup incrementally builds the current `manyforge_manager_daemon`,

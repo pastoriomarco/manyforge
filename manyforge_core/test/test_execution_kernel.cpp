@@ -540,11 +540,8 @@ class MockCollisionWorldPublisher final : public ICollisionWorldSnapshotPublishe
   std::vector<int> throw_on_published_runtime_bundle_call_numbers;
   bool lease_inventory_enabled = true;
   std::int64_t lease_inventory_captured_at_ns = 0;
-  std::uint64_t lease_topology_epoch = 1;
-  std::uint64_t lease_policy_epoch = 1;
   ProjectionRevisionDTO lease_projection_revision = test_projection_revision();
   std::shared_ptr<const LogicalSceneSnapshotDTO> current_logical_scene;
-  std::vector<SceneSnapshotLiveObject> lease_live_objects;
   mutable std::atomic<int> lease_inventory_call_count{0};
   mutable std::atomic<int> lease_retain_call_count{0};
   std::function<void()> on_lease_retain;
@@ -616,8 +613,7 @@ class MockCollisionWorldPublisher final : public ICollisionWorldSnapshotPublishe
       throw std::runtime_error("published runtime snapshot bundle unavailable");
     }
     return build_runtime_collision_query_bundle(
-        CollisionWorldPolicySnapshotBundle{snapshot(), current_policy},
-        static_cast<std::uint64_t>(call), lease_projection_revision);
+        CollisionWorldPolicySnapshotBundle{snapshot(), current_policy}, lease_projection_revision);
   }
 
  private:
@@ -630,9 +626,6 @@ class MockCollisionWorldPublisher final : public ICollisionWorldSnapshotPublishe
                                   : testing::make_test_logical_scene(inventory.projection_binding);
     inventory.captured_at_ns = lease_inventory_captured_at_ns;
     inventory.bundle = {snapshot(), current_policy};
-    inventory.topology_epoch = lease_topology_epoch;
-    inventory.policy_epoch = lease_policy_epoch;
-    inventory.live_objects = lease_live_objects;
     return inventory;
   }
 };
@@ -1942,17 +1935,13 @@ Pose3DTO make_test_pose(double x_m = 0.0, double y_m = 0.0, double z_m = 0.0) {
   return pose;
 }
 
-CollisionWorldBody make_observed_box_body(
-    const std::string& object_id, const Pose3DTO& pose, std::string body_hash,
-    std::optional<std::int64_t> source_timestamp_ns = std::nullopt,
-    std::optional<std::int64_t> freshness_budget_ns = std::nullopt) {
+CollisionWorldBody make_observed_box_body(const std::string& object_id, const Pose3DTO& pose,
+                                          std::string body_hash) {
   CollisionWorldBody body;
   body.body_id = "scene/" + object_id + "/shape/0";
   body.owner_kind = CollisionOwnerKind::kSceneResource;
   body.frame_id = "universe";
   body.pose = pose;
-  body.source_timestamp_ns = source_timestamp_ns;
-  body.source_freshness_budget_ns = freshness_budget_ns;
   CollisionGeometryDescriptor geom;
   geom.body_id = body.body_id;
   geom.owner_kind = body.owner_kind;
@@ -1965,32 +1954,14 @@ CollisionWorldBody make_observed_box_body(
 
 CollisionWorldSnapshot make_test_collision_world_snapshot_with_object(
     const std::string& object_id, const Pose3DTO& pose, CollisionWorldRevision revision,
-    std::string body_hash, std::optional<std::int64_t> source_timestamp_ns = 0,
-    std::optional<std::int64_t> freshness_budget_ns = 10'000'000'000) {
+    std::string body_hash) {
   auto snapshot = make_test_collision_world_snapshot();
   snapshot.revision = std::move(revision);
-  snapshot.bodies.push_back(make_observed_box_body(object_id, pose, std::move(body_hash),
-                                                   source_timestamp_ns, freshness_budget_ns));
+  snapshot.bodies.push_back(make_observed_box_body(object_id, pose, std::move(body_hash)));
   snapshot.body_count = static_cast<std::int64_t>(snapshot.bodies.size());
   snapshot.geometry_count = 1;
   snapshot.scene_resource_count = 1;
   return snapshot;
-}
-
-SceneSnapshotLiveObject make_observed_box_live_object(
-    const std::string& object_id, const Pose3DTO& pose,
-    std::string object_revision_token = "box-shape-token",
-    std::optional<std::int64_t> source_timestamp_ns = 0,
-    std::optional<std::int64_t> freshness_budget_ns = 10'000'000'000) {
-  SceneSnapshotLiveObject live;
-  live.object_id = object_id;
-  live.collision_body_ids = {"scene/" + object_id + "/shape/0"};
-  live.object_revision_token = std::move(object_revision_token);
-  live.pose = pose;
-  live.source_id = "test_pose_source";
-  live.source_timestamp_ns = source_timestamp_ns;
-  live.source_freshness_budget_ns = freshness_budget_ns;
-  return live;
 }
 
 void install_mock_retained_object(MockCollisionWorldPublisher& publisher,
@@ -2002,8 +1973,6 @@ void install_mock_retained_object(MockCollisionWorldPublisher& publisher,
   publisher.current_snapshot =
       std::make_shared<const CollisionWorldSnapshot>(make_test_collision_world_snapshot_with_object(
           object_id, pose, revision, object_id + "-body-hash"));
-  publisher.lease_live_objects = {
-      make_observed_box_live_object(object_id, pose, object_id + "-shape-token")};
 }
 
 CollisionWorldBody make_test_robot_link_body(const std::string& link_name) {
@@ -2083,15 +2052,12 @@ void bind_resolved_contact_grasp(ExecuteRequestDTO& request, MockCollisionWorldP
   return policy_id.rfind("contact_grasp.bound.", 0) == 0U;
 }
 
-CollisionWorldBody make_dynamic_test_body(std::int64_t source_timestamp_ns,
-                                          std::int64_t freshness_budget_ns) {
+CollisionWorldBody make_dynamic_test_body() {
   CollisionWorldBody body;
   body.body_id = "scene/dynamic_box/shape/0";
   body.owner_kind = CollisionOwnerKind::kSceneResource;
   body.frame_id = "universe";
   body.pose.orientation.w = 1.0;
-  body.source_timestamp_ns = source_timestamp_ns;
-  body.source_freshness_budget_ns = freshness_budget_ns;
   CollisionGeometryDescriptor geom;
   geom.body_id = body.body_id;
   geom.owner_kind = body.owner_kind;
@@ -2411,10 +2377,8 @@ class ExecutionKernelTest : public ::testing::Test {
 
   void store_cache(const ExecuteRequestDTO& request, TrajectoryDTO trajectory) {
     const auto resolved_request = prepared_motion_request(request).execution_request;
-    cache.store(
-        trajectory_cache_key(resolved_request), std::move(trajectory),
-        TrajectoryCacheRevisionEvidence{test_projection_revision(), context.current_revision},
-        trajectory_cache_intent_identity(resolved_request));
+    cache.store(trajectory_cache_key(resolved_request), std::move(trajectory),
+                trajectory_cache_intent_identity(resolved_request));
   }
 
   TrajectoryCacheKey cache_key(const std::string& move_id) const {
@@ -2424,10 +2388,6 @@ class ExecutionKernelTest : public ::testing::Test {
 
   std::optional<TrajectoryDTO> peek_cache(const std::string& move_id) const {
     return cache.peek_unvalidated(cache_key(move_id));
-  }
-
-  std::optional<TrajectoryCacheRevisionEvidence> cache_revision(const std::string& move_id) const {
-    return cache.revision_of(cache_key(move_id));
   }
 
   ExecuteRequestDTO make_relative_object_request(const std::string& move_id,
@@ -2443,19 +2403,11 @@ class ExecutionKernelTest : public ::testing::Test {
 
   void publish_observed_box_for_lease(
       const std::string& object_id, double x_m, CollisionWorldRevision revision,
-      std::string body_hash, std::uint64_t topology_epoch = 1, std::uint64_t policy_epoch = 1,
-      std::string object_revision_token = "box-shape-token") {
+      std::string body_hash) {
     const auto pose = make_test_pose(x_m, 0.0, 0.0);
     collision_world_publisher.current_snapshot = std::make_shared<const CollisionWorldSnapshot>(
         make_test_collision_world_snapshot_with_object(object_id, pose, std::move(revision),
                                                        std::move(body_hash)));
-    collision_world_publisher.lease_topology_epoch = topology_epoch;
-    collision_world_publisher.lease_policy_epoch = policy_epoch;
-    if (collision_world_publisher.current_policy.has_value()) {
-      collision_world_publisher.current_policy->revision.revision_id = policy_epoch;
-    }
-    collision_world_publisher.lease_live_objects = {make_observed_box_live_object(
-        object_id, pose, std::move(object_revision_token))};
   }
 
   void enable_observed_box_lease(const std::string& object_id) {
@@ -3760,20 +3712,16 @@ TEST_F(ExecutionKernelTest,
 
   auto result = execute_sync(make_test_request("move_scene_changed"));
 
-  // A newer world without lease objects is an ordinary newer scene: the
-  // runtime monitor checks it from the first tick.
+  // A newer world is an ordinary newer scene: dispatch compares nothing and
+  // the runtime monitor checks it from the first tick.
   ASSERT_TRUE(result.ok());
   EXPECT_EQ(ended_as(kernel), "completed");
   EXPECT_EQ(execution.execute_count, 1);
   EXPECT_EQ(collision_engine->check_count.load(), 2);
   std::lock_guard<std::mutex> lock(events_mutex);
-  const auto accepted = std::find_if(events.begin(), events.end(), [](const KernelEvent& e) {
-    return e.type == KernelEventType::kValidationPassed && e.details.contains("reason") &&
-           e.details.at("reason") == "scene_snapshot_lease_live_divergence_accepted";
-  });
-  ASSERT_NE(accepted, events.end());
-  EXPECT_EQ(accepted->details.at("validation_collision_world_revision_id"), "1");
-  EXPECT_EQ(accepted->details.at("live_collision_world_revision_id"), "2");
+  EXPECT_TRUE(std::none_of(events.begin(), events.end(), [](const KernelEvent& e) {
+    return e.type == KernelEventType::kErrorRaised;
+  }));
 }
 
 TEST_F(ExecutionKernelTest, Execute_SameContentRevisionChangeDuringValidationDispatchesOnLatestScene) {
@@ -3836,7 +3784,6 @@ TEST_F(ExecutionKernelTest, Execute_ObservedSceneLeaseAcceptsBoundedTargetPoseDr
   EXPECT_TRUE(peek_cache("move_lease_drift").has_value());
   EXPECT_EQ(collision_world_publisher.lease_retain_call_count.load(), 1);
   EXPECT_EQ(collision_world_publisher.lease_release_call_count.load(), 1);
-  EXPECT_GE(collision_world_publisher.lease_inventory_call_count.load(), 1);
 }
 
 TEST_F(ExecutionKernelTest, Execute_RetainsOneExactProjectionThroughPlanValidationAndDispatch) {
@@ -3912,8 +3859,7 @@ TEST_F(ExecutionKernelTest, Execute_ObservedSceneLeaseAcceptsTargetShapeChange) 
     if (!mutated_once) {
       mutated_once = true;
       publish_observed_box_for_lease(
-          "box", 0.005, CollisionWorldRevision{2, test_digest("box-world-2")}, "box-body-hash-2",
-          /*topology_epoch=*/2, /*policy_epoch=*/1, "box-shape-token-v2");
+          "box", 0.005, CollisionWorldRevision{2, test_digest("box-world-2")}, "box-body-hash-2");
     }
   };
 
@@ -3925,31 +3871,6 @@ TEST_F(ExecutionKernelTest, Execute_ObservedSceneLeaseAcceptsTargetShapeChange) 
   EXPECT_EQ(execution.execute_count, 1);
 }
 
-TEST_F(ExecutionKernelTest, Execute_ObservedSceneLeaseRefusesStaleLiveSourceBeforeDispatch) {
-  enable_observed_box_lease("box");
-  bool aged_once = false;
-  collision_engine->on_check = [this, &aged_once](const CollisionQuery&) {
-    if (!aged_once) {
-      aged_once = true;
-      // The source goes silent past its budget between validation and dispatch.
-      collision_world_publisher.lease_live_objects.front().source_freshness_budget_ns = 1;
-      clock.advance(10);
-    }
-  };
-
-  auto result = execute_sync(make_test_request("move_lease_stale_source"));
-
-  ASSERT_TRUE(result.ok());
-  EXPECT_EQ(ended_as(kernel), "failed");
-  EXPECT_EQ(execution.execute_count, 0);
-  const auto snapshot = kernel.get_execution_snapshot();
-  ASSERT_TRUE(snapshot.error.has_value());
-  EXPECT_EQ(snapshot.error->code, kErrorSceneChangedDuringValidation);
-  EXPECT_EQ(snapshot.error->details.at("reason"), reason_codes::kObservedSceneSourceStale);
-  EXPECT_EQ(snapshot.error->details.at("object_id"), "box");
-  EXPECT_EQ(snapshot.error->details.at("source_id"), "test_pose_source");
-}
-
 TEST_F(ExecutionKernelTest, Execute_ObservedSceneLeaseAcceptsNonTargetObjectChange) {
   enable_observed_box_lease("box");
   bool mutated_once = false;
@@ -3957,8 +3878,7 @@ TEST_F(ExecutionKernelTest, Execute_ObservedSceneLeaseAcceptsNonTargetObjectChan
     if (!mutated_once) {
       mutated_once = true;
       publish_observed_box_for_lease(
-          "box", 0.005, CollisionWorldRevision{2, test_digest("box-world-2")}, "box-body-hash-2",
-          /*topology_epoch=*/2, /*policy_epoch=*/1, "box-shape-token-v2");
+          "box", 0.005, CollisionWorldRevision{2, test_digest("box-world-2")}, "box-body-hash-2");
     }
   };
 
@@ -3992,27 +3912,6 @@ TEST_F(ExecutionKernelTest, Execute_ObservedSceneLeaseAcceptsDefaultSnapshotObst
   ASSERT_FALSE(snapshot.error.has_value());
 }
 
-TEST_F(ExecutionKernelTest, Execute_CachedTrajectoryMissesAfterLeaseWorldRevisionChanges) {
-  enable_observed_box_lease("box");
-  cache.store(
-      cache_key("move_lease_cache"), make_test_trajectory(),
-      TrajectoryCacheRevisionEvidence{test_projection_revision(),
-                                      CollisionWorldRevision{1, test_digest("box-world-1")}},
-      "stale-revision-entry");
-  ASSERT_TRUE(peek_cache("move_lease_cache").has_value());
-
-  publish_observed_box_for_lease(
-      "box", 0.005, CollisionWorldRevision{2, test_digest("box-world-2")}, "box-body-hash-2");
-
-  auto result = execute_sync(make_relative_object_request("move_lease_cache", "box"));
-
-  ASSERT_TRUE(result.ok());
-  EXPECT_EQ(ended_as(kernel), "completed");
-  EXPECT_EQ(planner.plan_count, 1)
-      << "cache lookup must miss when the live authoritative revision changed";
-  EXPECT_EQ(execution.execute_count, 1);
-}
-
 TEST_F(ExecutionKernelTest, Execute_IncrementingIds) {
   auto r1 = execute_sync(make_test_request());
   EXPECT_EQ(r1.value(), 1u);
@@ -4031,18 +3930,17 @@ TEST_F(ExecutionKernelTest, Execute_CacheHit_SkipsPlanning) {
   EXPECT_EQ(execution.execute_count, 1);
 }
 
-TEST_F(ExecutionKernelTest, Execute_CrossRevisionCacheCandidateRevalidatesWithoutPlanning) {
-  std::atomic<int> candidate_events{0};
-  std::atomic<int> success_events{0};
+TEST_F(ExecutionKernelTest, Execute_CachedTrajectoryRevalidatesAgainstChangedSceneWithoutPlanning) {
+  std::atomic<int> hit_events{0};
   kernel.subscribe_events([&](const KernelEvent& event) {
-    if (event.type == KernelEventType::kCacheRevalidationCandidate) {
-      candidate_events.fetch_add(1, std::memory_order_relaxed);
-    } else if (event.type == KernelEventType::kCacheRevalidated) {
-      success_events.fetch_add(1, std::memory_order_relaxed);
+    if (event.type == KernelEventType::kCacheHit) {
+      hit_events.fetch_add(1, std::memory_order_relaxed);
     }
   });
-  const auto request = make_test_request("move_cross_revision_valid");
+  const auto request = make_test_request("move_changed_scene_valid");
   store_cache(request, make_test_trajectory());
+  // The scene changed after the trajectory was stored. Reuse does not compare
+  // revisions: the stored trajectory is validated against the latest scene.
   auto current_world = make_test_collision_world_snapshot();
   current_world.revision = {2, test_digest("current-collision-world")};
   collision_world_publisher.current_snapshot =
@@ -4053,32 +3951,26 @@ TEST_F(ExecutionKernelTest, Execute_CrossRevisionCacheCandidateRevalidatesWithou
   ASSERT_TRUE(result.ok());
   EXPECT_EQ(planner.plan_count, 0);
   EXPECT_GE(context.validate_count, 1);
+  EXPECT_GE(collision_engine->check_count.load(), 1);
   EXPECT_EQ(execution.execute_count, 1);
   const auto metrics = kernel.get_metrics();
-  EXPECT_EQ(metrics.cache_hits, 0u);
-  EXPECT_EQ(metrics.cache_revalidation_candidates, 1u);
-  EXPECT_EQ(metrics.cache_revalidations_succeeded, 1u);
-  EXPECT_EQ(candidate_events.load(std::memory_order_relaxed), 1);
-  EXPECT_EQ(success_events.load(std::memory_order_relaxed), 1);
-  const auto stored_revision = cache_revision(request.move_id);
-  ASSERT_TRUE(stored_revision.has_value());
-  EXPECT_EQ(stored_revision->collision_world_revision.revision_id, 2u);
-  EXPECT_EQ(stored_revision->collision_world_revision.content_hash,
-            test_digest("current-collision-world"));
-  EXPECT_EQ(stored_revision->projection_revision, test_projection_revision());
+  EXPECT_EQ(metrics.cache_hits, 1u);
+  EXPECT_EQ(metrics.cache_revalidations_failed, 0u);
+  EXPECT_EQ(hit_events.load(std::memory_order_relaxed), 1);
+  EXPECT_TRUE(peek_cache(request.move_id).has_value());
 }
 
-TEST_F(ExecutionKernelTest, Execute_FailedCrossRevisionCacheCandidateInvalidatesAndReplansOnce) {
-  std::atomic<int> candidate_events{0};
+TEST_F(ExecutionKernelTest, Execute_FailedCachedTrajectoryInvalidatesAndReplansOnce) {
+  std::atomic<int> hit_events{0};
   std::atomic<int> failure_events{0};
   kernel.subscribe_events([&](const KernelEvent& event) {
-    if (event.type == KernelEventType::kCacheRevalidationCandidate) {
-      candidate_events.fetch_add(1, std::memory_order_relaxed);
+    if (event.type == KernelEventType::kCacheHit) {
+      hit_events.fetch_add(1, std::memory_order_relaxed);
     } else if (event.type == KernelEventType::kCacheRevalidationFailed) {
       failure_events.fetch_add(1, std::memory_order_relaxed);
     }
   });
-  const auto request = make_test_request("move_cross_revision_invalid");
+  const auto request = make_test_request("move_changed_scene_invalid");
   store_cache(request, make_test_trajectory());
   auto current_world = make_test_collision_world_snapshot();
   current_world.revision = {2, test_digest("current-collision-world")};
@@ -4103,14 +3995,13 @@ TEST_F(ExecutionKernelTest, Execute_FailedCrossRevisionCacheCandidateInvalidates
   EXPECT_EQ(planner.plan_count, 1);
   EXPECT_EQ(execution.execute_count, 1);
   const auto metrics = kernel.get_metrics();
-  EXPECT_EQ(metrics.cache_revalidation_candidates, 1u);
+  EXPECT_EQ(metrics.cache_hits, 1u);
   EXPECT_EQ(metrics.cache_revalidations_failed, 1u);
-  EXPECT_EQ(candidate_events.load(std::memory_order_relaxed), 1);
+  EXPECT_EQ(hit_events.load(std::memory_order_relaxed), 1);
   EXPECT_EQ(failure_events.load(std::memory_order_relaxed), 1);
   EXPECT_EQ(metrics.cache_invalidations, 1u);
-  const auto stored_revision = cache_revision(request.move_id);
-  ASSERT_TRUE(stored_revision.has_value());
-  EXPECT_EQ(stored_revision->collision_world_revision.revision_id, 2u);
+  // The re-planned, validated trajectory replaces the failed one.
+  EXPECT_TRUE(peek_cache(request.move_id).has_value());
 }
 
 // Planner-intent cache admission: an existing uncapped entry must not be
@@ -4411,8 +4302,10 @@ TEST_F(ExecutionKernelTest, Execute_CacheHitValidationFailure_BlocksExecution) {
 
   execute_sync(make_test_request("move_cached_invalid"));
 
-  EXPECT_EQ(planner.plan_count, 0);
-  EXPECT_EQ(context.validate_count, 1);
+  // The failed cached trajectory is re-planned once; the re-planned one fails
+  // the same validation, so nothing executes.
+  EXPECT_EQ(planner.plan_count, 1);
+  EXPECT_EQ(context.validate_count, 2);
   EXPECT_EQ(execution.execute_count, 0);
   EXPECT_EQ(ended_as(kernel), "failed");
   EXPECT_FALSE(peek_cache("move_cached_invalid").has_value());
@@ -5592,7 +5485,6 @@ TEST_F(ExecutionKernelTest, RuntimeCollisionPublishedBundleFailureFailsClosedWit
   config.collision_monitor_period_ns = 10'000'000;
   config.runtime_collision_immediate_query_budget_ns = 10'000'000;
   config.runtime_observed_state_max_age_ns = 0;
-  config.runtime_dynamic_body_max_age_cap_ns = 5'000'000'000;
   MockCollisionWorldPublisher local_publisher;
   auto validation_engine = std::make_shared<MockCollisionEngine>();
   auto runtime_engine = std::make_shared<MockCollisionEngine>();
@@ -6445,57 +6337,12 @@ TEST_F(ExecutionKernelTest, CollisionMonitoring_ReadsDedicatedPublicationWithout
   controlled_kernel.wait_for_completion();
 }
 
-TEST_F(ExecutionKernelTest, CollisionMonitoring_StaleDynamicBodyFailsClosedBeforeEngineQuery) {
-  ControlledExecution controlled_execution;
-  ThreadSafeFakeClock local_clock;
-  ThreadSafeManualScheduler local_scheduler;
-  TrajectoryCache local_cache{CacheConfig{10}};
-  ExecutionKernelConfig config;
-  config.runtime_dynamic_body_max_age_cap_ns = 100'000'000;  // 100 ms
-  MockCollisionWorldPublisher local_collision_world;
-  auto local_collision_engine = std::make_shared<MockCollisionEngine>();
-  auto local_runtime_engine = std::make_shared<MockCollisionEngine>();
-  ExecutionKernel controlled_kernel{
-      planner, context, controlled_execution, local_clock, local_scheduler, local_cache, config};
-  configure_runtime_collision_monitoring(controlled_kernel, local_collision_world,
-                                         local_collision_engine, local_runtime_engine);
-  CollisionDetailsRecorder collisions(controlled_kernel);
-  auto live_snapshot = make_test_collision_world_snapshot();
-  live_snapshot.revision = CollisionWorldRevision{42, test_digest("dynamic-world")};
-  live_snapshot.bodies.push_back(make_dynamic_test_body(0, 10'000'000));
-  local_collision_world.current_snapshot =
-      std::make_shared<const CollisionWorldSnapshot>(std::move(live_snapshot));
-
-  auto result = prepare_and_dispatch(controlled_kernel, make_test_request());
-  ASSERT_TRUE(result.ok());
-  ASSERT_TRUE(controlled_execution.wait_until_execute_called())
-      << "wait_until_execute_called timed out";
-  ASSERT_TRUE(wait_for_state(controlled_kernel, ExecutionState::kExecuting));
-  controlled_execution.set_progress(0.25, {0.25, 0.75}, 20'000'000);
-  local_clock.advance(20'000'000);
-  const int baseline_engine_checks = local_runtime_engine->check_count.load();
-
-  auto tick = controlled_kernel.collision_check_tick();
-  ASSERT_TRUE(tick.ok());
-  local_scheduler.advance_to(local_clock.now());
-  EXPECT_EQ(local_runtime_engine->check_count.load(), baseline_engine_checks);
-  EXPECT_EQ(controlled_execution.stop_count_value(), 0);
-  // The collision is a reported fact only: no local latch, no ending.
-  EXPECT_EQ(ended_as(controlled_kernel), "working:Executing");
-  const auto latch = collisions.latest();
-  ASSERT_TRUE(latch.has_value());
-  EXPECT_EQ(latch->at("reason"), "stale_dynamic_collision_body");
-  EXPECT_EQ(latch->at("dynamic_body_id"), "scene/dynamic_box/shape/0");
-  EXPECT_EQ(latch->at("dynamic_body_age_ns"), "20000000");
-}
-
 TEST_F(ExecutionKernelTest, CollisionMonitoring_RefreshesRuntimeSnapshotOnWorldRevisionChange) {
   ControlledExecution controlled_execution;
   ThreadSafeFakeClock local_clock;
   ThreadSafeManualScheduler local_scheduler;
   TrajectoryCache local_cache{CacheConfig{10}};
   ExecutionKernelConfig config;
-  config.runtime_dynamic_body_max_age_cap_ns = 100'000'000;  // 100 ms
   MockCollisionWorldPublisher local_collision_world;
   auto local_collision_engine = std::make_shared<MockCollisionEngine>();
   auto local_runtime_engine = std::make_shared<MockCollisionEngine>();
@@ -6506,7 +6353,7 @@ TEST_F(ExecutionKernelTest, CollisionMonitoring_RefreshesRuntimeSnapshotOnWorldR
 
   auto initial_snapshot = make_test_collision_world_snapshot();
   initial_snapshot.revision = CollisionWorldRevision{42, test_digest("dynamic-world-old")};
-  initial_snapshot.bodies.push_back(make_dynamic_test_body(0, 10'000'000));
+  initial_snapshot.bodies.push_back(make_dynamic_test_body());
   local_collision_world.current_snapshot =
       std::make_shared<const CollisionWorldSnapshot>(std::move(initial_snapshot));
 
@@ -6523,7 +6370,7 @@ TEST_F(ExecutionKernelTest, CollisionMonitoring_RefreshesRuntimeSnapshotOnWorldR
   const CollisionWorldRevision fresh_revision{43, test_digest("dynamic-world-fresh")};
   auto fresh_snapshot = make_test_collision_world_snapshot();
   fresh_snapshot.revision = fresh_revision;
-  fresh_snapshot.bodies.push_back(make_dynamic_test_body(local_clock.now(), 10'000'000));
+  fresh_snapshot.bodies.push_back(make_dynamic_test_body());
   local_collision_world.current_snapshot =
       std::make_shared<const CollisionWorldSnapshot>(std::move(fresh_snapshot));
   controlled_execution.set_progress(0.25, {0.25, 0.75}, local_clock.now());
@@ -8061,7 +7908,7 @@ TEST_F(ExecutionKernelTest, Events_CacheInvalidatedEvent) {
     if (e.type == KernelEventType::kCacheInvalidated) {
       found_cache_invalidated = true;
       EXPECT_EQ(e.details.at("move_id"), "invalidate_test");
-      EXPECT_EQ(e.details.at("reason"), "validation_failed");
+      EXPECT_EQ(e.details.at("reason"), "cache_revalidation_failed");
       break;
     }
   }

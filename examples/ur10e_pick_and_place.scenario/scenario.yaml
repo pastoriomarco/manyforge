@@ -8,12 +8,12 @@
   "description": "ur10e_robotiq_pick_place_preview\n\nPreview deployment for UR10e + Robotiq 2F-140 native RoboPlan pick-and-place demo.",
   "members": {
     "assignment.yaml": "sha256:fe4fe32b76167ec3c2593aa9afd6643f68b85b3676df142a20e31464eeb4e42e",
-    "deployment.yaml": "sha256:5b63004b0f165c4e99184bb8b851dc02b19aea74f50d83beb1153ad30ae1c243",
+    "deployment.yaml": "sha256:81c1bd7e5945154e657c618bd07e4f6d1ba078c6be6b4452a3642d44c8809902",
     "program.yaml": "sha256:06d2c4dc1240d0354b96d6109ebe69cbce87b928592db87112abd5495065bbb8"
   },
   "name": "ur10e_pick_and_place",
   "saved_status": {
-    "checked_content_digest": "sha256:3ec038cbf9b7b56bbd71dc29b7c0a118fab33fbf9a796c8ff5d80c8d2257c2aa",
+    "checked_content_digest": "sha256:04dcf4edd7ad2d15122cbe51d936f237833d45776badd8958a3b24f4524d241c",
     "last_known_status": "ready",
     "manyforge_version": "0.1.0"
   },

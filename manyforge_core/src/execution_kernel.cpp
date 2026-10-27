@@ -257,21 +257,6 @@ Result<ControlledStateDTO> controlled_state_for_publication(
   return Result<ControlledStateDTO>::Ok(std::move(state));
 }
 
-std::unordered_map<CollisionBodyId, std::string> body_hashes_by_id(
-    const CollisionWorldSnapshotPtr& snapshot) {
-  std::unordered_map<CollisionBodyId, std::string> out;
-  if (!snapshot) {
-    return out;
-  }
-  out.reserve(snapshot->bodies.size());
-  for (const auto& body : snapshot->bodies) {
-    out.emplace(body.body_id, body.body_content_hash.empty()
-                                  ? compute_collision_world_body_content_hash(body)
-                                  : body.body_content_hash);
-  }
-  return out;
-}
-
 [[nodiscard]] const CollisionWorldBody* find_collision_body(
     const CollisionWorldSnapshot& world, const CollisionBodyId& body_id) noexcept;
 
@@ -566,19 +551,6 @@ std::unordered_map<CollisionBodyId, std::string> body_hashes_by_id(
     message += ": " + displayed_diagnostic->first + "=" + displayed_diagnostic->second;
   }
   return ErrorDTO{kErrorValidationCollision, std::move(message), std::move(details)};
-}
-
-void enrich_live_objects_with_body_hashes(std::vector<SceneSnapshotLiveObject>& live_objects,
-                                          const CollisionWorldSnapshotPtr& snapshot) {
-  const auto body_hashes = body_hashes_by_id(snapshot);
-  for (auto& object : live_objects) {
-    for (const auto& body_id : object.collision_body_ids) {
-      const auto it = body_hashes.find(body_id);
-      if (it != body_hashes.end()) {
-        object.body_content_hashes[body_id] = it->second;
-      }
-    }
-  }
 }
 
 const char* collision_thread_safety_to_string(CollisionEngineThreadSafetyClass thread_safety) {
@@ -897,9 +869,6 @@ ExecutionKernel::ExecutionKernel(IPlannerBackend& planner, ExecutionKernelPorts 
   if (config_.validation_collision_wall_timeout_ns <= 0) {
     throw std::invalid_argument("validation_collision_wall_timeout_ns must be > 0");
   }
-  if (config_.scene_snapshot_lease_max_age_ns <= 0) {
-    throw std::invalid_argument("scene_snapshot_lease_max_age_ns must be > 0");
-  }
   if (config_.enable_collision_diagnostic_compare && collision_diagnostic_comparator_ == nullptr) {
     throw std::invalid_argument("collision diagnostic compare requires a comparator port");
   }
@@ -1178,26 +1147,6 @@ void ExecutionKernel::unsubscribe_events(SubscriptionHandle handle) {
   event_publisher_.unsubscribe(handle);
 }
 
-CollisionWorldRevision ExecutionKernel::current_authoritative_collision_world_revision() const {
-  ICollisionWorldSnapshotPublisher* publisher = collision_resources_.snapshot().snapshot_publisher;
-  if (publisher == nullptr) {
-    return {};
-  }
-  try {
-    auto snapshot = publisher->snapshot();
-    if (snapshot) {
-      return snapshot->revision;
-    }
-  } catch (const std::exception&) {
-    // Callers use the default revision as "no authoritative revision
-    // available"; validation itself reports the concrete publisher error.
-  } catch (...) {
-    // Callers use the default revision as "no authoritative revision
-    // available"; validation itself reports the concrete publisher error.
-  }
-  return {};
-}
-
 ExecutionKernel::RetainedSceneSnapshotLease::RetainedSceneSnapshotLease(
     ICollisionWorldSnapshotPublisher& publisher, CollisionWorldLeaseInventory inventory)
     : publisher_(&publisher), inventory_(std::move(inventory)) {}
@@ -1315,87 +1264,6 @@ ExecutionKernel::retain_current_scene_snapshot_lease_inventory(std::uint64_t exe
                  {{"reason", "planner_projection_retention_exception"},
                   {"exception", reason_codes::kUnknownNonStdException}}});
   }
-}
-
-std::optional<SceneSnapshotLease> ExecutionKernel::build_scene_snapshot_lease(
-    const CollisionWorldLeaseInventory& inventory, std::uint64_t exec_id) const {
-  if (!inventory.bundle.world || !inventory.bundle.policy.has_value()) {
-    return std::nullopt;
-  }
-
-  SceneSnapshotLease lease;
-  lease.lease_id = inventory.projection_binding.projection_lease_id.empty()
-                       ? "execution_" + std::to_string(exec_id)
-                       : inventory.projection_binding.projection_lease_id.value();
-  lease.validation_epoch = exec_id;
-  lease.captured_at_ns = inventory.captured_at_ns > 0 ? inventory.captured_at_ns : clock_.now();
-  lease.lease_max_age_ns = config_.scene_snapshot_lease_max_age_ns;
-  lease.projection_revision = inventory.projection_binding.projection_revision;
-  lease.world_revision = inventory.bundle.world->revision;
-  lease.policy_revision = inventory.bundle.policy->revision;
-  lease.topology_epoch = inventory.topology_epoch;
-  lease.policy_epoch = inventory.policy_epoch;
-
-  const auto tighten_lease_age = [](std::optional<std::int64_t>& current,
-                                    std::optional<std::int64_t> candidate) {
-    if (!candidate.has_value()) {
-      return;
-    }
-    if (!current.has_value() || *candidate < *current) {
-      current = *candidate;
-    }
-  };
-  const auto body_hashes = body_hashes_by_id(inventory.bundle.world);
-  lease.objects.reserve(inventory.live_objects.size());
-  for (const auto& live : inventory.live_objects) {
-    if (live.object_id.empty() || live.collision_body_ids.empty()) {
-      continue;
-    }
-    SceneSnapshotLeaseObject object;
-    object.object_id = live.object_id;
-    object.collision_body_ids = live.collision_body_ids;
-    object.object_revision_token = live.object_revision_token;
-    object.pose = live.pose;
-    tighten_lease_age(lease.lease_max_age_ns, live.lease_max_age_ns);
-    for (const auto& body_id : object.collision_body_ids) {
-      const auto it = body_hashes.find(body_id);
-      if (it != body_hashes.end()) {
-        object.body_content_hashes[body_id] = it->second;
-      }
-    }
-    lease.objects.push_back(std::move(object));
-  }
-  return lease;
-}
-
-std::optional<SceneSnapshotLeaseValidationContext>
-ExecutionKernel::current_scene_snapshot_lease_validation_context() const {
-  ICollisionWorldSnapshotPublisher* publisher = collision_resources_.snapshot().snapshot_publisher;
-  if (publisher == nullptr) {
-    return std::nullopt;
-  }
-  try {
-    auto inventory = publisher->current_scene_snapshot_lease_inventory();
-    if (!inventory.has_value() || !inventory->bundle.world ||
-        !inventory->bundle.policy.has_value()) {
-      return std::nullopt;
-    }
-    SceneSnapshotLeaseValidationContext context;
-    context.now_ns = clock_.now();
-    context.default_lease_max_age_ns = config_.scene_snapshot_lease_max_age_ns;
-    context.live_projection_revision = inventory->projection_binding.projection_revision;
-    context.live_world_revision = inventory->bundle.world->revision;
-    context.live_policy_revision = inventory->bundle.policy->revision;
-    context.topology_epoch = inventory->topology_epoch;
-    context.policy_epoch = inventory->policy_epoch;
-    context.live_objects = std::move(inventory->live_objects);
-    context.record_object_divergence = config_.record_scene_divergence_detail;
-    enrich_live_objects_with_body_hashes(context.live_objects, inventory->bundle.world);
-    return context;
-  } catch (const std::exception&) {
-  } catch (...) {
-  }
-  return std::nullopt;
 }
 
 std::shared_ptr<CollisionCancellationToken> ExecutionKernel::install_validation_cancel_token() {
@@ -1534,12 +1402,10 @@ ExecutionKernel::CollisionMonitoringStart ExecutionKernel::start_collision_monit
   std::map<std::string, std::string> refresh_details;
   RuntimeCollisionQueryBundlePtr initial_bundle;
   bool snapshot_ready = false;
-  std::optional<ProjectionRevisionDTO> admission_projection_revision;
   if (admission_inventory != nullptr && admission_inventory->projection_binding.valid() &&
       admission_inventory->bundle.world && admission_inventory->bundle.policy.has_value()) {
-    admission_projection_revision = admission_inventory->projection_binding.projection_revision;
-    initial_bundle = build_runtime_collision_query_bundle(admission_inventory->bundle, 0U,
-                                                          admission_projection_revision);
+    initial_bundle = build_runtime_collision_query_bundle(
+        admission_inventory->bundle, admission_inventory->projection_binding.projection_revision);
     snapshot_ready = initial_bundle && initial_bundle->world && initial_bundle->policy &&
                      initial_bundle->policy_index && initial_bundle->lookup_order_valid &&
                      initial_bundle->distance_selection_order_valid;
@@ -1580,8 +1446,7 @@ ExecutionKernel::CollisionMonitoringStart ExecutionKernel::start_collision_monit
     query_session = std::make_shared<RuntimeCollisionQuerySession>(
         std::move(*projection), *resources.snapshot_publisher, resources.runtime_monitor_engine,
         runtime_collision_monitor_.active_contact_policy_id(),
-        static_cast<std::int64_t>(config_.runtime_collision_immediate_query_budget_ns),
-        std::move(admission_projection_revision));
+        static_cast<std::int64_t>(config_.runtime_collision_immediate_query_budget_ns));
     query_prepare_error = query_session->prepare(initial_bundle);
     if (query_prepare_error) {
       query_session.reset();
@@ -1702,7 +1567,7 @@ void ExecutionKernel::arm_runtime_collision_lookahead(
                         !admission_inventory.projection_binding.valid();
     if (!invalid_authority) {
       lookahead->arm(execution_id, execution_generation, std::move(collision_trajectory),
-                     contact_policy_id, admission_inventory.projection_binding.projection_revision);
+                     contact_policy_id);
       return;
     }
   }
@@ -2068,8 +1933,7 @@ void ExecutionKernel::expire_planning_deadline() {
 ExecutionKernel::ExecuteWorkerPlanPhaseResult ExecutionKernel::execute_worker_plan_phase(
     std::stop_token st, ExecuteRequestDTO& request,
     const CollisionWorldLeaseInventory& projection_inventory, std::uint64_t exec_id,
-    std::optional<TrajectoryDTO> cached_trajectory, bool cache_revalidation_candidate,
-    ActiveMotionExecution& motion_state,
+    std::optional<TrajectoryDTO> cached_trajectory, ActiveMotionExecution& motion_state,
     const std::shared_ptr<PreparedMotionSession>& prepared_session) {
   ExecuteWorkerPlanPhaseResult result;
 
@@ -2096,7 +1960,6 @@ ExecutionKernel::ExecuteWorkerPlanPhaseResult ExecutionKernel::execute_worker_pl
   }
   const bool cache_hit = cached_trajectory.has_value();
   result.active_trajectory_from_cache = cache_hit;
-  result.cache_revalidation_candidate = cache_hit && cache_revalidation_candidate;
   if (cache_hit) {
     auto cached_request = make_plan_request(request, projection_inventory, 0U, nullptr);
     if (!cached_request.ok()) {
@@ -2226,9 +2089,7 @@ ExecutionKernel::execute_worker_validate_replan_phase(
     std::stop_token st, const ExecuteRequestDTO& request, std::uint64_t exec_id,
     TrajectoryDTO& trajectory, std::optional<PlanRequestDTO>& plan_request,
     std::optional<PlanResultDTO>& planning_result, bool& active_trajectory_from_cache,
-    bool& cache_revalidation_candidate,
     CollisionWorldLeaseInventory& scene_snapshot_lease_inventory,
-    const std::optional<SceneSnapshotLease>& scene_snapshot_lease,
     ActiveMotionExecution& motion_state,
     const std::shared_ptr<PreparedMotionSession>& prepared_session) {
   ExecuteWorkerValidationPhaseResult phase_result;
@@ -2239,7 +2100,6 @@ ExecutionKernel::execute_worker_validate_replan_phase(
       const auto& motion = std::get<PreparedMotionExecutionDTO>(prepared_session->participant->payload);
       phase_result.collision_world_revision = motion.validation_evidence.collision_world_revision;
       phase_result.validation_evidence = motion.validation_evidence;
-      phase_result.scene_snapshot_lease = scene_snapshot_lease;
       phase_result.collision_trajectory = prepared_session->replacement_collision_trajectory;
     }
     const TrajectoryDTO missing_curve;
@@ -2257,8 +2117,10 @@ ExecutionKernel::execute_worker_validate_replan_phase(
     set_runtime_collision_state_projection(std::move(projection.value()));
     return phase_result;
   }
+  // A cached trajectory that fails validation against the latest scene is
+  // always re-planned once.
   const int max_authoritative_validation_attempts =
-      std::max(cache_revalidation_candidate ? 2 : 1,
+      std::max(active_trajectory_from_cache ? 2 : 1,
                1 + config_.authoritative_validation_collision_replan_attempts);
   int authoritative_validation_attempt = 0;
   Result<CollisionValidationSuccess> val_result =
@@ -2275,8 +2137,8 @@ ExecutionKernel::execute_worker_validate_replan_phase(
                  {"max_attempts", std::to_string(max_authoritative_validation_attempts)}}});
 
     val_result =
-        validate_trajectory(trajectory, request, scene_snapshot_lease_inventory,
-                            scene_snapshot_lease, nullptr, {}, &conclusive_collision_failure);
+        validate_trajectory(trajectory, request, scene_snapshot_lease_inventory, nullptr, {},
+                            &conclusive_collision_failure);
     if (finalize_prepared_motion_cancellation_if_requested(
             prepared_session, request, exec_id, motion_state,
             "prepared_motion_cancelled_during_validation")) {
@@ -2287,9 +2149,8 @@ ExecutionKernel::execute_worker_validate_replan_phase(
       break;
     }
     const auto& validation_error = val_result.error();
-    const bool failed_revalidation_candidate =
-        cache_revalidation_candidate && active_trajectory_from_cache;
-    if (failed_revalidation_candidate) {
+    const bool failed_cached_trajectory = active_trajectory_from_cache;
+    if (failed_cached_trajectory) {
       emit_event({KernelEventType::kCacheRevalidationFailed,
                   exec_id,
                   clock_.now(),
@@ -2301,8 +2162,7 @@ ExecutionKernel::execute_worker_validate_replan_phase(
       metrics_.cache_revalidations_failed++;
     }
     const bool can_replan_authoritative_collision =
-        (failed_revalidation_candidate ||
-         authoritative_collision_replan_candidate(validation_error)) &&
+        (failed_cached_trajectory || authoritative_collision_replan_candidate(validation_error)) &&
         authoritative_validation_attempt + 1 < max_authoritative_validation_attempts &&
         sm_.status().state == ExecutionState::kValidating && !st.stop_requested();
     if (!can_replan_authoritative_collision) {
@@ -2310,8 +2170,8 @@ ExecutionKernel::execute_worker_validate_replan_phase(
     }
 
     std::map<std::string, std::string> retry_details = validation_error.details;
-    retry_details["reason"] = failed_revalidation_candidate ? "cache_revalidation_failed_replan"
-                                                            : "authoritative_validation_replan";
+    retry_details["reason"] = failed_cached_trajectory ? "cache_revalidation_failed_replan"
+                                                       : "authoritative_validation_replan";
     retry_details["attempt_index"] = std::to_string(authoritative_validation_attempt);
     retry_details["next_attempt_index"] = std::to_string(authoritative_validation_attempt + 1);
     retry_details["max_attempts"] = std::to_string(max_authoritative_validation_attempts);
@@ -2335,8 +2195,8 @@ ExecutionKernel::execute_worker_validate_replan_phase(
                   {},
                   std::nullopt,
                   {{"move_id", request.move_id},
-                   {"reason", failed_revalidation_candidate ? "cache_revalidation_failed"
-                                                            : "authoritative_validation_replan"}}});
+                   {"reason", failed_cached_trajectory ? "cache_revalidation_failed"
+                                                       : "authoritative_validation_replan"}}});
       {
         std::lock_guard<std::mutex> lock(metrics_mutex_);
         metrics_.cache_invalidations++;
@@ -2431,7 +2291,6 @@ ExecutionKernel::execute_worker_validate_replan_phase(
     planning_result = std::move(replan_result.value().result);
     trajectory = *planning_result->trajectory;
     active_trajectory_from_cache = false;
-    cache_revalidation_candidate = false;
     emit_event({KernelEventType::kPlanCompleted,
                 exec_id,
                 clock_.now(),
@@ -2554,155 +2413,33 @@ ExecutionKernel::execute_worker_validate_replan_phase(
       config_.validation_revision, val_result.value().noncollision_result,
       val_result.value().collision_world_revision, val_result.value().collision_policy_revision,
       val_result.value().collision_decision};
-  phase_result.scene_snapshot_lease = std::move(val_result.value().scene_snapshot_lease);
   phase_result.collision_trajectory =
       std::make_shared<const TrajectoryDTO>(std::move(val_result.value().collision_trajectory));
   return phase_result;
 }
 
-void ExecutionKernel::store_validated_candidate(const ExecuteRequestDTO& request,
-                                                std::uint64_t exec_id,
-                                                const TrajectoryDTO& trajectory,
-                                                const ProjectionRevisionDTO& projection_revision,
-                                                const CollisionWorldRevision& validation_revision,
-                                                bool revalidated_cache_candidate) {
-  // The exact resolved intent and validation revision remain cache authority.
+void ExecutionKernel::store_validated_trajectory(const ExecuteRequestDTO& request,
+                                                 const TrajectoryDTO& trajectory) {
+  // Only the slot and the exact resolved intent select a stored trajectory;
+  // every reuse is validated again against the latest scene.
   const auto key = trajectory_cache_key(request);
-  if (request.cache_mode == CacheMode::kDisable || !key.valid() ||
-      !collision_world_revision_is_set(validation_revision))
-    return;
-  cache_.store(key, trajectory,
-               TrajectoryCacheRevisionEvidence{projection_revision, validation_revision},
-               trajectory_cache_intent_identity(request));
-  if (revalidated_cache_candidate) {
-    emit_event({KernelEventType::kCacheRevalidated,
-                exec_id,
-                clock_.now(),
-                {},
-                {},
-                std::nullopt,
-                {{"move_id", request.move_id},
-                 {"revision_id", std::to_string(validation_revision.revision_id)}}});
-    std::lock_guard<std::mutex> lock(metrics_mutex_);
-    metrics_.cache_revalidations_succeeded++;
-  }
+  if (request.cache_mode == CacheMode::kDisable || !key.valid()) return;
+  cache_.store(key, trajectory, trajectory_cache_intent_identity(request));
 }
 
 ExecutionKernel::ExecuteWorkerDispatchPhaseResult ExecutionKernel::execute_worker_dispatch_phase(
     const ExecuteRequestDTO& request, std::uint64_t exec_id, const TrajectoryDTO& trajectory,
-    bool active_trajectory_from_cache, bool cache_revalidation_candidate,
-    const ProjectionLeaseBindingDTO& projection_binding,
+    bool active_trajectory_from_cache,
     const CollisionWorldLeaseInventory& scene_snapshot_lease_inventory,
-    const CollisionWorldRevision& validation_world_revision,
-    const std::optional<SceneSnapshotLease>& scene_snapshot_lease,
     std::shared_ptr<const TrajectoryDTO> collision_trajectory,
     std::shared_ptr<const PreparedOperationParticipantDTO> prepared_participant,
     ActiveMotionExecution& motion_state) {
   ExecuteWorkerDispatchPhaseResult phase_result;
 
-  const auto fail_scene_snapshot_gate = [&](ErrorDTO stale_error, const char* reason) -> bool {
-    emit_event({KernelEventType::kErrorRaised, exec_id, clock_.now(), {}, {}, stale_error, {}});
-    settle_local_failure(request, exec_id, motion_state, std::move(stale_error),
-                         ParticipantEffectKnowledge::kNoEffect, reason);
-    phase_result.status = ExecuteWorkerPhaseStatus::kTerminal;
-    return true;
-  };
-  if (collision_world_revision_is_set(validation_world_revision)) {
-    if (scene_snapshot_lease.has_value()) {
-      auto validation_context = current_scene_snapshot_lease_validation_context();
-      SceneSnapshotLeaseValidationContext missing_context;
-      missing_context.now_ns = clock_.now();
-      missing_context.default_lease_max_age_ns = config_.scene_snapshot_lease_max_age_ns;
-      auto lease_result = validate_scene_snapshot_lease(
-          *scene_snapshot_lease,
-          validation_context.has_value() ? *validation_context : missing_context);
-      if (!lease_result.accepted) {
-        std::map<std::string, std::string> details = std::move(lease_result.details);
-        details["reason"] = lease_result.reason_code.empty() ? "scene_snapshot_lease_rejected"
-                                                             : lease_result.reason_code;
-        details["reason_code"] = details["reason"];
-        details["scene_snapshot_lease_id"] = lease_result.lease_id;
-        details["validation_collision_world_revision_id"] =
-            std::to_string(lease_result.validated_world_revision.revision_id);
-        details["validation_collision_world_content_hash"] =
-            lease_result.validated_world_revision.content_hash;
-        details["live_collision_world_revision_id"] =
-            std::to_string(lease_result.live_world_revision.revision_id);
-        details["live_collision_world_content_hash"] =
-            lease_result.live_world_revision.content_hash;
-        details["validation_collision_policy_revision_id"] =
-            std::to_string(lease_result.validated_policy_revision.revision_id);
-        details["live_collision_policy_revision_id"] =
-            std::to_string(lease_result.live_policy_revision.revision_id);
-        if (lease_result.object_id.has_value()) {
-          details["object_id"] = *lease_result.object_id;
-        }
-        if (lease_result.source_id.has_value()) {
-          details["source_id"] = *lease_result.source_id;
-        }
-        if (lease_result.lease_age_ns.has_value()) {
-          details["scene_snapshot_lease_age_ns"] = std::to_string(*lease_result.lease_age_ns);
-        }
-        if (lease_result.source_age_ns.has_value()) {
-          details["observed_scene_source_age_ns"] = std::to_string(*lease_result.source_age_ns);
-        }
-
-        ErrorDTO stale_error{kErrorSceneChangedDuringValidation,
-                             "Collision world changed after validation and before dispatch",
-                             std::move(details)};
-        if (fail_scene_snapshot_gate(std::move(stale_error),
-                                     "dispatch_scene_snapshot_lease_rejected")) {
-          return phase_result;
-        }
-      } else if (lease_result.details.find("accepted_live_world_revision_divergence") !=
-                 lease_result.details.end()) {
-        auto details = std::move(lease_result.details);
-        details["reason"] = "scene_snapshot_lease_live_divergence_accepted";
-        details["reason_code"] = details["reason"];
-        details["scene_snapshot_lease_id"] = lease_result.lease_id;
-        details["validation_collision_world_revision_id"] =
-            std::to_string(lease_result.validated_world_revision.revision_id);
-        details["validation_collision_world_content_hash"] =
-            lease_result.validated_world_revision.content_hash;
-        details["live_collision_world_revision_id"] =
-            std::to_string(lease_result.live_world_revision.revision_id);
-        details["live_collision_world_content_hash"] =
-            lease_result.live_world_revision.content_hash;
-        emit_event({KernelEventType::kValidationPassed,
-                    exec_id,
-                    clock_.now(),
-                    {},
-                    {},
-                    std::nullopt,
-                    std::move(details)});
-      }
-    } else {
-      const auto live_revision = current_authoritative_collision_world_revision();
-      const bool live_revision_available = collision_world_revision_is_set(live_revision);
-      if (!live_revision_available ||
-          !collision_world_revisions_equal(live_revision, validation_world_revision)) {
-        std::map<std::string, std::string> details;
-        details["reason"] = live_revision_available
-                                ? "collision_world_changed_after_validation"
-                                : "collision_world_revision_unavailable_before_dispatch";
-        details["validation_collision_world_revision_id"] =
-            std::to_string(validation_world_revision.revision_id);
-        details["validation_collision_world_content_hash"] = validation_world_revision.content_hash;
-        details["live_collision_world_revision_id"] = std::to_string(live_revision.revision_id);
-        details["live_collision_world_content_hash"] = live_revision.content_hash;
-        ErrorDTO stale_error{kErrorSceneChangedDuringValidation,
-                             "Collision world changed after validation and before dispatch",
-                             std::move(details)};
-        if (fail_scene_snapshot_gate(std::move(stale_error), "dispatch_revision_changed")) {
-          return phase_result;
-        }
-      }
-    }
-  }
-
-  if (!active_trajectory_from_cache || cache_revalidation_candidate)
-    store_validated_candidate(request, exec_id, trajectory, projection_binding.projection_revision,
-                              validation_world_revision, cache_revalidation_candidate);
+  // Dispatch runs on the latest scene. Freshness was judged at validation
+  // time; scene changes since then are covered by the runtime monitor, whose
+  // preparation below is the only dispatch precondition here.
+  if (!active_trajectory_from_cache) store_validated_trajectory(request, trajectory);
 
   auto prev_state3 = sm_.status().state;
   auto r3 = sm_.try_transition(ExecutionState::kExecuting);
@@ -3222,21 +2959,18 @@ ExecutionKernel::make_and_prepare_motion_participant(
 
 void ExecutionKernel::async_execute_worker(
     std::stop_token st, ExecuteRequestDTO initial_request, uint64_t initial_exec_id,
-    std::optional<TrajectoryDTO> cached_trajectory, bool cache_revalidation_candidate,
+    std::optional<TrajectoryDTO> cached_trajectory,
     RetainedSceneSnapshotLease initial_retained_scene,
-    std::optional<SceneSnapshotLease> initial_scene_snapshot_lease,
     std::shared_ptr<PreparedMotionSession> initial_prepared_session) {
   // The existing physical worker owns one current context. Candidate planning
   // never replaces this context until the worker reaches a handover safe point.
   ActiveMotionExecution motion_state(std::move(initial_request));
   motion_state.execution_id = initial_exec_id;
   motion_state.retained_scene = std::move(initial_retained_scene);
-  motion_state.scene_snapshot_lease = std::move(initial_scene_snapshot_lease);
   motion_state.prepared_session = std::move(initial_prepared_session);
   auto& request = motion_state.request;
   auto& exec_id = motion_state.execution_id;
   auto& retained_scene = motion_state.retained_scene;
-  auto& scene_snapshot_lease = motion_state.scene_snapshot_lease;
   auto& prepared_session = motion_state.prepared_session;
   {
     std::lock_guard lock(prepared_motion_session_mutex_);
@@ -3246,7 +2980,6 @@ void ExecutionKernel::async_execute_worker(
     ExecutionKernel* self;
     ActiveMotionExecution& motion_state;
     RetainedSceneSnapshotLease& retained_scene;
-    std::optional<SceneSnapshotLease>& scene_snapshot_lease;
     std::shared_ptr<PreparedMotionSession>& prepared_session;
     ~WorkerCompletionGuard() {
       // Defensive: an unexpected return path missed the explicit terminal
@@ -3300,13 +3033,11 @@ void ExecutionKernel::async_execute_worker(
       // Completion is the quiescence boundary observed by reset, tests, and
       // callers. Release every worker-owned scene authority handle before
       // publishing it; otherwise a waiter can race retained-lease cleanup.
-      scene_snapshot_lease.reset();
       retained_scene = RetainedSceneSnapshotLease{};
       self->finish_execute_worker();
     }
   };
-  WorkerCompletionGuard completion_guard{this, motion_state, retained_scene, scene_snapshot_lease,
-                                         prepared_session};
+  WorkerCompletionGuard completion_guard{this, motion_state, retained_scene, prepared_session};
   try {
     const auto projection_binding = retained_scene.binding();
     if (!projection_binding.valid()) {
@@ -3314,24 +3045,20 @@ void ExecutionKernel::async_execute_worker(
     }
     auto plan_phase = execute_worker_plan_phase(
         st, request, retained_scene.inventory(), exec_id, std::move(cached_trajectory),
-        cache_revalidation_candidate, motion_state, prepared_session);
+        motion_state, prepared_session);
     if (plan_phase.status == ExecuteWorkerPhaseStatus::kTerminal) {
       return;
     }
     TrajectoryDTO trajectory = std::move(plan_phase.trajectory);
     bool active_trajectory_from_cache = plan_phase.active_trajectory_from_cache;
-    cache_revalidation_candidate = plan_phase.cache_revalidation_candidate;
 
     auto validation_phase = execute_worker_validate_replan_phase(
         st, request, exec_id, trajectory, plan_phase.plan_request, plan_phase.planning_result,
-        active_trajectory_from_cache, cache_revalidation_candidate,
-        retained_scene.mutable_inventory(), scene_snapshot_lease, motion_state, prepared_session);
+        active_trajectory_from_cache, retained_scene.mutable_inventory(), motion_state,
+        prepared_session);
     if (validation_phase.status == ExecuteWorkerPhaseStatus::kTerminal) {
       return;
     }
-    const CollisionWorldRevision validation_world_revision =
-        validation_phase.collision_world_revision;
-
     // Owner policy, resolved only after all planning/validation retiming. The
     // prepared product and the dispatch watchdog must carry the same budget.
     resolve_motion_execution_timeout(request, trajectory);
@@ -3409,10 +3136,8 @@ void ExecutionKernel::async_execute_worker(
     }
 
     auto dispatch_phase = execute_worker_dispatch_phase(
-        request, exec_id, trajectory, active_trajectory_from_cache, cache_revalidation_candidate,
-        projection_binding, retained_scene.inventory(), validation_world_revision,
-        validation_phase.scene_snapshot_lease, std::move(validation_phase.collision_trajectory),
-        prepared_participant, motion_state);
+        request, exec_id, trajectory, active_trajectory_from_cache, retained_scene.inventory(),
+        std::move(validation_phase.collision_trajectory), prepared_participant, motion_state);
     if (dispatch_phase.status == ExecuteWorkerPhaseStatus::kTerminal) {
       return;
     }
@@ -3786,7 +3511,6 @@ Result<ExecutionKernel::ValidatedMotionPlan> ExecutionKernel::compute_validated_
     const std::int64_t planning_start_ns, const std::int64_t planning_timeout_ns,
     const std::stop_token stop_token,
     std::shared_ptr<CollisionCancellationToken> validation_cancellation,
-    const std::optional<std::uint64_t> validation_execution_id,
     const MovingReplacementInputDTO* replacement,
     const std::optional<std::int64_t> suffix_planning_deadline_ns) {
   const auto reject = [](const ErrorCode code, std::string message, std::string reason) {
@@ -3842,8 +3566,8 @@ Result<ExecutionKernel::ValidatedMotionPlan> ExecutionKernel::compute_validated_
   if (!planned.ok()) return failure(planned.error(), "candidate_compute");
 
   auto validated = validate_trajectory(
-      *planned.value().result.trajectory, request, projection_inventory, std::nullopt,
-      &start_state, stop_token, nullptr, std::move(validation_cancellation), validation_execution_id, replacement);
+      *planned.value().result.trajectory, request, projection_inventory, &start_state, stop_token,
+      nullptr, std::move(validation_cancellation), replacement);
   if (stop_token.stop_requested()) {
     return reject(ErrorCode::kExecutionAborted, "Motion preview was cancelled during validation",
                   "motion_preview_cancelled");
@@ -4228,8 +3952,7 @@ Result<void> ExecutionKernel::compute_spring_motion_replacement(
       std::min(request.timeouts.planning_timeout_s, static_cast<double>(remaining_ns) / 1.0e9);
   auto computed = compute_validated_motion_plan(
       candidate_request, inventory, rest, 0U, session->preparation_started_ns,
-      context.preparation_budget_ns, stop_token, session->replacement_validation_cancellation,
-      execution_id);
+      context.preparation_budget_ns, stop_token, session->replacement_validation_cancellation);
   if (!computed.ok()) return Result<void>::Err(computed.error());
   if (clock_.now() >= session->preparation_deadline_ns || stop_token.stop_requested())
     return refuse("spring_return_preparation_budget_expired");
@@ -4246,7 +3969,6 @@ Result<void> ExecutionKernel::compute_spring_motion_replacement(
   if (!product.ok()) return Result<void>::Err(product.error());
   auto collision_curve = std::make_shared<const TrajectoryDTO>(
       std::move(computed.value().validation.collision_trajectory));
-  staged->scene_snapshot_lease = std::move(computed.value().validation.scene_snapshot_lease);
   std::lock_guard lock(session->mutex);
   if (session->cancel_requested || (attached && attached->cancelled) || stop_token.stop_requested())
     return refuse("spring_return_cancelled");
@@ -4777,7 +4499,7 @@ void ExecutionKernel::compute_motion_replacement(const std::stop_token stop_toke
     } deadline_guard{scheduler_, deadline};
     auto computed = compute_validated_motion_plan(
         request, inventory, start_state, 0U, start_ns, context.preparation_budget_ns, stop_token,
-        session->replacement_validation_cancellation, session->execution_id, &moving,
+        session->replacement_validation_cancellation, &moving,
         context.planning_budget_ns
             ? std::optional<std::int64_t>(start_ns + *context.planning_budget_ns)
             : std::nullopt);
@@ -4809,10 +4531,8 @@ void ExecutionKernel::compute_motion_replacement(const std::stop_token stop_toke
     correlation->set_from_request(request);
     auto collision_curve =
         std::make_shared<const TrajectoryDTO>(std::move(validation.collision_trajectory));
-    prepared->scene_snapshot_lease = std::move(validation.scene_snapshot_lease);
     auto arm = RuntimeCollisionLookaheadSession::prepare_arm(
-        session->execution_id, 0U, collision_curve, request.contact_policy_id,
-        prepared->retained_scene.binding().projection_revision);
+        session->execution_id, 0U, collision_curve, request.contact_policy_id);
     std::lock_guard lock(session->mutex);
     if (session->cancel_requested || stop_token.stop_requested())
       return Result<void>::Err(failed("motion_replacement_cancelled"));
@@ -4886,21 +4606,8 @@ Result<void> ExecutionKernel::check_motion_replacement_scene(
                            : nullptr;
   if (!motion || !session.replacement_execution)
     return Result<void>::Err(ErrorCode::kInvalidRequest);
-  const auto& next = *session.replacement_execution;
-  if (next.scene_snapshot_lease) {
-    const auto validation = current_scene_snapshot_lease_validation_context();
-    if (validation) {
-      if (validate_scene_snapshot_lease(*next.scene_snapshot_lease, *validation).accepted)
-        return Result<void>::Ok();
-    }
-  } else if (collision_world_revisions_equal(
-                 current_authoritative_collision_world_revision(),
-                 motion->validation_evidence.collision_world_revision)) {
-    return Result<void>::Ok();
-  }
-  return Result<void>::Err(ErrorDTO{kErrorSceneChangedDuringValidation,
-                                    "Replacement collision evidence is no longer current",
-                                    {{"reason", "motion_replacement_scene_stale"}}});
+  // A newer scene is accepted; the runtime monitor checks the latest world.
+  return Result<void>::Ok();
 }
 
 bool ExecutionKernel::service_motion_replacement(const std::stop_token stop_token,
@@ -5792,15 +5499,9 @@ Result<uint64_t> ExecutionKernel::execute_impl(
 
   auto retained_scene_result = [&]() -> Result<RetainedSceneSnapshotLease> {
     if (!cold_reuse) return retain_current_scene_snapshot_lease_inventory(exec_id, request.move_id);
-    const auto current = current_scene_snapshot_lease_validation_context();
+    // The staged spring successor runs on the latest scene; the runtime
+    // monitor covers scene changes since staging.
     std::lock_guard lock(prepared_session->mutex);
-    const auto& staged = *prepared_session->replacement_execution;
-    if (!current || current->live_projection_revision != staged.retained_scene.binding().projection_revision ||
-        (staged.scene_snapshot_lease &&
-         !validate_scene_snapshot_lease(*staged.scene_snapshot_lease, *current).accepted))
-      return Result<RetainedSceneSnapshotLease>::Err(ErrorDTO{kErrorExecutionRejected,
-          "Spring successor projection or retained lease changed before activation",
-          {{"reason", "spring_return_projection_stale"}}});
     return Result<RetainedSceneSnapshotLease>::Ok(
         std::move(prepared_session->replacement_execution->retained_scene));
   }();
@@ -5829,9 +5530,6 @@ Result<uint64_t> ExecutionKernel::execute_impl(
     return reject_admission(contact_grasp_binding.error());
   }
   set_active_request_correlation(resolved_request);
-  std::optional<SceneSnapshotLease> scene_snapshot_lease;
-  scene_snapshot_lease = cold_reuse ? prepared_session->replacement_execution->scene_snapshot_lease
-      : build_scene_snapshot_lease(retained_scene.inventory(), exec_id);
 
   std::optional<RobotStateDTO> synced_state;
   auto observed_start = observed_state_.current_state(clock_.now());
@@ -5946,21 +5644,14 @@ Result<uint64_t> ExecutionKernel::execute_impl(
           {{"reason", "spring_return_start_or_target_changed"}}});
     prepared.trajectory = motion.trajectory;
   }
-  const auto active_collision_world_revision = retained_scene.inventory().bundle.world->revision;
-  const TrajectoryCacheRevisionEvidence active_cache_evidence{
-      projection_binding.projection_revision, active_collision_world_revision};
   const auto cache_key = trajectory_cache_key(resolved_request);
   if (!cold_reuse && resolved_request.cache_mode != CacheMode::kDisable) {
-    // Exact-revision entries are cache hits. A same-intent older-revision entry
-    // is only a current-snapshot revalidation candidate; it carries no stale
-    // proof and cannot dispatch until the ordinary validation gate restamps it.
-    const auto intent_identity = trajectory_cache_intent_identity(resolved_request);
+    // A stored trajectory for this slot and intent is only a candidate: the
+    // ordinary validation gate checks it against the latest scene, and a
+    // failure re-plans.
     auto cache_lookup =
-        cache_.lookup_with_revision(cache_key, active_cache_evidence, intent_identity);
-    const bool exact_cache_hit = cache_lookup.disposition == TrajectoryCacheLookupDisposition::kHit;
-    const bool revalidation_candidate =
-        cache_lookup.disposition == TrajectoryCacheLookupDisposition::kRevalidationCandidate;
-    if ((exact_cache_hit || revalidation_candidate) && cache_lookup.trajectory.has_value()) {
+        cache_.lookup(cache_key, trajectory_cache_intent_identity(resolved_request));
+    if (cache_lookup.disposition == TrajectoryCacheLookupDisposition::kFound) {
       auto& cached = *cache_lookup.trajectory;
       const auto goal_match =
           cached_trajectory_matches_request_goal(kinematics_, cached, resolved_request);
@@ -5970,8 +5661,7 @@ Result<uint64_t> ExecutionKernel::execute_impl(
                                                         request.tolerances.joint_position_tol_rad)
               : incompatible_cache("start_state_changed");
       if (goal_match.compatible && start_match.compatible) {
-        prepared.cache_hit = exact_cache_hit;
-        prepared.cache_revalidation_candidate = revalidation_candidate;
+        prepared.cache_hit = true;
         prepared.trajectory = std::move(cached);
       } else {
         cache_.invalidate(cache_key);
@@ -5982,15 +5672,12 @@ Result<uint64_t> ExecutionKernel::execute_impl(
     } else if (cache_lookup.disposition == TrajectoryCacheLookupDisposition::kIntentMismatch) {
       prepared.cache_invalidated = true;
       prepared.cache_invalidation_reason = "planner_intent_changed";
-    } else if (cache_lookup.disposition == TrajectoryCacheLookupDisposition::kRevisionMismatch) {
-      prepared.cache_invalidated = true;
-      prepared.cache_invalidation_reason = "collision_world_revision_changed";
     } else {
       prepared.cache_miss = true;
     }
   }
 
-  const auto initial_state = (cold_reuse || prepared.cache_hit || prepared.cache_revalidation_candidate)
+  const auto initial_state = (cold_reuse || prepared.cache_hit)
                                  ? ExecutionState::kValidating
                                  : ExecutionState::kPlanning;
   if (initial_state != ExecutionState::kPlanning) {
@@ -6026,18 +5713,6 @@ Result<uint64_t> ExecutionKernel::execute_impl(
     emit_event({KernelEventType::kCacheHit, exec_id, clock_.now(), {}, {}, std::nullopt, {}});
     std::lock_guard<std::mutex> metrics_lock(metrics_mutex_);
     metrics_.cache_hits++;
-  } else if (prepared.cache_revalidation_candidate) {
-    emit_event(
-        {KernelEventType::kCacheRevalidationCandidate,
-         exec_id,
-         clock_.now(),
-         {},
-         {},
-         std::nullopt,
-         {{"move_id", request.move_id},
-          {"current_revision_id", std::to_string(active_collision_world_revision.revision_id)}}});
-    std::lock_guard<std::mutex> metrics_lock(metrics_mutex_);
-    metrics_.cache_revalidation_candidates++;
   } else {
     if (prepared.cache_miss) {
       emit_event({KernelEventType::kCacheMiss,
@@ -6080,20 +5755,17 @@ Result<uint64_t> ExecutionKernel::execute_impl(
   const auto worker_generation = ++execute_worker_generation_;
   worker_thread_ = std::jthread(
       [this, request_copy = std::move(resolved_request), exec_id,
-       cached_trajectory = (cold_reuse || prepared.cache_hit || prepared.cache_revalidation_candidate)
+       cached_trajectory = (cold_reuse || prepared.cache_hit)
                                ? std::make_optional(std::move(prepared.trajectory))
                                : std::nullopt,
-       cache_revalidation_candidate = prepared.cache_revalidation_candidate,
        retained_scene = std::move(retained_scene),
-       scene_snapshot_lease = std::move(scene_snapshot_lease),
        prepared_session = std::move(prepared_session),
        worker_start_gate](std::stop_token st) mutable {
         if (!worker_start_gate->wait(st)) {
           return;
         }
         async_execute_worker(st, std::move(request_copy), exec_id, std::move(cached_trajectory),
-                             cache_revalidation_candidate, std::move(retained_scene),
-                             std::move(scene_snapshot_lease), std::move(prepared_session));
+                             std::move(retained_scene), std::move(prepared_session));
       });
 
   lifecycle_lock.unlock();
@@ -7462,13 +7134,11 @@ Result<void> ExecutionKernel::collision_check_tick() {
   const auto& world_snapshot = published_bundle->world;
   const auto& policy_snapshot = published_bundle->policy;
   const auto& runtime_capability = query_session->engine_capability();
-  if (world_snapshot->bodies.size() > runtime_capability.runtime_query_max_world_bodies ||
-      published_bundle->body_freshness.size() > runtime_capability.runtime_query_max_world_bodies) {
+  if (world_snapshot->bodies.size() > runtime_capability.runtime_query_max_world_bodies) {
     std::map<std::string, std::string> details{
         {"reason_code", "runtime_collision_monitor"},
         {"reason", "runtime_collision_bundle_capacity_exceeded"},
         {"body_count", std::to_string(world_snapshot->bodies.size())},
-        {"freshness_count", std::to_string(published_bundle->body_freshness.size())},
         {"body_bound", std::to_string(runtime_capability.runtime_query_max_world_bodies)}};
     return publish_runtime_monitor_fault(CollisionCheckResultDTO{}, std::move(details));
   }
@@ -7476,21 +7146,6 @@ Result<void> ExecutionKernel::collision_check_tick() {
     std::map<std::string, std::string> details{
         {"reason_code", "runtime_collision_monitor"},
         {"reason", "runtime_collision_bundle_lookup_order_invalid"}};
-    return publish_runtime_monitor_fault(CollisionCheckResultDTO{}, std::move(details));
-  }
-
-  const auto dynamic_body_now_ns = clock_.now();
-  const auto freshness = check_runtime_dynamic_body_freshness(
-      *world_snapshot, published_bundle->body_freshness, dynamic_body_now_ns,
-      config_.runtime_dynamic_body_max_age_cap_ns, published_bundle->lookup_order_valid);
-  if (freshness.status != RuntimeDynamicBodyFreshnessStatus::kFresh) {
-    std::map<std::string, std::string> details{{"reason_code", "runtime_collision_monitor"}};
-    const auto reason = validate_dynamic_body_freshness(
-        *world_snapshot, published_bundle->body_freshness, dynamic_body_now_ns,
-        config_.runtime_dynamic_body_max_age_cap_ns, details);
-    details["reason"] = reason.value_or(runtime_dynamic_body_freshness_reason(freshness.status));
-    details["collision_world_revision_id"] = std::to_string(world_snapshot->revision.revision_id);
-    details["collision_world_content_hash"] = world_snapshot->revision.content_hash;
     return publish_runtime_monitor_fault(CollisionCheckResultDTO{}, std::move(details));
   }
 
@@ -7585,7 +7240,6 @@ Result<void> ExecutionKernel::collision_check_tick() {
       {"published_collision_policy_revision_id",
        std::to_string(policy_snapshot->revision.revision_id)},
       {"published_collision_policy_content_hash", policy_snapshot->revision.content_hash},
-      {"runtime_bundle_epoch", std::to_string(published_bundle->epoch)},
       {"runtime_query_engine_id", query_session->engine_capability().engine_id},
       {"runtime_query_engine_version", query_session->engine_capability().engine_version},
       {"runtime_query_duration_ns", std::to_string(outcome.query_duration_ns)}};
@@ -8028,11 +7682,9 @@ Result<ExecutionKernel::PlanningSuccess> ExecutionKernel::plan_motion_continuati
 Result<ExecutionKernel::CollisionValidationSuccess> ExecutionKernel::validate_trajectory(
     const TrajectoryDTO& trajectory, const ExecuteRequestDTO& request,
     CollisionWorldLeaseInventory& scene_snapshot_lease_inventory,
-    const std::optional<SceneSnapshotLease>& scene_snapshot_lease,
     const RobotStateDTO* start_state_override, const std::stop_token external_stop_token,
     bool* conclusive_collision_failure,
     std::shared_ptr<CollisionCancellationToken> validation_cancellation,
-    const std::optional<std::uint64_t> validation_execution_id,
     const MovingReplacementInputDTO* replacement) {
   if (conclusive_collision_failure != nullptr) {
     *conclusive_collision_failure = false;
@@ -8154,14 +7806,6 @@ Result<ExecutionKernel::CollisionValidationSuccess> ExecutionKernel::validate_tr
     std::optional<std::map<std::string, std::string>> contact_policy_violation;
   };
 
-  std::optional<SceneSnapshotLease> effective_scene_snapshot_lease = scene_snapshot_lease;
-  if (!effective_scene_snapshot_lease.has_value() && scene_snapshot_lease_inventory.bundle.world) {
-    const auto execution_id =
-        validation_execution_id ? *validation_execution_id : sm_.status().execution_id;
-    effective_scene_snapshot_lease =
-        build_scene_snapshot_lease(scene_snapshot_lease_inventory, execution_id);
-  }
-
   auto run_authoritative_validation_once = [&]() -> Result<AuthoritativeValidationAttempt> {
     CollisionWorldPolicySnapshotBundle world_policy_bundle;
     world_policy_bundle = scene_snapshot_lease_inventory.bundle;
@@ -8244,8 +7888,7 @@ Result<ExecutionKernel::CollisionValidationSuccess> ExecutionKernel::validate_tr
   if (bundle.decision.accepted) {
     return Result<CollisionValidationSuccess>::Ok(CollisionValidationSuccess{
         bundle.borrowed_world_revision, attempt.policy->revision, std::move(val_result),
-        std::move(bundle.decision), std::move(collision_trajectory),
-        std::move(effective_scene_snapshot_lease), telemetry,
+        std::move(bundle.decision), std::move(collision_trajectory), telemetry,
         dynamically_discovered_start_contact_count});
   }
   std::map<std::string, std::string> details;
@@ -8473,7 +8116,6 @@ void ExecutionKernel::set_collision_resources(
     lookahead_config.min_waypoints_for_parallel =
         config_.runtime_collision_lookahead_min_waypoints_for_parallel;
     lookahead_config.query_budget_ns = config_.runtime_collision_lookahead_query_budget_ns;
-    lookahead_config.dynamic_body_max_age_cap_ns = config_.runtime_dynamic_body_max_age_cap_ns;
     next_lookahead = std::make_shared<RuntimeCollisionLookaheadSession>(
         lookahead_config, clock_, scheduler_, publisher, *progress, runtime_lookahead_engines,
         [this](const RuntimeCollisionLookaheadSession* source_session,
@@ -8711,7 +8353,6 @@ ExecutionKernel::replace_collision_resources_under_apply_fence(
     lookahead_config.min_waypoints_for_parallel =
         config_.runtime_collision_lookahead_min_waypoints_for_parallel;
     lookahead_config.query_budget_ns = config_.runtime_collision_lookahead_query_budget_ns;
-    lookahead_config.dynamic_body_max_age_cap_ns = config_.runtime_dynamic_body_max_age_cap_ns;
     try {
       next_lookahead = std::make_shared<RuntimeCollisionLookaheadSession>(
           lookahead_config, clock_, scheduler_, *candidate.snapshot_publisher, *progress,

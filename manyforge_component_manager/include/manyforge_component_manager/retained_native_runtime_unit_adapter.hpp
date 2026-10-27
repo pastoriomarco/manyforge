@@ -24,14 +24,6 @@ public:
   using std::runtime_error::runtime_error;
 };
 
-/// Exact output of the existing observer's effect-free strict config check.
-/// The caller owns its interpretation and source lifecycle; this is no
-/// readiness or observer-spawn receipt.
-struct IsaacPoseObserverCheckedConfiguration final {
-  std::filesystem::path retained_snapshot;
-  std::string metadata;
-};
-
 /// Manager-owned local adapter for the retained native execution product.
 ///
 /// The adapter resolves only the contract-fixed installed target beneath one
@@ -45,11 +37,6 @@ struct IsaacPoseObserverCheckedConfiguration final {
 /// Program scene meshes. It is opened once here, kept for the adapter's
 /// lifetime, and passed to every child as an inherited directory descriptor;
 /// it is never a retained package root.
-/// `isaac_site_settings_document`, when supplied, owns the exact Manager-validated
-/// startup document. It is captured once in a private file under the Manager
-/// run root; children receive that short path and use the existing site loader.
-/// The snapshot is never overwritten or removed by the adapter, including on
-/// child retirement, and remains with the run's evidence. No payload logging.
 class RetainedNativeRuntimeUnitAdapter final
     : public IRuntimeUnitProcessPort,
       public IRuntimeUnitProgressPort,
@@ -73,9 +60,7 @@ public:
       std::filesystem::path logical_scene_database = {},
       std::filesystem::path program_cycle_journal = {},
       std::filesystem::path activation_root = {},
-      std::filesystem::path scene_asset_root = {},
-      std::optional<std::string> isaac_site_settings_document = std::nullopt,
-      std::optional<std::filesystem::path> isaac_pose_observer_executable = std::nullopt);
+      std::filesystem::path scene_asset_root = {});
   RetainedNativeRuntimeUnitAdapter(
       std::filesystem::path trusted_installed_target_root,
       std::filesystem::path trusted_package_root,
@@ -91,9 +76,7 @@ public:
       std::filesystem::path logical_scene_database = {},
       std::filesystem::path program_cycle_journal = {},
       std::filesystem::path activation_root = {},
-      std::filesystem::path scene_asset_root = {},
-      std::optional<std::string> isaac_site_settings_document = std::nullopt,
-      std::optional<std::filesystem::path> isaac_pose_observer_executable = std::nullopt);
+      std::filesystem::path scene_asset_root = {});
   ~RetainedNativeRuntimeUnitAdapter() override;
 
   RetainedNativeRuntimeUnitAdapter(const RetainedNativeRuntimeUnitAdapter &) =
@@ -104,19 +87,6 @@ public:
       delete;
   RetainedNativeRuntimeUnitAdapter &
   operator=(RetainedNativeRuntimeUnitAdapter &&) = delete;
-
-  /// Capture the supplied observer file once and execute only the configured
-  /// existing observer entrypoint with --check-config. Inherits this Manager's
-  /// container ROS overlay; no shell, host ROS, runtime child protocol or world
-  /// effects. Caller supplies a bounded observer-configuration budget.
-  [[nodiscard]] IsaacPoseObserverCheckedConfiguration
-  CheckIsaacPoseObserverConfiguration(const std::filesystem::path &config_path,
-                                      double observer_configuration_timeout_s);
-
-  /// Supply checked cell inputs before initial managed child creation. This
-  /// does not launch/restart a child; Apply facts use the accepted request.
-  void SetIsaacPoseObserverStartupLaunchFacts(
-      std::optional<ManagerIsaacPoseObserverLaunchFactsDTO> facts);
 
   [[nodiscard]] ProcessPresenceObservation
   ObserveProcess(const RuntimeUnitConvergenceQueryDTO &query) override;

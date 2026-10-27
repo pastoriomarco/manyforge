@@ -10,13 +10,6 @@
 namespace manyforge::core {
 namespace {
 
-CollisionWorldRevision make_revision(uint64_t id = 1) {
-  CollisionWorldRevision revision;
-  revision.revision_id = id;
-  revision.content_hash = "test_hash_" + std::to_string(id);
-  return revision;
-}
-
 TrajectoryDTO make_trajectory(const std::string &label) {
   TrajectoryDTO t;
   t.joint_names = {label};
@@ -58,26 +51,10 @@ protected:
     return trajectory_cache_key(request);
   }
 
-  static TrajectoryCacheRevisionEvidence
-  evidence(CollisionWorldRevision revision) {
-    return {testing::make_test_projection_binding().projection_revision,
-            std::move(revision)};
-  }
-
   void store(const std::string &move_id, TrajectoryDTO trajectory,
-             CollisionWorldRevision revision,
              std::string intent_fingerprint = "intent-a") {
     cache.store(key(move_id), std::move(trajectory),
-                evidence(std::move(revision)), std::move(intent_fingerprint));
-  }
-
-  std::optional<TrajectoryDTO>
-  lookup(const std::string &move_id, const CollisionWorldRevision &revision,
-         const std::string &intent_fingerprint = "intent-a") {
-    return cache
-        .lookup_with_revision(key(move_id), evidence(revision),
-                              intent_fingerprint)
-        .trajectory;
+                std::move(intent_fingerprint));
   }
 
   TrajectoryCache cache{CacheConfig{3}}; // max 3 entries
@@ -86,7 +63,7 @@ protected:
 // --- Store and lookup ---
 
 TEST_F(TrajectoryCacheTest, StoreAndLookup) {
-  store("move_1", make_trajectory("t1"), make_revision());
+  store("move_1", make_trajectory("t1"));
   auto result = cache.peek_unvalidated(key("move_1"));
   ASSERT_TRUE(result.has_value());
   EXPECT_EQ(result->joint_names[0], "t1");
@@ -100,8 +77,8 @@ TEST_F(TrajectoryCacheTest, LookupMiss_ReturnsNullopt) {
 
 // --- Overwrite ---
 TEST_F(TrajectoryCacheTest, StoreOverwritesExisting) {
-  store("move_1", make_trajectory("v1"), make_revision());
-  store("move_1", make_trajectory("v2"), make_revision());
+  store("move_1", make_trajectory("v1"));
+  store("move_1", make_trajectory("v2"));
   auto result = cache.peek_unvalidated(key("move_1"));
   ASSERT_TRUE(result.has_value());
   EXPECT_EQ(result->joint_names[0], "v2");
@@ -110,8 +87,8 @@ TEST_F(TrajectoryCacheTest, StoreOverwritesExisting) {
 
 // --- Invalidate ---
 TEST_F(TrajectoryCacheTest, InvalidateSpecificMoveId) {
-  store("move_1", make_trajectory("t1"), make_revision());
-  store("move_2", make_trajectory("t2"), make_revision());
+  store("move_1", make_trajectory("t1"));
+  store("move_2", make_trajectory("t2"));
   cache.invalidate(key("move_1"));
   EXPECT_FALSE(cache.peek_unvalidated(key("move_1")).has_value());
   EXPECT_TRUE(cache.peek_unvalidated(key("move_2")).has_value());
@@ -119,14 +96,14 @@ TEST_F(TrajectoryCacheTest, InvalidateSpecificMoveId) {
 }
 
 TEST_F(TrajectoryCacheTest, InvalidateNonExistent_NoOp) {
-  store("move_1", make_trajectory("t1"), make_revision());
+  store("move_1", make_trajectory("t1"));
   cache.invalidate(key("nonexistent"));
   EXPECT_EQ(cache.size(), 1u);
 }
 
 TEST_F(TrajectoryCacheTest, InvalidateAll) {
-  store("move_1", make_trajectory("t1"), make_revision());
-  store("move_2", make_trajectory("t2"), make_revision());
+  store("move_1", make_trajectory("t1"));
+  store("move_2", make_trajectory("t2"));
   cache.invalidate_all();
   EXPECT_EQ(cache.size(), 0u);
   EXPECT_FALSE(cache.peek_unvalidated(key("move_1")).has_value());
@@ -135,9 +112,9 @@ TEST_F(TrajectoryCacheTest, InvalidateAll) {
 
 // --- Multiple independent entries ---
 TEST_F(TrajectoryCacheTest, MultipleMovesIndependent) {
-  store("move_1", make_trajectory("t1"), make_revision());
-  store("move_2", make_trajectory("t2"), make_revision());
-  store("move_3", make_trajectory("t3"), make_revision());
+  store("move_1", make_trajectory("t1"));
+  store("move_2", make_trajectory("t2"));
+  store("move_3", make_trajectory("t3"));
 
   EXPECT_EQ(cache.size(), 3u);
   EXPECT_EQ(cache.peek_unvalidated(key("move_1"))->joint_names[0], "t1");
@@ -179,7 +156,6 @@ TEST_F(TrajectoryCacheTest, EveryCompositeSlotDimensionPreventsAliasing) {
   for (std::size_t index = 0; index < requests.size(); ++index) {
     slot_cache.store(trajectory_cache_key(requests[index]),
                      make_trajectory("slot-" + std::to_string(index)),
-                     evidence(make_revision()),
                      "intent-" + std::to_string(index));
   }
 
@@ -195,9 +171,9 @@ TEST_F(TrajectoryCacheTest, EveryCompositeSlotDimensionPreventsAliasing) {
 // --- Size and capacity ---
 TEST_F(TrajectoryCacheTest, SizeCorrect) {
   EXPECT_EQ(cache.size(), 0u);
-  store("a", make_trajectory("a"), make_revision());
+  store("a", make_trajectory("a"));
   EXPECT_EQ(cache.size(), 1u);
-  store("b", make_trajectory("b"), make_revision());
+  store("b", make_trajectory("b"));
   EXPECT_EQ(cache.size(), 2u);
 }
 
@@ -214,13 +190,13 @@ TEST_F(TrajectoryCacheTest, DefaultCapacity) {
 
 // --- Safety bound: FIFO eviction ---
 TEST_F(TrajectoryCacheTest, EvictsOldestWhenFull) {
-  store("move_1", make_trajectory("t1"), make_revision());
-  store("move_2", make_trajectory("t2"), make_revision());
-  store("move_3", make_trajectory("t3"), make_revision());
+  store("move_1", make_trajectory("t1"));
+  store("move_2", make_trajectory("t2"));
+  store("move_3", make_trajectory("t3"));
   EXPECT_EQ(cache.size(), 3u);
 
   // 4th entry evicts oldest (move_1).
-  store("move_4", make_trajectory("t4"), make_revision());
+  store("move_4", make_trajectory("t4"));
   EXPECT_EQ(cache.size(), 3u);
   EXPECT_FALSE(cache.peek_unvalidated(key("move_1")).has_value());
   EXPECT_TRUE(cache.peek_unvalidated(key("move_2")).has_value());
@@ -229,12 +205,12 @@ TEST_F(TrajectoryCacheTest, EvictsOldestWhenFull) {
 }
 
 TEST_F(TrajectoryCacheTest, OverwriteDoesNotEvict) {
-  store("move_1", make_trajectory("t1"), make_revision());
-  store("move_2", make_trajectory("t2"), make_revision());
-  store("move_3", make_trajectory("t3"), make_revision());
+  store("move_1", make_trajectory("t1"));
+  store("move_2", make_trajectory("t2"));
+  store("move_3", make_trajectory("t3"));
 
   // Overwrite move_1 — should not evict anything.
-  store("move_1", make_trajectory("t1_updated"), make_revision());
+  store("move_1", make_trajectory("t1_updated"));
   EXPECT_EQ(cache.size(), 3u);
   EXPECT_EQ(cache.peek_unvalidated(key("move_1"))->joint_names[0],
             "t1_updated");
@@ -242,125 +218,28 @@ TEST_F(TrajectoryCacheTest, OverwriteDoesNotEvict) {
   EXPECT_TRUE(cache.peek_unvalidated(key("move_3")).has_value());
 }
 
-// --- Empty trajectory ---
-// --- Chunk 2: revision-aware cache ---
-TEST_F(TrajectoryCacheTest, RevisionAware_StoreAndLookupSucceedsOnExactMatch) {
-  CollisionWorldRevision rev{7, "abc"};
-  store("move_1", make_trajectory("t1"), rev);
-  auto result = lookup("move_1", rev);
-  ASSERT_TRUE(result.has_value());
-  EXPECT_EQ(result->joint_names[0], "t1");
-}
-
-TEST_F(TrajectoryCacheTest, RevisionAware_MismatchRevisionReturnsCandidate) {
-  CollisionWorldRevision rev_old{7, "abc"};
-  CollisionWorldRevision rev_new{8, "def"};
-  store("move_1", make_trajectory("t1"), rev_old);
-
-  const auto candidate =
-      cache.lookup_with_revision(key("move_1"), evidence(rev_new), "intent-a");
-  EXPECT_EQ(candidate.disposition,
-            TrajectoryCacheLookupDisposition::kRevalidationCandidate);
-  ASSERT_TRUE(candidate.trajectory.has_value());
-  EXPECT_EQ(candidate.trajectory->joint_names[0], "t1");
-  EXPECT_TRUE(cache.peek_unvalidated(key("move_1")).has_value());
+// --- Lookup: slot and intent only ---
+TEST_F(TrajectoryCacheTest, LookupReturnsStoredTrajectoryForSameIntent) {
+  store("move_1", make_trajectory("t1"));
+  const auto result = cache.lookup(key("move_1"), "intent-a");
+  EXPECT_EQ(result.disposition, TrajectoryCacheLookupDisposition::kFound);
+  ASSERT_TRUE(result.trajectory.has_value());
+  EXPECT_EQ(result.trajectory->joint_names[0], "t1");
   EXPECT_EQ(cache.size(), 1u);
 }
 
-TEST_F(TrajectoryCacheTest, RevisionAware_DifferentHashSameIdEvictsFailClosed) {
-  CollisionWorldRevision rev_a{7, "abc"};
-  CollisionWorldRevision rev_b{7, "xyz"};
-  store("move_1", make_trajectory("t1"), rev_a);
-
-  const auto result =
-      cache.lookup_with_revision(key("move_1"), evidence(rev_b), "intent-a");
-  EXPECT_EQ(result.disposition,
-            TrajectoryCacheLookupDisposition::kRevisionMismatch);
+TEST_F(TrajectoryCacheTest, LookupMissLeavesOtherSlots) {
+  store("move_1", make_trajectory("t1"));
+  const auto result = cache.lookup(key("move_2"), "intent-a");
+  EXPECT_EQ(result.disposition, TrajectoryCacheLookupDisposition::kMiss);
   EXPECT_FALSE(result.trajectory.has_value());
-  EXPECT_EQ(cache.size(), 0u);
-}
-
-TEST_F(TrajectoryCacheTest, RevisionAware_RevisionRollbackEvictsFailClosed) {
-  const CollisionWorldRevision rev_newer{8, "def"};
-  const CollisionWorldRevision rev_older{7, "abc"};
-  store("move_1", make_trajectory("t1"), rev_newer);
-
-  const auto result = cache.lookup_with_revision(
-      key("move_1"), evidence(rev_older), "intent-a");
-  EXPECT_EQ(result.disposition,
-            TrajectoryCacheLookupDisposition::kRevisionMismatch);
-  EXPECT_FALSE(result.trajectory.has_value());
-  EXPECT_EQ(cache.size(), 0u);
-}
-
-TEST_F(TrajectoryCacheTest,
-       RevisionAware_ForwardProjectionRevisionIsRevalidationCandidate) {
-  const CollisionWorldRevision world{7, "abc"};
-  const auto stored_evidence = evidence(world);
-  auto advanced_evidence = stored_evidence;
-  advanced_evidence.projection_revision.scene_revision.revision_id += 1U;
-  advanced_evidence.projection_revision.scene_revision.content_hash =
-      ContentDigest("sha256:" + std::string(64U, '3'));
-  cache.store(key("move_1"), make_trajectory("t1"), stored_evidence,
-              "intent-a");
-
-  const auto result =
-      cache.lookup_with_revision(key("move_1"), advanced_evidence, "intent-a");
-
-  EXPECT_EQ(result.disposition,
-            TrajectoryCacheLookupDisposition::kRevalidationCandidate);
-  ASSERT_TRUE(result.trajectory.has_value());
-  EXPECT_EQ(result.trajectory->joint_names.front(), "t1");
-  EXPECT_EQ(cache.size(), 1U);
-}
-
-TEST_F(TrajectoryCacheTest,
-       RevisionAware_ConflictingProjectionContentEvictsFailClosed) {
-  const CollisionWorldRevision world{7, "abc"};
-  const auto stored_evidence = evidence(world);
-  auto conflicting_evidence = stored_evidence;
-  conflicting_evidence.projection_revision.scene_revision.content_hash =
-      ContentDigest("sha256:" + std::string(64U, '4'));
-  cache.store(key("move_1"), make_trajectory("t1"), stored_evidence,
-              "intent-a");
-
-  const auto result = cache.lookup_with_revision(
-      key("move_1"), conflicting_evidence, "intent-a");
-
-  EXPECT_EQ(result.disposition,
-            TrajectoryCacheLookupDisposition::kRevisionMismatch);
-  EXPECT_FALSE(result.trajectory.has_value());
-  EXPECT_EQ(cache.size(), 0U);
-}
-
-TEST_F(TrajectoryCacheTest,
-       RevisionAware_ForeignProjectionLineageEvictsFailClosed) {
-  const CollisionWorldRevision world{7, "abc"};
-  const auto stored_evidence = evidence(world);
-  auto foreign_evidence = stored_evidence;
-  foreign_evidence.projection_revision.graph_revision =
-      GraphRevision("graph:foreign");
-  foreign_evidence.projection_revision.scene_revision.revision_id += 1U;
-  foreign_evidence.projection_revision.scene_revision.content_hash =
-      ContentDigest("sha256:" + std::string(64U, '5'));
-  cache.store(key("move_1"), make_trajectory("t1"), stored_evidence,
-              "intent-a");
-
-  const auto result =
-      cache.lookup_with_revision(key("move_1"), foreign_evidence, "intent-a");
-
-  EXPECT_EQ(result.disposition,
-            TrajectoryCacheLookupDisposition::kRevisionMismatch);
-  EXPECT_FALSE(result.trajectory.has_value());
-  EXPECT_EQ(cache.size(), 0U);
+  EXPECT_EQ(cache.size(), 1u);
 }
 
 TEST_F(TrajectoryCacheTest, IntentMismatchMissesAndEvicts) {
-  const CollisionWorldRevision revision{7, "abc"};
-  store("move_1", make_trajectory("t1"), revision, "intent-a");
+  store("move_1", make_trajectory("t1"), "intent-a");
 
-  const auto result =
-      cache.lookup_with_revision(key("move_1"), evidence(revision), "intent-b");
+  const auto result = cache.lookup(key("move_1"), "intent-b");
   EXPECT_EQ(result.disposition,
             TrajectoryCacheLookupDisposition::kIntentMismatch);
   EXPECT_FALSE(result.trajectory.has_value());
@@ -548,61 +427,28 @@ TEST(TrajectoryCacheIntentTest,
             trajectory_cache_intent_identity(execution_budget));
 }
 
-TEST_F(TrajectoryCacheTest, StoreRejectsIncompleteProjectionEvidence) {
-  EXPECT_THROW(store("move_1", make_trajectory("t1"), CollisionWorldRevision{}),
+TEST_F(TrajectoryCacheTest, StoreRejectsIncompleteSlotOrIntent) {
+  EXPECT_THROW(cache.store(TrajectoryCacheKey{}, make_trajectory("t1"), "intent-a"),
                std::invalid_argument);
+  EXPECT_THROW(store("move_1", make_trajectory("t1"), ""), std::invalid_argument);
   EXPECT_EQ(cache.size(), 0U);
 }
 
-TEST_F(TrajectoryCacheTest, RevisionAware_ExpectedUnsetButStoredTaggedMisses) {
-  CollisionWorldRevision rev{7, "abc"};
-  store("move_1", make_trajectory("t1"), rev);
+TEST_F(TrajectoryCacheTest, OverwriteServesLatestTrajectoryAndIntent) {
+  store("move_1", make_trajectory("t1"), "intent-a");
+  store("move_1", make_trajectory("t1_updated"), "intent-b");
 
-  // Caller without an authoritative revision MUST NOT see the tagged hit.
-  EXPECT_FALSE(lookup("move_1", CollisionWorldRevision{}).has_value());
-
-  // Entry NOT evicted: it remains valid for a future caller that does
-  // supply the correct revision.
+  const auto latest = cache.lookup(key("move_1"), "intent-b");
+  EXPECT_EQ(latest.disposition, TrajectoryCacheLookupDisposition::kFound);
+  ASSERT_TRUE(latest.trajectory.has_value());
+  EXPECT_EQ(latest.trajectory->joint_names[0], "t1_updated");
   EXPECT_EQ(cache.size(), 1u);
-  auto subsequent = lookup("move_1", rev);
-  ASSERT_TRUE(subsequent.has_value());
-}
-
-TEST_F(TrajectoryCacheTest, RevisionAware_RevisionOfReturnsTaggedValue) {
-  CollisionWorldRevision rev{7, "abc"};
-  store("move_1", make_trajectory("t1"), rev);
-  auto stored = cache.revision_of(key("move_1"));
-  ASSERT_TRUE(stored.has_value());
-  EXPECT_EQ(stored->collision_world_revision.revision_id, 7u);
-  EXPECT_EQ(stored->collision_world_revision.content_hash, "abc");
-  EXPECT_EQ(stored->projection_revision,
-            testing::make_test_projection_binding().projection_revision);
-}
-
-TEST_F(TrajectoryCacheTest, RevisionAware_OverwriteUpdatesRevision) {
-  CollisionWorldRevision rev_a{7, "abc"};
-  CollisionWorldRevision rev_b{8, "def"};
-  store("move_1", make_trajectory("t1"), rev_a);
-  store("move_1", make_trajectory("t1_updated"), rev_b);
-
-  const auto exact =
-      cache.lookup_with_revision(key("move_1"), evidence(rev_b), "intent-a");
-  EXPECT_EQ(exact.disposition, TrajectoryCacheLookupDisposition::kHit);
-  ASSERT_TRUE(exact.trajectory.has_value());
-  EXPECT_EQ(exact.trajectory->joint_names[0], "t1_updated");
-
-  const auto rollback =
-      cache.lookup_with_revision(key("move_1"), evidence(rev_a), "intent-a");
-  EXPECT_EQ(rollback.disposition,
-            TrajectoryCacheLookupDisposition::kRevisionMismatch);
-  EXPECT_FALSE(rollback.trajectory.has_value());
-  EXPECT_EQ(cache.size(), 0u);
 }
 
 TEST_F(TrajectoryCacheTest, StoreEmptyTrajectory) {
   TrajectoryDTO empty;
   EXPECT_TRUE(empty.empty());
-  store("move_empty", empty, make_revision());
+  store("move_empty", empty);
   auto result = cache.peek_unvalidated(key("move_empty"));
   ASSERT_TRUE(result.has_value());
   EXPECT_TRUE(result->empty());

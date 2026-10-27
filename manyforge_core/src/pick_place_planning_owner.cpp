@@ -83,11 +83,7 @@ template <typename T>
       !command_payload(tool) || motion_payload(retreat) == nullptr ||
       !same_program_context(approach, descend) || !same_program_context(approach, tool) ||
       !same_program_context(approach, retreat) || !same_motion_target(approach, descend) ||
-      !same_motion_target(approach, retreat) || !approach.expected_scene_revision.has_value() ||
-      !ProjectionIsSameOrForwardInLineage(
-          current_projection,
-          {approach.expected_retained_bundle_id, approach.expected_graph_revision,
-           *approach.expected_scene_revision}) ||
+      !same_motion_target(approach, retreat) ||
       approach.expected_graph_revision != current_projection.graph_revision ||
       approach.expected_retained_bundle_id != current_projection.retained_bundle_id) {
     return planning_error<void>("pick_place_public_intent_invalid",

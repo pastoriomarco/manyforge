@@ -101,27 +101,29 @@ struct IoProviderDriverRecord::State final {
   bool enabled{};
   bool retired{};
   std::optional<core::ErrorDTO> fault;
-  std::function<std::optional<std::string>()> process_fault_source;
+  std::function<std::optional<core::ErrorDTO>()> process_fault_source;
+  std::vector<std::unique_ptr<core::StreamRecorder>> pose_streams;
   std::vector<core::LifecycleFactDTO> last_facts;
   std::optional<std::vector<IoProviderInputSourceInstallation>> last_rebind;
   std::optional<core::ErrorDTO> last_rebind_error;
 
-  // The supervised simulated PLC's exit, never latched into `fault`: the
+  // The supervised process's exit, never latched into `fault`: the
   // restarted process's source replaces it at the next Apply.
   std::optional<core::ErrorDTO> ProcessFault() const {
     if (retired || !process_fault_source)
       return std::nullopt;
-    auto reason = process_fault_source();
-    if (!reason)
+    auto fault = process_fault_source();
+    if (!fault)
       return std::nullopt;
-    if (reason->size() > core::kMaxLifecycleErrorMessageBytes) {
+    auto &reason = fault->message;
+    if (reason.size() > core::kMaxLifecycleErrorMessageBytes) {
       auto end = core::kMaxLifecycleErrorMessageBytes;
       while (end > 0U &&
-             (static_cast<unsigned char>((*reason)[end]) & 0xC0U) == 0x80U)
+             (static_cast<unsigned char>(reason[end]) & 0xC0U) == 0x80U)
         --end;
-      reason->resize(end);
+      reason.resize(end);
     }
-    return core::ErrorDTO{"simulated_plc_exited", std::move(*reason), {}};
+    return fault;
   }
 
   std::optional<core::ErrorDTO> EffectiveFault() const {
@@ -786,9 +788,36 @@ RetainedExternallyManagedPrimitiveOutcome IoProviderDriverRecord::Dispatch(
 }
 
 void IoProviderDriverRecord::SetSupervisedProcessFaultSource(
-    std::function<std::optional<std::string>()> source) {
+    std::function<std::optional<core::ErrorDTO>()> source) {
   auto lock = AcquireDelivery();
   state_->process_fault_source = std::move(source);
+}
+
+bool IoProviderDriverRecord::pose_source() const noexcept {
+  return state_->manifest.provider_manifest_id.value() ==
+         core::kPoseSourceLifecycleManifestId;
+}
+
+core::Result<void> IoProviderDriverRecord::InstallPoseSourceLocked(
+    std::vector<std::unique_ptr<core::StreamRecorder>> streams) {
+  using Reply = core::Result<void>;
+  if (!pose_source() || state_->installed || state_->retired)
+    return Reply::Err(error("driver_pose_source_install_invalid"));
+  std::vector<std::string> ids;
+  for (const auto &stream : streams) {
+    if (!stream)
+      return Reply::Err(error("driver_pose_source_install_invalid"));
+    ids.push_back(stream->stream_id());
+  }
+  std::sort(ids.begin(), ids.end());
+  if (ids != state_->domain.provider()->provider.signal_names)
+    return Reply::Err(error("driver_resource_closure_not_exact"));
+  if (!state_->Advance())
+    return Reply::Err(error("driver_generation_exhausted"));
+  state_->pose_streams = std::move(streams);
+  state_->installed = true;
+  state_->CommitFacts();
+  return Reply::Ok();
 }
 
 void IoProviderDriverRecord::Shutdown() {
@@ -820,6 +849,7 @@ void IoProviderDriverRecord::Shutdown() {
     if (!fenced.ok())
       state_->fault = fenced.error();
   }
+  state_->pose_streams.clear();
   state_->enabled = false;
   state_->state = core::ComponentLifecycleStateDTO::kDisabled;
   state_->CommitFacts();

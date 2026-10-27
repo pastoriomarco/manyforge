@@ -16,7 +16,6 @@ const execution: ExecutionIdentity = {
   controlManagementMode: 'component_lifecycle',
   graphRevision: 'graph.1',
   retainedBundleId: 'bundle.1',
-  sceneRevision: 1 as unknown as ExecutionIdentity['sceneRevision'],
 };
 
 const incident: CCLCComponentIncident = {

@@ -242,17 +242,6 @@ class RetainedCollisionWorldProjector final {
       const core::LogicalSceneSnapshotDTO& logical_scene,
       std::uint64_t effective_policy_revision_id) const;
 
-  /// Build the exact lease sidecars for an already projected immutable world.
-  /// Durable publication and candidate-local projection share these helpers so
-  /// scene-object freshness and body identities cannot drift.
-  [[nodiscard]] std::vector<core::CollisionWorldBodyFreshness>
-  project_body_freshness(
-      const core::CollisionWorldSnapshot& world) const;
-  [[nodiscard]] std::vector<core::SceneSnapshotLiveObject>
-  project_live_objects(
-      const core::LogicalSceneSnapshotDTO& logical_scene,
-      const core::CollisionWorldSnapshot& world) const;
-
   [[nodiscard]] const RetainedCollisionModelMapInput& model_map()
       const noexcept {
     return model_map_;

@@ -69,26 +69,38 @@ _PROFILE_DESCRIPTION = Path(
 )
 
 
-_MODEL_FREE_IO_PROFILE = {
-    "runtime_restoration_profile_id": "io_device_v0",
-    "io_provider_runtime": {},
-    "source_fields": {},
-    "stop_profiles": {},
-    "acceptance_obligations": [],
+# Approved model-free profiles: runtime marker key -> (exact profile row,
+# Deployment runtime_kind of its components).
+_MODEL_FREE_PROFILES = {
+    marker: (
+        {
+            "runtime_restoration_profile_id": profile_id,
+            marker: {},
+            "source_fields": {},
+            "stop_profiles": {},
+            "acceptance_obligations": [],
+        },
+        runtime_kind,
+    )
+    for marker, profile_id, runtime_kind in (
+        ("io_provider_runtime", "io_device_v0", "io_provider"),
+        ("pose_source_runtime", "pose_source_v0", "pose_source"),
+    )
 }
 
 
 def _model_preparation_profiles(
     capability_root: Path,
-) -> dict[str, tuple[str, str] | None]:
+) -> dict[str, tuple[str, str] | str]:
     """Read the minimum repository-owned profile facts needed by Python XML prep.
 
     Native preparation independently validates the complete profile and intent
     join.  This projection only supplies the model identity and accepted package
-    prefix required to rewrite the already captured source bytes.  The approved
-    model-free I/O profile (runtime kind ``io_provider_runtime``) maps to
-    ``None``: it has no model to prepare.  Only its exact approved row is
-    accepted; every other row must name a known model family.
+    prefix required to rewrite the already captured source bytes.  An approved
+    model-free profile (I/O device ``io_provider_runtime`` or pose source
+    ``pose_source_runtime``) maps to its components' Deployment runtime kind:
+    it has no model to prepare.  Only its exact approved row is accepted;
+    every other row must name a known model family.
     """
 
     try:
@@ -133,7 +145,7 @@ def _model_preparation_profiles(
                 "Activation model families contain an invalid row",
             )
         families[family_id] = (model_asset_id, prefix)
-    profiles: dict[str, tuple[str, str] | None] = {}
+    profiles: dict[str, tuple[str, str] | str] = {}
     profile_rows = root.get("runtime_restoration_profiles")
     if not isinstance(profile_rows, list):
         raise HeadlessApiError(
@@ -146,13 +158,24 @@ def _model_preparation_profiles(
             if isinstance(row, dict)
             else None
         )
-        model_free = isinstance(row, dict) and "io_provider_runtime" in row
+        model_free = next(
+            (
+                approved
+                for marker, approved in _MODEL_FREE_PROFILES.items()
+                if isinstance(row, dict) and marker in row
+            ),
+            None,
+        )
         family_id = row.get("model_family_id") if isinstance(row, dict) else None
-        family = families.get(family_id) if isinstance(family_id, str) else None
+        family = (
+            model_free[1]
+            if model_free is not None
+            else families.get(family_id) if isinstance(family_id, str) else None
+        )
         if (
             not isinstance(profile_id, str)
             or not profile_id
-            or (row != _MODEL_FREE_IO_PROFILE if model_free else family is None)
+            or (row != model_free[0] if model_free is not None else family is None)
             or profile_id in profiles
         ):
             raise HeadlessApiError(
@@ -338,7 +361,7 @@ def _prepare_model_closure(
     *,
     deployment: Mapping[str, Any],
     model_source_closure: Mapping[str, Any],
-    profiles: Mapping[str, tuple[str, str] | None],
+    profiles: Mapping[str, tuple[str, str] | str],
 ) -> dict[str, Any]:
     if (
         set(model_source_closure) != {"components", "schema_version"}
@@ -394,13 +417,14 @@ def _prepare_model_closure(
                     "Deployment components do not match captured model profiles",
                 )
             seen_components.add(component_id)
-            if profile is None:
-                # The registered model-free I/O profile: only an io_provider
-                # component with no model source and no captured row has no XML.
+            if isinstance(profile, str):
+                # A registered model-free profile (I/O device or pose source):
+                # only a component of its runtime kind with no model source and
+                # no captured row has no XML.
                 configuration = component.get("configuration")
                 if (
                     not isinstance(configuration, dict)
-                    or configuration.get("runtime_kind") != "io_provider"
+                    or configuration.get("runtime_kind") != profile
                     or "model_source" in component
                     or source is not None
                 ):

@@ -220,6 +220,26 @@ export interface CCLCComponentSnapshot {
   /** Informational host output losses; unavailable observations stay absent. */
   droppedOutputLines?: CCLCUnsigned64;
   droppedOutputBytes?: CCLCUnsigned64;
+  /** CP9 health of the component's declared streams; absent when none. */
+  streamHealth?: CCLCStreamHealth[];
+}
+
+export type CCLCStreamState = 'live' | 'stale' | 'absent';
+export type CCLCStreamSeverity = 'fault' | 'blocking' | 'warning';
+export type CCLCStreamRecovery = 'ack' | 'auto';
+export type CCLCStreamTimestampSource = 'message_stamp' | 'arrival';
+
+export interface CCLCStreamHealth {
+  streamId: string;
+  state: CCLCStreamState;
+  /** Host-clock age of the last advancing sample; null when none arrived. */
+  ageNs: number | null;
+  budgetNs: number;
+  severity: CCLCStreamSeverity;
+  recovery: CCLCStreamRecovery;
+  timestampSource: CCLCStreamTimestampSource;
+  acknowledgementRequired: boolean;
+  error: CCLCTransactionStatus['error'];
 }
 
 export type CCLCLifecycleFactValue =
@@ -384,6 +404,11 @@ export interface CCLCAdmission {
    * explicit operator action.
    */
   incidentRecovery: CCLCIncidentRecovery | null;
+  /**
+   * CP9: present only when the operator's `recover` of a component without an
+   * open incident cleared a latched stream condition (no transaction).
+   */
+  streamAcknowledgement?: { controllableComponentId: string; acknowledgedAtNs: Nanoseconds };
 }
 
 /** The operator's accepted acknowledgement of one open component incident. */

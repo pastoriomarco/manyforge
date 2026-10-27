@@ -2,7 +2,7 @@
 api_version: manyforge.node_catalog.v2
 content_version: 2.7.0
 catalog_id: manyforge_builtin
-catalog_digest: sha256:376863946817c83ee0e92f3a72257bc2ac25e3f9cdbdca0029aab5af42c3d6e2
+catalog_digest: sha256:29eaa1447b105a20b4582b508938ac0ba97d77b9fcdc26cd97467b42b628dc93
 schema_types:
   motion_endpoint_ref:
     type: object
@@ -2184,6 +2184,20 @@ entries:
         type: string
         semantic_type: collision_body_role
         semantic_scope_parameter: target_role
+  - id: grasp_lost_translation_m
+    required: false
+    default: 0.03
+    schema:
+      type: float
+      constraints:
+        min_exclusive: 0.0
+  - id: grasp_lost_rotation_rad
+    required: false
+    default: 0.26
+    schema:
+      type: float
+      constraints:
+        min_exclusive: 0.0
   required_capabilities:
   - capability_id: scene.edit.attach_detach
     scope: cell_global

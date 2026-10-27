@@ -44,7 +44,6 @@
 #include <type_traits>
 #include <variant>
 #include <manyforge_collision/manyforge_collision_engine.hpp>
-#include <manyforge_component_manager/isaac_site_settings.hpp>
 #include <manyforge_component_manager/manager_named_apply_coordinator.hpp>
 #include <manyforge_component_manager/active_bundle_publication_store.hpp>
 #include <manyforge_component_manager/durable_store_set.hpp>
@@ -97,7 +96,10 @@
 #include <manyforge_roboplan/retained_native_runtime.hpp>
 #include <manyforge_roboplan/controller_launch_artifacts.hpp>
 #include <manyforge_roboplan/controller_launch_process.hpp>
+#include <manyforge_roboplan/host_component_stream_health.hpp>
 #include <manyforge_roboplan/simulated_plc_launch.hpp>
+#include <manyforge_roboplan/pose_source_launch.hpp>
+#include <manyforge_roboplan/component_stream_sample_bridge.hpp>
 #include <manyforge_roboplan/retained_isaac_ros2_control_profile.hpp>
 #include "managed_ros2_component_installation.hpp"
 #include <manyforge_roboplan/retained_ros2_control_lifecycle_product.hpp>
@@ -1946,6 +1948,21 @@ struct RetainedNativeComponentSnapshot final {
   std::shared_ptr<const ComponentRuntimePins> component_runtime_pins{};
 };
 
+// CP9: the host's stream registry follows the installed product's
+// Deployment overrides and logs its edge-triggered transitions.
+void ApplyComponentStreamOverrides(const deployment::RetainedBundle *bundle) {
+  const auto health = host_component_stream_health();
+  health->SetLog([](const std::string &line) {
+    host_controller_launch_supervisor().enqueue_host_log(line);
+  });
+  const auto applied = health->SetOverrides(
+      bundle == nullptr ? std::vector<core::StreamParameterOverrideDTO>{}
+                        : deployment::ComponentStreamParameterOverrides(*bundle));
+  if (!applied.ok())
+    host_controller_launch_supervisor().enqueue_host_log(
+        "WARN manyforge component stream overrides refused: " + applied.error().message + "\n");
+}
+
 // One explicit native-host lifetime, shared only by resources given this
 // provider. No ROS context/participant is initialized for an empty host. The
 // provider captures only this small state, never a Composition or host pointer.
@@ -3360,15 +3377,7 @@ BuildSingleProductComposition(CompositionBuildInput input) {
                    input.projection_revision.scene_revision);
     auto publisher_result = RetainedCollisionWorldPublisher::create(
         std::move(collision_projector), "i6-native-execution-host",
-        logical_scene,
-        RetainedCollisionWorldPublicationContext{
-            core::CollisionWorldMutationSource::kDeploymentApply,
-            {},
-            WallClock{}.now(),
-            {},
-            "i6_native_execution_host_startup",
-            std::nullopt},
-        [] { return WallClock{}.now(); });
+        logical_scene, WallClock{}.now(), [] { return WallClock{}.now(); });
     if (!publisher_result.ok()) {
       Fail("retained collision publication failed: " +
            publisher_result.error().message);
@@ -3379,8 +3388,9 @@ BuildSingleProductComposition(CompositionBuildInput input) {
           "native composition has no authoritative collision projection");
   const auto inventory = publisher->current_scene_snapshot_lease_inventory();
   Require(inventory.has_value() &&
-              inventory->projection_binding.projection_revision ==
-                  input.projection_revision,
+              core::SameProjectionIdentity(
+                  inventory->projection_binding.projection_revision,
+                  input.projection_revision),
           "native collision publisher does not expose the active product "
           "projection");
 
@@ -3624,6 +3634,7 @@ BuildSingleProductComposition(CompositionBuildInput input) {
                 : std::get<core::LinearPositionDTO>(position).value_m;
       }
     }
+    std::optional<double> gripper_state_freshness_timeout_s;
     if (direct_control_gripper_binding) {
       const auto row = std::find_if(retained_runtime_configuration.gripper_target_configurations.begin(),
           retained_runtime_configuration.gripper_target_configurations.end(), [&](const auto& configured) {
@@ -3633,6 +3644,7 @@ BuildSingleProductComposition(CompositionBuildInput input) {
       Require(row != retained_runtime_configuration.gripper_target_configurations.end(),
               "ROS controller artifacts have no exact authored gripper output choice");
       artifact_input.gripper_output_mode = row->output_mode;
+      gripper_state_freshness_timeout_s = row->state_freshness_timeout_s;
     }
     artifact_input.model_urdf = source_urdf->urdf_bytes;
     artifact_input.frame_prefix = selected_profile->frame_prefix;
@@ -3691,7 +3703,7 @@ BuildSingleProductComposition(CompositionBuildInput input) {
       Require(artifact_input.isaac_lane.has_value(),
               "managed Isaac component has no retained controller lane");
       const auto command = isaac_controller_launch_command(
-          written, *artifact_input.isaac_lane);
+          written, *artifact_input.isaac_lane, gripper_state_freshness_timeout_s);
       const auto ensured = host_controller_launch_supervisor().ensure(
           command, written.directory,
           input.controller_request_context.empty()
@@ -3872,20 +3884,10 @@ BuildSingleProductComposition(CompositionBuildInput input) {
         *retained_runtime_configuration.runtime_collision_lookahead_workers);
     kernel_config.runtime_collision_lookahead_workers_declared = true;
   }
-  if (retained_runtime_configuration.runtime_dynamic_body_max_age_cap_ms
-          .has_value()) {
-    kernel_config.runtime_dynamic_body_max_age_cap_ns = milliseconds_to_ns(
-        *retained_runtime_configuration.runtime_dynamic_body_max_age_cap_ms);
-  }
   if (retained_runtime_configuration.validation_collision_workers.has_value()) {
     kernel_config.validation_collision_workers = static_cast<int>(
         *retained_runtime_configuration.validation_collision_workers);
     kernel_config.validation_collision_workers_declared = true;
-  }
-  // Debug only: bounded per-object detail when dispatch accepts a newer scene.
-  if (const char *debug = std::getenv("MANYFORGE_DEBUG_SCENE_DIVERGENCE");
-      debug != nullptr && std::string_view(debug) == "1") {
-    kernel_config.record_scene_divergence_detail = true;
   }
   RetainedNativeRuntimeConfig runtime_config{
       input.owner_epoch,
@@ -3939,8 +3941,6 @@ BuildSingleProductComposition(CompositionBuildInput input) {
                                 : std::make_shared<SimpleScheduler>(runtime_config.scheduler);
   const auto runtime_collision_immediate_query_budget_ns =
       runtime_config.kernel.runtime_collision_immediate_query_budget_ns;
-  const auto runtime_dynamic_body_max_age_cap_ns =
-      runtime_config.kernel.runtime_dynamic_body_max_age_cap_ns;
   auto runtime = input.attach_addressed_owner
                      ? create_retained_native_runtime(
                            std::move(runtime_input), std::move(runtime_config),
@@ -3951,11 +3951,6 @@ BuildSingleProductComposition(CompositionBuildInput input) {
   runtime->collision_monitor_period_ns = collision_monitor_period_ns;
   runtime->runtime_collision_immediate_query_budget_ns =
       runtime_collision_immediate_query_budget_ns;
-  runtime->runtime_dynamic_body_max_age_cap_ns =
-      runtime_dynamic_body_max_age_cap_ns > 0
-          ? std::optional<core::Duration>(
-                runtime_dynamic_body_max_age_cap_ns)
-          : std::nullopt;
   auto direct_scene_frame_resolver =
       std::dynamic_pointer_cast<RetainedSceneFrameResolver>(
           runtime->reference_resolver);
@@ -4136,6 +4131,125 @@ void EnsureSimulatedPlc(
             << " config_dir=" << plan->config_dir.string() << std::endl;
 }
 
+// CP9: the observer plan `bundle` authors for a `pose_source` component, or
+// none when the component has no pose-source row.
+[[nodiscard]] std::optional<PoseSourcePlan> PoseSourcePlanFor(
+    const deployment::RetainedBundle &bundle, const core::RuntimeUnitId &unit,
+    const core::ControllableComponentId &component,
+    const std::filesystem::path &execution_run_root,
+    const std::filesystem::path &manager_run_root) {
+  namespace contract = deployment::ros2_control_execution_runtime_contract;
+  const auto configuration = contract::require_configuration(bundle, unit);
+  const auto *row = contract::find_pose_source(configuration, component);
+  if (row == nullptr) return std::nullopt;
+  return plan_pose_source(bundle.value().cell_graph.cell_id.value(),
+                          component.value(), row->observer_configuration,
+                          execution_run_root, manager_run_root);
+}
+
+// As the simulated PLC: a rebuilt pose source keeps its running observer
+// when the candidate's launch identity (document, Manager root) is unchanged.
+[[nodiscard]] bool PoseSourceSurvivesRebuild(
+    const std::shared_ptr<ControllerLaunchProcess> &process,
+    const deployment::RetainedBundle &candidate,
+    const core::RuntimeUnitId &unit,
+    const core::ControllableComponentId &component,
+    const std::filesystem::path &execution_run_root,
+    const std::filesystem::path &manager_run_root) {
+  if (!process || process->command().lane != ControllerLaunchLane::kPoseSource)
+    return false;
+  return pose_source_launch_survives(
+      process.get(), PoseSourcePlanFor(candidate, unit, component,
+                                       execution_run_root, manager_run_root));
+}
+
+// CP9 pose source: a model-free component whose provider driver has no I/O
+// members. A fresh driver is installed here with one declared stream per
+// binding (`warning` + `auto`, budget = binding lifetime, message stamps;
+// Deployment overrides apply). Its observer process is started or kept by the
+// supervisor like the simulated PLC, and never awaited: the Manager may be
+// waiting on this host. The process exit is the driver's fault (typed
+// `pose_source_exited` / `pose_source_config_invalid`).
+void EnsurePoseSource(
+    Composition &view, const deployment::RetainedBundle &bundle,
+    const std::optional<core::RuntimeUnitId> &runtime_unit,
+    const std::filesystem::path &execution_run_root,
+    const std::filesystem::path &manager_run_root,
+    const std::string &request_context, const std::string &bootstrap_context,
+    const bool borrowed_drivers,
+    const std::shared_ptr<ControllerLaunchProcess> &installed_process) {
+  if (view.runtime || view.gripper_runtime || !view.io_provider_drivers)
+    return;
+  std::shared_ptr<IoProviderDriverRecord> driver;
+  for (const auto &record : *view.io_provider_drivers)
+    if (record && record->pose_source()) driver = record;
+  if (!driver) return;
+  Require(runtime_unit.has_value(), "pose source has no host runtime unit");
+  namespace contract = deployment::ros2_control_execution_runtime_contract;
+  const auto configuration = contract::require_configuration(bundle, *runtime_unit);
+  const auto *row =
+      contract::find_pose_source(configuration, view.controllable_component_id);
+  Require(row != nullptr, "pose source component has no Deployment row");
+  const auto plan = plan_pose_source(
+      bundle.value().cell_graph.cell_id.value(),
+      view.controllable_component_id.value(), row->observer_configuration,
+      execution_run_root, manager_run_root);
+  if (!borrowed_drivers) {
+    std::vector<std::unique_ptr<core::StreamRecorder>> streams;
+    for (const auto &binding : row->bindings) {
+      auto declared = host_component_stream_health()->Declare(
+          view.controllable_component_id,
+          core::StreamDeclarationDTO{contract::pose_source_stream_id(binding),
+                                     binding.lifetime_ns,
+                                     core::StreamSeverityDTO::kWarning,
+                                     core::StreamRecoveryDTO::kAuto,
+                                     core::StreamTimestampSourceDTO::kMessageStamp});
+      Require(declared.ok(), "pose source stream cannot be declared: " +
+                                 (declared.ok() ? std::string{}
+                                                : declared.error().message));
+      streams.push_back(std::move(declared.value()));
+    }
+    auto delivery = driver->AcquireDelivery();
+    const auto installed = driver->InstallPoseSourceLocked(std::move(streams));
+    Require(installed.ok(), "pose source driver cannot be installed: " +
+                                (installed.ok() ? std::string{}
+                                                : installed.error().message));
+  }
+  write_pose_source_document(plan);
+  auto &supervisor = host_controller_launch_supervisor();
+  const auto ensured = supervisor.ensure(
+      pose_source_launch_command(plan, RandomToken(plan.component_id + ".")),
+      plan.artifacts_root,
+      request_context.empty() ? bootstrap_context : request_context);
+  if (borrowed_drivers) {
+    // The retained driver observes exactly the installed process.
+    if (ensured.decision != ControllerLaunchDecision::kKeep ||
+        ensured.process != installed_process) {
+      static_cast<void>(supervisor.discard_candidate(ensured));
+      Fail("pose_source_not_ready: component=" + plan.component_id +
+           " installed process is no longer running; the retained component "
+           "cannot change its observer");
+    }
+  } else {
+    driver->SetSupervisedProcessFaultSource(
+        pose_source_fault_source(ensured.process));
+  }
+  // A later build failure's ~Composition discards a fresh start; a kept
+  // (borrowed) process is never discarded by this candidate.
+  view.controller_process = ensured.process;
+  view.controller_request_context = request_context;
+  view.prepared_controller_launch = ensured;
+  std::cerr << "manyforge pose source launch: component=" << plan.component_id
+            << " decision="
+            << (ensured.decision == ControllerLaunchDecision::kKeep
+                    ? "kept"
+                    : ensured.decision == ControllerLaunchDecision::kStart
+                          ? "started"
+                          : "restarted")
+            << " pid=" << ensured.process->pid()
+            << " site_config=" << plan.site_config_path.string() << std::endl;
+}
+
 [[nodiscard]] std::unique_ptr<Composition>
 BuildProductComposition(CompositionBuildInput input) {
   if (input.managed_component_delta.has_value()) {
@@ -4192,6 +4306,7 @@ BuildProductComposition(CompositionBuildInput input) {
       selected_program = input.selected_program_products,
       ros_context = input.ros_context_provider,
       run_root = input.execution_run_root,
+      manager_run_root = input.manager_run_root,
       request_context = input.controller_request_context](std::unique_ptr<Composition> composition) {
     composition->origin_named_apply = origin;
     if (selected_program) {
@@ -4270,10 +4385,15 @@ BuildProductComposition(CompositionBuildInput input) {
         view->component_runtime_pins = std::make_shared<const ComponentRuntimePins>(
             ComponentRuntimePins{view->runtime, view->gripper_runtime, view->io_provider_drivers});
       }
+      const auto bootstrap_context = "Bootstrap runtime=" +
+          (runtime_unit ? runtime_unit->value() : std::string("unmanaged")) +
+          " epoch=" + epoch.value();
       EnsureSimulatedPlc(*view, *bundle, io_rows, ros_context, run_root,
-          request_context, "Bootstrap runtime=" +
-              (runtime_unit ? runtime_unit->value() : std::string("unmanaged")) +
-              " epoch=" + epoch.value(),
+          request_context, bootstrap_context,
+          previous != snapshots.end(),
+          previous != snapshots.end() ? previous->second.controller_process : nullptr);
+      EnsurePoseSource(*view, *bundle, runtime_unit, run_root, manager_run_root,
+          request_context, bootstrap_context,
           previous != snapshots.end(),
           previous != snapshots.end() ? previous->second.controller_process : nullptr);
     }
@@ -5151,7 +5271,13 @@ void PrepareCompositionIoResources(Composition &composition,
     std::span<const CompositionIoResourcePredecessor> existing = {}) {
   const auto rows = deployment::ResolveRetainedIoSignalCatalog(composition.bundle->value().cell_graph);
   Require(rows.ok(), "retained I/O source configuration is invalid");
-  const bool needs_ros = std::any_of(rows.value().begin(), rows.value().end(), [](const auto &row) {
+  const auto &domains = composition.bundle->value().cell_graph.control_domains;
+  const bool pose_source = std::any_of(domains.begin(), domains.end(), [](const auto &domain) {
+    return domain.provider() && domain.provider()->provider_manifest_id.value() ==
+                                    core::kPoseSourceLifecycleManifestId;
+  });
+  const bool needs_ros = pose_source ||
+      std::any_of(rows.value().begin(), rows.value().end(), [](const auto &row) {
     return row.provider.profile == "ros_bool" ||
            row.provider.profile == "ros_set_bool" ||
            row.provider.profile == "ur_io_states" ||
@@ -5168,6 +5294,20 @@ void PrepareCompositionIoResources(Composition &composition,
       transport ? transport->node() : nullptr, existing);
   Require(prepared.ok(), "actual I/O resource preparation failed: " +
       (prepared.ok() ? std::string{} : prepared.error().message));
+  if (pose_source) {
+    // One bridge per host process: Python pose-source sinks push samples
+    // into the streams their host-side driver declared.
+    static std::mutex bridge_mutex;
+    static std::weak_ptr<void> installed_bridge;
+    std::lock_guard bridge_lock(bridge_mutex);
+    auto bridge = installed_bridge.lock();
+    if (!bridge) {
+      bridge = InstallComponentStreamSampleBridge(transport->node(),
+                                                  host_component_stream_health());
+      installed_bridge = bridge;
+    }
+    composition.component_stream_sample_bridge = std::move(bridge);
+  }
   if (created_transport) {
     transport->start();
     // Publish only a successfully prepared, running host transport. Later
@@ -6348,6 +6488,7 @@ void AttachRetainedNativeCCLC(
        10'000'000LL, 30'000'000'000LL}};
   cclc_config.coordinator.quiescent_predecessor = quiescent_predecessor;
   cclc_config.preparation_failure_source = config.preparation_failure_source;
+  cclc_config.lifecycle_target_driver.stream_health = host_component_stream_health();
   cclc_config.lifecycle_target_driver.read_output_drop_counts =
       [](const core::ControllableComponentId &component)
       -> std::optional<std::pair<std::uint64_t, std::uint64_t>> {
@@ -7538,6 +7679,7 @@ struct ManagedCellCCLCLifetime final {
     cclc_config.coordinator.quiescent_predecessor = quiescent_predecessor;
     cclc_config.preparation_failure_source =
         MakeNativeApplyPreparationFailureSource(config, kernel);
+    cclc_config.lifecycle_target_driver.stream_health = host_component_stream_health();
     auto created = deployment::CCLCRuntimeComposition::Create(
         std::move(cclc_config), std::move(bundle), *active_publication_reader,
         head, *artifact_source, *empty_catalog, {}, {}, {}, {}, {},
@@ -8021,9 +8163,11 @@ struct ManagedBootstrapStopProduct final {
   Require(model_map.has_value(),
           "managed active retained model map is absent or invalid");
 
+  // Candidate projections hold the latest Scene, which may be newer than the
+  // revision this Apply recorded at its request.
   auto component_projections = SelectManagedComponentProjections(
       config, *bundle, projections, request.candidate_projection_revision,
-      false);
+      true);
   Require(component_projections.has_value(),
           "managed selected robot projections are not active at the candidate "
           "revision");
@@ -8174,7 +8318,8 @@ void RefreshRetainedNativePublicationView(
     const auto inventory =
         projection->second->current_scene_snapshot_lease_inventory();
     Require(inventory.has_value() &&
-                inventory->projection_binding.projection_revision == revision,
+                core::SameProjectionIdentity(
+                    inventory->projection_binding.projection_revision, revision),
             "retained native projection does not match the candidate Scene");
   }
   for (const auto &[component_id, composition] : components) {
@@ -8203,310 +8348,6 @@ void RefreshRetainedNativePublicationView(
   }
   replace_pins();
 }
-
-// Stable host-owned occurrences. Component Composition roots never own or
-// retire these processes. Manager has already checked the immutable observer
-// input and activates its expectation between ordinary Prepare and Finalize.
-class ManagedIsaacCellProcesses final {
-public:
-  using Facts = component_manager::ManagerIsaacPoseObserverLaunchFactsDTO;
-  explicit ManagedIsaacCellProcesses(const ManagedRuntimeChildConfig &config)
-      : config_(config) {}
-  ~ManagedIsaacCellProcesses() {
-    std::shared_ptr<CellLaunchProcess> process;
-    {
-      std::lock_guard lock(state_mutex_);
-      process = std::move(observer_);
-    }
-    if (process)
-      static_cast<void>(host_controller_launch_supervisor().retire_cell_process(process));
-  }
-
-  /// Capture the current occurrence once. Inspect grants no effect and never
-  /// regenerates detection time, settings or output when persistence retries.
-  [[nodiscard]] std::optional<component_manager::ManagerCellObserverObservationDTO>
-  observe_current(deployment::CCLCRuntimeComposition *const cclc = nullptr) {
-    std::lock_guard transition_lock(transition_mutex_);
-    std::lock_guard lock(state_mutex_);
-    if (!facts_) return std::nullopt;
-    using Presence = component_manager::ProcessPresenceState;
-    using Persistence = component_manager::ManagerCellObserverIncidentPersistenceDTO;
-    if (!observer_) {
-      return component_manager::ManagerCellObserverObservationDTO{
-          core::CellId(config_.cell_id), facts_->source_id, facts_->source_epoch_base,
-          observer_start_failure_ ? Presence::kAbsent : Presence::kUnknown};
-    }
-    const auto exit = observer_->exit_evidence();
-    if (!exit) {
-      return component_manager::ManagerCellObserverObservationDTO{
-          core::CellId(config_.cell_id), facts_->source_id, facts_->source_epoch_base,
-          Presence::kPresent};
-    }
-    if (!observer_incident_observation_) {
-      Require(exit->command.cell_id == core::CellId(config_.cell_id) &&
-                  exit->command.role == CellLaunchRole::kPoseObserver &&
-                  exit->command.observer_source_id == facts_->source_id,
-              "cell observer exit belongs to another occurrence");
-      const auto detected = WallClock{}.now();
-      const auto id = RandomToken("observer-incident-");
-      observer_incident_process_ = observer_;
-      observer_incident_observation_ =
-          component_manager::ManagerCellObserverObservationDTO{
-              core::CellId(config_.cell_id), facts_->source_id, facts_->source_epoch_base,
-              Presence::kAbsent,
-              component_manager::ManagerCellObserverExitDTO{
-                  exit->pid,
-                  exit->exit_status ? std::optional<std::uint8_t>(*exit->exit_status) : std::nullopt,
-                  exit->signal ? std::optional<std::uint8_t>(*exit->signal) : std::nullopt,
-                  exit->core_dumped, exit->observed_utc, detected},
-              std::nullopt, Persistence::kUnknown};
-      try {
-      const auto optional_number = [](const std::optional<int> value) {
-        return value ? CanonicalValue(static_cast<double>(*value)) : CanonicalValue(nullptr);
-      };
-      CanonicalValue::Array argv;
-      for (const auto &argument : exit->command.argv) argv.emplace_back(argument);
-      observer_incident_record_ = core::CellObserverIncidentRecordDTO{
-          id, {core::CellId(config_.cell_id), facts_->source_id, facts_->source_epoch_base},
-          detected, "cell pose observer exited; observation intervention required",
-          CanonicalValue(CanonicalValue::Object{
-              {"exit", CanonicalValue(CanonicalValue::Object{
-                  {"status", optional_number(exit->exit_status)},
-                  {"signal", optional_number(exit->signal)},
-                  {"core_dumped", CanonicalValue(exit->core_dumped)},
-                  {"observed_utc", CanonicalValue(exit->observed_utc)}})},
-              {"context", CanonicalValue(CanonicalValue::Object{
-                  {"cell_id", CanonicalValue(config_.cell_id)},
-                  {"source_id", CanonicalValue(facts_->source_id)},
-                  {"source_epoch_base", CanonicalValue(facts_->source_epoch_base)},
-                  {"runtime_unit_id", CanonicalValue(config_.runtime_unit_id)},
-                  {"runtime_epoch", CanonicalValue(config_.runtime_epoch)},
-                  {"pid", CanonicalValue(static_cast<double>(exit->pid))},
-                  {"launch_identity", CanonicalValue(exit->command.identity)},
-                  {"request_context", CanonicalValue(exit->request_context)}})},
-              {"settings", CanonicalValue(CanonicalValue::Object{
-                  {"argv", CanonicalValue(std::move(argv))},
-                  {"retained_snapshot_path", CanonicalValue(facts_->retained_snapshot_path)}})},
-              {"generated", CanonicalValue(CanonicalValue::Object{})},
-              {"output", LaunchIncidentOutput(observer_->output_snapshot())},
-              {"core_dump_link", CanonicalValue(nullptr)}})};
-      if (!observer_incident_record_->locally_valid()) {
-        observer_incident_observation_->incident_id = id;
-        observer_incident_observation_->incident_persistence = Persistence::kFailed;
-      }
-      } catch (const std::bad_alloc &) {
-        observer_incident_observation_->incident_persistence = Persistence::kUnknown;
-      } catch (...) {
-        // A retained real exit remains unavailable even if its payload cannot
-        // be qualified. Do not advertise an unconstructed record as pending.
-        try {
-          observer_incident_observation_->incident_id = id;
-          observer_incident_observation_->incident_persistence = Persistence::kFailed;
-        } catch (...) {
-          observer_incident_observation_->incident_id.reset();
-          observer_incident_observation_->incident_persistence = Persistence::kUnknown;
-        }
-      }
-    }
-    Require(observer_incident_process_ == observer_,
-            "pending observer incident belongs to another current occurrence");
-    if (cclc && observer_incident_record_ && observer_incident_record_->locally_valid() &&
-        !observer_incident_slot_qualified_) {
-      // The managed main channel is the sole observer writer. Lookup and
-      // capture are pinned to this exact current occurrence by the same cell
-      // transition mutex used for stop/start. An uncertain lookup is never
-      // treated as an absent slot or a newly minted durable reference.
-      try {
-        const auto open = cclc->LoadOpenCellObserverIncident();
-        if (open.ok()) {
-          if (open.value()) {
-            Require(open.value()->target.cell_id == core::CellId(config_.cell_id),
-                    "open observer incident belongs to another cell slot");
-            observer_incident_observation_->incident_id = open.value()->incident_id;
-          } else {
-            observer_incident_observation_->incident_id = observer_incident_record_->incident_id;
-          }
-          observer_incident_observation_->incident_persistence = Persistence::kPending;
-          observer_incident_slot_qualified_ = true;
-        }
-      } catch (...) {
-        // Keep the genuine exit unavailable and retain the original canonical
-        // payload/time for another ordinary read; no false pending reference.
-        observer_incident_observation_->incident_persistence = Persistence::kUnknown;
-      }
-    }
-    return observer_incident_observation_;
-  }
-
-  // Called only by the existing serial managed status handler, outside
-  // composition/Kernel locks. Inspect itself remains entirely read-only.
-  void persist_current_exit(deployment::CCLCRuntimeComposition &cclc) {
-    static_cast<void>(observe_current(&cclc));
-    std::lock_guard transition_lock(transition_mutex_);
-    std::lock_guard lock(state_mutex_);
-    using Persistence = component_manager::ManagerCellObserverIncidentPersistenceDTO;
-    if (!observer_incident_record_ || !observer_incident_observation_ ||
-        !observer_incident_slot_qualified_ ||
-        observer_incident_observation_->incident_persistence == Persistence::kPersisted ||
-        observer_incident_observation_->incident_persistence == Persistence::kFailed)
-      return;
-    Require(observer_ && observer_incident_process_ == observer_ && facts_ &&
-                observer_incident_record_->target.cell_id == core::CellId(config_.cell_id) &&
-                observer_incident_record_->target.source_id == facts_->source_id &&
-                observer_incident_record_->target.source_epoch_base == facts_->source_epoch_base &&
-                observer_incident_observation_->incident_id.has_value(),
-            "observer incident write lost its exact current occurrence");
-    try {
-      const auto stored = cclc.RecordCellObserverIncident(*observer_incident_record_);
-      // The first open record belongs to the cell slot; repeated exit events
-      // may have a different source/base without changing that incident ID.
-      if (stored.ok() && stored.value().target.cell_id == core::CellId(config_.cell_id)) {
-        observer_incident_observation_->incident_id = stored.value().incident_id;
-        observer_incident_observation_->incident_persistence = Persistence::kPersisted;
-      } else {
-        observer_incident_observation_->incident_persistence = Persistence::kUnknown;
-      }
-    } catch (...) {
-      observer_incident_observation_->incident_persistence = Persistence::kUnknown;
-    }
-  }
-
-  [[nodiscard]] std::optional<CellLaunchExitEvidence> observer_exit_fact() const {
-    std::shared_ptr<CellLaunchProcess> process;
-    {
-      std::lock_guard lock(state_mutex_);
-      process = observer_;
-    }
-    return process ? process->exit_evidence() : std::nullopt;
-  }
-
-  [[nodiscard]] std::optional<CellLaunchExitEvidence> retired_observer_fact() const {
-    std::shared_ptr<CellLaunchProcess> process;
-    {
-      std::lock_guard lock(state_mutex_);
-      process = retired_observer_;
-    }
-    return process ? process->exit_evidence() : std::nullopt;
-  }
-
-  void prepare(const deployment::RetainedBundle &bundle,
-               const std::optional<Facts> &facts,
-               const std::string &context) {
-    std::lock_guard transition_lock(transition_mutex_);
-    bool uses_isaac = false;
-    for (const auto &unit : bundle.value().cell_graph.runtime_units) {
-      if (unit.runtime_unit_id.value() != config_.runtime_unit_id ||
-          unit.runtime_profile_id.value() !=
-              deployment::ros2_control_execution_runtime_contract::kRuntimeProfileId) continue;
-      const auto value = deployment::ros2_control_execution_runtime_contract::require_configuration(
-          bundle, unit.runtime_unit_id);
-      for (const auto &profile : value.controller_profiles) {
-        uses_isaac = uses_isaac || profile.isaac_profile.has_value();
-      }
-    }
-    Require(!facts || (uses_isaac && facts->valid() &&
-                       config_.isaac_pose_observer_executable.has_value()),
-            "Isaac pose observer facts require a configured Isaac component and executable");
-    std::optional<Facts> old_facts;
-    std::shared_ptr<CellLaunchProcess> old_observer;
-    bool initialized = false;
-    {
-      std::lock_guard lock(state_mutex_);
-      initialized = initialized_;
-      old_facts = facts_;
-      old_observer = observer_;
-      if (initialized && old_facts == facts) {
-        Require(!facts || old_observer || observer_start_pending_,
-                "cell pose observer is absent; explicit intervention requires a fresh occurrence");
-        Require(!old_observer || !old_observer->exit_evidence(),
-                "cell pose observer exited; explicit intervention requires a fresh occurrence");
-      }
-    }
-    const bool unchanged_observer = initialized && old_facts == facts;
-    if (initialized && old_facts && facts && !unchanged_observer)
-      Require(old_facts->source_epoch_base != facts->source_epoch_base,
-              "replacement cell observer requires a fresh Manager source epoch base");
-    if (unchanged_observer) {
-      return;
-    }
-    if (old_observer) {
-      old_observer->update_request_context(context);
-      Require(host_controller_launch_supervisor().retire_cell_process(old_observer),
-              "old cell observer exact leader reap is unknown; replacement not started");
-      std::lock_guard lock(state_mutex_);
-      retired_observer_ = old_observer;
-      observer_.reset();
-    }
-    {
-      std::lock_guard lock(state_mutex_);
-      initialized_ = true;
-      facts_ = facts;
-      observer_.reset();
-      observer_start_pending_ = facts.has_value();
-      observer_start_failure_.reset();
-    }
-  }
-
-  void finish(const std::optional<Facts> &facts, const std::string &context) {
-    std::lock_guard transition_lock(transition_mutex_);
-    std::lock_guard lock(state_mutex_);
-    Require(initialized_ && facts_ == facts,
-            "cell observer Finalize differs from prepared checked facts");
-    if (!facts_ || observer_) return;
-    Require(observer_start_pending_,
-            "cell observer start was already attempted; explicit intervention requires a fresh occurrence" +
-                (observer_start_failure_ ? ": " + *observer_start_failure_ : std::string{}));
-    const auto scalar = [](const std::string &value) {
-      return content_identity::canonical_json(CanonicalValue(value));
-    };
-    const CellLaunchCommand command{core::CellId(config_.cell_id),
-        CellLaunchRole::kPoseObserver, facts_->source_id,
-        {config_.isaac_pose_observer_executable->string(), "--ros-args",
-         "-p", "site_config_path:=" + scalar(facts_->retained_snapshot_path),
-         "-p", "manager_run_root:=" + scalar(config_.manager_run_root.string()),
-         "-p", "source_epoch_base:=" + scalar(facts_->source_epoch_base),
-         "--disable-external-lib-logs"},
-        "cell-observer:" + facts_->source_epoch_base};
-    // Consume the one authorized attempt before entering the spawner. Exact
-    // Finalize replay must observe failure, never retry an unknown spawn.
-    observer_start_pending_ = false;
-    try {
-      observer_ = host_controller_launch_supervisor().start_cell_process(
-          command, config_.execution_run_root, context);
-    } catch (const std::exception &error) {
-      observer_start_failure_ = error.what();
-      throw;
-    } catch (...) {
-      observer_start_failure_ = "unknown observer spawn failure";
-      throw;
-    }
-    // Do not wait for Open: Manager may be waiting for this host's response.
-    // Process spawn alone is not a fresh-pose or Scene-readiness receipt.
-  }
-
-  [[nodiscard]] ControllerLaunchSupervisor::HostShutdownSnapshot
-  BeginHostShutdown() {
-    std::lock_guard lock(state_mutex_);
-    return host_controller_launch_supervisor().BeginHostShutdown(
-        {observer_, retired_observer_, observer_incident_process_});
-  }
-
-private:
-  const ManagedRuntimeChildConfig &config_;
-  std::mutex transition_mutex_;
-  mutable std::mutex state_mutex_;
-  bool initialized_{false};
-  std::optional<Facts> facts_;
-  std::shared_ptr<CellLaunchProcess> observer_;
-  std::shared_ptr<CellLaunchProcess> retired_observer_;
-  std::shared_ptr<CellLaunchProcess> observer_incident_process_;
-  std::optional<core::CellObserverIncidentRecordDTO> observer_incident_record_;
-  std::optional<component_manager::ManagerCellObserverObservationDTO>
-      observer_incident_observation_;
-  bool observer_incident_slot_qualified_{false};
-  bool observer_start_pending_{false};
-  std::optional<std::string> observer_start_failure_;
-};
 
 [[nodiscard]] int
 RunManagedRuntimeChild(const ManagedRuntimeChildConfig &config) {
@@ -8592,18 +8433,6 @@ RunManagedRuntimeChild(const ManagedRuntimeChildConfig &config) {
       });
   NativeShutdownOwnerPhase projection_destructor_phase{
       shutdown_projection, ShutdownPhase::kProjectionDestruction, projections};
-  ManagedIsaacCellProcesses managed_isaac_cell(config);
-  NativeShutdownOwnerPhase cell_destructor_phase{
-      shutdown_projection, ShutdownPhase::kCellProcessesDestruction,
-      managed_isaac_cell};
-  const auto prepare_managed_cell_observer = [&](const deployment::RetainedBundle &bundle,
-      const std::optional<component_manager::ManagerIsaacPoseObserverLaunchFactsDTO> &facts,
-      const std::string &context) {
-    managed_isaac_cell.prepare(bundle, facts, context);
-  };
-  const auto finish_managed_cell_observer = [&](const auto &facts, const std::string &context) {
-    managed_isaac_cell.finish(facts, context);
-  };
   std::mutex managed_composition_mutex;
   // Bounded observation history on this host owner, not Composition pins.
   // Replacing a composition/Apply never depends on reading these receipts.
@@ -8754,11 +8583,6 @@ RunManagedRuntimeChild(const ManagedRuntimeChildConfig &config) {
   const auto bootstrap_cell = LoadManagedBundleAtPinnedRoot(config, bootstrap_retained_bundle_id);
   Require(bootstrap_cell && bootstrap_cell->bundle,
           "Isaac attach bootstrap has no verified retained bundle");
-  const std::string cell_bootstrap_context = "Bootstrap runtime=" + config.runtime_unit_id +
-                                           " epoch=" + config.runtime_epoch;
-  prepare_managed_cell_observer(
-      *bootstrap_cell->bundle, config.isaac_pose_observer_launch_facts, cell_bootstrap_context);
-  finish_managed_cell_observer(config.isaac_pose_observer_launch_facts, cell_bootstrap_context);
   const bool bootstrap_requires_physical_composition =
       bootstrap_stop.requires_physical_composition;
   bootstrap_kernel_config.empty_runtime_resource_inventory =
@@ -9316,6 +9140,7 @@ RunManagedRuntimeChild(const ManagedRuntimeChildConfig &config) {
               for (auto &peer : built->participant_compositions)
                 peer->controller_launch_adopted = true;
               active_managed_composition = std::move(built);
+              ApplyComponentStreamOverrides(active_managed_composition->bundle.get());
               if (active_managed_composition->runtime != nullptr)
                 active_managed_composition->runtime->BindCellRuntimeOwner(
                     *stable_cell_runtime_owner, config.runtime_epoch, config.cell_id);
@@ -10253,8 +10078,6 @@ RunManagedRuntimeChild(const ManagedRuntimeChildConfig &config) {
                   prepared_request->component_delta);
           compare("predecessor_projection_revision", expected.predecessor_projection_revision,
                   prepared_request->predecessor_projection_revision);
-          compare("isaac_pose_observer_launch_facts", expected.isaac_pose_observer_launch_facts,
-                  prepared_request->isaac_pose_observer_launch_facts);
           Require(false,
                   "final runtime composition differs from its exact prepared Apply; "
                   "normalized_mismatching_fields=[" + mismatches + "]" +
@@ -10278,7 +10101,7 @@ RunManagedRuntimeChild(const ManagedRuntimeChildConfig &config) {
                 ? std::optional<ManagedComponentProjectionSet>{}
                 : SelectManagedComponentProjections(
                       config, bundle, projections,
-                      request.candidate_projection_revision, false);
+                      request.candidate_projection_revision, true);
         Require(bundle.value().cell_graph.controllable_components.empty() ||
                     final_projections.has_value(),
                 "final runtime composition has no installed Scene projection");
@@ -10739,12 +10562,6 @@ RunManagedRuntimeChild(const ManagedRuntimeChildConfig &config) {
     Require(
         actual_candidate && actual_candidate->bundle,
         "actual_installed_state_unknown: candidate product is not verified");
-    const std::string observer_request_context =
-        "Apply=" + request.apply_id.value() + " generation=" +
-        std::to_string(request.apply_generation.value());
-    prepare_managed_cell_observer(
-        *actual_candidate->bundle, request.isaac_pose_observer_launch_facts,
-        observer_request_context);
     {
       std::lock_guard lock(managed_composition_mutex);
       if (managed_composition_failure != nullptr) {
@@ -10861,7 +10678,12 @@ RunManagedRuntimeChild(const ManagedRuntimeChildConfig &config) {
             if (owner->controller_process &&
                 included_processes.insert(owner->controller_process.get()).second &&
                 !SimulatedPlcSurvivesRebuild(owner->controller_process,
-                                             *actual_candidate->bundle, id))
+                                             *actual_candidate->bundle, id) &&
+                !PoseSourceSurvivesRebuild(owner->controller_process,
+                                           *actual_candidate->bundle,
+                                           core::RuntimeUnitId(config.runtime_unit_id),
+                                           id, config.execution_run_root,
+                                           config.manager_run_root))
               processes_to_retire.push_back(owner->controller_process);
           }
         preparing_composition_request = request;
@@ -11670,6 +11492,7 @@ RunManagedRuntimeChild(const ManagedRuntimeChildConfig &config) {
             // held fence before those calls; failure must not destroy the
             // admission owner still referenced by the command surface.
             active_managed_composition = std::move(prepared);
+            ApplyComponentStreamOverrides(active_managed_composition->bundle.get());
             if (active_managed_composition->runtime != nullptr)
               active_managed_composition->runtime->BindCellRuntimeOwner(
                     *stable_cell_runtime_owner, config.runtime_epoch, config.cell_id);
@@ -11788,6 +11611,9 @@ RunManagedRuntimeChild(const ManagedRuntimeChildConfig &config) {
               component.controller_request_context = context;
               if (component.controller_process)
                 component.controller_process->update_request_context(context);
+              // Every Apply starts without stored trajectories: a retained
+              // Kernel may now serve another robot, model or Program.
+              if (component.runtime) component.runtime->cache->invalidate_all();
             };
             update_context(*active_managed_composition);
             for (auto &peer :
@@ -11807,8 +11633,6 @@ RunManagedRuntimeChild(const ManagedRuntimeChildConfig &config) {
       }
       throw;
     }
-    finish_managed_cell_observer(request.isaac_pose_observer_launch_facts,
-                                 observer_request_context);
     require_installed_candidate_configuration();
     if (request.phase == component_manager::
                              ManagerSelectedRuntimeCompositionPhase::kPrepare) {
@@ -12214,7 +12038,6 @@ RunManagedRuntimeChild(const ManagedRuntimeChildConfig &config) {
     std::mutex &servicing_mutex;
     bool &teardown_only;
     std::atomic<bool> &status_servicing;
-    ManagedIsaacCellProcesses *cells;
     ExecutionCompositionAccess *execution_access;
     ~DrainBeforeLivenessShutdown() {
       // Keep existing renewals through group/worker/projection drain, as
@@ -12226,7 +12049,7 @@ RunManagedRuntimeChild(const ManagedRuntimeChildConfig &config) {
       HandleStopSignal(0); // same existing stop/wake fact, including barriers
       for (auto *worker : workers)
         worker->request_stop();
-      auto snapshot = cells->BeginHostShutdown();
+      auto snapshot = host_controller_launch_supervisor().BeginHostShutdown();
       auto &supervisor = host_controller_launch_supervisor();
       while (true) {
         const auto actual = supervisor.PollHostShutdown(snapshot);
@@ -12275,9 +12098,7 @@ RunManagedRuntimeChild(const ManagedRuntimeChildConfig &config) {
       shutdown_projection,
       manager_liveness_servicing_mutex,
       teardown_only,
-      shutdown_status_servicing
-      ,
-      &managed_isaac_cell,
+      shutdown_status_servicing,
       &execution_composition
   };
 
@@ -12592,22 +12413,6 @@ RunManagedRuntimeChild(const ManagedRuntimeChildConfig &config) {
                 occurrence.process, *controller_cleanup_scheduler,
                 controller_cleanup_clock->now(),
                 CachedControllerLaunchReadinessSource(occurrence.handle)));
-      deployment::CCLCRuntimeComposition *observer_journal_owner = nullptr;
-      {
-        std::lock_guard lock(managed_composition_mutex);
-        if (!current_composition_building && !managed_composition_building &&
-            !preparing_composition_request &&
-            !installed_under_fence_composition_request)
-          observer_journal_owner = current_cell_cclc();
-      }
-      if (observer_journal_owner) {
-        try {
-          managed_isaac_cell.persist_current_exit(*observer_journal_owner);
-        } catch (...) {
-          // Persistence never suppresses the genuine exit or ordinary host
-          // status. The read-only observation still reports uncertainty.
-        }
-      }
       // The ordinary Manager progress poll also correlates the already minted
       // CCLC incident with its existing process evidence. No new polling owner.
       try {
@@ -13208,7 +13013,6 @@ RunManagedRuntimeChild(const ManagedRuntimeChildConfig &config) {
                   candidate_planning = std::move(compiled.value());
                 }
                 deployment::CCLCRuntimeComposition *planning_owner = nullptr;
-                deployment::CCLCRuntimeComposition *observer_read_owner = nullptr;
                 bool planning_predecessor_present = false;
                 component_manager::ManagerComponentBringUpInspectionResultDTO result{value, {}};
                 std::vector<VerifiedLocalNoneProcessOwner> candidate_local_owners;
@@ -13223,9 +13027,8 @@ RunManagedRuntimeChild(const ManagedRuntimeChildConfig &config) {
                       prepared_managed_composition || prepared_retained_view ||
                       prepared_managed_composition_is_empty ||
                       selected_composition_failure != nullptr || managed_composition_failure != nullptr;
-                  // Changing component owners are unknown. The independent cell
-                  // observer can still report its actual exit while Apply holds
-                  // the composition fence; unknown rows authorize no bring-up.
+                  // Changing component owners are unknown; unknown rows
+                  // authorize no bring-up.
                   if (!changing && active_managed_composition)
                     Require(active_managed_composition->projection_revision == value.predecessor_projection_revision &&
                                 active_managed_composition->publication_generation == value.expected_predecessor_publication_generation,
@@ -13276,13 +13079,6 @@ RunManagedRuntimeChild(const ManagedRuntimeChildConfig &config) {
                     }
                     result.configured_components.push_back(std::move(observed));
                   }
-                  // The initial builder can transfer ownership concurrently.
-                  // Read the pointer under its publication mutex; an established
-                  // cell facade is stable through later composition changes.
-                  if (managed_cell_cclc.facade)
-                    observer_read_owner = managed_cell_cclc.facade.get();
-                  else if (!changing)
-                    observer_read_owner = current_cell_cclc();
                   if (value.planning_component_id) {
                     Require(!changing && managed_cell_cclc.facade &&
                                 managed_cell_cclc.publication == predecessor,
@@ -13372,7 +13168,6 @@ RunManagedRuntimeChild(const ManagedRuntimeChildConfig &config) {
                       component, owner_epoch, generation.value(), closure->candidate_expected_domains,
                       target, *next};
                 }
-                result.cell_observer = managed_isaac_cell.observe_current(observer_read_owner);
                 if (!candidate_local_owners.empty()) {
                   std::lock_guard composition_lock(managed_composition_mutex);
                   std::shared_lock execution_lock(execution_composition.mutex);

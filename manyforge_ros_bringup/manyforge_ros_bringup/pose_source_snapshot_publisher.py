@@ -1,9 +1,13 @@
 """Observe configured Isaac ROS sources through the Manager-owned runtime.
 
-The process is a thin producer. It normalizes depth-one JointState and
-Detection3D subscriptions plus bounded ``simulation_interfaces`` reads, then
-hands immutable observations to Manager. It owns no freshness, scene apply,
-lifecycle, command admission, or Composer protocol.
+The process is a thin producer and the supervised process of one
+``pose_source`` Deployment component (``source_id`` = component id). It
+normalizes depth-one JointState and Detection3D subscriptions plus bounded
+``simulation_interfaces`` reads, then hands immutable observations to Manager.
+Each good observation it submits is also one sample of its binding's CP9
+stream (``poses/<object_id>/<policy_id>``), which the execution host declared.
+It owns no freshness, scene apply, lifecycle, command admission, or Composer
+protocol.
 """
 
 from __future__ import annotations
@@ -34,9 +38,11 @@ from manyforge_ros.isaac_pose_observer import (
     joint_state_observation_intent,
     load_isaac_pose_observer_site_config,
     manager_source_epoch_factory,
+    pose_source_stream_id,
     simulation_entity_observation_intent,
     unknown_observation_intent,
 )
+from manyforge_ros.component_stream_health import ComponentStreamSink
 from manyforge_ros.manager_scene_runtime import PoseObservationIntent
 from manyforge_ros.pose_source_sidecar import (
     AdapterFailure,
@@ -66,6 +72,8 @@ DispatcherFactory = Callable[
     _Dispatcher,
 ]
 SimulationClientFactory = Callable[[Node, float], Any]
+# (node, controllable component id, stream id) -> sink with ``record``.
+StreamSinkFactory = Callable[[Node, str, str], Any]
 
 
 def _default_dispatcher_factory(
@@ -97,6 +105,7 @@ class PoseSourceSnapshotPublisher(Node):
         simulation_client_factory: SimulationClientFactory = (
             _default_simulation_client_factory
         ),
+        stream_sink_factory: StreamSinkFactory = ComponentStreamSink,
         context: Context | None = None,
     ) -> None:
         super().__init__("manyforge_pose_source_snapshot_publisher", context=context)
@@ -154,6 +163,12 @@ class PoseSourceSnapshotPublisher(Node):
                 self._on_dispatch_event,
             )
         self._simulation_client_factory = simulation_client_factory
+        self._stream_sinks = {
+            binding.key: stream_sink_factory(
+                self, self._config.source_id, pose_source_stream_id(binding)
+            )
+            for binding in self._config.bindings
+        }
         # Do not shadow rclpy.Node._subscriptions: executors consume that
         # internal collection as transport entities.
         self._source_adapters: list[DepthOneSubscriptionAdapter] = []
@@ -337,11 +352,15 @@ class PoseSourceSnapshotPublisher(Node):
         self._tf_buffer = Buffer()
         self._tf_listener = TransformListener(self._tf_buffer, self)
 
+    def _record_sample(self, binding: Any, stamp_ns: int | None) -> None:
+        self._stream_sinks[binding.key].record(stamp_ns)
+
     def _submit_joint(self, binding: JointStateBinding, observation: Any) -> None:
         try:
             self._dispatcher.submit(
                 joint_state_observation_intent(binding, observation)
             )
+            self._record_sample(binding, observation.source_stamp_ns)
         except ObservationNormalizationError as error:
             self._submit_unknown(binding, error=error, source_key=binding.topic)
         except Exception as error:
@@ -356,6 +375,7 @@ class PoseSourceSnapshotPublisher(Node):
             self._dispatcher.submit(
                 detection3d_observation_intent(binding, observation)
             )
+            self._record_sample(binding, observation.pose.stamp_ns)
         except ObservationNormalizationError as error:
             self._submit_unknown(binding, error=error, source_key=binding.topic)
         except Exception as error:
@@ -388,6 +408,7 @@ class PoseSourceSnapshotPublisher(Node):
                     coherent=coherent,
                 )
             )
+            self._record_sample(binding, observation.pose.stamp_ns)
         except ObservationNormalizationError as error:
             self._submit_unknown(
                 binding,
@@ -645,43 +666,6 @@ def _bounded_parameter(
 
 
 def main(args: list[str] | None = None) -> int:
-    invocation = sys.argv[1:] if args is None else args
-    if invocation and invocation[0] == "--check-config":
-        try:
-            if len(invocation) != 2:
-                raise ValueError("--check-config requires exactly one site config path")
-            config = load_isaac_pose_observer_site_config(Path(invocation[1]))
-            # Only metadata from the existing bounded strict parser. The host
-            # captures stdout losslessly before attaching the observer;
-            # this is neither an Open session nor an observation receipt.
-            print(
-                json.dumps(
-                    {
-                        "cell_id": config.cell_id,
-                        "source_id": config.source_id,
-                        "bindings": [
-                            binding.to_value() for binding in config.observer_bindings
-                        ],
-                        "expected_joint_state": (
-                            None
-                            if config.joint_state is None
-                            else {
-                                "object_id": config.joint_state.object_id,
-                                "policy_id": config.joint_state.policy_id,
-                                "topic": config.joint_state.topic,
-                            }
-                        ),
-                    },
-                    separators=(",", ":"),
-                    sort_keys=True,
-                    ensure_ascii=False,
-                )
-            )
-            return 0
-        except Exception as error:
-            print(f"isaac_pose_observer_failed: {error}", file=sys.stderr)
-            return 78
-
     context = Context()
     rclpy.init(args=args, context=context)
     node: PoseSourceSnapshotPublisher | None = None

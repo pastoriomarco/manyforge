@@ -56,6 +56,8 @@ def _launch_context(module, *, profile: str = "ur10e") -> LaunchContext:
         if isinstance(entity, DeclareLaunchArgument):
             entity.execute(context)
     context.launch_configurations["isaac_profile"] = profile
+    # Host-owned: the gripper target configuration's value.
+    context.launch_configurations["gripper_state_freshness_timeout_s"] = "0.75"
     return context
 
 
@@ -91,10 +93,13 @@ def test_launch_declares_runtime_inputs_and_has_no_retired_semantic_owner() -> N
         "robot_description_file",
         "controllers_file",
         "runtime_namespace",
-        "manager_run_root",
-        "pose_observer_site_config",
         "pointcloud_topic",
         "pointcloud_cell_id",
+    }
+    # The pose observer is a Deployment component's supervised process now.
+    assert not {action.name for action in declarations} & {
+        "manager_run_root",
+        "pose_observer_site_config",
     }
     assert (
         sum(isinstance(action, OpaqueFunction) for action in description.entities)
@@ -266,6 +271,29 @@ def test_explicit_prefix_changes_rsp_and_static_child_only(
     assert _node_namespace(rsp, context) == module.DEFAULT_RUNTIME_NAMESPACE
 
 
+def test_gripper_adapter_takes_host_freshness_and_refuses_without_it(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    module = _load_launch_module()
+    monkeypatch.setattr(
+        module.FindPackageShare, "find", lambda _self, _name: str(_PACKAGE_ROOT)
+    )
+    context = _launch_context(module, profile="ur10e")
+    bridge = next(
+        action for action in module._launch_setup(context)
+        if _node_executable(action) == "isaac_gripper_action_bridge"
+    )
+    parameters = evaluate_parameters(context, bridge._Node__parameters)
+    assert parameters[-1]["state_freshness_timeout_s"] == 0.75
+    assert "state_freshness_timeout_s" not in Path(str(parameters[0])).read_text(
+        encoding="utf-8"
+    )
+
+    context.launch_configurations["gripper_state_freshness_timeout_s"] = ""
+    with pytest.raises(ValueError, match="gripper_state_freshness_timeout_s"):
+        module._launch_setup(context)
+
+
 def test_launch_lite6_stack_omits_python_gripper_action_adapter(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -281,39 +309,6 @@ def test_launch_lite6_stack_omits_python_gripper_action_adapter(
         _node_executable(action) for action in actions
     }
     assert len(actions) == 5
-
-
-def test_launch_includes_exact_pose_observer_with_controller_stack(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    module = _load_launch_module()
-    monkeypatch.setattr(
-        module.FindPackageShare,
-        "find",
-        lambda _self, _name: str(_PACKAGE_ROOT),
-    )
-    context = _launch_context(module, profile="ur10e")
-    context.launch_configurations["pose_observer_site_config"] = (
-        "/opt/manyforge/isaac-ur10e-light.pose-observer.json"
-    )
-    context.launch_configurations["manager_run_root"] = "/run/manyforge"
-    actions = module._launch_setup(context)
-
-    assert [_node_executable(action) for action in actions].count(
-        "pose_source_snapshot_publisher"
-    ) == 1
-    observer = next(
-        action
-        for action in actions
-        if _node_executable(action) == "pose_source_snapshot_publisher"
-    )
-    assert getattr(observer, "_ExecuteLocal__on_exit") is not None
-
-    for missing_name in ("pose_observer_site_config", "manager_run_root"):
-        invalid = _launch_context(module, profile="ur10e")
-        invalid.launch_configurations[missing_name] = "/configured/value"
-        with pytest.raises(ValueError, match="configured together"):
-            module._launch_setup(invalid)
 
 
 def test_launch_adds_demand_pointcloud_bridge_only_with_exact_cell_inputs(
@@ -399,13 +394,6 @@ def test_launch_name_topic_and_vector_parsers_are_bounded() -> None:
                 runtime_namespace="/manyforge/robot_a",
                 name="topic",
             )
-    assert module._optional_absolute_path("", name="path") == ""
-    assert module._optional_absolute_path(" /run/manyforge ", name="path") == (
-        "/run/manyforge"
-    )
-    for invalid in ("relative", "/" + ("x" * 4096), "/bad\x00path"):
-        with pytest.raises(ValueError):
-            module._optional_absolute_path(invalid, name="path")
     assert module._bounded_observer_identity(
         "isaac.cell/1",
         name="identity",

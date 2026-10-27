@@ -1,5 +1,7 @@
 #include "manyforge_headless/scene_runtime_pose_projector.hpp"
 
+#include <manyforge_core/types/carried_object_lost.hpp>
+
 #include <gtest/gtest.h>
 
 #include <manyforge_content_identity/canonical_value.hpp>
@@ -57,7 +59,8 @@ core::CapabilityProviderBindingDTO Provider(const core::CellId &cell_id) {
 
 CanonicalValue PosePayload(const double x = 0.25,
                            const double quaternion_w = 1.0,
-                           const std::int64_t source_stamp_ns = 1250000000) {
+                           const std::int64_t source_stamp_ns = 1250000000,
+                           const double quaternion_z = 0.0) {
   return CanonicalValue(CanonicalValue::Object{
       {"api_version", CanonicalValue("manyforge.ros_pose_observation.v2")},
       {"kind", CanonicalValue("simulation_entity_pose")},
@@ -67,7 +70,7 @@ CanonicalValue PosePayload(const double x = 0.25,
                    {"orientation_xyzw", CanonicalValue(CanonicalValue::Array{
                                             CanonicalValue(0.0),
                                             CanonicalValue(0.0),
-                                            CanonicalValue(0.0),
+                                            CanonicalValue(quaternion_z),
                                             CanonicalValue(quaternion_w),
                                         })},
                    {"position_m", CanonicalValue(CanonicalValue::Array{
@@ -132,6 +135,20 @@ public:
           std::nullopt,
       };
     }
+    if (const auto *detach =
+            std::get_if<core::DetachCarriedObjectRequestDTO>(&request.operation)) {
+      // Detach at the given cell pose.
+      detached_at = detach->pose;
+      state.attached = false;
+      state.carried_object_attachment_id.reset();
+      pose = detach->pose;
+      projection = Projection(projection.scene_revision.revision_id + 1U);
+      return {request.request_context.request_id,
+              core::RequestReplayStatusDTO::kAcceptedNew, true, std::nullopt,
+              static_cast<std::uint64_t>(commit_count), projection,
+              core::SceneProjectionCommitStatusDTO::kCommitted,
+              core::SceneUpdateStatusDTO::kGeometryChanged};
+    }
     const auto &update =
         std::get<core::UpdateObjectPoseRequestDTO>(request.operation);
     pose = update.pose;
@@ -173,17 +190,6 @@ public:
     return result;
   }
 
-  core::Result<core::ProjectionRevisionDTO> ConfirmProviderFreshness(
-      const core::ProviderFreshnessConfirmationDTO &confirmation) override {
-    ++confirmation_count;
-    last_confirmation = confirmation;
-    if (confirmation_error.has_value()) {
-      return core::Result<core::ProjectionRevisionDTO>::Err(
-          *confirmation_error);
-    }
-    return core::Result<core::ProjectionRevisionDTO>::Ok(projection);
-  }
-
   core::Result<core::Pose3DTO>
   GetObjectPose(const core::SceneResourceId &) const override {
     if (!state.exists) {
@@ -200,13 +206,11 @@ public:
   std::shared_ptr<const core::LogicalSceneSnapshotDTO> snapshot;
   std::optional<core::ErrorDTO> failure;
   std::optional<core::SceneTransactionRequestDTO> last_request;
+  std::optional<core::Pose3DTO> detached_at;
   std::size_t commit_count{};
   std::string owner_epoch{"scene-owner.1"};
   std::size_t compaction_refusals{};
   bool compaction_proof{true};
-  std::optional<core::ErrorDTO> confirmation_error;
-  std::optional<core::ProviderFreshnessConfirmationDTO> last_confirmation;
-  std::size_t confirmation_count{};
 };
 
 PoseSourceObservation Newer(PoseSourceObservation observation,
@@ -258,7 +262,7 @@ TEST(SceneRuntimePoseProjector, DoesNotRetryUnprovenOldEpochRefusal) {
 }
 
 TEST(SceneRuntimePoseProjector,
-     CommitsExactProviderEvidenceAndRecognizesDurableReplay) {
+     CommitsProviderIdentityEvidenceAndRecognizesReplay) {
   const core::CellId cell_id("cell.1");
   FakeSceneAuthority scene;
   SceneRuntimePoseProjector projector(scene, cell_id);
@@ -295,23 +299,20 @@ TEST(SceneRuntimePoseProjector,
             "cell.logical_scene");
   EXPECT_EQ(update.provider_evidence->provider_manifest_id.value(),
             "manyforge.provider.logical_scene");
-  EXPECT_EQ(update.provider_evidence->provider_source_sequence, 2U);
-  EXPECT_EQ(update.provider_evidence->received_at_ns, 100);
-  EXPECT_EQ(update.provider_evidence->source_timestamp_ns, 1250000000);
-  EXPECT_EQ(update.provider_evidence->source_freshness_budget_ns, 900);
   EXPECT_TRUE(content_identity::is_sha256_digest(
       update.provider_evidence->provider_source_epoch));
 
-  const auto already_applied =
+  // A replay of the committed observation is an unchanged same-origin sample.
+  const auto replay =
       projector.Apply(providers, scene.projection.retained_bundle_id,
                       scene.projection.graph_revision, observation);
-  ASSERT_TRUE(already_applied.ok()) << already_applied.error().message;
-  EXPECT_EQ(already_applied.value().status,
-            SceneRuntimePoseApplicationStatus::kAlreadyApplied);
+  ASSERT_TRUE(replay.ok()) << replay.error().message;
+  EXPECT_EQ(replay.value().status,
+            SceneRuntimePoseApplicationStatus::kUnchanged);
   EXPECT_EQ(scene.commit_count, 1U);
 }
 
-TEST(SceneRuntimePoseProjector, LongServicePoseEvidenceRemainsExactAndIdempotent) {
+TEST(SceneRuntimePoseProjector, LongServicePoseEvidenceRemainsIdempotent) {
   const core::CellId cell_id("cell.1");
   FakeSceneAuthority scene;
   SceneRuntimePoseProjector projector(scene, cell_id);
@@ -326,9 +327,6 @@ TEST(SceneRuntimePoseProjector, LongServicePoseEvidenceRemainsExactAndIdempotent
   ASSERT_TRUE(scene.last_request.has_value());
   const auto &update = std::get<core::UpdateObjectPoseRequestDTO>(scene.last_request->operation);
   ASSERT_TRUE(update.provider_evidence.has_value());
-  EXPECT_EQ(update.provider_evidence->received_at_ns, observation.observed_at_ns);
-  EXPECT_EQ(update.provider_evidence->source_freshness_budget_ns, 900);
-  EXPECT_EQ(update.provider_evidence->source_timestamp_ns, years31 - 1);
   const auto replay = projector.Apply(providers, scene.projection.retained_bundle_id,
                                        scene.projection.graph_revision, observation);
   ASSERT_TRUE(replay.ok()) << replay.error().message;
@@ -354,83 +352,39 @@ TEST(SceneRuntimePoseProjector, SkipsAttachedObjectsWithoutChangingScene) {
   EXPECT_EQ(scene.commit_count, 0U);
 }
 
-TEST(SceneRuntimePoseProjector,
-     SafePointSnapshotsHaveNoContinuousRuntimeExpiry) {
-  for (const auto *policy : {"before_planning", "between_nodes"}) {
+TEST(SceneRuntimePoseProjector, UnchangedSameOriginSampleDoesNotCommit) {
+  for (const auto *policy : {"continuous_unattached", "continuous",
+                             "before_planning", "between_nodes"}) {
     const core::CellId cell_id("cell.1");
     FakeSceneAuthority scene;
     SceneRuntimePoseProjector projector(scene, cell_id);
     const std::vector providers{Provider(cell_id)};
-    const auto result = projector.Apply(
-        providers, scene.projection.retained_bundle_id,
-        scene.projection.graph_revision, Observation(), std::nullopt, policy);
-    ASSERT_TRUE(result.ok()) << result.error().message;
-    const auto &update = std::get<core::UpdateObjectPoseRequestDTO>(
-        scene.last_request->operation);
-    ASSERT_TRUE(update.provider_evidence);
-    EXPECT_FALSE(update.provider_evidence->source_timestamp_ns);
-    EXPECT_FALSE(update.provider_evidence->source_freshness_budget_ns);
+    const auto apply = [&](const PoseSourceObservation &observation) {
+      return projector.Apply(providers, scene.projection.retained_bundle_id,
+                             scene.projection.graph_revision, observation,
+                             std::nullopt, policy);
+    };
+    ASSERT_TRUE(apply(Observation()).ok());
+    ASSERT_EQ(scene.commit_count, 1U);
+    const auto committed_projection = scene.projection;
+
+    // A newer same-origin sample of the bit-identical pose; its source
+    // timestamp differs and is irrelevant.
+    const auto newer =
+        Newer(Observation(PosePayload(0.25, 1.0, 1500000000)), 3U);
+    const auto unchanged = apply(newer);
+    ASSERT_TRUE(unchanged.ok()) << unchanged.error().message;
+    ASSERT_TRUE(unchanged.value().valid());
+    EXPECT_EQ(unchanged.value().status,
+              SceneRuntimePoseApplicationStatus::kUnchanged);
+    EXPECT_EQ(ToString(unchanged.value().status), "unchanged");
+    EXPECT_EQ(unchanged.value().projection_revision, committed_projection);
+    EXPECT_FALSE(unchanged.value().update_status.has_value());
+    EXPECT_EQ(scene.commit_count, 1U);
+    EXPECT_EQ(scene.projection, committed_projection);
+    EXPECT_TRUE(SceneRuntimePoseApplicationRetainsPlanningEvidence(
+        unchanged.value().status));
   }
-}
-
-TEST(SceneRuntimePoseProjector,
-     FreshSafePointUnchangedPoseDoesNotCommitAcrossSamePolicyClass) {
-  const core::CellId cell_id("cell.1");
-  FakeSceneAuthority scene;
-  SceneRuntimePoseProjector projector(scene, cell_id);
-  const std::vector providers{Provider(cell_id)};
-  const auto apply = [&](const PoseSourceObservation &observation,
-                         const std::string_view policy) {
-    return projector.Apply(providers, scene.projection.retained_bundle_id,
-                           scene.projection.graph_revision, observation,
-                           std::nullopt, policy);
-  };
-
-  const auto continuous = apply(Observation(), "continuous");
-  ASSERT_TRUE(continuous.ok()) << continuous.error().message;
-  ASSERT_EQ(scene.commit_count, 1U);
-  ASSERT_TRUE(scene.state.provider_evidence.has_value());
-  ASSERT_TRUE(scene.state.provider_evidence->source_freshness_budget_ns);
-
-  // Changing from a freshness-tracked continuous policy to a safe-point
-  // snapshot still commits, so the retained evidence loses continuous expiry.
-  const auto safe_point = apply(Newer(Observation(), 3U), "between_nodes");
-  ASSERT_TRUE(safe_point.ok()) << safe_point.error().message;
-  EXPECT_EQ(safe_point.value().status,
-            SceneRuntimePoseApplicationStatus::kCommitted);
-  ASSERT_EQ(scene.commit_count, 2U);
-  ASSERT_TRUE(scene.state.provider_evidence.has_value());
-  EXPECT_FALSE(scene.state.provider_evidence->source_timestamp_ns);
-  EXPECT_FALSE(scene.state.provider_evidence->source_freshness_budget_ns);
-  const auto safe_point_projection = scene.projection;
-
-  // A newer fresh observation at a safe point with the same provider origin
-  // and exact detached pose is already represented by Scene truth.
-  const auto unchanged = apply(Newer(Observation(), 4U), "before_planning");
-  ASSERT_TRUE(unchanged.ok()) << unchanged.error().message;
-  EXPECT_EQ(unchanged.value().status,
-            SceneRuntimePoseApplicationStatus::kAlreadyApplied);
-  EXPECT_EQ(unchanged.value().projection_revision, safe_point_projection);
-  EXPECT_EQ(scene.projection, safe_point_projection);
-  EXPECT_EQ(scene.commit_count, 2U);
-  ASSERT_TRUE(scene.state.provider_evidence.has_value());
-  EXPECT_EQ(scene.state.provider_evidence->provider_source_sequence, 3U);
-
-  const auto moved =
-      apply(Newer(Observation(PosePayload(0.5)), 5U), "between_nodes");
-  ASSERT_TRUE(moved.ok()) << moved.error().message;
-  EXPECT_EQ(moved.value().status,
-            SceneRuntimePoseApplicationStatus::kCommitted);
-  ASSERT_EQ(scene.commit_count, 3U);
-  EXPECT_DOUBLE_EQ(scene.pose.position_m.x_m, 0.5);
-
-  auto new_epoch = Newer(Observation(PosePayload(0.5)), 6U);
-  new_epoch.source_epoch = "source-epoch.2";
-  const auto changed_origin = apply(new_epoch, "between_nodes");
-  ASSERT_TRUE(changed_origin.ok()) << changed_origin.error().message;
-  EXPECT_EQ(changed_origin.value().status,
-            SceneRuntimePoseApplicationStatus::kCommitted);
-  EXPECT_EQ(scene.commit_count, 4U);
 }
 
 TEST(SceneRuntimePoseProjector, ContinuousUpdatesAttachedPoseThroughAuthority) {
@@ -458,6 +412,15 @@ TEST(SceneRuntimePoseProjector, ContinuousUpdatesAttachedPoseThroughAuthority) {
     EXPECT_EQ(replay.value().status,
               SceneRuntimePoseApplicationStatus::kAlreadyApplied);
     EXPECT_EQ(scene.commit_count, 1U);
+    // A cell-frame update of an attached object has no unchanged shortcut.
+    const auto newer = projector.Apply(
+        providers, scene.projection.retained_bundle_id,
+        scene.projection.graph_revision, Newer(Observation(), 3U),
+        std::nullopt, policy);
+    ASSERT_TRUE(newer.ok()) << newer.error().message;
+    EXPECT_EQ(newer.value().status,
+              SceneRuntimePoseApplicationStatus::kCommitted);
+    EXPECT_EQ(scene.commit_count, 2U);
   }
 }
 
@@ -497,8 +460,7 @@ TEST(SceneRuntimePoseProjector,
   EXPECT_EQ(ambiguous.error().code, "scene_runtime_pose_provider_invalid");
 }
 
-TEST(SceneRuntimePoseProjector,
-     FailsClosedOnStaleEvidenceAndSceneOwnerRejection) {
+TEST(SceneRuntimePoseProjector, FailsClosedOnSceneOwnerRejection) {
   const core::CellId cell_id("cell.1");
   FakeSceneAuthority scene;
   SceneRuntimePoseProjector projector(scene, cell_id);
@@ -508,13 +470,6 @@ TEST(SceneRuntimePoseProjector,
       projector.Apply(providers, scene.projection.retained_bundle_id,
                       scene.projection.graph_revision, observation);
   ASSERT_TRUE(initial.ok());
-
-  scene.state.provider_evidence->provider_source_sequence = 3U;
-  const auto stale =
-      projector.Apply(providers, scene.projection.retained_bundle_id,
-                      scene.projection.graph_revision, observation);
-  ASSERT_FALSE(stale.ok());
-  EXPECT_EQ(stale.error().code, "scene_runtime_pose_observation_stale");
 
   scene.state.provider_evidence.reset();
   scene.failure = core::ErrorDTO{
@@ -530,107 +485,24 @@ TEST(SceneRuntimePoseProjector,
             "native_projection_failed");
 }
 
-TEST(SceneRuntimePoseProjector,
-     ConfirmsFreshnessOfUnchangedPoseWithoutCommitting) {
-  const core::CellId cell_id("cell.1");
-  FakeSceneAuthority scene;
-  SceneRuntimePoseProjector projector(scene, cell_id);
-  const std::vector providers{Provider(cell_id)};
-  const auto initial = ApplyTo(projector, scene, providers, Observation());
-  ASSERT_TRUE(initial.ok()) << initial.error().message;
-  const auto committed_projection = scene.projection;
-
-  // The source timestamp is diagnostic only and never blocks confirmation.
-  const auto newer =
-      Newer(Observation(PosePayload(0.25, 1.0, 1500000000)), 3U);
-  const auto confirmed = ApplyTo(projector, scene, providers, newer);
-
-  ASSERT_TRUE(confirmed.ok()) << confirmed.error().message;
-  ASSERT_TRUE(confirmed.value().valid());
-  EXPECT_EQ(confirmed.value().status,
-            SceneRuntimePoseApplicationStatus::kFreshnessConfirmed);
-  EXPECT_EQ(ToString(confirmed.value().status), "freshness_confirmed");
-  EXPECT_EQ(confirmed.value().projection_revision, committed_projection);
-  EXPECT_FALSE(confirmed.value().update_status.has_value());
-  EXPECT_EQ(scene.commit_count, 1U);
-  EXPECT_EQ(scene.projection, committed_projection);
-  ASSERT_EQ(scene.confirmation_count, 1U);
-  ASSERT_TRUE(scene.last_confirmation.has_value());
-  EXPECT_TRUE(scene.last_confirmation->valid());
-  EXPECT_EQ(scene.last_confirmation->expected_projection_revision,
-            committed_projection);
-  EXPECT_EQ(scene.last_confirmation->scene_resource_id.value(), "box");
-  EXPECT_EQ(scene.last_confirmation->pose_in_cell, scene.pose);
-  const auto &evidence = scene.last_confirmation->evidence;
-  EXPECT_EQ(evidence.provider_source_sequence, 3U);
-  EXPECT_EQ(evidence.received_at_ns, newer.observed_at_ns);
-  EXPECT_EQ(evidence.source_timestamp_ns, 1500000000);
-  EXPECT_EQ(evidence.source_freshness_budget_ns, 900);
-  ASSERT_TRUE(scene.state.provider_evidence.has_value());
-  const auto &committed_evidence = *scene.state.provider_evidence;
-  EXPECT_EQ(committed_evidence.provider_source_sequence, 2U);
-  EXPECT_EQ(evidence.provider_instance_id,
-            committed_evidence.provider_instance_id);
-  EXPECT_EQ(evidence.provider_manifest_id,
-            committed_evidence.provider_manifest_id);
-  EXPECT_EQ(evidence.provider_manifest_revision,
-            committed_evidence.provider_manifest_revision);
-  EXPECT_EQ(evidence.provider_source_epoch,
-            committed_evidence.provider_source_epoch);
+TEST(SceneRuntimePoseProjector, PlanningEvidenceRuleIsStatusSensitive) {
   EXPECT_TRUE(SceneRuntimePoseApplicationRetainsPlanningEvidence(
-      confirmed.value().status,
-      committed_evidence.provider_source_sequence,
-      newer.source_sequence));
-
-  // A replay of the accepted confirmation neither re-confirms nor commits.
-  const auto replay = ApplyTo(projector, scene, providers, newer,
-                              confirmed.value());
-  ASSERT_TRUE(replay.ok()) << replay.error().message;
-  EXPECT_EQ(replay.value().status,
-            SceneRuntimePoseApplicationStatus::kFreshnessConfirmed);
-  EXPECT_EQ(replay.value().projection_revision, committed_projection);
-  EXPECT_EQ(scene.confirmation_count, 1U);
-  EXPECT_EQ(scene.commit_count, 1U);
-
-  // The committed evidence is untouched, so an equal-sequence replay of the
-  // committed observation remains already applied.
-  const auto already_applied =
-      ApplyTo(projector, scene, providers, Observation());
-  ASSERT_TRUE(already_applied.ok()) << already_applied.error().message;
-  EXPECT_EQ(already_applied.value().status,
-            SceneRuntimePoseApplicationStatus::kAlreadyApplied);
-  EXPECT_EQ(scene.confirmation_count, 1U);
-  EXPECT_EQ(scene.commit_count, 1U);
+      SceneRuntimePoseApplicationStatus::kCommitted));
+  EXPECT_TRUE(SceneRuntimePoseApplicationRetainsPlanningEvidence(
+      SceneRuntimePoseApplicationStatus::kAlreadyApplied));
+  EXPECT_TRUE(SceneRuntimePoseApplicationRetainsPlanningEvidence(
+      SceneRuntimePoseApplicationStatus::kUnchanged));
+  EXPECT_FALSE(SceneRuntimePoseApplicationRetainsPlanningEvidence(
+      SceneRuntimePoseApplicationStatus::kNotRequested));
+  EXPECT_FALSE(SceneRuntimePoseApplicationRetainsPlanningEvidence(
+      SceneRuntimePoseApplicationStatus::kDeferredBeforePlanning));
+  EXPECT_FALSE(SceneRuntimePoseApplicationRetainsPlanningEvidence(
+      SceneRuntimePoseApplicationStatus::kBuffered));
+  EXPECT_FALSE(SceneRuntimePoseApplicationRetainsPlanningEvidence(
+      SceneRuntimePoseApplicationStatus::kSkippedAttached));
 }
 
-TEST(SceneRuntimePoseProjector,
-     PlanningEvidenceSequenceRuleIsStatusSensitiveAndFailClosed) {
-  EXPECT_TRUE(SceneRuntimePoseApplicationRetainsPlanningEvidence(
-      SceneRuntimePoseApplicationStatus::kCommitted, 7U, 7U));
-  EXPECT_TRUE(SceneRuntimePoseApplicationRetainsPlanningEvidence(
-      SceneRuntimePoseApplicationStatus::kAlreadyApplied, 7U, 7U));
-  EXPECT_FALSE(SceneRuntimePoseApplicationRetainsPlanningEvidence(
-      SceneRuntimePoseApplicationStatus::kCommitted, 6U, 7U));
-  EXPECT_FALSE(SceneRuntimePoseApplicationRetainsPlanningEvidence(
-      SceneRuntimePoseApplicationStatus::kAlreadyApplied, 7U, 8U));
-
-  EXPECT_TRUE(SceneRuntimePoseApplicationRetainsPlanningEvidence(
-      SceneRuntimePoseApplicationStatus::kFreshnessConfirmed, 7U, 8U));
-  EXPECT_FALSE(SceneRuntimePoseApplicationRetainsPlanningEvidence(
-      SceneRuntimePoseApplicationStatus::kFreshnessConfirmed, 8U, 8U));
-  EXPECT_FALSE(SceneRuntimePoseApplicationRetainsPlanningEvidence(
-      SceneRuntimePoseApplicationStatus::kFreshnessConfirmed, 9U, 8U));
-  EXPECT_FALSE(SceneRuntimePoseApplicationRetainsPlanningEvidence(
-      SceneRuntimePoseApplicationStatus::kNotRequested, 7U, 7U));
-  EXPECT_FALSE(SceneRuntimePoseApplicationRetainsPlanningEvidence(
-      SceneRuntimePoseApplicationStatus::kDeferredBeforePlanning, 7U, 7U));
-  EXPECT_FALSE(SceneRuntimePoseApplicationRetainsPlanningEvidence(
-      SceneRuntimePoseApplicationStatus::kBuffered, 7U, 7U));
-  EXPECT_FALSE(SceneRuntimePoseApplicationRetainsPlanningEvidence(
-      SceneRuntimePoseApplicationStatus::kSkippedAttached, 7U, 7U));
-}
-
-TEST(SceneRuntimePoseProjector, CommitsChangedPoseBudgetOrOriginInstead) {
+TEST(SceneRuntimePoseProjector, CommitsChangedPoseOrOtherOrigin) {
   const core::CellId cell_id("cell.1");
   FakeSceneAuthority scene;
   SceneRuntimePoseProjector projector(scene, cell_id);
@@ -643,108 +515,26 @@ TEST(SceneRuntimePoseProjector, CommitsChangedPoseBudgetOrOriginInstead) {
   EXPECT_EQ(moved.value().status,
             SceneRuntimePoseApplicationStatus::kCommitted);
   EXPECT_EQ(scene.commit_count, 2U);
+  EXPECT_DOUBLE_EQ(scene.pose.position_m.x_m, 0.5);
 
-  auto rebudgeted = Newer(Observation(PosePayload(0.5)), 4U);
-  rebudgeted.expires_at_ns += 100;
-  const auto budget = ApplyTo(projector, scene, providers, rebudgeted);
-  ASSERT_TRUE(budget.ok()) << budget.error().message;
-  EXPECT_EQ(budget.value().status,
+  // No deadband: the smallest representable change commits.
+  const auto nudged =
+      ApplyTo(projector, scene, providers,
+              Newer(Observation(PosePayload(std::nextafter(0.5, 1.0))), 4U));
+  ASSERT_TRUE(nudged.ok()) << nudged.error().message;
+  EXPECT_EQ(nudged.value().status,
             SceneRuntimePoseApplicationStatus::kCommitted);
   EXPECT_EQ(scene.commit_count, 3U);
 
-  auto other_epoch = Newer(Observation(PosePayload(0.5)), 5U);
+  // A different provider origin with the identical pose commits.
+  auto other_epoch =
+      Newer(Observation(PosePayload(std::nextafter(0.5, 1.0))), 5U);
   other_epoch.source_epoch = "source-epoch.2";
   const auto origin = ApplyTo(projector, scene, providers, other_epoch);
   ASSERT_TRUE(origin.ok()) << origin.error().message;
   EXPECT_EQ(origin.value().status,
             SceneRuntimePoseApplicationStatus::kCommitted);
   EXPECT_EQ(scene.commit_count, 4U);
-  EXPECT_EQ(scene.confirmation_count, 0U);
-}
-
-TEST(SceneRuntimePoseProjector, FallsBackToCommitOnlyWhenUnsupported) {
-  const core::CellId cell_id("cell.1");
-  FakeSceneAuthority scene;
-  SceneRuntimePoseProjector projector(scene, cell_id);
-  const std::vector providers{Provider(cell_id)};
-  ASSERT_TRUE(ApplyTo(projector, scene, providers, Observation()).ok());
-
-  scene.confirmation_error = core::ErrorDTO{
-      "provider_freshness_unsupported", "confirmation is unsupported", {}};
-  const auto fallback =
-      ApplyTo(projector, scene, providers, Newer(Observation(), 3U));
-  ASSERT_TRUE(fallback.ok()) << fallback.error().message;
-  EXPECT_EQ(fallback.value().status,
-            SceneRuntimePoseApplicationStatus::kCommitted);
-  EXPECT_EQ(scene.confirmation_count, 1U);
-  EXPECT_EQ(scene.commit_count, 2U);
-
-  scene.confirmation_error = core::ErrorDTO{
-      "provider_freshness_projection_failed",
-      "a required native projection did not apply the freshness confirmation",
-      {{"reason", "provider_freshness_projection_failed"},
-       {"failed_projection_ordinals", "1"},
-       {"applied_projection_ordinals", "0"},
-       {"uncertain_projection_ordinals", "1"}}};
-  const auto failed =
-      ApplyTo(projector, scene, providers, Newer(Observation(), 4U));
-  ASSERT_FALSE(failed.ok());
-  EXPECT_EQ(failed.error().code,
-            "scene_runtime_pose_freshness_confirmation_failed");
-  EXPECT_EQ(failed.error().details.at("scene_error_code"),
-            "provider_freshness_projection_failed");
-  // Partial-propagation details survive the projector boundary.
-  EXPECT_EQ(failed.error().details.at("failed_projection_ordinals"), "1");
-  EXPECT_EQ(failed.error().details.at("applied_projection_ordinals"), "0");
-  EXPECT_EQ(failed.error().details.at("uncertain_projection_ordinals"), "1");
-  EXPECT_EQ(scene.confirmation_count, 2U);
-  EXPECT_EQ(scene.commit_count, 2U);
-}
-
-TEST(SceneRuntimePoseProjector, DefaultAuthorityFallsBackToCommit) {
-  struct DefaultConfirmationAuthority final : core::ISceneAuthority {
-    explicit DefaultConfirmationAuthority(FakeSceneAuthority &delegate)
-        : delegate(delegate) {}
-    core::SceneCommitResultDTO
-    Commit(const core::SceneTransactionRequestDTO &request) override {
-      return delegate.Commit(request);
-    }
-    core::RequestOwnerEpoch CurrentRequestOwnerEpoch() const override {
-      return delegate.CurrentRequestOwnerEpoch();
-    }
-    core::ProjectionRevisionDTO CurrentProjectionRevision() const override {
-      return delegate.CurrentProjectionRevision();
-    }
-    std::shared_ptr<const core::LogicalSceneSnapshotDTO>
-    LogicalSnapshot() const override {
-      return nullptr;
-    }
-    std::vector<core::SceneObjectSnapshotDTO> GetSceneObjects() const override {
-      return {};
-    }
-    core::SceneObjectStateDTO
-    GetObjectState(const core::SceneResourceId &id) const override {
-      return delegate.GetObjectState(id);
-    }
-    core::Result<core::Pose3DTO>
-    GetObjectPose(const core::SceneResourceId &id) const override {
-      return delegate.GetObjectPose(id);
-    }
-    FakeSceneAuthority &delegate;
-  };
-  const core::CellId cell_id("cell.1");
-  FakeSceneAuthority scene;
-  DefaultConfirmationAuthority authority(scene);
-  SceneRuntimePoseProjector projector(authority, cell_id);
-  const std::vector providers{Provider(cell_id)};
-  ASSERT_TRUE(ApplyTo(projector, scene, providers, Observation()).ok());
-  const auto fallback =
-      ApplyTo(projector, scene, providers, Newer(Observation(), 3U));
-  ASSERT_TRUE(fallback.ok()) << fallback.error().message;
-  EXPECT_EQ(fallback.value().status,
-            SceneRuntimePoseApplicationStatus::kCommitted);
-  EXPECT_EQ(scene.commit_count, 2U);
-  EXPECT_EQ(scene.confirmation_count, 0U);
 }
 
 CanonicalValue WithMember(const CanonicalValue &payload, const std::string &name,
@@ -762,7 +552,9 @@ CanonicalValue WithMember(const CanonicalValue &payload, const std::string &name
 }
 
 CanonicalValue ReferencedPayload(const bool coherent = true,
-                                 const bool relative = true) {
+                                 const bool relative = true,
+                                 const double reference_x = 0.02,
+                                 const double reference_yaw = 0.0) {
   return WithMember(
       WithMember(PosePayload(), "kind",
                  CanonicalValue("simulation_entity_pose_with_reference.v1")),
@@ -777,9 +569,10 @@ CanonicalValue ReferencedPayload(const bool coherent = true,
                      {"orientation_xyzw",
                       CanonicalValue(CanonicalValue::Array{
                           CanonicalValue(0.0), CanonicalValue(0.0),
-                          CanonicalValue(0.0), CanonicalValue(1.0)})},
+                          CanonicalValue(std::sin(reference_yaw / 2.0)),
+                          CanonicalValue(std::cos(reference_yaw / 2.0))})},
                      {"position_m", CanonicalValue(CanonicalValue::Array{
-                                        CanonicalValue(0.02),
+                                        CanonicalValue(reference_x),
                                         CanonicalValue(0.0),
                                         CanonicalValue(0.25)})},
                  })
@@ -791,7 +584,10 @@ const core::ComponentSceneFrameRefDTO kCarrier{
     core::ControllableComponentId("robot"), core::ModelInstanceId("robot.model"),
     core::FrameRoleId("gripper_tcp")};
 
-void AttachInSnapshot(FakeSceneAuthority &scene) {
+void AttachInSnapshot(FakeSceneAuthority &scene,
+                      const core::Pose3DTO &pose_in_carrier = {},
+                      const std::optional<core::CarriedObjectGraspLostCheckDTO>
+                          &grasp_lost_check = std::nullopt) {
   scene.state.attached = true;
   scene.state.carried_object_attachment_id =
       core::CarriedObjectAttachmentId("attachment.1");
@@ -808,7 +604,8 @@ void AttachInSnapshot(FakeSceneAuthority &scene) {
               core::CarriedObjectAttachmentId("attachment.1"),
               core::CarriedObjectAttachmentRevision(Digest('9')),
               core::SceneResourceId("box"), kCarrier.controllable_component_id,
-              core::CommandTargetId("arm"), kCarrier, core::Pose3DTO{}, {}}},
+              core::CommandTargetId("arm"), kCarrier, pose_in_carrier, {},
+              grasp_lost_check}},
       });
 }
 
@@ -847,6 +644,44 @@ TEST(SceneRuntimePoseProjector,
   EXPECT_NEAR(update.pose.position_m.y_m, 0.0, 1e-12);
   EXPECT_NEAR(update.pose.position_m.z_m, 0.05, 1e-12);
   EXPECT_TRUE(update.provider_evidence.has_value());
+}
+
+TEST(SceneRuntimePoseProjector,
+     RelativePolicyUnchangedCarrierPoseDoesNotCommit) {
+  const core::CellId cell_id("cell.1");
+  FakeSceneAuthority scene;
+  AttachInSnapshot(scene);
+  std::size_t calls = 0U;
+  SceneRuntimePoseProjector projector(scene, cell_id, TcpAboveReference(calls));
+  const auto apply = [&](const std::uint64_t sequence) {
+    return projector.Apply(
+        std::vector{Provider(cell_id)}, scene.projection.retained_bundle_id,
+        scene.projection.graph_revision,
+        Newer(Observation(ReferencedPayload()), sequence), std::nullopt,
+        "continuous_relative_to_attached");
+  };
+  ASSERT_TRUE(apply(2U).ok());
+  ASSERT_EQ(scene.commit_count, 1U);
+  const auto committed_pose =
+      std::get<core::UpdateObjectPoseRequestDTO>(scene.last_request->operation)
+          .pose;
+
+  // The attachment now holds exactly the committed carrier-relative pose.
+  AttachInSnapshot(scene, committed_pose);
+  const auto unchanged = apply(3U);
+  ASSERT_TRUE(unchanged.ok()) << unchanged.error().message;
+  EXPECT_EQ(unchanged.value().status,
+            SceneRuntimePoseApplicationStatus::kUnchanged);
+  EXPECT_EQ(unchanged.value().projection_revision, scene.projection);
+  EXPECT_EQ(scene.commit_count, 1U);
+
+  // Any other carrier-relative pose in the scene commits.
+  AttachInSnapshot(scene, core::Pose3DTO{});
+  const auto changed = apply(4U);
+  ASSERT_TRUE(changed.ok()) << changed.error().message;
+  EXPECT_EQ(changed.value().status,
+            SceneRuntimePoseApplicationStatus::kCommitted);
+  EXPECT_EQ(scene.commit_count, 2U);
 }
 
 TEST(SceneRuntimePoseProjector,
@@ -1000,6 +835,261 @@ TEST(SceneRuntimePoseProjector, FixedLinkTransformFollowsOnlyFixedJoints) {
   const auto unknown = SceneRuntimeFixedLinkTransform(urdf, "camera", "grasp");
   ASSERT_FALSE(unknown.ok());
   EXPECT_EQ(unknown.error().code, "scene_runtime_pose_reference_link_unknown");
+}
+
+core::CarriedObjectGraspLostCheckDTO GraspCheck(const core::Pose3DTO &attach) {
+  return {{0.03, 0.26}, attach};
+}
+
+core::Pose3DTO YawPose(const double x, const double yaw) {
+  return {{x, 0.0, 0.05}, {0.0, 0.0, std::sin(yaw / 2.0), std::cos(yaw / 2.0)}};
+}
+
+// Records each Stop request with the scene's commit count at that moment.
+struct StopRecorder final {
+  std::vector<SceneRuntimeCarriedObjectLoss> requests;
+  std::vector<std::size_t> commits_before;
+  SceneRuntimeCarrierStopRequester Requester(const FakeSceneAuthority &scene) {
+    return [this, &scene](const SceneRuntimeCarriedObjectLoss &loss) {
+      requests.push_back(loss);
+      commits_before.push_back(scene.commit_count);
+      return std::optional<core::ErrorDTO>{};
+    };
+  }
+};
+
+void ExpectLostStoppedThenDetached(
+    const core::Result<SceneRuntimePoseApplicationResult> &result,
+    const FakeSceneAuthority &scene, const StopRecorder &stops,
+    const core::Pose3DTO &observed_in_cell,
+    const std::size_t prior_commits = 0U) {
+  ASSERT_FALSE(result.ok());
+  EXPECT_EQ(result.error().code, "carried_object_lost");
+  EXPECT_EQ(result.error().details.at("stop"), "requested");
+  EXPECT_EQ(result.error().details.at("detach"), "committed");
+  EXPECT_NE(result.error().message.find("box moved "), std::string::npos);
+  EXPECT_NE(result.error().message.find("it was detached and the motion stopped"),
+            std::string::npos);
+  // Stop first, before any scene change; then exactly one commit: the detach
+  // at the observed cell pose. The update itself is not applied.
+  ASSERT_EQ(stops.requests.size(), 1U);
+  EXPECT_EQ(stops.commits_before.front(), prior_commits);
+  EXPECT_EQ(stops.requests.front().controllable_component_id,
+            kCarrier.controllable_component_id);
+  EXPECT_EQ(stops.requests.front().carried_object_attachment_id,
+            core::CarriedObjectAttachmentId("attachment.1"));
+  EXPECT_EQ(scene.commit_count, prior_commits + 1U);
+  ASSERT_TRUE(scene.detached_at.has_value());
+  EXPECT_EQ(*scene.detached_at, observed_in_cell);
+  const auto &detach = std::get<core::DetachCarriedObjectRequestDTO>(
+      scene.last_request->operation);
+  EXPECT_EQ(detach.frame_ref,
+            core::SceneTransactionFrameRefDTO{core::CellSceneFrameRefDTO{
+                core::CellId("cell.1")}});
+}
+
+const core::Pose3DTO kObservedCellPose{{0.25, -0.5, 0.75}, {0.0, 0.0, 0.0, 1.0}};
+
+TEST(SceneRuntimePoseProjector, RelativeGraspLostComparesWithTheFirstMeasuredOffset) {
+  // Live 2026-10-26: the stream's carried offset differed from ManyForge's
+  // attach-time offset by a fixed 180° plus ~25 mm of real grasp error. That
+  // constant difference is not a loss; only drift from the first measured
+  // offset (0.02, 0, 0.05), yaw 0, is.
+  struct Case final {
+    double x;
+    double yaw;
+    bool lost;
+  };
+  for (const auto &later : {Case{0.02, 0.0, false}, Case{0.04, 0.2, false},
+                            Case{0.06, 0.0, true}, Case{0.02, 0.3, true}}) {
+    const core::CellId cell_id("cell.1");
+    FakeSceneAuthority scene;
+    const auto attach_offset = YawPose(-0.006, std::acos(-1.0));
+    AttachInSnapshot(scene, attach_offset, GraspCheck(attach_offset));
+    std::size_t calls = 0U;
+    StopRecorder stops;
+    SceneRuntimePoseProjector projector(scene, cell_id, TcpAboveReference(calls),
+                                        stops.Requester(scene));
+    const auto apply = [&](const std::uint64_t sequence, const double x,
+                           const double yaw) {
+      // The fake's snapshot follows each committed projection revision.
+      AttachInSnapshot(scene, attach_offset, GraspCheck(attach_offset));
+      return projector.Apply(
+          std::vector{Provider(cell_id)}, scene.projection.retained_bundle_id,
+          scene.projection.graph_revision,
+          Newer(Observation(ReferencedPayload(true, true, x, yaw)), sequence),
+          std::nullopt, "continuous_relative_to_attached");
+    };
+    for (const auto sequence : {2U, 3U}) {
+      const auto baseline = apply(sequence, 0.02, 0.0);
+      ASSERT_TRUE(baseline.ok()) << baseline.error().message;
+      EXPECT_EQ(baseline.value().status,
+                SceneRuntimePoseApplicationStatus::kCommitted);
+    }
+    EXPECT_TRUE(stops.requests.empty());
+    const auto result = apply(4U, later.x, later.yaw);
+    if (!later.lost) {
+      ASSERT_TRUE(result.ok()) << result.error().message;
+      EXPECT_TRUE(stops.requests.empty());
+      continue;
+    }
+    ExpectLostStoppedThenDetached(result, scene, stops, kObservedCellPose, 2U);
+  }
+}
+
+TEST(SceneRuntimePoseProjector, LostSampleReappliedForPlanningRetainsEvidence) {
+  // Live 2026-10-26 (r10-E): the cheese fell at the end of a motion; its loss
+  // sample detached it and returned carried_object_lost, so that sample had
+  // no application. The next node's before-planning latch now applies the
+  // same sample again with the effective policy: the object is a world object
+  // at exactly the observed pose, which is retained planning evidence.
+  const core::CellId cell_id("cell.1");
+  FakeSceneAuthority scene;
+  const auto attach_offset = YawPose(0.02, 0.0);
+  AttachInSnapshot(scene, attach_offset, GraspCheck(attach_offset));
+  std::size_t calls = 0U;
+  StopRecorder stops;
+  SceneRuntimePoseProjector projector(scene, cell_id, TcpAboveReference(calls),
+                                      stops.Requester(scene));
+  const auto apply = [&](const PoseSourceObservation &observation) {
+    return projector.Apply(
+        std::vector{Provider(cell_id)}, scene.projection.retained_bundle_id,
+        scene.projection.graph_revision, observation, std::nullopt,
+        "continuous_relative_to_attached");
+  };
+  const auto baseline =
+      apply(Newer(Observation(ReferencedPayload(true, true, 0.02, 0.0)), 2U));
+  ASSERT_TRUE(baseline.ok()) << baseline.error().message;
+  AttachInSnapshot(scene, attach_offset, GraspCheck(attach_offset));
+  const auto lost_sample =
+      Newer(Observation(ReferencedPayload(true, true, 0.08, 0.0)), 3U);
+  ExpectLostStoppedThenDetached(apply(lost_sample), scene, stops,
+                                kObservedCellPose, 1U);
+  const auto reapplied = apply(lost_sample);
+  ASSERT_TRUE(reapplied.ok()) << reapplied.error().message;
+  EXPECT_EQ(reapplied.value().status,
+            SceneRuntimePoseApplicationStatus::kUnchanged);
+  EXPECT_TRUE(SceneRuntimePoseApplicationRetainsPlanningEvidence(
+      reapplied.value().status));
+  EXPECT_EQ(stops.requests.size(), 1U);
+  EXPECT_EQ(scene.commit_count, 2U);
+}
+
+TEST(SceneRuntimePoseProjector, ContinuousGraspLostComparesWithTheFirstMeasuredOffset) {
+  // The carrier sits at (0.25, -0.5, 0.75); the attachment's stored offset is
+  // identity, but the first sample measures (0.05, 0, 0): that is the
+  // baseline, not a loss.
+  const core::CellId cell_id("cell.1");
+  FakeSceneAuthority scene;
+  scene.pose = core::Pose3DTO{{0.25, -0.5, 0.75}, {}};
+  AttachInSnapshot(scene, {}, GraspCheck({}));
+  StopRecorder stops;
+  SceneRuntimePoseProjector projector(scene, cell_id, {}, stops.Requester(scene));
+  const auto apply = [&](const std::uint64_t sequence, const double x) {
+    return projector.Apply(
+        std::vector{Provider(cell_id)}, scene.projection.retained_bundle_id,
+        scene.projection.graph_revision,
+        Newer(Observation(PosePayload(x)), sequence), std::nullopt, "continuous");
+  };
+  const auto first = apply(2U, 0.30);
+  ASSERT_TRUE(first.ok()) << first.error().message;
+  EXPECT_EQ(first.value().status, SceneRuntimePoseApplicationStatus::kCommitted);
+  // As the scene owner does: the committed offset is the measured one.
+  AttachInSnapshot(scene, core::Pose3DTO{{0.05, 0.0, 0.0}, {}}, GraspCheck({}));
+  const auto within = apply(3U, 0.31);
+  ASSERT_TRUE(within.ok()) << within.error().message;
+  EXPECT_TRUE(stops.requests.empty());
+  AttachInSnapshot(scene, core::Pose3DTO{{0.05, 0.0, 0.0}, {}}, GraspCheck({}));
+  const auto lost = apply(4U, 0.40);
+  ExpectLostStoppedThenDetached(
+      lost, scene, stops, core::Pose3DTO{{0.40, -0.5, 0.75}, {0.0, 0.0, 0.0, 1.0}},
+      2U);
+  // Afterwards the object is an ordinary world object, and its baseline is
+  // gone: a new attachment re-baselines on its first sample.
+  const auto world = apply(5U, 0.35);
+  ASSERT_TRUE(world.ok()) << world.error().message;
+  EXPECT_EQ(world.value().status, SceneRuntimePoseApplicationStatus::kCommitted);
+  scene.pose = core::Pose3DTO{{0.25, -0.5, 0.75}, {}};
+  AttachInSnapshot(scene, {}, GraspCheck({}));
+  const auto reattached = apply(6U, 0.40);
+  ASSERT_TRUE(reattached.ok()) << reattached.error().message;
+  EXPECT_EQ(stops.requests.size(), 1U);
+}
+
+TEST(SceneRuntimePoseProjector, CarriedObjectLostTextComesFromItsErrorRow) {
+  EXPECT_EQ(core::kCarriedObjectLostRow.code, "scene.carried_object_lost");
+  EXPECT_EQ(core::kCarriedObjectLostRow.compact_text, "Carried object lost");
+  EXPECT_EQ(core::CarriedObjectLostFullText("box", 0.052, 0.0523599, 0.03, 0.26),
+            "box moved 52.0 mm / 3.0° from its grasp pose (bound 30.0 mm / "
+            "14.9°); it was detached and the motion stopped.");
+}
+
+TEST(SceneRuntimePoseProjector, GraspLostCheckOnlyForMeasuredOffsetPolicies) {
+  // Without a check every update applies; between_nodes is not checked.
+  for (const auto *policy : {"continuous", "between_nodes"}) {
+    for (const bool checked : {false, true}) {
+      if (checked && std::string_view(policy) == "continuous")
+        continue;
+      const core::CellId cell_id("cell.1");
+      FakeSceneAuthority scene;
+      AttachInSnapshot(scene, {},
+                       checked ? std::optional(GraspCheck({})) : std::nullopt);
+      SceneRuntimePoseProjector projector(scene, cell_id);
+      const auto result = projector.Apply(
+          std::vector{Provider(cell_id)}, scene.projection.retained_bundle_id,
+          scene.projection.graph_revision, Observation(PosePayload(1.8)),
+          std::nullopt, policy);
+      ASSERT_TRUE(result.ok()) << result.error().message;
+      EXPECT_EQ(result.value().status,
+                SceneRuntimePoseApplicationStatus::kCommitted);
+    }
+  }
+}
+
+TEST(SceneRuntimePoseProjector, DeadbandTreatsSmallSameOriginChangesAsUnchanged) {
+  struct Case final {
+    SceneRuntimePoseDeadband deadband;
+    CanonicalValue payload;
+    SceneRuntimePoseApplicationStatus status;
+  };
+  const auto yaw = [](const double angle) {
+    return PosePayload(0.25, std::cos(angle / 2.0), 1250000000,
+                       std::sin(angle / 2.0));
+  };
+  const std::vector<Case> cases{
+      // Default 0: any change commits, as before.
+      {{}, PosePayload(0.2501), SceneRuntimePoseApplicationStatus::kCommitted},
+      {{}, yaw(0.0001), SceneRuntimePoseApplicationStatus::kCommitted},
+      {{0.001, 0.0}, PosePayload(0.2505),
+       SceneRuntimePoseApplicationStatus::kUnchanged},
+      {{0.001, 0.0}, PosePayload(0.252),
+       SceneRuntimePoseApplicationStatus::kCommitted},
+      // A zero rotation deadband keeps the orientation exact.
+      {{0.001, 0.0}, yaw(0.0001), SceneRuntimePoseApplicationStatus::kCommitted},
+      {{0.0, 0.001}, yaw(0.0005), SceneRuntimePoseApplicationStatus::kUnchanged},
+      {{0.0, 0.001}, yaw(0.002), SceneRuntimePoseApplicationStatus::kCommitted},
+  };
+  for (const auto &entry : cases) {
+    const core::CellId cell_id("cell.1");
+    FakeSceneAuthority scene;
+    SceneRuntimePoseProjector projector(scene, cell_id);
+    const std::vector providers{Provider(cell_id)};
+    const auto apply = [&](const PoseSourceObservation &observation) {
+      return projector.Apply(providers, scene.projection.retained_bundle_id,
+                             scene.projection.graph_revision, observation,
+                             std::nullopt, "continuous_unattached",
+                             entry.deadband);
+    };
+    ASSERT_TRUE(apply(Observation()).ok());
+    ASSERT_EQ(scene.commit_count, 1U);
+    const auto result = apply(Newer(Observation(entry.payload), 3U));
+    ASSERT_TRUE(result.ok()) << result.error().message;
+    EXPECT_EQ(result.value().status, entry.status);
+    EXPECT_EQ(scene.commit_count,
+              entry.status == SceneRuntimePoseApplicationStatus::kCommitted
+                  ? 2U
+                  : 1U);
+  }
 }
 
 } // namespace

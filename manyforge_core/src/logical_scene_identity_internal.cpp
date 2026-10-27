@@ -22,7 +22,6 @@ using manyforge::content_identity::CanonicalValue;
 using manyforge::content_identity::CanonicalValueError;
 
 constexpr std::uint64_t kMaxSafeIntegral = 9007199254740991ULL;
-constexpr std::int64_t kMinSafeIntegral = -9007199254740991LL;
 constexpr std::string_view kSceneObjectCollisionIdentityDomain =
     "scene-object-collision-content";
 
@@ -50,13 +49,6 @@ CanonicalValue Unsigned(std::uint64_t value, std::string_view field,
   Require(value <= kMaxSafeIntegral,
           std::string(field) + " exceeds the RFC-8785 safe-integral range");
   Require(!nonzero || value != 0U, std::string(field) + " must be nonzero");
-  return CanonicalValue(static_cast<double>(value));
-}
-
-CanonicalValue Signed(std::int64_t value, std::string_view field) {
-  Require(value >= kMinSafeIntegral &&
-              value <= static_cast<std::int64_t>(kMaxSafeIntegral),
-          std::string(field) + " exceeds the RFC-8785 safe-integral range");
   return CanonicalValue(static_cast<double>(value));
 }
 
@@ -541,25 +533,7 @@ CanonicalValue ProviderEvidence(const SceneObjectProviderEvidenceDTO& value,
       {"provider_source_epoch",
        String(value.provider_source_epoch,
               std::string(field) + ".provider_source_epoch")},
-      {"provider_source_sequence",
-       Unsigned(value.provider_source_sequence,
-                std::string(field) + ".provider_source_sequence")},
-      {"received_at_ns",
-       content_identity::nonnegative_int64_value(value.received_at_ns)},
   };
-  if (value.source_timestamp_ns.has_value()) {
-    object.emplace_back("source_timestamp_ns",
-                        content_identity::nonnegative_int64_value(*value.source_timestamp_ns));
-  }
-  if (value.source_freshness_budget_ns.has_value()) {
-    Require(
-        *value.source_freshness_budget_ns > 0,
-        std::string(field) + ".source_freshness_budget_ns must be positive");
-    object.emplace_back(
-        "source_freshness_budget_ns",
-        Signed(*value.source_freshness_budget_ns,
-               std::string(field) + ".source_freshness_budget_ns"));
-  }
   return CanonicalValue(std::move(object));
 }
 
@@ -647,7 +621,7 @@ CanonicalValue AttachmentPayload(const CarriedObjectAttachmentDTO& attachment,
                                  std::string(field) + ".touch_body_roles[" +
                                      std::to_string(index) + "]"));
   }
-  return CanonicalValue(CanonicalValue::Object{
+  CanonicalValue::Object result{
       {"carried_object_attachment_id",
        String(attachment.carried_object_attachment_id.value(),
               std::string(field) + ".carried_object_attachment_id")},
@@ -665,7 +639,27 @@ CanonicalValue AttachmentPayload(const CarriedObjectAttachmentDTO& attachment,
        Pose(attachment.pose_in_carrier_frame,
             std::string(field) + ".pose_in_carrier_frame")},
       {"touch_body_roles", CanonicalValue(std::move(touch_roles))},
-  });
+  };
+  // Present only with a bound, so attachments without one keep their identity.
+  if (attachment.grasp_lost_check) {
+    const auto& check = *attachment.grasp_lost_check;
+    const std::string label = std::string(field) + ".grasp_lost_check";
+    result.emplace_back(
+        "grasp_lost_check",
+        CanonicalValue(CanonicalValue::Object{
+            {"attach_pose_in_carrier_frame",
+             Pose(check.attach_pose_in_carrier_frame,
+                  label + ".attach_pose_in_carrier_frame")},
+            {"bound",
+             CanonicalValue(CanonicalValue::Object{
+                 {"rotation_rad", Number(check.bound.rotation_rad,
+                                         label + ".rotation_rad", true)},
+                 {"translation_m", Number(check.bound.translation_m,
+                                          label + ".translation_m", true)},
+             })},
+        }));
+  }
+  return CanonicalValue(std::move(result));
 }
 
 CarriedObjectAttachmentRevision AttachmentRevision(
@@ -817,8 +811,8 @@ ContentDigest ComputeSceneObjectCollisionIdentity(
     const CellId& snapshot_cell) {
   return TranslateCodecErrors<ContentDigest>([&] {
     // Validate the complete supplied row before projecting its deliberately
-    // stable non-pose identity. This keeps unsafe sample counters and poses
-    // from being silently normalized into an otherwise valid token.
+    // stable non-pose identity. This keeps unsafe poses from being silently
+    // normalized into an otherwise valid token.
     (void)SceneObject(normalized_object, "scene_object", snapshot_cell);
 
     auto identity_object = normalized_object;
@@ -828,12 +822,6 @@ ContentDigest ComputeSceneObjectCollisionIdentity(
           {0.0, 0.0, 0.0},
           {0.0, 0.0, 0.0, 1.0},
       };
-    }
-    if (identity_object.provider_evidence.has_value()) {
-      auto& evidence = *identity_object.provider_evidence;
-      evidence.provider_source_sequence = 0U;
-      evidence.received_at_ns = 0;
-      evidence.source_timestamp_ns.reset();
     }
     return ContentDigest(manyforge::content_identity::framed_sha256(
         kSceneObjectCollisionIdentityDomain, kLogicalSceneApiVersion,

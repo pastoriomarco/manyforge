@@ -96,6 +96,18 @@ struct ProjectionRevisionDTO final {
          left.graph_revision == right.graph_revision;
 }
 
+/// Whether two projection revisions name the same Deployment and Scene.
+///
+/// Apply binds identity and structure only. The Scene revision it records is
+/// evidence of the moment of the request; streamed state moves it on, so an
+/// Apply never requires it to stay true.
+[[nodiscard]] inline bool SameProjectionIdentity(
+    const ProjectionRevisionDTO& left,
+    const ProjectionRevisionDTO& right) noexcept {
+  return SameActiveDeployment(left, right) &&
+         left.scene_revision.scene_id == right.scene_revision.scene_id;
+}
+
 struct ProjectionLeaseBindingDTO final {
   ProjectionRevisionDTO projection_revision;
   ProjectionLeaseId projection_lease_id{std::string{}};
@@ -208,6 +220,15 @@ struct ProjectionHealthDTO final {
            state == ProjectionHealthState::kHealthy && !error.has_value() &&
            active_projection_revision.has_value() &&
            *active_projection_revision == target;
+  }
+
+  /// Cleanly healthy at any revision of `target`'s Deployment and Scene.
+  [[nodiscard]] bool healthy_for_identity(
+      const ProjectionRevisionDTO& target) const noexcept {
+    return valid() && target.valid() &&
+           state == ProjectionHealthState::kHealthy && !error.has_value() &&
+           active_projection_revision.has_value() &&
+           SameProjectionIdentity(*active_projection_revision, target);
   }
 };
 

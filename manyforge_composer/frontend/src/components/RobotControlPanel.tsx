@@ -374,9 +374,8 @@ export function RobotControlPanelView({
   const programActive = program?.cycleState !== null
     && program?.cycleState !== undefined
     && program.cycleState !== 'idle_after_reset';
-  // Scene identity only: pose updates advance its revision while typing.
   const inputResetKey = [status?.ownerEpoch, motion?.programBindingId,
-    gripper?.programBindingId, status?.sceneRevision.scene_id,
+    gripper?.programBindingId,
     status?.retainedBundleId, status?.graphRevision, programActive,
     state.selectedControllableComponentId, state.selectedMotionTargetId, state.selectedGripperTargetId,
     state.mode, inputRebase].join('\u0000');

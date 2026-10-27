@@ -6,7 +6,6 @@
 #include <optional>
 #include <string>
 #include <string_view>
-#include <manyforge_component_manager/isaac_site_settings.hpp>
 #include <manyforge_component_manager/selected_runtime_composition.hpp>
 #include <manyforge_content_identity/content_identity.hpp>
 #include <manyforge_core/sqlite_cclc_journal.hpp>
@@ -96,10 +95,6 @@ struct ManagedRuntimeChildConfig final {
   /// Approved scene-asset root for relative scene meshes; absent when the
   /// Manager has none configured (relative scene meshes then fail closed).
   std::optional<int> scene_asset_root_fd;
-  std::optional<component_manager::IsaacSiteSettings> isaac_site_settings;
-  std::optional<std::filesystem::path> isaac_pose_observer_executable;
-  std::optional<component_manager::ManagerIsaacPoseObserverLaunchFactsDTO>
-      isaac_pose_observer_launch_facts;
   std::filesystem::path package_root;
   std::filesystem::path program_artifact_root;
   std::filesystem::path manager_state_root;

@@ -82,7 +82,6 @@ def test_recovery_fences_join_program_and_execution_owner_contracts() -> None:
             "retained_bundle_id": _DIGEST_A,
             "graph_revision": _DIGEST_B,
             "active_publication_generation": 11,
-            "scene_revision": {"revision_id": 3},
         },
     }
 
@@ -188,7 +187,6 @@ class _Headless:
                 "retained_bundle_id": _DIGEST_A,
                 "graph_revision": _DIGEST_B,
                 "active_publication_generation": 1,
-                "scene_revision": {"revision_id": 1},
             },
         }
 
@@ -5541,7 +5539,6 @@ def test_node_availability_uses_supplied_exact_facts_without_headless_callback(
                 "retained_bundle_id": _DIGEST_A,
                 "graph_revision": _DIGEST_A,
                 "active_publication_generation": 3,
-                "scene_revision": {"revision_id": 2},
             },
         },
     )

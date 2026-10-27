@@ -99,6 +99,14 @@ prove that the fingers are open or closed.
 
 ## TCP And Scene State
 
+Scene object poses, the measured TCP and the viewer joint state come from a
+pose-source component in the Deployment (runtime kind `pose_source`, profile
+`pose_source_v0`). Its `runtime_configuration.pose_sources` row carries the
+observer bindings, and the component id is the observer `source_id` named by
+`policies.scene_pose_sources`. Composer Check validates it, and the execution
+host supervises the observer process like any other component; there is no
+Manager site-settings file.
+
 The USD `ee_link` Xform is not a live rigid-body feedback source. The light
 deployments query the rigid `robotiq_arg2f_base_link` through
 `simulation_interfaces` and compose the fixed entity-to-`grasp_frame`

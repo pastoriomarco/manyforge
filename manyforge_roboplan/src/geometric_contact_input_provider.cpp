@@ -87,8 +87,7 @@ struct GeometricContactInputProvider::State final
     if (!bundle || !bundle->world || !bundle->lookup_order_valid)
       return false;
     const auto &capability = selected.value.collision_engine->capability();
-    if (bundle->world->bodies.size() > capability.runtime_query_max_world_bodies ||
-        bundle->body_freshness.size() > capability.runtime_query_max_world_bodies)
+    if (bundle->world->bodies.size() > capability.runtime_query_max_world_bodies)
       return false;
     if (selected.value.collision_engine->prepare_runtime_snapshot(*bundle->world) !=
         core::RuntimeCollisionQueryPrepareStatus::kReady)
@@ -213,11 +212,7 @@ struct GeometricContactInputProvider::State final
     auto bundle =
         selected->value.collision_publisher
             ->published_runtime_collision_query_bundle();
-    if (!bundle || !bundle->world ||
-        core::check_runtime_dynamic_body_freshness(
-            *bundle->world, bundle->body_freshness, now,
-            selected->value.dynamic_body_max_age_cap_ns.value_or(0), true)
-                .status != core::RuntimeDynamicBodyFreshnessStatus::kFresh) {
+    if (!bundle || !bundle->world) {
       PublishUnavailable(selected, receipt, "collision_geometry_missing_or_stale");
       ScheduleNext(expected_generation, cadence_anchor, clock.now());
       return;

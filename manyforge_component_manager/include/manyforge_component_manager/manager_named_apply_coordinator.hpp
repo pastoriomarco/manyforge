@@ -60,10 +60,6 @@ struct ManagerNamedApplyRequestDTO final {
       expected_admission_generation;
   std::optional<manyforge::core::CellAdmissionClaimDTO>
       parent_authoring_claim;
-  /// Manager-checked startup input captured before acceptance. Exact replay
-  /// retains the stored snapshot and base rather than recapturing either.
-  std::optional<ManagerIsaacPoseObserverLaunchFactsDTO>
-      isaac_pose_observer_launch_facts{};
   ManagerSceneInitialization scene_initialization{
       ManagerSceneInitialization::kPreserve};
 

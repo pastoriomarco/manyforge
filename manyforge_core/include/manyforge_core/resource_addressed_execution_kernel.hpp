@@ -635,6 +635,9 @@ class ResourceAddressedExecutionKernel final : public IAddressedOperationOwner,
   /// request identity (owner epoch + incident id) whose transaction latches a
   /// `physical_rest_unproven` Stop fault, so the cell stays latched even when
   /// it was idle until the operator's exact Stop-fault recovery.
+  [[nodiscard]] Result<void> PublishComponentStreamHold(
+      const ControllableComponentId& component, const std::optional<ErrorDTO>& hold,
+      bool cell_wide = false) override;
   [[nodiscard]] Result<ComponentIncidentContainmentReceiptDTO> RequestComponentIncidentContainment(
       const ComponentIncidentContainmentIntentDTO& intent) override;
   [[nodiscard]] Result<AuthoringAdmissionDTO> ReplaceManagerLivenessRequiredSet(
@@ -852,8 +855,7 @@ class ResourceAddressedExecutionKernel final : public IAddressedOperationOwner,
   [[nodiscard]] Result<std::optional<ResolvedManualProgramHandover>>
   resolve_manual_program_handover(const RuntimeParticipantExecutionRegistration& registration);
   [[nodiscard]] Result<void> validate_manual_program_handover_locked(
-      const ResolvedManualProgramHandover& handover,
-      const RuntimeParticipantExecutionRegistration* manual_registration = nullptr) const;
+      const ResolvedManualProgramHandover& handover) const;
   struct ReplayEntry;
   struct ControlReplayEntry;
   struct StopReplayEntry;
@@ -1236,6 +1238,10 @@ class ResourceAddressedExecutionKernel final : public IAddressedOperationOwner,
   /// Component command eligibility, separate from route readiness. Guarded
   /// like the route readbacks it is checked together with.
   std::map<ControllableComponentId, ComponentCommandReadinessDTO> component_command_readiness_;
+  /// CP9 stream holds (state_mutex_): refusal of new commands per component.
+  std::map<ControllableComponentId, ErrorDTO> component_stream_holds_;
+  /// CP9 holds of components without motion: refusal of every component.
+  std::map<ControllableComponentId, ErrorDTO> cell_stream_holds_;
   IClock& clock_;
   IScheduler& scheduler_;
   IOperationJournal& journal_;
@@ -1418,22 +1424,9 @@ class ResourceAddressedExecutionKernel final : public IAddressedOperationOwner,
     std::optional<ControllableComponentId> controllable_component_id;
   };
   std::vector<RememberedIncidentContainment> incident_containments_;
-  // Boolean compatibility keeps every existing moving reader and restrictive
-  // writer unchanged. Only an explicit FullStop records the narrower cause.
-  class MotionAdmissionClosure final {
-   public:
-    operator bool() const noexcept { return closed_; }
-    MotionAdmissionClosure& operator=(const bool closed) noexcept {
-      closed_ = restrictive_ = closed;
-      return *this;
-    }
-    void close_for_stop() noexcept { closed_ = true; }
-    [[nodiscard]] bool restrictive() const noexcept { return restrictive_; }
-   private:
-    bool closed_{};
-    bool restrictive_{};
-  };
-  MotionAdmissionClosure motion_admission_closed_{};
+  // Closed refuses all new admission. A Full Stop no longer closes admission
+  // by itself (its causing fault gates motion).
+  bool motion_admission_closed_{};
   std::optional<OperationJournalWriteFaultDTO> operation_journal_write_fault_{};
   std::optional<RetainedOperatorAlarmAttentionDTO> operator_alarm_attention_;
 };

@@ -308,6 +308,30 @@ core::Result<void> CCLCRuntimeComposition::Start() {
       coordinator_.CloseAdmission();
       return following;
     }
+    // CP9: pushed stream verdicts become Kernel holds for new motion and
+    // wake the follower (incidents); the registry replays current verdicts.
+    // A component without a controller domain (only provider domains, e.g. a
+    // pose source) has no motion of its own: its hold refuses new motion of
+    // every component.
+    if (const auto &health = config_.lifecycle_target_driver.stream_health) {
+      stream_listener_token_ = health->SetListener(
+          [this](const core::ControllableComponentId &component,
+                 const core::ComponentStreamVerdictDTO &verdict) {
+            bool cell_wide = false;
+            if (verdict.motion_hold) {
+              const auto current = ReadCurrentComponentSnapshot(component);
+              cell_wide = current.ok() && !current.value().domains.empty() &&
+                          std::all_of(current.value().domains.begin(),
+                                      current.value().domains.end(),
+                                      [](const auto &domain) {
+                                        return domain.provider() != nullptr;
+                                      });
+            }
+            static_cast<void>(kernel_cell_admission_port_.PublishComponentStreamHold(
+                component, verdict.motion_hold, cell_wide));
+            target_driver_.Wake();
+          });
+    }
     return core::Result<void>::Ok();
   } catch (const std::exception &exception) {
     coordinator_.CloseAdmission();
@@ -350,6 +374,7 @@ CCLCRuntimeComposition::CCLCRuntimeComposition(
                config_.terminal_result_bytes_capacity,
                config_.on_incidents_pruned, config_.preparation_failure_source),
       kernel_route_fence_port_(kernel_route_fence_port), clock_(clock),
+      kernel_cell_admission_port_(kernel_cell_admission_port),
       initial_product_context_(std::make_shared<ProductContext>(
           std::move(retained_bundle), active_publication_reader,
           std::move(expected_active_publication), journal_, artifact_source,
@@ -536,6 +561,8 @@ CCLCRuntimeComposition::~CCLCRuntimeComposition() {
 }
 
 void CCLCRuntimeComposition::StopRequestFollowingAndTransports() noexcept {
+  if (const auto &health = config_.lifecycle_target_driver.stream_health)
+    health->ClearListener(stream_listener_token_);
   // Stop following before any transport or owner it submits through goes.
   target_driver_.Stop();
   ros_open_request_server_.reset();
@@ -783,46 +810,6 @@ core::Result<void> CCLCRuntimeComposition::AdoptNativeApplyFacts(
   if (!pin.ok())
     return core::Result<void>::Err(pin.error());
   return journal_.AdoptNativeApplyFacts(adoption);
-}
-
-core::Result<core::CellObserverIncidentRecordDTO>
-CCLCRuntimeComposition::RecordCellObserverIncident(
-    const core::CellObserverIncidentRecordDTO &record) {
-  return journal_.RecordCellObserverIncident(record);
-}
-
-core::Result<std::optional<core::CellObserverIncidentRecordDTO>>
-CCLCRuntimeComposition::LoadOpenCellObserverIncident() {
-  return journal_.LoadOpenCellObserverIncident();
-}
-
-core::Result<std::optional<core::CellObserverLossAssociationDTO>>
-CCLCRuntimeComposition::LoadOpenCellObserverLossAssociation() {
-  return journal_.LoadOpenCellObserverLossAssociation();
-}
-
-core::Result<std::optional<core::CellObserverBringUpRecordDTO>>
-CCLCRuntimeComposition::LoadLatestCellObserverBringUp() {
-  return journal_.LoadLatestCellObserverBringUp();
-}
-core::Result<core::CellObserverBringUpAdmissionDTO>
-CCLCRuntimeComposition::BeginLatestCellObserverBringUp(
-    const core::CellObserverBringUpRecordDTO &admitted,
-    const std::optional<core::CellObserverBringUpRecordDTO> &expected_latest) {
-  return journal_.BeginLatestCellObserverBringUp(admitted, expected_latest);
-}
-core::Result<core::CellObserverBringUpRecordDTO>
-CCLCRuntimeComposition::UpdateLatestCellObserverBringUp(
-    const core::CellObserverBringUpRecordDTO &expected,
-    const core::CellObserverBringUpRecordDTO &updated) {
-  return journal_.UpdateLatestCellObserverBringUp(expected, updated);
-}
-core::Result<core::CellObserverBringUpRecordDTO>
-CCLCRuntimeComposition::CloseCellObserverIncidentByOperatorBringUp(
-    const core::CellObserverBringUpRecordDTO &expected_started,
-    const core::CellObserverBringUpOpenDTO &first_open) {
-  return journal_.CloseCellObserverIncidentByOperatorBringUp(expected_started,
-                                                             first_open);
 }
 
 core::Result<core::ApplyComponentGenerationSelectionDTO>

@@ -8,12 +8,12 @@
   "description": "R5 trial (a): automatic motion retry after a planning (IK) failure. The goal key starts unreachable; after 1.5 s a parallel branch writes a reachable goal, and a later automatic attempt (automatic_retries 3, delay 1.0 s) re-reads it and succeeds.",
   "members": {
     "assignment.yaml": "sha256:f4dd3bfffcc14e0cb446f820e79e2405f4477ecbc470ca9fdc127dce17086e06",
-    "deployment.yaml": "sha256:fae26670e4448800d823a9804399a844b4e8f255dd7af58f9860e2aad426e039",
+    "deployment.yaml": "sha256:180af7bcc7be010bc3fbd5e8c2d56b8e4bd3464b5f05eee574010c52071db1c4",
     "program.yaml": "sha256:0109a0956947d8f8f862394a31c99521d9175da0ec1c56452f95de1922ca03d4"
   },
   "name": "r5_trial_a_retry",
   "saved_status": {
-    "checked_content_digest": "sha256:31b82040de3f1a0fd215d6d5a3260f7d0bd824d306e90566d8e5e299eef04972",
+    "checked_content_digest": "sha256:4e9b2df1cb56751aef52f00500660bcc942abe8707e004074dc0e5bdc71e336b",
     "last_known_status": "unknown",
     "manyforge_version": "0.1.0"
   },

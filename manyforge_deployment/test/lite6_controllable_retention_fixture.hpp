@@ -183,8 +183,10 @@ provider_contract_role_id(const CanonicalValue &declaration) {
                             CanonicalValue("lite_gripper_left_finger"),
                             CanonicalValue("lite_gripper_right_finger")})},
     };
-  if (ros2_control_execution)
+  if (ros2_control_execution) {
     gripper_configuration.emplace_back("output_mode", CanonicalValue("commanded"));
+    gripper_configuration.emplace_back("state_freshness_timeout_s", CanonicalValue(1.0));
+  }
   return CanonicalValue(std::move(gripper_configuration));
 }
 

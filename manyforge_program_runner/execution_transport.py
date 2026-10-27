@@ -35,7 +35,6 @@ from manyforge_headless_api.models import (
     TargetObservationQuery,
     IoWatchResult,
     SHA256_PATTERN,
-    SceneRevisionRequest,
 )
 from manyforge_headless_api.program_cycle import ProgramResetPositionAvailabilityDTO
 from manyforge_headless_api.native import HeadlessApiError
@@ -87,7 +86,6 @@ class _ResetPositionExecutionIdentity(_ResetPositionDeploymentIdentity):
     schema_version: Literal["manyforge.execution_identity.v2"]
     cell_id: _Identity
     control_management_mode: Literal["component_lifecycle", "pending"]
-    scene_revision: SceneRevisionRequest
 
 
 class _ResetPositionSuccessResponse(StrictRequest):

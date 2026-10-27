@@ -1641,8 +1641,7 @@ CanonicalValue ExecutionCommandSurface::IoWatchResponse(
     Require(projection.retained_bundle_id ==
                     composition.projection_revision.retained_bundle_id &&
                 projection.graph_revision ==
-                    composition.projection_revision.graph_revision &&
-                projection.scene_revision.valid(),
+                    composition.projection_revision.graph_revision,
             "selected execution identity crosses its active product");
     return CanonicalValue::Object{
         {"active_publication_generation",
@@ -1662,7 +1661,6 @@ CanonicalValue ExecutionCommandSurface::IoWatchResponse(
         {"owner_epoch", CanonicalValue(owner_epoch_.value())},
         {"retained_bundle_id",
          CanonicalValue(projection.retained_bundle_id.value())},
-        {"scene_revision", SceneRevisionValue(projection.scene_revision)},
     };
   }
 
@@ -3323,15 +3321,8 @@ CanonicalValue ExecutionCommandSurface::ExecuteLogicalProduct(
             "motion preview requires an installed motion-capable component");
       }
       auto preview_intent = *command.operation;
-      if (!preview_intent.expected_scene_revision.has_value()) {
-        return ErrorResponse("scene_changed_during_validation",
-                             "motion preview requires a Scene revision");
-      }
-      const core::ProjectionRevisionDTO requested{
-          preview_intent.expected_retained_bundle_id,
-          preview_intent.expected_graph_revision,
-          *preview_intent.expected_scene_revision};
-      auto minimum = requested;
+      // Preview plans on the latest Scene; the caller names no revision.
+      std::optional<core::ProjectionRevisionDTO> minimum;
       if (composition.runtime->planning_scene_synchronizer != nullptr) {
         auto synchronized = composition.runtime->planning_scene_synchronizer
                                 ->SynchronizeBeforePlanning();
@@ -3343,10 +3334,6 @@ CanonicalValue ExecutionCommandSurface::ExecuteLogicalProduct(
           });
         }
         minimum = synchronized.value();
-        if (!core::ProjectionIsSameOrForwardInLineage(minimum, requested)) {
-          return ErrorResponse("scene_changed_during_validation",
-                               "motion preview request is ahead of or outside the captured Scene");
-        }
       }
       const auto preview_lease_id = core::ProjectionLeaseId{
           "motion-preview." +
@@ -3363,7 +3350,8 @@ CanonicalValue ExecutionCommandSurface::ExecuteLogicalProduct(
           *composition.runtime->collision_publisher,
           inventory->projection_binding.projection_lease_id);
       const auto &selected = inventory->projection_binding.projection_revision;
-      if (!core::ProjectionIsSameOrForwardInLineage(selected, minimum)) {
+      if (minimum.has_value() &&
+          !core::ProjectionIsSameOrForwardInLineage(selected, *minimum)) {
         return ErrorResponse("scene_changed_during_validation",
                              "motion preview snapshot does not include the capture");
       }

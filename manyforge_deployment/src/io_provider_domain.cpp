@@ -83,6 +83,9 @@ Array member_rows(const core::CellGraphDTO &graph,
   return selected;
 }
 
+/// CP9 pose sources have no device-configured lifecycle limit field.
+constexpr core::Duration kPoseSourceLifecycleCommandTimeoutNs = 30'000'000'000;
+
 struct Owner final {
   core::ProviderInstanceId instance;
   core::ProviderManifestId manifest;
@@ -216,6 +219,115 @@ CanonicalValue IoProviderDomainRecord(const core::ControlDomainDTO &domain) {
                          provider->lifecycle_command_timeout_ns))}})}});
 }
 
+// CP9: one provider domain per pose-source component. Its members are the
+// stream ids of its bindings; the configuration digest covers the whole row.
+static void derive_pose_source_domains(
+    const core::CellGraphDTO &graph,
+    std::span<const core::CapabilityProviderBindingDTO> bindings,
+    std::span<const QualifiedProviderManifest> manifests, bool structural_only,
+    IoProviderDomainDerivation &result) {
+  const auto sources = ResolveRetainedPoseSources(graph);
+  if (!sources.ok())
+    throw std::invalid_argument(sources.error().details.at("reason"));
+  for (const auto &source : sources.value()) {
+    std::optional<Owner> owner;
+    for (const auto &binding : bindings) {
+      const auto *target =
+          std::get_if<core::ComponentTargetCapabilityProviderTargetDTO>(
+              &binding.target);
+      if (!target ||
+          target->controllable_component_id !=
+              source.controllable_component_id ||
+          binding.capability_id.value() != "scene.pose.observe")
+        continue;
+      if (!ValidateNonCoordinateProviderTarget(graph, binding).ok())
+        fail("pose_source_target_unqualified");
+      const auto manifest = std::find_if(
+          manifests.begin(), manifests.end(), [&](const auto &value) {
+            return value.value().provider_manifest_id ==
+                       binding.provider_manifest_id &&
+                   value.value().provider_manifest_revision ==
+                       binding.provider_manifest_revision;
+          });
+      if (binding.provider_manifest_id.value() !=
+              core::kPoseSourceLifecycleManifestId ||
+          (!structural_only &&
+           (manifest == manifests.end() ||
+            !std::any_of(manifest->value().offered_capabilities.begin(),
+                         manifest->value().offered_capabilities.end(),
+                         [&](const auto &offer) {
+                           return offer.capability_id ==
+                                      binding.capability_id &&
+                                  offer.capability_definition_revision ==
+                                      binding.capability_definition_revision;
+                         }))))
+        fail("pose_source_manifest_offer_mismatch");
+      Owner candidate{binding.provider_instance_id, binding.provider_manifest_id,
+                      binding.provider_manifest_revision,
+                      core::EndpointRoleId("ros2_control_execution_status")};
+      if (owner && *owner != candidate)
+        fail("pose_source_ownership_ambiguous");
+      owner = std::move(candidate);
+    }
+    if (!owner)
+      fail("pose_source_ownership_missing");
+    const auto catalog =
+        [&]() -> core::Result<core::BrandLifecyclePlanCatalogDTO> {
+      if (!structural_only) {
+        const auto manifest = std::find_if(
+            manifests.begin(), manifests.end(), [&](const auto &value) {
+              return value.value().provider_manifest_id == owner->manifest &&
+                     value.value().provider_manifest_revision ==
+                         owner->revision;
+            });
+        return core::MakeIoProviderLifecycleCatalog(manifest->value());
+      }
+      const auto plans = core::MakeIoProviderLifecyclePlans();
+      if (!plans.ok())
+        return core::Result<core::BrandLifecyclePlanCatalogDTO>::Err(
+            plans.error());
+      return core::MakeBrandLifecyclePlanCatalog(owner->manifest,
+                                                 owner->revision, plans.value());
+    }();
+    if (!catalog.ok())
+      fail("pose_source_lifecycle_catalog_unqualified");
+    const auto identity = content_identity::sha256_digest(canonical_json(
+        Value(Object{{"runtime_unit_id", Value(source.runtime_unit_id.value())},
+                     {"provider_instance_id",
+                      Value(owner->instance.value())}})));
+    const core::ControlDomainId id("pose_source.provider." +
+                                   identity.substr(7));
+    core::ProviderControlDomainDTO provider{
+        source.controllable_component_id,
+        source.runtime_unit_id,
+        owner->instance,
+        owner->manifest,
+        owner->revision,
+        catalog.value().catalog_digest,
+        core::ContentDigest(content_identity::framed_sha256(
+            "pose-source-configuration", "manyforge.pose_source_configuration.v1",
+            json_value(source.row))),
+        source.stream_ids,
+        kPoseSourceLifecycleCommandTimeoutNs};
+    if (!provider.locally_valid())
+      fail("pose_source_domain_invalid");
+    core::ControlDomainDTO domain{
+        id,
+        core::ControlDomainRevision("sha256:" + std::string(64, '0')),
+        {source.runtime_unit_id},
+        owner->endpoint,
+        core::ContainmentGranularity::kControlDomain,
+        provider};
+    domain.control_domain_revision =
+        core::ControlDomainRevision(detail::compute_content_identity(
+            IoProviderDomainRecord(domain),
+            {"control-domain-revision", std::string(core::kCellGraphApiVersion),
+             "control_domain_revision",
+             detail::ContentIdentityRootShape::kNestedRecord}));
+    result.provider_domains.push_back(std::move(domain));
+  }
+}
+
 static core::Result<IoProviderDomainDerivation>
 derive_domains(const core::CellGraphDTO &graph,
                std::span<const core::CapabilityProviderBindingDTO> bindings,
@@ -321,6 +433,8 @@ derive_domains(const core::CellGraphDTO &graph,
     }
     if (groups.size() != devices.value().size())
       fail("io_provider_device_policy_coverage_mismatch");
+    derive_pose_source_domains(graph, bindings, manifests, structural_only,
+                               result);
     for (const auto &[key, group] : groups) {
       const auto device = std::find_if(
           devices.value().begin(), devices.value().end(), [&](const auto &row) {

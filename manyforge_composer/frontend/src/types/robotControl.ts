@@ -359,7 +359,6 @@ export interface ExecutionOwnerStatus {
   activePublicationGeneration: number;
   graphRevision: string;
   retainedBundleId: string;
-  sceneRevision: SceneRevisionValue;
   components: ExecutionComponentStatus[];
   /** The selected motion/gripper target (a UI projection, not a wire
    * primary). Null when the selected component has no such capability. */
@@ -386,7 +385,6 @@ export interface ExecutionIdentity {
   controlManagementMode: 'pending' | 'direct' | 'component_lifecycle';
   graphRevision: string;
   retainedBundleId: string;
-  sceneRevision: SceneRevisionValue;
 }
 
 export type DirectControlMotionSpec =
@@ -496,7 +494,8 @@ export interface DirectControlOperationIntent {
   program_run_id: string;
   expected_graph_revision: string;
   expected_retained_bundle_id: string;
-  expected_scene_revision: SceneRevisionValue;
+  /** The latest Scene is used; callers name no Scene revision. */
+  expected_scene_revision: null;
   participants: [{
     component_role_id: string;
     target_role_id: string;
@@ -549,7 +548,6 @@ export interface CapabilityCommandPreviewReceipt {
   programRunId: string;
   graphRevision: string;
   retainedBundleId: string;
-  sceneRevision: SceneRevisionValue;
   componentRoleId: string;
   targetRoleId: string;
   requiredCapabilityId: string;

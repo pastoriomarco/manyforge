@@ -12,6 +12,7 @@
 #include <manyforge_content_identity/content_identity.hpp>
 #include <manyforge_deployment/artifact_codec.hpp>
 
+#include <manyforge_core/types/carried_object_lost.hpp>
 #include "manyforge_headless/operator_alarm_catalog.hpp"
 
 namespace manyforge::headless {
@@ -101,11 +102,19 @@ TEST(OperatorAlarmCatalog,
 TEST(OperatorAlarmCatalog, LoadsThePackagedDigestVerifiedClosedCatalog) {
   const auto catalog = OperatorAlarmCatalog::Load(PackagedCatalog());
   EXPECT_EQ(catalog.schema_version(), "manyforge.operator_alarm_catalog.v1");
-  EXPECT_EQ(catalog.catalog_version(), "2.6.0");
+  EXPECT_EQ(catalog.catalog_version(), "2.7.0");
   EXPECT_EQ(catalog.descriptor_digest(),
             "sha256:"
-            "7cbf4060ee2b4e6790a4ee425c9b3e5c07eb4dcb91aa61395f3e759055ff6a7f");
-  ASSERT_EQ(catalog.definitions().size(), 12U);
+            "eae2f502411ddcb0aacb0d71cf73716ecb833dbf5d0496d5cb2d5cfe292b6049");
+  ASSERT_EQ(catalog.definitions().size(), 13U);
+  // The dedicated carried-object alarm repeats its error row's compact text,
+  // needs acknowledgement and gates no motion.
+  const auto *lost = catalog.Find(manyforge::core::kCarriedObjectLostRow.code);
+  ASSERT_NE(lost, nullptr);
+  EXPECT_EQ(lost->title, manyforge::core::kCarriedObjectLostRow.compact_text);
+  EXPECT_EQ(lost->alarm_class, "scene");
+  EXPECT_TRUE(lost->acknowledgement_required);
+  EXPECT_FALSE(lost->requires_motion_attention);
   for (const auto name : {"manyforge.runtime.program_runner_loss",
                           "manyforge.runtime.operation_journal_write_fault"}) {
     const auto* fault = catalog.Find(name);
@@ -147,7 +156,7 @@ TEST(OperatorAlarmCatalog,
   const auto parsed = deployment::parse_strict_json_model_yaml(source);
   const auto canonical_json = content_identity::canonical_json(parsed.root());
   EXPECT_EQ(OperatorAlarmCatalog::Decode(canonical_json).definitions().size(),
-            12U);
+            13U);
 
   auto tampered = source;
   const auto title = tampered.find("Runtime collision stop");

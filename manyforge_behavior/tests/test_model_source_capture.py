@@ -72,6 +72,24 @@ def test_capture_owns_exact_entrypoints_and_resource_bytes(tmp_path: Path) -> No
     ) == mesh
 
 
+@pytest.mark.parametrize("runtime_kind", ["io_provider", "pose_source"])
+def test_capture_skips_model_free_components(
+    tmp_path: Path, runtime_kind: str
+) -> None:
+    deployment = {
+        "components": [
+            {
+                "component_id": "free",
+                "configuration": {"runtime_kind": runtime_kind},
+            }
+        ]
+    }
+
+    captured = capture_deployment_model_sources(deployment, project_root=tmp_path)
+
+    assert captured["components"] == []
+
+
 def test_capture_rejects_unregistered_package_resource(tmp_path: Path) -> None:
     (tmp_path / "model.urdf").write_bytes(
         b'<robot name="r"><link name="a"><visual><geometry>'

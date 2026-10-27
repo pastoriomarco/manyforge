@@ -399,7 +399,7 @@ void Ros2GripperCommandBackend::configure_gripper_action(
   if (!std::isfinite(config.state_freshness_timeout_s) ||
       !std::isfinite(config.wait_for_action_server_timeout_s) ||
       !std::isfinite(*config.result_timeout_s) ||
-      config.state_freshness_timeout_s < 0.0 ||
+      config.state_freshness_timeout_s <= 0.0 ||
       config.wait_for_action_server_timeout_s < 0.0 ||
       *config.result_timeout_s < 0.0 ||
       (pneumatic && *config.result_timeout_s == 0.0)) {
@@ -456,6 +456,9 @@ void Ros2GripperCommandBackend::configure_gripper_action(
                 return;
               }
               const auto position = position_for_joint(*msg, observed_joint);
+              // CP9 liveness: lock-free, no allocation.
+              if (position.has_value() && runtime->config.feedback_stream)
+                runtime->config.feedback_stream->RecordArrival();
               {
                 std::lock_guard<std::mutex> lock(runtime->mutex);
                 if (runtime->feedback_messages_received !=
@@ -545,7 +548,11 @@ void Ros2GripperCommandBackend::configure_gripper_action(
         const auto goal_id = goal_handle->get_goal_id();
         (void)action_client->async_cancel_goal(
             goal_handle,
-            [runtime, command_id, generation, goal_id](const auto response) {
+            [weak_runtime = std::weak_ptr<GripperRuntime>(runtime), command_id,
+             generation, goal_id](const auto response) {
+              const auto runtime = weak_runtime.lock();
+              if (!runtime)
+                return;
               std::lock_guard lock(runtime->mutex);
               if (!runtime->lifecycle_disable_pending ||
                   runtime->lifecycle_disable_command_id != command_id ||
@@ -1187,7 +1194,11 @@ Ros2GripperLifecycleResult Ros2GripperCommandBackend::disable_lifecycle_gripper(
   try {
     const auto goal_id = goal->get_goal_id();
     (void)client->async_cancel_goal(
-        goal, [runtime, command_id, generation, goal_id](const auto response) {
+        goal, [weak_runtime = std::weak_ptr<GripperRuntime>(runtime), command_id,
+               generation, goal_id](const auto response) {
+          const auto runtime = weak_runtime.lock();
+          if (!runtime)
+            return;
           std::lock_guard lock(runtime->mutex);
           if (!runtime->lifecycle_disable_pending ||
               runtime->command_id != command_id ||
@@ -1300,7 +1311,10 @@ Ros2GripperCommandBackend::gripper_transport_readiness(
       } else {
         result.feedback_publisher_count =
             state_subscriber ? state_subscriber->get_publisher_count() : 0U;
-        if (observed_at.has_value()) {
+        if (observed_at.has_value() && runtime_config.feedback_stream) {
+          // CP9: the pushed `gripper_feedback` stream owns staleness.
+          result.feedback_path_ready = true;
+        } else if (observed_at.has_value()) {
           const auto age = std::chrono::steady_clock::now() - *observed_at;
           const auto freshness = std::chrono::duration<double>(
               runtime_config.state_freshness_timeout_s);
@@ -1833,9 +1847,16 @@ core::GripperCommandResultDTO Ros2GripperCommandBackend::command_gripper(
   rclcpp_action::Client<GripperCommand>::SendGoalOptions options;
   // Runtime state is generation-owned. Backend access is limited to cancelling
   // the owner-scheduled deadline; the retained host quiesces the ROS executor
-  // before adapter destruction.
-  options.goal_response_callback = [this, runtime, command_id,
+  // before adapter destruction. The runtime owns the action client, which owns
+  // these callbacks (pending requests and goal handles), so they hold the
+  // runtime weakly: a strong capture forms a cycle that leaks the client, node
+  // and DDS participant whenever a goal never reaches a final result.
+  const std::weak_ptr<GripperRuntime> weak_runtime = runtime;
+  options.goal_response_callback = [this, weak_runtime, command_id,
                                     generation](const GoalHandleGripper::SharedPtr& goal_handle) {
+    const auto runtime = weak_runtime.lock();
+    if (!runtime)
+      return;
     GoalHandleGripper::SharedPtr handle_to_cancel;
     rclcpp_action::Client<GripperCommand>::SharedPtr action_client;
     std::optional<core::ScheduleHandle> lifecycle_handle;
@@ -1921,7 +1942,11 @@ core::GripperCommandResultDTO Ros2GripperCommandBackend::command_gripper(
         const auto goal_id = handle_to_cancel->get_goal_id();
         (void)action_client->async_cancel_goal(
             handle_to_cancel,
-            [runtime, command_id, generation, goal_id](const auto response) {
+            [weak_runtime = std::weak_ptr<GripperRuntime>(runtime), command_id,
+             generation, goal_id](const auto response) {
+              const auto runtime = weak_runtime.lock();
+              if (!runtime)
+                return;
               std::lock_guard lock(runtime->mutex);
               if (!runtime->lifecycle_disable_pending ||
                   runtime->lifecycle_disable_command_id != command_id ||
@@ -1949,16 +1974,18 @@ core::GripperCommandResultDTO Ros2GripperCommandBackend::command_gripper(
     }
   };
   options.feedback_callback =
-      [this, runtime, command_id, generation](
+      [this, weak_runtime, command_id, generation](
           GoalHandleGripper::SharedPtr goal_handle,
           const std::shared_ptr<const GripperCommand::Feedback> feedback) {
-        on_gripper_feedback(runtime, command_id, generation, goal_handle,
-                            feedback);
+        if (const auto runtime = weak_runtime.lock())
+          on_gripper_feedback(runtime, command_id, generation, goal_handle,
+                              feedback);
       };
   options.result_callback =
-      [this, runtime, command_id,
+      [this, weak_runtime, command_id,
        generation](const GoalHandleGripper::WrappedResult &result) {
-        on_gripper_result(runtime, command_id, generation, result);
+        if (const auto runtime = weak_runtime.lock())
+          on_gripper_result(runtime, command_id, generation, result);
       };
 
   {

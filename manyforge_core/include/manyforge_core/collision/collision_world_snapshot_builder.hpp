@@ -38,8 +38,6 @@ inline constexpr std::string_view kCollisionWorldContentIdentityDomain = "collis
 ///   - Each body's `body_id` is non-empty.
 ///   - Each body's `body_id` matches its `owner_kind` namespace.
 ///   - Each body's `frame_id` is non-empty.
-///   - If a body declares `source_freshness_budget_ns`, it also declares a
-///     non-negative `source_timestamp_ns` and the budget is positive.
 ///   - Body ids are unique within the snapshot.
 ///   - Each body has at least one geometry.
 ///   - Each body's geometries reference the same `body_id` as the
@@ -59,10 +57,8 @@ inline constexpr std::string_view kCollisionWorldContentIdentityDomain = "collis
 ///     values are never identity authority.
 ///   - Each body's `body_content_hash` is computed by the builder
 ///     using the qualified RFC 8785/framed SHA-256 projection over
-///     (body_id, owner_kind, parent_body_id, frame_id, pose, freshness budget,
+///     (body_id, owner_kind, parent_body_id, frame_id, pose,
 ///     geometries' source-defining fields).
-///     `source_timestamp_ns` is intentionally excluded so freshness-only
-///     updates do not change collision-world content identity.
 ///   - The snapshot's `revision.content_hash` is the framed SHA-256 digest over
 ///     `publisher_id`, `snapshot_format_version`, component-model frames, and
 ///     the sorted bodies' `body_content_hash` values, plus the effective policy

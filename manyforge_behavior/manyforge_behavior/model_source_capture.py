@@ -438,9 +438,9 @@ def capture_deployment_model_sources(
             source is None
             and "model_source" not in raw_component
             and isinstance(configuration, Mapping)
-            and configuration.get("runtime_kind") == "io_provider"
+            and configuration.get("runtime_kind") in ("io_provider", "pose_source")
         ):
-            # A model-free I/O device has no model source closure.
+            # A model-free I/O device or pose source has no model source closure.
             if (
                 not isinstance(component_id, str)
                 or not component_id

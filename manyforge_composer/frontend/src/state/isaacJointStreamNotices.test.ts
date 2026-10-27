@@ -4,6 +4,7 @@ import type { HeadlessSourceSection } from '../types/headless';
 import { isaacJointStreamNotices } from './isaacJointStreamNotices';
 
 const EXPECTED = {
+  source_id: 'isaac_scene_objects',
   object_id: 'isaac_ur10e_light_robot',
   policy_id: 'viewer.measured_robot',
   topic: '/isaac_joint_states',
@@ -13,10 +14,7 @@ function sceneRuntimeSection(): HeadlessSourceSection {
   const sections = structuredClone(isaacSceneOwnerSections.sections) as Record<string, unknown>;
   const wire = sections.scene_runtime as Record<string, unknown>;
   const payload = wire.payload as Record<string, unknown>;
-  payload.cell_observer = {
-    ...(payload.cell_observer as Record<string, unknown>),
-    expected_joint_state: EXPECTED,
-  };
+  payload.configured_joint_states = [EXPECTED];
   return {
     available: wire.available as boolean,
     freshness: wire.freshness as HeadlessSourceSection['freshness'],
@@ -91,11 +89,17 @@ describe('Isaac joint-state stream notices', () => {
     });
   });
 
-  it('reports status unavailable when the configured observer is not present/current', () => {
+  it('waits for feedback when only another source reports the configured object', () => {
     const section = sceneRuntimeSection();
-    const payload = section.payload as Record<string, unknown>;
-    const observer = payload.cell_observer as Record<string, unknown>;
-    observer.process_presence = 'absent';
+    jointRow(section).source_id = 'other_source';
+
+    expect(isaacJointStreamNotices(section)[0]?.title)
+      .toBe('Waiting for Isaac joint-state feedback');
+  });
+
+  it('reports status unavailable when the projection is malformed', () => {
+    const section = sceneRuntimeSection();
+    (section.payload as Record<string, unknown>).unexpected = true;
 
     expect(isaacJointStreamNotices(section)[0]?.title)
       .toBe('Isaac joint-state stream status unavailable');
@@ -124,14 +128,13 @@ describe('Isaac joint-state stream notices', () => {
     expect(notice?.message).not.toMatch(/paused|stopped/i);
   });
 
-  it('does not infer a configured stream from legacy or explicit no-binding projections', () => {
+  it('does not infer a configured stream from legacy or no-binding projections', () => {
     const legacy = sceneRuntimeSection();
-    const legacyPayload = legacy.payload as Record<string, unknown>;
-    delete (legacyPayload.cell_observer as Record<string, unknown>).expected_joint_state;
+    delete (legacy.payload as Record<string, unknown>).configured_joint_states;
     expect(isaacJointStreamNotices(legacy)).toEqual([]);
 
     const noBinding = sceneRuntimeSection();
-    (noBinding.payload!.cell_observer as Record<string, unknown>).expected_joint_state = null;
+    (noBinding.payload as Record<string, unknown>).configured_joint_states = [];
     expect(isaacJointStreamNotices(noBinding)).toEqual([]);
   });
 });

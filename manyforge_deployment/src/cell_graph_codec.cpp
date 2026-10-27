@@ -101,6 +101,26 @@ using RuntimeProfileKey = std::pair<std::string, std::string>;
   });
 }
 
+// Provider-domain members: an identity, or a CP9 pose-source stream id whose
+// '/'-separated segments are identities (`poses/<object_id>/<policy_id>`).
+[[nodiscard]] bool is_provider_signal_name(std::string_view spelling) noexcept {
+  if (spelling.empty() ||
+      spelling.size() > detail::kMaximumPortableIdentityBytes) {
+    return false;
+  }
+  std::size_t start = 0U;
+  while (true) {
+    const auto end = spelling.find('/', start);
+    if (!is_bounded_ascii_identity(spelling.substr(start, end - start))) {
+      return false;
+    }
+    if (end == std::string_view::npos) {
+      return true;
+    }
+    start = end + 1U;
+  }
+}
+
 [[noreturn]] void fail(std::string_view path, std::string_view reason) {
   throw CellGraphCodecError(std::string(path) + ": " + std::string(reason));
 }
@@ -449,8 +469,12 @@ template <typename StrongType>
     for (const auto &item :
          require_array(require_member(provider, "signal_names", provider_path),
                        child_path(provider_path, "signal_names"))) {
-      names.push_back(
-          parse_identity<core::ResourceRoleId>(item, provider_path).value());
+      const auto &name = require_string(item, provider_path);
+      if (!is_provider_signal_name(name)) {
+        fail(provider_path, "provider signal name is not an identity or a "
+                            "pose-source stream id");
+      }
+      names.push_back(name);
     }
     if (names.empty() || !std::is_sorted(names.begin(), names.end()) ||
         std::adjacent_find(names.begin(), names.end()) != names.end())

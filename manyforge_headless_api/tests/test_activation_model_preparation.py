@@ -1,7 +1,8 @@
-"""Model-preparation projection and closure join for model-free I/O (R5).
+"""Model-preparation projection and closure join for model-free components.
 
 The maintained registry carries the approved model-free I/O profile
-``io_device_v0`` beside the physical ros2_control profiles. Python model
+``io_device_v0`` and pose-source profile ``pose_source_v0`` beside the
+physical ros2_control profiles. Python model
 preparation must skip it without fabricating a model family, while unknown or
 malformed physical rows and foreign captured sources stay refused.
 """
@@ -37,6 +38,14 @@ _IO_ROW = {
     "stop_profiles": {},
     "acceptance_obligations": [],
 }
+_POSE_ROW = {
+    "runtime_restoration_profile_id": "pose_source_v0",
+    "pose_source_runtime": {},
+    "source_fields": {},
+    "stop_profiles": {},
+    "acceptance_obligations": [],
+}
+_MODEL_FREE_MARKERS = ("io_provider_runtime", "pose_source_runtime")
 _MOCK_PROFILE = "lite6_mock_commanded_v0"
 _SOURCE_SCHEMA = "manyforge.activation_model_source_closure.v1"
 
@@ -56,6 +65,7 @@ def _maintained(order: str) -> dict[str, object]:
         io_rows = [copy.deepcopy(_IO_ROW)]
         rows.extend(io_rows)
     assert io_rows == [_IO_ROW]
+    assert [row for row in rows if "pose_source_runtime" in row] == [_POSE_ROW]
     if order == "io_first":
         rows.remove(_IO_ROW)
         rows.insert(0, copy.deepcopy(_IO_ROW))
@@ -127,6 +137,26 @@ def _io_device() -> dict[str, object]:
     }
 
 
+def _pose_source() -> dict[str, object]:
+    return {
+        "component_id": "poses",
+        "component_profile_id": "pose_source_v0",
+        "target_settings": {},
+        "configuration": {
+            "runtime_kind": "pose_source",
+            "runtime_configuration": {"pose_sources": []},
+        },
+    }
+
+
+def _pose_row(root: dict[str, object]) -> dict[str, object]:
+    return next(
+        row
+        for row in root["runtime_restoration_profiles"]
+        if "pose_source_runtime" in row
+    )
+
+
 def _source(component_id: str) -> dict[str, object]:
     return {"component_id": component_id, "entrypoints": {}, "resources": []}
 
@@ -167,7 +197,8 @@ def test_registry_with_model_free_io_profile_constructs_ros_only_preparer(
         timeout_seconds=3.0,
     )
 
-    assert "io_device_v0" in profiles and profiles["io_device_v0"] is None
+    assert profiles["io_device_v0"] == "io_provider"
+    assert profiles["pose_source_v0"] == "pose_source"
     assert profiles[_MOCK_PROFILE] == (
         "lite6_lite_gripper",
         "package://manyforge_example_models/models/lite6_lite_gripper/",
@@ -175,9 +206,11 @@ def test_registry_with_model_free_io_profile_constructs_ros_only_preparer(
     physical = [
         row["runtime_restoration_profile_id"]
         for row in root["runtime_restoration_profiles"]
-        if "io_provider_runtime" not in row
+        if not any(marker in row for marker in _MODEL_FREE_MARKERS)
     ]
-    assert physical and all(profiles[profile] is not None for profile in physical)
+    assert physical and all(
+        isinstance(profiles[profile], tuple) for profile in physical
+    )
     assert preparer._profiles == profiles
 
 
@@ -243,10 +276,10 @@ def test_closure_join_skips_only_the_model_free_io_component(
     prepared_sources: list[tuple[str, str]],
 ) -> None:
     # Typed profile map as the projection returns it: the I/O profile is
-    # registered with an explicit ``None`` (no model), never a fabricated one.
+    # registered with its runtime kind (no model), never a fabricated family.
     profiles = {
         _MOCK_PROFILE: ("lite6_lite_gripper", "package://example/"),
-        "io_device_v0": None,
+        "io_device_v0": "io_provider",
     }
 
     closure = _prepare_model_closure(
@@ -379,3 +412,61 @@ def test_duplicate_component_ids_are_refused_for_io_components(
             model_source_closure=_closure(),
             profiles=profiles,
         )
+
+
+def test_closure_join_skips_the_model_free_pose_source_component(
+    registry: dict[str, object],
+    tmp_path: Path, prepared_sources: list[tuple[str, str]]
+) -> None:
+    profiles = _model_preparation_profiles(_capability_root(tmp_path, registry))
+
+    closure = _prepare_model_closure(
+        deployment={"components": [_pose_source(), _io_device(), _mock_robot()]},
+        model_source_closure=_closure("robot"),
+        profiles=profiles,
+    )
+
+    assert prepared_sources == [("robot", "lite6_lite_gripper")]
+    assert [row["component_id"] for row in closure["components"]] == ["robot"]
+
+
+@pytest.mark.parametrize(
+    "component",
+    [
+        {**_pose_source(), "model_source": {"kind": "package"}},
+        {**_pose_source(), "configuration": {"runtime_kind": "io_provider"}},
+        {**_io_device(), "configuration": {"runtime_kind": "pose_source"}},
+    ],
+    ids=["pose-with-model-source", "pose-profile-io-kind", "io-profile-pose-kind"],
+)
+def test_model_free_profile_requires_its_own_runtime_kind_and_no_model(
+    registry: dict[str, object],
+    tmp_path: Path, prepared_sources: list[tuple[str, str]], component
+) -> None:
+    profiles = _model_preparation_profiles(_capability_root(tmp_path, registry))
+
+    with pytest.raises(HeadlessApiError, match="do not match captured model profiles"):
+        _prepare_model_closure(
+            deployment={"components": [component]},
+            model_source_closure=_closure(),
+            profiles=profiles,
+        )
+
+
+@pytest.mark.parametrize(
+    "mutate",
+    [
+        lambda row: row.__setitem__("model_family_id", "lite6_lite_gripper"),
+        lambda row: row.__setitem__("runtime_restoration_profile_id", "pose_source_v1"),
+        lambda row: row.__setitem__("pose_source_runtime", {"extra": 1}),
+    ],
+    ids=["pose-with-family", "pose-renamed", "pose-runtime-config"],
+)
+def test_only_the_exact_model_free_pose_source_row_is_accepted(
+    registry: dict[str, object], tmp_path: Path, mutate
+) -> None:
+    root = registry
+    mutate(_pose_row(root))
+
+    with pytest.raises(HeadlessApiError, match="runtime profiles contain an invalid row"):
+        _model_preparation_profiles(_capability_root(tmp_path, root))

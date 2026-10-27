@@ -21,6 +21,7 @@ from rclpy.action import ActionServer, CancelResponse, GoalResponse
 from rclpy.callback_groups import ReentrantCallbackGroup
 from rclpy.executors import MultiThreadedExecutor
 from rclpy.node import Node
+from rclpy.parameter import Parameter
 from rclpy.qos import DurabilityPolicy, QoSProfile, ReliabilityPolicy
 from sensor_msgs.msg import JointState
 from std_msgs.msg import Bool
@@ -130,7 +131,10 @@ class IsaacGripperActionBridge(Node):
         self.declare_parameter("completion_tolerance_rad", 0.04)
         self.declare_parameter("completion_settle_time_s", 0.1)
         self.declare_parameter("completion_min_samples", 3)
-        self.declare_parameter("state_freshness_timeout_s", 1.0)
+        # No default: the host passes the gripper target configuration's value.
+        self.declare_parameter(
+            "state_freshness_timeout_s", Parameter.Type.DOUBLE
+        )
         self.declare_parameter("goal_timeout_s", 20.0)
         self.declare_parameter("publish_period_s", 0.05)
         self.declare_parameter("hold_last_target", True)

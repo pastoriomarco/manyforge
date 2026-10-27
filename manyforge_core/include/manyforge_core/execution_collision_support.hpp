@@ -31,33 +31,6 @@ std::string format_double(double value);
 bool snapshot_too_old(std::int64_t now_ns, std::int64_t timestamp_ns, std::int64_t max_age_ns,
                       std::map<std::string, std::string>& details, const std::string& timestamp_key,
                       const std::string& age_key, const std::string& budget_key);
-std::optional<std::string> validate_dynamic_body_freshness(
-    const CollisionWorldSnapshot& snapshot,
-    const std::vector<CollisionWorldBodyFreshness>& body_freshness, std::int64_t now_ns,
-    std::int64_t runtime_cap_ns, std::map<std::string, std::string>& details);
-
-enum class RuntimeDynamicBodyFreshnessStatus {
-  kFresh,
-  kSidecarUnsorted,
-  kMissingTimestamp,
-  kInvalidTimestamp,
-  kStale,
-};
-
-struct RuntimeDynamicBodyFreshnessCheck {
-  RuntimeDynamicBodyFreshnessStatus status = RuntimeDynamicBodyFreshnessStatus::kFresh;
-  const CollisionWorldBody* body = nullptr;
-  const CollisionWorldBodyFreshness* freshness = nullptr;
-  std::int64_t effective_budget_ns = 0;
-  std::int64_t age_ns = 0;
-};
-
-RuntimeDynamicBodyFreshnessCheck check_runtime_dynamic_body_freshness(
-    const CollisionWorldSnapshot& snapshot,
-    const std::vector<CollisionWorldBodyFreshness>& body_freshness, std::int64_t now_ns,
-    std::int64_t runtime_cap_ns, bool lookup_order_prevalidated = false) noexcept;
-const char* runtime_dynamic_body_freshness_reason(
-    RuntimeDynamicBodyFreshnessStatus status) noexcept;
 
 struct RuntimeCollisionStateProjection {
   std::vector<std::string> source_joint_names;
@@ -70,7 +43,7 @@ Result<RuntimeCollisionStateProjection> build_runtime_collision_state_projection
     const TrajectoryDTO& source_trajectory, const TrajectoryDTO& collision_trajectory);
 
 struct RuntimeCollisionStopCoverageSummary {
-  static constexpr std::size_t kUnavailableReasonCount = 9;
+  static constexpr std::size_t kUnavailableReasonCount = 8;
   std::uint64_t generation = 0;
   std::uint64_t ticks_attempted = 0;
   std::uint64_t queries_executed = 0;
@@ -82,7 +55,6 @@ struct RuntimeCollisionStopCoverageSummary {
 enum class RuntimeCollisionUnavailableReason : std::size_t {
   kCollisionResources = 0,
   kCollisionSnapshot,
-  kDynamicBodyFreshness,
   kObservedStateUnavailable,
   kObservedStateStale,
   kObservedStateIncomplete,
@@ -167,11 +139,9 @@ Result<RuntimeCollisionQueryBundlePtr> load_published_runtime_collision_query_bu
     const ICollisionWorldSnapshotPublisher& publisher);
 
 RuntimeCollisionQueryBundlePtr build_runtime_collision_query_bundle(
-    CollisionWorldPolicySnapshotBundle bundle, std::uint64_t epoch,
+    CollisionWorldPolicySnapshotBundle bundle,
     std::optional<ProjectionRevisionDTO> projection_revision = std::nullopt);
-bool runtime_collision_lookup_order_is_valid(
-    const CollisionWorldSnapshot& world,
-    const std::vector<CollisionWorldBodyFreshness>& body_freshness) noexcept;
+bool runtime_collision_lookup_order_is_valid(const CollisionWorldSnapshot& world) noexcept;
 
 void append_collision_failure_diagnostics(std::map<std::string, std::string>& details,
                                           const CollisionValidationDecisionBundle& bundle);
@@ -192,8 +162,6 @@ CollisionCheckResultDTO collision_check_result_from_bundle(
     const CollisionValidationDecisionBundle& bundle);
 
 bool collision_world_revision_is_set(const CollisionWorldRevision& revision);
-bool collision_world_revisions_equal(const CollisionWorldRevision& lhs,
-                                     const CollisionWorldRevision& rhs);
 bool engines_require_single_context_exclusivity(
     const std::vector<std::shared_ptr<ICollisionQueryEngine>>& engines);
 bool runtime_monitor_may_hold_collision_engine(ExecutionState state);

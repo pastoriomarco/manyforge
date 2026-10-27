@@ -1355,6 +1355,115 @@ TEST(DeploymentApplicabilityCodec, ScenePosePoliciesAreClosedAndRetained) {
 }
 
 TEST(DeploymentApplicabilityCodec,
+     ComponentStreamOverridesAreClosedNormalizedAndRetained) {
+  const auto document_for = [](const std::string &rows) {
+    auto policies = interrupt_policy_envelope("", "");
+    policies.pop_back();
+    return with_policies(minimal_document(),
+                         policies + ",\"component_streams\":" + rows + "}");
+  };
+  // Authored out of canonical order; the codec normalizes the table.
+  const auto candidate = decode(document_for(
+      R"([{"controllable_component_id":"robot_1","stream_id":"measured_joints","budget_ns":300000000,"recovery":"auto"},)"
+      R"({"controllable_component_id":"octomap_1","stream_id":"map_updates","severity":"fault"}])"));
+  const std::vector<core::StreamParameterOverrideDTO> expected{
+      {core::ControllableComponentId("octomap_1"), "map_updates", std::nullopt,
+       core::StreamSeverityDTO::kFault, std::nullopt},
+      {core::ControllableComponentId("robot_1"), "measured_joints",
+       std::int64_t{300000000}, std::nullopt, core::StreamRecoveryDTO::kAuto},
+  };
+  ASSERT_TRUE(candidate.normalized_policies().has_value());
+  const auto *streams =
+      candidate.normalized_policies()->find_object_member("component_streams");
+  ASSERT_NE(streams, nullptr);
+  EXPECT_EQ(decode_component_stream_overrides(*streams), expected);
+  EXPECT_EQ(*streams, encode_component_stream_overrides(expected));
+  const auto revisioned =
+      compute_capability_provider_binding_revisions(candidate);
+  EXPECT_EQ(revisioned.normalized_policies(), candidate.normalized_policies());
+
+  // Absent or empty tables keep the existing policy projection unchanged.
+  const auto ordinary = decode(
+      with_policies(minimal_document(), interrupt_policy_envelope("", "")));
+  EXPECT_EQ(ordinary.normalized_policies()->find_object_member(
+                "component_streams"),
+            nullptr);
+  EXPECT_EQ(decode(document_for("[]")).normalized_policies(),
+            ordinary.normalized_policies());
+
+  const std::string row_prefix =
+      R"({"controllable_component_id":"octomap_1","stream_id":"map_updates")";
+  expect_decode_error_containing(
+      document_for("[" + row_prefix + R"(,"severity":"fault"},)" + row_prefix +
+                   R"(,"budget_ns":5}])"),
+      "$.policies.component_streams: duplicate");
+  expect_decode_error_containing(document_for("[" + row_prefix + "}]"),
+                                 "$.policies.component_streams[0]: expected "
+                                 "at least one");
+  expect_decode_error_containing(
+      document_for("[" + row_prefix + R"(,"severity":"fatal"}])"),
+      "$.policies.component_streams[0].severity");
+  expect_decode_error_containing(
+      document_for("[" + row_prefix + R"(,"recovery":"never"}])"),
+      "$.policies.component_streams[0].recovery");
+  expect_decode_error_containing(
+      document_for("[" + row_prefix + R"(,"budget_ns":0}])"),
+      "$.policies.component_streams[0].budget_ns");
+  expect_decode_error_containing(
+      document_for("[" + row_prefix + R"(,"severity":"fault","recovery":"auto"}])"),
+      "$.policies.component_streams[0].recovery: severity fault requires "
+      "recovery ack");
+  expect_decode_error_containing(
+      document_for("[" + row_prefix + R"(,"timestamp_source":"arrival"}])"),
+      "unknown field 'timestamp_source'");
+  expect_decode_error_containing(
+      document_for(
+          R"([{"controllable_component_id":"octomap_1","stream_id":"Map","severity":"fault"}])"),
+      "$.policies.component_streams[0].stream_id");
+  expect_decode_error_containing(document_for("{}"),
+                                 "$.policies.component_streams: expected "
+                                 "array");
+}
+
+TEST(DeploymentApplicabilityCodec, ScenePoseDeadbandIsOptionalNonnegative) {
+  const auto document_for = [](const std::string &extra) {
+    auto policies = interrupt_policy_envelope("", "");
+    policies.pop_back();
+    return with_policies(
+        minimal_document(),
+        policies +
+            R"(,"scene_pose_sources":[{"source_id":"camera","scene_resource_id":"part","apply_policy":"continuous")" +
+            extra + "}]}");
+  };
+  // Default 0, and a zero deadband stays absent from the normalized form.
+  for (const auto *absent : {"", R"(,"deadband_translation_m":0)"}) {
+    const auto plain = decode(document_for(absent));
+    const auto &row = plain.value().scene_pose_sources.front();
+    EXPECT_EQ(row.deadband_translation_m, 0.0);
+    EXPECT_EQ(row.deadband_rotation_rad, 0.0);
+    EXPECT_EQ(canonical_json(*plain.normalized_policies())
+                  .find("deadband"),
+              std::string::npos);
+  }
+  const auto banded = decode(document_for(
+      R"(,"deadband_translation_m":0.0001,"deadband_rotation_rad":0.0002)"));
+  const auto &row = banded.value().scene_pose_sources.front();
+  EXPECT_DOUBLE_EQ(row.deadband_translation_m, 0.0001);
+  EXPECT_DOUBLE_EQ(row.deadband_rotation_rad, 0.0002);
+  const auto revisioned = compute_capability_provider_binding_revisions(banded);
+  EXPECT_EQ(revisioned.value().scene_pose_sources,
+            banded.value().scene_pose_sources);
+  EXPECT_EQ(revisioned.normalized_policies(), banded.normalized_policies());
+  EXPECT_NE(canonical_json(*banded.normalized_policies())
+                .find(R"("deadband_rotation_rad":0.0002)"),
+            std::string::npos);
+  for (const auto *invalid :
+       {R"(,"deadband_translation_m":-0.1)", R"(,"deadband_rotation_rad":"1")",
+        R"(,"deadband_rotation_rad":null)", R"(,"deadband":0.1)"})
+    EXPECT_THROW(decode(document_for(invalid)), std::invalid_argument);
+}
+
+TEST(DeploymentApplicabilityCodec,
      MotionTakeoverBudgetIsOptionalPositiveAndPreserved) {
   const auto document_for = [](std::string_view value) {
     auto policies = interrupt_policy_envelope("", "");
