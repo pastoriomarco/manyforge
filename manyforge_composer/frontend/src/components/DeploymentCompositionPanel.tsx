@@ -29,6 +29,7 @@ import type {
   ManualControlGripperDescriptor,
   ManualControlMotionDescriptor,
 } from '../types/robotControl';
+import type { CarriedObjectLostSignalChoice } from '../utils/systemSignalAuthoring';
 
 export interface ComponentOverviewInput {
   request: number;
@@ -63,6 +64,8 @@ interface DeploymentCompositionPanelProps {
   programSceneIds?: readonly string[] | null;
   /** The Applied Program's execution group ids; null when no Program is applied. */
   executionGroupIds?: readonly string[] | null;
+  systemSignalChoices?: readonly CarriedObjectLostSignalChoice[];
+  systemSignalsNeedApply?: boolean;
   /** The workbench's single observation of the advertised maintenance
    * operation; this panel observes only an inventory-selected operation. */
   maintenanceStatus: ReturnType<typeof useManagerApplyStatus>;
@@ -112,6 +115,8 @@ export function DeploymentCompositionPanel({
   programKeys,
   programSceneIds = null,
   executionGroupIds = null,
+  systemSignalChoices = [],
+  systemSignalsNeedApply = false,
   maintenanceStatus: advertisedStatus,
 }: DeploymentCompositionPanelProps) {
   const refreshDeploymentWorkspace = deploymentController.refresh;
@@ -260,6 +265,8 @@ export function DeploymentCompositionPanel({
             programKeys={programKeys}
             executionGroupIds={executionGroupIds}
             programSceneIds={programSceneIds}
+            systemSignalChoices={systemSignalChoices}
+            systemSignalsNeedApply={systemSignalsNeedApply}
           />
           <details className="dcard">
             <summary>Advanced compiled Deployment artifact</summary>

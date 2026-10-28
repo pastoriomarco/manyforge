@@ -579,6 +579,8 @@ CanonicalValue CurrentStopFaultLatch() {
       {"graph_revision", CanonicalValue(Digest('6'))},
       {"latch_generation", CanonicalValue(1.0)},
       {"latch_id", CanonicalValue("stop-fault.test.1")},
+      {"observed_triggers",
+       CanonicalValue(CanonicalValue::Array{CanonicalValue("escalated")})},
       {"persistence_degraded", CanonicalValue(false)},
       {"reason_code", CanonicalValue("stop_escalated")},
       {"recovery_assessment_revision", CanonicalValue(1.0)},
@@ -4968,7 +4970,7 @@ TEST(HeadlessApiCore, PreviousSessionNoticeBulkAcknowledgementUsesTheSameRetaine
 
 namespace {
 CanonicalValue RuntimeFaultSnapshot(const std::string &epoch, bool runner,
-                                    bool journal) {
+                                    bool journal, bool internal = false) {
   const CanonicalValue journal_fact(CanonicalValue::Object{
       {"request_owner_epoch", CanonicalValue(epoch)},
       {"write_kind", CanonicalValue("state_observed")},
@@ -4999,10 +5001,19 @@ CanonicalValue RuntimeFaultSnapshot(const std::string &epoch, bool runner,
            {"cycle_claim_generation", CanonicalValue(1.0)},
            {"terminal_or_settlement_reference", CanonicalValue(nullptr)},
            {"accepted_reset", CanonicalValue(nullptr)}})}});
+  const CanonicalValue internal_fact(CanonicalValue::Object{
+      {"request_owner_epoch", CanonicalValue(epoch)},
+      {"reason_code",
+       CanonicalValue("scheduler_runtime_safety_callback_exception")},
+      {"stop_accepted", CanonicalValue(false)},
+      {"stop_refusal_code", CanonicalValue("stop_operation_not_fenceable")},
+      {"later_count", CanonicalValue(3.0)}});
   return CanonicalValue(CanonicalValue::Object{
       {"operation_journal_write_fault",
        journal ? journal_fact : CanonicalValue(nullptr)},
-      {"program_runner_loss", runner ? runner_fact : CanonicalValue(nullptr)}});
+      {"program_runner_loss", runner ? runner_fact : CanonicalValue(nullptr)},
+      {"kernel_internal_fault",
+       internal ? internal_fact : CanonicalValue(nullptr)}});
 }
 } // namespace
 
@@ -5041,6 +5052,55 @@ TEST(HeadlessApiCore, PublicationFaultKeepsItsActualPredicateAndDiagnostic) {
       AlarmFor(retained, "manyforge.runtime.program_runner_loss");
   ASSERT_NE(same, nullptr);
   EXPECT_EQ(*same, *alarm);
+}
+
+TEST(HeadlessApiCore, KernelInternalFaultRaisesItsTypedCauseOnce) {
+  TemporaryDirectory directory;
+  HeadlessApiCore core(Config(directory, "api.epoch.1"), Clocks());
+  const auto facts = RuntimeFaultSnapshot("kernel.1", false, false, true);
+  EXPECT_TRUE(
+      Member(core.ObserveRuntimeFaultConditions("kernel.1", facts), "changed")
+          .as_bool());
+  const auto snapshot = core.AlarmSnapshot();
+  const auto *alarm =
+      AlarmFor(snapshot, "manyforge.runtime.kernel_internal_fault");
+  ASSERT_NE(alarm, nullptr);
+  EXPECT_EQ(Text(*alarm, "lifecycle_state"), "active_unacknowledged");
+  EXPECT_EQ(Text(Member(*alarm, "details"), "reason_code"),
+            "scheduler_runtime_safety_callback_exception");
+  // A refused containment Full Stop is visible with its refusal code.
+  EXPECT_FALSE(Member(Member(*alarm, "details"), "stop_accepted").as_bool());
+  EXPECT_EQ(Text(Member(*alarm, "details"), "stop_refusal_code"),
+            "stop_operation_not_fenceable");
+  EXPECT_EQ(Text(Member(*alarm, "correlations"), "source_owner_epoch"),
+            "kernel.1");
+  // A higher later_count is the same fault: no second activation.
+  EXPECT_FALSE(
+      Member(core.ObserveRuntimeFaultConditions(
+                 "kernel.1",
+                 WithField(facts, "kernel_internal_fault",
+                           WithField(Member(facts, "kernel_internal_fault"),
+                                     "later_count", CanonicalValue(9.0)))),
+             "changed")
+          .as_bool());
+  auto unknown = Member(facts, "kernel_internal_fault");
+  unknown = WithField(unknown, "reason_code", CanonicalValue(""));
+  EXPECT_THROW(static_cast<void>(core.ObserveRuntimeFaultConditions(
+                   "kernel.1", WithField(facts, "kernel_internal_fault", unknown))),
+               std::exception);
+  // A refusal code exactly when the Full Stop was refused.
+  const auto accepted_with_code = WithField(Member(facts, "kernel_internal_fault"),
+                                            "stop_accepted", CanonicalValue(true));
+  EXPECT_THROW(static_cast<void>(core.ObserveRuntimeFaultConditions(
+                   "kernel.1",
+                   WithField(facts, "kernel_internal_fault", accepted_with_code))),
+               std::exception);
+  const auto refused_without_code = WithField(Member(facts, "kernel_internal_fault"),
+                                              "stop_refusal_code", CanonicalValue(nullptr));
+  EXPECT_THROW(static_cast<void>(core.ObserveRuntimeFaultConditions(
+                   "kernel.1",
+                   WithField(facts, "kernel_internal_fault", refused_without_code))),
+               std::exception);
 }
 
 TEST(HeadlessApiCore,
@@ -5155,6 +5215,8 @@ TEST(HeadlessApiCore,
   const std::string message(1024U, '\x01');
   auto fields = RuntimeFaultSnapshot(native_identity, true, true).as_object();
   for (auto &[kind, fact] : fields) {
+    if (fact.is_null()) // kernel_internal_fault is absent in this snapshot
+      continue;
     auto members = fact.as_object();
     for (auto &[key, value] : members) {
       if (kind == "operation_journal_write_fault") {

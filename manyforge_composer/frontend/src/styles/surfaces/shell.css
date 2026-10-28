@@ -940,9 +940,15 @@
   margin-left: 0.3rem;
   place-items: center;
   border-radius: var(--mf-radius-pill);
+  color: var(--mf-text-danger-81);
+  background: var(--mf-bg-danger-23);
+  font-size: var(--mf-font-size-058);
+}
+
+/* Warnings block nothing: counted apart from errors. */
+.global-attention-count.warning {
   color: var(--mf-text-warning-92);
   background: var(--mf-bg-warning-29);
-  font-size: var(--mf-font-size-058);
 }
 
 .global-surface-launchers > .global-settings-button {

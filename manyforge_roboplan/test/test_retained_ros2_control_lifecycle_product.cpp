@@ -4,10 +4,20 @@
 
 #include <gtest/gtest.h>
 #include <manyforge_core/component_lifecycle_plan_catalog_codec.hpp>
+#include <manyforge_core/component_lifecycle_plan_evaluator.hpp>
+#include <manyforge_core/types/lifecycle_cause.hpp>
 #include <manyforge_core/observed_robot_state_publication.hpp>
 #include <manyforge_core/time/fake_clock.hpp>
 #include <manyforge_core/time/manual_scheduler.hpp>
 #include <manyforge_roboplan/retained_ros2_control_lifecycle_product.hpp>
+#include <manyforge_xarm_control/lifecycle_profile.hpp>
+
+#include <algorithm>
+#include <stdexcept>
+#include <string>
+#include <string_view>
+#include <utility>
+#include <vector>
 
 namespace manyforge::roboplan_backend {
 namespace {
@@ -260,6 +270,196 @@ TEST(RetainedRos2ControlLifecycleProductTest,
     EXPECT_EQ(ingress->frames, 0U);
   }
   EXPECT_TRUE(actual_driver.expired());
+}
+
+// Live defect (2026-10-27, Real Lite 6 with its no-output pneumatic gripper):
+// the gripper domain shared the Real arm's catalog, whose only Recover target
+// (`disabled`) is eligible only for a degraded/faulted arm, so no target was
+// common and Recover failed `no_common_recover_target` before `clean_error`.
+namespace real_recover {
+
+constexpr std::string_view kRevision =
+    "sha256:1111111111111111111111111111111111111111111111111111111111111111";
+
+[[nodiscard]] core::BrandLifecyclePlanCatalogDTO
+Catalog(std::string_view id, std::vector<core::LifecycleIntentPlanDTO> plans) {
+  auto made = core::MakeBrandLifecyclePlanCatalog(
+      core::ProviderManifestId(std::string(id)),
+      core::ProviderManifestRevision(std::string(kRevision)), std::move(plans));
+  if (!made.ok()) throw std::logic_error(made.error().message);
+  return made.value();
+}
+
+[[nodiscard]] core::LifecycleFactDTO Fact(std::string_view id, bool value) {
+  return {core::LifecycleFactId(std::string(id)),
+          {core::LifecycleFactValueKindDTO::kBoolean, value, std::nullopt,
+           std::nullopt}};
+}
+
+[[nodiscard]] core::LifecycleFactDTO
+Cause(core::LifecycleBlockingCauseClassDTO cause) {
+  return {core::LifecycleFactId(std::string(core::kLifecycleBlockingCauseFactId)),
+          {core::LifecycleFactValueKindDTO::kToken, std::nullopt, std::nullopt,
+           std::string(core::to_string(cause))}};
+}
+
+[[nodiscard]] core::LifecycleRecoverSelectionInput
+Input(std::string_view domain, std::string_view instance,
+      core::BrandLifecyclePlanCatalogDTO catalog,
+      core::ComponentLifecycleStateDTO state,
+      std::vector<core::LifecycleFactDTO> facts) {
+  std::sort(facts.begin(), facts.end(), [](const auto &left, const auto &right) {
+    return left.lifecycle_fact_id < right.lifecycle_fact_id;
+  });
+  core::ResolvedLifecycleProviderOccurrenceDTO occurrence{
+      core::ControlDomainId(std::string(domain)),
+      core::ControlDomainRevision("domain-revision"),
+      core::ProviderInstanceId(std::string(instance)),
+      catalog.provider_manifest_id,
+      catalog.provider_manifest_revision,
+      core::RuntimeUnitId("robot_cell.ros2_control_execution"),
+      core::RuntimeEpoch("runtime-epoch.1"),
+      catalog.catalog_digest};
+  core::BrandLifecycleObservationDTO observation{
+      core::LifecycleTransactionId("lifecycle.1"),
+      core::LifecycleTransactionGeneration(1U),
+      core::ControllableComponentId("lite6_robot"),
+      occurrence.control_domain_id,
+      occurrence.control_domain_revision,
+      occurrence.provider_instance_id,
+      occurrence.provider_manifest_id,
+      occurrence.provider_manifest_revision,
+      occurrence.provider_runtime_unit_id,
+      occurrence.provider_runtime_epoch,
+      1U,
+      1U,
+      10,
+      20,
+      30,
+      state,
+      std::move(facts)};
+  return {std::move(occurrence), std::move(catalog), std::move(observation)};
+}
+
+/// The Real arm after an emergency stop at start-up: not armed, vendor error.
+[[nodiscard]] core::LifecycleRecoverSelectionInput EmergencyStoppedArm() {
+  return Input(
+      "lite6_robot.arm.control", "lite6_robot.ros2_control",
+      Catalog(xarm_control::kXArmRos2ControlLifecycleProviderManifestId,
+              xarm_control::make_xarm_ros2_control_lifecycle_plans()),
+      core::ComponentLifecycleStateDTO::kFaulted,
+      {Fact(core::kDeviceAcceptsCommandsFactId, false),
+       Fact(core::kDeviceErrorPresentFactId, true),
+       Fact(core::kDeviceWarningPresentFactId, false),
+       Fact("external.broadcaster_active", true),
+       Fact("external.controller_active", false),
+       Fact("external.controller_configuration_ready", false),
+       Fact("external.controller_inactive_unrequested", false),
+       Fact("external.controller_loaded", false),
+       Fact("external.controller_spawned", true),
+       Fact("external.fault_present", true),
+       Fact("external.hardware_active", false),
+       Fact("external.measured_joints_valid", true),
+       Fact("external.transport_ready", true),
+       Cause(core::LifecycleBlockingCauseClassDTO::kEmergencyStop)});
+}
+
+/// The no-output pneumatic gripper: its logical owner is ready (active).
+[[nodiscard]] core::LifecycleRecoverSelectionInput
+NoOutputGripper(std::string_view manifest, std::string_view instance,
+                std::vector<core::LifecycleIntentPlanDTO> plans) {
+  return Input("lite6_robot.gripper.control", instance,
+               Catalog(manifest, std::move(plans)),
+               core::ComponentLifecycleStateDTO::kActive,
+               {Fact("external.controller_configuration_ready", true),
+                Fact("external.controller_inactive_unrequested", false),
+                Fact("external.controller_loaded", true),
+                Fact("external.fault_present", false),
+                Fact("external.transport_ready", true),
+                Cause(core::LifecycleBlockingCauseClassDTO::kNone)});
+}
+
+} // namespace real_recover
+
+TEST(RetainedRos2ControlLifecycleProductTest,
+     RealArmWithNoOutputGripperRecoversToDisabledAndClearsTheArmError) {
+  using Intent = core::ComponentLifecycleIntentKindDTO;
+  using State = core::ComponentLifecycleStateDTO;
+  const auto arm = real_recover::EmergencyStoppedArm();
+  const auto gripper = real_recover::NoOutputGripper(
+      kXArmRos2ControlGripperLifecycleProviderManifestId,
+      "lite6_robot.ros2_control.gripper",
+      retained_ros2_control_gripper_lifecycle_plans());
+
+  // The live failure: the gripper on the arm's catalog has no common target.
+  const auto shared = real_recover::NoOutputGripper(
+      xarm_control::kXArmRos2ControlLifecycleProviderManifestId,
+      "lite6_robot.ros2_control",
+      xarm_control::make_xarm_ros2_control_lifecycle_plans());
+  const auto refused = core::SelectCommonRecoverTarget({arm, shared});
+  ASSERT_FALSE(refused.ok());
+  EXPECT_EQ(refused.error().code, "component_lifecycle_recover_target_missing");
+  EXPECT_EQ(refused.error().details.at("reason"), "no_common_recover_target");
+
+  // Fixed: the gripper's own provider shares the arm's `disabled` target.
+  const auto target = core::SelectCommonRecoverTarget({arm, gripper});
+  ASSERT_TRUE(target.ok()) << target.error().message;
+  EXPECT_EQ(target.value(), State::kDisabled);
+  // The arm dispatches the vendor `clean_error`...
+  const auto arm_step =
+      core::EvaluateLifecycleDomainPlan(Intent::kRecover, target.value(),
+                                        arm.lifecycle_plan_catalog,
+                                        arm.fresh_observation);
+  ASSERT_TRUE(arm_step.ok()) << arm_step.error().message;
+  ASSERT_EQ(arm_step.value().kind,
+            core::LifecycleDomainPlanDecisionKind::kDispatchPrimitive);
+  ASSERT_TRUE(arm_step.value().selected_transition.has_value());
+  EXPECT_EQ(arm_step.value().selected_transition->lifecycle_primitive_id.value(),
+            xarm_control::kXArmClearErrorPrimitiveId);
+  // ...while the healthy gripper has nothing to clear and dispatches nothing.
+  const auto gripper_step =
+      core::EvaluateLifecycleDomainPlan(Intent::kRecover, target.value(),
+                                        gripper.lifecycle_plan_catalog,
+                                        gripper.fresh_observation);
+  ASSERT_TRUE(gripper_step.ok()) << gripper_step.error().message;
+  EXPECT_EQ(gripper_step.value().kind,
+            core::LifecycleDomainPlanDecisionKind::kAlreadySatisfied);
+
+  // The target driver's next Prepare/Enable need nothing from the active
+  // gripper (shared plans, as on Mock and Isaac).
+  for (const auto &[intent, state] :
+       {std::pair{Intent::kPrepare, State::kPrepared},
+        std::pair{Intent::kEnable, State::kActive}}) {
+    const auto next = core::EvaluateLifecycleDomainPlan(
+        intent, state, gripper.lifecycle_plan_catalog, gripper.fresh_observation);
+    ASSERT_TRUE(next.ok()) << next.error().message;
+    EXPECT_EQ(next.value().kind,
+              core::LifecycleDomainPlanDecisionKind::kAlreadySatisfied);
+  }
+}
+
+TEST(RetainedRos2ControlLifecycleProductTest,
+     MaintainedRealGripperManifestAnchorsTheGripperPlans) {
+  // The generator's `xarm_ros2_control_gripper_lifecycle_plans` mirrors these
+  // plans; resources/maintained/catalog/provider_manifest/
+  // manyforge.provider.ros2_control.xarm.gripper.json carries this digest.
+  const auto semantic = core::ComputeBrandLifecyclePlanCatalogSemanticDigest(
+      core::ProviderManifestId(
+          std::string(kXArmRos2ControlGripperLifecycleProviderManifestId)),
+      retained_ros2_control_gripper_lifecycle_plans());
+  ASSERT_TRUE(semantic.ok()) << semantic.error().message;
+  EXPECT_EQ(semantic.value().value(),
+            "sha256:4146867fc28c6f84d1167879a54dd189edd208a175dfcb31dfc061e5f082bc97");
+  // Only the Recover row differs from the shared plans.
+  auto plans = retained_ros2_control_gripper_lifecycle_plans();
+  auto shared = retained_ros2_control_lifecycle_plans();
+  ASSERT_EQ(plans.size(), shared.size());
+  EXPECT_EQ(plans.back().intent, core::ComponentLifecycleIntentKindDTO::kRecover);
+  EXPECT_EQ(plans.back().requested_state, core::ComponentLifecycleStateDTO::kDisabled);
+  EXPECT_TRUE(plans.back().transitions.empty());
+  plans.pop_back();
+  shared.pop_back();
+  EXPECT_EQ(plans, shared);
 }
 
 } // namespace

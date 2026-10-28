@@ -56,6 +56,16 @@ inline constexpr std::string_view kDeviceErrorPresentFactId = "device.error_pres
 inline constexpr std::string_view kDeviceWarningPresentFactId = "device.warning_present";
 inline constexpr std::string_view kDeviceMotionEnabledFactId = "device.motion_enabled";
 inline constexpr std::string_view kDeviceAcceptsCommandsFactId = "device.accepts_commands";
+/// m5.5: the armed robot was moved or its mode/state changed from its own
+/// interface without an error, and the adapter's policy lets ManyForge re-arm
+/// it (`external_move_rearm: automatic`). Reported only when true, from the
+/// change until ManyForge's own arming completes. The CCLC target driver
+/// decides: on an idle cell a non-blocking condition, re-armed at the next
+/// ManyForge motion command; otherwise the `external_control` incident.
+inline constexpr std::string_view kDeviceMovedExternallyFactId = "device.moved_externally";
+/// m5.5: reported with `device.moved_externally`: the robot's controller
+/// still reports motion, so it is not re-armed now.
+inline constexpr std::string_view kDeviceInMotionFactId = "device.in_motion";
 
 [[nodiscard]] constexpr std::string_view to_string(
     const LifecycleBlockingCauseClassDTO value) noexcept {

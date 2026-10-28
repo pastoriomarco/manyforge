@@ -7207,6 +7207,36 @@
                     }
                   },
                   {
+                    "not": {
+                      "allOf": [
+                        {
+                          "properties": {
+                            "parameters": {
+                              "required": [
+                                "on_grasp_lost"
+                              ]
+                            }
+                          },
+                          "required": [
+                            "parameters"
+                          ]
+                        },
+                        {
+                          "properties": {
+                            "value_sources": {
+                              "required": [
+                                "on_grasp_lost"
+                              ]
+                            }
+                          },
+                          "required": [
+                            "value_sources"
+                          ]
+                        }
+                      ]
+                    }
+                  },
+                  {
                     "$ref": "#/$defs/s_f32141df5dcacbc2"
                   },
                   {
@@ -7260,6 +7290,32 @@
                         "exclusiveMinimum": 0.0,
                         "type": "number"
                       },
+                      "on_grasp_lost": {
+                        "additionalProperties": false,
+                        "properties": {
+                          "detach": {
+                            "type": "boolean"
+                          },
+                          "raise_alarm": {
+                            "type": "boolean"
+                          },
+                          "set_key": {
+                            "anyOf": [
+                              {
+                                "type": "string",
+                                "x-manyforge-semantic-type": "blackboard_key"
+                              },
+                              {
+                                "type": "null"
+                              }
+                            ]
+                          },
+                          "stop_motion": {
+                            "type": "boolean"
+                          }
+                        },
+                        "type": "object"
+                      },
                       "scene_resource_id": {
                         "type": "string",
                         "x-manyforge-semantic-type": "scene_resource"
@@ -7289,6 +7345,9 @@
                         "$ref": "#/$defs/s_239060e26cdf11f6"
                       },
                       "grasp_lost_translation_m": {
+                        "$ref": "#/$defs/s_239060e26cdf11f6"
+                      },
+                      "on_grasp_lost": {
                         "$ref": "#/$defs/s_239060e26cdf11f6"
                       },
                       "scene_resource_id": {
@@ -10295,6 +10354,36 @@
                     }
                   },
                   {
+                    "not": {
+                      "allOf": [
+                        {
+                          "properties": {
+                            "parameters": {
+                              "required": [
+                                "on_grasp_lost"
+                              ]
+                            }
+                          },
+                          "required": [
+                            "parameters"
+                          ]
+                        },
+                        {
+                          "properties": {
+                            "value_sources": {
+                              "required": [
+                                "on_grasp_lost"
+                              ]
+                            }
+                          },
+                          "required": [
+                            "value_sources"
+                          ]
+                        }
+                      ]
+                    }
+                  },
+                  {
                     "$ref": "#/$defs/s_f32141df5dcacbc2"
                   },
                   {
@@ -10392,6 +10481,32 @@
                         "exclusiveMinimum": 0.0,
                         "type": "number"
                       },
+                      "on_grasp_lost": {
+                        "additionalProperties": false,
+                        "properties": {
+                          "detach": {
+                            "type": "boolean"
+                          },
+                          "raise_alarm": {
+                            "type": "boolean"
+                          },
+                          "set_key": {
+                            "anyOf": [
+                              {
+                                "type": "string",
+                                "x-manyforge-semantic-type": "blackboard_key"
+                              },
+                              {
+                                "type": "null"
+                              }
+                            ]
+                          },
+                          "stop_motion": {
+                            "type": "boolean"
+                          }
+                        },
+                        "type": "object"
+                      },
                       "scene_resource_id": {
                         "type": "string",
                         "x-manyforge-semantic-type": "scene_resource"
@@ -10425,6 +10540,9 @@
                         "$ref": "#/$defs/s_239060e26cdf11f6"
                       },
                       "grasp_lost_translation_m": {
+                        "$ref": "#/$defs/s_239060e26cdf11f6"
+                      },
+                      "on_grasp_lost": {
                         "$ref": "#/$defs/s_239060e26cdf11f6"
                       },
                       "scene_resource_id": {
@@ -15593,6 +15711,36 @@
                     }
                   },
                   {
+                    "not": {
+                      "allOf": [
+                        {
+                          "properties": {
+                            "parameters": {
+                              "required": [
+                                "on_grasp_lost"
+                              ]
+                            }
+                          },
+                          "required": [
+                            "parameters"
+                          ]
+                        },
+                        {
+                          "properties": {
+                            "value_sources": {
+                              "required": [
+                                "on_grasp_lost"
+                              ]
+                            }
+                          },
+                          "required": [
+                            "value_sources"
+                          ]
+                        }
+                      ]
+                    }
+                  },
+                  {
                     "$ref": "#/$defs/s_f32141df5dcacbc2"
                   },
                   {
@@ -15690,6 +15838,32 @@
                         "exclusiveMinimum": 0.0,
                         "type": "number"
                       },
+                      "on_grasp_lost": {
+                        "additionalProperties": false,
+                        "properties": {
+                          "detach": {
+                            "type": "boolean"
+                          },
+                          "raise_alarm": {
+                            "type": "boolean"
+                          },
+                          "set_key": {
+                            "anyOf": [
+                              {
+                                "type": "string",
+                                "x-manyforge-semantic-type": "blackboard_key"
+                              },
+                              {
+                                "type": "null"
+                              }
+                            ]
+                          },
+                          "stop_motion": {
+                            "type": "boolean"
+                          }
+                        },
+                        "type": "object"
+                      },
                       "scene_resource_id": {
                         "type": "string",
                         "x-manyforge-semantic-type": "scene_resource"
@@ -15723,6 +15897,9 @@
                         "$ref": "#/$defs/s_239060e26cdf11f6"
                       },
                       "grasp_lost_translation_m": {
+                        "$ref": "#/$defs/s_239060e26cdf11f6"
+                      },
+                      "on_grasp_lost": {
                         "$ref": "#/$defs/s_239060e26cdf11f6"
                       },
                       "scene_resource_id": {
@@ -22733,6 +22910,36 @@
                 }
               },
               {
+                "not": {
+                  "allOf": [
+                    {
+                      "properties": {
+                        "parameters": {
+                          "required": [
+                            "on_grasp_lost"
+                          ]
+                        }
+                      },
+                      "required": [
+                        "parameters"
+                      ]
+                    },
+                    {
+                      "properties": {
+                        "value_sources": {
+                          "required": [
+                            "on_grasp_lost"
+                          ]
+                        }
+                      },
+                      "required": [
+                        "value_sources"
+                      ]
+                    }
+                  ]
+                }
+              },
+              {
                 "$ref": "#/$defs/s_f32141df5dcacbc2"
               },
               {
@@ -22815,6 +23022,32 @@
                     "exclusiveMinimum": 0.0,
                     "type": "number"
                   },
+                  "on_grasp_lost": {
+                    "additionalProperties": false,
+                    "properties": {
+                      "detach": {
+                        "type": "boolean"
+                      },
+                      "raise_alarm": {
+                        "type": "boolean"
+                      },
+                      "set_key": {
+                        "anyOf": [
+                          {
+                            "type": "string",
+                            "x-manyforge-semantic-type": "blackboard_key"
+                          },
+                          {
+                            "type": "null"
+                          }
+                        ]
+                      },
+                      "stop_motion": {
+                        "type": "boolean"
+                      }
+                    },
+                    "type": "object"
+                  },
                   "scene_resource_id": {
                     "type": "string",
                     "x-manyforge-semantic-type": "scene_resource"
@@ -22844,6 +23077,9 @@
                     "$ref": "#/$defs/s_239060e26cdf11f6"
                   },
                   "grasp_lost_translation_m": {
+                    "$ref": "#/$defs/s_239060e26cdf11f6"
+                  },
+                  "on_grasp_lost": {
                     "$ref": "#/$defs/s_239060e26cdf11f6"
                   },
                   "scene_resource_id": {

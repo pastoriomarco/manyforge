@@ -396,6 +396,7 @@ def _capture_ros_bootstrap_project(
         derive_candidate,
         validate_invariants,
     )
+    from manyforge_composer.backend.deployment_intent import MODEL_FREE_RUNTIME_KINDS
     from manyforge_composer.backend.scenario_artifacts import (
         ScenarioArtifactError,
         capture_scenario_artifact,
@@ -412,11 +413,16 @@ def _capture_ros_bootstrap_project(
             for component in (deployment or {}).get("components", [])
             if "runtime_kind" in component.get("configuration", {})
         }
-        # Model-free pose sources run inside the same ROS execution host.
-        if runtime_kinds - {"pose_source"} != {"ros2_control"}:
+        # Model-free components (I/O providers, pose sources, AI models) run
+        # inside the same ROS execution host. The activation preparer remains
+        # the real gate; this only refuses what ROS startup cannot run.
+        if "ros2_control" not in runtime_kinds or not runtime_kinds <= (
+            {"ros2_control"} | MODEL_FREE_RUNTIME_KINDS
+        ):
             raise WorkbenchError(
-                "ROS startup requires an intended first Scenario with only "
-                "ros2_control execution components"
+                "ROS startup requires an intended first Scenario with a "
+                "ros2_control execution component and otherwise only I/O "
+                "provider, pose source or AI model components"
             )
         catalog = build_node_environment().catalog
         authoring = scenario["program_draft"]
@@ -937,6 +943,8 @@ class Workbench:
                 f"program-runner.{self.operator_instance_id or 'development-workbench'}",
                 "--persistent-key-register-path",
                 str(_persistent_key_register_path()),
+                "--snapshot-url",
+                f"http://127.0.0.1:{self.composer_port}/api/scene/snapshot/render",
                 *self._simulation_control_arguments(),
             ),
         )

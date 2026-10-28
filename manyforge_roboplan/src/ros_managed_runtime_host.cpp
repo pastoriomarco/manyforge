@@ -72,6 +72,7 @@
 #include <manyforge_deployment/artifact_codec.hpp>
 #include <manyforge_deployment/apply_component_delta.hpp>
 #include <manyforge_deployment/model_source.hpp>
+#include <manyforge_deployment/prepared_activation_input.hpp>
 #include <manyforge_deployment/native_execution_runtime_contract.hpp>
 #include <manyforge_deployment/ros2_control_execution_runtime_contract.hpp>
 #include <manyforge_deployment/program_binding.hpp>
@@ -5410,9 +5411,16 @@ void PrepareCompositionIoResources(Composition &composition,
   });
   auto transport = shared_transport;
   const bool created_transport = needs_ros && !transport;
-  if (created_transport)
+  if (created_transport) {
     transport = std::make_shared<ros2_control_execution::Ros2TransportResources>(
         "manyforge_generic_io", "/", 3U, ros_context_provider);
+    // No component health reads this host-wide transport: its executor fault
+    // contains the cell like any other safety-path callback throw.
+    transport->set_executor_fault_observer(
+        [scheduler = cell.scheduler()](const std::string_view reason_code) {
+          scheduler->contain_safety_path_fault(reason_code);
+        });
+  }
   composition.io_transport = transport;
   const auto prepared = PrepareCompositionIoProviderResources(composition, cell,
       transport ? transport->node() : nullptr, existing);
@@ -8842,10 +8850,18 @@ RunManagedRuntimeChild(const ManagedRuntimeChildConfig &config) {
       stable_kernel_owner->resource_admission_table());
   component_manager::detail::ManagerLivenessCommandAdmission
       manager_liveness_admission;
+  auto manager_liveness_scheduler = std::make_unique<SimpleScheduler>(
+      SimpleSchedulerConfig::from_environment());
+  // Its RuntimeSafety Expire callback is a safety path: a throw contains the
+  // cell through the same sink as the shared scheduler. The stable Kernel is
+  // declared first, so it outlives this receiver and its workers.
+  manager_liveness_scheduler->set_safety_path_fault_sink(
+      [kernel = stable_kernel_owner](const std::string_view reason_code) {
+        kernel->ContainInternalFault(reason_code);
+      });
   component_manager::detail::ChildOwnedManagerLivenessReceiver
       manager_liveness_receiver(std::make_shared<WallClock>(),
-                                std::make_unique<SimpleScheduler>(
-                                    SimpleSchedulerConfig::from_environment()));
+                                std::move(manager_liveness_scheduler));
   NativeShutdownOwnerPhase receiver_destructor_phase{
       shutdown_projection, ShutdownPhase::kLivenessReceiverDestruction,
       manager_liveness_receiver};
@@ -9674,9 +9690,55 @@ RunManagedRuntimeChild(const ManagedRuntimeChildConfig &config) {
   // Read actual owner-issued lifecycle facts outside composition/Kernel locks.
   // The serial managed caller borrows the stable facade; product exchange must
   // exclude these reads through its accounted current-context pin.
+  // D6 (SX-365): the component has launch processes and every one is a drained
+  // process group (cleanup-proven, not an exited leader). No process at all
+  // (a processless I/O owner) or a local no-output owner never qualifies.
+  const auto component_processes_drained = [&](const core::ControllableComponentId &id) {
+    std::vector<std::shared_ptr<ControllerLaunchProcess>> processes;
+    bool local_no_output = false;
+    {
+      std::lock_guard lock(managed_composition_mutex);
+      std::shared_lock execution_lock(execution_composition.mutex);
+      const auto collect = [&](Composition *root) {
+        if (!root) return;
+        const auto include = [&](Composition &item) {
+          if (item.controllable_component_id != id) return;
+          // A local no-output owner or any I/O provider (its I/O effects are
+          // not proven settled) never qualifies (SX-374).
+          if (IsLocalNoOutputGripperOwner(item) ||
+              (item.io_provider_drivers && !item.io_provider_drivers->empty()))
+            local_no_output = true;
+          if (item.controller_process) processes.push_back(item.controller_process);
+        };
+        include(*root);
+        for (auto &peer : root->participant_compositions)
+          if (peer) include(*peer);
+      };
+      collect(active_managed_composition.get());
+      collect(execution_composition.current);
+    }
+    return !local_no_output && !processes.empty() &&
+           std::all_of(processes.begin(), processes.end(), [](const auto &process) {
+             return process->cleanup_observation().state ==
+                    ControllerLaunchCleanupState::kDrained;
+           });
+  };
+  // D6: the Apply candidate is the verified canonical-empty one (its
+  // Manager-verified sealed origin), from any caller.
+  const auto canonical_empty_apply = [&](const component_manager::ManagerApplyIntentDTO &intent) {
+    try {
+      return deployment::prepared_receipt_is_canonical_empty_candidate(
+          content_identity::parse_canonical_json(intent.prepared_activation.canonical_receipt_json),
+          core::CellId(config.cell_id), intent.candidate_retained_bundle_id,
+          intent.candidate_graph_revision);
+    } catch (const std::exception &) {
+      return false;
+    }
+  };
   const auto require_inactive_changed_components =
       [&](const deployment::ApplyComponentDeltaDTO &delta,
-          const core::ActiveBundlePublicationReceiptDTO &predecessor) {
+          const core::ActiveBundlePublicationReceiptDTO &predecessor,
+          const bool canonical_empty_candidate) {
     Require(delta.valid() && predecessor.valid(),
             "configuration Apply has invalid delta/predecessor evidence");
     deployment::CCLCRuntimeComposition *facade = nullptr;
@@ -9697,7 +9759,14 @@ RunManagedRuntimeChild(const ManagedRuntimeChildConfig &config) {
                   fact.value().active_publication_receipt == predecessor,
               "configuration Apply cannot read the exact current component " +
                   change.controllable_component_id.value());
-      Require(fact.value().component_lifecycle_state != core::ComponentLifecycleStateDTO::kActive,
+      // D6 (D-M4-4): a component whose provider is gone (its Disable has no
+      // eligible step) still reads Active. Only an Apply of the verified
+      // canonical-empty candidate, from any caller, may remove it, once every
+      // launch process group is drained.
+      Require(fact.value().component_lifecycle_state != core::ComponentLifecycleStateDTO::kActive ||
+                  (canonical_empty_candidate &&
+                   change.disposition == deployment::ApplyComponentDisposition::kRemove &&
+                   component_processes_drained(change.controllable_component_id)),
               "configuration Apply cannot replace or remove Active component " +
                   change.controllable_component_id.value() + "; deactivate it first");
     }
@@ -9842,6 +9911,7 @@ RunManagedRuntimeChild(const ManagedRuntimeChildConfig &config) {
       configuration_parent_claim = stable_addressed_kernel()->ReadHeldCellAdmissionClaim(
           core::CellAdmissionClaimKindDTO::kAuthoringMutation);
     }
+    bool prepare_canonical_empty_candidate = false;
     if (configuration_parent_claim &&
         (configuration_parent_claim->intent.claim_kind == core::CellAdmissionClaimKindDTO::kAuthoringMutation ||
          configuration_parent_claim->intent.owner_transaction_id == request.apply_id.value())) {
@@ -9857,6 +9927,12 @@ RunManagedRuntimeChild(const ManagedRuntimeChildConfig &config) {
           detail += "; integrity_detail=" + found->second;
         Require(false, std::move(detail));
       }
+      prepare_canonical_empty_candidate =
+          canonical_empty_apply(parent.value().intent.intent) &&
+          parent.value().intent.intent.candidate_retained_bundle_id ==
+              request.candidate_projection_revision.retained_bundle_id &&
+          parent.value().intent.intent.candidate_graph_revision ==
+              request.candidate_projection_revision.graph_revision;
       if (parent.value().bring_up_plan) {
         Require(original_apply_bring_up_capture &&
                     original_apply_bring_up_capture->original_facade == current_cell_cclc() &&
@@ -9912,7 +9988,8 @@ RunManagedRuntimeChild(const ManagedRuntimeChildConfig &config) {
           predecessor.durable_public_pointer_content_digest == request.expected_predecessor_public_pointer_digest &&
           core::SameActiveDeployment(predecessor.request.candidate_projection_revision,
                                      request.predecessor_projection_revision))
-        require_inactive_changed_components(request.component_delta, predecessor);
+        require_inactive_changed_components(request.component_delta, predecessor,
+                                            prepare_canonical_empty_candidate);
     }
     const auto read_installed_receipts = [&] {
       const std::array<const Composition *, 1> actual_other_predecessors{
@@ -11094,6 +11171,16 @@ RunManagedRuntimeChild(const ManagedRuntimeChildConfig &config) {
     if (managed_composition_builder.joinable()) {
       managed_composition_builder.join();
     }
+    // Timing diagnostics for the install below: the whole install runs inside
+    // this one Manager exchange, whose budget is per installed component.
+    const auto install_started = std::chrono::steady_clock::now();
+    const auto install_ms = [&install_started] {
+      return std::chrono::duration_cast<std::chrono::milliseconds>(
+                 std::chrono::steady_clock::now() - install_started)
+          .count();
+    };
+    std::cerr << "native composition install: start apply="
+              << request.apply_id.value() << '\n';
 
     std::shared_ptr<host_detail::ExecutionProduct> prepared_logical_product;
     if (prepared_is_empty) {
@@ -11332,6 +11419,8 @@ RunManagedRuntimeChild(const ManagedRuntimeChildConfig &config) {
         fence_query, request.expected_predecessor_publication_generation,
         request.expected_predecessor_public_pointer_digest, [&] {
           std::unique_lock execution_lock(execution_composition.mutex);
+          std::cerr << "native composition install: fence and composition "
+                       "lock held elapsed_ms=" << install_ms() << '\n';
           Require(retired_managed_composition == nullptr &&
                       retired_registration_engines.empty(),
                   "a predecessor runtime engine remains lifetime-pinned");
@@ -11598,6 +11687,8 @@ RunManagedRuntimeChild(const ManagedRuntimeChildConfig &config) {
                      "participants: " +
                      reconfigured.error().message);
               }
+              std::cerr << "native composition install: Kernel reconfigured "
+                           "elapsed_ms=" << install_ms() << '\n';
               AdoptNativeCellParticipantResolverFactory(*prepared, std::move(staged_factory));
               const auto adopt_launch = [&](Composition &component) {
                 component.controller_launch_adopted = true;
@@ -11660,7 +11751,11 @@ RunManagedRuntimeChild(const ManagedRuntimeChildConfig &config) {
             // controller or issue a home goal; observed readiness remains NRT.
             for (const auto &[component_id, view] :
                  IndexNativeComponentCompositions(candidate)) {
-              static_cast<void>(component_id);
+              const auto component_started = install_ms();
+              std::cerr << "native composition install: component="
+                        << component_id.value()
+                        << " bring-up start elapsed_ms=" << component_started
+                        << '\n';
               if (view->ros2_control_runtime_handle)
                 view->ros2_control_runtime_handle->StartBackend();
               else
@@ -11671,6 +11766,9 @@ RunManagedRuntimeChild(const ManagedRuntimeChildConfig &config) {
                                   return record && record->resources_installed();
                                 }),
                         "installed component has no actual transport resources");
+              std::cerr << "native composition install: component="
+                        << component_id.value() << " bring-up done took_ms="
+                        << install_ms() - component_started << '\n';
             }
             if (original_apply_native_plan &&
                 original_apply_native_plan->apply ==
@@ -11702,8 +11800,13 @@ RunManagedRuntimeChild(const ManagedRuntimeChildConfig &config) {
             }
             InstallDirectSceneFrameResolver(projections, candidate);
 #if !defined(MANYFORGE_ENABLE_FOCUSED_PICK_PLACE_PLANNING_FIXTURE)
-            if (candidate.runtime != nullptr)
+            if (candidate.runtime != nullptr) {
+              const auto planning_started = install_ms();
               AttachProductPickPlacePlanningOwner(candidate);
+              std::cerr << "native composition install: pick-place planning "
+                           "owner attached took_ms="
+                        << install_ms() - planning_started << '\n';
+            }
 #endif
           }
           if (active_managed_composition) {
@@ -11749,6 +11852,8 @@ RunManagedRuntimeChild(const ManagedRuntimeChildConfig &config) {
           }
           installed_under_fence_composition_request = request;
           preparing_composition_request.reset();
+          std::cerr << "native composition install: installed elapsed_ms="
+                    << install_ms() << '\n';
         });
     } catch (...) {
       // Preparation was consumed. Preserve the first failure rather than
@@ -13932,7 +14037,7 @@ RunManagedRuntimeChild(const ManagedRuntimeChildConfig &config) {
                       "configuration Apply lacks its exact current/candidate products");
               require_inactive_changed_components(
                   deployment::derive_apply_component_delta(*previous->bundle, *candidate->bundle),
-                  predecessor);
+                  predecessor, canonical_empty_apply(parent.intent.intent));
               actual_candidate_product = candidate->bundle;
             }
             std::lock_guard lock(managed_composition_mutex);
@@ -14007,7 +14112,23 @@ RunManagedRuntimeChild(const ManagedRuntimeChildConfig &config) {
                                  {}});
                       }
                       return core::Result<void>::Ok();
-                    });
+                    },
+                    // D6: only the exact canonical-empty candidate (its
+                    // Manager-verified sealed origin) is admitted while Close
+                    // of a latched Scenario runs.
+                    [&] {
+                      const auto &apply = read.value().intent.intent;
+                      try {
+                        return deployment::prepared_receipt_is_canonical_empty_candidate(
+                            content_identity::parse_canonical_json(
+                                apply.prepared_activation.canonical_receipt_json),
+                            core::CellId(config.cell_id),
+                            apply.candidate_retained_bundle_id,
+                            apply.candidate_graph_revision);
+                      } catch (const std::exception &) {
+                        return false;
+                      }
+                    }());
             response =
                 acquired.ok()
                     ? component_manager::detail::KernelCellAdmissionRpcResponse(
@@ -14394,6 +14515,9 @@ public:
     composition_access_.detach_addressed_owner();
 #if defined(MANYFORGE_ENABLE_STANDALONE_ADMISSION_FIXTURE)
     DetachRetainedCCLC(*composition_);
+    // The generic I/O transport's executor fault reaches the cell
+    // scheduler's sink: quiesce it before the cell removes that sink.
+    if (composition_->io_transport) composition_->io_transport->quiesce();
     fixture_cell_runtime_.reset();
 #endif
   }

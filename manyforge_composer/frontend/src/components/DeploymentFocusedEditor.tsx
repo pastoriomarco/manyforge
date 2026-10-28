@@ -63,6 +63,7 @@ import type {
   ManualControlGripperDescriptor,
   ManualControlMotionDescriptor,
 } from '../types/robotControl';
+import type { CarriedObjectLostSignalChoice } from '../utils/systemSignalAuthoring';
 
 interface DeploymentFocusedEditorProps {
   controller: DeploymentWorkspaceController;
@@ -75,6 +76,8 @@ interface DeploymentFocusedEditorProps {
   stopChains?: readonly TargetStopChain[];
   /** The Applied Program's execution group ids; null when no Program is applied (contract 73). */
   executionGroupIds?: readonly string[] | null;
+  systemSignalChoices?: readonly CarriedObjectLostSignalChoice[];
+  systemSignalsNeedApply?: boolean;
   /** The Program Draft's scene object ids; null without a Program. */
   programSceneIds?: readonly string[] | null;
 }
@@ -1873,6 +1876,8 @@ export function DeploymentFocusedEditor({
   stopChains = NO_STOP_CHAINS,
   executionGroupIds = null,
   programSceneIds = null,
+  systemSignalChoices = [],
+  systemSignalsNeedApply = false,
 }: DeploymentFocusedEditorProps) {
   const document = controller.workspace?.draft.document ?? null;
   const geometricContactEndpoints = useMemo(() => {
@@ -1946,7 +1951,8 @@ export function DeploymentFocusedEditor({
       )}
       {document.api_version === 'manyforge.deployment_intent.v2' && (
         <GlobalInterruptRulesSection controller={controller} document={document} programKeys={programKeys}
-          stopChains={stopChains} executionGroupIds={executionGroupIds} />
+          stopChains={stopChains} executionGroupIds={executionGroupIds}
+          systemSignalChoices={systemSignalChoices} systemSignalsNeedApply={systemSignalsNeedApply} />
       )}
     </section>
   );
@@ -2245,6 +2251,7 @@ const IDLE_BEHAVIOUR_HELP = 'Full Stop only. Default: latches while a Program Ru
  */
 export function GlobalInterruptRulesSection({
   controller, document, programKeys, stopChains = NO_STOP_CHAINS, executionGroupIds = null,
+  systemSignalChoices = [], systemSignalsNeedApply = false,
 }: {
   controller: DeploymentWorkspaceController;
   document: Record<string, JsonValue>;
@@ -2254,13 +2261,15 @@ export function GlobalInterruptRulesSection({
   stopChains?: readonly TargetStopChain[];
   /** The Applied Program's execution group ids; null when no Program is applied. */
   executionGroupIds?: readonly string[] | null;
+  systemSignalChoices?: readonly CarriedObjectLostSignalChoice[];
+  systemSignalsNeedApply?: boolean;
 }) {
   const rows = globalRulesOf(document);
   const stopStages = useMemo(() => commonStopStages(stopChains), [stopChains]);
   // Operands of a new rule; each rule's own list adds the keys it reads that no Program declares.
   const choices = useMemo(
-    () => globalRuleChoices(document, programKeys, undefined),
-    [document, programKeys],
+    () => globalRuleChoices(document, programKeys, undefined, systemSignalChoices),
+    [document, programKeys, systemSignalChoices],
   );
   const [error, setError] = useState<string | null>(null);
   const disabled = !controller.mutationAvailable || controller.busy;
@@ -2280,7 +2289,7 @@ export function GlobalInterruptRulesSection({
         return at !== index && typeof id === 'string' ? [id] : [];
       });
       const problem = globalRuleProblem(next[index], others,
-        globalRuleChoices(document, programKeys, objectValue(next[index])?.condition));
+        globalRuleChoices(document, programKeys, objectValue(next[index])?.condition, systemSignalChoices));
       if (problem !== null) {
         setError(problem);
         return;
@@ -2305,6 +2314,9 @@ export function GlobalInterruptRulesSection({
       <summary>Global interrupt rules</summary>
       <div className="deployment-focused-body">
         <p className="field-help">A global rule stops the motion in its scope when its condition holds and either gates new motion until it clears or trips a Full Stop that the operator clears. It publishes the read-only key <code>interrupt_state.&lt;rule id&gt;</code> (clear, tripped or latched), always current. Program nodes react to a rule only through that key.</p>
+        {systemSignalsNeedApply && (
+          <p className="field-help">Apply to list system signals.</p>
+        )}
         {rows.length === 0 && <p className="muted">No global interrupt rule is declared.</p>}
         {rows.map((row, index) => {
           const rule = objectValue(row) ?? {};
@@ -2314,7 +2326,7 @@ export function GlobalInterruptRulesSection({
           const groupChoices = [...new Set([...(executionGroupIds ?? []), ...groups])].sort();
           const groupsAvailable = executionGroupIds !== null && executionGroupIds.length > 0;
           const ruleId = typeof rule.rule_id === 'string' ? rule.rule_id : `rule ${index + 1}`;
-          const ruleChoices = globalRuleChoices(document, programKeys, rule.condition);
+          const ruleChoices = globalRuleChoices(document, programKeys, rule.condition, systemSignalChoices);
           const keyNotes = globalRuleKeyNotes(rule.condition, programKeys);
           return (
             <fieldset className="deployment-gripper-editor" key={`${index}:${ruleId}`} aria-label={`Global rule ${ruleId}`}>

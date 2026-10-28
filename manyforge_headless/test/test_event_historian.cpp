@@ -10,6 +10,7 @@
 #include <limits>
 #include <memory>
 #include <mutex>
+#include <random>
 #include <set>
 #include <stdexcept>
 #include <string>
@@ -122,8 +123,70 @@ HistorianCaptureLimits TriggerOnlyCaptureLimits() {
   return limits;
 }
 
+// Revisions 2-4 indexed the whole payload JSON and keyed no codes.
+#define MANYFORGE_RESTORE_PAYLOAD_SEARCH_INDEX \
+  "DROP TABLE historian_search; DROP VIEW historian_search_content;" \
+  "CREATE VIEW historian_search_content AS " \
+  "SELECT sequence,component,event_type,payload_json AS details FROM historian_events;" \
+  "CREATE VIRTUAL TABLE historian_search USING fts5(component,event_type,details," \
+  "content='historian_search_content',content_rowid='sequence',tokenize='trigram');" \
+  "INSERT INTO historian_search(historian_search) VALUES('rebuild');" \
+  "DELETE FROM historian_event_keys WHERE kind IN ('code','reason','reason_code','cause_class','closure_reason');"
+constexpr const char* kRestorePayloadSearchIndex = MANYFORGE_RESTORE_PAYLOAD_SEARCH_INDEX;
+
+// Revision 5 indexed the same human text without the incident cause, closure
+// and vendor codes (no `cause_class`/`closure_reason` keys, no
+// `details.vendor_codes` path).
+const std::string kRestoreRevision5SearchIndex = [] {
+  std::string details;
+  for (const auto *path : {"$.message", "$.title", "$.incident_kind", "$.definition_id", "$.source_label",
+                           "$.subject.subject_id", "$.subject.resource_ids", "$.details.reason", "$.details.reasons"}) {
+    details += std::string("ifnull(CASE WHEN json_type(e.payload_json,'") + path + "') IN ('text','array') "
+               "THEN json_extract(e.payload_json,'" + path + "')||char(10) END,'')||";
+  }
+  return "DROP TABLE historian_search; DROP VIEW historian_search_content;"
+         "DELETE FROM historian_event_keys WHERE kind IN ('cause_class','closure_reason');"
+         "CREATE VIEW historian_search_content AS SELECT e.sequence,e.component,e.event_type," + details +
+         "ifnull((SELECT group_concat(k.value,char(10)) FROM historian_event_keys k WHERE k.sequence=e.sequence),'') "
+         "AS details FROM historian_events e;"
+         "CREATE VIRTUAL TABLE historian_search USING fts5(component,event_type,details,"
+         "content='historian_search_content',content_rowid='sequence',tokenize='trigram');"
+         "INSERT INTO historian_search(historian_search) VALUES('rebuild');"
+         "UPDATE historian_metadata SET schema_version=5; PRAGMA user_version=5;";
+}();
+
+// The recorded CCLC component incident row (`manyforge.cclc`), as on the
+// live Workbench: codes sit in `details`, the summary is not search text.
+HistorianEvent ComponentIncidentEvent(std::int64_t index, const std::string &cause, bool closed) {
+  const auto incident_id = "incident.arm_robot." + std::to_string(index);
+  const CanonicalValue codes(CanonicalValue::Array{CanonicalValue("C2"), CanonicalValue("mode=0"),
+                                                   CanonicalValue("state=" + std::to_string(index))});
+  CanonicalValue::Object details{
+      {"cause_class", CanonicalValue(cause)},
+      {"controllable_component_id", CanonicalValue("arm_robot")},
+      {"event_kind", CanonicalValue(closed ? "component_incident_acknowledged" : "component_incident")},
+      {"incident_id", CanonicalValue(incident_id)},
+      {"providers", CanonicalValue(CanonicalValue::Array{CanonicalValue(CanonicalValue::Object{
+                        {"provider_instance_id", CanonicalValue("arm_robot.providerneedle")}})})},
+      {"schema_version", CanonicalValue("manyforge.component_incident_event.v2")},
+      {"summary", CanonicalValue("Component arm_robot summaryneedle " + cause + ".")},
+      {"timeline", CanonicalValue(CanonicalValue::Array{CanonicalValue(CanonicalValue::Object{
+                       {"cause_class", CanonicalValue(cause)}, {"vendor_codes", codes}})})},
+      {"vendor_codes", codes}};
+  if (closed) details.emplace_back("closure_reason", CanonicalValue("cell_closed_by_operator"));
+  return MakeHistorianEvent(
+      "manyforge.cclc", closed ? "component_incident_acknowledged" : "component_incident", closed ? "INFO" : "ERROR",
+      index, "2026-10-28T00:00:00Z",
+      CanonicalValue(CanonicalValue::Object{
+          {"cclc_owner_epoch", CanonicalValue("sha256:epochneedle")},
+          {"details", CanonicalValue(std::move(details))},
+          {"event_kind", CanonicalValue(closed ? "component_incident_acknowledged" : "component_incident")},
+          {"incident_id", CanonicalValue(incident_id)},
+          {"schema_version", CanonicalValue("manyforge.cclc_incident_history_event.v2")}}));
+}
+
 // Storage revision 4 adds only derived failure-capture protection.
-constexpr const char* kRestoreRevision3Schema = R"sql(
+constexpr const char* kRestoreRevision3Schema = MANYFORGE_RESTORE_PAYLOAD_SEARCH_INDEX R"sql(
   DROP TABLE historian_capture_triggers; DROP TABLE historian_captures;
   DROP TABLE historian_capture_retention; DROP INDEX historian_events_prune_idx;
   ALTER TABLE historian_events DROP COLUMN capture_refs;
@@ -399,7 +462,7 @@ TEST(EventHistorian, IndexedFiltersFindOlderErrorsAcrossClockDomainsBeforePagina
   EXPECT_EQ(store.Query(query).events.size(), 1U);
 }
 
-TEST(EventHistorian, ProgramDiagnosticValuesRemainSearchableButNeverBecomeOwnerIdentities) {
+TEST(EventHistorian, ProgramDiagnosticValuesAreNeitherSearchTextNorOwnerIdentities) {
   TemporaryDirectory directory;
   // Originals recorded before the v3 cutover keep their version and derivation.
   for (const auto version : kProgramDiagnosticSchemaVersions) {
@@ -441,7 +504,10 @@ TEST(EventHistorian, ProgramDiagnosticValuesRemainSearchableButNeverBecomeOwnerI
       query.correlations = {{"operation_id", "operation.foreign"}};
       EXPECT_TRUE(store.Query(query).events.empty());
       query.correlations.clear();
+      // Search covers the producer identities, not user values in the payload.
       query.search = "run.foreign";
+      EXPECT_TRUE(store.Query(query).events.empty());
+      query.search = "run.actual";
       EXPECT_EQ(store.Query(query).events.size(), 1U);
     }
   }
@@ -590,7 +656,7 @@ TEST(EventHistorian, IndexedSearchReflectsPruningAfterRestart) {
     return MakeHistorianEvent(
         "manyforge.runtime", "operation_progressed", "INFO", index,
         "2026-09-05T00:00:00Z",
-        CanonicalValue(CanonicalValue::Object{{"tag", CanonicalValue(tag)}}));
+        CanonicalValue(CanonicalValue::Object{{"message", CanonicalValue(tag)}}));
   };
   const auto check_search = [](SqliteEventHistoryStore &store) {
     HistorianQuery query;
@@ -703,7 +769,53 @@ TEST(EventHistorian, LegacyIndexMigrationPreservesBytesAndRollsBackCorruption) {
       HistorianQuery query;
       query.correlations = {{"operation_id", "operation.1"}};
       EXPECT_EQ(upgraded.Query(query).events.size(), 1U);
+      query.correlations.clear();
+      query.search = "operation.1";
+      EXPECT_EQ(upgraded.Query(query).events.size(), 1U);
     }
+  }
+}
+
+TEST(EventHistorian, SearchCoversHumanTextAndIdentitiesButNeverPayloadJson) {
+  TemporaryDirectory directory;
+  const auto path = directory.path() / "search-text.sqlite3";
+  const auto event = MakeHistorianEvent(
+      "manyforge.runtime", "stop_terminal_projected", "WARN", 1, "2026-10-28T00:00:00Z",
+      CanonicalValue(CanonicalValue::Object{
+          {"message", CanonicalValue("Gripper closed on \"part\"")},
+          {"reason_code", CanonicalValue("grip_lost")},
+          {"details", CanonicalValue(CanonicalValue::Object{
+                          {"reason", CanonicalValue("finger_blocked")},
+                          {"reasons", CanonicalValue(CanonicalValue::Array{CanonicalValue("sensor_stale"),
+                                                                           CanonicalValue("quoted \"jaw\" reason")})},
+                          {"note", CanonicalValue("hiddenneedle")}})},
+          {"subject", CanonicalValue(CanonicalValue::Object{
+                          {"subject_id", CanonicalValue("cell.alpha")},
+                          {"resource_ids", CanonicalValue(CanonicalValue::Array{CanonicalValue("arm.res1"),
+                                                                                CanonicalValue("arm\\joint2")})}})},
+          {"journal_payload", CanonicalValue(CanonicalValue::Object{
+                                  {"stop_id", CanonicalValue("stop.42")},
+                                  {"terminal_error", CanonicalValue(CanonicalValue::Object{
+                                                         {"code", CanonicalValue("ik_failed")},
+                                                         {"message", CanonicalValue("nestedneedle")}})}})},
+          {"payload_digest", CanonicalValue("sha256:abcdef0123")}}));
+  const auto found = [](SqliteEventHistoryStore &store, const std::string &text) {
+    HistorianQuery query;
+    query.search = text;
+    return store.Query(query).events.size();
+  };
+  for (const bool reopened : {false, true}) {
+    SqliteEventHistoryStore store(path, 8U);
+    if (!reopened) {
+      ASSERT_EQ(store.Append(event), IEventHistoryStore::AppendStatus::kStored);
+    }
+    for (const auto *text : {"manyforge.runt", "terminal_proj", "closed on \"part\"", "grip_lost", "finger_blocked",
+                             "sensor_stale", "cell.alpha", "arm.res1", "stop.42", "ik_failed",
+                             // Array elements: literal quote and backslash.
+                             "quoted \"jaw\" reason", "arm\\joint2"})
+      EXPECT_EQ(found(store, text), 1U) << text;
+    for (const auto *text : {"hiddenneedle", "nestedneedle", "sha256:abc", "payload_digest", "journal_payload"})
+      EXPECT_EQ(found(store, text), 0U) << text;
   }
 }
 
@@ -1137,6 +1249,7 @@ TEST(EventHistorian, SummaryMigrationPreservesEscapedValuesLossAndStickyClockFac
     sqlite3* database = nullptr;
     ASSERT_EQ(sqlite3_open(path.c_str(), &database), SQLITE_OK);
     ASSERT_EQ(sqlite3_exec(database,
+                           MANYFORGE_RESTORE_PAYLOAD_SEARCH_INDEX
                            "DROP TABLE historian_capture_triggers; DROP TABLE historian_captures;"
                            "DROP TABLE historian_capture_retention; DROP INDEX historian_events_prune_idx;"
                            "ALTER TABLE historian_events DROP COLUMN capture_refs;"
@@ -1218,6 +1331,7 @@ TEST(EventHistorian, V2DiagnosticIndexMigratesOnlyAfterItsHistoricalDerivationIs
     sqlite3* database = nullptr;
     ASSERT_EQ(sqlite3_open(path.c_str(), &database), SQLITE_OK);
     ASSERT_EQ(sqlite3_exec(database,
+                           MANYFORGE_RESTORE_PAYLOAD_SEARCH_INDEX
                            "DROP TABLE historian_capture_triggers; DROP TABLE historian_captures;"
                            "DROP TABLE historian_capture_retention; DROP INDEX historian_events_prune_idx;"
                            "ALTER TABLE historian_events DROP COLUMN capture_refs;"
@@ -1503,6 +1617,7 @@ TEST(EventHistorian, AlarmLifecycleEnvelopeRetainsOwnerCallerAndSubject) {
   for (const auto *definition :
        {"manyforge.runtime.program_runner_loss",
         "manyforge.runtime.operation_journal_write_fault",
+        "manyforge.runtime.kernel_internal_fault",
         "manyforge.motion.stop_fault"}) {
     fact.definition_id = definition;
     for (const auto *type :
@@ -1852,6 +1967,284 @@ TEST(EventHistorian, Revision3MigrationAddsOnlyDerivedProtectionAndKeepsDigests)
   EXPECT_TRUE(CaptureList(migrated).empty());
   ASSERT_EQ(migrated.Append(ErrorEvent(3)), IEventHistoryStore::AppendStatus::kStored);
   EXPECT_EQ(Field(CaptureList(migrated).front(), "first_sequence").as_number(), 1.0);
+}
+
+// Storage revision 5 replaces only the derived search text. A revision 4
+// database indexed the whole payload JSON; it is rebuilt in place on open.
+TEST(EventHistorian, Revision4SearchIndexMigratesToHumanTextAndKeepsOriginals) {
+  TemporaryDirectory directory;
+  for (const bool corrupt : {false, true}) {
+    const auto path = directory.path() / (corrupt ? "corrupt-revision4.sqlite3" : "revision4.sqlite3");
+    std::string original;
+    {
+      SqliteEventHistoryStore store(path, 100U);
+      for (std::int64_t i = 1; i <= 3; ++i) {
+        ASSERT_EQ(store.Append(MakeHistorianEvent("manyforge.runtime", "operation_progressed", "INFO", i,
+            "2026-10-28T00:00:00Z", CanonicalValue(CanonicalValue::Object{
+                {"message", CanonicalValue("visibleneedle " + std::to_string(i))},
+                {"operation_id", CanonicalValue("operation.needle")},
+                {"state", CanonicalValue(CanonicalValue::Object{{"error", CanonicalValue(CanonicalValue::Object{
+                    {"code", CanonicalValue("nested_code")}})}})},
+                {"blob", CanonicalValue("payloadneedle" + std::string(20000, static_cast<char>('a' + i)))}}))),
+            IEventHistoryStore::AppendStatus::kStored);
+      }
+      original = content_identity::canonical_json(HistorianPersistenceValue(store.Read(3U)->event));
+    }
+    sqlite3 *database = nullptr;
+    const auto scalar = [&](const char *sql) {
+      sqlite3_stmt *statement = nullptr;
+      EXPECT_EQ(sqlite3_prepare_v2(database, sql, -1, &statement, nullptr), SQLITE_OK);
+      EXPECT_EQ(sqlite3_step(statement), SQLITE_ROW);
+      const auto value = sqlite3_column_int64(statement, 0);
+      sqlite3_finalize(statement);
+      return value;
+    };
+    const auto index_bytes = "SELECT sum(length(block)) FROM historian_search_data";
+    ASSERT_EQ(sqlite3_open(path.c_str(), &database), SQLITE_OK);
+    ASSERT_EQ(sqlite3_exec(database, kRestorePayloadSearchIndex, nullptr, nullptr, nullptr), SQLITE_OK);
+    ASSERT_EQ(sqlite3_exec(database, "UPDATE historian_metadata SET schema_version=4; PRAGMA user_version=4;",
+                           nullptr, nullptr, nullptr), SQLITE_OK);
+    EXPECT_EQ(scalar("SELECT count(*) FROM historian_search WHERE historian_search MATCH '\"payloadneedle\"'"), 3);
+    if (corrupt) {
+      ASSERT_EQ(sqlite3_exec(database, "INSERT INTO historian_search(rowid,component,event_type,details) "
+                             "VALUES(99,'fake','fake','gripper phantom')", nullptr, nullptr, nullptr), SQLITE_OK);
+    }
+    const auto before = scalar(index_bytes);
+    ASSERT_EQ(sqlite3_close(database), SQLITE_OK);
+    if (corrupt) {
+      // As in revision 4, a damaged search index is refused, never rebuilt.
+      ExpectHistorianError([&] { SqliteEventHistoryStore rejected(path, 100U); }, "historian_storage_corrupt");
+      ASSERT_EQ(sqlite3_open(path.c_str(), &database), SQLITE_OK);
+      EXPECT_EQ(scalar("PRAGMA user_version"), 4);
+      EXPECT_EQ(scalar("SELECT count(*) FROM historian_event_keys WHERE kind='code'"), 0);
+      ASSERT_EQ(sqlite3_close(database), SQLITE_OK);
+      continue;
+    }
+    {
+      SqliteEventHistoryStore migrated(path, 100U);
+      EXPECT_EQ(content_identity::canonical_json(HistorianPersistenceValue(migrated.Read(3U)->event)), original);
+      HistorianQuery query;
+      query.search = "payloadneedle";
+      EXPECT_TRUE(migrated.Query(query).events.empty());
+      for (const auto *text : {"visibleneedle", "operation.needle", "nested_code"}) {
+        query.search = text;
+        EXPECT_EQ(migrated.Query(query).events.size(), 3U) << text;
+      }
+    }
+    ASSERT_EQ(sqlite3_open(path.c_str(), &database), SQLITE_OK);
+    EXPECT_EQ(scalar("PRAGMA user_version"), 6);
+    const auto after = scalar(index_bytes);
+    ASSERT_EQ(sqlite3_close(database), SQLITE_OK);
+    // Report numbers only; the size depends on the SQLite build.
+    ::testing::Test::RecordProperty("search_index_bytes_before", std::to_string(before));
+    ::testing::Test::RecordProperty("search_index_bytes_after", std::to_string(after));
+    EXPECT_LT(after, before);
+  }
+}
+
+// A revision 4 history whose old payload index filled the page ceiling still
+// migrates: the old index is verified and dropped before code keys and the
+// new index take pages, all in the one open transaction.
+TEST(EventHistorian, NearCapacityRevision4MigrationDropsTheOldIndexFirst) {
+  TemporaryDirectory directory;
+  const auto path = directory.path() / "near-capacity-revision4.sqlite3";
+  std::vector<std::string> originals;
+  {
+    SqliteEventHistoryStore store(path, 100U);
+    std::mt19937 random(7U);
+    for (std::int64_t i = 1; i <= 60; ++i) {
+      std::string blob(200000U, ' ');
+      for (auto &character : blob) character = "abcdefghijklmnopqrstuvwxyz0123456789"[random() % 36U];
+      CanonicalValue::Array codes;
+      for (int code = 0; code < 2000; ++code)
+        codes.emplace_back(CanonicalValue::Object{{"code", CanonicalValue("code." + std::to_string(code))}});
+      const auto event = MakeHistorianEvent("manyforge.runtime", "operation_progressed", "INFO", i,
+          "2026-10-28T00:00:00Z", CanonicalValue(CanonicalValue::Object{
+              {"blob", CanonicalValue(std::move(blob))}, {"codes", CanonicalValue(std::move(codes))}}));
+      ASSERT_EQ(store.Append(event), IEventHistoryStore::AppendStatus::kStored);
+      originals.push_back(content_identity::canonical_json(HistorianPersistenceValue(event)));
+    }
+  }
+  sqlite3 *database = nullptr;
+  ASSERT_EQ(sqlite3_open(path.c_str(), &database), SQLITE_OK);
+  ASSERT_EQ(sqlite3_exec(database, kRestorePayloadSearchIndex, nullptr, nullptr, nullptr), SQLITE_OK);
+  // Grow the old index with unmerged segments (still consistent) until the
+  // product page ceiling refuses the next one, leaving no free page.
+  ASSERT_EQ(sqlite3_exec(database,
+      "UPDATE historian_metadata SET schema_version=4; PRAGMA user_version=4; PRAGMA synchronous=OFF;"
+      "INSERT INTO historian_search(historian_search,rank) VALUES('automerge',0);"
+      "INSERT INTO historian_search(historian_search,rank) VALUES('crisismerge',2000);"
+      "PRAGMA max_page_count=131072;", nullptr, nullptr, nullptr), SQLITE_OK);
+  for (int cycle = 0;; ++cycle) {
+    const auto sequence = std::to_string(cycle % 60 + 1);
+    const auto sql = "BEGIN;"
+        "INSERT INTO historian_search(historian_search,rowid,component,event_type,details) "
+        "SELECT 'delete',sequence,component,event_type,details FROM historian_search_content WHERE sequence=" + sequence + ";"
+        "INSERT INTO historian_search(rowid,component,event_type,details) "
+        "SELECT sequence,component,event_type,details FROM historian_search_content WHERE sequence=" + sequence + ";"
+        "COMMIT;";
+    if (sqlite3_exec(database, sql.c_str(), nullptr, nullptr, nullptr) != SQLITE_OK) {
+      EXPECT_EQ(sqlite3_extended_errcode(database) & 0xff, SQLITE_FULL);
+      if (!sqlite3_get_autocommit(database)) {
+        ASSERT_EQ(sqlite3_exec(database, "ROLLBACK", nullptr, nullptr, nullptr), SQLITE_OK);
+      }
+      break;
+    }
+  }
+  ASSERT_EQ(sqlite3_exec(database, "INSERT INTO historian_search(historian_search,rank) VALUES('integrity-check',1)",
+                         nullptr, nullptr, nullptr), SQLITE_OK);
+  ASSERT_EQ(sqlite3_close(database), SQLITE_OK);
+  EXPECT_GT(std::filesystem::file_size(path), 500U * 1024U * 1024U);
+  {
+    SqliteEventHistoryStore migrated(path, 100U);
+    for (std::size_t i = 0; i < originals.size(); ++i) {
+      const auto stored = migrated.Read(i + 1U);
+      ASSERT_TRUE(stored);
+      EXPECT_EQ(content_identity::canonical_json(HistorianPersistenceValue(stored->event)), originals[i]);
+    }
+    // One 240 KB row per page keeps each query inside the 100 ms budget.
+    HistorianQuery query;
+    query.search = "code.1999";
+    query.limit = 1U;
+    std::size_t found = 0U;
+    for (;;) {
+      const auto page = migrated.Query(query);
+      found += page.events.size();
+      if (!page.next_before_sequence) break;
+      query.before_sequence = page.next_before_sequence;
+    }
+    EXPECT_EQ(found, 60U);
+  }
+  ASSERT_EQ(sqlite3_open(path.c_str(), &database), SQLITE_OK);
+  sqlite3_stmt *version = nullptr;
+  ASSERT_EQ(sqlite3_prepare_v2(database, "PRAGMA user_version", -1, &version, nullptr), SQLITE_OK);
+  ASSERT_EQ(sqlite3_step(version), SQLITE_ROW);
+  EXPECT_EQ(sqlite3_column_int(version, 0), 6);
+  sqlite3_finalize(version);
+  ASSERT_EQ(sqlite3_close(database), SQLITE_OK);
+}
+
+// Live finding (M5 session 10): incident cause and closure codes were not
+// search text, while the incident id was.
+TEST(EventHistorian, IncidentCauseClosureAndVendorCodesAreSearchable) {
+  TemporaryDirectory directory;
+  const auto path = directory.path() / "incident-search.sqlite3";
+  const auto found = [](SqliteEventHistoryStore &store, const std::string &text) {
+    HistorianQuery query;
+    query.search = text;
+    return store.Query(query).events.size();
+  };
+  for (const bool reopened : {false, true}) {
+    SqliteEventHistoryStore store(path, 8U);
+    if (!reopened) {
+      ASSERT_EQ(store.Append(ComponentIncidentEvent(1, "provider_lost", false)), IEventHistoryStore::AppendStatus::kStored);
+      ASSERT_EQ(store.Append(ComponentIncidentEvent(1, "provider_lost", true)), IEventHistoryStore::AppendStatus::kStored);
+      ASSERT_EQ(store.Append(ComponentIncidentEvent(2, "emergency_stop", false)), IEventHistoryStore::AppendStatus::kStored);
+    }
+    EXPECT_EQ(found(store, "provider_lost"), 2U);
+    EXPECT_EQ(found(store, "cell_closed_by_operator"), 1U);
+    EXPECT_EQ(found(store, "emergency_stop"), 1U);
+    EXPECT_EQ(found(store, "mode=0"), 3U);
+    EXPECT_EQ(found(store, "state=2"), 1U);
+    EXPECT_EQ(found(store, "incident.arm_robot.1"), 2U);
+    EXPECT_EQ(found(store, "incident.arm_robot.2"), 1U);
+    // Codes are search text only, never correlation discovery kinds.
+    ExpectHistorianError([&] { (void)store.Discover("cause_class", "", 8U); }, "historian_query_invalid");
+    for (const auto *text : {"summaryneedle", "providerneedle", "epochneedle", "component_incident_event.v2"})
+      EXPECT_EQ(found(store, text), 0U) << text;
+  }
+}
+
+// Storage revision 6 adds the incident codes to the revision 5 search text.
+// A revision 5 history is re-derived on open, so its existing incident rows
+// become searchable; a damaged revision 5 index is still refused.
+TEST(EventHistorian, Revision5SearchIndexMigratesToIncidentCodesAndKeepsOriginals) {
+  TemporaryDirectory directory;
+  constexpr std::int64_t kRows = 40;
+  for (const bool corrupt : {false, true}) {
+    const auto path = directory.path() / (corrupt ? "corrupt-revision5.sqlite3" : "revision5.sqlite3");
+    std::string original;
+    {
+      SqliteEventHistoryStore store(path, 100U);
+      for (std::int64_t i = 1; i <= kRows; ++i) {
+        ASSERT_EQ(store.Append(ComponentIncidentEvent(i, i % 2 == 0 ? "provider_lost" : "emergency_stop", i % 4 == 0)),
+                  IEventHistoryStore::AppendStatus::kStored);
+      }
+      original = content_identity::canonical_json(HistorianPersistenceValue(store.Read(4U)->event));
+    }
+    sqlite3 *database = nullptr;
+    const auto scalar = [&](const char *sql) {
+      sqlite3_stmt *statement = nullptr;
+      EXPECT_EQ(sqlite3_prepare_v2(database, sql, -1, &statement, nullptr), SQLITE_OK);
+      EXPECT_EQ(sqlite3_step(statement), SQLITE_ROW);
+      const auto value = sqlite3_column_int64(statement, 0);
+      sqlite3_finalize(statement);
+      return value;
+    };
+    const auto index_bytes = "SELECT (SELECT sum(length(block)) FROM historian_search_data)+"
+                             "(SELECT sum(length(kind)+length(value)) FROM historian_event_keys)";
+    ASSERT_EQ(sqlite3_open(path.c_str(), &database), SQLITE_OK);
+    ASSERT_EQ(sqlite3_exec(database, kRestoreRevision5SearchIndex.c_str(), nullptr, nullptr, nullptr), SQLITE_OK);
+    EXPECT_EQ(scalar("SELECT count(*) FROM historian_search WHERE historian_search MATCH '\"provider_lost\"'"), 0);
+    EXPECT_EQ(scalar("SELECT count(*) FROM historian_search WHERE historian_search MATCH '\"incident.arm_robot.5\"'"), 1);
+    if (corrupt) {
+      ASSERT_EQ(sqlite3_exec(database, "INSERT INTO historian_search(rowid,component,event_type,details) "
+                             "VALUES(99,'fake','fake','gripper phantom')", nullptr, nullptr, nullptr), SQLITE_OK);
+    }
+    const auto before = scalar(index_bytes);
+    ASSERT_EQ(sqlite3_close(database), SQLITE_OK);
+    if (corrupt) {
+      ExpectHistorianError([&] { SqliteEventHistoryStore rejected(path, 100U); }, "historian_storage_corrupt");
+      ASSERT_EQ(sqlite3_open(path.c_str(), &database), SQLITE_OK);
+      EXPECT_EQ(scalar("PRAGMA user_version"), 5);
+      EXPECT_EQ(scalar("SELECT count(*) FROM historian_event_keys WHERE kind='cause_class'"), 0);
+      ASSERT_EQ(sqlite3_close(database), SQLITE_OK);
+      continue;
+    }
+    const auto found = [](SqliteEventHistoryStore &store, const std::string &text) {
+      HistorianQuery query;
+      query.search = text;
+      query.limit = 32U;
+      std::size_t count = 0U;
+      for (;;) {
+        const auto page = store.Query(query);
+        count += page.events.size();
+        if (!page.next_before_sequence) return count;
+        query.before_sequence = page.next_before_sequence;
+      }
+    };
+    {
+      SqliteEventHistoryStore migrated(path, 100U);
+      EXPECT_EQ(content_identity::canonical_json(HistorianPersistenceValue(migrated.Read(4U)->event)), original);
+      EXPECT_EQ(found(migrated, "provider_lost"), static_cast<std::size_t>(kRows / 2));
+      EXPECT_EQ(found(migrated, "emergency_stop"), static_cast<std::size_t>(kRows / 2));
+      EXPECT_EQ(found(migrated, "cell_closed_by_operator"), static_cast<std::size_t>(kRows / 4));
+      EXPECT_EQ(found(migrated, "mode=0"), static_cast<std::size_t>(kRows));
+      EXPECT_EQ(found(migrated, "incident.arm_robot.5"), 1U);
+      EXPECT_EQ(found(migrated, "summaryneedle"), 0U);
+    }
+    ASSERT_EQ(sqlite3_open(path.c_str(), &database), SQLITE_OK);
+    EXPECT_EQ(scalar("PRAGMA user_version"), 6);
+    const auto after = scalar(index_bytes);
+    const auto event_bytes = scalar("SELECT sum(length(payload_json)) FROM historian_events");
+    ASSERT_EQ(sqlite3_close(database), SQLITE_OK);
+    // Report numbers; the bound (512 bytes per incident row) is well under
+    // the size of a recorded incident row (about 3 KB).
+    ::testing::Test::RecordProperty("search_index_bytes_revision5", std::to_string(before));
+    ::testing::Test::RecordProperty("search_index_bytes_revision6", std::to_string(after));
+    ::testing::Test::RecordProperty("event_payload_bytes", std::to_string(event_bytes));
+    EXPECT_GT(after, before);
+    EXPECT_LT(after - before, kRows * 512);
+    {
+      // New rows use the same derivation; a restart validates it.
+      SqliteEventHistoryStore store(path, 100U);
+      ASSERT_EQ(store.Append(ComponentIncidentEvent(kRows + 1, "provider_lost", true)),
+                IEventHistoryStore::AppendStatus::kStored);
+    }
+    SqliteEventHistoryStore reopened(path, 100U);
+    EXPECT_EQ(found(reopened, "provider_lost"), static_cast<std::size_t>(kRows / 2 + 1));
+    EXPECT_EQ(found(reopened, "cell_closed_by_operator"), static_cast<std::size_t>(kRows / 4 + 1));
+  }
 }
 
 TEST(EventHistorian, InconsistentCaptureLimitsAreRejected) {

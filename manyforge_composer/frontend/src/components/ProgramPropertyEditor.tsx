@@ -20,6 +20,7 @@ import type {
   SourceModelProjection,
 } from '../types/api';
 import type { ManualControlMotionDescriptor } from '../types/robotControl';
+import type { CarriedObjectLostSignalChoice } from '../utils/systemSignalAuthoring';
 import { firstCatalogParameterValidationMessage } from '../utils/catalogParameterValidation';
 import {
   ioEmptyOmits,
@@ -100,6 +101,7 @@ import { precisionContactStopWarnings } from '../utils/precisionContactStopWarni
 import { resolvedTargetRoles } from '../utils/targetRoleResolution';
 import { ProgramPolicyEditor } from './ProgramPolicyEditor';
 import { StopStagePicker } from './StopStagePicker';
+import { GraspLostPolicyEditor } from './GraspLostPolicyEditor';
 
 interface ProgramPropertyEditorProps {
   embedded?: boolean;
@@ -111,6 +113,8 @@ interface ProgramPropertyEditorProps {
   sourceModel?: SourceModelProjection | null;
   sourceModelUnavailableReason?: string | null;
   deploymentWorkspace?: DeploymentWorkspaceResponse | null;
+  systemSignalChoices?: readonly CarriedObjectLostSignalChoice[];
+  systemSignalsNeedApply?: boolean;
   /** The scenario's Program role assignment: resolves target roles while the workspace has no binding. */
   programRoleAssignment?: Record<string, JsonValue> | null;
   motionDescriptors?: ManualControlMotionDescriptor[];
@@ -268,6 +272,8 @@ export function ProgramPropertyEditor({
   sourceModel = null,
   sourceModelUnavailableReason = null,
   deploymentWorkspace = null,
+  systemSignalChoices = [],
+  systemSignalsNeedApply = false,
   programRoleAssignment = null,
   motionDescriptors = [],
   stopChains = [],
@@ -291,8 +297,8 @@ export function ProgramPropertyEditor({
   const blackboardKeys = useMemo(() => programBlackboardKeys(program, ruleIds), [program, ruleIds]);
   const conditionChoices = useMemo(() => nodeConditionChoices(
     program, deploymentWorkspace?.binding, ruleIds,
-    deploymentDocument as Record<string, JsonValue> | null, programRoleAssignment,
-  ), [deploymentDocument, deploymentWorkspace?.binding, program, programRoleAssignment, ruleIds]);
+    deploymentDocument as Record<string, JsonValue> | null, programRoleAssignment, systemSignalChoices,
+  ), [deploymentDocument, deploymentWorkspace?.binding, program, programRoleAssignment, ruleIds, systemSignalChoices]);
   const motionConfiguration = useMemo(
     () => deriveProgramMotionConfiguration(program, catalogEntries),
     [catalogEntries, program],
@@ -748,6 +754,7 @@ export function ProgramPropertyEditor({
               deploymentWorkspace?.binding,
               { program, roleAssignment: programRoleAssignment,
                 deploymentDocument: deploymentDocument as Record<string, JsonValue> | null },
+              systemSignalChoices,
             )
             : null;
           const unsupportedChoices = ioUnsupportedChoices(
@@ -770,6 +777,22 @@ export function ProgramPropertyEditor({
             && (!Array.isArray(literal) || new Set(literal.map((item) => (
               item !== null && typeof item === 'object' && !Array.isArray(item) ? item.input : null
             ))).size === literal.length);
+          const graspLostPolicyField = selected.node_id === 'scene.attach_carried_object'
+            && parameter.id === 'on_grasp_lost' && source === undefined && !repairMode;
+          const valueEditorContext: ProgramSchemaValueEditorContext = {
+            entry,
+            node: selected,
+            parameterId: parameter.id,
+            program,
+            globalRuleIds: ruleIds,
+            sourceJointInventory,
+            onCreateReference,
+            semanticChoices: signalChoices,
+            unsupportedChoices,
+            emptyOmits: emptyOmits
+              ? { placeholder: 'Wait forever', onOmit: () => removeLiteral(parameter) }
+              : undefined,
+          };
           const storedText = (id: string) => (typeof selected.parameters[id] === 'string'
             ? selected.parameters[id] as string : undefined);
           return (
@@ -803,6 +826,10 @@ export function ProgramPropertyEditor({
                   The current binding has no {selected.node_id === 'io.set_output' ? 'output' : 'input'} signal for {String(selected.parameters.target_role)}.
                 </p>
               )}
+              {systemSignalsNeedApply && signalChoices !== null && selected.node_id !== 'io.set_output'
+                && parameter.id === 'resource_role' && (
+                <p className="program-form-hint">Apply to list system signals.</p>
+              )}
               {signalChoices !== null && selected.node_id !== 'io.set_output'
                 && conditionChoices.some((choice) => choice.liveness === 'change_only'
                   && operandId(choice.operand) === operandId({ signal: {
@@ -824,7 +851,16 @@ export function ProgramPropertyEditor({
                   {literal} does not apply to this key; choose {rule.choices.join(' or ')}.
                 </p>
               )}
-              {requiredInputsField ? (() => {
+              {graspLostPolicyField ? (
+                <GraspLostPolicyEditor
+                  key={`${selected.instance_id}:${parameter.id}:${discardEpoch}`}
+                  value={literal}
+                  nodeId={selected.instance_id}
+                  context={valueEditorContext}
+                  disabled={busy}
+                  onCommit={(value) => commitLiteral(parameter, value)}
+                />
+              ) : requiredInputsField ? (() => {
                 const target = draftTargetRoles.find((row) => row.target_role_id === selected.parameters.target_role);
                 return <div id={`property-${selected.instance_id}-${parameter.id}`}>
                   <PneumaticRequiredInputsEditor value={literal}
@@ -860,6 +896,9 @@ export function ProgramPropertyEditor({
                 </div>
               ) : interruptField === 'interrupt_condition' ? (
                 <div id={`property-${selected.instance_id}-${parameter.id}`}>
+                  {systemSignalsNeedApply && (
+                    <p className="program-form-hint">Apply to list system signals.</p>
+                  )}
                   <InterruptConditionEditor
                     label="Interrupt condition"
                     value={hasLiteral ? literal : undefined}
@@ -992,20 +1031,7 @@ export function ProgramPropertyEditor({
                     schema={schema}
                     value={literal}
                     disabled={busy || rule.locked !== undefined}
-                    context={{
-                      entry,
-                      node: selected,
-                      parameterId: parameter.id,
-                      program,
-                      globalRuleIds: ruleIds,
-                      sourceJointInventory,
-                      onCreateReference,
-                      semanticChoices: signalChoices,
-                      unsupportedChoices,
-                      emptyOmits: emptyOmits
-                        ? { placeholder: 'Wait forever', onOmit: () => removeLiteral(parameter) }
-                        : undefined,
-                    }}
+                    context={valueEditorContext}
                     path={parameter.id}
                     onCommit={(value, moves) => commitLiteral(parameter, value, moves)}
                     onInvalidChange={(message) => setFieldError(parameter.id, message)}

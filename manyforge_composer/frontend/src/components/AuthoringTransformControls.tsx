@@ -11,6 +11,10 @@ const poseOf = (object: Object3D): PoseTuple => ({
   position: object.position.toArray(), quaternion: object.quaternion.clone().normalize().toArray(),
 });
 
+/** Why a release left the object where it started: no movement at all, or
+ * Snap rounded the drag back onto the start. Interrupted drags pass none. */
+export type GizmoNoChange = 'no_change' | 'snapped_no_change';
+
 /** Same installed gizmo, with explicit gesture/listener ownership. No effects
  * in render: this also survives React StrictMode's setup/cleanup replay. */
 export function AuthoringTransformControls({ object, settings, contextKey, onBegin, onCommit, onCancel }: {
@@ -19,7 +23,7 @@ export function AuthoringTransformControls({ object, settings, contextKey, onBeg
   contextKey: string;
   onBegin: () => boolean;
   onCommit: () => void;
-  onCancel: () => void;
+  onCancel: (noChange?: GizmoNoChange) => void;
 }) {
   const element = useThree((state) => state.gl.domElement);
   const camera = useThree((state) => state.camera);
@@ -37,7 +41,7 @@ export function AuthoringTransformControls({ object, settings, contextKey, onBeg
     control.setSpace(settings.space);
     control.attach(object);
     control.connect(element);
-    let drag: { pose: PoseTuple; scale: [number, number, number] } | null = null;
+    let drag: { pose: PoseTuple; scale: [number, number, number]; moved: boolean } | null = null;
     let interaction: { camera: { enabled: boolean } | null; enabled: boolean; touchAction: string } | null = null;
     const releaseInteraction = () => {
       if (interaction === null) return;
@@ -71,12 +75,14 @@ export function AuthoringTransformControls({ object, settings, contextKey, onBeg
         setGeneration((value) => value + 1);
         return;
       }
-      drag = { pose: poseOf(object), scale: object.scale.toArray() };
+      drag = { pose: poseOf(object), scale: object.scale.toArray(), moved: false };
       if (interaction?.camera !== null && interaction?.camera !== undefined) interaction.camera.enabled = false;
     };
     const change = () => {
       if (drag === null) return;
-      const pose = snapGizmoPose(drag.pose, poseOf(object), settings);
+      const raw = poseOf(object);
+      if (!samePose(drag.pose, raw)) drag.moved = true;
+      const pose = snapGizmoPose(drag.pose, raw, settings);
       object.position.fromArray(pose.position);
       object.quaternion.fromArray(pose.quaternion);
       invalidate();
@@ -87,7 +93,7 @@ export function AuthoringTransformControls({ object, settings, contextKey, onBeg
       releaseInteraction();
       if (start === null) return;
       if (samePose(start.pose, poseOf(object)) && start.scale.every((value, index) => value === object.scale.getComponent(index))) {
-        latest.current.onCancel();
+        latest.current.onCancel(start.moved && settings.snap ? 'snapped_no_change' : 'no_change');
       } else latest.current.onCommit();
     };
     const captureInteraction = () => {

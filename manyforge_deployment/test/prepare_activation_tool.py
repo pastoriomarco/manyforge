@@ -1645,6 +1645,31 @@ def main() -> int:
                 for row in new_graph["control_bindings"]
                 if row["command_target_id"] == "arm"
             )
+            # The gripper domain has its own provider (one common Recover
+            # target with the arm, `disabled`) and so its own instance.
+            new_id = new_component["controllable_component_id"]
+            for row in [
+                *new_graph["control_bindings"],
+                *(
+                    row
+                    for row in accepted["activation_payload"]["retained_bundle"][
+                        "capability_provider_bindings"
+                    ]
+                    if row["scope"] == "target_binding"
+                ),
+            ]:
+                gripper = (
+                    row.get("command_target_id", row.get("target", {}).get("command_target_id"))
+                    == "gripper"
+                )
+                assert row["provider_manifest_id"] == (
+                    "manyforge.provider.ros2_control.xarm.gripper"
+                    if gripper
+                    else "manyforge.provider.ros2_control.xarm"
+                )
+                assert row["provider_instance_id"] == (
+                    f"{new_id}.ros2_control.gripper" if gripper else f"{new_id}.ros2_control"
+                )
             (new_unit,) = new_graph["runtime_units"]
             assert [row["stream_id"] for row in new_unit["configuration"]["component_streams"]] == [
                 "measured_joints"

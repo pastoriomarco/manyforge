@@ -5,10 +5,7 @@ For repository changes follow the root AGENTS.md and its development references.
 
 The optional MCP HTTP adapter uses the current tool schemas published by
 `tools/list` and generated in `docs/reference/MCP_RUNTIME_CONTRACT.md`.
-It is disabled unless Composer starts with `--mcp-http`. Historical v0 tool
-signatures and the old CycleManager are not compatibility interfaces.
-OpenClaw/Hermes packaging and provider qualification are separate gates;
-this template does not start or qualify either provider.
+It is disabled unless Composer starts with `--mcp-http`.
 
 ## Authority and commands
 
@@ -55,6 +52,4 @@ this template does not start or qualify either provider.
 
 Actions route through the existing REST handlers. Read their live schemas;
 do not translate older examples by guessing fields or silently selecting a
-robot. A tool name does not prove a provider or historical workflow is ready.
-The historical skill recipes remain non-operative until their owning
-functional/provider gate is qualified; do not invoke their v0 signatures.
+robot. A tool name does not prove a provider is ready.

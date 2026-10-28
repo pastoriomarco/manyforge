@@ -80,6 +80,7 @@ function authoringWorkspaceFixture(): Record<string, unknown> {
     },
     project: {
       document_path: '/workspace/cell',
+      read_only: false,
       document_id: 'cell',
       document_name: 'Cell',
       document_description: '',
@@ -99,6 +100,24 @@ describe('shared authoring workspace transport', () => {
     expect(parsed.program.draft.draftRevision).toBe(2);
     expect(parsed.deployment.draftRevision).toBe(4);
     expect(parsed.project.documentPath).toBe('/workspace/cell');
+  });
+
+  it('parses the edited-outside-ManyForge project warning', () => {
+    const edited = authoringWorkspaceFixture();
+    (edited.project as Record<string, unknown>).source_diagnostics = [{
+      code: 'edited_outside_manyforge',
+      source_id: 'member:program.yaml',
+      message: 'Edited outside ManyForge since the last Save',
+    }];
+    expect(parseAuthoringWorkspaceSnapshot(edited).project.sourceDiagnostics).toEqual([{
+      code: 'edited_outside_manyforge',
+      sourceId: 'member:program.yaml',
+      message: 'Edited outside ManyForge since the last Save',
+    }]);
+    (edited.project as Record<string, unknown>).source_diagnostics = [{
+      code: 'unknown_diagnostic', source_id: 'x', message: 'x',
+    }];
+    expect(() => parseAuthoringWorkspaceSnapshot(edited)).toThrow(/edited_outside_manyforge/);
   });
 
   it('rejects added fields and an untruthful saved comparison', () => {
@@ -1820,6 +1839,10 @@ describe('Program product projections', () => {
       expect(parseProgramCycleStatus({ ...input, reset_phase: phase }).resetOptions)
         .toEqual({ reloadInitialScene: true, resetRobotPosition: true });
     }
+    // D6 (SX-324): Close's accepted Reset publishes keep_stop_fault.
+    expect(parseProgramCycleStatus({ ...input, reset_phase: 'restoring_scene',
+      reset_options: { reload_initial_scene: true, reset_robot_position: true, keep_stop_fault: true } })
+      .resetOptions).toEqual({ reloadInitialScene: true, resetRobotPosition: true, keepStopFault: true });
     expect(parseProgramCycleStatus({
       ...input, state: 'recovery_required', reset_phase: 'restoring_position',
       failure: { failed_phase: 'restoring_position', code: 'position_failed' },
@@ -1830,6 +1853,7 @@ describe('Program product projections', () => {
       { reset_options: { reload_initial_scene: true } },
       { reset_options: { reload_initial_scene: true, reset_robot_position: 1 } },
       { reset_options: { reload_initial_scene: true, reset_robot_position: false, extra: true } },
+      { reset_options: { reload_initial_scene: true, reset_robot_position: false, keep_stop_fault: 1 } },
       { reset_options: { reload_initial_scene: false, reset_robot_position: false } },
       { state: 'idle_after_reset' }, { current_command_kind: 'program_run' },
       { cycle_claim_generation: 2 }, { terminal_or_settlement_reference: digestA },
@@ -2999,9 +3023,13 @@ describe('headless projection parsers', () => {
     const lostState = ((lostRuntime.sections as Record<string, Record<string, unknown>>)
       .scene_runtime.payload as Record<string, unknown>).state as Record<string, unknown>;
     const loss = {
+      carried_object_attachment_id: 'attachment.1',
       code: 'scene.carried_object_lost',
+      command_target_id: 'left_gripper',
+      controllable_component_id: 'robot',
       event_id: 'scene-runtime-pose-1',
       full_text: 'isaac_cheese_box moved 52.0 mm / 3.0° from its grasp pose (bound 30.0 mm / 14.9°); it was detached and the motion stopped.',
+      on_grasp_lost: { detach: true, raise_alarm: true, set_key: null, stop_motion: true },
       scene_resource_id: 'isaac_cheese_box',
     };
     lostState.carried_object_losses = [loss];
@@ -3019,6 +3047,68 @@ describe('headless projection parsers', () => {
       environment,
     );
     expect(wrongCode.available).toBe(false);
+    lostState.carried_object_losses = [{ ...loss, on_grasp_lost: { ...loss.on_grasp_lost, set_key: 'loss_flag' } }];
+    const keyed = sceneOwnerFacts(
+      parseHeadlessRuntimeSnapshot(lostRuntime),
+      parseSourceModelProjection(sourceModel),
+      environment,
+    );
+    expect(keyed.available).toBe(true);
+    const signalError = 'carried_object_lost_signal_unavailable';
+    lostState.carried_object_losses = [{ ...loss, signal_error: signalError }];
+    const failedPublication = sceneOwnerFacts(
+      parseHeadlessRuntimeSnapshot(lostRuntime),
+      parseSourceModelProjection(sourceModel),
+      environment,
+    );
+    expect(failedPublication.available).toBe(true);
+    if (failedPublication.available) {
+      expect(failedPublication.facts.sceneRuntime.state.carried_object_losses).toEqual([
+        { ...loss, signal_error: signalError },
+      ]);
+    }
+    lostState.carried_object_losses = [{ ...loss, signal_error: { code: signalError } }];
+    const errorObject = sceneOwnerFacts(
+      parseHeadlessRuntimeSnapshot(lostRuntime),
+      parseSourceModelProjection(sourceModel),
+      environment,
+    );
+    expect(errorObject.available).toBe(false);
+    lostState.carried_object_losses = [{ ...loss, signal_error: '' }];
+    const emptySignalError = sceneOwnerFacts(
+      parseHeadlessRuntimeSnapshot(lostRuntime),
+      parseSourceModelProjection(sourceModel),
+      environment,
+    );
+    expect(emptySignalError.available).toBe(false);
+    lostState.carried_object_losses = [{
+      ...loss,
+      on_grasp_lost: { ...loss.on_grasp_lost, raise_alarm: false, stop_motion: false },
+      signal_error: signalError,
+    }];
+    const signalErrorWithoutFailClosedPolicy = sceneOwnerFacts(
+      parseHeadlessRuntimeSnapshot(lostRuntime),
+      parseSourceModelProjection(sourceModel),
+      environment,
+    );
+    expect(signalErrorWithoutFailClosedPolicy.available).toBe(false);
+    lostState.carried_object_losses = [{
+      ...loss,
+      on_grasp_lost: { ...loss.on_grasp_lost, stop_motion: false },
+    }];
+    const alarmWithoutStop = sceneOwnerFacts(
+      parseHeadlessRuntimeSnapshot(lostRuntime),
+      parseSourceModelProjection(sourceModel),
+      environment,
+    );
+    expect(alarmWithoutStop.available).toBe(false);
+    lostState.carried_object_losses = [{ ...loss, on_grasp_lost: { ...loss.on_grasp_lost, unexpected: true } }];
+    const extraPolicyField = sceneOwnerFacts(
+      parseHeadlessRuntimeSnapshot(lostRuntime),
+      parseSourceModelProjection(sourceModel),
+      environment,
+    );
+    expect(extraPolicyField.available).toBe(false);
   });
 
   it('strictly parses carried-object attachment hierarchy metadata', () => {
@@ -3103,14 +3193,18 @@ describe('headless projection parsers', () => {
 
   it('parses the versioned gripper-referenced simulation pose payload', () => {
     const reference = {
+      controllable_component_id: 'robot-1',
+      command_target_id: 'gripper-target',
+      gripper_link: 'tcp',
       coherent: true,
       entity: '/World/gripper',
       link: 'robotiq_base_link',
+      source_header_frame_id: 'robotiq_base_link',
       pose_in_reference: { orientation_xyzw: [0, 0, 0, 1], position_m: [0.02, 0, 0.25] },
     };
     const payload = {
       api_version: 'manyforge.ros_pose_observation.v2',
-      kind: 'simulation_entity_pose_with_reference.v1',
+      kind: 'simulation_entity_pose_with_references.v1',
       pose: {
         frame_id: 'universe',
         frame_kind: 'cell_frame',
@@ -3118,29 +3212,266 @@ describe('headless projection parsers', () => {
         position_m: [0.4, -0.2, 0.1],
         source_stamp_ns: null,
       },
-      reference,
+      references: [reference],
       source: { entity: '/mac_n_cheese_centered' },
     };
     const fixture = sceneRuntimeFixture();
     (fixture.state as Record<string, unknown>).pose_sources = [
       poseSourceFixture(payload, { eligible: true, object_id: 'isaac_cheese_box' }),
       poseSourceFixture(
-        { ...payload, reference: { ...reference, coherent: false, pose_in_reference: null } },
+        {
+          ...payload,
+          references: [{ ...reference, coherent: false, pose_in_reference: null }],
+        },
         { eligible: true, object_id: 'isaac_other_box', source_sequence: 8 },
       ),
     ];
     const parsed = parseSceneRuntimeProjection(fixture).state.pose_sources;
     expect(parsed[0]?.payload).toMatchObject({
-      kind: 'simulation_entity_pose_with_reference.v1',
-      reference: { coherent: true, pose_in_reference: { position_m: [0.02, 0, 0.25] } },
+      kind: 'simulation_entity_pose_with_references.v1',
+      references: [{
+        controllable_component_id: 'robot-1',
+        command_target_id: 'gripper-target',
+        gripper_link: 'tcp',
+        entity: '/World/gripper',
+        link: 'robotiq_base_link',
+        source_header_frame_id: 'robotiq_base_link',
+        coherent: true,
+        pose_in_reference: { position_m: [0.02, 0, 0.25] },
+      }],
     });
-    expect(parsed[1]?.payload).toMatchObject({ reference: { pose_in_reference: null } });
+    expect(parsed[1]?.payload).toMatchObject({ references: [{ coherent: false, pose_in_reference: null }] });
+
+    const multipleReferences = sceneRuntimeFixture();
+    (multipleReferences.state as Record<string, unknown>).pose_sources = [poseSourceFixture({
+      ...payload,
+      references: [reference, {
+        ...reference,
+        command_target_id: 'second-gripper',
+        gripper_link: 'parallel_jaw',
+      }],
+    })];
+    expect(parseSceneRuntimeProjection(multipleReferences).state.pose_sources[0]?.payload)
+      .toMatchObject({ references: [{ command_target_id: 'gripper-target' }, { command_target_id: 'second-gripper' }] });
+
+    const duplicateTarget = sceneRuntimeFixture();
+    (duplicateTarget.state as Record<string, unknown>).pose_sources = [poseSourceFixture({
+      ...payload,
+      references: [reference, { ...reference, gripper_link: 'parallel_jaw' }],
+    })];
+    expect(() => parseSceneRuntimeProjection(duplicateTarget)).toThrow(
+      /unique controllable_component_id and command_target_id pairs/,
+    );
 
     const extra = sceneRuntimeFixture();
     (extra.state as Record<string, unknown>).pose_sources = [
       poseSourceFixture({ ...payload, kind: 'simulation_entity_pose' }),
     ];
     expect(() => parseSceneRuntimeProjection(extra)).toThrow();
+  });
+
+  it('parses complete attached-reference measurements and optional grasp baseline', () => {
+    const payload = {
+      api_version: 'manyforge.ros_pose_observation.v2',
+      kind: 'simulation_entity_pose_with_references.v1',
+      pose: {
+        frame_id: 'universe',
+        frame_kind: 'cell_frame',
+        orientation_xyzw: [0, 0, 0, 1],
+        position_m: [0.4, -0.2, 0.1],
+        source_stamp_ns: null,
+      },
+      references: [{
+        controllable_component_id: 'arm',
+        command_target_id: 'gripper',
+        gripper_link: 'tcp',
+        entity: '/World/gripper',
+        link: 'robotiq_base_link',
+        source_header_frame_id: 'robotiq_header',
+        coherent: true,
+        pose_in_reference: { orientation_xyzw: [0, 0, 0, 1], position_m: [0.02, 0, 0.25] },
+      }],
+      source: { entity: '/mac_n_cheese_centered' },
+    };
+    const holder = {
+      controllable_component_id: 'arm', command_target_id: 'gripper', gripper_link: 'tcp',
+    };
+    const measuredAgainst = { entity: '/World/gripper', link: 'robotiq_base_link' };
+    const frame = {
+      kind: 'component',
+      controllable_component_id: 'arm',
+      model_instance_id: 'arm.model',
+      frame_role_id: 'tcp',
+    };
+    const currentOffset = {
+      position_m: { x: 0.02, y: 0, z: 0.25 },
+      orientation_xyzw: [0, 0, 0, 1],
+    };
+    const baselineOffset = {
+      position_m: { x: 0.01, y: 0, z: 0.24 },
+      orientation_xyzw: [0, 0, 0, 1],
+    };
+    const full = {
+      holder,
+      measured_against: measuredAgainst,
+      source_header_frame_id: 'robotiq_header',
+      frame,
+      current_offset: currentOffset,
+      baseline_offset: baselineOffset,
+      drift: { translation_m: 0.0141, rotation_rad: 0.02 },
+    };
+    const currentOnly = { ...full };
+    delete (currentOnly as Partial<typeof full>).baseline_offset;
+    delete (currentOnly as Partial<typeof full>).drift;
+    delete (currentOnly as Partial<typeof full>).source_header_frame_id;
+
+    const fixture = sceneRuntimeFixture();
+    (fixture.state as Record<string, unknown>).pose_sources = [
+      poseSourceFixture(payload, {
+        ...full,
+        eligible: true,
+        object_id: 'isaac_cheese_box',
+        policy_id: 'continuous_relative_to_attached',
+      }),
+      poseSourceFixture(payload, {
+        ...currentOnly,
+        eligible: true,
+        object_id: 'isaac_other_box',
+        policy_id: 'continuous_relative_to_attached',
+        source_sequence: 8,
+      }),
+    ];
+    const parsed = parseSceneRuntimeProjection(fixture).state.pose_sources;
+    expect(parsed[0]).toMatchObject(full);
+    expect(parsed[1]).toMatchObject({ holder, measured_against: measuredAgainst, current_offset: currentOffset });
+    expect(parsed[1]).not.toHaveProperty('baseline_offset');
+    expect(parsed[1]).not.toHaveProperty('drift');
+
+    const partial = sceneRuntimeFixture();
+    (partial.state as Record<string, unknown>).pose_sources = [poseSourceFixture(payload, {
+      holder,
+      eligible: true,
+      object_id: 'isaac_cheese_box',
+    })];
+    expect(() => parseSceneRuntimeProjection(partial)).toThrow(
+      /measured_against must be present with the pose measurement/,
+    );
+
+    const unpairedBaseline = sceneRuntimeFixture();
+    (unpairedBaseline.state as Record<string, unknown>).pose_sources = [poseSourceFixture(payload, {
+      ...currentOnly,
+      baseline_offset: baselineOffset,
+      eligible: true,
+      object_id: 'isaac_cheese_box',
+    })];
+    expect(() => parseSceneRuntimeProjection(unpairedBaseline)).toThrow(
+      /baseline_offset and drift to be present together/,
+    );
+
+    const wrongPolicy = sceneRuntimeFixture();
+    (wrongPolicy.state as Record<string, unknown>).pose_sources = [poseSourceFixture(payload, {
+      ...full,
+      eligible: true,
+      object_id: 'isaac_cheese_box',
+      policy_id: 'continuous_unattached',
+    })];
+    expect(() => parseSceneRuntimeProjection(wrongPolicy)).toThrow(
+      /gripper-relative pose measurements only on continuous_relative_to_attached referenced-pose rows/,
+    );
+
+    const wrongReference = sceneRuntimeFixture();
+    (wrongReference.state as Record<string, unknown>).pose_sources = [poseSourceFixture({
+      ...payload,
+      references: [{
+        controllable_component_id: 'arm',
+        command_target_id: 'gripper',
+        gripper_link: 'tcp',
+        entity: '/World/gripper',
+        link: 'robotiq_left_finger',
+        source_header_frame_id: 'robotiq_base_link',
+        coherent: true,
+        pose_in_reference: {
+          orientation_xyzw: [0, 0, 0, 1],
+          position_m: [0.02, 0, 0.25],
+        },
+      }],
+    }, {
+      ...full,
+      eligible: true,
+      object_id: 'isaac_cheese_box',
+      policy_id: 'continuous_relative_to_attached',
+    })];
+    expect(() => parseSceneRuntimeProjection(wrongReference)).toThrow(
+      /gripper-relative pose measurements to match a coherent reference in the same observation/,
+    );
+  });
+
+  it('parses a continuous grasp-loss measurement against the cell frame', () => {
+    const fixture = sceneRuntimeFixture();
+    const payload = {
+      api_version: 'manyforge.ros_pose_observation.v2',
+      kind: 'simulation_entity_pose',
+      pose: {
+        frame_id: 'cell',
+        frame_kind: 'cell_frame',
+        orientation_xyzw: [0, 0, 0, 1],
+        position_m: [0.4, -0.2, 0.1],
+        source_stamp_ns: null,
+      },
+      source: { entity: '/part' },
+    };
+    (fixture.state as Record<string, unknown>).pose_sources = [poseSourceFixture(payload, {
+      eligible: true,
+      object_id: 'part',
+      policy_id: 'continuous',
+      measured_against: 'cell frame',
+      frame: {
+        kind: 'component',
+        controllable_component_id: 'arm',
+        model_instance_id: 'arm.model',
+        frame_role_id: 'tcp',
+      },
+      current_offset: {
+        position_m: { x: 0.02, y: 0, z: 0.25 },
+        orientation_xyzw: [0, 0, 0, 1],
+      },
+      baseline_offset: {
+        position_m: { x: 0.01, y: 0, z: 0.24 },
+        orientation_xyzw: [0, 0, 0, 1],
+      },
+      drift: { translation_m: 0.0141, rotation_rad: 0.02 },
+    })];
+
+    const parsed = parseSceneRuntimeProjection(fixture).state.pose_sources[0];
+    expect(parsed).toMatchObject({
+      measured_against: 'cell frame',
+      current_offset: { position_m: { x: 0.02, y: 0, z: 0.25 } },
+      baseline_offset: { position_m: { x: 0.01, y: 0, z: 0.24 } },
+      drift: { translation_m: 0.0141, rotation_rad: 0.02 },
+    });
+    expect(parsed).not.toHaveProperty('holder');
+    expect(parsed).not.toHaveProperty('source_header_frame_id');
+
+    const wrongPolicy = sceneRuntimeFixture();
+    (wrongPolicy.state as Record<string, unknown>).pose_sources = [poseSourceFixture(payload, {
+      eligible: true,
+      object_id: 'part',
+      policy_id: 'continuous_relative_to_attached',
+      measured_against: 'cell frame',
+      frame: {
+        kind: 'component',
+        controllable_component_id: 'arm',
+        model_instance_id: 'arm.model',
+        frame_role_id: 'tcp',
+      },
+      current_offset: {
+        position_m: { x: 0.02, y: 0, z: 0.25 },
+        orientation_xyzw: [0, 0, 0, 1],
+      },
+    })];
+    expect(() => parseSceneRuntimeProjection(wrongPolicy)).toThrow(
+      /cell-frame pose measurements only on continuous rows/,
+    );
   });
 
   it('rejects ambiguous or dishonest ROS observation shapes', () => {
@@ -4797,6 +5128,7 @@ describe('addressed Robot Control parsers', () => {
         certificate: null,
         latch_generation: 1,
         latch_id: 'stop-fault.1',
+        observed_triggers: ['escalated', 'partial'],
         reason_code: 'stop_escalated',
         recovery_status: 'waiting_for_observation',
         state: 'latched',
@@ -4809,6 +5141,7 @@ describe('addressed Robot Control parsers', () => {
     expect(stoppedStatus.cellStopAction.latestTerminal?.executedStages[0])
       .toMatchObject({ executedMode: 'hard_deceleration', stageIndex: 1 });
     expect(stoppedStatus.cellStopAction.fault?.latchId).toBe('stop-fault.1');
+    expect(stoppedStatus.cellStopAction.fault?.observedTriggers).toEqual(['escalated', 'partial']);
 
     // Strict pneumatic targets expose a model coordinate for display, without
     // claiming an authoritative finger observation. The control shell must

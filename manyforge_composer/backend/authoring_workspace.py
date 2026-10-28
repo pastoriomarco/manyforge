@@ -53,6 +53,7 @@ import uuid
 from typing import TYPE_CHECKING, Any, Callable, Mapping, NoReturn
 
 from .authoring_identity import canonical_digest
+from .scenario_artifacts import scenario_project_read_only
 
 if TYPE_CHECKING:
     from .deployment_draft import DeploymentDraftSession
@@ -68,6 +69,7 @@ AUTHORING_WORKSPACE_MAXIMUM_REVISION = 9_007_199_254_740_991
 
 _PROJECT_FACT_FIELDS = (
     "document_path",
+    "read_only",
     "document_id",
     "document_name",
     "document_description",
@@ -154,6 +156,7 @@ def scenario_project_facts(
         # caller supplies a replacement path.
         return {
             "document_path": document_path,
+            "read_only": scenario_project_read_only(document_path),
             "document_id": None,
             "document_name": None,
             "document_description": None,
@@ -165,6 +168,8 @@ def scenario_project_facts(
         }
     return {
         "document_path": document_path,
+        # The built-in Untitled Scenario: Save As only, never saved in place.
+        "read_only": scenario_project_read_only(document_path),
         "document_id": document.get("scenario_id"),
         "document_name": document.get("name"),
         "document_description": document.get("description"),
@@ -920,6 +925,7 @@ class AuthoringWorkspace:
     def _project_facts_locked(self) -> dict[str, Any]:
         return {
             "document_path": self._document_path,
+            "read_only": scenario_project_read_only(self._document_path),
             "document_id": self._document_id,
             "document_name": self._document_name,
             "document_description": self._document_description,

@@ -463,6 +463,8 @@ def native_commands(config: NativeLauncherConfig) -> tuple[ProcessSpec, ...]:
             str(SERVICE_PORTS["program_runner"]),
             "--headless-url",
             config.headless_url,
+            "--snapshot-url",
+            f"http://127.0.0.1:{SERVICE_PORTS['composer']}/api/scene/snapshot/render",
             "--owner-id",
             f"program-runner.{config.instance_id}",
             "--headless-timeout-s",

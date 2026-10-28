@@ -213,7 +213,7 @@ TEST(ProductContractRegistryTest,
      QualifiesExactFlattenedViewerControlRuntimeAndSymbolMapContracts) {
   const auto &registry = build_qualified_product_contract_registry();
   const auto contracts = registry.contracts();
-  ASSERT_EQ(contracts.size(), 7U);
+  ASSERT_EQ(contracts.size(), 6U);
   const auto &contract = flattened_contract();
 
   EXPECT_EQ(contract.product_contract_id().value(),
@@ -367,32 +367,8 @@ TEST(ProductContractRegistryTest,
                           runtime->product_contract_revision()),
             &*runtime);
 
-  const auto native_runtime = std::find_if(
-      contracts.begin(), contracts.end(), [](const auto &candidate) {
-        return candidate.product_contract_id().value() ==
-               detail::kNativeExecutionRuntimeProductContractId;
-      });
-  ASSERT_NE(native_runtime, contracts.end());
-  EXPECT_EQ(native_runtime->product_kind(),
-            core::RetainedProductKind::kRuntimeUnitConfiguration);
-  EXPECT_EQ(native_runtime->placement(), ProductPlacement::kRuntimeUnit);
-  ASSERT_EQ(native_runtime->artifact_roles().size(), 2U);
-  EXPECT_EQ(native_runtime->artifact_roles()[0].artifact_role_id.value(),
-            detail::kNativeExecutionRuntimeLaunchDescriptorArtifactRole);
-  EXPECT_EQ(native_runtime->artifact_roles()[0].media_type,
-            detail::kNativeExecutionRuntimeLaunchDescriptorMediaType);
-  EXPECT_EQ(native_runtime->artifact_roles()[0].cardinality,
-            ProductArtifactCardinality::kRequiredExactlyOne);
-  EXPECT_EQ(native_runtime->artifact_roles()[1].artifact_role_id.value(),
-            detail::kNativeExecutionRuntimeManifestArtifactRole);
-  EXPECT_EQ(native_runtime->artifact_roles()[1].media_type,
-            detail::kNativeExecutionRuntimeManifestMediaType);
-  EXPECT_EQ(native_runtime->artifact_roles()[1].cardinality,
-            ProductArtifactCardinality::kRequiredExactlyOne);
-  EXPECT_EQ(registry.find(native_runtime->product_contract_id(),
-                          native_runtime->product_contract_revision()),
-            &*native_runtime);
-
+  // The native execution runtime product contract was retired; only the
+  // ros2_control runtime contract remains.
   const auto ros2_control_runtime = std::find_if(
       contracts.begin(), contracts.end(), [](const auto &candidate) {
         return candidate.product_contract_id().value() ==

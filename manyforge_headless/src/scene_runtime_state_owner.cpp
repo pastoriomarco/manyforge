@@ -7,6 +7,7 @@
 
 #include <manyforge_content_identity/content_identity.hpp>
 #include <manyforge_core/types/carried_object_lost.hpp>
+#include <manyforge_core/types/logical_scene_snapshot.hpp>
 
 namespace manyforge::headless {
 namespace {
@@ -434,6 +435,21 @@ void SceneRuntimeStateOwner::RecordCarriedObjectLoss(
   ValidateText(event.scene_resource_id, "scene_resource_id",
                kMaximumIdentifierBytes);
   ValidateText(event.full_text, "full_text", kMaximumErrorBytes);
+  ValidateText(event.carried_object_attachment_id,
+               "carried_object_attachment_id", kMaximumIdentifierBytes);
+  ValidateText(event.controllable_component_id, "controllable_component_id",
+               kMaximumIdentifierBytes);
+  ValidateText(event.command_target_id, "command_target_id",
+               kMaximumIdentifierBytes);
+  Require(event.on_grasp_lost.valid(),
+          "carried-object loss on_grasp_lost is invalid");
+  if (event.on_grasp_lost.set_key) {
+    ValidateText(*event.on_grasp_lost.set_key, "set_key",
+                 kMaximumIdentifierBytes);
+  }
+  if (event.signal_error) {
+    ValidateText(*event.signal_error, "signal_error", kMaximumIdentifierBytes);
+  }
   const auto now = Now();
   std::lock_guard lock(mutex_);
   if (carried_object_losses_.size() == kMaximumCarriedObjectLossEvents) {
@@ -784,12 +800,34 @@ SceneRuntimeStateValue(const SceneRuntimeStateSnapshot &snapshot) {
   if (!snapshot.carried_object_losses.empty()) {
     CanonicalValue::Array losses;
     for (const auto &loss : snapshot.carried_object_losses) {
+      const auto &response = loss.on_grasp_lost;
       losses.emplace_back(CanonicalValue::Object{
+          {"carried_object_attachment_id",
+           CanonicalValue(loss.carried_object_attachment_id)},
           {"code", CanonicalValue(std::string(
                        core::kCarriedObjectLostRow.code))},
+          {"command_target_id", CanonicalValue(loss.command_target_id)},
+          {"controllable_component_id",
+           CanonicalValue(loss.controllable_component_id)},
           {"event_id", CanonicalValue(loss.event_id)},
           {"full_text", CanonicalValue(loss.full_text)},
+          {"on_grasp_lost",
+           CanonicalValue(CanonicalValue::Object{
+               {"detach", CanonicalValue(response.detach)},
+               {"raise_alarm", CanonicalValue(response.raise_alarm)},
+               {"set_key", response.set_key
+                               ? CanonicalValue(*response.set_key)
+                               : CanonicalValue(nullptr)},
+               {"stop_motion", CanonicalValue(response.stop_motion)}})},
           {"scene_resource_id", CanonicalValue(loss.scene_resource_id)}});
+      if (loss.signal_error) {
+        // Only on a failed publication (SX-204).
+        losses.back() = CanonicalValue([&] {
+          auto row = losses.back().as_object();
+          row.emplace_back("signal_error", CanonicalValue(*loss.signal_error));
+          return row;
+        }());
+      }
     }
     result.emplace_back("carried_object_losses",
                         CanonicalValue(std::move(losses)));

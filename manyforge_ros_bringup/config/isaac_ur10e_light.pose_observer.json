@@ -40,11 +40,16 @@
       "local_position_xyz": [0, 0, 0],
       "object_id": "isaac_cheese_box",
       "policy_id": "scene",
-      "relative_reference": {
-        "entity": "/World/ur10e_robotiq2f_140_ROS/ur10e_robotiq2f_140/ee_link/robotiq_arg2f_base_link",
-        "link": "robotiq_base_link",
-        "source_header_frame_id": "robotiq_arg2f_base_link"
-      },
+      "relative_references": [
+        {
+          "controllable_component_id": "isaac_ur10e_light_robot",
+          "command_target_id": "gripper",
+          "gripper_link": "robotiq_base_link",
+          "entity": "/World/ur10e_robotiq2f_140_ROS/ur10e_robotiq2f_140/ee_link/robotiq_arg2f_base_link",
+          "link": "robotiq_base_link",
+          "source_header_frame_id": "robotiq_arg2f_base_link"
+        }
+      ],
       "source_coordinate_frame_id": "universe",
       "source_header_frame_id": "mac_n_cheese_centered",
       "target_frame_id": "universe"

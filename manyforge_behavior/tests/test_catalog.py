@@ -13,6 +13,7 @@ import rfc8785
 import manyforge_behavior.catalog as catalog_module
 from manyforge_behavior.catalog import (
     EXPECTED_API_VERSION,
+    EXPECTED_BUILTIN_CATALOG_DIGEST,
     EXPECTED_CONTENT_VERSION,
     CatalogValidationError,
     NodeCatalog,
@@ -23,7 +24,6 @@ from manyforge_behavior.node_registry import build_node_registry
 
 
 CATALOG_PATH = Path(__file__).parent.parent / "resources" / "node_catalog.yaml"
-EXPECTED_CATALOG_DIGEST = "sha256:b9d90f6ec180af69c9f342b4d7c995668693ef16854e7ab8df177381c5db9806"
 
 
 def _catalog_data() -> dict[str, object]:
@@ -50,7 +50,7 @@ def test_shipped_catalog_is_exact_frozen_v2_packet() -> None:
     assert catalog.api_version == EXPECTED_API_VERSION
     assert catalog.content_version == EXPECTED_CONTENT_VERSION
     assert catalog.catalog_id == "manyforge_builtin"
-    assert catalog.catalog_digest == EXPECTED_CATALOG_DIGEST
+    assert catalog.catalog_digest == EXPECTED_BUILTIN_CATALOG_DIGEST
     assert len(catalog.entries) == 49
     assert (
         len(
@@ -91,7 +91,7 @@ def test_gripper_position_schema_keeps_numeric_and_strict_semantic_aliases(
 
 def test_gripper_program_dwell_policy_is_optional_pause_default() -> None:
     catalog = NodeCatalog(CATALOG_PATH)
-    assert catalog.content_version == "2.7.0"
+    assert catalog.content_version == EXPECTED_CONTENT_VERSION
     gripper = catalog.get("gripper.command_position")
     policy = next(parameter for parameter in gripper.parameters if parameter.id == "dwell_while_held")
     assert policy.required is False
@@ -154,8 +154,8 @@ def test_motion_preemption_parameters_are_optional_with_closed_values(node_id) -
 
 
 def test_recomputed_previous_catalog_version_is_not_an_alias(tmp_path: Path) -> None:
-    path = _write_recomputed(tmp_path, lambda data: data.__setitem__("content_version", "2.6.0"))
-    with pytest.raises(CatalogValidationError, match="content_version must be '2.7.0'"):
+    path = _write_recomputed(tmp_path, lambda data: data.__setitem__("content_version", "2.7.0"))
+    with pytest.raises(CatalogValidationError, match=f"content_version must be '{EXPECTED_CONTENT_VERSION}'"):
         NodeCatalog(path)
 
 
@@ -365,6 +365,40 @@ def test_attach_node_grasp_lost_bound_parameters_have_defaults() -> None:
         assert parameter.required is False
         assert parameter.has_default is True
         assert parameter.default == default
+
+
+def test_attach_node_on_grasp_lost_defaults_and_nullable_key_schema() -> None:
+    catalog = NodeCatalog(CATALOG_PATH)
+    parameter = next(
+        row
+        for row in catalog.get("scene.attach_carried_object").parameters
+        if row.id == "on_grasp_lost"
+    )
+    assert parameter.required is False
+    assert parameter.default == {
+        "raise_alarm": True,
+        "stop_motion": True,
+        "set_key": None,
+        "detach": True,
+    }
+    assert not validate_value(
+        parameter.schema,
+        {"set_key": None},
+        registry=catalog.schema_registry,
+    )
+    assert validate_value(
+        parameter.schema,
+        {"set_key": 12},
+        registry=catalog.schema_registry,
+    )
+    schema = catalog.schema_registry.to_json_schema(parameter.schema)
+    assert schema["properties"]["set_key"]["anyOf"] == [
+        {
+            "type": "string",
+            "x-manyforge-semantic-type": "blackboard_key",
+        },
+        {"type": "null"},
+    ]
 
 
 @pytest.mark.parametrize("parameter_id", [
@@ -613,14 +647,28 @@ def test_old_catalog_apis_are_not_runtime_inputs(
         NodeCatalog(path)
 
 
-def test_catalog_digest_is_verified_over_rfc8785_content(tmp_path: Path) -> None:
+def test_catalog_digest_is_computed_over_rfc8785_content(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    assert NodeCatalog(CATALOG_PATH).diagnostics == ()
     data = _catalog_data()
     data["entries"][0]["name"] = "Changed without digest"
+    stale = data["catalog_digest"]
+    payload = dict(data)
+    payload.pop("catalog_digest")
+    computed = "sha256:" + hashlib.sha256(rfc8785.dumps(payload)).hexdigest()
+    # The frozen-packet pin (if still present) is a separate check.
+    monkeypatch.setattr(
+        catalog_module, "EXPECTED_BUILTIN_CATALOG_DIGEST", computed, raising=False
+    )
     path = tmp_path / "catalog.yaml"
     path.write_text(json.dumps(data), encoding="utf-8")
 
-    with pytest.raises(CatalogValidationError, match="digest mismatch"):
-        NodeCatalog(path)
+    catalog = NodeCatalog(path)
+
+    assert catalog.catalog_digest == computed != stale
+    assert catalog.raw_data["catalog_digest"] == computed
+    assert [row["code"] for row in catalog.diagnostics] == ["edited_outside_manyforge"]
 
 
 def test_recomputed_packet_change_cannot_reuse_frozen_content_version(

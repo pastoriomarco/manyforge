@@ -1,5 +1,6 @@
 #pragma once
 
+#include "host_carried_object_lost_signals.hpp"
 #include "io_provider_lifecycle_product.hpp"
 #include "mock_io_input_result.hpp"
 
@@ -48,14 +49,29 @@ public:
          std::map<core::InterruptSourceId, SourceInput> sources,
          std::shared_ptr<core::IClock> clock,
          std::shared_ptr<core::IScheduler> scheduler,
-         std::size_t compiled_blackboard_key_capacity = 0U) {
+         std::size_t compiled_blackboard_key_capacity = 0U,
+         std::vector<deployment::RetainedIoSignalConfiguration> system_rows =
+             {}) {
     Require(clock && scheduler &&
-                (!sources.empty() || compiled_blackboard_key_capacity > 0U),
+                (!sources.empty() || !system_rows.empty() ||
+                 compiled_blackboard_key_capacity > 0U),
             "I/O installation has no compiled source/time authority");
+    // Compiled system signals: one in-process source with no driver or
+    // lifecycle; the host owns it (contract §2).
+    std::optional<core::InterruptSourceId> system_source;
+    for (const auto &row : system_rows) {
+      Require(row.provider.profile == deployment::kSystemCarriedObjectProfile &&
+                  row.provider.ingress_depth > 0U &&
+                  (!system_source || *system_source == row.descriptor.source_id) &&
+                  !sources.contains(row.descriptor.source_id),
+              "system signal source is not one exact in-process source");
+      system_source = row.descriptor.source_id;
+    }
     Require(sources.size() < std::numeric_limits<std::size_t>::max(),
             "I/O source capacity arithmetic overflow");
     core::IoSignalLimitsDTO limits{
-        sources.size() + (compiled_blackboard_key_capacity > 0U ? 1U : 0U),
+        sources.size() + (system_source ? 1U : 0U) +
+            (compiled_blackboard_key_capacity > 0U ? 1U : 0U),
         0U,
         compiled_blackboard_key_capacity > 0U ? 64U : 0U,
         core::kMaxProgramTreeNodes,
@@ -84,6 +100,15 @@ public:
       limits.records_per_source = std::max(limits.records_per_source, depth);
       limits.records_per_source_overrides.emplace(source, depth);
       for (const auto &row : input.rows)
+        catalog.signals.push_back(row.descriptor);
+    }
+    if (system_source) {
+      const auto depth = system_rows.front().provider.ingress_depth;
+      catalog.authoritative_synthetic_sources.push_back(*system_source);
+      drain_budget += depth + 1U;
+      limits.records_per_source = std::max(limits.records_per_source, depth);
+      limits.records_per_source_overrides.emplace(*system_source, depth);
+      for (const auto &row : system_rows)
         catalog.signals.push_back(row.descriptor);
     }
     Require(catalog.signals.size() <= std::numeric_limits<std::size_t>::max() -
@@ -119,13 +144,39 @@ public:
               "sealed I/O source incarnation cannot be installed");
       result->incarnations_.emplace(source, incarnation);
     }
+    std::optional<core::IoSourceIncarnation> system_incarnation;
+    if (system_source) {
+      system_incarnation =
+          core::IoSourceIncarnation(content_identity::framed_sha256(
+              "manyforge.host-io-source", "manyforge.host-io-source.v1",
+              CanonicalValue(CanonicalValue::Object{
+                  {"owner_epoch", CanonicalValue(owner.value())},
+                  {"generation", CanonicalValue(std::to_string(generation))},
+                  {"source_id", CanonicalValue(system_source->value())}})));
+      Require(signals->InstallSource(*system_source, *system_incarnation,
+                                     std::nullopt)
+                  .ok(),
+              "system signal source incarnation cannot be installed");
+      result->incarnations_.emplace(*system_source, *system_incarnation);
+    }
     std::shared_ptr<IngressWake> wake;
-    if (!sources.empty()) {
+    if (!sources.empty() || system_source) {
       auto ingress = core::IoSignalIngress::Create(signals);
       Require(ingress.ok(), "sealed I/O ingress cannot be installed");
       result->ingress_ =
           std::shared_ptr<core::IoSignalIngress>(std::move(ingress.value()));
       wake = std::make_shared<IngressWake>(result->ingress_, result);
+    }
+    if (system_source) {
+      MockBooleanInputSource source{*system_source, *system_incarnation, {}};
+      for (const auto &row : system_rows) {
+        source.inputs.push_back({row.descriptor, false});
+        result->system_signals_.push_back(row.descriptor.signal_id);
+      }
+      auto provider =
+          MockBooleanInputProvider::Create(wake, *result->clock_, std::move(source));
+      Require(provider.ok(), "system signal source cannot be created");
+      result->system_provider_ = std::move(provider.value());
     }
     for (const auto &[source, input] : sources) {
       const auto &incarnation = result->incarnations_.at(source);
@@ -989,6 +1040,22 @@ public:
             if (auto self = weak.lock())
               self->ScheduleMockEcho(i, value, written_at);
           });
+    // The system source has no DriverRecord: its levels outlive compositions
+    // in the host store. Starting (also as an Apply candidate) only replays
+    // the recorded `true` levels, serialized with every Publish (SX-189); the
+    // store's sink moves here when this composition is committed
+    // (`AdoptCarriedObjectLostSignals`, SX-206).
+    if (system_provider_)
+      host_carried_object_lost_signals().Seed(
+          [this](const std::vector<core::IoSignalId> &lost) {
+            for (const auto &signal : lost)
+              if (std::find(system_signals_.begin(), system_signals_.end(),
+                            signal) != system_signals_.end())
+                Require(system_provider_->SetValue(signal, true).ok(),
+                        "system signal initial level cannot be set");
+            Require(system_provider_->PublishInitial().ok(),
+                    "system signal initial acquisition was refused");
+          });
     // Initial samples come only from actual DriverRecord Enable.
     if (ingress_) {
       const auto drained = ingress_->Drain(drain_budget_);
@@ -996,6 +1063,55 @@ public:
               "I/O initial ingress admission failed");
     }
     RequestRuleEvidenceProcessing();
+  }
+
+  /// This runtime's composition is committed (terminal publication proof):
+  /// the host store delivers every later level here, keeps only the rows of
+  /// the grippers it holds, and this runtime takes the store's current levels
+  /// (a level published while it was a candidate included), all in one
+  /// serialized step. Idempotent.
+  void AdoptCarriedObjectLostSignals() {
+    host_carried_object_lost_signals().InstallSink(
+        [weak = weak_from_this()](const core::IoSignalId &signal, bool value) {
+          const auto self = weak.lock();
+          return self ? self->PublishSystemSignal(signal, value)
+                      : std::optional<core::ErrorDTO>(core::ErrorDTO{
+                            "io_signal_service_unavailable",
+                            "System signal source is retired", {}});
+        },
+        system_signals_,
+        [this](const std::vector<core::IoSignalId> &lost) {
+          if (!system_provider_)
+            return;
+          for (const auto &signal : system_signals_)
+            Require(system_provider_
+                        ->SetValue(signal, std::find(lost.begin(), lost.end(),
+                                                     signal) != lost.end())
+                        .ok(),
+                    "system signal level cannot be set");
+        });
+  }
+
+  /// One level of a compiled system signal of this runtime. The ingress wake
+  /// drains it and runs rule evidence on the host scheduler.
+  std::optional<core::ErrorDTO> PublishSystemSignal(const core::IoSignalId &signal,
+                                                    bool value) {
+    {
+      std::lock_guard lock(mutex_);
+      if (!active_)
+        return core::ErrorDTO{"io_signal_service_unavailable",
+                              "System signal source is retired", {}};
+    }
+    if (!system_provider_ ||
+        std::find(system_signals_.begin(), system_signals_.end(), signal) ==
+            system_signals_.end())
+      return core::ErrorDTO{"io_signal_unbound",
+                            "No compiled system signal has this identity",
+                            {{"signal_name", signal.name}}};
+    const auto changed = system_provider_->SetValue(signal, value);
+    if (!changed.ok())
+      return changed.error();
+    return changed.value().publication_error;
   }
 
   core::Result<MockIoInputSetResult>
@@ -1125,6 +1241,8 @@ public:
       }
       // Borrowed actual records remain with their component owner. Retiring
       // an activation must never Shutdown a driver retained by its successor.
+      if (system_provider_)
+        system_provider_->Shutdown();
     } catch (...) {
     } // Clock/ingress remain pinned until callback teardown completes.
   }
@@ -1437,6 +1555,8 @@ private:
   DriverInputInstallations driver_inputs_;
   std::vector<std::shared_ptr<IoProviderDriverRecord>> drivers_;
   std::map<core::IoSignalId, MockInput> mock_inputs_;
+  std::vector<core::IoSignalId> system_signals_;
+  std::unique_ptr<MockBooleanInputProvider> system_provider_;
   std::vector<MockEchoChannel> mock_echoes_;
   mutable std::mutex mock_delivery_mutex_;
   mutable std::mutex mutex_;

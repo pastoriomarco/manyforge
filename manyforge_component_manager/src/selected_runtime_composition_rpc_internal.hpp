@@ -1,5 +1,7 @@
 #pragma once
 
+#include <algorithm>
+#include <chrono>
 #include <cstddef>
 #include <manyforge_component_manager/selected_runtime_composition.hpp>
 #include <manyforge_core/types/error_code.hpp>
@@ -11,6 +13,23 @@ namespace manyforge::component_manager::detail {
 
 inline constexpr std::size_t kMaximumSelectedRuntimeCompositionRpcPacketBytes =
     256U * 1024U;
+
+/// Budget per component a runtime-composition request installs (kAdd or
+/// kReplace in its delta). The whole exchange waits for that many budgets,
+/// at least one.
+inline constexpr std::chrono::seconds kRuntimeCompositionPerComponentTimeout{10};
+
+[[nodiscard]] inline std::chrono::milliseconds SelectedRuntimeCompositionTimeout(
+    const manyforge::deployment::ApplyComponentDeltaDTO &delta) noexcept {
+  using manyforge::deployment::ApplyComponentDisposition;
+  const auto &rows = delta.components;
+  const auto composed = std::count_if(rows.begin(), rows.end(), [](const auto &row) {
+    return row.disposition == ApplyComponentDisposition::kAdd ||
+           row.disposition == ApplyComponentDisposition::kReplace;
+  });
+  return kRuntimeCompositionPerComponentTimeout *
+         std::max<std::ptrdiff_t>(composed, 1);
+}
 
 struct SelectedRuntimeCompositionRpcFailure final {
   manyforge::core::ErrorDTO error;

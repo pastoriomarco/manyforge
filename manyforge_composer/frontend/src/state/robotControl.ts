@@ -142,8 +142,31 @@ export interface RobotControlState {
   previewIssue: string | null;
   error: string | null;
   /** Informational-only surface: uncommitted manual work discarded by an
-   * owner/binding replacement. Never an operational error. */
+   * owner/binding replacement, or a gizmo release that changed nothing or was
+   * discarded. Never an operational error. */
   ownerNotice: string | null;
+}
+
+/** Why a gizmo release produced no new target (shown as an info notice). */
+export type PoseDragDiscard =
+  /** Released where it started (no snap involved). */
+  | 'no_change'
+  /** Snap rounded the release back onto the start pose. */
+  | 'snapped_no_change'
+  /** The robot or its control context changed between press and release. */
+  | 'context_changed';
+
+export function poseDragNotice(reason: PoseDragDiscard | 'stale'): string {
+  switch (reason) {
+    case 'no_change':
+      return 'No change: the target was released where it started.';
+    case 'snapped_no_change':
+      return 'No change: Snap moved the target back to its start. Drag further than half a snap step, or turn Snap off.';
+    case 'context_changed':
+      return 'The robot moved or its control changed during the drag; the target was discarded.';
+    case 'stale':
+      return 'The robot control target changed during the drag; the release was discarded.';
+  }
 }
 
 export type RobotControlAction =
@@ -163,7 +186,7 @@ export type RobotControlAction =
   | { type: 'select_move_source'; source: MoveToDraftSource }
   | { type: 'edit_move_options'; update: Partial<CartesianMoveDraftOptions> }
   | { type: 'begin_pose_drag' }
-  | { type: 'finish_pose_drag'; generation: number; pose: Pose3Value | null }
+  | { type: 'finish_pose_drag'; generation: number; pose: Pose3Value | null; discard?: PoseDragDiscard }
   | { type: 'edit_pose'; pose: Pose3Value }
   | { type: 'edit_gripper'; position: number }
   | { type: 'edit_motion_settings'; update: Partial<ManualMotionSettings> }
@@ -1077,11 +1100,23 @@ export function robotControlReducer(
           : copyPose(selectedStatusForState(state)!.observedMotion!.currentTcpPose),
         poseDragging: true,
         generation: state.generation + 1,
+        ownerNotice: null,
       };
     case 'finish_pose_drag': {
-      if (!state.poseDragging || action.generation !== state.generation) return state;
+      if (!state.poseDragging) return state;
+      // A refresh replaced the target during the drag: its release is stale.
+      if (action.generation !== state.generation) {
+        return { ...state, poseDragging: false, ownerNotice: poseDragNotice('stale') };
+      }
       const settled = { ...state, poseDragging: false };
-      if (action.pose === null || samePose(poseTupleFromValue(state.draftPose), poseTupleFromValue(action.pose))) return settled;
+      if (action.discard === 'context_changed') {
+        return { ...robotControlReducer(settled, { type: 'revert' }), ownerNotice: poseDragNotice('context_changed') };
+      }
+      if (action.discard !== undefined) return { ...settled, ownerNotice: poseDragNotice(action.discard) };
+      if (action.pose === null) return settled;
+      if (samePose(poseTupleFromValue(state.draftPose), poseTupleFromValue(action.pose))) {
+        return { ...settled, ownerNotice: poseDragNotice('no_change') };
+      }
       return robotControlReducer(settled, { type: 'edit_pose', pose: action.pose });
     }
     case 'edit_move_to_joint': {

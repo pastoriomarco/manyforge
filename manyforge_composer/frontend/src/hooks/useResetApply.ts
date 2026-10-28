@@ -368,7 +368,9 @@ export function resetApplyNotice(
   const name = plan.document === 'program' ? 'Program' : 'Deployment';
   return {
     id: `reset-apply.${plan.correlationId}`,
-    severity: failedPhase ? 'error' : 'info',
+    // A stopped Apply blocks nothing: a warning until acknowledged.
+    severity: failedPhase ? 'warning' : 'info',
+    acknowledgeable: failedPhase,
     domain: 'activation',
     title: failedPhase
       ? `${name} Apply stopped`
@@ -378,7 +380,9 @@ export function resetApplyNotice(
     message: `${resetApplyPhaseText(phase)} Correlation ${plan.correlationId}.`,
     busy: !resetApplyTerminal(phase),
     actions: resetApplyDismissible(phase) && phase.kind !== 'applied'
-      ? [{ id: 'dismiss', label: 'Dismiss', title: 'Stop showing this Apply. Nothing is undone, resent or resumed.', run: dismiss }]
+      ? [failedPhase
+        ? { id: 'acknowledge', label: 'Acknowledge', title: 'Stop showing this Apply. Nothing is undone, resent or resumed.', run: dismiss }
+        : { id: 'dismiss', label: 'Dismiss', title: 'Stop showing this Apply. Nothing is undone, resent or resumed.', run: dismiss }]
       : undefined,
   };
 }

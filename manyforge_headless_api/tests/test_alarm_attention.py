@@ -16,6 +16,7 @@ from manyforge_headless_api.alarm_attention import (
     OperatorAlarmAttentionPublisher,
 )
 from manyforge_headless_api.execution import ExecutionEventPump
+from manyforge_headless_api.tests.paged_event_stream import paged_subscription
 
 
 class _Core:
@@ -181,6 +182,9 @@ class _BlockedSourceRefresh:
     def __init__(self) -> None:
         self.entered = threading.Event()
         self.release = threading.Event()
+
+    def subscribe_events(self, after_cursor: int, owner_epoch: str | None):
+        return paged_subscription(self, after_cursor, owner_epoch)
 
     def identity(self) -> dict[str, Any]:
         self.entered.set()

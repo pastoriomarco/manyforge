@@ -9,11 +9,11 @@
   "members": {
     "assignment.yaml": "sha256:dc572e492edec9edcd61a9e8404f16c75c4ad77cb9cab55aff7d8f20eeb7a253",
     "deployment.yaml": "sha256:373cb5260ae97af09b4e21f452250a04aebf6040d91c6621b2737df9fed646bb",
-    "program.yaml": "sha256:4e6120d8d5847d65d0009c2f0c627b613d0dae00cbb181ac36480cffdb7ea1ca"
+    "program.yaml": "sha256:2f3d2bbdc4d2c80c7a8f278968689612c4fccd4a05399b4963561e430da72bfd"
   },
   "name": "isaac-lite6-pick-place",
   "saved_status": {
-    "checked_content_digest": "sha256:bb402fbc88abd694e40079dfe2e91b005006e55edda3768d0d39c36e22149ffb",
+    "checked_content_digest": "sha256:444e652ceb9c500668ba7f841bac03fd6da8c96b1bb07f7f4d1095f8b64950a6",
     "last_known_status": "ready",
     "manyforge_version": "0.1.0"
   },

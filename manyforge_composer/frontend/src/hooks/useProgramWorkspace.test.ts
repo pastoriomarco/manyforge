@@ -91,6 +91,7 @@ function testPublication(
     },
     project: {
       documentPath: '/workspace/cell',
+      readOnly: false,
       documentId: null,
       documentName: null,
       documentDescription: null,
@@ -659,7 +660,7 @@ describe('useProgramWorkspace Draft policy interaction', () => {
     expect(apiMock.programWorkspace.apply).toHaveBeenCalledOnce();
   });
 
-  it('New uses the shared fence and follows the exact accepted Apply without a second command', async () => {
+  it('New loads Untitled with the shared fence and follows the exact accepted Apply without a second command', async () => {
     const initial = deferred<ProgramWorkspaceResponse>();
     await mountHarness(initial, authoringSnapshot(workspace(1)), testPublication(workspace(1)));
     await act(async () => initial.resolve(workspace(1)));
@@ -667,16 +668,13 @@ describe('useProgramWorkspace Draft policy interaction', () => {
       status: 'accepted', workspace: workspace(1),
       activation: { status: 'accepted', apply_id: 'apply.new', apply_generation: 9 },
     });
-    const input = {
-      name: 'new_cell', directory: '/workspace', deploymentChoice: 'empty' as const,
-      expectedRetainedBundleId: 'bundle', expectedGraphRevision: 'graph', confirmDiscard: true,
-    };
-    await act(async () => { await latest?.newScenarioDocument(input); });
+    await act(async () => { await latest?.newScenarioDocument(true); });
     expect(apiMock.scenarioDocuments.new).toHaveBeenCalledExactlyOnceWith(
-      expect.objectContaining({ draftId: 'draft-1', deploymentDraftId: 'deployment-draft-1' }), input,
+      expect.objectContaining({ draftId: 'draft-1', deploymentDraftId: 'deployment-draft-1' }), true,
     );
     expect(latest?.acceptedApply).toEqual({ applyId: 'apply.new', applyGeneration: 9 });
-    expect(latest?.state.message).toContain('No Program or motion starts automatically');
+    expect(latest?.state.message).toContain('New Scenario accepted (apply.new)');
+    expect(latest?.state.message).toContain('Motion does not start automatically');
     expect(apiMock.scenarioDocuments.load).not.toHaveBeenCalled();
   });
 

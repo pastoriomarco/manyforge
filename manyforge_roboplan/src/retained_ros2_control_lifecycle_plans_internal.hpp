@@ -29,6 +29,8 @@ predicate(std::vector<core::ComponentLifecycleStateDTO> states,
   return {std::move(states), std::move(values)};
 }
 
+/// Timeout of every shared ros2_control lifecycle plan (30 s).
+inline constexpr std::int64_t kRos2ControlLifecyclePlanTimeoutNs = 30'000'000'000LL;
 
 [[nodiscard]] inline std::vector<core::LifecycleIntentPlanDTO>
 retained_ros2_control_lifecycle_plans() {
@@ -47,7 +49,7 @@ retained_ros2_control_lifecycle_plans() {
       {{kReady, true}, {kLoaded, true}, {kFault, false}, {kTransport, true}});
   const auto disabled = predicate(
       {State::kDisabled}, {{kReady, false}, {kFault, false}, {kTransport, true}});
-  constexpr std::int64_t timeout = 30'000'000'000LL;
+  constexpr std::int64_t timeout = kRos2ControlLifecyclePlanTimeoutNs;
   // Design R6 / §7.5: the spawner loads the controller inactive; CCLC Enable
   // activates it and Disable deactivates it (`switch_controller`). Recover
   // (the operator's Reset of an incident, Q41) re-prepares the component;
@@ -79,6 +81,27 @@ retained_ros2_control_lifecycle_plans() {
          predicate({State::kDegraded, State::kFaulted}, {{kTransport, true}}),
          prepared}}},
   };
+}
+
+/// The gripper domain of a Real xArm-family component: the shared plans, but
+/// Recover targets `disabled`, the Real arm's Recover target, so the component
+/// has one common target (spec 210 section 3.17). A healthy gripper has
+/// nothing to clear: the target is already satisfied and nothing dispatches.
+[[nodiscard]] inline std::vector<core::LifecycleIntentPlanDTO>
+retained_ros2_control_gripper_lifecycle_plans() {
+  using State = core::ComponentLifecycleStateDTO;
+  using Intent = core::ComponentLifecycleIntentKindDTO;
+  auto plans = retained_ros2_control_lifecycle_plans();
+  const auto healthy = predicate(
+      {State::kDeclared, State::kPrepared, State::kActive, State::kDisabled},
+      {{"external.fault_present", false}, {"external.transport_ready", true}});
+  for (auto &plan : plans) {
+    if (plan.intent == Intent::kRecover)
+      plan = core::LifecycleIntentPlanDTO{
+          Intent::kRecover, State::kDisabled, healthy, healthy,
+          kRos2ControlLifecyclePlanTimeoutNs, {}};
+  }
+  return plans;
 }
 
 } // namespace manyforge::roboplan_backend::detail::ros2_control_lifecycle_plans_internal

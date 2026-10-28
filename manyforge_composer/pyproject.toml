@@ -39,6 +39,7 @@ packages = ["manyforge_composer", "manyforge_composer.backend"]
 
 [tool.setuptools.package-data]
 manyforge_composer = ["resources/*.yaml"]
+"manyforge_composer.backend" = ["resources/Untitled.scenario/*.yaml"]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]

@@ -39,6 +39,7 @@ from manyforge_headless_api.control_state import (
 from manyforge_headless_api.component_overview import ComponentOverviewFacts
 from manyforge_headless_api.execution_control import ExecutionControlIngress
 from manyforge_headless_api.execution import ExecutionEventPump
+from manyforge_headless_api.tests.paged_event_stream import paged_subscription
 from manyforge_headless_api.execution_control import (
     ExecutionControlBusyError,
     ExecutionControlLane,
@@ -431,6 +432,7 @@ def test_event_pump_reopens_admission_for_existing_session_without_events() -> N
                 "runtime_faults": {
                     "operation_journal_write_fault": None,
                     "program_runner_loss": None,
+                    "kernel_internal_fault": None,
                 },
                 "operation_progress": [],
                 "admission_generation": admission["admission_generation"],
@@ -462,10 +464,13 @@ def test_event_pump_reopens_admission_for_existing_session_without_events() -> N
                     "changed": False,
                 },
             ),
-            SimpleNamespace(
+            execution := SimpleNamespace(
                 identity=identity,
                 events=events,
                 stop_fault=lambda: {"ok": True, "stop_fault": None},
+                subscribe_events=lambda after_cursor, owner_epoch: paged_subscription(
+                    execution, after_cursor, owner_epoch
+                ),
             ),
             poll_seconds=0.01,
         )

@@ -162,6 +162,26 @@ struct OperationJournalWriteFaultDTO final {
                          const OperationJournalWriteFaultDTO&) = default;
 };
 
+/// First contained internal fault (D3: a callback threw on the Stop/safety
+/// path) in this Workbench owner. Motion admission stays closed while it is
+/// held; it is retained until owner destruction (Workbench restart), like the
+/// operation-journal write fault. Later throws only increase `later_count`.
+struct KernelInternalFaultDTO final {
+  RequestOwnerEpoch request_owner_epoch;
+  /// Typed code of the first cause, e.g. `scheduler_runtime_safety_callback_exception`.
+  std::string reason_code;
+  /// Whether the Kernel accepted (or joined) its one containment Full Stop.
+  /// It is not retried: the same refusal would repeat.
+  bool stop_accepted{};
+  /// Typed refusal reason of that Full Stop when it was not accepted, e.g.
+  /// `stop_operation_not_fenceable`; `containment_stop_exception` if it threw.
+  std::optional<std::string> stop_refusal_code;
+  /// Contained throws after the first one; they request no further Full Stop.
+  std::uint64_t later_count{};
+
+  friend bool operator==(const KernelInternalFaultDTO&, const KernelInternalFaultDTO&) = default;
+};
+
 /// Atomic read-only projection of one retained operation. `resident` is the
 /// exact Kernel-owned distinction between the active set and retained history;
 /// separate admission and recovery projections retain their own authority.
@@ -232,6 +252,8 @@ struct CellStopFaultSummaryDTO final {
   StopFaultRecoveryStatusDTO recovery_status{StopFaultRecoveryStatusDTO::kWaitingForObservation};
   std::string reason_code;
   std::optional<StopCertificateRefDTO> certificate;
+  /// The latch's distinct triggers in first-seen order (includes `trigger`).
+  std::vector<StopFaultTriggerDTO> observed_triggers;
 
   friend bool operator==(const CellStopFaultSummaryDTO&, const CellStopFaultSummaryDTO&) = default;
 };
@@ -389,9 +411,13 @@ class ResourceAddressedExecutionKernel final : public IAddressedOperationOwner,
   ResourceAddressedExecutionKernel& operator=(const ResourceAddressedExecutionKernel&) = delete;
 
   /// Lock-only first-fault snapshot; it never consults or writes the journal.
-  /// Reset and successful reads/writes do not clear this Workbench fault.
+  /// Reset, successful reads/writes and a Stop-fault clear do not clear this
+  /// Workbench fault; motion admission stays closed until restart.
   [[nodiscard]] std::optional<OperationJournalWriteFaultDTO>
   get_operation_journal_write_fault() const;
+  /// Lock-only snapshot of the contained internal fault (see ContainInternalFault),
+  /// published once the outcome of its containment Full Stop is recorded.
+  [[nodiscard]] std::optional<KernelInternalFaultDTO> get_internal_fault() const;
 
   /// Resolve, reserve, and submit one portable operation. Exact replay returns
   /// the original owner-minted identities and performs no subordinate call.
@@ -485,6 +511,9 @@ class ResourceAddressedExecutionKernel final : public IAddressedOperationOwner,
       std::shared_ptr<IIoSignalService>* actual_retired_service = nullptr) override;
   [[nodiscard]] Result<CellAdmissionClaimDTO> AcquireCellAdmissionClaim(
       const CellAdmissionClaimIntentDTO& intent) override;
+  [[nodiscard]] Result<CellAdmissionClaimDTO> AcquireComponentLifecycleClaim(
+      const CellAdmissionClaimIntentDTO& claim,
+      const ComponentLifecycleIntentDTO& lifecycle) override;
   /// Process-local Q91 composition only. Ordinary public acquire is unchanged.
   /// This input is insufficient without the original Manager live-plan interlock.
   /// Incomplete composition: aggregate-deficit source attribution is not
@@ -494,9 +523,11 @@ class ResourceAddressedExecutionKernel final : public IAddressedOperationOwner,
   /// Trusted ordinary Apply convergence on this Kernel's existing claim owner.
   /// The host supplies actual installed-state and immutable terminal checks;
   /// no public request can provide or skip this process-local validator.
+  /// D6: `canonical_empty_candidate` = the exact canonical-empty candidate;
+  /// only that Apply is admitted while a latched Close runs.
   [[nodiscard]] Result<CellAdmissionClaimDTO> AcquireConfigurationApplyCellAdmissionClaim(
       const CellAdmissionClaimIntentDTO& intent,
-      const CellAdmissionConfigurationApplyValidator& validate);
+      const CellAdmissionConfigurationApplyValidator& validate, bool canonical_empty_candidate = false);
   /// Fresh ordinary Apply success, after every exact old fence is released.
   [[nodiscard]] Result<AuthoringAdmissionDTO> ReleaseTerminalApplyClaimsAfterSuccess(
       const CellAdmissionClaimDTO& fresh_claim,
@@ -631,6 +662,14 @@ class ResourceAddressedExecutionKernel final : public IAddressedOperationOwner,
       const LifecycleTransactionId& actual_lifecycle_transaction, bool disabled);
   [[nodiscard]] Result<std::optional<TimePoint>> NextIoRuleExpiry() const;
   void LatchAndContain(const ManagerLivenessLossIntentDTO& intent) noexcept override;
+  /// A callback threw on the Stop/safety path (scheduler lane or runtime-
+  /// collision lookahead). The first call records `reason_code` as the
+  /// internal fault, closes motion admission until a Workbench restart (a
+  /// Stop-fault clear does not reopen it) and attempts one Full Stop under
+  /// this Kernel's own request identity, with `reason_code` as its
+  /// correlation; it records whether that Stop was accepted (or its refusal
+  /// reason; no retry) and writes one typed line. Later calls only count.
+  void ContainInternalFault(std::string_view reason_code) noexcept;
   /// Component-incident containment: a cell Full Stop under this Kernel's own
   /// request identity (owner epoch + incident id) whose transaction latches a
   /// `physical_rest_unproven` Stop fault, so the cell stays latched even when
@@ -1192,6 +1231,11 @@ class ResourceAddressedExecutionKernel final : public IAddressedOperationOwner,
   [[nodiscard]] std::optional<StopControlWorkToken> allocate_stop_projection_job_locked() noexcept;
   void latch_stop_fault_locked(StopTransaction& transaction, StopFaultTriggerDTO trigger);
   void refresh_stop_fault_latch_locked();
+  /// Ordinary acquire; `close_disable` marks a Kernel-verified Disable (D6).
+  [[nodiscard]] Result<CellAdmissionClaimDTO> acquire_cell_admission_claim(
+      const CellAdmissionClaimIntentDTO& intent, bool close_disable);
+  /// D6: how the active latch restricts cell admission (state_mutex_ held).
+  [[nodiscard]] StopFaultAdmissionScope stop_fault_admission_scope_locked() const noexcept;
   [[nodiscard]] Result<void> publish_stop_fault_assessment_locked(
       const StopStatusDTO& expected, const StopFaultLatchDTO& assessed);
   [[nodiscard]] bool commit_stop_terminal_locked(StopTransaction& transaction,
@@ -1276,7 +1320,7 @@ class ResourceAddressedExecutionKernel final : public IAddressedOperationOwner,
   [[nodiscard]] Result<void> retire_program_blackboard_source_locked(
       std::shared_ptr<IIoSignalService>* actual_retired_service = nullptr);
   [[nodiscard]] Result<void> reconcile_program_blackboard_cycle_locked(
-      const std::optional<ProgramCycleStatusDTO>& cycle, bool current,
+      const std::optional<ProgramCycleStatusDTO>& cycle,
       std::shared_ptr<IIoSignalService>* actual_retired_service = nullptr);
   [[nodiscard]] bool program_blackboard_runner_loss_locked(const ProgramCycleStatusDTO& cycle) const;
   [[nodiscard]] bool program_blackboard_scope_current_locked(
@@ -1407,6 +1451,9 @@ class ResourceAddressedExecutionKernel final : public IAddressedOperationOwner,
   StopGeneration cell_stop_generation_{0U};
   StopFaultLatchGeneration cell_stop_fault_latch_generation_{0U};
   std::optional<StopFaultLatchDTO> active_stop_fault_latch_;
+  /// D6: Scenario Close retired the current product's lifecycle targets. Set
+  /// by the Close lease after retirement; cleared when the product changes.
+  bool close_retired_product_{};
   bool manager_liveness_motion_inhibited_{};
   struct AttributedContainmentStop final {
     StopId stop_id;
@@ -1430,6 +1477,13 @@ class ResourceAddressedExecutionKernel final : public IAddressedOperationOwner,
   // by itself (its causing fault gates motion).
   bool motion_admission_closed_{};
   std::optional<OperationJournalWriteFaultDTO> operation_journal_write_fault_{};
+  std::optional<KernelInternalFaultDTO> internal_fault_{};
+  // Restart-only Workbench faults (internal fault, journal write fault): each
+  // keeps its typed cause in the runtime-fault status and holds motion
+  // admission closed until restart; a Stop-fault clear never reopens it.
+  [[nodiscard]] bool restart_required_fault_locked() const noexcept {
+    return internal_fault_.has_value() || operation_journal_write_fault_.has_value();
+  }
   std::optional<RetainedOperatorAlarmAttentionDTO> operator_alarm_attention_;
 };
 

@@ -72,7 +72,6 @@ def test_prototype_is_not_registered_as_a_runtime_or_public_package() -> None:
         REPO_ROOT / "pyproject.toml",
         REPO_ROOT / "docker-compose.yaml",
         REPO_ROOT / "manyforge_behavior" / "resources" / "node_catalog.yaml",
-        REPO_ROOT / "scripts" / "launch.sh",
     )
 
     offenders = [

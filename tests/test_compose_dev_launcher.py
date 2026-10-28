@@ -902,12 +902,16 @@ def test_g_exited_status_crosses_real_ssh_boundary_as_authenticated_facts(tmp_pa
         manager_executable="/qualified/manager", install_root="/qualified/package",
         node_catalog_path="/qualified/nodes", alarm_catalog_path="/qualified/alarms",
         state_root="/srv/state", simulation_control_config="/qualified/simulation.json",
+        # The operator defaults were removed: hosts and paths are explicit inputs.
+        advertised_host="runtime-host", bridge_state_root="/srv/manyforge/bridge-state",
+        ros_setup_script="/opt/ros/lyrical/setup.bash",
         ros_environment_script="/qualified/topology.sh", package_aggregate_sha256="a" * 64,
         compiler_build_manifest_sha256="b" * 64, node_environment_sha256="c" * 64,
         container_image_id=environment["MANYFORGE_DEV_IMAGE"], container_name=environment["MANYFORGE_DEV_CONTAINER_NAME"],
         cache_root=str(tmp_path / "cache"), runtime_root="/srv/runtime", evidence_root=str(tmp_path / "evidence"))
     config = IsaacLauncherConfig(source_root=workspace,
-        remote=remote, state_root=tmp_path / "outer-state",
+        remote=remote, simulator_host="isaac-host",
+        static_peers=("isaac-host", "runtime-host"), state_root=tmp_path / "outer-state",
         instance_id="isaac-fixture", ssh_executable=ssh)
     # Docker returns the exact digest forwarded by the production shell.
     outer = IsaacLauncher(config)

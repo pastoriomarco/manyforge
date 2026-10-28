@@ -173,12 +173,14 @@ def _effect_observations(folder: Path) -> tuple[str, list[str], list[str]]:
             "SELECT 1 FROM program_cycle_inflight_commands LIMIT 1",
             "SELECT 1 FROM program_persistent_value_requests WHERE outcome='storage_uncertain' LIMIT 1",
         ], []),
-        ("kernel_operation", "execution-state/operation-journal.sqlite3", 0x4D46454A, 14, [
+        # v16 archives and current v17 journals share the stop_projections
+        # *_sequence columns (v16 CHECKs pair each with its payload column).
+        ("kernel_operation", "execution-state/operation-journal.sqlite3", 0x4D46454A, (16, 17), [
             "SELECT 1 FROM operation_snapshots WHERE disposition='orphaned_by_host_replacement' OR state NOT IN ('completed','stopped','failed','intervention_required','cancelled_pre_dispatch') LIMIT 1",
             "SELECT 1 FROM cell_admission_claims WHERE release_owner_role IS NULL AND reconciled_sequence IS NULL LIMIT 1",
-            "SELECT 1 FROM stop_projections WHERE terminal_payload IS NULL OR (surveillance_payload IS NOT NULL AND clear_payload IS NULL) LIMIT 1",
+            "SELECT 1 FROM stop_projections WHERE terminal_sequence IS NULL OR (surveillance_sequence IS NOT NULL AND clear_sequence IS NULL) LIMIT 1",
         ], []),
-        ("cclc", "execution-state/cclc-journal.sqlite3", 0x4D464C4A, 19, [
+        ("cclc", "execution-state/cclc-journal.sqlite3", 0x4D464C4A, 21, [
             "SELECT 1 FROM lifecycle_transactions WHERE terminal != 1 LIMIT 1",
             "SELECT 1 FROM route_selection_transactions WHERE terminal != 1 LIMIT 1",
             "SELECT 1 FROM cclc_effect_attempts WHERE completed_attempt_blob IS NULL LIMIT 1",
@@ -190,7 +192,7 @@ def _effect_observations(folder: Path) -> tuple[str, list[str], list[str]]:
         ("manager", "manager/manager-bootstrap-journal.sqlite3", 1296450122, 1, [
             "SELECT 1 FROM manager_bootstrap_intents i LEFT JOIN manager_bootstrap_accepted_targets t USING(bootstrap_id,bootstrap_generation) WHERE t.bootstrap_id IS NULL LIMIT 1",
         ], ["manager_bootstrap_intents"]),
-        ("manager", "manager/manager-apply-journal.sqlite3", 1296450128, 17, [
+        ("manager", "manager/manager-apply-journal.sqlite3", 1296450128, 19, [
             "SELECT 1 FROM manager_apply_intents i LEFT JOIN manager_apply_terminal_outcomes t USING(apply_id,apply_generation) WHERE t.apply_id IS NULL LIMIT 1",
             "SELECT 1 FROM manager_apply_terminal_outcomes WHERE outcome_state='unknown_effect' OR effect_disposition='unknown' LIMIT 1",
         ], ["manager_apply_intents"]),

@@ -14,6 +14,7 @@
 #include <span>
 #include <string>
 #include <string_view>
+#include <variant>
 
 namespace manyforge::headless {
 
@@ -45,10 +46,20 @@ ToString(SceneRuntimePoseApplicationStatus status) noexcept;
     SceneRuntimePoseApplicationStatus status) noexcept;
 
 /// Fixed retained-model pose of the carrier frame in `reference_link`, a
-/// source-local link of the carrier frame's model instance. Errors are typed
-/// refusals: unknown links and any non-fixed joint on the path never resolve.
+/// source-local link of the carrier frame's model instance, plus that carrier
+/// frame's source link name for the runtime pose row.
+struct SceneRuntimeReferenceLinkResolution final {
+  manyforge::core::Pose3DTO carrier_in_reference;
+  std::string carrier_link_name;
+
+  friend bool operator==(const SceneRuntimeReferenceLinkResolution &,
+                         const SceneRuntimeReferenceLinkResolution &) = default;
+};
+
+/// Errors are typed refusals: unknown links and any non-fixed joint on the
+/// path never resolve.
 using SceneRuntimeReferenceLinkResolver =
-    std::function<manyforge::core::Result<manyforge::core::Pose3DTO>(
+    std::function<manyforge::core::Result<SceneRuntimeReferenceLinkResolution>(
         const manyforge::core::RetainedBundleId &retained_bundle_id,
         const manyforge::core::ComponentSceneFrameRefDTO &carrier_frame,
         const std::string &reference_link)>;
@@ -73,6 +84,39 @@ struct SceneRuntimePoseDistance final {
   double rotation_rad{};
 };
 
+/// One actual attachment holder, including its ManyForge target and validated
+/// model gripper base link.
+struct SceneRuntimePoseHolder final {
+  manyforge::core::ControllableComponentId controllable_component_id;
+  manyforge::core::CommandTargetId command_target_id;
+  std::string gripper_link;
+  friend bool operator==(const SceneRuntimePoseHolder &,
+                         const SceneRuntimePoseHolder &) = default;
+};
+
+/// Rigid body used as the relative observation reference.
+struct SceneRuntimeMeasuredBody final {
+  std::string entity;
+  std::string link;
+  friend bool operator==(const SceneRuntimeMeasuredBody &,
+                         const SceneRuntimeMeasuredBody &) = default;
+};
+
+/// Read-only offset facts exposed beside the matching live pose-source row.
+/// `measured_against` is either a measured body or the literal "cell frame".
+struct SceneRuntimePoseMeasurement final {
+  std::optional<SceneRuntimePoseHolder> holder;
+  std::variant<std::string, SceneRuntimeMeasuredBody> measured_against;
+  std::optional<std::string> source_header_frame_id;
+  manyforge::core::ComponentSceneFrameRefDTO frame;
+  manyforge::core::Pose3DTO current_offset;
+  std::optional<manyforge::core::Pose3DTO> baseline_offset;
+  std::optional<SceneRuntimePoseDistance> drift;
+
+  friend bool operator==(const SceneRuntimePoseMeasurement &,
+                         const SceneRuntimePoseMeasurement &) = default;
+};
+
 [[nodiscard]] SceneRuntimePoseDistance
 SceneRuntimePoseDistanceBetween(const manyforge::core::Pose3DTO &from,
                                 const manyforge::core::Pose3DTO &to) noexcept;
@@ -82,9 +126,16 @@ struct SceneRuntimeCarriedObjectLoss final {
   manyforge::core::SceneResourceId scene_resource_id;
   manyforge::core::CarriedObjectAttachmentId carried_object_attachment_id;
   manyforge::core::ControllableComponentId controllable_component_id;
+  /// The gripper target holding it: the `carried_object_lost.<target>`
+  /// system signal of `controllable_component_id`.
+  manyforge::core::CommandTargetId command_target_id;
   manyforge::core::GraphRevision graph_revision;
   /// Unique per observation; the Stop request id.
   std::string request_id;
+  /// Contract §10: the loss `event_id` and the attachment's stored
+  /// `on_grasp_lost.set_key`, carried into the host's loss row.
+  std::string loss_event_id{};
+  std::optional<std::string> set_key{};
 };
 
 /// Requests the normal operational Stop of the carrier's motion with reason
@@ -93,11 +144,25 @@ using SceneRuntimeCarrierStopRequester =
     std::function<std::optional<manyforge::core::ErrorDTO>(
         const SceneRuntimeCarriedObjectLoss &)>;
 
+/// The host's answer when the attachment's target has no
+/// `carried_object_lost` system signal (not a gripper target of the committed
+/// composition): the publication is not applicable, not a failure.
+inline constexpr std::string_view kCarriedObjectLostSignalNotApplicable =
+    "io_signal_unbound";
+
+/// Publishes the level `true` of the gripper's `carried_object_lost.<target>`
+/// system signal into the execution host's signal ingress; returns the
+/// refusal, if any.
+using SceneRuntimeCarriedObjectLostSignalPublisher =
+    std::function<std::optional<manyforge::core::ErrorDTO>(
+        const SceneRuntimeCarriedObjectLoss &)>;
+
 struct SceneRuntimePoseApplicationResult final {
   SceneRuntimePoseApplicationStatus status;
   std::optional<manyforge::core::RequestId> scene_request_id;
   std::optional<manyforge::core::ProjectionRevisionDTO> projection_revision;
   std::optional<manyforge::core::SceneUpdateStatusDTO> update_status;
+  std::optional<SceneRuntimePoseMeasurement> pose_measurement;
 
   [[nodiscard]] bool valid() const noexcept;
   friend bool operator==(const SceneRuntimePoseApplicationResult &,
@@ -119,17 +184,24 @@ struct SceneRuntimePoseApplicationResult final {
 /// Under `continuous` and `continuous_relative_to_attached`, an attached
 /// object whose attachment carries a grasp-lost check is lost when the
 /// measured carried offset leaves the bound around the first measured offset
-/// of that attachment (its baseline):
-/// the update is not applied, the carrier's motion Stop is requested, the
-/// object is detached at the observed cell pose, and the result is the typed
-/// error `carried_object_lost` (message: the error row's full text).
+/// of that attachment (its baseline). Per the attachment's `on_grasp_lost`:
+/// the gripper's `carried_object_lost.<target>` signal is published `true`
+/// (always); `stop_motion` requests the carrier's motion Stop; `detach`
+/// detaches the object at the observed cell pose. The update is not applied
+/// and the result is the typed error `carried_object_lost` (message: the error
+/// row's full text; details carry the four flags; `raise_alarm` is the
+/// Headless alarm's selector). The baseline is forgotten only after a
+/// successful detach, so a refused detach is detected and retried on the next
+/// sample (DX-2562); without `detach` the attachment is marked lost and fires
+/// once.
 class SceneRuntimePoseProjector final {
 public:
   SceneRuntimePoseProjector(
       manyforge::core::ISceneAuthority &scene_authority,
       manyforge::core::CellId cell_id,
       SceneRuntimeReferenceLinkResolver reference_resolver = {},
-      SceneRuntimeCarrierStopRequester carrier_stop_requester = {});
+      SceneRuntimeCarrierStopRequester carrier_stop_requester = {},
+      SceneRuntimeCarriedObjectLostSignalPublisher signal_publisher = {});
 
   /// `prior_application` is the caller's retained result for this exact
   /// observation, if any; an attached object's retained success is reported
@@ -155,28 +227,39 @@ private:
                     const SceneRuntimePoseDistance &distance,
                     const manyforge::core::ProjectionRevisionDTO &projection,
                     const manyforge::core::RequestId &request_id,
-                    const manyforge::core::Pose3DTO &observed_in_cell);
+                    const manyforge::core::Pose3DTO &observed_in_cell,
+                    std::optional<SceneRuntimePoseMeasurement>
+                        pose_measurement = std::nullopt);
 
-  /// Distance of a measured carried offset from its attachment's baseline
-  /// when beyond the grasp-lost bound. The first measured sample of an
-  /// attachment sets the baseline and is never lost.
-  [[nodiscard]] std::optional<SceneRuntimePoseDistance>
-  GraspDrift(const manyforge::core::CarriedObjectAttachmentDTO &attachment,
-             const manyforge::core::Pose3DTO &measured_in_carrier);
+  struct GraspMeasurement final {
+    manyforge::core::Pose3DTO baseline_offset;
+    SceneRuntimePoseDistance drift;
+    bool lost{};
+  };
+
+  /// Read and update the existing first-measured baseline. The first sample
+  /// establishes a zero-drift baseline and is never lost.
+  [[nodiscard]] std::optional<GraspMeasurement>
+  MeasureGrasp(const manyforge::core::CarriedObjectAttachmentDTO &attachment,
+               const manyforge::core::Pose3DTO &measured_in_carrier);
   void ForgetGraspBaseline(const std::string &scene_resource_id);
 
   struct GraspBaseline final {
     manyforge::core::CarriedObjectAttachmentId carried_object_attachment_id;
     manyforge::core::Pose3DTO measured_in_carrier;
+    /// Lost but kept attached (`detach` false): never fires again.
+    bool lost{};
   };
+  void MarkGraspLost(const std::string &scene_resource_id);
 
   manyforge::core::ISceneAuthority &scene_authority_;
   manyforge::core::CellId cell_id_;
   SceneRuntimeReferenceLinkResolver reference_resolver_;
   SceneRuntimeCarrierStopRequester carrier_stop_requester_;
+  SceneRuntimeCarriedObjectLostSignalPublisher signal_publisher_;
   /// In memory only: scene resource id -> first measured carried offset of
-  /// its current attachment. Dropped when seen unattached or lost; a restart
-  /// re-baselines on the next sample.
+  /// its current attachment. Dropped when seen unattached or detached after a
+  /// loss; a restart re-baselines on the next sample.
   std::mutex grasp_baselines_mutex_;
   std::map<std::string, GraspBaseline> grasp_baselines_;
 };

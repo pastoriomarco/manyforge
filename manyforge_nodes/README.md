@@ -9,5 +9,5 @@ content-addressed v2 package/compiler boundary: implementation availability at
 I5/H0 and addressed execution at I6/N. No path loader or Python factory table
 will be restored.
 
-See [`../docs/operations/EXTERNAL_NODES.md`](../docs/operations/EXTERNAL_NODES.md)
-for the current contract, outage status, and historical acceptance mapping.
+Program nodes are built in. For a build-time node example, see
+[`../manyforge_example_nodes/README.md`](../manyforge_example_nodes/README.md).

@@ -15,13 +15,13 @@ import type {
   OperatorAlarmSnapshot,
 } from '../../types/headless';
 import type {
+  CellRecoverResult,
   GlobalRuleRecoveryOffer,
   GlobalRuleRecoveryResult,
   GlobalRuleRecoverySelector,
   StopFaultRecoveryOffer,
 } from '../../types/robotControl';
 import {
-  StructuralContractError,
   allowedKeysAt,
   arrayAt,
   booleanAt,
@@ -598,7 +598,7 @@ export function parseStopFaultRecoveryOffer(
     ],
     [
       'captured_operation_ids', 'captured_resources', 'clear_projection',
-      'evidence_refs', 'persistence_degraded', 'reason_code',
+      'evidence_refs', 'observed_triggers', 'persistence_degraded', 'reason_code',
       'stop_generation', 'stop_id', 'terminal_projection', 'trigger',
     ],
     'stopFaultResponse.stop_fault.latch',
@@ -861,45 +861,60 @@ export function parseGlobalRuleRecoveryResult(
   };
 }
 
-export function parseStopFaultRecoveryResult(
+export function parseCellRecoverResult(
   value: unknown,
   expectedRequestId: string,
-): void {
-  const envelope = objectAt(value, 'stopFaultRecoveryResponse');
-  exactKeysAt(
-    envelope,
-    ['api_version', 'command', 'ok', 'result'],
-    'stopFaultRecoveryResponse',
-  );
-  if (
-    stringAt(envelope.api_version, 'stopFaultRecoveryResponse.api_version')
-      !== 'manyforge.execution_command_response.v1'
-    || booleanAt(envelope.ok, 'stopFaultRecoveryResponse.ok') !== true
-    || stringAt(envelope.command, 'stopFaultRecoveryResponse.command')
-      !== 'recover_stop_fault'
-  ) {
-    return fail(
-      'stopFaultRecoveryResponse',
-      'a successful stop-fault recovery response',
-    );
+): CellRecoverResult {
+  const path = 'cellRecoverResult';
+  const result = objectAt(value, path);
+  exactKeysAt(result, [
+    'acknowledged_incidents', 'latch_cleared', 'outcome', 'reason', 'recovered_components',
+    'request_id', 'schema_version',
+  ], path);
+  if (stringAt(result.schema_version, `${path}.schema_version`) !== 'manyforge.cell_recover_result.v1') {
+    return fail(`${path}.schema_version`, 'manyforge.cell_recover_result.v1');
   }
-  const result = objectAt(envelope.result, 'stopFaultRecoveryResponse.result');
-  allowedKeysAt(
-    result,
-    ['accepted', 'request_id'],
-    ['error', 'latch', 'replay_status'],
-    'stopFaultRecoveryResponse.result',
-  );
-  if (stringAt(result.request_id, 'stopFaultRecoveryResponse.result.request_id')
-      !== expectedRequestId) {
-    return fail(
-      'stopFaultRecoveryResponse.result.request_id',
-      `the request ID ${expectedRequestId}`,
-    );
+  if (stringAt(result.request_id, `${path}.request_id`) !== expectedRequestId) {
+    return fail(`${path}.request_id`, `the request ID ${expectedRequestId}`);
   }
-  if (!booleanAt(result.accepted, 'stopFaultRecoveryResponse.result.accepted')) {
-    const reason = typeof result.error === 'string' && result.error.length > 0
-      ? `: ${result.error}` : '';
-    throw new StructuralContractError(`Stop-fault recovery was rejected${reason}`);
+  const outcome = stringAt(result.outcome, `${path}.outcome`);
+  if (outcome !== 'done' && outcome !== 'not_recovered') {
+    return fail(`${path}.outcome`, 'done or not_recovered');
   }
+  const acknowledgedIncidents = arrayAt(result.acknowledged_incidents, `${path}.acknowledged_incidents`)
+    .map((entry, index) => {
+      const at = `${path}.acknowledged_incidents[${index}]`;
+      const row = objectAt(entry, at);
+      exactKeysAt(row, ['cause_class', 'controllable_component_id', 'incident_id'], at);
+      return {
+        controllableComponentId: stringAt(row.controllable_component_id, `${at}.controllable_component_id`),
+        incidentId: stringAt(row.incident_id, `${at}.incident_id`),
+        causeClass: stringAt(row.cause_class, `${at}.cause_class`),
+      };
+    });
+  let reason: CellRecoverResult['reason'] = null;
+  if (result.reason !== null) {
+    const at = `${path}.reason`;
+    const row = objectAt(result.reason, at);
+    exactKeysAt(row, ['code', 'details', 'message'], at);
+    const details = objectAt(row.details, `${at}.details`);
+    reason = {
+      code: stringAt(row.code, `${at}.code`),
+      message: stringAt(row.message, `${at}.message`),
+      details: Object.fromEntries(Object.entries(details).map(
+        ([key, detail]) => [key, stringAt(detail, `${at}.details.${key}`)],
+      )),
+    };
+  }
+  if ((outcome === 'done') !== (reason === null)) {
+    return fail(`${path}.reason`, 'a reason exactly when not recovered');
+  }
+  return {
+    outcome,
+    acknowledgedIncidents,
+    latchCleared: booleanAt(result.latch_cleared, `${path}.latch_cleared`),
+    recoveredComponents: arrayAt(result.recovered_components, `${path}.recovered_components`)
+      .map((id, index) => stringAt(id, `${path}.recovered_components[${index}]`)),
+    reason,
+  };
 }

@@ -871,6 +871,20 @@ ResolveSceneCandidate(const SceneTransactionRequestDTO &request,
             throw std::invalid_argument(
                 "grasp_lost_bound must be finite and positive");
           }
+          // The defaults are kept as absent: one form per attachment.
+          const auto on_grasp_lost =
+              operation.on_grasp_lost && !operation.on_grasp_lost->is_default()
+                  ? operation.on_grasp_lost
+                  : std::nullopt;
+          if (on_grasp_lost && !on_grasp_lost->valid()) {
+            throw std::invalid_argument(
+                "on_grasp_lost raise_alarm requires stop_motion and set_key "
+                "must be a non-empty key name");
+          }
+          if (!operation.grasp_lost_bound && on_grasp_lost) {
+            throw std::invalid_argument(
+                "on_grasp_lost requires grasp_lost_bound");
+          }
           const auto pose_in_carrier = core::multiply_poses(
               core::inverse_pose(frame_resolution->frame_pose_in_cell),
               fixed->pose_in_cell);
@@ -887,7 +901,7 @@ ResolveSceneCandidate(const SceneTransactionRequestDTO &request,
               std::move(touch_roles),
               operation.grasp_lost_bound
                   ? std::optional(core::CarriedObjectGraspLostCheckDTO{
-                        *operation.grasp_lost_bound})
+                        *operation.grasp_lost_bound, on_grasp_lost})
                   : std::nullopt};
           attachment.carried_object_attachment_revision =
               core::logical_scene_identity::
@@ -1694,7 +1708,8 @@ FrameSelectorForRequest(const SceneTransactionRequestDTO &request,
       request.operation);
 }
 
-[[nodiscard]] bool SameResolutionMeaning(
+// Static frames carry no sensor noise, so their meaning must agree exactly.
+[[nodiscard]] bool SameStaticFrameMeaning(
     const core::SceneFrameResolutionReceiptDTO &left,
     const core::SceneFrameResolutionReceiptDTO &right) noexcept {
   return left.resolved_frame == right.resolved_frame &&
@@ -1731,10 +1746,21 @@ ResolveFrameAcrossProjections(
         {{"reason", "scene_frame_projection_unavailable"}});
   }
 
+  // One owner per frame, one answer per owner. The robot's kinematic view
+  // belongs to the runtime unit hosting it, and that unit's frame resolver is
+  // installed into every native projection it hosts; the unit's first
+  // projection (canonical order) that owns the frame answers for it, and its
+  // other projections are not asked again. A projection that does not own the
+  // frame declines (ProjectionDoesNotOwnFrame). Answers are never compared:
+  // a robot frame claimed by two runtime units is a configuration error.
+  // Cell and passive fixture frames are Scene-owned static model geometry
+  // with no measured state: every unit that answers must agree exactly.
   std::vector<ScopedProjectionLease> leases;
   leases.reserve(projections.size());
-  std::vector<core::SceneFrameResolutionReceiptDTO> resolutions;
-  resolutions.reserve(projections.size());
+  std::set<core::RuntimeUnitId> answered_units;
+  std::optional<core::SceneFrameResolutionReceiptDTO> owner_resolution;
+  bool robot_frame_claimed_twice = false;
+  bool static_frame_disagrees = false;
   std::optional<ErrorDTO> first_missing;
   for (std::size_t ordinal = 0U; ordinal < projections.size(); ++ordinal) {
     const auto &projection = projections[ordinal];
@@ -1758,6 +1784,11 @@ ResolveFrameAcrossProjections(
           {{"reason", "scene_frame_lease_binding_mismatch"}});
     }
     leases.emplace_back(projection.projection, lease_id);
+    const auto &runtime_unit_id =
+        projection.preflight_health.native_runtime_binding.runtime_unit_id;
+    if (answered_units.contains(runtime_unit_id)) {
+      continue;
+    }
     auto resolved = projection.projection->ResolveSceneFrame(
         core::SceneFrameResolutionQueryDTO{selector, expected_binding});
     if (!resolved.ok()) {
@@ -1779,9 +1810,29 @@ ResolveFrameAcrossProjections(
           "native projection returned a malformed frame receipt",
           {{"reason", "scene_frame_receipt_mismatch"}});
     }
-    resolutions.push_back(std::move(resolved.value()));
+    answered_units.insert(runtime_unit_id);
+    if (!owner_resolution.has_value()) {
+      owner_resolution = std::move(resolved.value());
+    } else if (std::holds_alternative<core::ResolvedComponentModelFrameDTO>(
+                   resolved.value().resolved_frame)) {
+      robot_frame_claimed_twice = true;
+    } else if (!SameStaticFrameMeaning(*owner_resolution, resolved.value())) {
+      static_frame_disagrees = true;
+    }
   }
-  if (resolutions.empty()) {
+  if (robot_frame_claimed_twice) {
+    throw SceneRequestRejectionError(
+        "missing_reference",
+        "more than one native runtime unit owns this robot frame",
+        {{"reason", "scene_frame_owner_ambiguous"}});
+  }
+  if (static_frame_disagrees) {
+    throw SceneRequestRejectionError(
+        "missing_reference",
+        "native runtime units disagree on a static scene frame",
+        {{"reason", "scene_frame_resolution_ambiguous"}});
+  }
+  if (!owner_resolution.has_value()) {
     if (first_missing.has_value()) {
       throw SceneRequestRejectionError(
           first_missing->code, first_missing->message, first_missing->details);
@@ -1790,18 +1841,10 @@ ResolveFrameAcrossProjections(
         "missing_reference", "scene frame has no retained resolution",
         {{"reason", "scene_frame_reference_missing"}});
   }
-  for (std::size_t index = 1U; index < resolutions.size(); ++index) {
-    if (!SameResolutionMeaning(resolutions.front(), resolutions[index])) {
-      throw SceneRequestRejectionError(
-          "missing_reference",
-          "active native projections disagree on scene-frame meaning",
-          {{"reason", "scene_frame_resolution_ambiguous"}});
-    }
-  }
   for (auto &lease : leases) {
     lease.Release();
   }
-  return resolutions.front();
+  return owner_resolution;
 }
 
 } // namespace manyforge::scene::logical_scene_owner_detail

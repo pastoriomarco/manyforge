@@ -156,6 +156,9 @@ class _Headless:
             "admission_generation": self.generation,
         }
 
+    def program_cycle_status(self) -> dict[str, Any]:
+        return {"state": "idle_after_reset"}
+
     def acquire_authoring_transaction(
         self, body: dict[str, Any]
     ) -> dict[str, Any]:
@@ -1231,12 +1234,60 @@ def test_moving_settling_or_unknown_run_refuses_a_draft_edit(
     assert workspace.revision == 1
 
 
-def test_draft_edit_requires_the_displayed_admission_generation(tmp_path) -> None:
+def test_draft_edit_is_not_fenced_by_the_admission_generation(tmp_path) -> None:
     workspace, program, _deployment, headless, coordinator = _fixture(tmp_path)
 
-    with pytest.raises(HTTPException) as refused:
-        _draft_edit(coordinator, workspace, program, headless, envelope=_envelope(6))
+    # Stop, Reset or a component event moved the Kernel generation since the
+    # client read it: an in-memory Draft edit is unaffected.
+    _draft_edit(coordinator, workspace, program, headless, envelope=_envelope(6))
 
-    assert refused.value.detail["code"] == "stale_generation"
+    assert headless.events == ["install", "wake"]
+    assert headless.claims == []
+    assert workspace.revision == 2
+
+
+def test_idle_draft_edit_ignores_kernel_authoring_admission(tmp_path) -> None:
+    # Another client holds an Apply claim (or a manual operation runs): Kernel
+    # authoring admission is closed, but no Program run exists.
+    workspace, program, _deployment, headless, coordinator = _fixture(tmp_path)
+    headless.allowed = False
+
+    _draft_edit(coordinator, workspace, program, headless)
+
+    assert headless.events == ["install", "wake"]
+    assert headless.claims == [] and headless.settlements == []
+    assert workspace.revision == 2
+
+    # The claim-taking paths still refuse while admission is closed.
+    with pytest.raises(HTTPException) as refused:
+        _run_local(coordinator, workspace, program, headless)
+    assert refused.value.detail["code"] == "authoring_not_ready"
+    assert headless.claims == []
+
+
+@pytest.mark.parametrize(
+    "cycle",
+    [
+        {"state": "starting"},
+        {"state": "stopping"},
+        {"state": "resetting"},
+        {"state": "terminal_awaiting_reset"},
+        {"state": "recovery_required"},
+        HeadlessClientError("headless_http_timeout", "timed out"),
+    ],
+)
+def test_non_idle_cycle_without_a_held_run_refuses_a_draft_edit(
+    tmp_path, cycle
+) -> None:
+    workspace, program, _deployment, _headless, _coordinator = _fixture(tmp_path)
+    headless = _HeldHeadless(cycle)
+    coordinator = AuthoringAdmissionCoordinator(headless)
+
+    with pytest.raises(HTTPException) as refused:
+        _draft_edit(coordinator, workspace, program, headless)
+
+    assert refused.value.status_code == 409
+    assert refused.value.detail["code"] == "authoring_not_ready"
     assert refused.value.detail["effect"] == "none"
     assert headless.events == []
+    assert workspace.revision == 1

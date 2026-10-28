@@ -145,10 +145,13 @@ export function parseProgramCycleStatus(value: unknown): ProgramCycleStatus {
       : (() => {
         const path = 'programCycleStatus.reset_options';
         const options = objectAt(record.reset_options, path);
-        exactKeysAt(options, ['reload_initial_scene', 'reset_robot_position'], path);
+        const keep = Object.hasOwn(options, 'keep_stop_fault');
+        exactKeysAt(options, keep ? ['reload_initial_scene', 'reset_robot_position', 'keep_stop_fault']
+          : ['reload_initial_scene', 'reset_robot_position'], path);
         return {
           reloadInitialScene: booleanAt(options.reload_initial_scene, `${path}.reload_initial_scene`),
           resetRobotPosition: booleanAt(options.reset_robot_position, `${path}.reset_robot_position`),
+          ...(keep ? { keepStopFault: booleanAt(options.keep_stop_fault, `${path}.keep_stop_fault`) } : {}),
         };
       })(),
     resetRobotPosition: (() => {

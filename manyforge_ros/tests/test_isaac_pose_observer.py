@@ -271,54 +271,106 @@ def test_relative_reference_binding_emits_versioned_referenced_payload(
 ) -> None:
     value = _config_value()
     entity = value["simulation_entities"][0]
-    entity["relative_reference"] = {
-        "entity": "/World/gripper/robotiq_arg2f_base_link",
+    reference_entity = "/World/gripper/robotiq_arg2f_base_link"
+    entity["relative_references"] = [{
+        "controllable_component_id": "robot",
+        "command_target_id": "gripper",
+        "gripper_link": "robotiq_base_link",
+        "entity": reference_entity,
         "link": "robotiq_base_link",
         "source_header_frame_id": "robotiq_arg2f_base_link",
-    }
+    }]
     path = tmp_path / "site.json"
     _write_config(path, value)
     binding = load_isaac_pose_observer_site_config(path).simulation_entities[0]
-    assert binding.reference is not None
-    assert binding.reference.link == "robotiq_base_link"
-    assert binding.reference.request.source_coordinate_frame_id == "world"
-    assert binding.reference.request.target_frame_id == "universe"
-    assert binding.reference.request.local_position_xyz == (0.0, 0.0, 0.0)
+    assert len(binding.references) == 1
+    reference = binding.references[0]
+    assert reference.link == "robotiq_base_link"
+    assert reference.request.source_coordinate_frame_id == "world"
+    assert reference.request.target_frame_id == "universe"
+    assert reference.request.local_position_xyz == (0.0, 0.0, 0.0)
 
     observation = SimulationEntityPoseObservation(
         entity="/mac_n_cheese_centered",
         pose=PoseSnapshot("universe", 13, (0.4, -0.2, 0.1), (0.0, 0.0, 0.0, 1.0)),
     )
-    relative = PoseSnapshot("universe", 13, (0.02, 0.0, 0.25), (0.0, 0.0, 0.0, 1.0))
+    reference_pose = PoseSnapshot("universe", 13, (0.38, -0.2, -0.15), (0.0, 0.0, 0.0, 1.0))
     payload = simulation_entity_observation_intent(
-        binding, observation, pose_in_reference=relative, coherent=True
+        binding, observation, reference_poses={reference_entity: reference_pose}, coherent=True
     ).payload_value()
-    assert payload["kind"] == "simulation_entity_pose_with_reference.v1"
+    assert payload["kind"] == "simulation_entity_pose_with_references.v1"
     assert payload["pose"]["position_m"] == [0.4, -0.2, 0.1]
-    assert payload["reference"] == {
+    assert len(payload["references"]) == 1
+    measured = payload["references"][0]
+    assert measured == {
+        "controllable_component_id": "robot",
+        "command_target_id": "gripper",
+        "gripper_link": "robotiq_base_link",
         "coherent": True,
-        "entity": "/World/gripper/robotiq_arg2f_base_link",
+        "entity": reference_entity,
         "link": "robotiq_base_link",
+        "source_header_frame_id": "robotiq_arg2f_base_link",
         "pose_in_reference": {
             "orientation_xyzw": [0.0, 0.0, 0.0, 1.0],
-            "position_m": [0.02, 0.0, 0.25],
+            "position_m": pytest.approx([0.02, 0.0, 0.25]),
         },
     }
     unavailable = simulation_entity_observation_intent(
         binding, observation, coherent=True
-    ).payload_value()["reference"]
+    ).payload_value()["references"][0]
     assert unavailable["coherent"] is False
     assert unavailable["pose_in_reference"] is None
     assert (
         unknown_observation_intent(
             binding, code="source_error", detail="down", source_key=""
         ).payload_value()["kind"]
-        == "simulation_entity_pose_with_reference.v1"
+        == "simulation_entity_pose_with_references.v1"
     )
 
-    entity["relative_reference"] = {"entity": "/World/gripper", "link": "x"}
+    entity["relative_references"] = [{"entity": "/World/gripper", "link": "x"}]
     _write_config(path, value)
     with pytest.raises(IsaacPoseObserverConfigError):
+        load_isaac_pose_observer_site_config(path)
+
+
+def test_multiple_gripper_targets_keep_separate_reference_observations(
+    tmp_path: Path,
+) -> None:
+    value = _config_value()
+    rows = [
+        {
+            "controllable_component_id": "robot",
+            "command_target_id": target,
+            "gripper_link": link,
+            "entity": f"/World/{target}",
+            "link": link,
+            "source_header_frame_id": link,
+        }
+        for target, link in (("left", "left_base"), ("right", "right_base"))
+    ]
+    value["simulation_entities"][0]["relative_references"] = rows
+    path = tmp_path / "site.json"
+    _write_config(path, value)
+    binding = load_isaac_pose_observer_site_config(path).simulation_entities[0]
+    observation = SimulationEntityPoseObservation(
+        entity="/mac_n_cheese_centered",
+        pose=PoseSnapshot("universe", 13, (0.4, -0.2, 0.1), (0.0, 0.0, 0.0, 1.0)),
+    )
+    references = {
+        "/World/left": PoseSnapshot("universe", 13, (0.3, -0.2, 0.1), (0.0, 0.0, 0.0, 1.0)),
+        "/World/right": PoseSnapshot("universe", 13, (0.5, -0.2, 0.1), (0.0, 0.0, 0.0, 1.0)),
+    }
+    payload = simulation_entity_observation_intent(
+        binding, observation, reference_poses=references, coherent=True
+    ).payload_value()
+    measured = payload["references"]
+    assert [row["command_target_id"] for row in measured] == ["left", "right"]
+    assert [row["pose_in_reference"]["position_m"][0] for row in measured] == pytest.approx([0.1, -0.1])
+    assert all(row["coherent"] for row in measured)
+
+    rows[1]["command_target_id"] = "left"
+    _write_config(path, value)
+    with pytest.raises(IsaacPoseObserverConfigError, match="target keys must be unique"):
         load_isaac_pose_observer_site_config(path)
 
 

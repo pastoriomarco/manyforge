@@ -12,7 +12,6 @@ _SOURCE_CHECKER = _REPO_ROOT / "scripts/ci/check-private-spec-boundary.sh"
 _ALLOWLIST_FILES = (
     "AGENTS.md",
     "docs/operations/STACK_SETUP.md",
-    "docs/operations/ORIN_STACK_SETUP.md",
     "scripts/dev-agent-session-start.sh",
     "scripts/regen-public-contracts.py",
 )

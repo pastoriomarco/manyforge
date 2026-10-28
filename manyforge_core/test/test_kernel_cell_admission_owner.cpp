@@ -279,6 +279,158 @@ TEST(KernelCellAdmissionOwner,
   EXPECT_TRUE(owner.AcquireCellAdmissionClaim(fresh).ok());
 }
 
+KernelCellAdmissionOwner ScopedOwner(FixedClock& clock, AdmissionJournal& journal,
+                                     std::function<StopFaultAdmissionScope()> scope,
+                                     CellAdmissionProgramResetStatusSource reset_source = {}) {
+  return KernelCellAdmissionOwner(
+      RequestOwnerEpoch("kernel.1"), 16U, clock, journal, {}, AdmissionGeneration(0U),
+      [](const auto&, const auto&) { return Result<void>::Ok(); },
+      [](const auto&, const auto&) { return Result<void>::Ok(); },
+      [](const auto&, const auto&, const auto& reconcile) {
+        return Result<CellAdmissionReconcileValidationDTO>::Ok(
+            {reconcile.current_owner_epochs, {}});
+      },
+      {}, {}, EmptyLivenessSet(), CellAdmissionClaimGeneration(0U), {},
+      [scope] {
+        const auto current = scope();
+        return current == StopFaultAdmissionScope::kCell ||
+               current == StopFaultAdmissionScope::kClosing;
+      },
+      std::move(reset_source), {}, scope);
+}
+
+// D6 (a): Close of a latched Scenario admits only its motion-free steps; once
+// Close replaced the Scenario, the carried latch refuses only motion claims.
+TEST(KernelCellAdmissionOwner, StopFaultCloseAdmitsMotionFreeStepsAndCarriedLatchRefusesMotion) {
+  FixedClock clock;
+  AdmissionJournal journal;
+  auto scope = StopFaultAdmissionScope::kNone;
+  auto owner = ScopedOwner(clock, journal, [&] { return scope; });
+  ASSERT_TRUE(owner.UpdateCellAdmissionReadiness(Ready()).value().authoring_allowed);
+  const auto generation = [&] { return owner.GetAuthoringAdmission().admission_generation; };
+  const auto reason = [&](const CellAdmissionClaimIntentDTO& intent) {
+    const auto refused = owner.AcquireCellAdmissionClaim(intent);
+    return refused.ok() ? std::string("admitted") : refused.error().details.at("reason");
+  };
+  scope = StopFaultAdmissionScope::kCell;
+  ASSERT_TRUE(owner.RefreshStopFaultAdmission().ok());
+  EXPECT_FALSE(owner.GetAuthoringAdmission().authoring_allowed);
+  EXPECT_EQ(reason(Intent(CellAdmissionClaimKindDTO::kComponentLifecycle, generation(), "cell.disable")),
+            "active_stop_fault_requires_recovery");
+
+  EXPECT_FALSE(owner.AuthoringClosedOnlyByClosing());
+  // Close retired the latched Scenario's targets: authoring stays closed
+  // (Draft edits and ordinary preparation are refused as before, SX-366);
+  // the closing scope is its only blocker (SX-370).
+  scope = StopFaultAdmissionScope::kClosing;
+  EXPECT_FALSE(owner.GetAuthoringAdmission().authoring_allowed);
+  EXPECT_TRUE(owner.AuthoringClosedOnlyByClosing());
+  EXPECT_EQ(reason(Intent(CellAdmissionClaimKindDTO::kAuthoringMutation, generation(), "closing.edit")),
+            "active_stop_fault_requires_recovery");
+  EXPECT_EQ(reason(Intent(CellAdmissionClaimKindDTO::kProgramCycle, generation(), "closing.run")),
+            "active_stop_fault_requires_recovery");
+  // A concurrent ordinary Prepare/Enable is refused; only the Kernel-verified
+  // Disable (AcquireCloseDisableLifecycleClaim) is one of Close's steps.
+  EXPECT_EQ(reason(Intent(CellAdmissionClaimKindDTO::kComponentLifecycle, generation(), "closing.enable")),
+            "active_stop_fault_requires_recovery");
+  const auto disable = owner.AcquireCloseDisableLifecycleClaim(
+      Intent(CellAdmissionClaimKindDTO::kComponentLifecycle, generation(), "closing.disable"));
+  ASSERT_TRUE(disable.ok()) << disable.error().message;
+  // Closing plus an unrelated blocker (a held claim): not closing-only.
+  EXPECT_FALSE(owner.AuthoringClosedOnlyByClosing());
+  ASSERT_TRUE(owner.ReleaseCellAdmissionClaim(Release(disable.value())).ok());
+  // Once the empty Apply replaced the latched product, the latch is carried:
+  // authoring opens at once (Load), while every motion claim stays refused.
+  scope = StopFaultAdmissionScope::kCarried;
+  EXPECT_TRUE(owner.GetAuthoringAdmission().authoring_allowed);
+  EXPECT_EQ(reason(Intent(CellAdmissionClaimKindDTO::kProgramCycle, generation(), "carried.run")),
+            "active_stop_fault_requires_recovery");
+  const auto edit = owner.AcquireCellAdmissionClaim(
+      Intent(CellAdmissionClaimKindDTO::kAuthoringMutation, generation(), "carried.edit"));
+  ASSERT_TRUE(edit.ok()) << edit.error().message;
+  ASSERT_TRUE(owner.ReleaseCellAdmissionClaim(Release(edit.value())).ok());
+  ASSERT_TRUE(owner.RefreshStopFaultAdmission().ok());
+  EXPECT_TRUE(owner.GetAuthoringAdmission().authoring_allowed);
+  EXPECT_EQ(reason(Intent(CellAdmissionClaimKindDTO::kProgramCycle, generation(), "carried.run.2")),
+            "active_stop_fault_requires_recovery");
+
+  // Only the empty (component-free) Apply of a closing Scenario is admitted
+  // under its latch; a non-empty Apply is refused before its validator runs.
+  scope = StopFaultAdmissionScope::kClosing;
+  ASSERT_TRUE(owner.RefreshStopFaultAdmission().ok());
+  std::vector<std::string> validated;
+  const auto validator = [&](const CellAdmissionClaimIntentDTO& checked, auto, const auto&,
+                             const auto&) {
+    validated.push_back(checked.request_id.value());
+    return Result<void>::Ok();
+  };
+  auto full_apply = Intent(CellAdmissionClaimKindDTO::kManagerApply, generation(), "closing.full");
+  full_apply.owner_epoch = EmptyLivenessSet().manager_owner_epoch;
+  const auto full = owner.AcquireConfigurationApplyClaim(full_apply, validator, false);
+  ASSERT_FALSE(full.ok());
+  EXPECT_EQ(full.error().details.at("reason"), "active_stop_fault_requires_recovery");
+  auto empty_apply = Intent(CellAdmissionClaimKindDTO::kManagerApply, generation(), "closing.apply");
+  empty_apply.owner_epoch = EmptyLivenessSet().manager_owner_epoch;
+  const auto applied = owner.AcquireConfigurationApplyClaim(empty_apply, validator, true);
+  ASSERT_TRUE(applied.ok()) << applied.error().message;
+  EXPECT_EQ(validated, std::vector<std::string>{"closing.apply"});
+}
+
+// D6 (SX-322): while Close runs, the latch exemptions (Apply bring-up, CCLC
+// route recovery, selected bring-up, CCLC intervention) no longer pass; the
+// canonical-empty Apply needs none of them.
+TEST(KernelCellAdmissionOwner, StopFaultClosingRefusesEveryLatchExemptionPath) {
+  FixedClock clock;
+  AdmissionJournal journal;
+  auto scope = StopFaultAdmissionScope::kClosing;
+  auto owner = ScopedOwner(clock, journal, [&] { return scope; });
+  ASSERT_TRUE(owner.UpdateCellAdmissionReadiness(Ready()).ok());
+  ASSERT_TRUE(owner.RefreshStopFaultAdmission().ok());
+  const auto generation = [&] { return owner.GetAuthoringAdmission().admission_generation; };
+  const auto ok_offer = [](const auto&, const auto&) { return Result<void>::Ok(); };
+  const auto refused = [](const Result<CellAdmissionClaimDTO>& result) {
+    const auto reason = result.ok() ? std::string("admitted")
+                                    : result.error().code + "/" +
+                                          (result.error().details.contains("reason")
+                                               ? result.error().details.at("reason")
+                                               : std::string());
+    EXPECT_EQ(reason, "authoring_not_ready/active_stop_fault_requires_recovery");
+    return reason == "authoring_not_ready/active_stop_fault_requires_recovery";
+  };
+  const auto cclc = [&](std::string transaction, std::string request, bool selected = false) {
+    auto intent = Intent(CellAdmissionClaimKindDTO::kInterventionOrRecovery, generation(),
+                         std::move(request));
+    intent.owner_role = CellAdmissionOwnerRoleDTO::kComponentLifecycleOwner;
+    intent.owner_transaction_id = std::move(transaction);
+    intent.scope.configurations = {{ControlDomainId("arm.domain"),
+                                    ActiveControlConfigurationId("arm.configuration"),
+                                    ActiveControlConfigurationGeneration(1U)}};
+    if (selected) intent.scope.resources = {ResourceId("arm")};
+    // As the CCLC composes it: the evidence names the claim's own owner.
+    intent.intervention_evidence = CellAdmissionInterventionEvidenceDTO{
+        intent.owner_role, intent.owner_epoch, intent.owner_transaction_id,
+        intent.request_payload_digest, std::nullopt};
+    return intent;
+  };
+
+  auto bring_up = Intent(CellAdmissionClaimKindDTO::kManagerApply, generation(), "closing.bring_up");
+  bring_up.owner_epoch = EmptyLivenessSet().manager_owner_epoch;
+  EXPECT_TRUE(refused(owner.AcquireApplyBringUpClaim(
+      bring_up, [](const auto&, const auto&, const auto&) { return Result<void>::Ok(); })));
+  EXPECT_TRUE(refused(owner.AcquireRouteRecoveryClaim(
+      cclc("route-selection.1", "closing.route"), ok_offer)));
+  EXPECT_TRUE(refused(owner.AcquireSelectedBringUpClaim(
+      cclc("selected-lifecycle.1", "closing.selected", true), ok_offer)));
+  EXPECT_TRUE(refused(owner.AcquireCellAdmissionClaim(
+      cclc("route-selection.2", "closing.cclc"))));
+
+  // The same CCLC intervention passes its latch exemption outside Close.
+  scope = StopFaultAdmissionScope::kCell;
+  const auto outside = owner.AcquireCellAdmissionClaim(cclc("route-selection.3", "cell.cclc"));
+  EXPECT_TRUE(outside.ok() || !outside.error().details.contains("reason") ||
+              outside.error().details.at("reason") != "active_stop_fault_requires_recovery");
+}
+
 TEST(KernelCellAdmissionOwner, ConfigurationApplyRetainsTerminalMarkersUntilFreshSuccess) {
   FixedClock clock;
   AdmissionJournal journal;
@@ -1767,10 +1919,13 @@ TEST(KernelCellAdmissionOwner, SelectedBringUpRequiresExactPrivateValidatorAndPh
                 return Result<void>::Ok();
               })
           .ok());
-  for (int change = 0; change < 5; ++change) {
+  // An input-only provider component has no resources or configurations;
+  // the CCLC status and the Kernel check the closure per domain.
+  auto provider_only = intent;
+  provider_only.scope = {};
+  EXPECT_TRUE(ValidateCellAdmissionClaimIntent(provider_only).ok());
+  for (int change = 2; change < 5; ++change) {
     auto invalid = intent;
-    if (change == 0) invalid.scope.resources.clear();
-    if (change == 1) invalid.scope.configurations.clear();
     if (change == 2) invalid.intervention_evidence->offer_digest = Digest('b');
     if (change == 3)
       invalid.intervention_evidence->offering_owner_epoch = RequestOwnerEpoch("foreign");

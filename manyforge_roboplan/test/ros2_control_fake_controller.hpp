@@ -26,6 +26,7 @@
 #include <cmath>
 #include <condition_variable>
 #include <cstdint>
+#include <functional>
 #include <memory>
 #include <mutex>
 #include <optional>
@@ -358,6 +359,19 @@ public:
             if (contains_writer(request->deactivate_controllers))
               writer_active_ = false;
           }
+          // A listed broadcaster switches like the stock manager's strict
+          // request: activating an active one is refused.
+          constexpr const char *broadcaster = "joint_state_broadcaster";
+          if (std::find(request->activate_controllers.begin(),
+                        request->activate_controllers.end(),
+                        broadcaster) != request->activate_controllers.end()) {
+            if (broadcaster_active_) {
+              response->ok = false;
+              return;
+            }
+            broadcaster_listed_ = true;
+            broadcaster_active_ = true;
+          }
           bool next = active_;
           if (std::find(request->activate_controllers.begin(), request->activate_controllers.end(),
                         controller_) != request->activate_controllers.end()) {
@@ -404,6 +418,13 @@ public:
           }
           response->ok = request->name == hardware_ && !hardware_refused_;
           if (response->ok) SetHardwareActive(active);
+          std::function<void()> hook;
+          {
+            std::lock_guard lock(reset_mutex_);
+            hook = hardware_activate_hook_;
+          }
+          // Before the answer, like the vendor plugin's on_activate/write().
+          if (response->ok && active && hook) hook();
         });
     if (!reset_writer_.empty()) {
       const auto manager_suffix = manager.rfind('/');
@@ -480,6 +501,13 @@ public:
   }
 
   void SetHardwareRefused(bool refused) { hardware_refused_ = refused; }
+
+  /// Run on every successful hardware activation, before its answer (the
+  /// vendor plugin's first write() cycles after `on_activate`).
+  void SetHardwareActivateHook(std::function<void()> hook) {
+    std::lock_guard lock(reset_mutex_);
+    hardware_activate_hook_ = std::move(hook);
+  }
 
   /// Every `set_hardware_component_state` request, `true` for active.
   [[nodiscard]] std::vector<bool> hardware_history() const {
@@ -561,6 +589,7 @@ private:
   std::atomic<bool> broadcaster_active_{false};
   std::atomic<bool> hardware_refused_{false};
   std::vector<bool> hardware_history_;
+  std::function<void()> hardware_activate_hook_;
   std::atomic<std::size_t> switch_requests_{0U};
   rclcpp::Publisher<controller_manager_msgs::msg::ControllerManagerActivity>::SharedPtr activity_;
   rclcpp::Service<controller_manager_msgs::srv::SwitchController>::SharedPtr switch_;

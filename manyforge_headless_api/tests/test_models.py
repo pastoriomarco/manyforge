@@ -1664,6 +1664,43 @@ def test_attach_grasp_lost_bound_is_optional_positive_and_absent_on_the_wire() -
             SceneTransactionRequest.model_validate(body)
 
 
+def test_attach_on_grasp_lost_is_optional_closed_and_absent_on_the_wire() -> None:
+    from manyforge_headless_api.manager import _transaction_body
+
+    body = _scene_transaction()
+    body["operation"] = {
+        "kind": "attach_carried_object",
+        "carried_object_attachment_id": "attachment.1",
+        "scene_resource_id": "part.1",
+        "controllable_component_id": "robot.1",
+        "command_target_id": "gripper",
+        "frame_role_id": "tool0",
+        "touch_body_roles": [],
+        "expected_component_attachment_revisions": [],
+        "grasp_lost_bound": {"translation_m": 0.03, "rotation_rad": 0.26},
+    }
+    plain = SceneTransactionRequest.model_validate(body)
+    assert plain.operation.on_grasp_lost is None
+    assert "on_grasp_lost" not in _transaction_body(plain)["operation"]
+
+    for response in (
+        {"raise_alarm": False, "stop_motion": True, "set_key": "part_lost", "detach": False},
+        {"raise_alarm": False, "stop_motion": False, "set_key": None, "detach": True},
+    ):
+        body["operation"] = {**body["operation"], "on_grasp_lost": response}
+        model = SceneTransactionRequest.model_validate(body)
+        assert _transaction_body(model)["operation"]["on_grasp_lost"] == response
+
+    for invalid in (
+        {"raise_alarm": False, "stop_motion": True, "detach": False},
+        {"raise_alarm": "no", "stop_motion": True, "set_key": None, "detach": False},
+        {"raise_alarm": False, "stop_motion": True, "set_key": None, "detach": False, "extra": 1},
+    ):
+        body["operation"] = {**body["operation"], "on_grasp_lost": invalid}
+        with pytest.raises(ValidationError):
+            SceneTransactionRequest.model_validate(body)
+
+
 def test_scene_upsert_and_current_pose_detach_are_closed_typed_operations() -> None:
     upsert = _scene_transaction()
     upsert["operation"] = {

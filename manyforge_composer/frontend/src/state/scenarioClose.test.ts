@@ -436,6 +436,7 @@ function standaloneFixture(state: ProgramCycleStatus['state'] = 'idle_after_rese
     sourceOwnerEpoch: 'scene.epoch', sourceGeneration: 1, receiverAgeNs: 0, payload: { ...sceneView(1) } };
   let current = { receiverEpoch: 'receiver.1', authoringWorkspace: workspace, authoringWorkspaceContainment: null,
     authoringAdmission: { authoringAllowed: true, admissionGeneration: 8 }, programCycle: initialCycle,
+    executionControlStatus: { manualOperations: [], cellStopAction: { fault: null } },
     componentOverview: { readiness: 'ready', userMessage: 'Current', components: [], maintenanceOperation: null, basis: {} },
     runtime: { sections: { logicalScene: section, manager: { available: true, freshness: 'fresh', knownGaps: [],
       sourceOwnerId: source.sourceOwnerId, sourceOwnerEpoch: source.sourceOwnerEpoch,
@@ -479,7 +480,7 @@ it('standalone terminal Close sends one ordinary Reset and waits for its correla
       causalCorrelationId: test.reset.mock.calls[0][0].correlationId });
   });
   expect(await closeScenario(test.request)).toEqual(empty);
-  expect(test.reset).toHaveBeenCalledExactlyOnceWith({ correlationId: expect.any(String), expected: {
+  expect(test.reset).toHaveBeenCalledExactlyOnceWith({ correlationId: expect.any(String), keepStopFault: true, expected: {
     programRunId: 'run.1', programRunnerOwnerEpoch: 'runner.1', cycleGeneration: 7 } });
   // Count only Reset settlement observations: the ordinary Close can also
   // observe later process-drain/Apply completion through this shared callback.
@@ -712,6 +713,155 @@ it('idle no-carry Close retains ordinary incident recovery with generic authorin
     close_incident_recovery: { expected_incident_id: 'incident.1' }, reason: 'cell closed by operator' });
 });
 
+// D6 (a): Close always works on a latched cell. It retires the targets first,
+// so the Kernel admits Reset, Disable and the empty Apply, and it never clears
+// the cell Stop fault (no recover_stop_fault call exists on this path).
+function latchedFixture(state: ProgramCycleStatus['state'] = 'terminal_awaiting_reset') {
+  const test = standaloneFixture(state);
+  test.change({ ...test.current, executionControlStatus: { manualOperations: [], cellStopAction: { fault: {
+    latchId: 'stop-fault.1.1', latchGeneration: 1, state: 'latched', trigger: 'physical_rest_unproven',
+    observedTriggers: ['physical_rest_unproven'], recoveryStatus: 'waiting_for_observation',
+    reasonCode: 'component_incident', certificate: null } } } } as unknown as ComposerHeadlessState);
+  test.request.waitForObservation.mockImplementationOnce(async () => {
+    test.cycle({ state: 'idle_after_reset', cycleGeneration: 8, programRunId: null, cycleClaimGeneration: null,
+      causalCorrelationId: test.reset.mock.calls[0][0].correlationId });
+  });
+  return test;
+}
+
+it('D6: Close of a latched cell with an open incident retires first, Resets, closes the incident and keeps the fault', async () => {
+  const test = latchedFixture();
+  apiMock.cclc.component.mockResolvedValue({ ...component,
+    lifecycleProgress: { incident: { incidentId: 'incident.1' } } });
+  apiMock.cclc.submitLifecycle.mockImplementation(async (request) => request.intent === 'recover'
+    ? { incidentRecovery: { closureReason: 'cell_closed_by_operator' } }
+    : { transactionId: 'disable.1', status: { terminalResult: 'succeeded', reconciliationRequired: false } });
+  expect(await closeScenario(test.request)).toEqual(empty);
+  // Retirement precedes the Program Reset: the Kernel admits the Close steps.
+  expect(apiMock.cclc.retireTargets.mock.invocationCallOrder[0])
+    .toBeLessThan(test.reset.mock.invocationCallOrder[0]);
+  expect(apiMock.cclc.retireTargets).toHaveBeenCalledTimes(1);
+  // The incident is closed with the History-visible Close reason, then Disable.
+  expect(apiMock.cclc.submitLifecycle.mock.calls.map(([request]) => request.intent)).toEqual(['recover', 'disable']);
+  expect(apiMock.cclc.submitLifecycle.mock.calls[0][0]).toMatchObject({
+    close_incident_recovery: { expected_incident_id: 'incident.1' }, reason: 'cell closed by operator' });
+  expect(apiMock.manager.applyCandidate).toHaveBeenCalledTimes(1);
+});
+
+it('D6: an unavailable control projection stops Close before any Reset or detach', async () => {
+  const test = latchedFixture();
+  test.change({ ...test.current, executionControlStatus: null } as unknown as ComposerHeadlessState);
+  const refused = closeScenario(test.request);
+  await expect(refused).rejects.toThrow('Cell control state is unavailable');
+  await expect(refused.catch((error: unknown) => (error as { code?: string }).code)).resolves.toBe('cell_state_unavailable');
+  expect(test.reset).not.toHaveBeenCalled();
+  expect(apiMock.scene.commit).not.toHaveBeenCalled();
+  expect(apiMock.cclc.retireTargets).not.toHaveBeenCalled();
+});
+
+it('D6: a latch appearing after the read keeps it: Close sends its Reset with keepStopFault', async () => {
+  const test = standaloneFixture('terminal_awaiting_reset');
+  test.request.waitForObservation.mockImplementationOnce(async () => {
+    test.cycle({ state: 'idle_after_reset', cycleGeneration: 8, programRunId: null, cycleClaimGeneration: null,
+      causalCorrelationId: test.reset.mock.calls[0][0].correlationId });
+  });
+  expect(await closeScenario(test.request)).toEqual(empty);
+  // No early retirement was chosen, yet the Reset never clears a Stop fault.
+  expect(test.reset.mock.calls[0][0].keepStopFault).toBe(true);
+});
+
+it.each(['refused', 'scene'] as const)(
+  'D6: after the early retirement a later %s failure reports the retired targets', async (failure) => {
+    const test = latchedFixture();
+    if (failure === 'refused') {
+      test.reset.mockResolvedValueOnce({ status: 'refused', message: 'Program Reset was rejected.' });
+    } else {
+      test.change({ ...test.current, runtime: { ...test.current.runtime, sections: { ...test.current.runtime.sections,
+        logicalScene: { ...test.current.runtime.sections.logicalScene, available: false } } } } as ComposerHeadlessState);
+      test.request.preparation.confirmed.closeCycle = { ...test.current.programCycle, state: 'idle_after_reset',
+        programRunId: null, cycleClaimGeneration: null, terminalOrSettlementReference: null };
+      test.cycle({ state: 'idle_after_reset', programRunId: null, cycleClaimGeneration: null,
+        terminalOrSettlementReference: null });
+    }
+    const error = await closeScenario(test.request).then(() => new Error('Close completed'), (caught: unknown) => caught as Error);
+    expect(apiMock.cclc.retireTargets).toHaveBeenCalledTimes(1);
+    expect(error.message).toContain('Lifecycle targets retired; finish with New or Load.');
+    expect(apiMock.manager.applyCandidate).not.toHaveBeenCalled();
+  },
+);
+
+it('D6: an unconfirmed early retirement is reported as unconfirmed, a refused offer as no effect', async () => {
+  const test = latchedFixture();
+  apiMock.cclc.retireTargets.mockRejectedValueOnce(new Error('response lost'));
+  await expect(closeScenario(test.request)).rejects.toThrow('its outcome is not confirmed');
+  expect(test.reset).not.toHaveBeenCalled();
+  apiMock.manager.status.mockResolvedValueOnce({ source, status: { managerReady: true, active } });
+  apiMock.cclc.targetRetirementOffer.mockRejectedValueOnce(new Error('offer refused'));
+  await expect(closeScenario(latchedFixture().request)).rejects.toThrow('offer refused Close not completed.');
+});
+
+it('D6 (D-M4-4): after a provider loss the no-effect Disable is shut down by its drained process and retired again', async () => {
+  const test = latchedFixture();
+  apiMock.cclc.component.mockResolvedValue({ ...component,
+    lifecycleProgress: { incident: { incidentId: 'incident.provider_lost' } } });
+  apiMock.cclc.submitLifecycle.mockImplementation(async (request) => request.intent === 'recover'
+    ? { incidentRecovery: { closureReason: 'cell_closed_by_operator' } }
+    : { transactionId: 'disable.no_effect', status: { terminalResult: 'failed_known_no_effect',
+      reconciliationRequired: false, error: { code: 'component_lifecycle_transition_missing',
+        message: 'no transition satisfied' } } });
+  apiMock.cclc.componentProcessStopOffer.mockResolvedValue({ controllable_component_id: 'arm', process_inventories: [{
+    request: processScope, process_occurrences: [{ controllable_component_id: 'arm', launch_identity: 'actual-launch',
+      leader_pid: 42, process_presence: 'absent', cleanup_state: 'drained', receipt: null,
+      installed_runtime_identity: null }], error: null }] });
+  expect(await closeScenario(test.request)).toEqual(empty);
+  expect(apiMock.cclc.submitLifecycle.mock.calls.map(([request]) => request.intent)).toEqual(['recover', 'disable']);
+  expect(apiMock.cclc.stopComponentProcess).not.toHaveBeenCalled();
+  // The waiting Disable target Close's own request left is retired before Apply.
+  expect(apiMock.cclc.retireTargets).toHaveBeenCalledTimes(2);
+  expect(apiMock.cclc.retireTargets.mock.invocationCallOrder[1])
+    .toBeLessThan(apiMock.manager.prepareCanonicalEmpty.mock.invocationCallOrder[0]);
+  expect(apiMock.manager.applyCandidate).toHaveBeenCalledTimes(1);
+});
+
+it('D6: a Disable that fails with a partial effect still stops Close', async () => {
+  const test = latchedFixture('idle_after_reset');
+  test.request.waitForObservation.mockReset().mockResolvedValue(undefined);
+  apiMock.cclc.submitLifecycle.mockResolvedValue({ transactionId: 'disable.partial', status: {
+    terminalResult: 'failed_partial_effect', reconciliationRequired: false,
+    error: { code: 'controller_deactivate_failed', message: 'deactivate failed' } } });
+  await expect(closeScenario(test.request)).rejects.toThrow('deactivate failed');
+  expect(apiMock.manager.applyCandidate).not.toHaveBeenCalled();
+});
+
+it('D6: a faulted component is shut down by its process Stop without a Disable or a recovery', async () => {
+  const test = latchedFixture('idle_after_reset');
+  test.request.waitForObservation.mockReset().mockResolvedValue(undefined);
+  apiMock.cclc.component.mockResolvedValue({ ...component, lifecycleState: 'faulted' });
+  expect(await closeScenario(test.request)).toEqual(empty);
+  expect(test.reset).not.toHaveBeenCalled();
+  expect(apiMock.cclc.submitLifecycle).not.toHaveBeenCalled();
+  expect(apiMock.cclc.stopComponentProcess).toHaveBeenCalledTimes(1);
+  expect(apiMock.manager.applyCandidate).toHaveBeenCalledTimes(1);
+});
+
+it('D6: a degraded component is disabled, not recovered', async () => {
+  const test = latchedFixture('idle_after_reset');
+  test.request.waitForObservation.mockReset().mockResolvedValue(undefined);
+  apiMock.cclc.component.mockResolvedValue({ ...component, lifecycleState: 'degraded' });
+  expect(await closeScenario(test.request)).toEqual(empty);
+  expect(apiMock.cclc.submitLifecycle.mock.calls.map(([request]) => request.intent)).toEqual(['disable']);
+});
+
+it('D6: retained uncertain outputs still refuse Close before any effect on a latched cell', async () => {
+  const test = latchedFixture();
+  test.change({ ...test.current, executionControlStatus: { ...test.current.executionControlStatus!,
+    manualOperations: [{ operationId: 'op.io', operationRevision: 2, resident: true,
+      outputEvidence: 'acceptance_unknown', controllableComponentId: 'io', commandTargetId: 'valve' }] } } as unknown as ComposerHeadlessState);
+  await expect(closeScenario(test.request)).rejects.toThrow('Output write(s) with unknown acceptance');
+  expect(apiMock.cclc.retireTargets).not.toHaveBeenCalled();
+  expect(test.reset).not.toHaveBeenCalled();
+});
+
 it('terminal Reset continues from exact correlated idle without generic authoring readiness', async () => {
   const test = standaloneFixture('terminal_awaiting_reset');
   test.request.waitForObservation.mockImplementationOnce(async () => {
@@ -823,7 +973,7 @@ it('confirmed replacement Resets a terminal Program once and observes its own id
       causalCorrelationId: test.reset.mock.calls[0][0].correlationId });
   });
   expect(await closeScenario(test.request)).toEqual(empty);
-  expect(test.reset).toHaveBeenCalledExactlyOnceWith({ correlationId: expect.any(String), expected: {
+  expect(test.reset).toHaveBeenCalledExactlyOnceWith({ correlationId: expect.any(String), keepStopFault: true, expected: {
     programRunId: 'run.1', programRunnerOwnerEpoch: 'runner.1', cycleGeneration: 7 } });
   const retire = apiMock.cclc.retireTargets.mock.invocationCallOrder[0];
   expect(test.request.waitForObservation.mock.invocationCallOrder.filter((call) => call < retire)).toHaveLength(2);
@@ -976,7 +1126,7 @@ it('shared Close Resets one identity-matched held run, using the owner fact desp
       causalCorrelationId: test.reset.mock.calls[0][0].correlationId });
   });
   expect(await closeScenario(test.request)).toEqual(empty);
-  expect(test.reset).toHaveBeenCalledExactlyOnceWith({ correlationId: expect.any(String), expected: {
+  expect(test.reset).toHaveBeenCalledExactlyOnceWith({ correlationId: expect.any(String), keepStopFault: true, expected: {
     programRunId: 'run.1', programRunnerOwnerEpoch: 'program-runner-9f8ad954ed9a49c1918d451f3c602f66', cycleGeneration: 7 } });
   expect(apiMock.cclc.retireTargets).toHaveBeenCalledTimes(1);
   expect(apiMock.scene.commit).not.toHaveBeenCalled();

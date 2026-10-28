@@ -33,10 +33,20 @@ retained_ros2_control_lifecycle_plans();
 make_retained_ros2_control_lifecycle_catalog(
     const core::ProviderManifestDTO &manifest);
 
+/// The provider of a Real xArm-family component's gripper domain.
+inline constexpr std::string_view kXArmRos2ControlGripperLifecycleProviderManifestId =
+    "manyforge.provider.ros2_control.xarm.gripper";
+
+/// That gripper's plans: the shared plans with Recover targeting `disabled`,
+/// the Real arm's Recover target (nothing to clear on a healthy gripper).
+[[nodiscard]] std::vector<core::LifecycleIntentPlanDTO>
+retained_ros2_control_gripper_lifecycle_plans();
+
 /// The catalog of one physical ROS provider (R7 package 4): a Real xArm-family
 /// arm's provider (`manyforge.provider.ros2_control.xarm`) has its own plans
-/// (`manyforge_xarm_control`); every other physical provider uses the shared
-/// ros2_control catalog above. Both are anchored by the exact manifest.
+/// (`manyforge_xarm_control`), its gripper's provider the gripper plans above;
+/// every other physical provider uses the shared ros2_control catalog above.
+/// Each is anchored by the exact manifest.
 [[nodiscard]] core::Result<core::BrandLifecyclePlanCatalogDTO>
 make_retained_physical_ros2_control_lifecycle_catalog(
     const core::ProviderManifestDTO &manifest);

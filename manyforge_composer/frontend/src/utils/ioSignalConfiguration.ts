@@ -841,6 +841,25 @@ export function declaredIoSources(
   return result;
 }
 
+/** Where one declared input comes from, for operator text (e.g. `ROS topic /door`). */
+export function ioInputSourceText(draft: IoSignalInputDraft): string {
+  switch (draft.profile) {
+    case 'ros_bool': return `ROS topic ${draft.topic}`;
+    case 'ur_io_states': return `ROS topic ${draft.topic}, pin ${draft.pin}`;
+    case 'ros2_control_gpio': return `ROS topic ${draft.topic}, GPIO ${draft.group}/${draft.interfaceName}`;
+    case 'xarm_digital': return `xArm ${draft.robotComponentId} ${draft.bank} digital input pin ${draft.pin}`;
+    case 'geometric_contact': return `geometric contact with ${draft.targetSceneResourceId}`;
+    case 'mock': return 'Mock input';
+  }
+}
+
+/** The declared source text of each input of a Deployment document, by component, signal name and source id. */
+export function declaredIoInputSourceTexts(document: Record<string, JsonValue> | null): Map<string, string> {
+  return new Map(declaredIoInputs(document).map((draft) => [
+    JSON.stringify([draft.componentId, draft.signalName, draft.sourceId]), ioInputSourceText(draft),
+  ]));
+}
+
 export function ioSourceKey(componentId: string, targetId: string, resourceRoleId: string): string {
   return JSON.stringify([componentId, targetId, resourceRoleId]);
 }

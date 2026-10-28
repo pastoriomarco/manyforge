@@ -107,9 +107,7 @@ real-robot lane. The captured production binding selected the supervised
 `xarm_ros2` hardware plugin as the sole SDK owner. ManyForge reached its
 restricted state/request/result surface only through ROS; the separate
 ManyForge hardware plugin was fake/HIL-only. Lifecycle primitives, arming, and
-all motion remained later physical gates. See
-[`../docs/operations/LITE6_LIVE_QUALIFICATION.md`](../docs/operations/LITE6_LIVE_QUALIFICATION.md)
-for the staged acceptance boundary and evidence rules.
+all motion remained later physical gates.
 
 ### Historical offline workflow
 

@@ -147,14 +147,20 @@ Revision = Annotated[int, Field(ge=1, le=9_007_199_254_740_991)]
 Identity = Annotated[str, Field(min_length=1, max_length=256)]
 
 
-class ProgramResetOptionsDTO(BaseModel):
+class _ProgramResetSelectorsDTO(BaseModel):
     model_config = ConfigDict(extra="forbid", strict=True)
 
     reload_initial_scene: bool
     reset_robot_position: bool
 
 
-class AcceptedProgramResetDTO(ProgramResetOptionsDTO):
+class ProgramResetOptionsDTO(_ProgramResetSelectorsDTO):
+    # D6 (additive): the accepted Reset is Scenario Close's, which keeps the
+    # cell Stop fault; a continuation must carry the same value.
+    keep_stop_fault: bool = False
+
+
+class AcceptedProgramResetDTO(_ProgramResetSelectorsDTO):
     """Private heartbeat proof of the original accepted Reset occurrence."""
 
     request_owner_epoch: Identity

@@ -1,4 +1,4 @@
-# Copyright 2026 ManyForge contributors
+# Copyright 2026 Marco Pastorio
 # SPDX-License-Identifier: Apache-2.0
 uint8 NONE=0
 uint8 IMAGE_BOX=1

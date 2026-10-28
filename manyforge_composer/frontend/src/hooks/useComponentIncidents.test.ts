@@ -1,13 +1,9 @@
 import { afterEach, describe, expect, it, vi } from 'vitest';
 
 import { api } from '../api/client';
-import {
-  acknowledgeComponentIncidents,
-  readOpenComponentIncidents,
-  stopFaultRecoveryMissing,
-} from './useComponentIncidents';
+import { cellRecoverMessage, readOpenComponentIncidents } from './useComponentIncidents';
 import type { CCLCComponentIncident, CCLCComponentSnapshot } from '../types/cclc';
-import type { ExecutionIdentity, StopFaultRecoveryOffer } from '../types/robotControl';
+import type { CellRecoverResult, ExecutionIdentity } from '../types/robotControl';
 
 const execution: ExecutionIdentity = {
   ownerEpoch: 'kernel-owner.1',
@@ -73,81 +69,66 @@ describe('component incidents for Recover cell', () => {
     ]);
   });
 
-  it('has nothing to read or acknowledge under direct control', async () => {
+  it('has nothing to read under direct control', async () => {
     mockOwner({ arm: snapshot('arm', true) }, { ...execution, controlManagementMode: 'direct' });
-    const submit = vi.spyOn(api.cclc, 'submitLifecycle');
     await expect(readOpenComponentIncidents(['arm'])).resolves.toEqual([]);
-    await expect(acknowledgeComponentIncidents(['arm'], 3)).resolves.toBe(0);
-    expect(submit).not.toHaveBeenCalled();
+  });
+});
+
+describe('Recover cell result wording', () => {
+  const result = (reason: CellRecoverResult['reason'], acknowledged = 1): CellRecoverResult => ({
+    outcome: reason === null ? 'done' : 'not_recovered',
+    acknowledgedIncidents: Array.from({ length: acknowledged }, (_, index) => ({
+      controllableComponentId: `component.${index}`, incidentId: `incident.${index}`, causeClass: 'collision',
+    })),
+    latchCleared: false,
+    recoveredComponents: [],
+    reason,
   });
 
-  it('acknowledges each open incident with one exact recover request', async () => {
-    mockOwner({ arm: snapshot('arm', true), gripper: snapshot('gripper', false) });
-    const submit = vi.spyOn(api.cclc, 'submitLifecycle').mockResolvedValue({
-      replayStatus: 'accepted_new',
-      requestId: 'request',
-      transactionId: 'lifecycle.1',
-      status: null,
-      incidentRecovery: null,
-    });
-    await expect(acknowledgeComponentIncidents(['arm', 'gripper'], 3)).resolves.toBe(1);
-    expect(submit).toHaveBeenCalledTimes(1);
-    const [request] = submit.mock.calls[0]!;
-    expect(request).toMatchObject({
-      controllable_component_id: 'arm',
-      intent: 'recover',
-      expected_component_lifecycle_generation: 4,
-      expected_admission_generation: 3,
-      confirmed: true,
-      request_context: { request_owner_epoch: 'cclc.epoch.1', source_label: 'manyforge_composer' },
-    });
+  it('says nothing when the cell is recovered', () => {
+    expect(cellRecoverMessage({ ...result(null), latchCleared: true })).toBeNull();
   });
 
-  it('counts an authorization-only Recover (no transaction) as the acknowledgement', async () => {
-    mockOwner({ arm: snapshot('arm', true) });
-    vi.spyOn(api.cclc, 'submitLifecycle').mockResolvedValue({
-      replayStatus: 'accepted_new',
-      requestId: null,
-      transactionId: null,
-      status: null,
-      incidentRecovery: {
-        incidentId: 'incident.arm.1',
-        controllableComponentId: 'arm',
-        causeClass: 'collision',
-        acknowledgedBy: 'manyforge_composer',
-        acknowledgedAtNs: 2_000,
-      },
-    });
-    await expect(acknowledgeComponentIncidents(['arm'], 3)).resolves.toBe(1);
+  it('names an incident that is open again, such as an e-stop still pressed', () => {
+    expect(cellRecoverMessage(result({
+      code: 'incident_open', message: 'm',
+      details: { controllable_component_id: 'arm', cause_class: 'emergency_stop' },
+    }))).toBe('1 component incident(s) acknowledged. The arm incident is open again (emergency stop): '
+      + 'its cause is still present, for example an e-stop still pressed. '
+      + 'Clear the cause, then press Recover cell again.');
   });
 
-  it('refuses to acknowledge without admission and reports a refused request', async () => {
-    mockOwner({ arm: snapshot('arm', true) });
-    const submit = vi.spyOn(api.cclc, 'submitLifecycle').mockResolvedValue({
-      replayStatus: 'stale_request_owner_epoch',
-      requestId: null,
-      transactionId: null,
-      status: null,
-      incidentRecovery: null,
-    });
-    await expect(acknowledgeComponentIncidents(['arm'], null)).rejects.toThrow('admission');
-    expect(submit).not.toHaveBeenCalled();
-    await expect(acknowledgeComponentIncidents(['arm'], 3)).rejects.toThrow(
-      'Acknowledgement of the arm incident was stale_request_owner_epoch.',
-    );
+  it('says what the latch still waits for', () => {
+    expect(cellRecoverMessage(result({
+      code: 'stop_fault_recovery_waiting_for_quiescence', message: 'm', details: {},
+    }, 0))).toBe('Cell recovery is not ready yet: waiting for the arm to be proven at rest. '
+      + 'Press Recover cell again when it is ready.');
+    expect(cellRecoverMessage(result({
+      code: 'stop_fault_recovery_waiting_for_observation', message: 'm', details: {},
+    }, 0))).toContain('an uncertain operation to resolve');
   });
 
-  it('says what the cell recovery offer still waits for', () => {
-    const offer = {
-      recoveryStatus: 'waiting_for_configuration',
-      recoveryUnavailableReason: null,
-    } as StopFaultRecoveryOffer;
-    expect(stopFaultRecoveryMissing(offer, 1)).toBe(
-      '1 component incident(s) acknowledged. Cell recovery is not ready yet: waiting for the '
-      + 'control configuration to be confirmed. Press Recover cell again when it is ready.',
-    );
-    expect(stopFaultRecoveryMissing({ ...offer, recoveryStatus: 'waiting_for_observation' }, 0))
-      .toBe('Cell recovery is not ready yet: waiting for a fresh controller observation. '
-        + 'Press Recover cell again when it is ready.');
+  it('names the components whose Recover started and a replaced latch', () => {
+    expect(cellRecoverMessage({
+      ...result({ code: 'stop_fault_latch_replaced', message: 'm', details: {} }, 0),
+      recoveredComponents: ['arm'],
+    })).toBe('Recover started for arm. A newer cell stop replaced the one this press saw. '
+      + 'Press Recover cell again.');
+  });
+
+  it('does not call an unknown outcome a refusal', () => {
+    expect(cellRecoverMessage(result({
+      code: 'cell_recover_outcome_unknown', message: 'm', details: {},
+    }, 1))).toBe('1 component incident(s) acknowledged. Recover cell outcome not confirmed — '
+      + 'check the cell state. Steps not listed here may or may not have run.');
+  });
+
+  it('shows any other owner refusal with its code', () => {
+    expect(cellRecoverMessage(result({
+      code: 'stale_request_owner_epoch', message: 'Stop fault recovery names a stale owner epoch',
+      details: {},
+    }, 0))).toBe('Cell recovery was refused: Stop fault recovery names a stale owner epoch '
+      + '(stale_request_owner_epoch).');
   });
 });

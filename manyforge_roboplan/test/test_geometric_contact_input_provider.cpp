@@ -223,8 +223,7 @@ protected:
             std::shared_ptr<core::IScheduler>(&scheduler,
                                               [](core::IScheduler *) {}),
             10,
-            5,
-            std::nullopt};
+            5};
   }
 
   void Successor(
@@ -273,6 +272,27 @@ TEST_F(GeometricContactInputProviderTest, ImmediateContactUsesBothReportedStates
   clock.set(126);
   EXPECT_EQ(signals->ReadSignal(kSignal).value().availability,
             core::IoSignalAvailability::kStale);
+}
+
+TEST_F(GeometricContactInputProviderTest, StateReceivedAfterTheQueryClockIsCurrent) {
+  Build();
+  // Received after the provider's clock read (100): current
+  // (received_sample_age.hpp), not missing or stale.
+  const std::vector<std::string> finger{"finger_joint"};
+  const std::vector<double> finger_position{0.3};
+  const std::vector<double> velocity{0.0};
+  ASSERT_TRUE(gripper->publish(core::ObservedRobotStateSourceKind::kJointState,
+                               finger, finger_position, velocity, 105, 105)
+                  .published);
+  const auto baseline = provider->Resume(2);
+  ASSERT_TRUE(baseline.ok()) << baseline.error().message;
+  ASSERT_TRUE(ingress->Drain(8).ok());
+  const auto observed = signals->ReadSignal(kSignal).value();
+  ASSERT_TRUE(observed.latest_sample);
+  EXPECT_EQ(observed.availability, core::IoSignalAvailability::kFresh);
+  EXPECT_EQ(observed.latest_sample->publication.value, true);
+  EXPECT_EQ(engine->positions, (std::vector<double>{0.4, 0.3}));
+  EXPECT_EQ(engine->state_time, 90);
 }
 
 TEST_F(GeometricContactInputProviderTest, MissingStateIsExplicitUnavailableBaseline) {

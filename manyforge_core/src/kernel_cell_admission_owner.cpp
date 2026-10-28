@@ -82,7 +82,8 @@ KernelCellAdmissionOwner::KernelCellAdmissionOwner(
     CellAdmissionProgramNodeValidator program_node_validator,
     std::function<bool()> stop_fault_active,
     CellAdmissionProgramResetStatusSource program_reset_status_source,
-    std::function<Result<void>(std::shared_ptr<IIoSignalService>*)> required_health_loss_observer)
+    std::function<Result<void>(std::shared_ptr<IIoSignalService>*)> required_health_loss_observer,
+    std::function<StopFaultAdmissionScope()> stop_fault_scope)
     : kernel_owner_epoch_(std::move(kernel_owner_epoch)),
       capacity_(capacity),
       clock_(clock),
@@ -93,6 +94,7 @@ KernelCellAdmissionOwner::KernelCellAdmissionOwner(
       reconcile_validator_(std::move(reconcile_validator)),
       program_node_validator_(std::move(program_node_validator)),
       stop_fault_active_(std::move(stop_fault_active)),
+      stop_fault_scope_(std::move(stop_fault_scope)),
       required_health_loss_observer_(std::move(required_health_loss_observer)),
       manager_liveness_required_set_(std::move(manager_liveness_required_set)),
       membership_(std::move(recovered_membership)),
@@ -227,12 +229,19 @@ KernelCellAdmissionOwner::AcquireProgramBlackboardAdmission() const {
   std::unique_lock lock(mutex_);
   if (persistence_outcome_unknown_ || !manager_liveness_required_set_ ||
       manager_liveness_current_unfenced_count_ != manager_liveness_rows_.size() ||
-      !readiness_.program_cycle_status_current || !readiness_.program_cycle_status ||
-      readiness_.program_runner_loss)
+      !readiness_.program_cycle_status || readiness_.program_runner_loss)
     return Result<ProgramBlackboardAdmissionGuard>::Err(
         {"stale_generation",
          "Program blackboard requires current Runner health and cycle",
          {{"reason", "program_bb_owner_not_current"}}});
+  // Healthy Manager and Runner, but the Manager closed cycle readiness for a
+  // transition (it does so before every Run end and Reset step). Distinct
+  // reason: a BB frame is retryable not-ready in this window, not a fault.
+  if (!readiness_.program_cycle_status_current)
+    return Result<ProgramBlackboardAdmissionGuard>::Err(
+        {"stale_generation",
+         "Program blackboard requires current Runner health and cycle",
+         {{"reason", "program_bb_cycle_status_closed"}}});
   return Result<ProgramBlackboardAdmissionGuard>::Ok(
       ProgramBlackboardAdmissionGuard(std::move(lock), *readiness_.program_cycle_status,
                                       manager_liveness_required_set_->active_bundle_id));
@@ -556,8 +565,7 @@ Result<void> KernelCellAdmissionOwner::AdvanceGenerationLocked() {
 }
 
 AuthoringAdmissionDTO KernelCellAdmissionOwner::AdmissionLocked() const noexcept {
-  return AuthoringAdmissionDTO{!persistence_outcome_unknown_ && !published_stop_fault_active_ &&
-                                   !(stop_fault_active_ && stop_fault_active_()) &&
+  return AuthoringAdmissionDTO{!persistence_outcome_unknown_ && !StopFaultClosesCellLocked() &&
                                    !route_recovery_pending_ && BaseReadinessLocked() &&
                                    held_claim_count_ == 0U,
                                generation_};
@@ -614,6 +622,13 @@ bool KernelCellAdmissionOwner::route_recovery_pending() const {
 AuthoringAdmissionDTO KernelCellAdmissionOwner::GetAuthoringAdmission() const {
   std::lock_guard lock(mutex_);
   return AdmissionLocked();
+}
+
+bool KernelCellAdmissionOwner::AuthoringClosedOnlyByClosing() const {
+  std::lock_guard lock(mutex_);
+  return !persistence_outcome_unknown_ &&
+         StopFaultScopeLocked() == StopFaultAdmissionScope::kClosing &&
+         !route_recovery_pending_ && BaseReadinessLocked() && held_claim_count_ == 0U;
 }
 
 Result<void> KernelCellAdmissionOwner::ValidateProgramRunnerContactLossSource(
@@ -1006,9 +1021,18 @@ Result<CellAdmissionClaimDTO> KernelCellAdmissionOwner::AcquireApplyBringUpClaim
   }, true);
 }
 
+Result<CellAdmissionClaimDTO> KernelCellAdmissionOwner::AcquireCloseDisableLifecycleClaim(
+    const CellAdmissionClaimIntentDTO& intent) {
+  if (intent.claim_kind != CellAdmissionClaimKindDTO::kComponentLifecycle ||
+      intent.owner_role != CellAdmissionOwnerRoleDTO::kComponentLifecycleOwner ||
+      intent.program_node_evidence || intent.intervention_evidence)
+    return Reject<CellAdmissionClaimDTO>("invalid_request", "close_disable_claim_invalid");
+  return AcquireClaim(intent, intervention_validator_, false, {}, nullptr, {}, true);
+}
+
 Result<CellAdmissionClaimDTO> KernelCellAdmissionOwner::AcquireConfigurationApplyClaim(
     const CellAdmissionClaimIntentDTO& intent,
-    const CellAdmissionConfigurationApplyValidator& validate) {
+    const CellAdmissionConfigurationApplyValidator& validate, const bool canonical_empty_candidate) {
   if (intent.claim_kind != CellAdmissionClaimKindDTO::kManagerApply ||
       intent.owner_role != CellAdmissionOwnerRoleDTO::kManager || !intent.scope.resources.empty() ||
       !intent.scope.configurations.empty() || intent.program_cycle_evidence ||
@@ -1016,7 +1040,21 @@ Result<CellAdmissionClaimDTO> KernelCellAdmissionOwner::AcquireConfigurationAppl
     return Reject<CellAdmissionClaimDTO>("invalid_request",
                                          "configuration_apply_validator_required");
   }
-  return AcquireClaim(intent, {}, false, validate);
+  return AcquireClaim(intent, {}, false, validate, nullptr, {}, canonical_empty_candidate);
+}
+
+StopFaultAdmissionScope KernelCellAdmissionOwner::StopFaultScopeLocked() const {
+  if (stop_fault_scope_) return stop_fault_scope_();
+  return stop_fault_active_ && stop_fault_active_() ? StopFaultAdmissionScope::kCell
+                                                    : StopFaultAdmissionScope::kNone;
+}
+
+bool KernelCellAdmissionOwner::StopFaultClosesCellLocked() const {
+  const auto scope = StopFaultScopeLocked();
+  // A carried latch opens the cell at once; any other stale publication of an
+  // active latch keeps it closed until RefreshStopFaultAdmission (unchanged).
+  return scope == StopFaultAdmissionScope::kCell || scope == StopFaultAdmissionScope::kClosing ||
+         (published_stop_fault_active_ && scope != StopFaultAdmissionScope::kCarried);
 }
 
 bool KernelCellAdmissionOwner::IoOutputRecoveryDependenciesReadyLocked() const noexcept {
@@ -1068,7 +1106,8 @@ Result<CellAdmissionClaimDTO> KernelCellAdmissionOwner::AcquireClaim(
     const CellAdmissionInterventionValidator& validate_offer, const bool selected_apply_bring_up,
     const CellAdmissionConfigurationApplyValidator& configuration_apply_validator,
     const PreparedProgramResetStatus* reset_proof,
-    const CellAdmissionIoOutputRecoveryValidator& io_output_recovery_validator) {
+    const CellAdmissionIoOutputRecoveryValidator& io_output_recovery_validator,
+    const bool close_step_claim) {
   const bool configuration_apply = static_cast<bool>(configuration_apply_validator);
   std::lock_guard transition_lock(liveness_transition_mutex_);
   auto valid = ValidateCellAdmissionClaimIntent(intent);
@@ -1109,12 +1148,29 @@ Result<CellAdmissionClaimDTO> KernelCellAdmissionOwner::AcquireClaim(
     return Reject<CellAdmissionClaimDTO>("stale_generation", "expected_generation_stale");
   }
   // Exact replay above remains observable during a fault. The private Q91
-  // parent alternative still requires its positive plan validation below;
-  // ordinary Manager Apply receives no fault exception.
-  if ((published_stop_fault_active_ || (stop_fault_active_ && stop_fault_active_())) &&
-      !selected_apply_bring_up &&
-      !(intent.claim_kind == CellAdmissionClaimKindDTO::kInterventionOrRecovery &&
-        intent.owner_role == CellAdmissionOwnerRoleDTO::kComponentLifecycleOwner)) {
+  // parent alternative still requires its positive plan validation below.
+  // D6: Close of a latched Scenario admits its motion-free steps, and a latch
+  // carried past Close refuses only claims that lead to motion; the latch
+  // itself stays until the operator's Recover cell clears it.
+  const auto fault_scope = StopFaultScopeLocked();
+  const bool latch_exempt =
+      selected_apply_bring_up ||
+      (intent.claim_kind == CellAdmissionClaimKindDTO::kInterventionOrRecovery &&
+       intent.owner_role == CellAdmissionOwnerRoleDTO::kComponentLifecycleOwner);
+  const bool motion_intent = intent.claim_kind == CellAdmissionClaimKindDTO::kProgramCycle ||
+                             intent.claim_kind == CellAdmissionClaimKindDTO::kManualOperation ||
+                             intent.claim_kind == CellAdmissionClaimKindDTO::kInterventionOrRecovery;
+  // Only Close's own claims: the Kernel-verified Disable and the exact
+  // canonical-empty Apply. Close's Program Reset selects no Scene or position
+  // effect and so takes no Reset claim; every kProgramReset claim is refused.
+  const bool close_step = fault_scope == StopFaultAdmissionScope::kClosing && close_step_claim;
+  // While Close runs (kClosing) only its own steps pass, ahead of every other
+  // latch exemption: the canonical-empty Apply composes no component, so it
+  // needs no bring-up, route-recovery or selected bring-up claim.
+  if (fault_scope == StopFaultAdmissionScope::kClosing
+          ? !close_step
+          : !latch_exempt && (StopFaultClosesCellLocked() ||
+                              (fault_scope != StopFaultAdmissionScope::kNone && motion_intent))) {
     return AuthoringNotReady<CellAdmissionClaimDTO>(generation_,
                                                     "active_stop_fault_requires_recovery");
   }

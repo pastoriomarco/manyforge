@@ -337,7 +337,7 @@ core::Result<void> PrepareCompositionIoProviderResources(
                          "resources were pinned",
                          {}});
     }
-    const auto catalog = deployment::ResolveRetainedIoSignalCatalog(
+    const auto catalog = deployment::ResolveCompiledIoSignalCatalog(
         candidate.bundle->value().cell_graph);
     if (!catalog.ok())
       return Reply::Err(catalog.error());
@@ -350,7 +350,14 @@ core::Result<void> PrepareCompositionIoProviderResources(
         aliases;
     std::map<core::ControlDomainId, std::shared_ptr<IoProviderDriverRecord>>
         drivers;
+    // Compiled system signals have no I/O driver or lifecycle: the runtime
+    // owns their one in-process source.
+    std::vector<deployment::RetainedIoSignalConfiguration> system_rows;
     for (const auto &row : catalog.value()) {
+      if (row.provider.profile == deployment::kSystemCarriedObjectProfile) {
+        system_rows.push_back(row);
+        continue;
+      }
       const auto driver = driver_for(candidate, row);
       if (row.descriptor.direction == core::IoSignalDirection::kOutput &&
           driver->resources_installed())
@@ -421,12 +428,13 @@ core::Result<void> PrepareCompositionIoProviderResources(
           id, std::make_shared<HostIoOutputChannelEntry>(std::move(entry)));
     }
     auto runtime =
-        sources.empty() && key_capacity.value() == 0U
+        sources.empty() && system_rows.empty() && key_capacity.value() == 0U
             ? std::shared_ptr<HostIoSignalRuntime>{}
             : HostIoSignalRuntime::Create(
                   cell.addressed_kernel().request_owner_epoch(),
                   candidate.publication_generation.value(), std::move(sources),
-                  cell.clock(), cell.scheduler(), key_capacity.value());
+                  cell.clock(), cell.scheduler(), key_capacity.value(),
+                  std::move(system_rows));
     for (const auto &[resource, rows] : aliases) {
       static_cast<void>(rows);
       const auto old = existing.find(resource);

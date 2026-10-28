@@ -33,12 +33,14 @@ import {
 import { ProgramContactPolicyEditor } from './ProgramContactPolicyEditor';
 import { ProgramSupportContactEditor } from './ProgramSupportContactEditor';
 import { ObjectPoseSourceCard } from './ObjectPoseSourceCard';
+import { CarriedObjectPoseCard } from './CarriedObjectPoseCard';
 import type { DeploymentWorkspaceController } from '../hooks/useDeploymentWorkspace';
 import { RobotControlPanelView } from './RobotControlPanel';
 import { ToolIoPanel } from './ToolIoPanel';
 import { useGizmoSettings } from './common/GizmoControls';
 import type { GizmoController } from './common/GizmoControls';
 import type { ViewerInspectorPanel } from './StructuralViewer';
+import type { GizmoNoChange } from './AuthoringTransformControls';
 import {
   candidateTcpPoseFromCell,
   candidateTcpPoseInCell,
@@ -1877,7 +1879,7 @@ const SceneViewerBridge = memo(function SceneViewerBridge({
     dragReference.current = reference.key;
     return true;
   };
-  const finishCandidateDrag = (pose: Pose3Value | null) => {
+  const finishCandidateDrag = (pose: Pose3Value | null, noChange?: GizmoNoChange) => {
     if (!robotControl.state.poseDragging) {
       dragReference.current = null;
       robotControl.finishPoseDrag(null);
@@ -1888,8 +1890,12 @@ const SceneViewerBridge = memo(function SceneViewerBridge({
       && reference !== null && reference.key === dragReference.current;
     dragReference.current = null;
     if (!valid) {
-      robotControl.finishPoseDrag(null);
-      robotControl.revert();
+      // Discards the draft (revert) and says so.
+      robotControl.finishPoseDrag(null, 'context_changed');
+      return;
+    }
+    if (noChange !== undefined) {
+      robotControl.finishPoseDrag(null, noChange);
       return;
     }
     const control = reference.motion;
@@ -1909,7 +1915,7 @@ const SceneViewerBridge = memo(function SceneViewerBridge({
     [],
   );
   const finishCandidateDragStable = useCallback(
-    (pose: Pose3Value | null) => candidateDragHandlers.current.finish(pose),
+    (pose: Pose3Value | null, noChange?: GizmoNoChange) => candidateDragHandlers.current.finish(pose, noChange),
     [],
   );
   const frameAxes = useMemo(() => {
@@ -2245,6 +2251,7 @@ const SceneViewerBridge = memo(function SceneViewerBridge({
           ownerEpoch={robotControl.selectedStatus?.ownerEpoch ?? null}
           retainedBundleId={robotControl.selectedStatus?.retainedBundleId ?? null}
           ioSignalBindings={robotControl.selectedStatus?.ioSignalBindings}
+          systemSignals={robotControl.selectedStatus?.systemSignals}
           controlSource={robotControl.controlSource}
         />
       )}
@@ -2347,16 +2354,17 @@ export function SceneAuthoringWorkspace({
     () => facts?.logicalScene.snapshot?.objects ?? [],
     [facts],
   );
-  const runtimeStatus = useMemo(
+  const runtimePresentation = useMemo(
     () => runtimeScenePresentation(
       facts?.sceneRuntime ?? null,
       facts?.logicalScene ?? null,
       sourceValue,
       manifest.status === 'ready' ? manifest.data : null,
       robotControl.selectedStatus?.directControl?.targetDescriptor ?? null,
-    ).status,
+    ),
     [facts, manifest, robotControl.selectedStatus, sourceValue],
   );
+  const runtimeStatus = runtimePresentation.status;
   const [selectedOccurrenceId, setSelectedOccurrenceId] = useState<string | null>(null);
   const [activeSceneTool, setActiveSceneTool] = useState<SceneWorkspaceTool>('hierarchy');
   const [selection, setSelection] = useState<SceneSelection>(null);
@@ -2659,6 +2667,13 @@ export function SceneAuthoringWorkspace({
                 <div><dt>Support contacts</dt><dd>{selectedObject.support_contacts.length}</dd></div>
               </dl>
             </details>
+          )}
+          {selectedObject?.placement.kind === 'carried' && (
+            <CarriedObjectPoseCard
+              measurement={runtimePresentation.attachedObjects.find((item) => (
+                item.object.scene_resource_id === selectedObject.scene_resource_id
+              ))?.poseMeasurement ?? null}
+            />
           )}
           <details className="dcard">
             <summary>Owner and runtime source facts</summary>

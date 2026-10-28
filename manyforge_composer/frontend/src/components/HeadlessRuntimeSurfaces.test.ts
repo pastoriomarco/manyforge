@@ -7,7 +7,10 @@ import {
   historianEventView,
   motionInterlockMessage,
   operatorAlarmView,
+  nonBlockingAttentionAlarms,
+  redAcknowledgementMembers,
   runtimeAttentionSummary,
+  runtimeErrorItemCount,
 } from './HeadlessRuntimeSurfaces';
 import type {
   ComposerHeadlessState,
@@ -31,26 +34,9 @@ function source() {
 describe('headless Composer presentation adapters', () => {
   it('keeps automatic attention to one concise summary line', () => {
     expect(runtimeAttentionSummary([], [])).toBe('No messages require attention');
-    expect(runtimeAttentionSummary([], [{
-      id: 'composer.error.1',
-      title: 'Program command failed',
-      message: 'Exact response mismatch.',
-      active: true,
-      acknowledgementRequired: false, severity: 'error' as const,
-    }])).toBe('Program command failed · Exact response mismatch.');
-    expect(runtimeAttentionSummary([], [
-      {
-        id: 'composer.error.1', title: 'First', message: 'First detail',
-        active: true, acknowledgementRequired: false, severity: 'error' as const,
-      },
-      {
-        id: 'composer.error.2', title: 'Second', message: 'Second detail',
-        active: false, acknowledgementRequired: true, severity: 'error' as const,
-      },
-    ])).toBe('2 errors require attention · First');
     // Unresolved conditions lead the summary and count, but never enter the
     // acknowledgement fence (see the rendered rail below).
-    expect(runtimeAttentionSummary([], [], [{
+    expect(runtimeAttentionSummary([], [{
       id: 'recovery.cell', severity: 'error', domain: 'recovery',
       title: 'Cell recovery required', message: 'physical rest unproven.',
     }])).toBe('Cell recovery required · physical rest unproven.');
@@ -328,7 +314,14 @@ describe('headless Composer presentation adapters', () => {
         activeCount: 2,
         activeAcknowledgedCount: 1,
         motionAttentionCount: 1,
-        motionAttentionMembership: [],
+        motionAttentionMembership: [{
+          conditionId: attentionAlarm.conditionId,
+          activationId: attentionAlarm.activationId,
+          recordRevision: attentionAlarm.recordRevision,
+          lifecycleState: attentionAlarm.lifecycleState,
+          definitionId: attentionAlarm.definitionId,
+          subject: attentionAlarm.subject,
+        }],
         unacknowledgedMembership: [{
           conditionId: attentionAlarm.conditionId,
           activationId: attentionAlarm.activationId,
@@ -352,26 +345,17 @@ describe('headless Composer presentation adapters', () => {
         semanticReason: null,
         reconnect,
       },
-      clientErrors: [{
-        id: 'composer.program_runtime',
-        title: 'Program command or response failed',
-        message: 'Invalid response from /api/program/runs/program-run.1',
-        active: false,
-        acknowledgementRequired: true, severity: 'error' as const,
-      }],
-      onAcknowledgeClientError: vi.fn(),
     }));
 
+    // Composer request failures are warnings now: never in the red row.
     expect(html).toContain('Planner unavailable');
-    expect(html).toContain('Attention 2');
+    expect(html).toContain('Attention 1');
     expect(html).toContain('Active 1');
     expect(html).toContain('>History</button>');
     expect(html).not.toContain('Reduced capability · Active · Acknowledged');
     expect(html).toContain('Reconnect headless projection');
-    expect(html).toContain('Program command or response failed · Composer error · Resolved · Dismissal required');
-    expect(html).toContain('Invalid response from /api/program/runs/program-run.1');
-    expect(html).toContain('Acknowledge message');
-    expect(html).toContain('Acknowledge all');
+    expect(html).not.toContain('Composer error');
+    expect(html).not.toContain('Acknowledge all');
     expect(reconnect).not.toHaveBeenCalled();
 
     const collapsed = renderToStaticMarkup(createElement(HeadlessRuntimeSurfacesView, {
@@ -385,19 +369,12 @@ describe('headless Composer presentation adapters', () => {
         semanticReason: null,
         reconnect,
       },
-      clientErrors: [{
-        id: 'composer.program_runtime',
-        title: 'Program command or response failed',
-        message: 'Invalid response from /api/program/runs/program-run.1',
-        active: false,
-        acknowledgementRequired: true, severity: 'error' as const,
-      }],
       expanded: false,
       onExpandedChange: vi.fn(),
       onClose: vi.fn(),
     }));
-    expect(collapsed).toContain('2 errors require attention');
-    expect(collapsed).toContain('Acknowledge all');
+    expect(collapsed).toContain('Planner unavailable');
+    expect(collapsed).toContain('>Acknowledge</button>');
 
     // An unresolved condition is shown and counted with its source action,
     // but it is never acknowledged/dismissed and never enters the fence.
@@ -434,48 +411,6 @@ describe('headless Composer presentation adapters', () => {
     expect(withCondition).not.toMatch(/>(Acknowledge|Dismiss|Acknowledge all)</);
     expect(withCondition).toContain('attention-error');
     expect(collapsed).not.toContain('Runtime observability sections');
-    expect(collapsed).not.toContain('Planner unavailable');
-
-    const singleClientFailure = renderToStaticMarkup(createElement(HeadlessRuntimeSurfacesView, {
-      enabled: true,
-      headlessState: {
-        snapshot: {
-          ...snapshot,
-          alarms: {
-            ...snapshot.alarms,
-            liveCount: 1,
-            unacknowledgedCount: 0,
-            activeCount: 1,
-            motionAttentionCount: 0,
-            motionAttentionMembership: [],
-            unacknowledgedMembership: [],
-            alarms: [standingAlarm],
-          },
-        },
-        error: null,
-        transportStatus: 'connected',
-        transportError: null,
-        semanticStatus: 'current',
-        semanticReason: null,
-        reconnect,
-      },
-      clientErrors: [{
-        id: 'composer.source_model',
-        title: 'Viewer source-model response failed',
-        message: 'Projection contract mismatch.',
-        active: true,
-        acknowledgementRequired: false, severity: 'error' as const,
-      }],
-      onAcknowledgeClientError: vi.fn(),
-      expanded: false,
-      onExpandedChange: vi.fn(),
-    }));
-    expect(singleClientFailure).toContain(
-      'runtime-observability-surface collapsed has-attention attention-error',
-    );
-    expect(singleClientFailure).toContain('Viewer source-model response failed');
-    expect(singleClientFailure).toContain('>Dismiss</button>');
-    expect(singleClientFailure).not.toContain('Acknowledge all');
 
     const previousAlarm: OperatorAlarmRecord = {
       ...attentionAlarm,
@@ -494,19 +429,14 @@ describe('headless Composer presentation adapters', () => {
       error: null, transportStatus: 'connected' as const, transportError: null,
       semanticStatus: 'current' as const, semanticReason: null, reconnect,
     };
+    // A non-gating alarm blocks nothing: a warning, never in the red row.
+    expect(nonBlockingAttentionAlarms(previousState.snapshot.alarms)).toEqual([previousAlarm]);
+    expect(runtimeErrorItemCount(previousState.snapshot.alarms, [])).toBe(0);
     const previous = renderToStaticMarkup(createElement(HeadlessRuntimeSurfacesView, {
       enabled: true, headlessState: previousState, expanded: false,
     }));
-    expect(previous).toContain('Warnings');
-    expect(previous).toContain('>Acknowledge</button>');
-    expect(previous).toContain(previousAlarm.message);
-    expect(previous).not.toContain('not_imported');
-    const detailed = renderToStaticMarkup(createElement(HeadlessRuntimeSurfacesView, {
-      enabled: true, headlessState: previousState, expanded: true,
-    }));
-    expect(detailed).toContain('not_imported');
-    expect(detailed).toContain('<details><summary>');
-    expect(detailed).not.toContain('<details open');
+    expect(previous).not.toContain('has-attention');
+    expect(previous).not.toContain(previousAlarm.message);
 
     // One item per failure: the Program recovery notice represents the
     // operation-failure alarm, shows it inside with its exact Acknowledge
@@ -530,7 +460,7 @@ describe('headless Composer presentation adapters', () => {
       title: 'Program recovery required', message: 'Node unreachable_hold failed.',
       alarmDefinitionIds: ['manyforge.program.operation_failure'],
     };
-    expect(runtimeAttentionSummary([failureAlarm], [], [programRecovery]))
+    expect(runtimeAttentionSummary([failureAlarm], [programRecovery]))
       .toBe('Program recovery required · RoboPlan could not resolve the pose goal');
     const merged = renderToStaticMarkup(createElement(HeadlessRuntimeSurfacesView, {
       enabled: true, headlessState: failureState, conditions: [programRecovery], expanded: true,
@@ -547,5 +477,59 @@ describe('headless Composer presentation adapters', () => {
     expect(alone).toContain('Attention 1');
     expect(alone).not.toContain('workbench-notice-alarms');
     expect(alone).toContain('<summary>RoboPlan could not resolve the pose goal · Program operation failed · node unreachable_hold');
+
+    // An active interlock gates motion without acknowledgement: it is shown
+    // red in the row and counted in the badge, with no Acknowledge.
+    const interlock: OperatorAlarmRecord = {
+      ...attentionAlarm,
+      conditionId: 'condition-scope',
+      activationId: 'activation-scope',
+      definitionId: 'manyforge.runtime.alarm_scope_unavailable',
+      lifecycleState: 'active_acknowledged',
+      acknowledged: true,
+      title: 'Fault alarm scope unavailable',
+      acknowledgementRequired: false,
+      requiresMotionAttention: true,
+    };
+    const interlockAlarms = {
+      ...snapshot.alarms,
+      alarms: [interlock],
+      unacknowledgedCount: 0,
+      unacknowledgedMembership: [],
+      motionAttentionMembership: [{
+        conditionId: interlock.conditionId,
+        activationId: interlock.activationId,
+        recordRevision: interlock.recordRevision,
+        lifecycleState: interlock.lifecycleState,
+        definitionId: interlock.definitionId,
+        subject: interlock.subject,
+      }],
+    };
+    expect(runtimeErrorItemCount(interlockAlarms, [])).toBe(1);
+    // Red "Acknowledge all" names only unacknowledged gating alarms, by
+    // exact revision; interlocks and non-gating warnings stay out.
+    expect(redAcknowledgementMembers(interlockAlarms)).toEqual([]);
+    expect(redAcknowledgementMembers({
+      ...snapshot.alarms,
+      alarms: [attentionAlarm, { ...previousAlarm, activationId: 'activation-previous' }, interlock],
+      motionAttentionMembership: [...snapshot.alarms.motionAttentionMembership,
+        ...interlockAlarms.motionAttentionMembership],
+    })).toEqual([{ conditionId: 'condition-attention', activationId: 'activation-attention', recordRevision: 3 }]);
+    expect(runtimeErrorItemCount({ ...interlockAlarms, motionAttentionMembership: [] }, []))
+      .toBe(0);
+    const interlockState = { ...previousState, snapshot: { ...snapshot, alarms: interlockAlarms } };
+    const interlockRow = renderToStaticMarkup(createElement(HeadlessRuntimeSurfacesView, {
+      enabled: true, headlessState: interlockState, expanded: false,
+    }));
+    expect(interlockRow).toContain('has-attention attention-error');
+    expect(interlockRow).toContain('>Errors<');
+    expect(interlockRow).toContain('Fault alarm scope unavailable');
+    expect(interlockRow).not.toMatch(/>(Acknowledge|Acknowledge all)</);
+    const interlockDetail = renderToStaticMarkup(createElement(HeadlessRuntimeSurfacesView, {
+      enabled: true, headlessState: interlockState, expanded: true,
+    }));
+    expect(interlockDetail).toContain('Attention 1');
+    expect(interlockDetail).toContain('Acknowledgement does not release it');
+    expect(interlockDetail).not.toContain('Acknowledge alarm');
   });
 });

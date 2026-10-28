@@ -11,7 +11,7 @@ import logging
 import math
 from threading import Lock
 import time
-from typing import Any, Callable, Sequence
+from typing import Any, Callable, Mapping, Sequence
 
 import rfc8785
 from starlette.responses import JSONResponse
@@ -2570,6 +2570,29 @@ class HeadlessService:
             )
         return self.manager.preview_deployment_candidate(request)
 
+    def _scenario_closing(self) -> bool:
+        """The Kernel reports authoring closed *only* by the closing scope.
+
+        `stop_fault_recovery_closing` on the Stop-fault offer means every other
+        admission condition holds (SX-370); `_not_ready` or no reason does not.
+        A latch whose Stop has not certified yet is a typed wait.
+        """
+
+        try:
+            response = self._execution().stop_fault()
+        except HeadlessApiError:
+            return False
+        offer = response.get("stop_fault") if isinstance(response, Mapping) else None
+        if not isinstance(offer, Mapping):
+            return False
+        latch = offer.get("latch")
+        if isinstance(latch, Mapping) and latch.get("stop_certificate") is None:
+            raise HeadlessApiError(
+                "authoring_not_ready",
+                "The cell Stop is still settling; retry Close in a moment",
+            )
+        return offer.get("recovery_unavailable_reason") == "stop_fault_recovery_closing"
+
     def prepare_activation(
         self, request: ActivationPreparationRequest | CanonicalEmptyActivationPreparationRequest
     ) -> dict[str, Any]:
@@ -2578,20 +2601,29 @@ class HeadlessService:
                 "activation_preparer_unavailable",
                 "Activation preparation is not configured",
             )
-        try:
-            admission = self._cell_admission().get()
-        except CellAdmissionError as error:
-            raise self._admission_error(error) from error
-        if (
-            admission.get("authoring_allowed") is not True
-            or admission.get("admission_generation")
-            != request.expected_admission_generation
-        ):
+        canonical_empty = isinstance(request, CanonicalEmptyActivationPreparationRequest)
+
+        def admitted() -> bool:
+            try:
+                admission = self._cell_admission().get()
+            except CellAdmissionError as error:
+                raise self._admission_error(error) from error
+            if admission.get("admission_generation") != request.expected_admission_generation:
+                return False
+            if admission.get("authoring_allowed") is True:
+                return True
+            # D6 (SX-366/370): while Scenario Close runs, authoring stays
+            # closed; only the verified canonical-empty preparation, from any
+            # caller, is admitted, and only when the Kernel reports that the
+            # closing scope is the sole blocker.
+            return canonical_empty and self._scenario_closing()
+
+        if not admitted():
             raise HeadlessApiError(
                 "stale_generation",
                 "Activation preparation requires the current idle admission",
             )
-        if isinstance(request, CanonicalEmptyActivationPreparationRequest):
+        if canonical_empty:
             selection = self.manager.canonical_empty_selection()
             origin = request.origin.model_dump(mode="json")
             selected_origin = {
@@ -2607,13 +2639,8 @@ class HeadlessService:
             receipt = self.activation_preparer.prepare_canonical_empty(selection)
             try:
                 after = self.manager.canonical_empty_selection()
-                current_admission = self._cell_admission().get()
-                if (after != selection or current_admission.get("authoring_allowed") is not True
-                        or current_admission.get("admission_generation") != request.expected_admission_generation):
+                if after != selection or not admitted():
                     raise HeadlessApiError("stale_generation", "Canonical-empty selection or admission changed during preparation")
-            except CellAdmissionError as error:
-                self.activation_preparer.release(receipt["prepared_activation_id"])
-                raise self._admission_error(error) from error
             except Exception:
                 self.activation_preparer.release(receipt["prepared_activation_id"])
                 raise

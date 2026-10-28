@@ -287,7 +287,7 @@ profiles:
 
   thor_gemma4_12b_gguf:
     # ★ Smoke-corpus winner on BOTH Thor and Orin (QAT GGUF, 78.8% effective).
-    # Current default model in serving/config.sh + manyforge launch.sh.
+    # Current default model in serving/config.sh.
     # GGUF Q4_K_XL via llama.cpp + E2B speculative draft, text-only, Thor image.
     provider: openai
     model_id: gemma4-12b-it-gguf
@@ -303,7 +303,7 @@ profiles:
 
   thor_gemma4_12b_gguf_orin:
     # Same model/recipe as thor_gemma4_12b_gguf, Jetson Orin AGX image +
-    # NVMe-backed caches. Default model on Orin (launch-orin-gemma.sh).
+    # NVMe-backed caches.
     provider: openai
     model_id: gemma4-12b-it-gguf-orin
     base_url: http://127.0.0.1:8000/v1

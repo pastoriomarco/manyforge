@@ -492,3 +492,77 @@ describe('pneumatic manual availability observation', () => {
     },
   );
 });
+
+describe('Recover cell single press', () => {
+  let root: import('react-dom/client').Root;
+  let latest: ReturnType<typeof useRobotControl>;
+  function Harness({ snapshot }: { snapshot: ComposerHeadlessState }) {
+    const result = useRobotControl(true, true, true, snapshot);
+    useEffect(() => { latest = result; }, [result]);
+    return null;
+  }
+  beforeEach(async () => {
+    const document = Object.assign(new EventTarget(), { nodeType: 9, activeElement: null, defaultView: {} });
+    const makeNode = (tag: string) => Object.assign(new EventTarget(), {
+      nodeType: 1, nodeName: tag.toUpperCase(), tagName: tag.toUpperCase(),
+      namespaceURI: 'http://www.w3.org/1999/xhtml', ownerDocument: document, style: {},
+      appendChild: vi.fn(), removeChild: vi.fn(), insertBefore: vi.fn(),
+      setAttribute: vi.fn(), removeAttribute: vi.fn(),
+    });
+    Object.assign(document, { createElement: makeNode, documentElement: makeNode('html') });
+    document.defaultView = Object.assign(new EventTarget(), { document, HTMLIFrameElement: class {},
+      setTimeout: globalThis.setTimeout, clearTimeout: globalThis.clearTimeout });
+    vi.stubGlobal('window', document.defaultView);
+    vi.stubGlobal('document', document);
+    vi.stubGlobal('IS_REACT_ACT_ENVIRONMENT', true);
+    const { createRoot } = await import('react-dom/client');
+    root = createRoot(makeNode('div') as unknown as Element);
+  });
+  afterEach(async () => {
+    await act(async () => root.unmount());
+    vi.restoreAllMocks();
+    vi.unstubAllGlobals();
+  });
+
+  it('sends one Headless cell-recover per press and shows its typed reason', async () => {
+    const status = statusFixture();
+    status.cellStopAction.fault = {
+      latchId: 'stop-fault.1', latchGeneration: 1, state: 'latched',
+      trigger: 'physical_rest_unproven', observedTriggers: ['physical_rest_unproven'],
+      recoveryStatus: 'waiting_for_observation', reasonCode: 'stop_fault_recovery_waiting_for_observation',
+      certificate: null,
+    } as unknown as NonNullable<typeof status.cellStopAction.fault>;
+    const snapshot = { executionControlStatus: status, authoringAdmission: { admissionGeneration: 1 },
+      programCycle: { programRunnerOwnerEpoch: 'runner.1', programRunId: null, cycleGeneration: 1,
+        state: 'idle_after_reset', executionControlRevision: 1,
+        runtimeControls: { executionSelections: { selectionRevision: 1, groups: [] } } },
+    } as unknown as ComposerHeadlessState;
+    const cellRecover = vi.spyOn(api.execution, 'cellRecover')
+      .mockResolvedValueOnce({
+        outcome: 'not_recovered',
+        acknowledgedIncidents: [{ controllableComponentId: 'arm', incidentId: 'incident.1', causeClass: 'emergency_stop' }],
+        latchCleared: false,
+        recoveredComponents: [],
+        reason: { code: 'incident_open', message: 'm',
+          details: { controllable_component_id: 'arm', cause_class: 'emergency_stop' } },
+      })
+      .mockResolvedValueOnce({ outcome: 'done', acknowledgedIncidents: [], latchCleared: true, recoveredComponents: [], reason: null });
+    // The browser no longer chains the owners itself.
+    const submitLifecycle = vi.spyOn(api.cclc, 'submitLifecycle');
+    const stopFault = vi.spyOn(api.execution, 'stopFault');
+    vi.spyOn(api.execution, 'manualAvailability').mockReturnValue(new Promise(() => {}));
+    await act(async () => root.render(createElement(Harness, { snapshot })));
+
+    await act(async () => { await latest.recoverStopFault(); });
+    expect(cellRecover).toHaveBeenCalledTimes(1);
+    expect(latest.stopFaultRecoveryPending).toBe(false);
+    expect(latest.stopFaultRecoveryError).toContain('The arm incident is open again (emergency stop)');
+
+    await act(async () => { await latest.recoverStopFault(); });
+    expect(cellRecover).toHaveBeenCalledTimes(2);
+    expect(cellRecover.mock.calls[0]![0]).not.toBe(cellRecover.mock.calls[1]![0]);
+    expect(latest.stopFaultRecoveryError).toBeNull();
+    expect(submitLifecycle).not.toHaveBeenCalled();
+    expect(stopFault).not.toHaveBeenCalled();
+  });
+});

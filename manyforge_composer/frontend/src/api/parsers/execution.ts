@@ -19,12 +19,13 @@ import type {
   OutputEvidence,
   ResourceSourceKind,
   SceneRevisionValue,
+  StopFaultTrigger,
   TargetStopResponse,
   ManualControlAvailability,
   ManualProgramHandoverContext,
 } from '../../types/robotControl';
 import type { JsonObject } from './shared';
-import { ioSignalBindingsAt } from './ioSignals';
+import { ioSignalBindingsAt, systemSignalsAt } from './ioSignals';
 import {
   allowedKeysAt,
   arrayAt,
@@ -747,11 +748,15 @@ export function parseExecutionControlStatus(
   // execution_targets.v3 + execution_control_state.v6 (H1a-IF.2): every
   // managed cell uses one component-based shape; no primary target exists.
   const targets = objectAt(targetsEnvelope.targets, 'executionTargets.targets');
-  allowedKeysAt(targets, ['components', 'schema_version'], ['io_signal_bindings'], 'executionTargets.targets');
+  allowedKeysAt(targets, ['components', 'schema_version'], ['io_signal_bindings', 'system_signals'], 'executionTargets.targets');
   // Optional and static per activation: every target's bound boolean signals.
   const ioSignalBindings = targets.io_signal_bindings === undefined
     ? undefined
     : ioSignalBindingsAt(targets.io_signal_bindings, 'executionTargets.targets.io_signal_bindings');
+  // Owners omit this projection when the composition has no system signals.
+  const systemSignals = targets.system_signals === undefined
+    ? []
+    : systemSignalsAt(targets.system_signals, 'executionTargets.targets.system_signals');
   if (stringAt(targets.schema_version, 'executionTargets.targets.schema_version')
     !== 'manyforge.execution_targets.v3') {
     return fail('executionTargets.targets.schema_version', 'manyforge.execution_targets.v3');
@@ -1062,6 +1067,7 @@ export function parseExecutionControlStatus(
     manualOperations,
     runtimeScaleControl,
     ...(ioSignalBindings === undefined ? {} : { ioSignalBindings }),
+    systemSignals,
   };
 }
 
@@ -1762,20 +1768,29 @@ function normalizedOwnerStatusAt(value: unknown): ExecutionOwnerStatus {
     const path = 'executionStatus.status.cell_stop_action.fault';
     const fault = objectAt(cellStop.fault, path);
     exactKeysAt(fault, [
-      'certificate', 'latch_generation', 'latch_id', 'reason_code',
+      'certificate', 'latch_generation', 'latch_id', 'observed_triggers', 'reason_code',
       'recovery_status', 'state', 'trigger',
     ], path);
     const stateName = stringAt(fault.state, `${path}.state`);
     if (!['latched', 'recovery_pending', 'cleared'].includes(stateName)) {
       return fail(`${path}.state`, 'a Stop fault latch state');
     }
-    const trigger = stringAt(fault.trigger, `${path}.trigger`);
-    if (![
+    const stopFaultTriggers: readonly string[] = [
       'scope_promotion', 'escalated', 'partial', 'failed_uncontained',
-      'physical_rest_unproven', 'persistence_degraded',
-    ].includes(trigger)) {
+      'physical_rest_unproven', 'persistence_degraded', 'post_reserve_fence_failed',
+    ];
+    const trigger = stringAt(fault.trigger, `${path}.trigger`);
+    if (!stopFaultTriggers.includes(trigger)) {
       return fail(`${path}.trigger`, 'a Stop fault trigger');
     }
+    const observedTriggers = arrayAt(fault.observed_triggers, `${path}.observed_triggers`)
+      .map((value, index) => {
+        const name = stringAt(value, `${path}.observed_triggers[${index}]`);
+        if (!stopFaultTriggers.includes(name)) {
+          return fail(`${path}.observed_triggers[${index}]`, 'a Stop fault trigger');
+        }
+        return name as StopFaultTrigger;
+      });
     const recoveryStatus = stringAt(
       fault.recovery_status,
       `${path}.recovery_status`,
@@ -1794,7 +1809,8 @@ function normalizedOwnerStatusAt(value: unknown): ExecutionOwnerStatus {
         `${path}.latch_generation`,
       ),
       state: stateName as 'latched' | 'recovery_pending' | 'cleared',
-      trigger: trigger as NonNullable<ExecutionOwnerStatus['cellStopAction']['fault']>['trigger'],
+      trigger: trigger as StopFaultTrigger,
+      observedTriggers,
       recoveryStatus: recoveryStatus as NonNullable<ExecutionOwnerStatus['cellStopAction']['fault']>['recoveryStatus'],
       reasonCode: stringAt(fault.reason_code, `${path}.reason_code`),
       certificate: fault.certificate === null
@@ -1883,6 +1899,9 @@ function normalizedOwnerStatusAt(value: unknown): ExecutionOwnerStatus {
     observedGrippers,
     manualOperations: [],
     runtimeScaleControl: null,
+    // This parser normalizes raw control_state status. Applied target
+    // projections are merged later, after their system signal rows are read.
+    systemSignals: [],
     cellStopAction: {
       available: cellStopAvailable,
       unavailableReason: cellStopUnavailableReason,

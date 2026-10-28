@@ -1616,68 +1616,95 @@ if(BUILD_TESTING)
     set(${output_variable} "${fixture_root}" PARENT_SCOPE)
   endfunction()
 
+  # E1: one preparation per model family row of the maintained description,
+  # so a family added as data needs no CMake edit. URDF/SRDF and the resource
+  # root come from the row's `source`; distinct historical files are extra
+  # inputs. A family whose resources may come from an installed package names
+  # a sentinel file here: the local root is used only when it holds that file,
+  # otherwise the package named by the accepted `package://` prefix (M3 rule).
+  # The strict family-row loaders accept no extra field, so it stays here.
+  set(MANYFORGE_INSTALLED_MODEL_SENTINEL_ur5_roboplan "meshes/visual/base.dae")
+  file(READ "${MANYFORGE_MAINTAINED_DEPLOYMENT_SOURCE_DESCRIPTION}"
+    _maintained_description)
+  string(JSON _family_count LENGTH "${_maintained_description}" model_families)
+  math(EXPR _family_last "${_family_count} - 1")
+  set(MANYFORGE_MAINTAINED_FAMILY_IDS "")
+  set(MANYFORGE_MAINTAINED_PREPARED_ARGUMENTS "")
+  set(MANYFORGE_MAINTAINED_PREPARATION_MANIFESTS "")
+  foreach(_family_index RANGE ${_family_last})
+    string(JSON _family_id GET "${_maintained_description}"
+      model_families ${_family_index} model_family_id)
+    foreach(_field urdf_path srdf_path historical_urdf_path historical_srdf_path
+        resource_root accepted_package_uri_prefix)
+      string(JSON _family_${_field} GET "${_maintained_description}"
+        model_families ${_family_index} source ${_field})
+    endforeach()
+    set(_family_resource_root
+      "${_MANYFORGE_WORKSPACE_ROOT}/${_family_resource_root}")
+    set(_family_sentinel "${MANYFORGE_INSTALLED_MODEL_SENTINEL_${_family_id}}")
+    if(_family_sentinel AND
+       NOT EXISTS "${_family_resource_root}/${_family_sentinel}")
+      string(REGEX MATCH "^package://([^/]+)/(.*)/$" _package_match
+        "${_family_accepted_package_uri_prefix}")
+      set(_package_name "${CMAKE_MATCH_1}")
+      set(_package_path "${CMAKE_MATCH_2}")
+      find_package(${_package_name} CONFIG REQUIRED)
+      get_filename_component(_family_installed_root
+        "${${_package_name}_DIR}/../../../share/${_package_name}/${_package_path}"
+        REALPATH)
+      foreach(_field historical_urdf_path historical_srdf_path)
+        string(REPLACE "${_family_resource_root}" "${_family_installed_root}"
+          _family_${_field}
+          "${_MANYFORGE_WORKSPACE_ROOT}/${_family_${_field}}")
+      endforeach()
+      set(_family_resource_root "${_family_installed_root}")
+      if(NOT EXISTS "${_family_resource_root}/${_family_sentinel}")
+        message(FATAL_ERROR
+          "model family ${_family_id} requires the installed example model resources")
+      endif()
+    else()
+      foreach(_field historical_urdf_path historical_srdf_path)
+        set(_family_${_field}
+          "${_MANYFORGE_WORKSPACE_ROOT}/${_family_${_field}}")
+      endforeach()
+    endif()
+    set(_family_extra_inputs "")
+    foreach(_kind urdf srdf)
+      set(_family_${_kind}_path
+        "${_MANYFORGE_WORKSPACE_ROOT}/${_family_${_kind}_path}")
+      if(NOT EXISTS "${_family_historical_${_kind}_path}")
+        message(FATAL_ERROR
+          "model family ${_family_id} requires ${_family_historical_${_kind}_path}")
+      endif()
+      if(NOT _family_historical_${_kind}_path STREQUAL _family_${_kind}_path)
+        list(APPEND _family_extra_inputs "${_family_historical_${_kind}_path}")
+      endif()
+    endforeach()
+    manyforge_prepare_maintained_model(
+      ${_family_id} "${_family_id}"
+      "${_family_urdf_path}"
+      "${_family_srdf_path}"
+      "${_family_accepted_package_uri_prefix}"
+      "${_family_resource_root}"
+      MANYFORGE_STRUCTURAL_FIXTURE_ROOT_${_family_id}
+      ${_family_extra_inputs})
+    list(APPEND MANYFORGE_MAINTAINED_FAMILY_IDS ${_family_id})
+    list(APPEND MANYFORGE_MAINTAINED_PREPARED_ARGUMENTS --prepared
+      "${_family_id}=${MANYFORGE_STRUCTURAL_FIXTURE_ROOT_${_family_id}}")
+    list(APPEND MANYFORGE_MAINTAINED_PREPARATION_MANIFESTS
+      "${MANYFORGE_STRUCTURAL_FIXTURE_ROOT_${_family_id}}/preparation-manifest.json")
+  endforeach()
+  set_property(DIRECTORY APPEND PROPERTY CMAKE_CONFIGURE_DEPENDS
+    "${MANYFORGE_MAINTAINED_DEPLOYMENT_SOURCE_DESCRIPTION}")
+  # The fixtures several tests name directly.
   set(MANYFORGE_LITE6_STRUCTURAL_SOURCE_ROOT
     "${CMAKE_CURRENT_SOURCE_DIR}/../manyforge_example_models/models/lite6_lite_gripper")
   set(MANYFORGE_UR10E_ROBOTIQ_STRUCTURAL_SOURCE_ROOT
     "${CMAKE_CURRENT_SOURCE_DIR}/../manyforge_example_models/models/ur10e_robotiq_2f_140")
-  set(MANYFORGE_UF850_XARM_STRUCTURAL_SOURCE_ROOT
-    "${CMAKE_CURRENT_SOURCE_DIR}/../manyforge_example_models/models/uf850_xarm_gripper")
-  set(MANYFORGE_UR5E_ROBOTIQ_STRUCTURAL_SOURCE_ROOT
-    "${CMAKE_CURRENT_SOURCE_DIR}/../manyforge_example_models/models/ur5e_robotiq_2f_85")
-  set(MANYFORGE_UR5_ROBOPLAN_STRUCTURAL_SOURCE_ROOT
-    "${CMAKE_CURRENT_SOURCE_DIR}/resources/maintained/model_sources/ur5_roboplan")
-  set(MANYFORGE_UR5_ROBOPLAN_HISTORICAL_SOURCE_ROOT
-    "${CMAKE_CURRENT_SOURCE_DIR}/../.docker/roboplan/roboplan_example_models/models/ur_robot_model")
-  if(NOT EXISTS "${MANYFORGE_UR5_ROBOPLAN_HISTORICAL_SOURCE_ROOT}/meshes/visual/base.dae")
-    find_package(roboplan_example_models CONFIG REQUIRED)
-    get_filename_component(MANYFORGE_UR5_ROBOPLAN_HISTORICAL_SOURCE_ROOT
-      "${roboplan_example_models_DIR}/../../../share/roboplan_example_models/models/ur_robot_model"
-      REALPATH)
-  endif()
-  if(NOT EXISTS "${MANYFORGE_UR5_ROBOPLAN_HISTORICAL_SOURCE_ROOT}/ur5_gripper.urdf" OR
-     NOT EXISTS "${MANYFORGE_UR5_ROBOPLAN_HISTORICAL_SOURCE_ROOT}/meshes/visual/base.dae")
-    message(FATAL_ERROR "UR5/RoboPlan qualification requires the installed example model resources")
-  endif()
-
-  manyforge_prepare_maintained_model(
-    lite6_lite_gripper "Lite6"
-    "${MANYFORGE_LITE6_STRUCTURAL_SOURCE_ROOT}/lite6_lite_gripper.urdf"
-    "${MANYFORGE_LITE6_STRUCTURAL_SOURCE_ROOT}/lite6_lite_gripper.srdf"
-    "package://manyforge_example_models/models/lite6_lite_gripper/"
-    "${MANYFORGE_LITE6_STRUCTURAL_SOURCE_ROOT}"
-    MANYFORGE_LITE6_STRUCTURAL_FIXTURE_ROOT)
-  manyforge_prepare_maintained_model(
-    uf850_xarm_gripper "UF850/xArm gripper"
-    "${MANYFORGE_UF850_XARM_STRUCTURAL_SOURCE_ROOT}/uf850_xarm_gripper.urdf"
-    "${MANYFORGE_UF850_XARM_STRUCTURAL_SOURCE_ROOT}/uf850_xarm_gripper.srdf"
-    "package://manyforge_example_models/models/uf850_xarm_gripper/"
-    "${MANYFORGE_UF850_XARM_STRUCTURAL_SOURCE_ROOT}"
-    MANYFORGE_UF850_XARM_STRUCTURAL_FIXTURE_ROOT)
-  manyforge_prepare_maintained_model(
-    ur10e_robotiq_2f_140 "UR10e/Robotiq"
-    "${MANYFORGE_UR10E_ROBOTIQ_STRUCTURAL_SOURCE_ROOT}/ur10e_robotiq_2f_140.structural.urdf"
-    "${MANYFORGE_UR10E_ROBOTIQ_STRUCTURAL_SOURCE_ROOT}/ur10e_robotiq_2f_140.structural.srdf"
-    "package://manyforge_example_models/models/ur10e_robotiq_2f_140/"
-    "${MANYFORGE_UR10E_ROBOTIQ_STRUCTURAL_SOURCE_ROOT}"
-    MANYFORGE_UR10E_ROBOTIQ_STRUCTURAL_FIXTURE_ROOT
-    "${MANYFORGE_UR10E_ROBOTIQ_STRUCTURAL_SOURCE_ROOT}/ur10e_robotiq_2f_140.urdf"
-    "${MANYFORGE_UR10E_ROBOTIQ_STRUCTURAL_SOURCE_ROOT}/ur10e_robotiq_2f_140.srdf")
-  manyforge_prepare_maintained_model(
-    ur5_roboplan "UR5/RoboPlan"
-    "${MANYFORGE_UR5_ROBOPLAN_STRUCTURAL_SOURCE_ROOT}/ur5_gripper.structural.urdf"
-    "${MANYFORGE_UR5_ROBOPLAN_STRUCTURAL_SOURCE_ROOT}/ur5_gripper.structural.srdf"
-    "package://roboplan_example_models/models/ur_robot_model/"
-    "${MANYFORGE_UR5_ROBOPLAN_HISTORICAL_SOURCE_ROOT}"
-    MANYFORGE_UR5_ROBOPLAN_STRUCTURAL_FIXTURE_ROOT
-    "${MANYFORGE_UR5_ROBOPLAN_HISTORICAL_SOURCE_ROOT}/ur5_gripper.urdf"
-    "${MANYFORGE_UR5_ROBOPLAN_HISTORICAL_SOURCE_ROOT}/ur5_gripper.srdf")
-  manyforge_prepare_maintained_model(
-    ur5e_robotiq_2f_85 "UR5e/Robotiq"
-    "${MANYFORGE_UR5E_ROBOTIQ_STRUCTURAL_SOURCE_ROOT}/ur5e_robotiq_2f_85.urdf"
-    "${MANYFORGE_UR5E_ROBOTIQ_STRUCTURAL_SOURCE_ROOT}/ur5e_robotiq_2f_85.srdf"
-    "package://manyforge_example_models/models/ur5e_robotiq_2f_85/"
-    "${MANYFORGE_UR5E_ROBOTIQ_STRUCTURAL_SOURCE_ROOT}"
-    MANYFORGE_UR5E_ROBOTIQ_STRUCTURAL_FIXTURE_ROOT)
+  set(MANYFORGE_LITE6_STRUCTURAL_FIXTURE_ROOT
+    "${MANYFORGE_STRUCTURAL_FIXTURE_ROOT_lite6_lite_gripper}")
+  set(MANYFORGE_UR10E_ROBOTIQ_STRUCTURAL_FIXTURE_ROOT
+    "${MANYFORGE_STRUCTURAL_FIXTURE_ROOT_ur10e_robotiq_2f_140}")
 
   # UI6-I process qualification needs the exact cell-scoped empty predecessor
   # before it can exercise ordinary project-folder activation. This generated
@@ -1705,16 +1732,7 @@ if(BUILD_TESTING)
       --check
       --workspace-root "${_MANYFORGE_WORKSPACE_ROOT}"
       --package-root "${MANYFORGE_UI6I_DUAL_SCENARIO_PACKAGE_ROOT}"
-      --prepared
-      "lite6_lite_gripper=${MANYFORGE_LITE6_STRUCTURAL_FIXTURE_ROOT}"
-      --prepared
-      "uf850_xarm_gripper=${MANYFORGE_UF850_XARM_STRUCTURAL_FIXTURE_ROOT}"
-      --prepared
-      "ur10e_robotiq_2f_140=${MANYFORGE_UR10E_ROBOTIQ_STRUCTURAL_FIXTURE_ROOT}"
-      --prepared
-      "ur5_roboplan=${MANYFORGE_UR5_ROBOPLAN_STRUCTURAL_FIXTURE_ROOT}"
-      --prepared
-      "ur5e_robotiq_2f_85=${MANYFORGE_UR5E_ROBOTIQ_STRUCTURAL_FIXTURE_ROOT}"
+      ${MANYFORGE_MAINTAINED_PREPARED_ARGUMENTS}
     COMMAND "${CMAKE_COMMAND}" -E touch
       "${MANYFORGE_UI6I_DUAL_SCENARIO_STAMP}"
     DEPENDS
@@ -1725,11 +1743,7 @@ if(BUILD_TESTING)
       "${MANYFORGE_NODE_CATALOG_SOURCE}"
       "${CMAKE_CURRENT_SOURCE_DIR}/resources/catalog/gripper.command_position.v1.yaml"
       ${MANYFORGE_MAINTAINED_MODEL_SOURCE_INPUTS}
-      "${MANYFORGE_LITE6_STRUCTURAL_FIXTURE_ROOT}/preparation-manifest.json"
-      "${MANYFORGE_UF850_XARM_STRUCTURAL_FIXTURE_ROOT}/preparation-manifest.json"
-      "${MANYFORGE_UR10E_ROBOTIQ_STRUCTURAL_FIXTURE_ROOT}/preparation-manifest.json"
-      "${MANYFORGE_UR5_ROBOPLAN_STRUCTURAL_FIXTURE_ROOT}/preparation-manifest.json"
-      "${MANYFORGE_UR5E_ROBOTIQ_STRUCTURAL_FIXTURE_ROOT}/preparation-manifest.json"
+      ${MANYFORGE_MAINTAINED_PREPARATION_MANIFESTS}
     VERBATIM)
   # Part of the default test build, like the other process fixtures: the
   # process tests consume this tree directly and must never see a stale one.
@@ -1749,16 +1763,7 @@ if(BUILD_TESTING)
       --check
       --description "${MANYFORGE_MAINTAINED_DEPLOYMENT_SOURCE_DESCRIPTION}"
       --workspace-root "${_MANYFORGE_WORKSPACE_ROOT}"
-      --prepared
-      "lite6_lite_gripper=${MANYFORGE_LITE6_STRUCTURAL_FIXTURE_ROOT}"
-      --prepared
-      "uf850_xarm_gripper=${MANYFORGE_UF850_XARM_STRUCTURAL_FIXTURE_ROOT}"
-      --prepared
-      "ur10e_robotiq_2f_140=${MANYFORGE_UR10E_ROBOTIQ_STRUCTURAL_FIXTURE_ROOT}"
-      --prepared
-      "ur5_roboplan=${MANYFORGE_UR5_ROBOPLAN_STRUCTURAL_FIXTURE_ROOT}"
-      --prepared
-      "ur5e_robotiq_2f_85=${MANYFORGE_UR5E_ROBOTIQ_STRUCTURAL_FIXTURE_ROOT}")
+      ${MANYFORGE_MAINTAINED_PREPARED_ARGUMENTS})
 
   add_test(
     NAME MaintainedDeploymentOccurrenceCompilation
@@ -1766,29 +1771,24 @@ if(BUILD_TESTING)
       "$<TARGET_FILE:manyforge_maintained_deployment_occurrences>"
       --check
       --workspace-root "${_MANYFORGE_WORKSPACE_ROOT}"
-      --prepared
-      "lite6_lite_gripper=${MANYFORGE_LITE6_STRUCTURAL_FIXTURE_ROOT}"
-      --prepared
-      "uf850_xarm_gripper=${MANYFORGE_UF850_XARM_STRUCTURAL_FIXTURE_ROOT}"
-      --prepared
-      "ur10e_robotiq_2f_140=${MANYFORGE_UR10E_ROBOTIQ_STRUCTURAL_FIXTURE_ROOT}"
-      --prepared
-      "ur5_roboplan=${MANYFORGE_UR5_ROBOPLAN_STRUCTURAL_FIXTURE_ROOT}"
-      --prepared
-      "ur5e_robotiq_2f_85=${MANYFORGE_UR5E_ROBOTIQ_STRUCTURAL_FIXTURE_ROOT}")
+      ${MANYFORGE_MAINTAINED_PREPARED_ARGUMENTS})
 
+  # Programs with expressions validate through the manyforge_headless_py
+  # engine binding, which this graph does not build: the caller's PYTHONPATH
+  # (scripts/test-all.sh setup_expression_binding) is kept after the sources.
   function(manyforge_add_prepare_activation_test test_name scenario)
     add_test(
       NAME "${test_name}"
-      COMMAND "${CMAKE_COMMAND}" -E env
-        "PYTHONPATH=${_MANYFORGE_WORKSPACE_ROOT}/manyforge_behavior:${_MANYFORGE_WORKSPACE_ROOT}"
+      COMMAND
         "${Python3_EXECUTABLE}"
         "${CMAKE_CURRENT_SOURCE_DIR}/test/prepare_activation_tool.py"
         --tool "$<TARGET_FILE:manyforge_prepare_activation>"
         --workspace "${_MANYFORGE_WORKSPACE_ROOT}"
         --scenario "${scenario}"
         ${ARGN})
-    set_tests_properties("${test_name}" PROPERTIES TIMEOUT 180)
+    set_tests_properties("${test_name}" PROPERTIES TIMEOUT 180
+      ENVIRONMENT_MODIFICATION
+        "PYTHONPATH=path_list_prepend:${_MANYFORGE_WORKSPACE_ROOT};PYTHONPATH=path_list_prepend:${_MANYFORGE_WORKSPACE_ROOT}/manyforge_behavior")
   endfunction()
 
   manyforge_add_prepare_activation_test(
@@ -1833,6 +1833,12 @@ if(BUILD_TESTING)
     PrepareActivationRos2Control
     "examples/isaac-ur10e-light-scene.scenario"
     --ros2-control)
+  manyforge_add_prepare_activation_test(
+    PrepareActivationVisionBinPick
+    "examples/ur5_vision_guided_bin_pick.scenario")
+  manyforge_add_prepare_activation_test(
+    PrepareActivationVisionPosePick
+    "examples/ur5_vision_guided_pose_pick.scenario")
 
   add_executable(test_model_source
     test/test_model_source.cpp)

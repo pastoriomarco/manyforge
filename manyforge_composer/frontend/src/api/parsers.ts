@@ -69,10 +69,10 @@ export {
   parseComponentOverviewProjection,
   parseComposerHeadlessState,
   parseObjectResponse,
+  parseCellRecoverResult,
   parseGlobalRuleRecoveryOffers,
   parseGlobalRuleRecoveryResult,
   parseStopFaultRecoveryOffer,
-  parseStopFaultRecoveryResult,
 } from './parsers/headless';
 export {
   parseHistorianCapturePage,

@@ -138,7 +138,7 @@ compile_retained_io_policies(const ProgramBindingContract *program,
     if (!rules)
       return Reply::Ok(std::move(projection));
     const auto signals =
-        ResolveRetainedIoSignalCatalog(retained_bundle.value().cell_graph);
+        ResolveCompiledIoSignalCatalog(retained_bundle.value().cell_graph);
     if (!signals.ok())
       return Reply::Err(signals.error());
     const std::span<const core::ProgramBlackboardKeyDeclarationDTO>

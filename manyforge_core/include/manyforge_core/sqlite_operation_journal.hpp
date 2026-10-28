@@ -13,9 +13,12 @@
 
 namespace manyforge::core {
 
+/// v17: lean Stop record. `stop_projections` is an index of journal_records
+/// sequences; each Stop payload is stored once, in journal_records. Earlier
+/// journals are refused (operation_journal_format_unsupported), not converted.
 inline constexpr std::string_view kOperationJournalSchemaId =
-    "manyforge.internal.execution.operation-journal.o1.5.v16";
-inline constexpr std::int64_t kOperationJournalSchemaVersion = 16;
+    "manyforge.internal.execution.operation-journal.o1.5.v17";
+inline constexpr std::int64_t kOperationJournalSchemaVersion = 17;
 inline constexpr std::int64_t kOperationJournalSqliteApplicationId = 0x4D46454A;
 inline constexpr std::string_view kOperationJournalFilename = "operation-journal.sqlite3";
 inline constexpr std::size_t kMaximumOperationJournalHistory = 4096U;

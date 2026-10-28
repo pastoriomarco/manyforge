@@ -321,70 +321,48 @@ it('accepts a certified latch that names why recovery is unavailable, never an e
   expect(() => parseStopFaultRecoveryOffer(offer([row], reason))).toThrow();
 });
 
-it('composes an identity-fenced stop-fault recovery from the live offer', async () => {
-  const fetchMock = vi.fn()
-    .mockResolvedValueOnce(response({
-      api_version: 'manyforge.execution_command_response.v1',
-      command: 'get_stop_fault',
-      ok: true,
-      stop_fault: {
-        recovery_unavailable_reason: null,
-        configuration_expectations: [{
-          active_control_configuration_generation: 4,
-          active_control_configuration_id: 'active.arm',
-          control_domain_id: 'robot.arm.control',
-        }],
-        latch: {
-          cell_id: 'cell.1',
-          graph_revision: 'sha256:graph',
-          latch_generation: 2,
-          latch_id: 'stop-fault.1',
-          recovery_assessment_revision: 3,
-          recovery_status: 'ready',
-          retained_bundle_id: 'sha256:bundle',
-          state: 'latched',
-          stop_certificate: {
-            stop_certificate_id: 'stop-certificate.1',
-            stop_certificate_revision: 1,
-            stop_generation: 4,
-            stop_id: 'stop.1',
-          },
-        },
-      },
-    }))
-    .mockResolvedValueOnce(response({
-      api_version: 'manyforge.execution_command_response.v1',
-      command: 'recover_stop_fault',
-      ok: true,
-      result: {
-        accepted: true,
-        error: null,
-        latch: {},
-        replay_status: 'accepted_new',
-        request_id: 'request.recover.1',
-      },
-    }));
+it('sends Recover cell as one request carrying only its request identity', async () => {
+  const fetchMock = vi.fn().mockResolvedValue(response({
+    schema_version: 'manyforge.cell_recover_result.v1',
+    request_id: 'request.recover.1',
+    outcome: 'not_recovered',
+    acknowledged_incidents: [{
+      controllable_component_id: 'arm', incident_id: 'incident.arm.1', cause_class: 'emergency_stop',
+    }],
+    latch_cleared: false,
+    recovered_components: [],
+    reason: {
+      code: 'incident_open', message: 'open again',
+      details: { controllable_component_id: 'arm', cause_class: 'emergency_stop' },
+    },
+  }));
   vi.stubGlobal('fetch', fetchMock);
 
-  await api.execution.recoverStopFault('owner.1', 'request.recover.1');
-
-  const [, options] = fetchMock.mock.calls[1] as [string, RequestInit];
-  expect(JSON.parse(String(options.body))).toMatchObject({
+  await expect(api.execution.cellRecover('request.recover.1')).resolves.toEqual({
+    outcome: 'not_recovered',
+    acknowledgedIncidents: [{
+      controllableComponentId: 'arm', incidentId: 'incident.arm.1', causeClass: 'emergency_stop',
+    }],
+    latchCleared: false,
+    recoveredComponents: [],
+    reason: {
+      code: 'incident_open', message: 'open again',
+      details: { controllable_component_id: 'arm', cause_class: 'emergency_stop' },
+    },
+  });
+  expect(fetchMock).toHaveBeenCalledTimes(1);
+  const [url, options] = fetchMock.mock.calls[0] as [string, RequestInit];
+  expect(url).toContain('/api/execution/cell-recover');
+  expect(options.method).toBe('POST');
+  // No owner epoch, latch identity or configuration echo: Headless reads them.
+  expect(JSON.parse(String(options.body))).toEqual({
     request_context: {
       request_id: 'request.recover.1',
-      request_owner_epoch: 'owner.1',
       source_label: 'composer_ui',
       correlation_id: null,
     },
-    expected_latch_id: 'stop-fault.1',
-    expected_recovery_assessment_revision: 3,
-    expected_stop_certificate_id: 'stop-certificate.1',
-    configuration_expectations: [{
-      control_domain_id: 'robot.arm.control',
-      active_control_configuration_id: 'active.arm',
-      active_control_configuration_generation: 4,
-    }],
   });
+  await expect(api.execution.cellRecover('request.other')).rejects.toThrow();
 });
 
 it('reads global-rule recovery offers and clears one with its exact selector (SX-2206)', async () => {
@@ -677,6 +655,7 @@ function authoringWorkspaceFixture(): Record<string, unknown> {
     },
     project: {
       document_path: '/workspace/examples/cell',
+      read_only: false,
       document_id: 'cell',
       document_name: 'Cell',
       document_description: '',

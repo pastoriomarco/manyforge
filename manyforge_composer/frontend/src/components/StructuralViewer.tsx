@@ -23,6 +23,7 @@ import {
 } from '@react-three/drei';
 import * as THREE from 'three';
 import { AuthoringTransformControls } from './AuthoringTransformControls';
+import type { GizmoNoChange } from './AuthoringTransformControls';
 import { GizmoSteps, useGizmoSettings } from './common/GizmoControls';
 import type { GizmoController } from './common/GizmoControls';
 import type { GizmoSettings } from '../utils/gizmo';
@@ -151,7 +152,7 @@ interface StructuralViewerProps {
   candidateTcpPose?: Pose3Value | null;
   candidateStale?: boolean;
   candidateTcpEditable?: boolean;
-  onEditCandidateTcpPose?: (pose: Pose3Value | null) => void;
+  onEditCandidateTcpPose?: (pose: Pose3Value | null, noChange?: GizmoNoChange) => void;
   onBeginCandidateTcpDrag?: () => boolean;
   candidateContextKey?: string;
   gizmo?: GizmoController;
@@ -2050,7 +2051,7 @@ function CandidateTcpGhost({
   tool: CandidateRobotPresentation | null;
   rejected: boolean;
   onAssetError: (error: Error) => void;
-  onEdit: (pose: Pose3Value | null) => void;
+  onEdit: (pose: Pose3Value | null, noChange?: GizmoNoChange) => void;
   onTransformDraggingChange: (dragging: boolean) => void;
 }) {
   const group = useRef<THREE.Group | null>(null);
@@ -2151,11 +2152,11 @@ function CandidateTcpGhost({
             return true;
           }}
           onCommit={commit}
-          onCancel={() => {
+          onCancel={(noChange) => {
             dragging.current = false;
             setDragVisible(false);
             restore();
-            onEdit(null);
+            onEdit(null, noChange);
             onTransformDraggingChange(false);
           }}
         />
@@ -2709,7 +2710,7 @@ const ViewerCanvas = memo(function ViewerCanvas({
   candidateTcpPose: Pose3Value | null;
   candidateStale: boolean;
   candidateTcpEditable: boolean;
-  onEditCandidateTcpPose: (pose: Pose3Value | null) => void;
+  onEditCandidateTcpPose: (pose: Pose3Value | null, noChange?: GizmoNoChange) => void;
   onBeginCandidateTcpDrag: () => boolean;
   candidateContextKey: string;
   gizmoSettings: GizmoSettings;

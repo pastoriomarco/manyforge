@@ -9,11 +9,11 @@
   "members": {
     "assignment.yaml": "sha256:f44d0d3f0adf5a93854e73a414393a779a4a5704a910f29b2500a491cf3a3ebe",
     "deployment.yaml": "sha256:7f07f567324ea339d5f46b97c520bc4add12823b5316ba85a5c034697542148a",
-    "program.yaml": "sha256:dda8af27ddaaa1ca4c75e02571c940a9cb734cef3b6653bb89aeb123e7b28c63"
+    "program.yaml": "sha256:6bd1992e7a8e12262c631dfe26b68e848eb83922e26c675901abf47c3bc50fb0"
   },
   "name": "ur5e_lite6_wall_isolation",
   "saved_status": {
-    "checked_content_digest": "sha256:f99220658fefe9e0e80445084743c1f732d957b66c9842d37896dd35b1a67f19",
+    "checked_content_digest": "sha256:dfca6f47a72e1fca02da3e5cc6c878ae2c9d5632a397a0400175d33f40f4f2be",
     "last_known_status": "ready",
     "manyforge_version": "0.1.0"
   },

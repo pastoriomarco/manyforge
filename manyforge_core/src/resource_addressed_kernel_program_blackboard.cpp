@@ -11,6 +11,23 @@ ErrorDTO bb_error(const char* reason, bool malformed = false) {
           {{"reason", reason}}};
 }
 
+// The same Runner names a cycle the Manager liveness heartbeat has not yet
+// delivered to this Kernel (e.g. the between-Runs baseline right after the
+// Runner journals its new Idle cycle). Not admitted and retryable: the
+// Runner's bounded not-ready retry resends it once the cycle is observed.
+// An older or equal generation, or another Runner epoch, stays stale.
+ErrorDTO bb_cycle_not_observed() {
+  return {"bb_source_not_ready",
+          "Program blackboard names a Program cycle the Kernel has not observed yet",
+          {{"reason", "program_bb_cycle_not_observed"}}};
+}
+
+bool cycle_not_yet_observed(const IoProgramBlackboardScopeDTO& scope,
+                            const ProgramCycleStatusDTO& cycle) {
+  return scope.program_runner_owner_epoch == cycle.program_runner_owner_epoch &&
+         scope.cycle_generation > cycle.cycle_generation;
+}
+
 bool cycle_matches(const IoProgramBlackboardScopeDTO& scope, const ProgramCycleStatusDTO& cycle) {
   return scope.program_runner_owner_epoch == cycle.program_runner_owner_epoch &&
          scope.cycle_generation == cycle.cycle_generation &&
@@ -121,14 +138,17 @@ Result<void> ResourceAddressedExecutionKernel::retire_program_blackboard_source_
 }
 
 Result<void> ResourceAddressedExecutionKernel::reconcile_program_blackboard_cycle_locked(
-    const std::optional<ProgramCycleStatusDTO>& cycle, bool current,
+    const std::optional<ProgramCycleStatusDTO>& cycle,
     std::shared_ptr<IIoSignalService>* actual_retired_service) {
   if (program_blackboard_source_) {
     const auto& prior = program_blackboard_source_->scope;
     // A healthy same-owner Reset/new Run keeps its accepted value store until
     // the actual replacement baseline commits atomically. Readiness is not a
     // fabricated source frame or a permission for new-Run dispatch to use it.
-    if (!current || !cycle || !applied_program_blackboard_context_ ||
+    // A closed (not current) cycle alone is not a teardown: the Manager closes
+    // readiness before every Run end and Reset step. Actual Runner contact
+    // loss and Manager liveness loss retire through their own paths.
+    if (!cycle || !applied_program_blackboard_context_ ||
         prior.program_runner_owner_epoch != cycle->program_runner_owner_epoch ||
         prior.request_owner_epoch != applied_program_blackboard_context_->request_owner_epoch ||
         prior.program_binding_id != applied_program_blackboard_context_->program_binding_id ||
@@ -281,10 +301,17 @@ Result<void> ResourceAddressedExecutionKernel::ValidatePendingProgramBlackboardS
       owner.value().retained_bundle_id() != candidate.retained_bundle_id ||
       stop_retained_bundle_id_ != candidate.retained_bundle_id ||
       stop_graph_revision_ != candidate.graph_revision ||
-      program_blackboard_runner_loss_locked(owner.value().cycle()) ||
-      !program_blackboard_scope_current_locked(scope, owner.value().cycle(),
-                                               config_.request_owner_epoch, publication, candidate))
+      program_blackboard_runner_loss_locked(owner.value().cycle()))
     return Result<void>::Err(bb_error("program_bb_scope_stale"));
+  if (!program_blackboard_scope_current_locked(scope, owner.value().cycle(),
+                                               config_.request_owner_epoch, publication, candidate))
+    return Result<void>::Err(
+        scope.request_owner_epoch == config_.request_owner_epoch &&
+                scope.program_binding_id == candidate.program_binding_id &&
+                scope.active_publication_generation == publication &&
+                cycle_not_yet_observed(scope, owner.value().cycle())
+            ? bb_cycle_not_observed()
+            : bb_error("program_bb_scope_stale"));
   return Result<void>::Ok();
 }
 
@@ -339,7 +366,17 @@ ResourceAddressedExecutionKernel::PublishProgramBlackboard(
       config_.operation_admission_gate->has_held_configuration_fences())
     return Reply::Err(bb_error("program_bb_apply_fence_held"));
   auto owner = cell_admission_owner_->AcquireProgramBlackboardAdmission();
-  if (!owner.ok()) return Reply::Err(owner.error());
+  if (!owner.ok()) {
+    // The Manager's brief transition close: not admitted, retried by the
+    // Runner within its existing budget once readiness is current again.
+    const auto reason = owner.error().details.find("reason");
+    if (reason != owner.error().details.end() &&
+        reason->second == "program_bb_cycle_status_closed")
+      return Reply::Err({"bb_source_not_ready",
+                         "Program cycle readiness is closed for a transition",
+                         {{"reason", "program_bb_cycle_status_closed"}}});
+    return Reply::Err(owner.error());
+  }
   std::lock_guard state_lock(state_mutex_);
   if (program_blackboard_runner_loss_locked(owner.value().cycle()))
     return Reply::Err(bb_error("program_bb_owner_not_current"));
@@ -373,6 +410,11 @@ ResourceAddressedExecutionKernel::PublishProgramBlackboard(
                           IoProgramBlackboardAcknowledgementStatus::kSuperseded});
       }
     }
+    if (scope.request_owner_epoch == context->request_owner_epoch &&
+        scope.program_binding_id == context->program_binding_id &&
+        scope.active_publication_generation == context->active_publication_generation &&
+        cycle_not_yet_observed(scope, owner.value().cycle()))
+      return Reply::Err(bb_cycle_not_observed());
     return Reply::Err(bb_error("program_bb_scope_stale"));
   }
   auto received = publication;

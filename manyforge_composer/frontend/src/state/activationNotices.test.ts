@@ -55,8 +55,9 @@ describe('activation failure notice', () => {
         effectDisposition: 'known',
       },
     }, null, true);
+    // Nothing was applied or locked: a warning until acknowledged.
     expect(notice).toMatchObject({
-      title: 'Activation failed',
+      title: 'Activation failed', severity: 'warning', acknowledgeable: true,
     });
     expect(notice.message).toContain(
       'Candidate preflight was refused. Failed during accepted (manager_apply_preflight_refused); its effects are known.',

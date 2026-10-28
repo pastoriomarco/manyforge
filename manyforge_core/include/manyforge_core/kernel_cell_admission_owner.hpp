@@ -1,5 +1,6 @@
 #pragma once
 
+#include <cstdint>
 #include <functional>
 #include <manyforge_core/ports/i_manager_liveness_observation_port.hpp>
 #include <manyforge_core/ports/ikernel_cell_admission_port.hpp>
@@ -47,6 +48,19 @@ using CellAdmissionReconcileValidator = std::function<Result<CellAdmissionReconc
     const std::vector<CellAdmissionClaimDTO>&,
     const std::vector<CellAdmissionCurrentOwnerEpochDTO>&, const CellAdmissionReconcileDTO&)>;
 
+/// D6: how an active Stop-fault latch restricts cell admission. The latch is
+/// a fact about the robots it captured, so Scenario Close never clears it.
+enum class StopFaultAdmissionScope : std::uint8_t {
+  kNone = 0,  ///< No active latch.
+  kCell,      ///< The latch closes cell admission (motion, authoring, lifecycle).
+  /// Close retired the latched Scenario's lifecycle targets: the motion-free
+  /// Close steps (Program Reset, lifecycle, Manager Apply) are admitted.
+  kClosing,
+  /// The latched Scenario was replaced: the latch refuses only motion claims
+  /// until the operator's Recover cell clears it on its unchanged facts.
+  kCarried,
+};
+
 /// The sole focused cell-admission ledger composed inside Kernel. Kernel takes
 /// its shared admission mutex before this state mutex; Stop recognition and
 /// forensic projection take neither in that order and retain their reserve.
@@ -70,7 +84,8 @@ class KernelCellAdmissionOwner final : public IKernelCellAdmissionPort,
       CellAdmissionProgramNodeValidator program_node_validator = {},
       std::function<bool()> stop_fault_active = {},
       CellAdmissionProgramResetStatusSource program_reset_status_source = {},
-      std::function<Result<void>(std::shared_ptr<IIoSignalService>*)> required_health_loss_observer = {});
+      std::function<Result<void>(std::shared_ptr<IIoSignalService>*)> required_health_loss_observer = {},
+      std::function<StopFaultAdmissionScope()> stop_fault_scope = {});
 
   /// Process-local health/current-cycle admission under this existing owner's
   /// mutex. Kernel acquires it before state_mutex_ and holds it only across
@@ -160,6 +175,10 @@ class KernelCellAdmissionOwner final : public IKernelCellAdmissionPort,
   [[nodiscard]] Result<void> RefreshStopFaultAdmission();
 
   [[nodiscard]] AuthoringAdmissionDTO GetAuthoringAdmission() const override;
+  /// D6 (SX-370): authoring is closed solely by the closing scope; every other
+  /// admission condition (persistence, route recovery, base readiness, no
+  /// held claim) holds. Only the canonical-empty preparation may use it.
+  [[nodiscard]] bool AuthoringClosedOnlyByClosing() const;
   /// Sticky owner-cache storage uncertainty; status only, cleared by restart.
   [[nodiscard]] std::optional<ErrorDTO> persistence_outcome_unknown() const;
   [[nodiscard]] Result<AuthoringAdmissionDTO> UpdateCellAdmissionReadiness(
@@ -193,9 +212,16 @@ class KernelCellAdmissionOwner final : public IKernelCellAdmissionPort,
       const CellAdmissionApplyBringUpValidator& validate_plan);
   /// Ordinary configuration convergence under exact current Manager/host and
   /// immutable-terminal proofs. All old held rows retain their exclusion.
+  /// D6: `canonical_empty_candidate` (the exact canonical-empty candidate) is
+  /// the only Apply admitted while Close of a latched Scenario runs.
   [[nodiscard]] Result<CellAdmissionClaimDTO> AcquireConfigurationApplyClaim(
       const CellAdmissionClaimIntentDTO& intent,
-      const CellAdmissionConfigurationApplyValidator& validate);
+      const CellAdmissionConfigurationApplyValidator& validate, bool canonical_empty_candidate = false);
+  /// D6: the CCLC owner's lifecycle Disable, verified by the composing Kernel
+  /// against its exact intent; the only lifecycle claim admitted while Close
+  /// of a latched Scenario runs. Otherwise identical to the ordinary acquire.
+  [[nodiscard]] Result<CellAdmissionClaimDTO> AcquireCloseDisableLifecycleClaim(
+      const CellAdmissionClaimIntentDTO& intent);
   /// Called only after fresh success has released every exact old fence.
   /// Keeps the fresh claim held until its ordinary release.
   [[nodiscard]] Result<AuthoringAdmissionDTO> ReleaseTerminalApplyClaimsAfterSuccess(
@@ -265,7 +291,8 @@ class KernelCellAdmissionOwner final : public IKernelCellAdmissionPort,
       bool selected_apply_bring_up = false,
       const CellAdmissionConfigurationApplyValidator& configuration_apply_validator = {},
       const PreparedProgramResetStatus* reset_proof = nullptr,
-      const CellAdmissionIoOutputRecoveryValidator& io_output_recovery_validator = {});
+      const CellAdmissionIoOutputRecoveryValidator& io_output_recovery_validator = {},
+      bool close_step = false);
   struct Entry final {
     CellAdmissionClaimDTO claim;
     std::optional<CellAdmissionClaimReleaseDTO> release;
@@ -273,6 +300,10 @@ class KernelCellAdmissionOwner final : public IKernelCellAdmissionPort,
   };
 
   [[nodiscard]] bool IoOutputRecoveryDependenciesReadyLocked() const noexcept;
+  /// `stop_fault_scope_` when composed, else kCell while `stop_fault_active_`.
+  [[nodiscard]] StopFaultAdmissionScope StopFaultScopeLocked() const;
+  /// Whether a latch (or its not yet refreshed publication) closes the cell.
+  [[nodiscard]] bool StopFaultClosesCellLocked() const;
   [[nodiscard]] AuthoringAdmissionDTO AdmissionLocked() const noexcept;
   [[nodiscard]] bool NonCycleReadinessLocked() const noexcept;
   [[nodiscard]] std::optional<std::string_view> LifecycleBlockingReasonLocked() const noexcept;
@@ -316,6 +347,7 @@ class KernelCellAdmissionOwner final : public IKernelCellAdmissionPort,
   CellAdmissionReconcileValidator reconcile_validator_;
   CellAdmissionProgramNodeValidator program_node_validator_;
   std::function<bool()> stop_fault_active_;
+  std::function<StopFaultAdmissionScope()> stop_fault_scope_;
   // Fixed at Kernel composition and destroyed with this owner. Runs while
   // mutex_ is held: bounded state -> signals invalidation only, with no owner
   // reentry, journal/host I/O or Stop dispatch.

@@ -280,6 +280,8 @@ class RuntimeCollisionLookaheadSession final {
 
   Config config_;
   IClock* clock_ = nullptr;
+  // Also the host's containment for a throwing authority/observer callback.
+  IScheduler* scheduler_ = nullptr;
   ICollisionWorldSnapshotPublisher* publisher_ = nullptr;
   const ExecutionProgressPublication* progress_publication_ = nullptr;
   std::vector<std::shared_ptr<ICollisionQueryEngine>> engines_;

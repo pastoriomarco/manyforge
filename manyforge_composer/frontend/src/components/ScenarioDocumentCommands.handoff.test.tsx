@@ -13,7 +13,7 @@ import type { ScenarioReplacementIdentity } from '../hooks/useProgramWorkspace';
 import type { ProgramResetExpectation, ProgramResetOutcome } from '../hooks/useProgramRuntime';
 
 const apiMock = vi.hoisted(() => ({
-  authoringWorkspace: { get: vi.fn() }, programWorkspace: { get: vi.fn(), clearClosedScenario: vi.fn() },
+  authoringWorkspace: { get: vi.fn() }, programWorkspace: { get: vi.fn() },
   manager: { status: vi.fn(), applyStatus: vi.fn() }, deploymentWorkspace: { get: vi.fn() },
   scenarioDocuments: { list: vi.fn(), load: vi.fn(), new: vi.fn() }, files: { browse: vi.fn() },
   scene: { commit: vi.fn() },
@@ -90,7 +90,7 @@ function publication(): AuthoringWorkspaceSnapshot {
       saved: { available: false, matchesDraft: false, path: null, programRevision: null } },
     deployment: { draftId: 'deployment.1', draftRevision: 1, document: null, savedPath: null,
       savedDocument: null, differsFromSaved: false },
-    project: { documentPath: '/projects/current', documentId: 'current', documentName: 'Current',
+    project: { documentPath: '/projects/current', readOnly: false, documentId: 'current', documentName: 'Current',
       documentDescription: '', sourceDiagnostics: [], sourceDocumentDigest: null,
       programRoleAssignment: null, sourceProgramDigest: null, sourceDeploymentDigest: null },
   };
@@ -122,9 +122,6 @@ function fixedObject(id: string, support?: string): LogicalSceneObject {
     placement: { kind: 'cell_fixed', cell_id: 'cell', pose_in_cell: {
       position_m: { x: 0, y: 0, z: 0 }, orientation_xyzw: [0, 0, 0, 1] } },
     provider_evidence: null, support_contacts: support === undefined ? [] : [{ support_object_id: support }] };
-}
-function supportedObjects(): LogicalSceneObject[] {
-  return [fixedObject('ground'), fixedObject('wall', 'ground'), fixedObject('graspable', 'wall')];
 }
 function snapshot(current: ManagerActiveProjection, published: AuthoringWorkspaceSnapshot, pending = false,
   options: { scene?: LogicalSceneProjection; admissionGeneration?: number } = {}): ComposerHeadlessState {
@@ -172,7 +169,6 @@ async function mount(empty = true, dirty = false,
   let current = snapshot(predecessor, published);
   apiMock.authoringWorkspace.get.mockImplementation(async () => published);
   apiMock.programWorkspace.get.mockImplementation(async () => workspace(published));
-  apiMock.programWorkspace.clearClosedScenario.mockImplementation(async () => workspace(published));
   apiMock.manager.status.mockResolvedValue({ source: { available: true, freshness: 'fresh' },
     status: { managerReady: true, active: predecessor } });
   apiMock.deploymentWorkspace.get.mockResolvedValue({ managerApplied: { scenarioId: 'current',
@@ -207,16 +203,17 @@ async function mount(empty = true, dirty = false,
     if (ack !== undefined) await click(ack);
   };
   const observe = async (value: ComposerHeadlessState) => { current = value; await render(); };
-  const openClose = async () => {
-    await click(dom.find((p) => p['aria-label'] === 'Close Scenario'));
-    const acknowledgement = dom.all().find((p) => p.className === 'danger-button' && p.children === 'Close Scenario');
+  // New has no form: it confirms only a non-empty cell or Draft changes, then closes.
+  const openNew = async () => {
+    await click(dom.find((p) => p['aria-label'] === 'New'));
+    const acknowledgement = dom.all().find((p) => p.className === 'danger-button' && p.children === 'Close and continue');
     if (!empty || dirty) {
       expect(closeScenario).not.toHaveBeenCalled();
       expect(acknowledgement).toBeDefined();
     } else expect(acknowledgement).toBeUndefined();
     if (acknowledgement !== undefined) await click(acknowledgement);
   };
-  return { ...dom, published, predecessor, closed, close, closeScenario, click, openLoad, openClose, observe,
+  return { ...dom, published, predecessor, closed, close, closeScenario, click, openLoad, openNew, observe,
     get current() { return current; },
     hideCommands: async () => { showCommands = false; await render(); },
   };
@@ -243,23 +240,23 @@ it.each([true, false])('waits for actual post-Close admission before one Load, e
   expect(apiMock.scenarioDocuments.load).toHaveBeenCalledTimes(1);
 });
 
-it.each([true, false])('New uses the exact completed empty identity, empty start=%s', async (empty) => {
+it.each([true, false])('New opens Untitled once after the completed Close is admitted, empty start=%s', async (empty) => {
   const test = await mount(empty);
-  await test.click(test.find((p) => p['aria-label'] === 'New'));
-  await act(() => test.find((p) => p.placeholder === 'e.g. lite6_pick_and_place')
-    .onChange?.({ target: { value: 'next_cell' } }));
-  await test.click(test.find((p) => p.className === 'primary-action' && p.children === 'Create Scenario'));
-  if (empty) expect(test.all().some((p) => p.children === 'Close and continue')).toBe(false);
-  else await test.click(test.find((p) => p.children === 'Close and continue'));
+  await test.openNew();
+  expect(test.closeScenario).toHaveBeenCalledExactlyOnceWith(test.predecessor, expect.objectContaining({
+    authoring: authoringWorkspaceIdentity(test.published),
+  }), expect.any(AbortSignal));
   await test.observe(snapshot(test.predecessor, test.published, true));
   await act(async () => { test.close.resolve(test.closed); });
   expect(apiMock.scenarioDocuments.new).not.toHaveBeenCalled();
   await test.observe(snapshot(test.closed, test.published));
   expect(apiMock.scenarioDocuments.new).toHaveBeenCalledTimes(1);
-  expect(apiMock.scenarioDocuments.new).toHaveBeenCalledWith(expect.anything(), expect.objectContaining({
-    expectedRetainedBundleId: test.closed.retainedBundleId, expectedGraphRevision: test.closed.graphRevision,
-    directory: '/projects', name: 'next_cell', deploymentChoice: 'empty',
-  }));
+  expect(apiMock.scenarioDocuments.new).toHaveBeenCalledWith(expect.objectContaining({
+    expectedWorkspaceEpoch: 'workspace.1', expectedWorkspaceRevision: 1, expectedAdmissionGeneration: 8,
+  }), true);
+  expect(apiMock.scenarioDocuments.load).not.toHaveBeenCalled();
+  await test.observe(snapshot(test.closed, test.published));
+  expect(apiMock.scenarioDocuments.new).toHaveBeenCalledTimes(1);
 });
 
 it.each(['draft', 'deployment', 'epoch', 'owner', 'publication', 'fault'])('refuses intervening %s without loading', async (change) => {
@@ -348,12 +345,7 @@ it.each(['load', 'new'])('cancels waiting without a follow-up, then allows later
   apiMock.manager.status.mockResolvedValue({ source: { available: true, freshness: 'fresh' },
     status: { managerReady: true, active: test.closed } });
   if (kind === 'load') await test.openLoad();
-  else {
-    await test.click(test.find((p) => p['aria-label'] === 'New'));
-    await act(() => test.find((p) => p.placeholder === 'e.g. lite6_pick_and_place')
-      .onChange?.({ target: { value: 'next_cell' } }));
-    await test.click(test.find((p) => p.className === 'primary-action' && p.children === 'Create Scenario'));
-  }
+  else await test.openNew();
   expect(test.closeScenario).toHaveBeenCalledTimes(2);
   expect(kind === 'load' ? apiMock.scenarioDocuments.load : apiMock.scenarioDocuments.new).toHaveBeenCalledTimes(1);
 });
@@ -396,11 +388,15 @@ it('blocks cancellation while the one replacement mutation is submitting', async
 
 it.each(['load', 'new'])('canonical-empty with dirty Program Draft requires popup before %s', async (kind) => {
   const test = await mount(true, true);
-  await test.click(test.find((p) => p['aria-label'] === (kind === 'new' ? 'New' : 'Load Scenario')));
-  if (kind === 'new') await act(() => test.find((p) => p.placeholder === 'e.g. lite6_pick_and_place')
-    .onChange?.({ target: { value: 'next_cell' } }));
-  else await act(() => test.find((p) => p.value === '').onChange?.({ target: { value: 'saved:/projects/other' } }));
-  await test.click(test.find((p) => p.className === 'primary-action' && p.children === (kind === 'new' ? 'Create Scenario' : 'Load Scenario')));
+  const start = async () => {
+    if (kind === 'new') await test.click(test.find((p) => p['aria-label'] === 'New'));
+    else await test.click(test.find((p) => p.className === 'primary-action' && p.children === 'Load Scenario'));
+  };
+  if (kind === 'load') {
+    await test.click(test.find((p) => p['aria-label'] === 'Load Scenario'));
+    await act(() => test.find((p) => p.value === '').onChange?.({ target: { value: 'saved:/projects/other' } }));
+  }
+  await start();
   expect(test.find((p) => p.children === 'Close Scenario?')).toBeDefined();
   expect(test.all().some((p) => typeof p.children === 'string' && p.children.includes('Draft changes will be discarded'))).toBe(true);
   expect(test.find((p) => p.children === 'Discard the current Draft and continue?')).toBeDefined();
@@ -411,7 +407,7 @@ it.each(['load', 'new'])('canonical-empty with dirty Program Draft requires popu
   expect(apiMock.scenarioDocuments.new).not.toHaveBeenCalled();
   await test.click(test.find((p) => p.children === 'Cancel'));
   expect(test.closeScenario).not.toHaveBeenCalled();
-  await test.click(test.find((p) => p.className === 'primary-action' && p.children === (kind === 'new' ? 'Create Scenario' : 'Load Scenario')));
+  await start();
   await test.click(test.find((p) => p.children === 'Close and continue'));
   expect(test.closeScenario).toHaveBeenCalledExactlyOnceWith(test.predecessor, expect.objectContaining({
     authoring: authoringWorkspaceIdentity(test.published),
@@ -419,384 +415,7 @@ it.each(['load', 'new'])('canonical-empty with dirty Program Draft requires popu
 });
 
 
-it.each([[true, false], [false, false], [true, true]])('standalone Close waits for exact admission then clears once, empty=%s dirty=%s', async (empty, dirty) => {
-  const test = await mount(empty, dirty);
-  await test.openClose();
-  expect(test.closeScenario).toHaveBeenCalledExactlyOnceWith(test.predecessor, expect.objectContaining({
-    authoring: authoringWorkspaceIdentity(test.published), closeCycle: expect.anything(), closeScene: expect.anything(),
-  }), expect.any(AbortSignal));
-  expect(apiMock.programWorkspace.clearClosedScenario).not.toHaveBeenCalled();
-  expect(test.find((p) => p.children === 'Cancel').disabled).toBe(true);
-  await test.click(test.find((p) => p.children === 'Cancel'));
-  expect(test.all().some((p) => p.role === 'dialog')).toBe(true);
-  await act(async () => { test.close.resolve(test.closed); });
-  expect(apiMock.programWorkspace.clearClosedScenario).not.toHaveBeenCalled();
-  await test.observe(snapshot(test.closed, test.published, true));
-  expect(apiMock.programWorkspace.clearClosedScenario).not.toHaveBeenCalled();
-  await test.observe(snapshot(test.closed, test.published));
-  expect(apiMock.programWorkspace.clearClosedScenario).toHaveBeenCalledExactlyOnceWith(expect.objectContaining({
-    draftId: 'draft.1', expectedDraftRevision: 1, expectedWorkspaceEpoch: 'workspace.1',
-    expectedWorkspaceRevision: 1, expectedAdmissionGeneration: 8,
-  }), {
-    managerOwnerId: 'manager', managerOwnerEpoch: 'manager.1',
-    retainedBundleId: test.closed.retainedBundleId, graphRevision: test.closed.graphRevision,
-    publication: test.closed.publication, deploymentDraftId: 'deployment.1', expectedDeploymentDraftRevision: 1,
-    sceneOwnerId: 'scene', sceneOwnerEpoch: 'scene.1', sceneProjectionRevision: sceneRevision(test.closed),
-  });
-  expect(test.all().some((p) => p.role === 'dialog')).toBe(false);
-  await test.observe(snapshot(test.closed, test.published));
-  expect(apiMock.programWorkspace.clearClosedScenario).toHaveBeenCalledTimes(1);
-  expect(apiMock.scenarioDocuments.new).not.toHaveBeenCalled();
-  expect(apiMock.scenarioDocuments.load).not.toHaveBeenCalled();
-});
-
-it('temporary Close of a dirty empty Draft warns of editor clearing without robot retirement paragraphs', async () => {
-  const test = await mount(true, true);
-  await test.click(test.find((p) => p['aria-label'] === 'Close Scenario'));
-  expect(test.closeScenario).not.toHaveBeenCalled();
-  expect(test.all().some((p) => typeof p.children === 'string'
-    && p.children.includes('Program and Scene editors cleared')
-    && p.children.includes('Draft changes will be discarded')
-    && p.children.includes('Saved files are unchanged'))).toBe(true);
-  expect(test.all().some((p) => String(p.children).includes('Active targets are retired')
-    || String(p.children).includes('Robot positions may be unknown'))).toBe(false);
-  expect(test.all().some((p) => p.type === 'checkbox')).toBe(false);
-  await test.click(test.find((p) => p.children === 'Cancel'));
-  expect(test.closeScenario).not.toHaveBeenCalled();
-  expect(apiMock.programWorkspace.clearClosedScenario).not.toHaveBeenCalled();
-  expect(test.all().some((p) => p.role === 'dialog')).toBe(false);
-});
-
-it.each(['draft', 'deployment', 'epoch', 'owner', 'publication', 'fault'])('standalone Close preserves editors after intervening %s', async (change) => {
-  const test = await mount(false);
-  await test.openClose();
-  await act(async () => { test.close.resolve(test.closed); });
-  const next = snapshot(test.closed, test.published);
-  if (change === 'draft') next.authoringWorkspace.programDraftRevision += 1;
-  if (change === 'deployment') next.authoringWorkspace.deploymentDraftRevision += 1;
-  if (change === 'epoch') next.authoringWorkspace.workspaceEpoch = 'another';
-  if (change === 'owner') next.runtime.sections.manager.sourceOwnerEpoch = 'manager.2';
-  if (change === 'publication') {
-    // Same empty graph and bundle, different publication: equality of physical content is insufficient.
-    (next.runtime.sections.manager.payload!.active as Record<string, unknown>).publication = active(true, 4).publication;
-  }
-  if (change === 'fault') {
-    next.componentOverview.readiness = 'fault';
-    next.componentOverview.userMessage = 'Actual owner fault';
-  }
-  await test.observe(next);
-  expect(apiMock.programWorkspace.clearClosedScenario).not.toHaveBeenCalled();
-  expect(test.all().some((p) => p.className === 'inline-message severity-error')).toBe(true);
-  await test.observe(snapshot(test.closed, test.published));
-  expect(apiMock.programWorkspace.clearClosedScenario).not.toHaveBeenCalled();
-});
-
-it('failed standalone Close never clears the editors', async () => {
-  const test = await mount(false);
-  await test.openClose();
-  await act(async () => { test.close.resolve(null); });
-  await test.observe(snapshot(test.closed, test.published));
-  expect(apiMock.programWorkspace.clearClosedScenario).not.toHaveBeenCalled();
-  expect(test.all().some((p) => typeof p.children === 'string'
-    && p.children.includes('Scenario Close is refused or unresolved'))).toBe(true);
-});
-
-it('waiting standalone Close can be cancelled without a later editor clear', async () => {
-  const test = await mount();
-  await test.openClose();
-  await act(async () => { test.close.resolve(test.closed); });
-  expect(test.find((p) => p.children === 'Cancel').disabled).toBe(false);
-  await test.click(test.find((p) => p.children === 'Cancel'));
-  await test.observe(snapshot(test.closed, test.published));
-  expect(apiMock.programWorkspace.clearClosedScenario).not.toHaveBeenCalled();
-  expect(test.all().some((p) => p.role === 'dialog')).toBe(false);
-});
-
-it.each(['closing', 'waiting'])('unmounting standalone Close while %s prevents late editor clearing', async (phase) => {
-  const test = await mount();
-  await test.openClose();
-  if (phase === 'waiting') await act(async () => { test.close.resolve(test.closed); });
-  await unmount!();
-  unmount = null;
-  if (phase === 'closing') await act(async () => { test.close.resolve(test.closed); });
-  expect(apiMock.programWorkspace.clearClosedScenario).not.toHaveBeenCalled();
-});
-
-it('an unresolved editor-clear request is not resent on later owner publications', async () => {
-  const test = await mount();
-  apiMock.programWorkspace.clearClosedScenario.mockRejectedValueOnce(new Error('Editor-clear response lost'));
-  await test.openClose();
-  await act(async () => { test.close.resolve(test.closed); });
-  await test.observe(snapshot(test.closed, test.published));
-  expect(apiMock.programWorkspace.clearClosedScenario).toHaveBeenCalledTimes(1);
-  await test.observe(snapshot(test.closed, test.published));
-  expect(apiMock.programWorkspace.clearClosedScenario).toHaveBeenCalledTimes(1);
-  expect(test.all().some((p) => typeof p.children === 'string' && p.children.includes('nothing was retried'))).toBe(true);
-});
-
-it.each(['load', 'new'])('internal Close before %s does not clear the authoring workspace separately', async (kind) => {
-  const test = await mount(false);
-  if (kind === 'load') await test.openLoad();
-  else {
-    await test.click(test.find((p) => p['aria-label'] === 'New'));
-    await act(() => test.find((p) => p.placeholder === 'e.g. lite6_pick_and_place')
-      .onChange?.({ target: { value: 'next_cell' } }));
-    await test.click(test.find((p) => p.className === 'primary-action' && p.children === 'Create Scenario'));
-    await test.click(test.find((p) => p.children === 'Close and continue'));
-  }
-  await act(async () => { test.close.resolve(test.closed); });
-  await test.observe(snapshot(test.closed, test.published));
-  expect(kind === 'load' ? apiMock.scenarioDocuments.load : apiMock.scenarioDocuments.new).toHaveBeenCalledTimes(1);
-  expect(apiMock.programWorkspace.clearClosedScenario).not.toHaveBeenCalled();
-});
-
-it('removes three supported fixed Scene objects in dependency order with fresh revision and admission before every effect', async () => {
-  const test = await mount(false);
-  const objects = supportedObjects();
-  await test.openClose();
-  await act(async () => { test.close.resolve(test.closed); });
-  expect(apiMock.scene.commit).not.toHaveBeenCalled();
-  await test.observe(snapshot(test.closed, test.published, false, { scene: logicalScene(test.closed, objects) }));
-  expect(apiMock.scene.commit).toHaveBeenCalledTimes(1);
-  expect(apiMock.scene.commit.mock.calls[0][0]).toMatchObject({
-    expected_projection_revision: sceneRevision(test.closed), expected_admission_generation: 8,
-    expected_draft_id: 'draft.1', expected_draft_revision: 1,
-    expected_authoring_workspace: authoringWorkspaceIdentity(test.published),
-    request_context: { request_owner_epoch: 'scene.1', source_label: 'composer_ui' },
-    operation: { kind: 'remove_object', scene_resource_id: 'graspable' },
-  });
-  const remaining = objects.filter((object) => object.scene_resource_id !== 'graspable');
-  // New admission alone is insufficient while the old Scene is still displayed.
-  await test.observe(snapshot(test.closed, test.published, false,
-    { scene: logicalScene(test.closed, objects), admissionGeneration: 9 }));
-  expect(apiMock.scene.commit).toHaveBeenCalledTimes(1);
-  // The new Scene alone is insufficient while the last generation is displayed.
-  await test.observe(snapshot(test.closed, test.published, false,
-    { scene: logicalScene(test.closed, remaining, 4), admissionGeneration: 8 }));
-  expect(apiMock.scene.commit).toHaveBeenCalledTimes(1);
-  await test.observe(snapshot(test.closed, test.published, false,
-    { scene: logicalScene(test.closed, remaining, 4), admissionGeneration: 9 }));
-  expect(apiMock.scene.commit).toHaveBeenCalledTimes(2);
-  expect(apiMock.scene.commit.mock.calls[1][0]).toMatchObject({
-    expected_projection_revision: sceneRevision(test.closed, 4), expected_admission_generation: 9,
-    expected_authoring_workspace: authoringWorkspaceIdentity(test.published),
-    operation: { kind: 'remove_object', scene_resource_id: 'wall' },
-  });
-  const ground = remaining.filter((object) => object.scene_resource_id === 'ground');
-  await test.observe(snapshot(test.closed, test.published, false,
-    { scene: logicalScene(test.closed, ground, 5), admissionGeneration: 9 }));
-  expect(apiMock.scene.commit).toHaveBeenCalledTimes(2);
-  await test.observe(snapshot(test.closed, test.published, false,
-    { scene: logicalScene(test.closed, ground, 5), admissionGeneration: 10 }));
-  expect(apiMock.scene.commit).toHaveBeenCalledTimes(3);
-  expect(apiMock.scene.commit.mock.calls[2][0]).toMatchObject({
-    expected_projection_revision: sceneRevision(test.closed, 5), expected_admission_generation: 10,
-    expected_authoring_workspace: authoringWorkspaceIdentity(test.published),
-    operation: { kind: 'remove_object', scene_resource_id: 'ground' },
-  });
-  expect(apiMock.programWorkspace.clearClosedScenario).not.toHaveBeenCalled();
-  await test.observe(snapshot(test.closed, test.published, false,
-    { scene: logicalScene(test.closed, [], 6), admissionGeneration: 10 }));
-  expect(apiMock.programWorkspace.clearClosedScenario).not.toHaveBeenCalled();
-  const final = snapshot(test.closed, test.published, false,
-    { scene: logicalScene(test.closed, [], 6), admissionGeneration: 11 });
-  await test.observe(final);
-  expect(apiMock.programWorkspace.clearClosedScenario).toHaveBeenCalledExactlyOnceWith(expect.objectContaining({
-    expectedAdmissionGeneration: 11, expectedWorkspaceEpoch: 'workspace.1', expectedWorkspaceRevision: 1,
-  }), expect.objectContaining({ sceneOwnerId: 'scene', sceneOwnerEpoch: 'scene.1',
-    sceneProjectionRevision: sceneRevision(test.closed, 6), publication: test.closed.publication }));
-  await test.observe(final);
-  expect(apiMock.scene.commit).toHaveBeenCalledTimes(3);
-  expect(apiMock.programWorkspace.clearClosedScenario).toHaveBeenCalledTimes(1);
-  expect(new Set(apiMock.scene.commit.mock.calls.map(([request]) => request.request_context.request_id)).size).toBe(3);
-});
-
-it.each(['stale', 'scene_owner', 'manager_owner', 'workspace', 'fault', 'scene', 'inventory'])('stops further Scene effects after intervening %s', async (change) => {
-  const test = await mount(false);
-  const objects = supportedObjects();
-  await test.openClose();
-  await act(async () => { test.close.resolve(test.closed); });
-  await test.observe(snapshot(test.closed, test.published, false, { scene: logicalScene(test.closed, objects) }));
-  expect(apiMock.scene.commit).toHaveBeenCalledTimes(1);
-  const remaining = objects.filter((object) => object.scene_resource_id !== 'graspable');
-  const next = snapshot(test.closed, test.published, false,
-    { scene: logicalScene(test.closed, remaining, 4), admissionGeneration: 9 });
-  if (change === 'stale') next.runtime.sections.logicalScene.freshness = 'stale';
-  if (change === 'scene_owner') next.runtime.sections.logicalScene.sourceOwnerEpoch = 'scene.2';
-  if (change === 'manager_owner') next.runtime.sections.manager.sourceOwnerEpoch = 'manager.2';
-  if (change === 'workspace') next.authoringWorkspace.workspaceRevision += 1;
-  if (change === 'fault') {
-    next.componentOverview.readiness = 'fault'; next.componentOverview.userMessage = 'Actual owner fault';
-  }
-  if (change === 'scene') {
-    const other = logicalScene(test.closed, remaining, 5);
-    other.access.active_projection!.scene_revision.scene_id = 'scene.other';
-    next.runtime.sections.logicalScene.payload = { ...other };
-  }
-  if (change === 'inventory') next.runtime.sections.logicalScene.payload = { ...logicalScene(test.closed, [fixedObject('unexpected')], 4) };
-  await test.observe(next);
-  expect(apiMock.scene.commit).toHaveBeenCalledTimes(1);
-  expect(apiMock.programWorkspace.clearClosedScenario).not.toHaveBeenCalled();
-  if (change === 'stale') await test.click(test.find((p) => p.children === 'Cancel'));
-  else expect(test.all().some((p) => p.className === 'inline-message severity-error')).toBe(true);
-  await test.observe(snapshot(test.closed, test.published, false,
-    { scene: logicalScene(test.closed, remaining, 4), admissionGeneration: 9 }));
-  expect(apiMock.scene.commit).toHaveBeenCalledTimes(1);
-  expect(apiMock.programWorkspace.clearClosedScenario).not.toHaveBeenCalled();
-});
-
-it('continues Scene removal on a later revision of the same Scene, naming that latest revision', async () => {
-  const test = await mount(false);
-  const objects = supportedObjects();
-  await test.openClose();
-  await act(async () => { test.close.resolve(test.closed); });
-  // A pose update already advanced the Scene past the Close publication.
-  await test.observe(snapshot(test.closed, test.published, false, { scene: logicalScene(test.closed, objects, 4) }));
-  expect(apiMock.scene.commit).toHaveBeenCalledTimes(1);
-  expect(apiMock.scene.commit.mock.calls[0][0]).toMatchObject({ expected_projection_revision: sceneRevision(test.closed, 4) });
-  const remaining = objects.filter((object) => object.scene_resource_id !== 'graspable');
-  // The removal committed revision 5; pose updates since then reached revision 9.
-  await test.observe(snapshot(test.closed, test.published, false,
-    { scene: logicalScene(test.closed, remaining, 9), admissionGeneration: 9 }));
-  expect(apiMock.scene.commit).toHaveBeenCalledTimes(2);
-  expect(apiMock.scene.commit.mock.calls[1][0]).toMatchObject({
-    expected_projection_revision: sceneRevision(test.closed, 9), operation: { kind: 'remove_object', scene_resource_id: 'wall' } });
-  expect(test.all().some((p) => p.className === 'inline-message severity-error')).toBe(false);
-});
-
-it('a failed second Scene removal reports the confirmed partial outcome and never clears or resends', async () => {
-  const test = await mount(false);
-  const objects = supportedObjects();
-  await test.openClose();
-  await act(async () => { test.close.resolve(test.closed); });
-  await test.observe(snapshot(test.closed, test.published, false, { scene: logicalScene(test.closed, objects) }));
-  apiMock.scene.commit.mockRejectedValueOnce(new Error('Owner refused wall removal'));
-  const latest = snapshot(test.closed, test.published, false,
-    { scene: logicalScene(test.closed, objects.filter((object) => object.scene_resource_id !== 'graspable'), 4), admissionGeneration: 9 });
-  await test.observe(latest);
-  expect(apiMock.scene.commit).toHaveBeenCalledTimes(2);
-  expect(test.all().some((p) => typeof p.children === 'string'
-    && p.children.includes('Owner refused wall removal') && p.children.includes('1 Scene object removal(s) confirmed'))).toBe(true);
-  await test.observe(latest);
-  expect(apiMock.scene.commit).toHaveBeenCalledTimes(2);
-  expect(apiMock.programWorkspace.clearClosedScenario).not.toHaveBeenCalled();
-});
-
-it('cancelling after one Scene removal fences every later publication and editor clear', async () => {
-  const test = await mount(false);
-  const objects = supportedObjects();
-  await test.openClose();
-  await act(async () => { test.close.resolve(test.closed); });
-  await test.observe(snapshot(test.closed, test.published, false, { scene: logicalScene(test.closed, objects) }));
-  expect(apiMock.scene.commit).toHaveBeenCalledTimes(1);
-  expect(test.find((p) => p.children === 'Cancel').disabled).toBe(false);
-  await test.click(test.find((p) => p.children === 'Cancel'));
-  expect(test.all().some((p) => p.role === 'dialog')).toBe(false);
-  expect(test.find((p) => p['aria-label'] === 'Program feedback').children)
-    .toContain('1 Scene object removal(s) confirmed; editors were kept');
-  await test.observe(snapshot(test.closed, test.published, false,
-    { scene: logicalScene(test.closed, [], 6), admissionGeneration: 11 }));
-  expect(apiMock.scene.commit).toHaveBeenCalledTimes(1);
-  expect(apiMock.programWorkspace.clearClosedScenario).not.toHaveBeenCalled();
-  expect(test.all().some((p) => p.role === 'dialog')).toBe(false);
-});
-
-it('retained carried attachment is visibly refused before any Scene removal or editor clear', async () => {
-  const test = await mount(false);
-  const attachmentRevision = 'sha256:' + 'a'.repeat(64);
-  const carried: LogicalSceneObject = { ...fixedObject('held_part'), placement: {
-    kind: 'carried', carried_object_attachment_id: 'attachment.1', carried_object_attachment_revision: attachmentRevision } };
-  const scene = logicalScene(test.closed, [fixedObject('ground'), carried]);
-  scene.snapshot!.carried_object_attachments = [{
-    carried_object_attachment_id: 'attachment.1', carried_object_attachment_revision: attachmentRevision,
-    scene_resource_id: 'held_part', controllable_component_id: 'arm', command_target_id: 'tool',
-    carrier_frame_ref: { kind: 'component', controllable_component_id: 'arm', model_instance_id: 'robot', frame_role_id: 'tool' },
-    pose_in_carrier_frame: { position_m: { x: 0, y: 0, z: 0 }, orientation_xyzw: [0, 0, 0, 1] }, touch_body_roles: [],
-  }];
-  await test.openClose();
-  await act(async () => { test.close.resolve(test.closed); });
-  await test.observe(snapshot(test.closed, test.published, false, { scene }));
-  expect(apiMock.scene.commit).not.toHaveBeenCalled();
-  expect(apiMock.programWorkspace.clearClosedScenario).not.toHaveBeenCalled();
-  expect(test.all().some((p) => typeof p.children === 'string'
-    && p.children.includes('cannot clear carried Scene objects') && p.children.includes('editors were kept'))).toBe(true);
-});
-
-it('unmount during a Scene removal cannot continue after its late receipt', async () => {
-  const test = await mount(false);
-  const receipt = deferred<unknown>();
-  apiMock.scene.commit.mockImplementationOnce(() => receipt.promise);
-  await test.openClose();
-  await act(async () => { test.close.resolve(test.closed); });
-  await test.observe(snapshot(test.closed, test.published, false, { scene: logicalScene(test.closed, supportedObjects()) }));
-  expect(apiMock.scene.commit).toHaveBeenCalledTimes(1);
-  const request = apiMock.scene.commit.mock.calls[0][0] as SceneTransactionRequest;
-  expect(test.find((p) => p.children === 'Cancel').disabled).toBe(true);
-  await unmount!(); unmount = null;
-  await act(async () => { receipt.resolve({ request_id: request.request_context.request_id,
-    request_owner_epoch: request.request_context.request_owner_epoch,
-    committed_projection_revision: sceneRevision(test.closed, 4) }); });
-  expect(apiMock.scene.commit).toHaveBeenCalledTimes(1);
-  expect(apiMock.programWorkspace.clearClosedScenario).not.toHaveBeenCalled();
-});
-
-it.each(['cyclic', 'missing'])('an unsupported %s Scene support dependency sends no removal or editor clear', async (kind) => {
-  const test = await mount(false);
-  await test.openClose();
-  await act(async () => { test.close.resolve(test.closed); });
-  await test.observe(snapshot(test.closed, test.published, false,
-    { scene: logicalScene(test.closed, kind === 'cyclic'
-      ? [fixedObject('ground', 'wall'), fixedObject('wall', 'ground')] : [fixedObject('wall', 'missing')]) }));
-  expect(apiMock.scene.commit).not.toHaveBeenCalled();
-  expect(apiMock.programWorkspace.clearClosedScenario).not.toHaveBeenCalled();
-  expect(test.all().some((p) => typeof p.children === 'string'
-    && p.children.includes(kind === 'cyclic' ? 'cyclic support dependency' : 'unknown support dependency'))).toBe(true);
-});
-
-
-it('resets a nondefault collision policy once and requires its exact publication and admission before editor clear', async () => {
-  const test = await mount(false);
-  await test.openClose();
-  await act(async () => { test.close.resolve(test.closed); });
-  const custom = logicalScene(test.closed);
-  custom.snapshot!.configured_collision_policy.require_full_diagnostics = false;
-  await test.observe(snapshot(test.closed, test.published, false, { scene: custom }));
-  expect(apiMock.scene.commit).toHaveBeenCalledTimes(1);
-  expect(apiMock.scene.commit.mock.calls[0][0]).toMatchObject({
-    expected_authoring_workspace: authoringWorkspaceIdentity(test.published),
-    expected_projection_revision: sceneRevision(test.closed), expected_admission_generation: 8,
-    operation: { kind: 'set_collision_policy',
-      expected_configured_policy_revision: { revision_id: 1, content_hash: 'policy.1' },
-      configured_policy: { policy_id: 'free_space', require_full_diagnostics: true,
-        allowed_static_static_pairs: [], allowed_touch_link_pairs: [], support_contacts: [], contact_grasps: [] } },
-  });
-  expect(apiMock.programWorkspace.clearClosedScenario).not.toHaveBeenCalled();
-  await test.observe(snapshot(test.closed, test.published, false,
-    { scene: logicalScene(test.closed, [], 4), admissionGeneration: 8 }));
-  expect(apiMock.programWorkspace.clearClosedScenario).not.toHaveBeenCalled();
-  await test.observe(snapshot(test.closed, test.published, false,
-    { scene: logicalScene(test.closed, [], 4), admissionGeneration: 9 }));
-  expect(apiMock.programWorkspace.clearClosedScenario).toHaveBeenCalledTimes(1);
-  expect(apiMock.scene.commit).toHaveBeenCalledTimes(1);
-});
-
-it('never resends an accepted policy reset whose published content is still nondefault', async () => {
-  const test = await mount(false);
-  await test.openClose();
-  await act(async () => { test.close.resolve(test.closed); });
-  const custom = logicalScene(test.closed);
-  custom.snapshot!.configured_collision_policy.require_full_diagnostics = false;
-  await test.observe(snapshot(test.closed, test.published, false, { scene: custom }));
-  const wrong = logicalScene(test.closed, [], 4);
-  wrong.snapshot!.configured_collision_policy.require_full_diagnostics = false;
-  await test.observe(snapshot(test.closed, test.published, false, { scene: wrong, admissionGeneration: 9 }));
-  await test.observe(snapshot(test.closed, test.published, false, { scene: logicalScene(test.closed, [], 4), admissionGeneration: 9 }));
-  expect(apiMock.scene.commit).toHaveBeenCalledTimes(1);
-  expect(apiMock.programWorkspace.clearClosedScenario).not.toHaveBeenCalled();
-});
-
-
-it.each(['reset', 'detach'])('unmounting only the initiating header during %s aborts its standalone continuation while its workspace owner stays mounted', async (phase) => {
+it.each(['reset', 'detach'])('unmounting only the initiating header during %s aborts the New continuation while its workspace owner stays mounted', async (phase) => {
   const resetReceipt = deferred<ProgramResetOutcome>();
   const detachReceipt = deferred<Awaited<ReturnType<typeof apiMock.scene.commit>>>();
   const nextCloseEffect = vi.fn();
@@ -826,7 +445,7 @@ it.each(['reset', 'detach'])('unmounting only the initiating header during %s ab
     apiMock.scene.commit.mockImplementationOnce(() => detachReceipt.promise);
   }
   await test.observe(initial);
-  await test.openClose();
+  await test.openNew();
   expect(phase === 'reset' ? reset : apiMock.scene.commit).toHaveBeenCalledTimes(1);
   const callerSignal = test.closeScenario.mock.calls[0][2]!;
   expect(callerSignal.aborted).toBe(false);
@@ -846,7 +465,7 @@ it.each(['reset', 'detach'])('unmounting only the initiating header during %s ab
   expect(nextCloseEffect).not.toHaveBeenCalled();
   expect(reset).toHaveBeenCalledTimes(phase === 'reset' ? 1 : 0);
   expect(apiMock.scene.commit).toHaveBeenCalledTimes(phase === 'detach' ? 1 : 0);
-  expect(apiMock.programWorkspace.clearClosedScenario).not.toHaveBeenCalled();
+  expect(apiMock.scenarioDocuments.new).not.toHaveBeenCalled();
   expect(test.all().some((props) => typeof props.children === 'string'
     && props.children.includes(phase === 'detach' ? 'Detached objects confirmed: held' : 'Close not completed'))).toBe(true);
 });
@@ -872,12 +491,10 @@ async function terminalReplacement() {
   await test.observe(initial);
   const open = async (kind: 'new' | 'load') => {
     await test.click(test.find((p) => p['aria-label'] === (kind === 'new' ? 'New' : 'Load Scenario')));
-    if (kind === 'new') {
-      await act(() => test.find((p) => p.placeholder === 'e.g. lite6_pick_and_place')
-        .onChange?.({ target: { value: 'next_cell' } }));
-    } else await act(() => test.find((p) => p.value === '').onChange?.({ target: { value: 'saved:/projects/other' } }));
-    await test.click(test.find((p) => p.className === 'primary-action'
-      && p.children === (kind === 'new' ? 'Create Scenario' : 'Load Scenario')));
+    if (kind === 'load') {
+      await act(() => test.find((p) => p.value === '').onChange?.({ target: { value: 'saved:/projects/other' } }));
+      await test.click(test.find((p) => p.className === 'primary-action' && p.children === 'Load Scenario'));
+    }
     const text = test.all().map((p) => Array.isArray(p.children)
       ? p.children.filter((v) => typeof v === 'string').join('') : p.children).filter((v) => typeof v === 'string').join(' ');
     expect(text).toContain('a finished, stopped or held Program is Reset first');
@@ -893,7 +510,7 @@ async function terminalReplacement() {
   return { test, open, reset, receipt, observation, lifecycleClose, idle, sent };
 }
 
-it.each(['new', 'load'] as const)('confirmed %s waits for one Reset and correlated idle, then uses its existing final branch without standalone clearing', async (kind) => {
+it.each(['new', 'load'] as const)('confirmed %s waits for one Reset and correlated idle, then uses its existing final branch', async (kind) => {
   const step = await terminalReplacement();
   const { test } = step;
   await step.open(kind);
@@ -918,7 +535,6 @@ it.each(['new', 'load'] as const)('confirmed %s waits for one Reset and correlat
   expect(kind === 'load' ? apiMock.scenarioDocuments.new : apiMock.scenarioDocuments.load).not.toHaveBeenCalled();
   expect(step.reset).toHaveBeenCalledTimes(1);
   expect(apiMock.scene.commit).not.toHaveBeenCalled();
-  expect(apiMock.programWorkspace.clearClosedScenario).not.toHaveBeenCalled();
 });
 
 it.each(['new', 'load'] as const)('Reset refusal during confirmed %s stops without Close, final replacement or hidden resend', async (kind) => {
@@ -931,7 +547,6 @@ it.each(['new', 'load'] as const)('Reset refusal during confirmed %s stops witho
   expect(step.test.all().some((p) => typeof p.children === 'string' && p.children.includes('Reset was refused'))).toBe(true);
   await step.test.observe(step.test.current);
   expect(step.reset).toHaveBeenCalledTimes(1);
-  expect(apiMock.programWorkspace.clearClosedScenario).not.toHaveBeenCalled();
 });
 
 it.each(['new', 'load'] as const)('header unmount during %s Reset aborts the caller before any Close or final replacement', async (kind) => {
@@ -959,7 +574,6 @@ it('observed Deployment mutation while replacement Reset settles stops before Cl
   await act(() => step.observation.resolve());
   expect(step.lifecycleClose).not.toHaveBeenCalled();
   expect(apiMock.scenarioDocuments.load).not.toHaveBeenCalled();
-  expect(apiMock.programWorkspace.clearClosedScenario).not.toHaveBeenCalled();
   expect(step.reset).toHaveBeenCalledTimes(1);
   expect(step.test.all().some((p) => typeof p.children === 'string' && p.children.includes('Reset done; Close not completed'))).toBe(true);
 });
@@ -986,5 +600,4 @@ it('empty idle Load needs no popup and its captured shared preparation sends no 
   await test.observe(snapshot(test.closed, test.published));
   expect(apiMock.scenarioDocuments.load).toHaveBeenCalledTimes(1);
   expect(apiMock.scene.commit).not.toHaveBeenCalled();
-  expect(apiMock.programWorkspace.clearClosedScenario).not.toHaveBeenCalled();
 });

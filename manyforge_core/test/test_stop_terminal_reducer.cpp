@@ -7,6 +7,7 @@
 #include <manyforge_core/resolved_stop_base_plan_codec.hpp>
 #include <manyforge_core/runtime_participant_binding.hpp>
 #include <manyforge_core/stop_terminal_reducer.hpp>
+#include <manyforge_core/stop_terminal_state.hpp>
 #include "../src/stop_terminal_reducer_internal.hpp"
 #include <sstream>
 
@@ -725,6 +726,296 @@ TEST(StopTerminalReducerTest, ExternalUncontainedResourceFailsWithoutInventedPar
   EXPECT_TRUE(
       std::holds_alternative<ResourceId>(reduced.value().scope_entries.front().key.subject));
   EXPECT_TRUE(reduced.value().attempted_stage_results.empty());
+}
+
+// Lean Stop record helpers: DeriveStopCertificateEvidence and the terminal
+// status rest/rebuild pair must reproduce exactly what the reducer and the
+// Kernel produce, so a lean terminal record decodes to the same values.
+
+[[nodiscard]] StopTerminalReductionInputDTO EscalatedMultiEvidenceInput() {
+  auto input = Input();
+  auto hard = SuccessfulStage(1U);
+  input.newly_completed_stage_results.push_back(
+      StopAttemptedStageResultDTO{ParticipantKey(hard.request), 2U, 25,
+                                  StopStageResultAuthorityDTO::kAuthoritative, std::move(hard)});
+  // A second evidence item on the nominal attempt, appended after the policy
+  // item but sorting before it, so the helper's canonical sort is exercised.
+  auto& nominal = input.newly_completed_stage_results.front().result;
+  auto extra = nominal.evidence_items.front();
+  extra.evidence_item_id = StopEvidenceItemId("evidence.nominal.extra");
+  nominal.evidence_items.push_back(std::move(extra));
+  return input;
+}
+
+[[nodiscard]] StopTerminalReductionInputDTO PartialInput() {
+  auto input = Input();
+  auto& facts =
+      std::get<StopParticipantScopeFactsDTO>(input.newly_captured_scope_entries.front().facts);
+  facts.terminal_settlement =
+      StopParticipantScopeFactsDTO::TerminalSettlementState::kContainedUnsettled;
+  input.fault_latch_id = StopFaultLatchId("stop-fault.1");
+  input.fault_latch_generation = StopFaultLatchGeneration(1U);
+  input.terminal_error =
+      ErrorDTO{"participant_stop_settlement_failed", "participant terminal settlement failed", {}};
+  return input;
+}
+
+[[nodiscard]] StopTerminalReductionInputDTO FailedInput() {
+  auto input = Input();
+  auto& failed = input.newly_completed_stage_results.front().result;
+  failed.outcome = ParticipantStopStageOutcomeDTO::kFailed;
+  failed.error = ErrorDTO{"stop_stage_failed", "failed", {}};
+  for (auto& evidence : failed.evidence_items) {
+    evidence.state = StopEvidenceItemStateDTO::kFailed;
+    evidence.error = ErrorDTO{"stop_evidence_failed", "failed", {}};
+  }
+  input.fault_latch_id = StopFaultLatchId("stop-fault.1");
+  input.fault_latch_generation = StopFaultLatchGeneration(1U);
+  input.terminal_error = ErrorDTO{"stop_failed_uncontained", "failed", {}};
+  return input;
+}
+
+[[nodiscard]] StopCertificateDTO PredecessorMergeCertificate() {
+  const auto predecessor = ReduceStopTerminal(EscalatedMultiEvidenceInput());
+  EXPECT_TRUE(predecessor.ok()) << predecessor.error().message;
+  const StopPredecessorAcceptanceRefDTO acceptance{predecessor.value().stop_id,
+                                                   predecessor.value().stop_generation,
+                                                   ContentDigest(kDigestB)};
+  auto merged = ReduceStopTerminal(StopTerminalReductionInputDTO{
+      StopCertificateId("certificate.full"),
+      StopCertificateRevision(1U),
+      StopId("stop.full"),
+      StopGeneration(8U),
+      StopRequestedSelectorSnapshotDTO{StopRequestedSelectorKindDTO::kExplicitFull,
+                                       ContentDigest(kDigestC), std::nullopt, std::nullopt},
+      StopResolutionDispositionDTO::kExact,
+      StopScopeResolutionReasonDTO::kExplicitFullStop,
+      {},
+      {Capture({acceptance}, {}, {}, StopResolutionDispositionDTO::kExact,
+               StopScopeResolutionReasonDTO::kExplicitFullStop)},
+      {predecessor.value()},
+      {},
+      {},
+      std::nullopt,
+      std::nullopt,
+      std::nullopt,
+      40,
+      std::nullopt});
+  EXPECT_TRUE(merged.ok()) << merged.error().message;
+  EXPECT_EQ(merged.value().predecessor_certificates.size(), 1U);
+  return std::move(merged.value());
+}
+
+[[nodiscard]] StopCertificateDTO Reduced(const StopTerminalReductionInputDTO& input) {
+  auto reduced = ReduceStopTerminal(input);
+  EXPECT_TRUE(reduced.ok()) << reduced.error().message;
+  return std::move(reduced.value());
+}
+
+void ExpectEvidenceEqualsReducer(const StopCertificateDTO& certificate) {
+  ASSERT_FALSE(stop_certificate_field_error(certificate).has_value());
+  const auto derived = DeriveStopCertificateEvidence(certificate.attempted_stage_results);
+  ASSERT_TRUE(derived.ok()) << derived.error().message;
+  EXPECT_EQ(derived.value(), certificate.evidence_items);
+}
+
+TEST(StopTerminalReducerTest, EvidenceHelperEqualsReducerEvidence) {
+  const auto nominal = Reduced(Input());
+  ASSERT_EQ(nominal.result, StopCertificateResultDTO::kSucceededNominal);
+  ASSERT_EQ(nominal.evidence_items.size(), 1U);
+  ExpectEvidenceEqualsReducer(nominal);
+
+  const auto escalated = Reduced(EscalatedMultiEvidenceInput());
+  ASSERT_EQ(escalated.result, StopCertificateResultDTO::kSucceededEscalated);
+  ASSERT_EQ(escalated.attempted_stage_results.size(), 2U);
+  ASSERT_EQ(escalated.evidence_items.size(), 3U);
+  EXPECT_EQ(escalated.evidence_items.front().evidence_item.evidence_item_id,
+            StopEvidenceItemId("evidence.nominal.extra"));
+  EXPECT_EQ(escalated.evidence_items.back().stage_index, 1U);
+  ExpectEvidenceEqualsReducer(escalated);
+
+  ExpectEvidenceEqualsReducer(Reduced(PartialInput()));
+  ExpectEvidenceEqualsReducer(Reduced(FailedInput()));
+
+  const auto merged = PredecessorMergeCertificate();
+  ASSERT_EQ(merged.evidence_items.size(), 3U);
+  ExpectEvidenceEqualsReducer(merged);
+
+  const auto empty = DeriveStopCertificateEvidence({});
+  ASSERT_TRUE(empty.ok());
+  EXPECT_TRUE(empty.value().empty());
+}
+
+TEST(StopTerminalReducerTest, EvidenceHelperRefusesStageIndexOutsidePlan) {
+  auto attempts = Input().newly_completed_stage_results;
+  auto& request = attempts.front().result.request;
+  request.stage_index = request.participant_stop_plan.stage_commands.size();
+  const auto derived = DeriveStopCertificateEvidence(attempts);
+  ASSERT_FALSE(derived.ok());
+  EXPECT_EQ(derived.error().code, "stop_terminal_attempt_join_invalid");
+}
+
+TEST(StopTerminalReducerTest, EvidenceHelperAndReducerRefuseDuplicateEvidence) {
+  auto input = Input();
+  auto& evidence = input.newly_completed_stage_results.front().result.evidence_items;
+  evidence.push_back(evidence.front());
+
+  const auto derived = DeriveStopCertificateEvidence(input.newly_completed_stage_results);
+  ASSERT_FALSE(derived.ok());
+  EXPECT_EQ(derived.error().code, "stop_terminal_evidence_conflict");
+
+  const auto reduced = ReduceStopTerminal(input);
+  ASSERT_FALSE(reduced.ok());
+  EXPECT_EQ(reduced.error().code, "stop_terminal_evidence_conflict");
+}
+
+[[nodiscard]] StopCertificateRefDTO RefOf(const StopCertificateDTO& certificate) {
+  return StopCertificateRefDTO{certificate.stop_certificate_id,
+                               certificate.stop_certificate_revision, certificate.stop_id,
+                               certificate.stop_generation};
+}
+
+[[nodiscard]] StopDurableProjectionStatusDTO Projection(StopDurableProjectionStateDTO state) {
+  return StopDurableProjectionStatusDTO{state, std::nullopt, std::nullopt};
+}
+
+[[nodiscard]] StopFaultLatchDTO LatchFor(const StopCertificateDTO& certificate,
+                                         StopFaultTriggerDTO trigger) {
+  return StopFaultLatchDTO{CellId("cell.1"),
+                           certificate.stop_id,
+                           certificate.stop_generation,
+                           RefOf(certificate),
+                           StopFaultLatchId("stop-fault.1"),
+                           StopFaultLatchGeneration(1U),
+                           trigger,
+                           false,
+                           {OperationId("operation.1")},
+                           {ResourceId("joint.1"), ResourceId("joint.2")},
+                           RetainedBundleId(kDigestA),
+                           GraphRevision(kDigestB),
+                           Projection(StopDurableProjectionStateDTO::kRecorded),
+                           Projection(StopDurableProjectionStateDTO::kNotApplicable),
+                           StopFaultLatchStateDTO::kLatched,
+                           1U,
+                           StopFaultRecoveryStatusDTO::kWaitingForObservation,
+                           "stop_fault_latched",
+                           {},
+                           {trigger}};
+}
+
+[[nodiscard]] StopPostTerminalSurveillanceDTO SurveillanceFor(const StopCertificateDTO& certificate,
+                                                              const StopFaultLatchDTO& latch) {
+  const auto& attempt = certificate.attempted_stage_results.front();
+  const auto& requirement = attempt.result.request.participant_stop_plan.stage_commands.front()
+                                .resolved_stage.evidence_requirements.front();
+  return StopPostTerminalSurveillanceDTO{
+      certificate.stop_id,
+      certificate.stop_generation,
+      RefOf(certificate),
+      latch.latch_id,
+      latch.latch_generation,
+      RequestOwnerEpoch("owner.1"),
+      1U,
+      {ResourceId("joint.1"), ResourceId("joint.2")},
+      {StopSurveillanceSourceStatusDTO{attempt.scope_key, requirement.requirement.evidence_item_id,
+                                       requirement.resolved_source,
+                                       StopSurveillanceSourceAvailabilityDTO::kAvailable,
+                                       RuntimeEpoch("provider.epoch"), 5U, 0, std::nullopt}},
+      StopSurveillancePolicyDTO{10'000'000, 100'000'000, 8U},
+      0U,
+      std::nullopt,
+      std::nullopt,
+      std::nullopt,
+      std::nullopt,
+      StopPostTerminalSurveillanceStateDTO::kMonitoring,
+      1U,
+      Projection(StopDurableProjectionStateDTO::kRecorded)};
+}
+
+[[nodiscard]] StopStatusDTO TerminalStatus(
+    const StopCertificateDTO& certificate, StopStatusStateDTO state,
+    StopDurableProjectionStateDTO terminal_projection,
+    const std::optional<StopFaultLatchDTO>& latch,
+    const std::optional<StopPostTerminalSurveillanceDTO>& surveillance) {
+  return StopStatusDTO{
+      StopAcceptedDTO{RequestId("request.1"), RequestReplayStatusDTO::kAcceptedNew,
+                      certificate.stop_id, certificate.stop_generation,
+                      certificate.requested_selector.requested_selector_digest,
+                      certificate.resolution_disposition, certificate.resolution_reason,
+                      certificate.stale_diagnostics, ContentDigest(kDigestB), {}, {}, 10},
+      state,
+      certificate.scope_entries,
+      {},
+      certificate.attempted_stage_results,
+      certificate.evidence_items,
+      certificate.unsettled,
+      certificate.failed,
+      Projection(StopDurableProjectionStateDTO::kRecorded),
+      Projection(terminal_projection),
+      Projection(surveillance.has_value() ? StopDurableProjectionStateDTO::kRecorded
+                                          : StopDurableProjectionStateDTO::kNotApplicable),
+      RefOf(certificate),
+      latch,
+      surveillance};
+}
+
+void ExpectTerminalStatusRoundTrip(const StopStatusDTO& status,
+                                   const StopCertificateDTO& certificate,
+                                   const std::optional<StopFaultLatchDTO>& latch) {
+  const auto field = stop_terminal_projection_field_error(status, certificate, latch);
+  ASSERT_FALSE(field.has_value()) << *field;
+  const auto rest = TerminalStopStatusRest(status);
+  EXPECT_EQ(rest.accepted, status.accepted);
+  EXPECT_EQ(rest.current_stages, status.current_stages);
+  EXPECT_EQ(rest.acceptance_projection, status.acceptance_projection);
+  EXPECT_EQ(rest.terminal_projection, status.terminal_projection);
+  EXPECT_EQ(rest.surveillance_projection, status.surveillance_projection);
+  EXPECT_EQ(rest.surveillance, status.surveillance);
+  EXPECT_EQ(TerminalStopStatusFromCertificate(rest, certificate, latch), status);
+}
+
+TEST(StopTerminalReducerTest, TerminalStatusRebuildsFromRestCertificateAndLatch) {
+  const auto nominal = Reduced(Input());
+  ExpectTerminalStatusRoundTrip(
+      TerminalStatus(nominal, StopStatusStateDTO::kSucceeded,
+                     StopDurableProjectionStateDTO::kPending, std::nullopt, std::nullopt),
+      nominal, std::nullopt);
+  ExpectTerminalStatusRoundTrip(
+      TerminalStatus(nominal, StopStatusStateDTO::kSucceeded,
+                     StopDurableProjectionStateDTO::kRecorded, std::nullopt, std::nullopt),
+      nominal, std::nullopt);
+
+  const auto escalated = Reduced(EscalatedMultiEvidenceInput());
+  ExpectTerminalStatusRoundTrip(
+      TerminalStatus(escalated, StopStatusStateDTO::kSucceeded,
+                     StopDurableProjectionStateDTO::kRecorded, std::nullopt, std::nullopt),
+      escalated, std::nullopt);
+
+  const auto partial = Reduced(PartialInput());
+  ASSERT_EQ(partial.result, StopCertificateResultDTO::kPartial);
+  const auto partial_latch = LatchFor(partial, StopFaultTriggerDTO::kPartial);
+  ExpectTerminalStatusRoundTrip(
+      TerminalStatus(partial, StopStatusStateDTO::kPartial,
+                     StopDurableProjectionStateDTO::kPending, partial_latch, std::nullopt),
+      partial, partial_latch);
+
+  const auto failed = Reduced(FailedInput());
+  ASSERT_EQ(failed.result, StopCertificateResultDTO::kFailedUncontained);
+  const auto failed_latch = LatchFor(failed, StopFaultTriggerDTO::kFailedUncontained);
+  ExpectTerminalStatusRoundTrip(
+      TerminalStatus(failed, StopStatusStateDTO::kFailed, StopDurableProjectionStateDTO::kRecorded,
+                     failed_latch, SurveillanceFor(failed, failed_latch)),
+      failed, failed_latch);
+  ExpectTerminalStatusRoundTrip(
+      TerminalStatus(failed, StopStatusStateDTO::kFailed, StopDurableProjectionStateDTO::kPending,
+                     failed_latch, SurveillanceFor(failed, failed_latch)),
+      failed, failed_latch);
+
+  const auto merged = PredecessorMergeCertificate();
+  ExpectTerminalStatusRoundTrip(
+      TerminalStatus(merged, StopStatusStateDTO::kSucceeded,
+                     StopDurableProjectionStateDTO::kPending, std::nullopt, std::nullopt),
+      merged, std::nullopt);
 }
 
 }  // namespace

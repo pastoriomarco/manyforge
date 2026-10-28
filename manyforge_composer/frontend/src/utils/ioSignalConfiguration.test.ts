@@ -18,6 +18,7 @@ import {
   ioSourceKey,
   msTextToNs,
   newIoSignalInput,
+  ioInputSourceText,
   nsToMsText,
   lifecycleTimeoutProblem,
   newIoDeviceDraft,
@@ -542,5 +543,17 @@ describe('I/O device component', () => {
     expect(outputAckTimeoutProblem('0')).not.toBeNull();
     expect(outputAckTimeoutProblem('-1')).not.toBeNull();
     expect(outputAckTimeoutProblem('abc')).not.toBeNull();
+  });
+});
+
+describe('ioInputSourceText', () => {
+  it('says where a declared input comes from', () => {
+    const input = newIoSignalInput('cell_io');
+    expect(ioInputSourceText({ ...input, profile: 'ros_bool', topic: '/cell/door' })).toBe('ROS topic /cell/door');
+    expect(ioInputSourceText({ ...input, profile: 'xarm_digital', robotComponentId: 'lite6', bank: 'controller', pin: '3' }))
+      .toBe('xArm lite6 controller digital input pin 3');
+    expect(ioInputSourceText({ ...input, profile: 'ur_io_states', topic: '/io_states', pin: '2' }))
+      .toBe('ROS topic /io_states, pin 2');
+    expect(ioInputSourceText(input)).toBe('Mock input');
   });
 });

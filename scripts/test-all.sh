@@ -293,7 +293,10 @@ run_cpp_tests() {
     local deployment_build="$BUILD_DIR/deployment"
     build_manyforge_deployment "$deployment_build" ON
     cd "$deployment_build"
-    if ! require_ctest_tests "manyforge_deployment"; then
+    if ! setup_expression_binding; then
+        echo -e "${RED}  FAIL: the expression engine binding (manyforge_headless_py) is unavailable${NC}"
+        FAIL=$((FAIL + 1))
+    elif ! require_ctest_tests "manyforge_deployment"; then
         FAIL=$((FAIL + 1))
     elif ctest --output-on-failure --timeout "$CTEST_TEST_TIMEOUT_S"; then
         PASS=$((PASS + 1))
@@ -596,6 +599,7 @@ run_python_tests() {
         tests/composable_cell_i4/ \
         tests/test_benchmark.py \
         tests/test_public_contract_entrypoint_reconciliation.py \
+        tests/test_regen.py \
         tests/test_qualification_wrapper_entrypoints.py \
         tests/test_ros_qualification_helpers.py \
         tests/test_grouped_gtest_runner.py \
@@ -791,7 +795,10 @@ run_ros_tests() {
         return
     fi
     cd "$build"
-    if ! ( source_ros_integration_environment
+    if ! setup_expression_binding; then
+        echo -e "${RED}  FAIL: the expression engine binding (manyforge_headless_py) is unavailable${NC}"
+        FAIL=$((FAIL + 1))
+    elif ! ( source_ros_integration_environment
            require_ctest_tests "ROS integration graph" \
                "JtcExecutionPort" "Ros2GripperCommandBackendTest" \
                "RetainedRos2ControlBackendFactoryTest" \

@@ -52,11 +52,13 @@ struct RetainedExternallyManagedPrimitiveOutcome final {
 };
 
 /// Executes one lifecycle primitive of the selected product for one control
-/// domain. Its postcondition is then established only by Observe.
+/// domain. Its postcondition is then established only by Observe. The
+/// duration is the CCLC transaction's remaining command time at dispatch
+/// (absent outside a transaction); a blocking call may use it as its bound.
 using RetainedExternallyManagedPrimitiveDispatcher =
     std::function<RetainedExternallyManagedPrimitiveOutcome(
         const core::ControlDomainId &, const core::LifecyclePrimitiveId &,
-        std::stop_token)>;
+        std::stop_token, std::optional<core::Duration>)>;
 
 /// The real driver owner receives the entire immutable CCLC intent so it can
 /// check expected_observation_generation under its own mutation lock. This

@@ -99,6 +99,18 @@ CompileGlobalIoRuleCatalog(
 }
 
 namespace {
+/// The committed composition takes the grasp-lost levels (SX-206): the host
+/// store's sink moves to its runtime and the rows of grippers it does not hold
+/// drop. Only here, after the terminal publication proof; an Apply candidate
+/// never prunes.
+void AdoptCarriedObjectLostSignals(const std::shared_ptr<HostIoSignalRuntime> &runtime) {
+  if (runtime)
+    runtime->AdoptCarriedObjectLostSignals();
+  else
+    host_carried_object_lost_signals().InstallSink(
+        {}, {}, [](const std::vector<core::IoSignalId> &) {});
+}
+
 core::Result<void> CommitAppliedGlobalIoRuleCatalog(
     ExecutionCompositionAccess &access,
     core::ResourceAddressedExecutionKernel &kernel,
@@ -149,6 +161,8 @@ core::Result<void> CommitAppliedGlobalIoRuleCatalog(
                 selected->context, selected->catalog, selected->service,
                 selected->waiting)
           : kernel.ActivateGlobalIoRuleCatalog(selected->context, selected->service);
+      if (result.ok())
+        AdoptCarriedObjectLostSignals(selected->runtime);
       if (result.ok() && selected->runtime)
         selected->runtime->RequestRuleEvidenceProcessing();
       return result;
@@ -219,6 +233,8 @@ core::Result<void> CommitAppliedGlobalIoRuleCatalog(
             selected->context, selected->catalog, selected->service,
             selected->waiting)
       : kernel.ActivateGlobalIoRuleCatalog(selected->context, selected->service);
+  if (result.ok())
+    AdoptCarriedObjectLostSignals(selected->runtime);
   if (result.ok() && selected->runtime)
     selected->runtime->RequestRuleEvidenceProcessing();
   return result;

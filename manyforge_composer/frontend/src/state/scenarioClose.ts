@@ -5,7 +5,7 @@ import type { ProgramResetExpectation, ProgramResetOutcome } from '../hooks/useP
 import { scenarioCloseUncertainOutputRefusal, uncertainOutputs } from '../utils/uncertainOutputs';
 import type { ComposerHeadlessState } from '../types/headless';
 import { api } from '../api/client';
-import { awaitActivationCompletion, browserRequestIdentity, cclcRequestOwnerEpoch, lifecycleRequestFromSnapshot, requestContext } from '../hooks/useCCLC';
+import { browserRequestIdentity, cclcRequestOwnerEpoch, lifecycleRequestFromSnapshot, requestContext } from '../hooks/useCCLC';
 import type { CarriedObjectAttachment, JsonValue, ManagerActiveProjection, ProjectionRevision,
   SceneTransactionResponse } from '../types/api';
 import type { ComponentProcessStopResult } from '../types/cclc';
@@ -27,7 +27,7 @@ export interface ClosePreparationInputs {
   readSnapshot: () => ComposerHeadlessState;
   /** Pending accepted Reset only: null means connected observation synchronization. */
   readResetSnapshot?: () => ComposerHeadlessState | null;
-  reset: (options: { correlationId: string; expected: ProgramResetExpectation }) => Promise<ProgramResetOutcome>;
+  reset: (options: { correlationId: string; expected: ProgramResetExpectation; keepStopFault: boolean }) => Promise<ProgramResetOutcome>;
 }
 const identity = () => browserRequestIdentity('composer-close');
 /** After the backend's 750 ms response wait elapsed, only these unknowns mean the exact
@@ -90,12 +90,6 @@ export function managerPublicationMatches(value: unknown, expected: ManagerActiv
     && object(active.publication) && sameJson(active.publication, expected.publication);
 }
 
-/** Fresh-start policy content, with its owner-issued revision left intact. */
-export function freshClosePolicy(policy: Record<string, JsonValue>): boolean {
-  return policy.policy_id === 'free_space' && policy.require_full_diagnostics === true
-    && ['allowed_static_static_pairs', 'allowed_touch_link_pairs', 'support_contacts', 'contact_grasps']
-      .every((field) => Array.isArray(policy[field]) && policy[field].length === 0);
-}
 const sameProjection = (left: ProjectionRevision, right: ProjectionRevision) =>
   sameJson(left as unknown as JsonValue, right as unknown as JsonValue);
 
@@ -159,10 +153,11 @@ function currentCloseSnapshot(expected: ManagerActiveProjection, preparation: Cl
   return current;
 }
 
-/** Close always uses ordinary Reset with no optional restoration selected. */
+/** Close always uses ordinary Reset with no optional restoration selected. Its
+ * Reset never clears the cell Stop fault, whatever the ordering (D6). */
 async function resetProgramForClose(input: ClosePreparationInputs, expected: ProgramResetExpectation,
   correlationId: string): Promise<ProgramResetOutcome> {
-  return input.reset({ expected, correlationId });
+  return input.reset({ expected, correlationId, keepStopFault: true });
 }
 
 /** The same ordinary Reset-before-Close phase for every confirmed replacement. */
@@ -359,6 +354,15 @@ export async function prepareSceneForClose(input: CloseInputs): Promise<Prepared
   }
 }
 
+/** D6: appended when a later step fails after Close's early retirement. */
+const RETIRED_NOTE = ' Lifecycle targets retired; finish with New or Load.';
+
+/** D6: an open cell Stop fault (latch). Close keeps it: it never recovers it. */
+export function cellStopFaultOpen(snapshot: ComposerHeadlessState): boolean {
+  const fault = snapshot.executionControlStatus?.cellStopAction.fault;
+  return fault != null && fault.state !== 'cleared';
+}
+
 /** GUI composition only. Every effect uses the existing owner command and refusal. */
 export async function closeScenario({ expected, signal, admissionGeneration,
   waitForObservation, trackApply, progress, preparation }: CloseInputs): Promise<ManagerActiveProjection> {
@@ -373,7 +377,58 @@ export async function closeScenario({ expected, signal, admissionGeneration,
     throw new Error('Current Scenario changed; Close was not started.');
   }
   const input = { expected, signal, admissionGeneration, waitForObservation, trackApply, progress, preparation };
-  const preparedClose = await prepareSceneForClose(input);
+  // D6: with an open cell Stop fault, Close retires the lifecycle targets
+  // first. The Kernel then admits only Close's own claims (the verified
+  // Disable, the canonical-empty Apply) and keeps the fault for Recover cell.
+  const retire = async (check: () => void, phase: (next: 'sent' | 'retired') => void = () => {}) => {
+    progress('Retiring current lifecycle targets…');
+    const owner = confirmed === undefined ? undefined : await api.cclc.owner(signal);
+    const offer = await api.cclc.targetRetirementOffer(signal);
+    if (owner !== undefined && (offer.scope.request_owner_epoch !== owner.requestOwnerEpoch
+      || offer.scope.publication_generation !== expected.publication.publication_generation
+      || offer.scope.active_public_pointer_digest !== expected.publication.durable_public_pointer_content_digest))
+      throw new Error('The lifecycle retirement owner or publication changed.');
+    const context = { request_id: identity(), request_owner_epoch: offer.scope.request_owner_epoch,
+      source_label: 'composer_ui', correlation_id: identity() };
+    check();
+    phase('sent');
+    await api.cclc.retireTargets({ request_context: context, scope: offer.scope, expected_targets: offer.targets }, signal);
+    phase('retired');
+    check();
+    await api.cclc.ownerSettlement(offer.scope, signal);
+    signal.throwIfAborted();
+    return { offer, context, retirementOwner: owner };
+  };
+  let early: Awaited<ReturnType<typeof retire>> | null = null;
+  const initial = confirmed === undefined ? null : currentCloseSnapshot(expected, confirmed, signal);
+  // D6: which order Close takes depends on the cell Stop fault, so it needs the
+  // current control projection; without it Close does nothing.
+  if (initial !== null && initial.executionControlStatus == null)
+    throw Object.assign(new Error('Cell control state is unavailable (cell_state_unavailable); Close was not started. Retry.'),
+      { code: 'cell_state_unavailable' });
+  if (confirmed !== undefined && initial !== null && cellStopFaultOpen(initial)) {
+    // Close never acknowledges outputs with unknown acceptance (contract 66).
+    const uncertain = scenarioCloseUncertainOutputRefusal(
+      uncertainOutputs(initial.executionControlStatus?.manualOperations),
+    );
+    if (uncertain !== null) throw new Error(`${uncertain} Close not completed. Nothing was retried.`);
+    const retirement: { phase: 'none' | 'sent' | 'retired' } = { phase: 'none' };
+    try {
+      early = await retire(() => { currentCloseSnapshot(expected, confirmed, signal); },
+        (next) => { retirement.phase = next; });
+    } catch (error) {
+      const effect = retirement.phase === 'retired' ? RETIRED_NOTE
+        : retirement.phase === 'sent' ? ' Lifecycle target retirement was sent; its outcome is not confirmed. Finish with New or Load.'
+          : ' Close not completed.';
+      throw new Error(`${errorMessage(error, 'Close is unresolved.')}${effect} The cell Stop fault is kept. Editors were kept. Nothing was retried.`);
+    }
+  }
+  let preparedClose: PreparedClose;
+  try {
+    preparedClose = await prepareSceneForClose(input);
+  } catch (error) {
+    throw early === null ? error : new Error(`${errorMessage(error, 'Close is unresolved.')}${RETIRED_NOTE}`);
+  }
   const check = () => {
     if (confirmed === undefined) return;
     const latest = currentCloseSnapshot(expected, confirmed, signal);
@@ -393,20 +448,8 @@ export async function closeScenario({ expected, signal, admissionGeneration,
       throw new Error('The logical Scene changed before Close completed. No further lifecycle effect was sent.');
   };
   try {
-    progress('Retiring current lifecycle targets…');
-    const retirementOwner = confirmed === undefined ? undefined : await api.cclc.owner(signal);
-    const offer = await api.cclc.targetRetirementOffer(signal);
-    if (retirementOwner !== undefined && (offer.scope.request_owner_epoch !== retirementOwner.requestOwnerEpoch
-      || offer.scope.publication_generation !== expected.publication.publication_generation
-      || offer.scope.active_public_pointer_digest !== expected.publication.durable_public_pointer_content_digest))
-      throw new Error('The lifecycle retirement owner or publication changed.');
-    const context = { request_id: identity(), request_owner_epoch: offer.scope.request_owner_epoch,
-      source_label: 'composer_ui', correlation_id: identity() };
-    check();
-    await api.cclc.retireTargets({ request_context: context, scope: offer.scope, expected_targets: offer.targets }, signal);
-    check();
-    await api.cclc.ownerSettlement(offer.scope, signal);
-    signal.throwIfAborted();
+    const { offer, context, retirementOwner } = early ?? await retire(check);
+    let retireAgain = false;
     const graphRows = expected.cellGraph.controllable_components;
     if (!Array.isArray(graphRows)) throw new Error('Current component inventory is unavailable.');
     const ids = [...new Set([...offer.targets.map((row) => row.controllable_component_id),
@@ -436,13 +479,33 @@ export async function closeScenario({ expected, signal, admissionGeneration,
         if (result.incidentRecovery?.closureReason !== 'cell_closed_by_operator') throw new Error('Component incident Close is unresolved.');
       }
       const latest = await api.cclc.component(id, signal);
-      if (latest.lifecycleState === 'active' || latest.lifecycleState === 'prepared') {
+      // D6: Close disables without a recovery. A faulted component has no
+      // Disable (its recovery clears vendor faults); stopping its process
+      // below shuts it down, and its fault stays with the robot.
+      if (latest.lifecycleState === 'faulted') {
+        progress(`${id} is faulted; stopping its process without a recovery…`);
+      } else if (latest.lifecycleState === 'active' || latest.lifecycleState === 'prepared'
+        || latest.lifecycleState === 'degraded') {
         check();
         const result = await api.cclc.submitLifecycle(lifecycleRequestFromSnapshot(latest, 'disable',
           requestContext(ownerEpoch, `close:${id}:disable`), admissionGeneration()), signal);
         if (result.transactionId === null) throw new Error(`Disable of ${id} was not accepted.`);
-        await awaitActivationCompletion(result.status,
-          () => api.cclc.lifecycleStatus(result.transactionId!, signal), waitForObservation);
+        let status = result.status;
+        while (status === null || status.terminalResult === null) {
+          if (status?.reconciliationRequired) throw new Error('Disable outcome requires reconciliation.');
+          await waitForObservation();
+          status = await api.cclc.lifecycleStatus(result.transactionId, signal);
+          if (status === null) throw new Error('Accepted disable transaction has no retained status.');
+        }
+        if (status.terminalResult === 'failed_known_no_effect' && !status.reconciliationRequired) {
+          // D6 (D-M4-4): its provider is gone, so no Disable step is eligible.
+          // Like `faulted`: its process Stop below shuts it down, and the
+          // Disable target this request left is retired again before Apply.
+          progress(`${id} cannot be disabled (${status.error?.code ?? 'no eligible step'}); stopping its process…`);
+          retireAgain = true;
+        } else if (status.terminalResult !== 'succeeded' || status.reconciliationRequired) {
+          throw new Error(status.error?.message ?? `Disable failed: ${status.terminalResult}.`);
+        }
       } else if (latest.lifecycleState !== 'disabled' && latest.lifecycleState !== 'declared') {
         throw new Error(`Component ${id} has an unresolved lifecycle state.`);
       }
@@ -477,6 +540,9 @@ export async function closeScenario({ expected, signal, admissionGeneration,
         }
       }
     }
+    // The no-effect Disable above left a waiting `disable` target: retire it
+    // so the CCLC stops retrying before the empty Apply.
+    if (retireAgain) await retire(check);
     signal.throwIfAborted();
     progress('Preparing the empty configuration…');
     const selection = await api.manager.canonicalEmptySelection(signal);
@@ -542,9 +608,11 @@ export async function closeScenario({ expected, signal, admissionGeneration,
       await waitForObservation();
     }
   } catch (error) {
+    const retired = early === null ? '' : RETIRED_NOTE;
     if (preparedClose.resetDone || preparedClose.detached.length > 0)
       throw new Error(`${errorMessage(error, 'Close is unresolved.')} ${preparedClose.resetDone
-        ? 'Reset done; Close not completed.' : 'Close not completed.'} Detached objects confirmed: ${preparedClose.detached.join(', ') || 'none'}. Editors were kept. Nothing was retried.`);
+        ? 'Reset done; Close not completed.' : 'Close not completed.'} Detached objects confirmed: ${preparedClose.detached.join(', ') || 'none'}. Editors were kept. Nothing was retried.${retired}`);
+    if (early !== null) throw new Error(`${errorMessage(error, 'Close is unresolved.')}${retired}`);
     throw error;
   }
 }

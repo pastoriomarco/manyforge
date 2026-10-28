@@ -9,6 +9,7 @@ import {
 import type {
   CatalogEntry, DeploymentWorkspaceResponse, JsonValue, ProgramTreeNode,
 } from '../types/api';
+import type { CarriedObjectLostSignalChoice } from '../utils/systemSignalAuthoring';
 import { ProgramPropertyEditor } from './ProgramPropertyEditor';
 
 afterEach(() => vi.unstubAllGlobals());
@@ -94,6 +95,47 @@ describe('interrupt conditions with binding null', () => {
     try {
       expect(mounted.onInvalidEditChange).toHaveBeenLastCalledWith(true);
     } finally { await mounted.unmount(); }
+  });
+
+  it('lists the generated system input for an assigned required role before Apply', () => {
+    const node: ProgramTreeNode = {
+      node_id: 'motion.move_until_signal', instance_id: 'watch_loss', children: [],
+      parameters: { target_role: 'gripper', interrupt_condition: {
+        compare: { operand: { signal: { target_role: 'gripper', resource_role: 'carried_object_lost' } },
+          op: '==', value: true },
+      } },
+    };
+    const program = {
+      ...trialEProgram([node]),
+      target_roles: { gripper: { component_role: 'tool', required_resource_roles: ['carried_object_lost'] } },
+    };
+    const assignment = {
+      component_roles: [{ component_role_id: 'tool', controllable_component_id: 'robot' }],
+      target_roles: [{ target_role_id: 'gripper', command_target_id: 'gripper' }],
+    } as unknown as Record<string, JsonValue>;
+    const systemSignal: CarriedObjectLostSignalChoice = {
+      controllableComponentId: 'robot', commandTargetId: 'gripper',
+      signalName: 'carried_object_lost.gripper', resourceRoleId: 'carried_object_lost',
+      direction: 'input', valueType: 'bool', provenance: 'last_apply',
+    };
+    const markup = renderToStaticMarkup(<ProgramPropertyEditor
+      roots={[node]} selectedId="watch_loss" catalogEntries={[until]} program={program}
+      deploymentWorkspace={workspace(trialEDeployment())} programRoleAssignment={assignment}
+      systemSignalChoices={[systemSignal]} busy={false} onMutate={vi.fn()}
+      onUpdateNodePolicies={vi.fn()} />);
+
+    expect(markup).toContain('gripper · carried_object_lost (carried_object_lost.gripper, input) · from last Apply');
+    expect(markup).not.toContain('is not a bound input signal');
+  });
+
+  it('tells the user to Apply when the current Draft has no deterministic signal table', () => {
+    const markup = renderToStaticMarkup(<ProgramPropertyEditor
+      roots={[searchTrip]} selectedId="search_trip" catalogEntries={[until]}
+      program={trialEProgram([searchTrip])} deploymentWorkspace={workspace(trialEDeployment())}
+      programRoleAssignment={trialEAssignment} systemSignalsNeedApply busy={false}
+      onMutate={vi.fn()} onUpdateNodePolicies={vi.fn()} />);
+
+    expect(markup).toContain('Apply to list system signals.');
   });
 
   it('shows the probe Stop warning through the same resolver', () => {

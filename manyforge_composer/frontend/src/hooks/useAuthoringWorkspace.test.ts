@@ -110,6 +110,7 @@ function snapshotFixture(
     },
     project: {
       documentPath,
+      readOnly: false,
       documentId: 'cell.1',
       documentName: 'Cell',
       documentDescription: '',
@@ -340,6 +341,21 @@ describe('useAuthoringWorkspace', () => {
     await flush();
     expect(latest!.beginMutation()).toBe(false);
     expect(latest!.unavailableReason).toContain('Manager operation');
+  });
+
+  it('never makes a Draft edit wait for another client\'s Apply or Kernel admission', async () => {
+    apiMock.authoringWorkspace.get.mockResolvedValue(snapshotFixture(1, 3, 4, '/workspace/cell'));
+    const pending = headlessSnapshot(1);
+    pending.runtime.sections.manager.payload = { apply: {
+      records: [managerApplyRecord()], mutation_available: false, unavailable_reason_code: 'pending',
+    } };
+    pending.authoringAdmission.authoringAllowed = false;
+    await mountHarness(pending);
+    await flush();
+    // Apply/Save keep their gate; the Draft edit takes no claim.
+    expect(latest!.unavailableReason).toBe('Authoring is currently locked by the backend.');
+    expect(latest!.editUnavailableReason).toBe(null);
+    await act(async () => { expect(latest!.beginMutation('edit')).toBe(true); });
   });
 
   it('handles completion before the response, and exact terminal lookup after inventory eviction', async () => {

@@ -9,6 +9,7 @@ import {
   parseIoSignalResponse,
   parseMockIoInputReceipt,
   type MockIoInputReceipt,
+  type SystemSignalProjection,
 } from '../api/parsers/ioSignals';
 import type { ProgramBindingDocument } from '../types/api';
 import { reactPropsHost } from '../test/reactPropsHost';
@@ -86,6 +87,46 @@ afterEach(() => {
 });
 
 describe('ToolIoPanelView', () => {
+  it('shows generated system signals as read-only rows', () => {
+    const systemSignal: SystemSignalProjection = {
+      controllableComponentId: 'robot', commandTargetId: 'gripper',
+      signalName: 'carried_object_lost.gripper', sourceKind: 'system_carried_object',
+      direction: 'input', valueType: 'bool', level: true,
+    };
+    const html = renderToStaticMarkup(
+      <ToolIoPanelView unavailableReason={null} signals={[]} systemSignals={[systemSignal]} states={{}}
+        sourcesNotice={null} onSetMock={() => undefined} />,
+    );
+    expect(html).toContain('aria-label="System signals"');
+    expect(html).toContain('data-system-signal="carried_object_lost.gripper"');
+    expect(html).toContain('data-system-source-kind="system_carried_object"');
+    expect(html).toContain('data-system-signal-level="true">true</strong>');
+    expect(html).toContain('<small>Level</small>');
+    expect(html).toContain('gripper · input · system');
+    expect(html).toContain('Read only');
+    expect(html).not.toContain('<button');
+    expect(html).not.toContain('Setting a Mock input simulates');
+  });
+
+  it('hides retained bound and system rows when the panel is unavailable', () => {
+    const bound = signal();
+    const systemSignal: SystemSignalProjection = {
+      controllableComponentId: 'robot', commandTargetId: 'gripper',
+      signalName: 'carried_object_lost.gripper', sourceKind: 'system_carried_object',
+      direction: 'input', valueType: 'bool', level: true,
+    };
+    const html = renderToStaticMarkup(
+      <ToolIoPanelView unavailableReason="Tool and I/O signals require the configured headless runtime."
+        signals={[bound]} systemSignals={[systemSignal]}
+        states={{ [toolIoSignalKey(bound)]: { reading: reading(), error: null, sending: false } }}
+        sourcesNotice={null} onSetMock={() => undefined} />,
+    );
+    expect(html).toContain('Tool and I/O signals require the configured headless runtime.');
+    expect(html).not.toContain('data-io-signal=');
+    expect(html).not.toContain('data-system-signal=');
+    expect(html).not.toContain('<button');
+  });
+
   it('shows a fresh Mock reading with an enabled explicit toggle', () => {
     const html = view([signal()], [reading()]);
     expect(html).toContain('data-io-quality="fresh"');
@@ -209,6 +250,32 @@ describe('ToolIoPanel', () => {
     controllable_component_id: 'station', command_target_id: 'io', resource_role_id: resource,
     signal_name: resource, source_id: `${resource}_source`, value_type: 'bool', direction: 'input',
     transition_capability: 'sampled_only', provider, ...extra,
+  });
+
+  it('does not query generated system signals as bound I/O inputs', async () => {
+    api.getWorkspace.mockResolvedValue({
+      draft: { deploymentRevision: null, document: null },
+      managerApplied: { deploymentRevision: REVISION },
+      binding: null,
+    });
+    const { host } = reactPropsHost();
+    const { createRoot } = await import('react-dom/client');
+    const root = createRoot(host as unknown as Element);
+    try {
+      await act(async () => {
+        root.render(<ToolIoPanel enabled ownerEpoch="owner.1" retainedBundleId="bundle.1"
+          systemSignals={[{
+            controllableComponentId: 'robot', commandTargetId: 'gripper',
+            signalName: 'carried_object_lost.gripper', sourceKind: 'system_carried_object',
+            direction: 'input', valueType: 'bool', level: true,
+          }]} pollIntervalMs={60_000} />);
+      });
+      await act(async () => { await Promise.resolve(); });
+      expect(api.readIoSignal).not.toHaveBeenCalled();
+      expect(api.setMockIoInput).not.toHaveBeenCalled();
+    } finally {
+      await act(() => root.unmount());
+    }
   });
 
   it('polls only the bound inputs and sets the Mock input to the explicit opposite value', async () => {
@@ -486,6 +553,31 @@ describe('execution targets io_signal_bindings', () => {
       .toEqual(ioSignalBindingsAt(rows, 'rows'));
     expect(() => parseExecutionControlStatus(targets({ io_signal_bindings: [] }), control)).toThrow();
     expect(() => parseExecutionControlStatus(targets({ unknown: 1 }), control)).toThrow();
+  });
+
+  it('parses the generated read-only system signal projection', async () => {
+    const { parseExecutionControlStatus } = await import('../api/parsers/execution');
+    const rows = [{
+      controllable_component_id: 'robot', command_target_id: 'gripper',
+      signal_name: 'carried_object_lost.gripper', source_kind: 'system_carried_object',
+      direction: 'input', value_type: 'bool', level: true,
+    }];
+    expect(parseExecutionControlStatus(targets({}), control).systemSignals).toEqual([]);
+    expect(parseExecutionControlStatus(targets({ system_signals: [] }), control).systemSignals).toEqual([]);
+    expect(parseExecutionControlStatus(targets({ system_signals: rows }), control).systemSignals).toEqual([{
+      controllableComponentId: 'robot', commandTargetId: 'gripper',
+      signalName: 'carried_object_lost.gripper', sourceKind: 'system_carried_object',
+      direction: 'input', valueType: 'bool', level: true,
+    }]);
+    expect(() => parseExecutionControlStatus(targets({ system_signals: [{ ...rows[0], level: 'true' }] }), control))
+      .toThrow();
+    expect(() => parseExecutionControlStatus(targets({ system_signals: [{ ...rows[0], direction: 'output' }] }), control))
+      .toThrow();
+    expect(() => parseExecutionControlStatus(targets({ system_signals: [rows[0], {
+      ...rows[0], controllable_component_id: 'aaa', command_target_id: 'gripper',
+    }] }), control)).toThrow(/sorted by controllable_component_id/);
+    expect(() => parseExecutionControlStatus(targets({ system_signals: [{ ...rows[0], extra: true }] }), control))
+      .toThrow();
   });
 
   it('accepts the host signal_sources projection and checks its shape', () => {

@@ -162,6 +162,7 @@ export function statusFixture(ownerEpoch = 'execution-owner-1'): ExecutionOwnerS
     },
     manualOperations: [],
     runtimeScaleControl: null,
+    systemSignals: [],
     cellStopAction: {
       available: true,
       unavailableReason: null,

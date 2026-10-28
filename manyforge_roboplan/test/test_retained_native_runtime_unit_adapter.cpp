@@ -1161,6 +1161,34 @@ TEST(NativeExecutionRuntimeUnitAdmission,
                component_manager::NativeExecutionRuntimeUnitAdmissionError);
 }
 
+// F-5: the runtime-composition exchange waits 10 s per added or replaced
+// component, at least 10 s. Retained and removed rows install nothing.
+TEST(RetainedNativeRuntimeUnitAdapter,
+     CompositionTimeoutGrowsWithComposedComponents) {
+  using deployment::ApplyComponentDisposition;
+  const auto row = [](const std::string &id,
+                      const ApplyComponentDisposition disposition) {
+    return deployment::ApplyComponentChangeDTO{
+        core::ControllableComponentId(id), disposition, std::nullopt,
+        std::nullopt, {}, {}, {}};
+  };
+  const auto timeout = [](const deployment::ApplyComponentDeltaDTO &delta) {
+    return component_manager::detail::SelectedRuntimeCompositionTimeout(delta);
+  };
+  deployment::ApplyComponentDeltaDTO delta;
+  EXPECT_EQ(timeout(delta), std::chrono::seconds(10));
+  delta.components = {row("arm.1", ApplyComponentDisposition::kAdd),
+                      row("arm.2", ApplyComponentDisposition::kRetain),
+                      row("arm.3", ApplyComponentDisposition::kRemove)};
+  EXPECT_EQ(timeout(delta), std::chrono::seconds(10));
+  delta.components.push_back(
+      row("gripper.1", ApplyComponentDisposition::kReplace));
+  EXPECT_EQ(timeout(delta), std::chrono::seconds(20));
+  delta.components.push_back(
+      row("gripper.2", ApplyComponentDisposition::kAdd));
+  EXPECT_EQ(timeout(delta), std::chrono::seconds(30));
+}
+
 TEST(RetainedNativeRuntimeUnitAdapter,
      RejectsNestedStateAndRunCapabilityTreesBeforeLaunch) {
   NativeFixture fixture;

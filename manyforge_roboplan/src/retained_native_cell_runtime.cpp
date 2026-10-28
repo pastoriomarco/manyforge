@@ -255,9 +255,17 @@ RetainedNativeCellRuntime::RetainedNativeCellRuntime(
       std::make_unique<core::ResourceAddressedExecutionKernel>(
           participant_registrations_, *clock_, *scheduler_,
           *operation_journal_, std::move(input.kernel_config));
+  // A callback that throws on this scheduler's Stop/safety path, including a
+  // lookahead session of an engine sharing it, contains the cell.
+  scheduler_->set_safety_path_fault_sink(
+      [kernel = addressed_kernel_.get()](const std::string_view reason_code) {
+        kernel->ContainInternalFault(reason_code);
+      });
 }
 
 RetainedNativeCellRuntime::~RetainedNativeCellRuntime() {
+  // The sink borrows the Kernel; the shared scheduler may outlive both.
+  scheduler_->set_safety_path_fault_sink({});
   // The Kernel owns non-owning subscriptions to every registered engine and
   // references the journal, observer, clock, and scheduler. Retire it while
   // every referenced owner remains alive.

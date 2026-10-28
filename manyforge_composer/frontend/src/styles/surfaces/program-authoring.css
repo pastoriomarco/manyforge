@@ -1412,6 +1412,39 @@
   border-radius: var(--mf-radius-md-sm);
 }
 
+.program-grasp-lost-policy {
+  display: grid;
+  min-width: 0;
+  gap: 0.45rem;
+  padding: 0.5rem;
+  border: 1px solid var(--mf-border-neutral-23);
+  border-radius: var(--mf-radius-md-sm);
+}
+
+.program-grasp-lost-policy > label {
+  display: flex;
+  align-items: flex-start;
+  gap: 0.45rem;
+  color: var(--mf-text-neutral-86);
+  font-size: var(--mf-font-size-072);
+}
+
+.program-grasp-lost-policy input[type='checkbox'] {
+  flex: none;
+  margin: 0.1rem 0 0;
+}
+
+.program-grasp-lost-key {
+  margin-left: 1.35rem;
+}
+
+.program-grasp-lost-key-field {
+  display: grid;
+  gap: 0.35rem;
+  color: var(--mf-text-neutral-75);
+  font-size: var(--mf-font-size-068);
+}
+
 .program-schema-list-rows,
 .program-schema-list-row,
 .program-schema-object,

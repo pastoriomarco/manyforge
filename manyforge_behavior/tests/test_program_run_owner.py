@@ -4457,6 +4457,78 @@ def test_native_selection_join_rejects_unsupported_catalog_contract() -> None:
         )
 
 
+def test_applied_selection_keeps_strict_nested_program_identity() -> None:
+    """A stale nested revision in an otherwise consistent Applied selection is
+    refused at the Runner boundary; the same document opened for authoring
+    only warns (`edited_outside_manyforge`)."""
+
+    from manyforge_behavior.program import ProgramValidationError
+
+    _owner, admission, _task, _scope, _events = _fixture(
+        initial_task_state=OwnerTaskState.SUCCEEDED
+    )
+    selection = _scenario_selection(admission)
+    selection["program"]["program_revision"] = "sha256:" + "e" * 64
+
+    with pytest.raises(ProgramValidationError, match="content identity mismatch"):
+        build_program_run_admission(
+            selection,
+            expected_scenario_id=admission.scenario_id,
+            expected_source_document_digest=(admission.source_document_digest),
+            environment=admission.environment,
+            owner_availability=admission.readiness.owner_by_port,
+        )
+
+    authored = Program.from_dict(
+        selection["program"],
+        admission.environment.catalog,
+        authoring_load=True,
+    )
+    assert [row["code"] for row in authored.load_diagnostics] == [
+        "edited_outside_manyforge"
+    ]
+    assert authored.program_revision == admission.program.program_revision
+
+
+def test_applied_selection_refuses_an_older_catalog_selector() -> None:
+    """An internally consistent Program under an older catalog minor is refused
+    at the Runner boundary (M3); opened for authoring it is normalized."""
+
+    from manyforge_behavior.canonical_artifact import compute_content_identity
+    from manyforge_behavior.program import ProgramValidationError
+
+    _owner, admission, _task, _scope, _events = _fixture(
+        initial_task_state=OwnerTaskState.SUCCEEDED
+    )
+    selection = _scenario_selection(admission)
+    catalog = admission.environment.catalog
+    major, minor, _patch = catalog.content_version.split(".")
+    older = selection["program"]
+    older["catalog"]["content_version"] = f"{major}.{int(minor) - 1}.0"
+    older["program_revision"] = compute_content_identity(
+        older,
+        own_field="program_revision",
+        identity_domain="program-revision",
+        api_version="manyforge.program.v2",
+    )
+    selection["program_revision"] = older["program_revision"]
+    selection["program_binding"]["program_revision"] = older["program_revision"]
+
+    with pytest.raises(ProgramValidationError, match="exact active v2 catalog"):
+        build_program_run_admission(
+            selection,
+            expected_scenario_id=admission.scenario_id,
+            expected_source_document_digest=(admission.source_document_digest),
+            environment=admission.environment,
+            owner_availability=admission.readiness.owner_by_port,
+        )
+
+    authored = Program.from_dict(older, catalog, authoring_load=True)
+    assert authored.load_diagnostics == ()
+    assert authored.to_dict()["catalog"]["content_version"] == catalog.content_version
+    assert authored.program_revision == admission.program.program_revision
+
+
 def test_applied_program_publication_is_complete_run_input() -> None:
     _owner, admission, _task, _scope, _events = _fixture(
         initial_task_state=OwnerTaskState.SUCCEEDED

@@ -9,11 +9,11 @@
   "members": {
     "assignment.yaml": "sha256:1a04360d772c4925b8f0b02708b479388500d222c3b642d3eb039df7d79528f5",
     "deployment.yaml": "sha256:77f346dda8049e159082c6335de9c0832c8db02247ab8508035db3d279f7e4ed",
-    "program.yaml": "sha256:4dc50a5a25c9fbced2aab9828ec0882a18f2c2fb9304bfa2b19a5b5a068a40a9"
+    "program.yaml": "sha256:b6ee03d11cdb7d63f944d8ab6a1b13b51334db3c2314224dfc6300c1955f58a8"
   },
   "name": "isaac-lite6-trocar-foundationpose",
   "saved_status": {
-    "checked_content_digest": "sha256:7de85783821937d71d3005631adebb596d3203ca1a79f85f58df53a1becd7ca5",
+    "checked_content_digest": "sha256:0e64168d45633e48f4dd048cfbdd3b32ad1185301a54a44ad0363a810a1f0169",
     "last_known_status": "ready",
     "manyforge_version": "0.1.0"
   },

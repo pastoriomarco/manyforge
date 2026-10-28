@@ -28,9 +28,9 @@ filed here — email pastoriomarco@gmail.com (see SECURITY.md).
 ## Environment
 
 - **ManyForge version**: <!-- cat VERSION -->
-- **Lane**: manyforge-only / isaac-sim / real-robot
-- **Scenario or deployment YAML**: <!-- e.g. `--scenario isaac-light` or path to a custom deployment -->
-- **Assistant**: on / off
+- **Lane**: Mock / Isaac / Real
+- **Scenario project**: <!-- e.g. `--project examples/ur5e_lite6_wall_workbench.scenario` or the Scenario loaded in Composer -->
+- **AI assistant used**: yes / no
 - **OS**: <!-- e.g. Ubuntu 24.04 -->
 - **Docker version**: <!-- docker version | head -3 -->
 - **Hardware** (if relevant): <!-- e.g. UR10e + Robotiq 2F-140, Isaac Sim 2025.1, JetPack 7.x -->
@@ -41,8 +41,8 @@ filed here — email pastoriomarco@gmail.com (see SECURITY.md).
 <summary>Composer / kernel / supervisor logs</summary>
 
 ```text
-<paste relevant logs here — `docker logs manyforge-e2e-composer`,
- `journalctl -u <unit>`, or `scripts/launch.sh status` output>
+<paste relevant logs here — `./scripts/compose-dev.sh status` output,
+ `docker logs --tail 200 manyforge-development-workbench`, or `journalctl -u <unit>`>
 ```
 
 </details>

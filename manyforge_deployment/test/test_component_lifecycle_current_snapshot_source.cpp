@@ -434,7 +434,7 @@ TEST_F(ComponentLifecycleCurrentSnapshotSourceTest,
 }
 
 TEST_F(ComponentLifecycleCurrentSnapshotSourceTest,
-       RejectsUnresolvedDurableStateAndPublicationChangeDuringJoin) {
+       ReadsUnresolvedDurableStateFromDomainHealthAndRejectsPublicationChangeDuringJoin) {
   const auto facts = source_facts(bundle());
   const auto receipt = publication(bundle());
   ActivePublicationReader publication_reader(receipt);
@@ -446,10 +446,42 @@ TEST_F(ComponentLifecycleCurrentSnapshotSourceTest,
   VerifiedComponentLifecycleCurrentSnapshotSource unresolved(
       bundle(), publication_reader, receipt, current, catalogs,
       {facts.provider});
-  EXPECT_FALSE(unresolved
-                   .ReadCurrentComponentSnapshot(
-                       facts.component->controllable_component_id)
-                   .ok());
+  // A numbered component without a state (an older journal after a partial
+  // effect) and no domain health stays readable: Declared at its generation.
+  const auto declared = unresolved.ReadCurrentComponentSnapshot(
+      facts.component->controllable_component_id);
+  ASSERT_TRUE(declared.ok()) << declared.error().message;
+  EXPECT_EQ(declared.value().component_lifecycle_generation,
+            core::ComponentLifecycleGeneration(4U));
+  EXPECT_EQ(declared.value().component_lifecycle_state,
+            core::ComponentLifecycleStateDTO::kDeclared);
+
+  // With fresh domain health it reads the observed state; Active reads as
+  // Prepared (never command-ready) and a faulted domain as Declared.
+  const auto observed_as = [&](core::ComponentLifecycleStateDTO observed) {
+    VerifiedComponentLifecycleCurrentSnapshotSource source(
+        bundle(), publication_reader, receipt, current, catalogs,
+        {facts.provider},
+        [&](const core::ResolvedLifecycleProviderOccurrenceDTO &provider) {
+          EXPECT_EQ(provider, facts.provider);
+          return core::Result<core::LifecycleDomainHealthDTO>::Ok(
+              {observed, {}, std::nullopt, std::nullopt});
+        });
+    const auto read = source.ReadCurrentComponentSnapshot(
+        facts.component->controllable_component_id);
+    EXPECT_TRUE(read.ok()) << read.error().message;
+    EXPECT_EQ(read.value().component_lifecycle_generation,
+              core::ComponentLifecycleGeneration(4U));
+    return read.value().component_lifecycle_state;
+  };
+  EXPECT_EQ(observed_as(core::ComponentLifecycleStateDTO::kPrepared),
+            core::ComponentLifecycleStateDTO::kPrepared);
+  EXPECT_EQ(observed_as(core::ComponentLifecycleStateDTO::kDisabled),
+            core::ComponentLifecycleStateDTO::kDisabled);
+  EXPECT_EQ(observed_as(core::ComponentLifecycleStateDTO::kActive),
+            core::ComponentLifecycleStateDTO::kPrepared);
+  EXPECT_EQ(observed_as(core::ComponentLifecycleStateDTO::kFaulted),
+            core::ComponentLifecycleStateDTO::kDeclared);
 
   current = bootstrap_facts(facts);
   ActivePublicationReader changing_publication(receipt);
@@ -460,6 +492,49 @@ TEST_F(ComponentLifecycleCurrentSnapshotSourceTest,
   EXPECT_FALSE(torn.ReadCurrentComponentSnapshot(
                        facts.component->controllable_component_id)
                    .ok());
+}
+
+// The health join for a missing fact sits inside the read: a publication
+// change or an accepted transaction during it must fail the read.
+TEST_F(ComponentLifecycleCurrentSnapshotSourceTest,
+       MissingFactHealthJoinRechecksPublicationAndLifecycleFacts) {
+  const auto facts = source_facts(bundle());
+  const auto receipt = publication(bundle());
+  auto current = bootstrap_facts(facts);
+  current.readback.components.front().durable_generation =
+      core::ComponentLifecycleGeneration(4U);
+  ASSERT_TRUE(current.readback.locally_valid());
+  CatalogSource catalogs(facts.catalog);
+  const auto prepared = core::Result<core::LifecycleDomainHealthDTO>::Ok(
+      {core::ComponentLifecycleStateDTO::kPrepared, {}, std::nullopt,
+       std::nullopt});
+
+  ActivePublicationReader changing(receipt);
+  VerifiedComponentLifecycleCurrentSnapshotSource publication_changes(
+      bundle(), changing, receipt, current, catalogs, {facts.provider},
+      [&](const core::ResolvedLifecycleProviderOccurrenceDTO &) {
+        changing.change_after_first_read();
+        return prepared;
+      });
+  const auto torn = publication_changes.ReadCurrentComponentSnapshot(
+      facts.component->controllable_component_id);
+  ASSERT_FALSE(torn.ok());
+  EXPECT_EQ(torn.error().details.at("reason"),
+            "active_publication_changed_during_read");
+
+  ActivePublicationReader stable(receipt);
+  VerifiedComponentLifecycleCurrentSnapshotSource generation_changes(
+      bundle(), stable, receipt, current, catalogs, {facts.provider},
+      [&](const core::ResolvedLifecycleProviderOccurrenceDTO &) {
+        current.readback.components.front().durable_generation =
+            core::ComponentLifecycleGeneration(5U);
+        return prepared;
+      });
+  const auto advanced = generation_changes.ReadCurrentComponentSnapshot(
+      facts.component->controllable_component_id);
+  ASSERT_FALSE(advanced.ok());
+  EXPECT_EQ(advanced.error().details.at("reason"),
+            "current_fact_changed_during_read");
 }
 
 TEST_F(ComponentLifecycleCurrentSnapshotSourceTest,

@@ -6,6 +6,9 @@
 #include <manyforge_core/ports/icclc_lifecycle_plan_catalog_source.hpp>
 #include <manyforge_deployment/verified_retained_bundle.hpp>
 
+#include <functional>
+#include <map>
+#include <mutex>
 #include <vector>
 
 namespace manyforge::deployment {
@@ -18,6 +21,10 @@ namespace manyforge::deployment {
 /// new source. Provider occurrences are CCLC/composition-owned current runtime
 /// facts and are independently joined to the retained graph and exact
 /// build-owned lifecycle catalog on every read.
+///
+/// A numbered component without a current state fact (an older journal after
+/// a partial effect) reads the state its fresh domain health settles at
+/// (`SettleObservedComponentLifecycleState`), or Declared without it.
 class VerifiedComponentLifecycleCurrentSnapshotSource final
     : public core::ICCLCCurrentComponentSnapshotSource {
 public:
@@ -28,7 +35,10 @@ public:
       core::ICCLCCurrentFactReader &current_fact_reader,
       const core::ICCLCLifecyclePlanCatalogSource &lifecycle_catalog_source,
       std::vector<core::ResolvedLifecycleProviderOccurrenceDTO>
-          provider_occurrences);
+          provider_occurrences,
+      std::function<core::Result<core::LifecycleDomainHealthDTO>(
+          const core::ResolvedLifecycleProviderOccurrenceDTO &)>
+          domain_health = {});
 
   [[nodiscard]] core::Result<core::ComponentLifecycleCurrentSnapshotDTO>
   ReadCurrentComponentSnapshot(const core::ControllableComponentId
@@ -42,6 +52,13 @@ private:
   const core::ICCLCLifecyclePlanCatalogSource &lifecycle_catalog_source_;
   std::vector<core::ResolvedLifecycleProviderOccurrenceDTO>
       provider_occurrences_;
+  std::function<core::Result<core::LifecycleDomainHealthDTO>(
+      const core::ResolvedLifecycleProviderOccurrenceDTO &)>
+      domain_health_;
+  /// One log line per reconstructed component generation.
+  mutable std::mutex reconstructed_log_mutex_;
+  mutable std::map<core::ControllableComponentId, std::uint64_t>
+      reconstructed_logged_;
 };
 
 } // namespace manyforge::deployment

@@ -52,7 +52,6 @@ from manyforge_ros.pose_source_sidecar import (
     normalize_detection3d_array_message,
     normalize_joint_state_message,
     read_simulation_entity_states,
-    relative_pose,
 )
 from manyforge_ros.scene_mirror_probe import SimulationSceneMirrorClient
 
@@ -390,21 +389,11 @@ class PoseSourceSnapshotPublisher(Node):
         coherent: bool = False,
     ) -> None:
         try:
-            pose_in_reference = None
-            if binding.reference is not None and reference_poses:
-                reference = reference_poses.get(binding.reference.request.entity)
-                if reference is not None:
-                    try:
-                        pose_in_reference = relative_pose(
-                            reference, observation.pose
-                        )
-                    except ValueError:
-                        pose_in_reference = None
             self._dispatcher.submit(
                 simulation_entity_observation_intent(
                     binding,
                     observation,
-                    pose_in_reference=pose_in_reference,
+                    reference_poses=reference_poses,
                     coherent=coherent,
                 )
             )
@@ -450,9 +439,9 @@ class PoseSourceSnapshotPublisher(Node):
         # objects, so each relative pose is from one simulator instant.
         reference_requests = tuple(
             {
-                binding.reference.request.entity: binding.reference.request
+                reference.request.entity: reference.request
                 for binding in self._config.simulation_entities
-                if binding.reference is not None
+                for reference in binding.references
             }.values()
         )
         read_entities = tuple(

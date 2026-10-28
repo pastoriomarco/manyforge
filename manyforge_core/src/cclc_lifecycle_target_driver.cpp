@@ -133,7 +133,22 @@ struct DomainObservation final {
   /// records it, see RetainCause), observed at `observed_at_ns`.
   bool retain{};
   std::int64_t observed_at_ns{};
+  /// m5.5: the fresh observation reports `device.moved_externally` (an
+  /// error-free change from the robot's own interface the adapter may
+  /// re-arm) and, with it, whether the robot's controller still reports
+  /// motion.
+  bool moved_externally{};
+  bool in_motion{};
 };
+
+[[nodiscard]] bool BooleanFactIs(const BrandLifecycleObservationDTO& observation,
+                                 const std::string_view id, const bool expected) {
+  return std::any_of(observation.facts.begin(), observation.facts.end(), [&](const auto& fact) {
+    return fact.lifecycle_fact_id.value() == id &&
+           fact.value.kind == LifecycleFactValueKindDTO::kBoolean &&
+           fact.value.boolean_value == expected;
+  });
+}
 
 [[nodiscard]] bool Stale(const ErrorDTO& error) {
   return error.code == kLifecycleFactsStaleErrorCode;
@@ -161,7 +176,7 @@ struct DomainObservation final {
     const ResolvedLifecycleProviderOccurrenceDTO& occurrence,
     const std::uint64_t target_generation, const LifecycleBlockingCauseClassDTO retained_cause,
     const std::optional<LifecycleBlockingCauseClassDTO> recovered_cause, const bool record_causes,
-    IClock& clock) {
+    const std::function<bool()>& external_move_tolerated, IClock& clock) {
   const BrandLifecycleObservationQueryDTO query{
       LifecycleTransactionId(std::string(kObservationProbeTransactionId)),
       LifecycleTransactionGeneration(target_generation),
@@ -200,6 +215,16 @@ struct DomainObservation final {
   }
   result.generation = observed.value().observation_generation;
   auto domain_cause = CauseOf(observed.value());
+  // m5.5: an error-free move from the robot's own interface is a
+  // non-blocking condition on an idle cell (re-armed at the next ManyForge
+  // motion command); while ManyForge work may be in flight it is the
+  // `external_control` incident, exactly as an adapter reporting that class.
+  if (BooleanFactIs(observed.value(), kDeviceMovedExternallyFactId, true) &&
+      !lifecycle_cause_requires_intervention(domain_cause)) {
+    result.moved_externally = true;
+    result.in_motion = BooleanFactIs(observed.value(), kDeviceInMotionFactId, true);
+    if (!external_move_tolerated()) domain_cause = LifecycleBlockingCauseClassDTO::kExternalControl;
+  }
   result.reported = domain_cause;
   if (recovered_cause && domain_cause == *recovered_cause) {
     // The operator's Recover already covers this cause: an adapter that keeps
@@ -942,6 +967,23 @@ CCLCLifecycleTargetDriver::ObserveAllDomains(
     ComponentState& state, const ComponentLifecycleCurrentSnapshotDTO& current,
     const std::map<ControlDomainId, LifecycleBlockingCauseClassDTO>& retained,
     const bool record_causes) {
+  // m5.5: whether an error-free external move (`device.moved_externally`)
+  // is an ordinary condition: decided on the Kernel's current authoring
+  // admission (no Program cycle, claim or Stop fault), read at this decision
+  // boundary, unless lifecycle work of this component holds the cell's claim
+  // (its own re-arm): then the episode's decision stands. With no decision,
+  // conservative: the `external_control` incident. The re-arm itself is an
+  // operator Recover at the next motion command, fenced on the then current
+  // admission generation.
+  const auto component = target.controllable_component_id;
+  const std::function<bool()> external_move_tolerated = [&]() {
+    if (state.in_flight || state.pending_intent || ports.ComponentLifecycleSettling(component)) {
+      return state.external_move_decision.has_value() &&
+             state.external_move_decision->authoring_allowed;
+    }
+    state.external_move_decision = ports.ReadCellAdmission();
+    return state.external_move_decision->authoring_allowed;
+  };
   // Each domain judges freshness on the clock read after its own observation.
   std::vector<DomainCondition> conditions;
   conditions.reserve(current.provider_occurrences.size());
@@ -950,12 +992,17 @@ CCLCLifecycleTargetDriver::ObserveAllDomains(
     auto observed = ObserveDomain(
         ports, target.controllable_component_id, occurrence, target.target_generation,
         stored == retained.end() ? LifecycleBlockingCauseClassDTO::kNone : stored->second,
-        target.recovered_cause, record_causes, clock_);
+        target.recovered_cause, record_causes,
+        external_move_tolerated, clock_);
     if (observed.retain) {
       RetainCause(state, target.controllable_component_id, occurrence.control_domain_id,
                   observed.cause, observed.observed_at_ns);
     }
     conditions.push_back({occurrence.control_domain_id, std::move(observed)});
+  }
+  if (std::none_of(conditions.begin(), conditions.end(),
+                   [](const DomainCondition& condition) { return condition.observed.moved_externally; })) {
+    state.external_move_decision.reset();
   }
   return conditions;
 }
@@ -1188,6 +1235,7 @@ bool CCLCLifecycleTargetDriver::EvaluateIncident(
     } catch (...) {
     }
   }
+  bool moved_externally = false;
   std::vector<std::string> codes;
   std::optional<ControlDomainId> trigger;
   std::optional<ErrorDTO> diagnostic;
@@ -1206,6 +1254,13 @@ bool CCLCLifecycleTargetDriver::EvaluateIncident(
       diagnostic_snapshot = reported_now ? observed.observation->diagnostic_snapshot : nullptr;
       codes = reported_now ? ComponentIncidentVendorCodes(observed.observation->facts)
                            : std::vector<std::string>{};
+      continue;
+    }
+    // m5.5: the vendor switched the controllers off for an external move on
+    // an idle cell; the driver re-arms it, so this is waiting, not a loss.
+    if (observed.moved_externally && !lifecycle_cause_requires_intervention(observed.cause)) {
+      moved_externally = true;
+      requested_controller_absence = true;
       continue;
     }
     const bool reset_transition = program_reset_position_scope_ &&
@@ -1281,8 +1336,16 @@ bool CCLCLifecycleTargetDriver::EvaluateIncident(
                    ? intervention
                : any_mode && lost ? LifecycleBlockingCauseClassDTO::kProviderLost
                                   : LifecycleBlockingCauseClassDTO::kNone;
-  // CP9: a `fault` stream that is not live is a loss of the component.
-  if (cause == LifecycleBlockingCauseClassDTO::kNone && any_mode && state.streams.fault_loss) {
+  // CP9: a `fault` stream that is not live is a loss of the component. Its
+  // own in-deadline Prepare re-establishes the streams (a Real arm's hardware
+  // activation restarts /joint_states and waits for valid measured joints):
+  // absence is expected until it ends, like the inactivity rule 142 above.
+  // m5.5: so is the absence after an idle-cell external move (the vendor
+  // switched the broadcaster off) until the driver's re-arm completes.
+  const bool planned_stream_restart =
+      lifecycle_transition && state.in_flight->intent == ComponentLifecycleIntentKindDTO::kPrepare;
+  if (cause == LifecycleBlockingCauseClassDTO::kNone && any_mode && state.streams.fault_loss &&
+      !moved_externally && !planned_stream_restart) {
     cause = LifecycleBlockingCauseClassDTO::kProviderLost;
     stream_diagnostic = true;
     diagnostic = state.streams.fault_loss;
@@ -1555,8 +1618,12 @@ bool CCLCLifecycleTargetDriver::FollowInFlight(ICCLCLifecycleTargetDriverPorts& 
   const bool current = target && in_flight.expected_target.controllable_component_id == target->controllable_component_id &&
                 in_flight.expected_target.target_generation == target->target_generation;
   const bool succeeded = *value.terminal_result == ComponentLifecycleTerminalResultDTO::kSucceeded;
+  const bool recover_settled = in_flight.intent == ComponentLifecycleIntentKindDTO::kRecover;
   state.in_flight.reset();
   if (!current) return false;
+  // One driver Recover per operator Recover for an observed cause (see
+  // EvaluateComponent), whatever its outcome.
+  if (recover_settled) state.recover_settled_generation = state.recovery_generation;
   if (succeeded) {
     ++state.step;
     state.attempt = 1U;
@@ -1812,7 +1879,7 @@ bool CCLCLifecycleTargetDriver::EvaluateComponent(ICCLCLifecycleTargetDriverPort
   }
   const auto& current = snapshot.value();
   const auto achieved = current.component_lifecycle_state;
-  const auto next = NextLifecycleIntentTowardTarget(achieved, target.requested_state);
+  auto next = NextLifecycleIntentTowardTarget(achieved, target.requested_state);
   // While any CCLC transaction of the component is unsettled no newly
   // reported class is retained (see ObserveDomain) and no step is submitted.
   const bool settling = ports.ComponentLifecycleSettling(component);
@@ -1861,6 +1928,50 @@ bool CCLCLifecycleTargetDriver::EvaluateComponent(ICCLCLifecycleTargetDriverPort
   // a missing plan catalog cannot hide an explicitly reported intervention.
   const auto conditions =
       ObserveAllDomains(ports, target, state, current, retained, !settling);
+  // A Declared component whose every domain is already at a Disabled target
+  // on fresh status (its Disable plan has nothing to do: disabled, or never
+  // armed with no Disable step applying) meets that target without a
+  // transaction; a Recover of a never-armed arm leaves it Declared. Any
+  // domain with a Disable step to run keeps the Disable path, which then
+  // switches off only those domains. Apply bring-up planning keeps its own
+  // Disable choice.
+  if (target.requested_state == LifecycleTargetStateDTO::kDisabled &&
+      achieved == ComponentLifecycleStateDTO::kDeclared && !conditions.empty() &&
+      conditions.size() == current.provider_occurrences.size()) {
+    bool all_at_target = true;
+    for (std::size_t index = 0U; all_at_target && index < conditions.size(); ++index) {
+      const auto& observation = conditions[index].observed.observation;
+      const auto catalog = observation
+          ? ports.LoadLifecyclePlanCatalog(current.provider_occurrences[index])
+          : Result<BrandLifecyclePlanCatalogDTO>::Err(ErrorDTO{"observation_not_fresh", "", {}});
+      const auto decision = catalog.ok()
+          ? EvaluateLifecycleDomainPlan(ComponentLifecycleIntentKindDTO::kDisable,
+                                        ComponentLifecycleStateDTO::kDisabled, catalog.value(),
+                                        *observation)
+          : Result<LifecycleDomainPlanDecision>::Err(catalog.error());
+      all_at_target = decision.ok() &&
+                      decision.value().kind == LifecycleDomainPlanDecisionKind::kAlreadySatisfied;
+    }
+    if (all_at_target) next.reset();
+  }
+  // ADR-0026 §7: the operator's Recover authorizes the recovery steps. A
+  // domain that still reports the recovered cause, degraded or faulted, needs
+  // them whatever CCLC's achieved state is (a vendor error present before the
+  // component was ever armed leaves it Declared). Only with `recovered_cause`
+  // (set by the operator's Recover alone), and once per operator Recover.
+  const bool recover_observed_cause =
+      following && target.recovered_cause &&
+      (achieved == ComponentLifecycleStateDTO::kDeclared ||
+       achieved == ComponentLifecycleStateDTO::kDisabled ||
+       achieved == ComponentLifecycleStateDTO::kPrepared ||
+       achieved == ComponentLifecycleStateDTO::kActive) &&
+      std::any_of(conditions.begin(), conditions.end(), [&](const DomainCondition& condition) {
+        const auto& observation = condition.observed.observation;
+        return observation && condition.observed.reported == *target.recovered_cause &&
+               (observation->observed_state == ComponentLifecycleStateDTO::kDegraded ||
+                observation->observed_state == ComponentLifecycleStateDTO::kFaulted);
+      });
+  if (recover_observed_cause) next = ComponentLifecycleIntentKindDTO::kRecover;
   const bool verified_loss = achieved == ComponentLifecycleStateDTO::kDegraded ||
                              achieved == ComponentLifecycleStateDTO::kFaulted;
   if (EvaluateIncident(ports, target, state, current, conditions, std::nullopt,
@@ -1869,9 +1980,36 @@ bool CCLCLifecycleTargetDriver::EvaluateComponent(ICCLCLifecycleTargetDriverPort
                                      : LifecycleBlockingCauseClassDTO::kNone)) {
     return true;
   }
+  if (recover_observed_cause && state.recover_settled_generation == state.recovery_generation) {
+    // This driver's Recover already ran under this operator Recover and the
+    // cause persists (for example an emergency stop still engaged): nothing
+    // is resubmitted until the operator acts again.
+    Publish(state, LifecycleProgressPhaseDTO::kBlocked, next, *target.recovered_cause,
+            "recovered_cause_persists:" + std::string(to_string(*target.recovered_cause)) +
+                (state.failure_reason ? ":" + *state.failure_reason : std::string()),
+            now_ns);
+    return true;
+  }
   if (!next) {
     state.failed_basis.reset();
     state.failure_reason.reset();
+    // m5.5: moved from the robot's own interface on an idle cell: a
+    // non-blocking warning at the target (like a lost joint stream). The
+    // next ManyForge motion command re-arms it first (operator Recover; this
+    // driver then re-drives Prepare and Enable); nothing is submitted here.
+    const auto moved = std::find_if(conditions.begin(), conditions.end(),
+                                    [](const DomainCondition& condition) {
+      return condition.observed.moved_externally &&
+             !lifecycle_cause_requires_intervention(condition.observed.cause);
+    });
+    if (moved != conditions.end()) {
+      Publish(state, LifecycleProgressPhaseDTO::kSatisfied, std::nullopt,
+              LifecycleBlockingCauseClassDTO::kAvailability,
+              std::string(moved->observed.in_motion ? "moved_externally:in_motion"
+                                                    : "moved_externally:rearm_at_next_motion"),
+              now_ns);
+      return true;
+    }
     // A component at its target is still observed, read only, so that a
     // safety stop, fault or lost controller after it became ready stays
     // visible in its progress (spec 530 lifecycle blocking causes). Nothing

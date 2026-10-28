@@ -3,7 +3,7 @@
   Regenerate with:
     cd <repository-root>
     python3 scripts/regen-public-contracts.py structural-rest
-  Last regenerated: 2026-10-22 07:21:43 UTC
+  Last regenerated: 2026-10-28 10:30:18 UTC
   Generator source: scripts/regen-public-contracts.py:gen_rest_api
 -->
 
@@ -57,6 +57,7 @@ OpenAPI version: `3.1.0`. Title: `ManyForge Composer (replaceable client)`.
 | `GET` | `/api/cycle/status` | headless-runtime-client | Program Cycle Status |
 | `GET` | `/api/debug/export` | headless-runtime-client | Debug Export |
 | `GET` | `/api/debug/export/ros2-medkit` | headless-runtime-client | Normalized Trace Export |
+| `GET` | `/api/deployment/assistant-profiles` | composer-deployment-draft | Read Assistant Profiles |
 | `POST` | `/api/deployment/discard` | composer-deployment-draft | Discard |
 | `POST` | `/api/deployment/draft/apply` | composer-deployment-draft | Apply Authored Candidate |
 | `POST` | `/api/deployment/draft/controlled-stop` | composer-deployment-draft | Update Controlled Stop |
@@ -73,6 +74,7 @@ OpenAPI version: `3.1.0`. Title: `ManyForge Composer (replaceable client)`.
 | `GET` | `/api/execution/alarms/metrics` | headless-runtime-client | Alarm Metrics |
 | `POST` | `/api/execution/alarms/{condition_id}/acknowledge` | headless-runtime-client | Acknowledge Alarm |
 | `POST` | `/api/execution/capability-command-previews` | headless-runtime-client | Execution Preview Capability Command |
+| `POST` | `/api/execution/cell-recover` | headless-runtime-client | Execution Cell Recover |
 | `GET` | `/api/execution/control-state` | headless-runtime-client | Execution Control State |
 | `GET` | `/api/execution/diagnostics` | headless-runtime-client | Execution Diagnostics |
 | `POST` | `/api/execution/full-stop` | headless-runtime-client | Execution Full Stop |
@@ -177,3 +179,9 @@ OpenAPI version: `3.1.0`. Title: `ManyForge Composer (replaceable client)`.
 | `PATCH` | `/api/{unavailable_path}` |  | Unavailable Api |
 | `POST` | `/api/{unavailable_path}` |  | Unavailable Api |
 | `PUT` | `/api/{unavailable_path}` |  | Unavailable Api |
+
+## Route notes
+
+### `POST /api/execution/cell-recover`
+
+Recover cell, one server-side composite. Send only `request_context` with `request_id`, `source_label` and an optional `correlation_id`; every fence is read from the current owners. It acknowledges open component incidents, attempts the current cell Stop-fault latch recovery, and submits Recover for components whose previously recovered cause was still reported at the press and remains so. It then tries to enable again each component whose Active target an incident retired (Recover, Prepare, Enable; `component_rearm_*` reasons, for example the emergency stop still engaged), listing it in `recovered_components` on success. It is also the re-arm of a robot moved from its own interface on an idle cell: Execute and Run (`operation_start`, `program_run`) are refused `component_rearm_required` (no effect; `details.components`, and `details.in_motion` while it still moves) until it is re-armed. Clients call this route, wait until the component is `active` (`GET /api/cclc/components/{id}`, no `moved_externally:*` reason), then re-send the command with fresh fences; a robot still moving is refused `component_rearm_required` here too. A refused recovery still returns a JSON result: read `outcome` (`done` or `not_recovered`), `reason.code`, `acknowledged_incidents`, `latch_cleared` and `recovered_components` rather than treating HTTP success as recovery. Example reason codes (not exhaustive): `stop_fault_recovery_unavailable`, `stop_fault_recovery_closing` (Scenario Close keeps the latch; the latch recovery was refused, but incident acknowledgements earlier in the same press may already have happened), `stop_fault_latch_replaced`, `cell_state_unavailable`, `cell_recover_in_progress` and `cell_recover_outcome_unknown` (a step may have reached its owner: inspect and reconcile, do not assume nothing happened). `done` does not prove that every robot is ready to move. Repeating a `request_id` returns the stored result, or `cell_recover_in_progress`, without reading state again; this replay is in memory per Headless process, bounded, and lost on restart or eviction. Use a new `request_id` for each new press.

@@ -816,7 +816,11 @@ class ComposerState:
             str(Path(program_path).resolve()) if program_path is not None else None
         )
         program = (
-            Program(resolved_program, node_environment.catalog)
+            Program(
+                resolved_program,
+                node_environment.catalog,
+                authoring_load=True,
+            )
             if resolved_program is not None
             else None
         )

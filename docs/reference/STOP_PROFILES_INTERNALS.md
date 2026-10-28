@@ -1,14 +1,11 @@
 # Controlled Stop — Internals Reference
 
-> **Current `dev` status:** `ResourceAddressedExecutionKernel` is the sole
-> product Stop owner; the ROS controller adapters realize participant commands.
-> The native simulator is removed. Mock Phase A `qualified-live02` is current
-> focused live evidence, not Isaac or physical Stop/rest qualification. Historical
-> native transport details below remain algorithm or qualification references.
+`ResourceAddressedExecutionKernel` is the sole Stop owner; the ROS controller
+adapters realize participant commands in every lane (Mock, Isaac, Real).
 
 Reference companion to [`operations/STOP_PROFILES.md`](../operations/STOP_PROFILES.md).
-This document describes the current I8 owner and the retained transport
-qualification surface. It is intentionally code-facing: future maintainers should
+This document describes the Stop owner and its transport
+realization. It is intentionally code-facing: future maintainers should
 be able to verify the stop behavior from the files and symbols named here without
 reconstructing the design history.
 
@@ -33,19 +30,15 @@ ManyForge uses one addressed owner and prepared participant-local realization:
    emits one certificate plus any fault latch. Journal projection and
    post-terminal surveillance occur after containment and cannot rewrite that
    certificate.
-1. Stock `joint_trajectory_controller` may execute a prepared replacement
-   trajectory in a later ros2_control product; the maintained native backend
-   realizes the same selected contract directly.
+1. Stock `joint_trajectory_controller` executes the prepared replacement
+   trajectory.
 
-The stop math remains in `manyforge_core/src/soft_on_path_stop_planner.cpp`.
-Native realization is in `manyforge_roboplan/src/roboplan_execution_backend.cpp`;
-the generic ros2_control implementation is in
-`manyforge_ros2_control_execution/src/ros2_control_execution_backend.cpp` but is
-not yet a qualified product lane.
+The stop math is in `manyforge_core/src/soft_on_path_stop_planner.cpp`; the
+ros2_control realization is in
+`manyforge_ros2_control_execution/src/ros2_control_execution_backend.cpp`.
 
-The retired controller-native JTC plugin is not the target architecture. It is
-preserved historically on the `jtc_plugin` branch, but `main` uses stock JTC plus
-backend-authored replacement goals.
+ManyForge uses stock JTC plus backend-authored replacement goals; no
+controller-native Stop plugin is used.
 
 ## 2. Stop Catalog
 
@@ -183,7 +176,7 @@ identity from fresh state; it never resumes stale controller trajectory state.
 
 `plan_soft_on_path_stop(...)` is side-effect-free and returns a
 `SoftOnPathStopPlanDTO` containing the replacement trajectory plus structured
-diagnostics. It is used by the ROS execution path; native-lane evidence is historical.
+diagnostics. It is used by the ROS execution path.
 
 Inputs:
 

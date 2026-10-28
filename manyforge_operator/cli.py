@@ -9,8 +9,6 @@ import sys
 
 from .contracts import LaunchOperation, LaunchProfile, OperatorCommandResult
 from .isaac import (
-    DEFAULT_RUNTIME_HOST,
-    DEFAULT_SIMULATOR_HOST,
     IsaacLauncher,
     IsaacLauncherConfig,
     RemoteNativeConfig,
@@ -56,9 +54,9 @@ def _parser() -> argparse.ArgumentParser:
     start.add_argument("--manager-timeout-s", type=float, default=60.0)
     start.add_argument("--joint-commands-topic",
                        help="Arm command topic from the retained host profile; omission keeps the launch default")
-    start.add_argument("--simulator-host", default=DEFAULT_SIMULATOR_HOST)
+    start.add_argument("--simulator-host")
     start.add_argument("--control-host", default="")
-    start.add_argument("--remote-target", default=DEFAULT_RUNTIME_HOST)
+    start.add_argument("--remote-target")
     start.add_argument("--remote-source-root")
     start.add_argument("--remote-manager-executable")
     start.add_argument("--remote-install-root")
@@ -144,6 +142,10 @@ def _config(args: argparse.Namespace) -> NativeLauncherConfig:
 
 def _isaac_config(args: argparse.Namespace) -> IsaacLauncherConfig:
     required = (
+        "remote_target",
+        "advertised_host",
+        "simulator_host",
+        "static_peers",
         "remote_source_root",
         "remote_container_image_id",
         "remote_container_name",
@@ -156,12 +158,19 @@ def _isaac_config(args: argparse.Namespace) -> IsaacLauncherConfig:
         "remote_alarm_catalog_path",
         "remote_state_root",
         "remote_simulation_control_config",
+        "remote_bridge_state_root",
+        "remote_ros_setup_script",
         "remote_ros_environment_script",
         "package_aggregate_sha256",
         "compiler_build_manifest_sha256",
         "node_environment_sha256",
     )
-    missing = [name.replace("_", "-") for name in required if getattr(args, name, None) is None]
+    flags = {"static_peers": "static-peer"}
+    missing = [
+        flags.get(name, name.replace("_", "-"))
+        for name in required
+        if getattr(args, name, None) is None
+    ]
     if missing:
         raise ValueError(f"isaac profile requires: {', '.join(missing)}")
     remote = RemoteNativeConfig(
@@ -179,18 +188,18 @@ def _isaac_config(args: argparse.Namespace) -> IsaacLauncherConfig:
         runtime_root=args.remote_runtime_root,
         evidence_root=args.remote_evidence_root,
         simulation_control_config=args.remote_simulation_control_config,
-        bridge_state_root=args.remote_bridge_state_root or "/mnt/nova_ssd/codex-manyforge/runners/isaac-bridge",
-        ros_setup_script=args.remote_ros_setup_script or "/opt/ros/jazzy/setup.bash",
+        bridge_state_root=args.remote_bridge_state_root,
+        ros_setup_script=args.remote_ros_setup_script,
         ros_environment_script=args.remote_ros_environment_script,
         python_executable=args.remote_python_executable,
-        advertised_host=args.advertised_host or "192.168.1.68",
+        advertised_host=args.advertised_host,
         canonical_empty_admission_filename=args.canonical_empty_admission_filename,
         cell_id=args.cell_id,
         package_aggregate_sha256=args.package_aggregate_sha256,
         compiler_build_manifest_sha256=args.compiler_build_manifest_sha256,
         node_environment_sha256=args.node_environment_sha256,
     )
-    peers = tuple(sorted(set(args.static_peers or ("192.168.1.132", "192.168.1.68"))))
+    peers = tuple(sorted(set(args.static_peers)))
     return IsaacLauncherConfig(
         source_root=args.source_root,
         joint_commands_topic=args.joint_commands_topic,

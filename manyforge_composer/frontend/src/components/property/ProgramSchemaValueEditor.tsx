@@ -169,6 +169,7 @@ function SemanticChoiceEditor({
   value,
   disabled,
   context,
+  path = 'value',
   onCommit,
 }: ProgramSchemaValueEditorProps) {
   const overridden = context.semanticChoices != null;
@@ -205,13 +206,16 @@ function SemanticChoiceEditor({
   );
   return (
     <select
+      aria-label={`Choose ${semanticType?.replaceAll('_', ' ')} for ${path.replaceAll('_', ' ')}`}
       className={currentMissing ? 'program-reference-invalid' : undefined}
       value={current}
       disabled={disabled}
       aria-invalid={currentMissing || undefined}
       title={currentMissing
         ? overridden
-          ? `Current ${semanticType} is not a bound input signal of this target.`
+          ? semanticType === 'blackboard_key'
+            ? 'Current blackboard key is not a declared writable bool key.'
+            : `Current ${semanticType} is not a bound input signal of this target.`
           : `Current ${semanticType} is not declared in this Draft.`
         : undefined}
       onChange={(event) => {
@@ -232,7 +236,11 @@ function SemanticChoiceEditor({
       <option value="" disabled>Select {semanticType?.replaceAll('_', ' ')}</option>
       {currentMissing && (
         <option value={current}>
-          {overridden ? 'Current (not a bound input)' : 'Current (not declared)'} · {current}
+          {overridden
+            ? semanticType === 'blackboard_key'
+              ? 'Current (not a declared writable bool key)'
+              : 'Current (not a bound input)'
+            : 'Current (not declared)'} · {current}
         </option>
       )}
       {semanticType === 'blackboard_key' ? (

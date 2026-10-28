@@ -376,8 +376,10 @@ class ProgramRunnerLivenessReceiver:
 
     def latch_publisher_fault(
         self, fault: Mapping[str, Any], reference: str
-    ) -> None:
-        """Latch the first BB publication fault for this receiver's lifetime."""
+    ) -> bool:
+        """Latch the first BB publication fault for this receiver's lifetime,
+        unless its owner clears it (`clear_publisher_fault`, F-2). True when
+        this call latched it."""
 
         message = fault.get("message")
         if (
@@ -395,7 +397,7 @@ class ProgramRunnerLivenessReceiver:
             raise ProgramRunnerLivenessError("malformed BB publication fault")
         with self._lock:
             if self._publisher_fault is not None:
-                return
+                return False
             self._publisher_fault = {
                 "code": PUBLISHER_FAULT_CODE,
                 "message": message,
@@ -404,6 +406,24 @@ class ProgramRunnerLivenessReceiver:
             self._publisher_fault_reference = reference
             if self._receiver_status_sequence < MAXIMUM_SEQUENCE:
                 self._receiver_status_sequence += 1
+        return True
+
+    def clear_publisher_fault(self, reference: str) -> bool:
+        """Clear exactly the latched fault with this reference (F-2: a
+        between-Runs source whose loss the Kernel confirmed, or that a newer
+        source superseded). True when it was cleared."""
+
+        with self._lock:
+            if (
+                self._publisher_fault is None
+                or self._publisher_fault_reference != reference
+            ):
+                return False
+            self._publisher_fault = None
+            self._publisher_fault_reference = None
+            if self._receiver_status_sequence < MAXIMUM_SEQUENCE:
+                self._receiver_status_sequence += 1
+        return True
 
     def check_publication(self) -> None:
         """Run the BB publication budget check (watchdog; also used by tests)."""

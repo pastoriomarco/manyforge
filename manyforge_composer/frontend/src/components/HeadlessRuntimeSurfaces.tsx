@@ -12,7 +12,9 @@ import type {
   HistorianStoredEvent,
   HistorianDetail,
   HistorianRetention,
+  AlarmMembership,
   OperatorAlarmRecord,
+  OperatorAlarmSnapshot,
 } from '../types/headless';
 import {
   acknowledgementFence,
@@ -26,28 +28,16 @@ import type {
   ExecutionHistoryEventView,
   HistoryAlarmPhase,
 } from './ExecutionHistoryPanel';
-import { KernelErrorPanel } from './KernelErrorPanel';
 import { FailureCapturePanel } from './FailureCapturePanel';
 import { useOperationalErrorMirror } from '../state/operationalErrors';
+import { activeMotionInterlocks, motionGatingAlarms } from '../state/operatorAlarmMotionAttention';
 import {
   alarmActionErrorMessage as actionErrorMessage,
-  alarmRequestId as requestId,
   useExactAlarmAcknowledgement,
 } from '../hooks/useExactAlarmAcknowledgement';
 import type { WorkbenchNotice } from '../state/workbenchNotices';
 import { OverlayPanel } from './OverlayPanel';
 import { NoticeActions, NoticeItem, NotificationRail } from './WorkbenchNotifications';
-
-export interface ClientOperationalError {
-  id: string;
-  title: string;
-  message: string;
-  active: boolean;
-  acknowledgementRequired: boolean;
-  /** Composer messages in the registry are errors; acknowledgement never
-   * applies to warnings or information. */
-  severity: 'error';
-}
 
 
 function lifecycleLabel(alarm: OperatorAlarmRecord): string {
@@ -89,17 +79,6 @@ export function motionInterlockMessage(alarm: OperatorAlarmRecord): string | nul
   return alarm.active && alarm.requiresMotionAttention && !alarm.acknowledgementRequired
     ? `Motion blocked by an active interlock: ${alarm.title}; resolve its cause. Acknowledgement does not release it`
     : null;
-}
-
-/** "<title> · Composer error · Dismissal required", under the cause. */
-function clientErrorStatus(clientError: ClientOperationalError): string {
-  return [
-    clientError.title,
-    `Composer ${clientError.severity}`,
-    ...(clientError.acknowledgementRequired
-      ? [...(clientError.active ? [] : ['Resolved']), 'Dismissal required']
-      : []),
-  ].join(' · ');
 }
 
 export function operatorAlarmView(alarm: OperatorAlarmRecord): OperatorAlarmView {
@@ -162,9 +141,7 @@ export function historianEventView(
 interface HeadlessRuntimeSurfacesProps {
   enabled: boolean;
   headlessStateSource: HeadlessStateSource;
-  clientErrors?: ClientOperationalError[];
   conditions?: WorkbenchNotice[];
-  onAcknowledgeClientError?: (id: string) => void;
   attentionRequest?: string | null;
   expanded?: boolean;
   onExpandedChange?: (expanded: boolean) => void;
@@ -174,11 +151,9 @@ interface HeadlessRuntimeSurfacesProps {
 interface HeadlessRuntimeSurfacesViewProps {
   enabled: boolean;
   headlessState: HeadlessStateResult;
-  clientErrors?: ClientOperationalError[];
   /** Current unresolved error conditions. They have source actions but no
    * acknowledgement or dismissal and stay until their source resolves. */
   conditions?: WorkbenchNotice[];
-  onAcknowledgeClientError?: (id: string) => void;
   attentionRequest?: string | null;
   expanded?: boolean;
   onExpandedChange?: (expanded: boolean) => void;
@@ -192,14 +167,6 @@ interface HeadlessRuntimeSurfacesViewProps {
 
 interface RuntimeAttentionFence {
   alarmFence: AlarmAcknowledgementFence | null;
-  clientErrorIds: string[];
-}
-
-function sameIdentities(left: string[], right: string[]): boolean {
-  if (left.length !== right.length) return false;
-  const expected = [...left].sort();
-  const current = [...right].sort();
-  return expected.every((value, index) => value === current[index]);
 }
 
 /**
@@ -222,38 +189,83 @@ export function partitionRepresentedAlarms(
   return { standalone, represented };
 }
 
+/**
+ * The alarms of the red row: those that gate motion now (spec 530 §10.1),
+ * unacknowledged ones newest first, then active interlocks. Alarms that gate
+ * nothing are warnings.
+ */
+export function blockingAlarms(
+  alarms: OperatorAlarmSnapshot | null | undefined,
+): OperatorAlarmRecord[] {
+  return [
+    ...attentionAlarmsNewestFirst(motionGatingAlarms(alarms)),
+    ...activeMotionInterlocks(alarms),
+  ];
+}
+
+/**
+ * What red "Acknowledge all" acknowledges: the unacknowledged gating alarms
+ * only, each by its exact revision. The owner's bulk request must name every
+ * unacknowledged alarm, warnings included, so each is acknowledged exactly.
+ */
+export function redAcknowledgementMembers(
+  alarms: OperatorAlarmSnapshot | null | undefined,
+): AlarmMembership[] {
+  return attentionAlarmsNewestFirst(motionGatingAlarms(alarms)).map(
+    ({ conditionId, activationId, recordRevision }) => ({ conditionId, activationId, recordRevision }),
+  );
+}
+
+/** Unacknowledged alarms that gate nothing: warnings, newest first. */
+export function nonBlockingAttentionAlarms(
+  alarms: OperatorAlarmSnapshot | null | undefined,
+): OperatorAlarmRecord[] {
+  const gating = new Set(motionGatingAlarms(alarms));
+  return attentionAlarmsNewestFirst(alarms?.alarms ?? [])
+    .filter((alarm) => !gating.has(alarm));
+}
+
+/**
+ * The red row's badge: each condition and each blocking alarm once; an alarm
+ * a condition represents counts with it.
+ */
+export function runtimeErrorItemCount(
+  alarms: OperatorAlarmSnapshot | null | undefined,
+  conditions: readonly WorkbenchNotice[],
+): number {
+  const representedAlarmCount = [...partitionRepresentedAlarms(
+    blockingAlarms(alarms),
+    conditions,
+  ).represented.values()].reduce((count, records) => count + records.length, 0);
+  return Math.max(0, (alarms?.motionAttentionMembership.length ?? 0) - representedAlarmCount)
+    + conditions.length;
+}
+
 export function runtimeAttentionSummary(
   attentionAlarms: OperatorAlarmRecord[],
-  clientErrors: ClientOperationalError[],
   conditions: readonly WorkbenchNotice[] = [],
 ): string {
   const { standalone: alarms, represented } = partitionRepresentedAlarms(
     attentionAlarms,
     conditions,
   );
-  const count = alarms.length + clientErrors.length + conditions.length;
+  const count = alarms.length + conditions.length;
   if (count === 0) return 'No messages require attention';
   if (count > 1) return `${count} errors require attention · ${
-    conditions[0]?.title ?? clientErrors[0]?.title ?? alarms[0]?.title}`;
+    conditions[0]?.title ?? alarms[0]?.title}`;
   const condition = conditions[0];
   if (condition !== undefined) {
     const alarm = represented.get(condition.id)?.[0];
     if (alarm !== undefined) return `${condition.title} · ${operatorAlarmCause(alarm)}`;
     return condition.message ? `${condition.title} · ${condition.message}` : condition.title;
   }
-  const clientError = clientErrors[0];
-  if (clientError !== undefined) return `${clientError.title} · ${clientError.message}`;
-  return alarms[0]?.definitionId === 'manyforge.runtime.previous_session_unclean'
-    ? alarms[0].message
-    : alarms[0]?.title ?? 'Attention required';
+  return alarms[0]?.title ?? 'Attention required';
 }
 
 export function HeadlessRuntimeSurfacesView({
   enabled,
   headlessState,
-  clientErrors = [],
   conditions = [],
-  onAcknowledgeClientError,
   attentionRequest = null,
   expanded = true,
   onExpandedChange,
@@ -336,30 +348,24 @@ export function HeadlessRuntimeSurfacesView({
     message: actionError,
     onDismiss: () => setActionError(null),
   });
-  const attention = useMemo(
-    () => attentionAlarmsNewestFirst(snapshot?.alarms.alarms ?? []),
-    [snapshot],
-  );
   const standing = snapshot?.alarms.alarms.filter((alarm) =>
     alarm.lifecycleState === 'active_acknowledged') ?? [];
-  // Acknowledgeable/dismissible items keep their exact fence; conditions are
-  // counted and shown but never enter acknowledgement. An alarm a condition
-  // represents is shown and counted inside it.
+  // Only what blocks motion now: unacknowledged gating alarms (Acknowledge)
+  // and active interlocks (resolve the cause; never acknowledged).
+  const shownAlarms = useMemo(() => blockingAlarms(snapshot?.alarms), [snapshot]);
+  const acknowledgeable = (alarm: OperatorAlarmRecord) => alarm.lifecycleState !== 'active_acknowledged';
+  const attentionCount = shownAlarms.filter(acknowledgeable).length;
+  // Conditions are counted and shown but never enter acknowledgement. An
+  // alarm a condition represents is shown and counted inside it.
   const { standalone, represented } = useMemo(
-    () => partitionRepresentedAlarms(attention, conditions),
-    [attention, conditions],
+    () => partitionRepresentedAlarms(shownAlarms, conditions),
+    [shownAlarms, conditions],
   );
-  const attentionCount = attention.length + clientErrors.length;
-  const itemCount = standalone.length + clientErrors.length + conditions.length;
-  const attentionSummary = runtimeAttentionSummary(attention, clientErrors, conditions);
-  const singleClientError = itemCount === 1 ? clientErrors[0] : undefined;
-  const singleAlarm = itemCount === 1 ? standalone[0] : undefined;
+  const itemCount = standalone.length + conditions.length;
+  const attentionSummary = runtimeAttentionSummary(shownAlarms, conditions);
+  const singleAlarm = itemCount === 1 && standalone[0] !== undefined
+    && acknowledgeable(standalone[0]) ? standalone[0] : undefined;
   const singleCondition = itemCount === 1 ? conditions[0] : undefined;
-  const attentionSeverity = conditions.length > 0
-    || clientErrors.length > 0
-    || attention.some(
-    (alarm) => alarm.priority === 'critical' || alarm.priority === 'high',
-  ) ? 'error' : 'warning';
   useEffect(() => {
     if (attentionCount < 2) setBulkFence(null);
   }, [attentionCount]);
@@ -442,9 +448,9 @@ export function HeadlessRuntimeSurfacesView({
     await acknowledgeExact([alarm], snapshot.alarms.ownerEpoch);
   };
 
+  const gatingMembers = () => redAcknowledgementMembers(snapshot?.alarms);
   const requestBulkConfirmation = () => {
-    const members = snapshot?.alarms.unacknowledgedMembership ?? [];
-    const clientErrorIds = clientErrors.map((error) => error.id);
+    const members = gatingMembers();
     setBulkFence({
       alarmFence: snapshot === null || members.length === 0
         ? null
@@ -453,15 +459,13 @@ export function HeadlessRuntimeSurfacesView({
             snapshot.alarms.generation,
             members,
           ),
-      clientErrorIds,
     });
     setActionError(null);
   };
 
   const confirmBulk = async () => {
     if (bulkFence === null) return;
-    const members = snapshot?.alarms.unacknowledgedMembership ?? [];
-    const clientErrorIds = clientErrors.map((error) => error.id);
+    const members = gatingMembers();
     const alarmSetChanged = bulkFence.alarmFence !== null && (
       snapshot === null
       || !acknowledgementFenceMatches(
@@ -471,28 +475,18 @@ export function HeadlessRuntimeSurfacesView({
         members,
       )
     );
-    if (alarmSetChanged || !sameIdentities(bulkFence.clientErrorIds, clientErrorIds)) {
+    if (alarmSetChanged) {
       setBulkFence(null);
       setActionError('The attention set changed. Review it before confirming again.');
       onExpandedChange?.(true);
       return;
     }
     setBulkBusy(true);
-    setActionError(null);
     try {
       if (bulkFence.alarmFence !== null && snapshot !== null) {
-        await api.alarms.acknowledgeAll(
-          snapshot.alarms.ownerEpoch,
-          snapshot.alarms.generation,
-          members,
-          requestId(),
-        );
+        await acknowledgeExact(members, snapshot.alarms.ownerEpoch);
       }
-      bulkFence.clientErrorIds.forEach((id) => onAcknowledgeClientError?.(id));
       setBulkFence(null);
-    } catch (reason) {
-      setActionError(actionErrorMessage(reason));
-      onExpandedChange?.(true);
     } finally {
       setBulkBusy(false);
     }
@@ -502,7 +496,7 @@ export function HeadlessRuntimeSurfacesView({
   return (
     <section
       className={`runtime-observability-surface ${expanded ? 'expanded' : 'collapsed'}${
-        itemCount > 0 ? ` has-attention attention-${attentionSeverity}` : ''
+        itemCount > 0 ? ' has-attention attention-error' : ''
       }`}
       role="dialog"
       aria-modal="false"
@@ -510,11 +504,7 @@ export function HeadlessRuntimeSurfacesView({
     >
       <NotificationRail
         className="runtime-observability-rail"
-        label={itemCount > 0
-          ? (attention.length > 0 && attention.every((alarm) =>
-            alarm.definitionId === 'manyforge.runtime.previous_session_unclean')
-            && clientErrors.length === 0 && conditions.length === 0 ? 'Warnings' : 'Errors')
-          : 'Runtime / history'}
+        label={itemCount > 0 ? 'Errors' : 'Runtime / history'}
         summary={attentionSummary}
         expanded={expanded}
         onToggle={() => onExpandedChange?.(!expanded)}
@@ -524,18 +514,6 @@ export function HeadlessRuntimeSurfacesView({
         actions={<>
           {singleCondition !== undefined && !expanded && (
             <NoticeActions notice={singleCondition} />
-          )}
-          {singleClientError !== undefined && onAcknowledgeClientError !== undefined && (
-            <button
-              type="button"
-              disabled={bulkBusy || busyActivation !== null}
-              title={`${singleClientError.acknowledgementRequired
-                ? 'Acknowledge'
-                : 'Dismiss'} this Composer message. This does not change execution.`}
-              onClick={() => onAcknowledgeClientError(singleClientError.id)}
-            >
-              {singleClientError.acknowledgementRequired ? 'Acknowledge' : 'Dismiss'}
-            </button>
           )}
           {singleAlarm !== undefined && (
             <button
@@ -552,7 +530,7 @@ export function HeadlessRuntimeSurfacesView({
               ref={acknowledgeAllButton}
               type="button"
               disabled={bulkBusy || busyActivation !== null}
-              title="Acknowledge the exact current alarm set and dismiss the exact current Composer messages. Unresolved error conditions remain. This does not change execution."
+              title="Acknowledge the exact current alarm set. Unresolved error conditions remain. This does not change execution."
               onClick={requestBulkConfirmation}
             >
               Acknowledge all
@@ -603,7 +581,7 @@ export function HeadlessRuntimeSurfacesView({
           <header className="runtime-observability-section-header">
             <div>
               <strong>Attention required</strong>
-              <small>Unresolved error conditions, exact backend alarms and current Composer-session errors.</small>
+              <small>What blocks motion or commands now: unresolved error conditions and gating backend alarms.</small>
             </div>
           </header>
           {itemCount === 0 && <p className="muted">Nothing currently requires attention.</p>}
@@ -614,50 +592,21 @@ export function HeadlessRuntimeSurfacesView({
                   key={alarm.activationId}
                   alarm={operatorAlarmView(alarm)}
                   busy={busyActivation === alarm.activationId}
-                  onAcknowledge={(value) => { void acknowledge(value); }}
+                  onAcknowledge={acknowledgeable(alarm)
+                    ? (value) => { void acknowledge(value); }
+                    : undefined}
                 />
               ))}
             </NoticeItem>
           ))}
-          {clientErrors.map((clientError) => (
-          <div
-            className={`operator-alarm-panel severity-${clientError.severity}`}
-            key={clientError.id}
-          >
-            <details>
-              <summary>
-                {clientError.message || clientError.title} · {clientErrorStatus(clientError)}
-              </summary>
-              <KernelErrorPanel
-                error={{ code: clientError.id, message: clientError.message }}
-                presentation={{
-                  headline: clientError.message || clientError.title,
-                  status: clientErrorStatus(clientError),
-                  hint: '',
-                  severity: clientError.severity,
-                }}
-                presentationKey={clientError.id}
-                eyebrow="Composer client error"
-              />
-            </details>
-            <div className="operator-alarm-actions">
-              <button
-                type="button"
-                onClick={() => onAcknowledgeClientError?.(clientError.id)}
-              >
-                {clientError.acknowledgementRequired
-                  ? 'Acknowledge message'
-                  : 'Dismiss message'}
-              </button>
-            </div>
-          </div>
-        ))}
           {standalone.map((alarm) => (
           <OperatorAlarmPanel
             key={alarm.activationId}
             alarm={operatorAlarmView(alarm)}
             busy={busyActivation === alarm.activationId}
-            onAcknowledge={(value) => { void acknowledge(value); }}
+            onAcknowledge={acknowledgeable(alarm)
+              ? (value) => { void acknowledge(value); }
+              : undefined}
           />
           ))}
           {actionError !== null && (
@@ -742,7 +691,7 @@ export function HeadlessRuntimeSurfacesView({
             Acknowledge the exact current set of {attentionCount} attention messages?
           </p>
           <p>
-            Active backend conditions remain active. Composer messages are dismissed.
+            Active backend conditions remain active.
             This does not resume motion or otherwise change execution.
           </p>
           <div className="dialog-actions">
@@ -767,9 +716,7 @@ export function HeadlessRuntimeSurfacesView({
 export function HeadlessRuntimeSurfaces({
   enabled,
   headlessStateSource,
-  clientErrors = [],
   conditions = [],
-  onAcknowledgeClientError,
   attentionRequest = null,
   expanded = true,
   onExpandedChange,
@@ -790,9 +737,7 @@ export function HeadlessRuntimeSurfaces({
     <HeadlessRuntimeSurfacesView
       enabled={enabled}
       headlessState={headlessState}
-      clientErrors={clientErrors}
       conditions={conditions}
-      onAcknowledgeClientError={onAcknowledgeClientError}
       attentionRequest={attentionRequest}
       expanded={expanded}
       onExpandedChange={onExpandedChange}

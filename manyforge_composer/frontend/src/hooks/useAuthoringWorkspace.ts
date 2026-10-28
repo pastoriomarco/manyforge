@@ -194,10 +194,11 @@ export function useAuthoringWorkspace(
   const ownerReason = transportStatus !== 'connected'
     ? 'Current backend status is unavailable.'
     : authoringUnavailableReason(published, snapshot) ?? managerAdmission.reason;
-  // A Draft edit is also admitted while a held run has all motion stopped.
+  // A Draft edit takes no claim: it never waits for Kernel or Manager
+  // admission, and is also admitted while a held run has all motion stopped.
   const editOwnerReason = transportStatus !== 'connected'
     ? 'Current backend status is unavailable.'
-    : draftEditUnavailableReason(published, snapshot) ?? managerAdmission.reason;
+    : draftEditUnavailableReason(published, snapshot);
   const submissionReason = submissionState === null ? null
     : submissionState === 'unknown' ? 'Submission outcome is unconfirmed; inspect backend status before further changes.'
       : 'Waiting for the submitted operation to be observed by the backend.';

@@ -314,13 +314,15 @@
 }
 
 .deployment-target-limits,
-.deployment-runtime-unit {
+.deployment-runtime-unit,
+.deployment-pose-source {
   display: grid;
   gap: 0.55rem;
 }
 
 .deployment-target-limit,
-.deployment-runtime-unit {
+.deployment-runtime-unit,
+.deployment-pose-source {
   padding: 0.5rem;
   border: 1px solid var(--mf-border-neutral-23);
   border-radius: var(--mf-radius-sm);
@@ -511,7 +513,8 @@
 }
 
 .deployment-target-limit > header,
-.deployment-runtime-unit > header {
+.deployment-runtime-unit > header,
+.deployment-pose-source > header {
   display: flex;
   align-items: baseline;
   justify-content: space-between;
@@ -554,7 +557,8 @@
   grid-column: 1 / -1;
 }
 
-.deployment-gripper-editor {
+.deployment-gripper-editor,
+.deployment-pose-source-block {
   display: grid;
   gap: 0.55rem;
   margin: 0;
@@ -563,7 +567,8 @@
   border-radius: var(--mf-radius-sm);
 }
 
-.deployment-gripper-editor legend {
+.deployment-gripper-editor legend,
+.deployment-pose-source-block legend {
   padding: 0 0.25rem;
   color: var(--mf-text-accent-66);
   font-size: var(--mf-font-size-065);

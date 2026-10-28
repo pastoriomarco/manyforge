@@ -9,11 +9,11 @@
   "members": {
     "assignment.yaml": "sha256:f4dd3bfffcc14e0cb446f820e79e2405f4477ecbc470ca9fdc127dce17086e06",
     "deployment.yaml": "sha256:9ae56dbfa802dc1b621278710f99a6c69a2cb9382355a7a7521ffba9da93fe92",
-    "program.yaml": "sha256:0109a0956947d8f8f862394a31c99521d9175da0ec1c56452f95de1922ca03d4"
+    "program.yaml": "sha256:56e35cdc1152add730ec75d28b984098c5d340f07d98fe5d61874566dc87bab5"
   },
   "name": "r5_trial_a_retry",
   "saved_status": {
-    "checked_content_digest": "sha256:d2ae9690aa2a4072e34be72ddecd82496cea3c5141c6e745b3a07b5357d14d43",
+    "checked_content_digest": "sha256:bcef706427c78d5b5670965139393ea4842bbc8f82a9749b16d1be2f32136d5d",
     "last_known_status": "unknown",
     "manyforge_version": "0.1.0"
   },

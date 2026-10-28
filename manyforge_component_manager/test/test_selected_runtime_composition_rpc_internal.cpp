@@ -369,6 +369,49 @@ TEST(SelectedRuntimeCompositionRpcInternal,
   EXPECT_FALSE(preparing.valid());
 }
 
+// D6 (D-M4-4b, SX-365): only Close's canonical-empty Apply may remove a
+// component that still reads Active, and only when every launch process group
+// of it is drained (cleanup-proven). Everything else keeps "deactivate first".
+TEST(SelectedRuntimeCompositionRpcInternal, ActiveComponentRemovableOnlyWithDrainedGroupsInCanonicalEmpty) {
+  const manyforge::deployment::ApplyComponentChangeDTO remove{
+      ControllableComponentId("arm"), manyforge::deployment::ApplyComponentDisposition::kRemove,
+      ContentDigest("sha256:" + std::string(64U, 'a')), std::nullopt, {}, {}, {}};
+  const auto occurrence = [](std::string component, ProcessPresenceState presence,
+                             ControllerLaunchCleanupState cleanup) {
+    return ManagerComponentProcessOccurrenceDTO{
+        ControllableComponentId(std::move(component)), "launch", 42, presence, cleanup};
+  };
+  const auto drained = occurrence("arm", ProcessPresenceState::kAbsent, ControllerLaunchCleanupState::kDrained);
+  // Provider loss in Close: the provider's process group is drained.
+  EXPECT_TRUE(ActiveComponentRemovableWithoutLiveProcess(
+      remove, {drained, occurrence("gripper", ProcessPresenceState::kPresent,
+                                   ControllerLaunchCleanupState::kNotRequested)}, true, false));
+  // Any other Apply candidate keeps M3's "deactivate first".
+  EXPECT_FALSE(ActiveComponentRemovableWithoutLiveProcess(remove, {drained}, false, false));
+  // A processless I/O owner (no launch occurrence) still needs Disable.
+  EXPECT_FALSE(ActiveComponentRemovableWithoutLiveProcess(remove, {}, true, false));
+  EXPECT_FALSE(ActiveComponentRemovableWithoutLiveProcess(
+      remove, {occurrence("gripper", ProcessPresenceState::kAbsent, ControllerLaunchCleanupState::kDrained)}, true, false));
+  // An exited leader is not a drained group: a member may still be alive.
+  EXPECT_FALSE(ActiveComponentRemovableWithoutLiveProcess(
+      remove, {occurrence("arm", ProcessPresenceState::kAbsent, ControllerLaunchCleanupState::kNotRequested)}, true, false));
+  EXPECT_FALSE(ActiveComponentRemovableWithoutLiveProcess(
+      remove, {occurrence("arm", ProcessPresenceState::kAbsent, ControllerLaunchCleanupState::kPending)}, true, false));
+  EXPECT_FALSE(ActiveComponentRemovableWithoutLiveProcess(
+      remove, {drained, occurrence("arm", ProcessPresenceState::kPresent,
+                                   ControllerLaunchCleanupState::kNotRequested)}, true, false));
+  // A component that also owns an I/O provider domain keeps "deactivate first"
+  // (its I/O effects are not proven settled by a drained launch, SX-374).
+  EXPECT_FALSE(ActiveComponentRemovableWithoutLiveProcess(remove, {drained}, true, true));
+  // A local no-output owner and a replacement never qualify.
+  auto local = drained;
+  local.process_owner_kind = ManagerComponentProcessOwnerKindDTO::kPneumaticNoneLocal;
+  EXPECT_FALSE(ActiveComponentRemovableWithoutLiveProcess(remove, {local}, true, false));
+  auto replace = remove;
+  replace.disposition = manyforge::deployment::ApplyComponentDisposition::kReplace;
+  EXPECT_FALSE(ActiveComponentRemovableWithoutLiveProcess(replace, {drained}, true, false));
+}
+
 TEST(SelectedRuntimeCompositionRpcInternal, ReceiptsMustMatchTheDeltaExactly) {
   const auto request = Request();
   EXPECT_TRUE(ComponentReceiptsMatchRequest(request, {RetainedReceipt()}));

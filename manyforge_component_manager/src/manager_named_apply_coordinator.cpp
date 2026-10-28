@@ -5,6 +5,8 @@
 #include <manyforge_core/component_lifecycle_value_codec.hpp>
 #include <manyforge_deployment/apply_affected_scope.hpp>
 #include <manyforge_deployment/content_identity.hpp>
+#include <manyforge_deployment/prepared_activation_input.hpp>
+#include <manyforge_content_identity/canonical_value.hpp>
 #include <manyforge_deployment/ros2_control_execution_runtime_contract.hpp>
 #include <manyforge_deployment/verified_retained_bundle.hpp>
 #include <set>
@@ -201,6 +203,20 @@ public:
     // Prepare guard still checks the same requirement at the effect boundary.
     const auto delta =
         deployment::derive_apply_component_delta(predecessor, candidate);
+    // D6: only an Apply of the verified canonical-empty candidate (its
+    // Manager-verified sealed origin), from any caller, may remove a component
+    // left Active by a lost provider.
+    const bool canonical_empty_candidate = [&] {
+      try {
+        return deployment::prepared_receipt_is_canonical_empty_candidate(
+            content_identity::parse_canonical_json(
+                intent.prepared_activation.canonical_receipt_json),
+            candidate.value().cell_graph.cell_id, intent.candidate_retained_bundle_id,
+            intent.candidate_graph_revision);
+      } catch (const std::exception &) {
+        return false;
+      }
+    }();
     for (const auto &change : delta.components) {
       if (change.disposition !=
               deployment::ApplyComponentDisposition::kReplace &&
@@ -215,7 +231,17 @@ public:
       Require(fact != inventory.value().component_lifecycles.end(),
               "actual_installed_state_unknown: changed component lifecycle is "
               "unavailable");
-      if (fact->state == core::ComponentLifecycleStateDTO::kActive)
+      const bool has_io_provider_domain = std::any_of(
+          predecessor.value().cell_graph.control_domains.begin(),
+          predecessor.value().cell_graph.control_domains.end(), [&](const auto &domain) {
+            return domain.provider() != nullptr &&
+                   domain.provider()->controllable_component_id ==
+                       change.controllable_component_id;
+          });
+      if (fact->state == core::ComponentLifecycleStateDTO::kActive &&
+          !ActiveComponentRemovableWithoutLiveProcess(
+              change, inventory.value().process_occurrences, canonical_empty_candidate,
+              has_io_provider_domain))
         throw ActiveComponentApplyRefusal(
             "configuration Apply cannot replace or remove Active component " +
             change.controllable_component_id.value() + "; deactivate it first");

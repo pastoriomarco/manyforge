@@ -429,7 +429,8 @@ RetainedExternallyManagedBrandLifecyclePort::Dispatch(
       outcome = state_->provider_dispatcher(intent, cancellation);
     else
       outcome = state_->dispatcher(state_->occurrence.control_domain_id,
-                                   intent.lifecycle_primitive_id, cancellation);
+                                   intent.lifecycle_primitive_id, cancellation,
+                                   intent.remaining_duration_ns);
   } catch (...) {
     // An exception after a possible send cannot prove no effect.
     outcome = {core::LifecyclePrimitiveDispatchStateDTO::kDispatchedUncertain,

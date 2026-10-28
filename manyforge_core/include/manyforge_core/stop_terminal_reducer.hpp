@@ -261,6 +261,19 @@ struct StopTerminalReductionInputDTO final {
 [[nodiscard]] std::optional<std::string_view> stop_certificate_field_error(
     const StopCertificateDTO& certificate) noexcept;
 
+/// Flattened certificate evidence derived from the attempts alone: one row per
+/// attempt evidence item, keyed by the attempt's scope key, its stage's
+/// stop_escalation_stage_id and stage index (resolved through
+/// result.request.participant_stop_plan.stage_commands), and its result
+/// sequence; canonically sorted. The terminal reducer and the lean terminal
+/// decoder both call this one function, so stored and reduced evidence cannot
+/// diverge. It does not join attempts to scope entries (the reducer and
+/// stop_certificate_field_error do). Errors: "stop_terminal_attempt_join_invalid"
+/// (stage index outside the plan), "stop_terminal_evidence_capacity_exceeded",
+/// "stop_terminal_evidence_conflict".
+[[nodiscard]] Result<std::vector<StopCertificateEvidenceItemDTO>> DeriveStopCertificateEvidence(
+    const std::vector<StopAttemptedStageResultDTO>& attempts);
+
 /// Deterministically merge complete predecessor certificates and newly
 /// captured rows, derive flattened evidence/subsets/result, and return one
 /// immutable certificate. No input value is modified.

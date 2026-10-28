@@ -4,6 +4,8 @@
 #include <manyforge_core/types/program_io_condition.hpp>
 #include "component_lifecycle_journal_codec_internal.hpp"
 
+#include <cstdio>
+
 namespace manyforge::core {
 
 Result<std::unique_ptr<ICellCloseAdmissionLease>>
@@ -75,7 +77,7 @@ Result<AuthoringAdmissionDTO> ResourceAddressedExecutionKernel::UpdateCellAdmiss
     if (result.ok()) {
       std::lock_guard state_lock(state_mutex_);
       const auto bb_current = reconcile_program_blackboard_cycle_locked(
-          snapshot.program_cycle_status, snapshot.program_cycle_status_current, actual_retired_service);
+          snapshot.program_cycle_status, actual_retired_service);
       if (!bb_current.ok()) return Result<AuthoringAdmissionDTO>::Err(bb_current.error());
       current_program_run_id_ =
           snapshot.program_cycle_status_current && snapshot.program_cycle_status
@@ -106,6 +108,36 @@ ResourceAddressedExecutionKernel::get_program_runner_loss() const {
 
 Result<CellAdmissionClaimDTO> ResourceAddressedExecutionKernel::AcquireCellAdmissionClaim(
     const CellAdmissionClaimIntentDTO& intent) {
+  return acquire_cell_admission_claim(intent, false);
+}
+
+namespace {
+
+/// The claim names exactly this ordinary CCLC lifecycle request.
+[[nodiscard]] bool lifecycle_claim_binds(const CellAdmissionClaimIntentDTO& claim,
+                                         const ComponentLifecycleIntentDTO& lifecycle) {
+  return lifecycle.locally_valid() && !lifecycle.program_node_evidence &&
+         claim.claim_kind == CellAdmissionClaimKindDTO::kComponentLifecycle &&
+         claim.owner_role == CellAdmissionOwnerRoleDTO::kComponentLifecycleOwner &&
+         claim.request_id == lifecycle.request_context.request_id &&
+         claim.owner_epoch == lifecycle.request_context.request_owner_epoch &&
+         claim.expected_admission_generation == lifecycle.expected_admission_generation &&
+         claim.request_payload_digest ==
+             ContentDigest(detail::ComponentLifecycleSemanticIntentDigest(lifecycle));
+}
+
+}  // namespace
+
+Result<CellAdmissionClaimDTO> ResourceAddressedExecutionKernel::AcquireComponentLifecycleClaim(
+    const CellAdmissionClaimIntentDTO& claim, const ComponentLifecycleIntentDTO& lifecycle) {
+  // D6: only a claim that is exactly a Disable may be one of Close's steps.
+  return acquire_cell_admission_claim(
+      claim, lifecycle.intent == ComponentLifecycleIntentKindDTO::kDisable &&
+                 lifecycle_claim_binds(claim, lifecycle));
+}
+
+Result<CellAdmissionClaimDTO> ResourceAddressedExecutionKernel::acquire_cell_admission_claim(
+    const CellAdmissionClaimIntentDTO& intent, const bool close_disable) {
   if (intent.claim_kind == CellAdmissionClaimKindDTO::kInterventionOrRecovery &&
       intent.owner_role == CellAdmissionOwnerRoleDTO::kComponentLifecycleOwner) {
     return reject<CellAdmissionClaimDTO>(
@@ -189,7 +221,8 @@ Result<CellAdmissionClaimDTO> ResourceAddressedExecutionKernel::AcquireCellAdmis
   }
   auto acquired = reset_proof
       ? cell_admission_owner_->AcquirePreparedProgramResetClaim(intent, *reset_proof)
-      : cell_admission_owner_->AcquireCellAdmissionClaim(intent);
+      : close_disable ? cell_admission_owner_->AcquireCloseDisableLifecycleClaim(intent)
+                      : cell_admission_owner_->AcquireCellAdmissionClaim(intent);
   if (acquired.ok() && intent.claim_kind == CellAdmissionClaimKindDTO::kProgramCycle) {
     refresh_execution_claims();
   }
@@ -414,7 +447,9 @@ ResourceAddressedExecutionKernel::AcquireIoOutputRecoveryLifecycleClaim(
     std::lock_guard state_lock(state_mutex_);
     idle = active_operations_.empty();
   }
-  if (idle) return AcquireCellAdmissionClaim(claim);
+  if (idle)
+    return acquire_cell_admission_claim(
+        claim, lifecycle.intent == ComponentLifecycleIntentKindDTO::kDisable);
   std::lock_guard submit_lock(submission_mutex_);
   std::lock_guard admission_lock(*admission_mutex_);
   return cell_admission_owner_->AcquireIoOutputRecoveryLifecycleClaim(
@@ -1072,7 +1107,11 @@ Result<void> ResourceAddressedExecutionKernel::validate_apply_bring_up_current_l
   for (const auto& [id, domain] : domains) { static_cast<void>(id); closure.domains.push_back(domain); }
   for (const auto& [id, binding] : bindings) { static_cast<void>(id); closure.bindings.push_back(binding); }
   closure.resources.assign(resources.begin(), resources.end());
-  if ((is_active_stop_fault_latch(active_stop_fault_latch_) && !exact_latch) ||
+  // D6: a latch carried past Close constrains only motion, not the next
+  // Scenario's bring-up.
+  const auto fault_scope = stop_fault_admission_scope_locked();
+  if ((fault_scope != StopFaultAdmissionScope::kNone &&
+       fault_scope != StopFaultAdmissionScope::kCarried && !exact_latch) ||
       closure != offer.admission.echoed_query.affected_scope) {
     return reject<void>("Apply bring-up crosses its exact contained selected scope",
                         "apply_bring_up_scope_not_exact");
@@ -1083,10 +1122,10 @@ Result<void> ResourceAddressedExecutionKernel::validate_apply_bring_up_current_l
 Result<CellAdmissionClaimDTO>
 ResourceAddressedExecutionKernel::AcquireConfigurationApplyCellAdmissionClaim(
     const CellAdmissionClaimIntentDTO& intent,
-    const CellAdmissionConfigurationApplyValidator& validate) {
+    const CellAdmissionConfigurationApplyValidator& validate, const bool canonical_empty_candidate) {
   std::lock_guard submit_lock(submission_mutex_);
   std::lock_guard admission_lock(*admission_mutex_);
-  return cell_admission_owner_->AcquireConfigurationApplyClaim(intent, validate);
+  return cell_admission_owner_->AcquireConfigurationApplyClaim(intent, validate, canonical_empty_candidate);
 }
 
 Result<AuthoringAdmissionDTO>
@@ -2091,6 +2130,62 @@ void ResourceAddressedExecutionKernel::LatchAndContain(
     } catch (...) {
     }
   }
+}
+
+void ResourceAddressedExecutionKernel::ContainInternalFault(
+    const std::string_view reason_code) noexcept {
+  bool claimed = false;
+  bool contained = false;
+  std::string stop_error;
+  try {
+    StopGeneration expected_stop_generation(0U);
+    {
+      std::lock_guard state_lock(state_mutex_);
+      motion_admission_closed_ = true;
+      // One fault per runtime: a repeating throw only counts, so it requests
+      // no further Full Stop (no journal growth per event).
+      if (internal_fault_) {
+        ++internal_fault_->later_count;
+        return;
+      }
+      internal_fault_ = KernelInternalFaultDTO{config_.request_owner_epoch,
+                                               std::string(reason_code), false, std::nullopt, 0U};
+      claimed = true;
+      expected_stop_generation = cell_stop_generation_;
+    }
+    const auto material = config_.request_owner_epoch.value() + "\ninternal-fault\n" +
+                          std::string(reason_code) + "\n" +
+                          std::to_string(expected_stop_generation.value());
+    FullStopIntentDTO containment{
+        PublicRequestContextDTO{RequestId(manyforge::content_identity::sha256_digest(material)),
+                                config_.request_owner_epoch, "kernel.internal_fault",
+                                std::string(reason_code)},
+        expected_stop_generation,
+        RequestAttributionDTO{RequestTransportDTO::kInternal, RequestAssuranceDTO::kUnverified,
+                              std::nullopt}};
+    // A resident Stop is joined. The Stop fence revokes the lookahead permits
+    // of every active motion participant (an idle cell has none).
+    const auto accepted = accept_stop(EmergencyStopProjectedIntentDTO{std::move(containment)});
+    contained = accepted.ok();
+    if (!contained) stop_error = accepted.error().details.contains("reason")
+                                     ? accepted.error().details.at("reason")
+                                     : accepted.error().code;
+  } catch (...) {
+    stop_error = "containment_stop_exception";
+  }
+  // The fault record, its runtime-fault fact and its alarm name the outcome.
+  if (claimed) {
+    try {
+      std::lock_guard state_lock(state_mutex_);
+      internal_fault_->stop_accepted = contained;
+      if (!contained) internal_fault_->stop_refusal_code = stop_error;
+    } catch (...) {
+    }
+  }
+  (void)std::fprintf(stderr, "manyforge_fault code=%.*s state=%s%s%s\n",
+                     static_cast<int>(reason_code.size()), reason_code.data(),
+                     contained ? "contained" : "containment_failed",
+                     contained ? "" : " error=", stop_error.c_str());
 }
 
 void ResourceAddressedExecutionKernel::attribute_containment_stop_locked(

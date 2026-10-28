@@ -455,6 +455,9 @@ def test_no_project_ros_start_selects_repository_empty_with_original_identity(
     }
     runner = commands["Program runner"]
     assert runner[runner.index("--cycle-journal-path") + 1] == str(tmp_path / "state/current/program-cycle.sqlite3")
+    assert runner[runner.index("--snapshot-url") + 1] == (
+        "http://127.0.0.1:3/api/scene/snapshot/render"
+    )
     headless = commands["Headless API"]
     assert headless[headless.index("--historian-database-path") + 1] == str(tmp_path / "state/history.sqlite3")
     assert headless[headless.index("--projection-root") + 1] == str(tmp_path / "state/current/publications")
@@ -504,7 +507,7 @@ def test_process_stack_stages_only_selected_host_without_starting_services(
 @pytest.mark.parametrize("project,bootstrap,ros,error", [
     (None, "first", False, "requires ROS control"),
     ("first", "second", True, "excludes --project"),
-    ("non_ros_fixture", None, True, "only ros2_control execution components"),
+    ("non_ros_fixture", None, True, "a ros2_control execution component"),
 ])
 def test_invalid_ros_selection_is_refused_before_builds_or_runtime_start(
     monkeypatch: Any, project: str | None, bootstrap: str | None, ros: bool, error: str
@@ -528,6 +531,48 @@ def test_invalid_ros_selection_is_refused_before_builds_or_runtime_start(
     with pytest.raises(dev_workbench.WorkbenchError, match=error):
         workbench.start()
     assert workbench.processes == []
+
+
+@pytest.mark.parametrize("kinds,admitted", [
+    (["ros2_control"], True),
+    (["ros2_control", "ros2_control"], True),
+    (["pose_source", "ros2_control"], True),
+    (["io_provider", "io_provider", "ros2_control"], True),
+    (["ai_model", "pose_source", "ros2_control"], True),
+    (["io_provider"], False),
+    (["pose_source", "ai_model"], False),
+    (["native"], False),
+    (["native", "ros2_control"], False),
+    (["unknown_kind", "ros2_control"], False),
+])
+def test_ros_start_guard_admits_model_free_components_beside_ros2_control(
+    monkeypatch: Any, kinds: list[str], admitted: bool
+) -> None:
+    from manyforge_composer.backend import scenario_artifacts
+
+    deployment = {"components": [
+        {"configuration": {"runtime_kind": kind}} for kind in kinds]}
+    # An incomplete fixture: past the guard, capture stops at the Program check.
+    monkeypatch.setattr(scenario_artifacts, "capture_scenario_artifact",
+        lambda *args, **kwargs: ({"deployment_draft": deployment,
+                                  "program_draft": None}, "/fixture", "digest"))
+    error = ("intended first ROS Scenario is incomplete" if admitted
+             else "a ros2_control execution component")
+    with pytest.raises(dev_workbench.WorkbenchError, match=error):
+        dev_workbench._capture_ros_bootstrap_project(
+            "/fixture", allowed_root=REPOSITORY_ROOT / "examples")
+
+
+def test_ros_bootstrap_captures_io_provider_scenario() -> None:
+    captured, source = dev_workbench._capture_ros_bootstrap_project(
+        str(REPOSITORY_ROOT / "examples/lite6_pneumatic_real.scenario"),
+        allowed_root=REPOSITORY_ROOT / "examples",
+    )
+    assert source.endswith("/examples/lite6_pneumatic_real.scenario")
+    assert sorted(
+        component["configuration"]["runtime_kind"]
+        for component in captured["deployment"]["components"]
+    ) == ["io_provider", "io_provider", "ros2_control"]
 
 
 def test_ros_bootstrap_captures_authored_program_and_uses_production_preparer(

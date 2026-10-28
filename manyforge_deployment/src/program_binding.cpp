@@ -1781,7 +1781,7 @@ void verify_binding_context(const core::ProgramBindingDTO& binding,
   if (!verify_retained_bundle_identity(retained_bundle)) {
     fail("selected retained bundle no longer passes its intrinsic identity proof");
   }
-  const auto io_catalog = ResolveRetainedIoSignalCatalog(graph);
+  const auto io_catalog = ResolveCompiledIoSignalCatalog(graph);
   if (!io_catalog.ok())
     fail(io_catalog.error().details.at("reason"));
 

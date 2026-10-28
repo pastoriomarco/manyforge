@@ -15,7 +15,10 @@ import type {
   SceneRuntimeProjection,
   SceneRuntimeGoodObservationPayload,
   SceneRuntimeObservationPose,
+  SceneRuntimeObservationReference,
   SceneRuntimePoseSource,
+  SceneRuntimeAttachedPoseReference,
+  SceneRuntimePoseMeasurementFields,
   SceneRuntimeUnknownObservationPayload,
   SceneMeshAssetMetadata,
   SceneTransactionResponse,
@@ -33,6 +36,7 @@ import type {
   SourceModelTarget,
 } from '../../types/api';
 import {
+  allowedKeysAt,
   arrayAt,
   booleanAt,
   boundedArrayAt,
@@ -1080,15 +1084,48 @@ export function parseSceneRuntimeProjection(value: unknown): SceneRuntimeProject
           ).map((item, index) => {
             const path = `sceneRuntime.state.carried_object_losses[${index}]`;
             const row = objectAt(item, path);
-            exactKeysAt(row, ['code', 'event_id', 'full_text', 'scene_resource_id'], path);
+            allowedKeysAt(row, [
+              'carried_object_attachment_id', 'code', 'command_target_id', 'controllable_component_id',
+              'event_id', 'full_text', 'on_grasp_lost', 'scene_resource_id',
+            ], ['signal_error'], path);
             if (row.code !== 'scene.carried_object_lost') {
               return fail(`${path}.code`, 'scene.carried_object_lost');
             }
+            const policyPath = `${path}.on_grasp_lost`;
+            const policy = objectAt(row.on_grasp_lost, policyPath);
+            exactKeysAt(policy, ['detach', 'raise_alarm', 'set_key', 'stop_motion'], policyPath);
+            const raiseAlarm = booleanAt(policy.raise_alarm, `${policyPath}.raise_alarm`);
+            const stopMotion = booleanAt(policy.stop_motion, `${policyPath}.stop_motion`);
+            if (raiseAlarm && !stopMotion) {
+              return fail(`${policyPath}.stop_motion`, 'true when raise_alarm is true');
+            }
+            const signalError = Object.hasOwn(row, 'signal_error')
+              ? nonEmptyStringAt(row.signal_error, `${path}.signal_error`)
+              : undefined;
+            if (signalError !== undefined && (!raiseAlarm || !stopMotion)) {
+              return fail(`${path}.on_grasp_lost`, 'raise_alarm and stop_motion true when signal_error is present');
+            }
             return {
+              carried_object_attachment_id: nonEmptyStringAt(
+                row.carried_object_attachment_id,
+                `${path}.carried_object_attachment_id`,
+              ),
               code: 'scene.carried_object_lost' as const,
+              command_target_id: nonEmptyStringAt(row.command_target_id, `${path}.command_target_id`),
+              controllable_component_id: nonEmptyStringAt(
+                row.controllable_component_id,
+                `${path}.controllable_component_id`,
+              ),
               event_id: nonEmptyStringAt(row.event_id, `${path}.event_id`),
               full_text: nonEmptyStringAt(row.full_text, `${path}.full_text`),
+              on_grasp_lost: {
+                detach: booleanAt(policy.detach, `${policyPath}.detach`),
+                raise_alarm: raiseAlarm,
+                set_key: nullableStringAt(policy.set_key, `${policyPath}.set_key`),
+                stop_motion: stopMotion,
+              },
               scene_resource_id: nonEmptyStringAt(row.scene_resource_id, `${path}.scene_resource_id`),
+              ...(signalError === undefined ? {} : { signal_error: signalError }),
             };
           }),
         }
@@ -1184,22 +1221,26 @@ function parseSceneRuntimeObservationPose(
   };
 }
 
-type ObservationReference = Extract<
-  SceneRuntimeGoodObservationPayload,
-  { kind: 'simulation_entity_pose_with_reference.v1' }
->['reference'];
-
 function parseSceneRuntimeObservationReference(
   value: unknown,
   path: string,
-): ObservationReference {
+): SceneRuntimeObservationReference {
   const record = objectAt(value, path);
   exactKeysAt(
     record,
-    ['coherent', 'entity', 'link', 'pose_in_reference'],
+    [
+      'coherent',
+      'command_target_id',
+      'controllable_component_id',
+      'gripper_link',
+      'entity',
+      'link',
+      'source_header_frame_id',
+      'pose_in_reference',
+    ],
     path,
   );
-  let relative: ObservationReference['pose_in_reference'] = null;
+  let relative: SceneRuntimeObservationReference['pose_in_reference'] = null;
   if (record.pose_in_reference !== null) {
     const pose = objectAt(record.pose_in_reference, `${path}.pose_in_reference`);
     exactKeysAt(
@@ -1220,10 +1261,36 @@ function parseSceneRuntimeObservationReference(
   }
   return {
     coherent: booleanAt(record.coherent, `${path}.coherent`),
+    command_target_id: nonEmptyStringAt(record.command_target_id, `${path}.command_target_id`),
+    controllable_component_id: nonEmptyStringAt(
+      record.controllable_component_id,
+      `${path}.controllable_component_id`,
+    ),
+    gripper_link: nonEmptyStringAt(record.gripper_link, `${path}.gripper_link`),
     entity: nonEmptyStringAt(record.entity, `${path}.entity`),
     link: nonEmptyStringAt(record.link, `${path}.link`),
+    source_header_frame_id: nonEmptyStringAt(
+      record.source_header_frame_id,
+      `${path}.source_header_frame_id`,
+    ),
     pose_in_reference: relative,
   };
+}
+
+function parseSceneRuntimeObservationReferences(
+  value: unknown,
+  path: string,
+): SceneRuntimeObservationReference[] {
+  const references = boundedArrayAt(value, path, 4096).map((item, index) => (
+    parseSceneRuntimeObservationReference(item, `${path}[${index}]`)
+  ));
+  const keys = references.map((reference) => (
+    `${reference.controllable_component_id}\u0000${reference.command_target_id}`
+  ));
+  if (new Set(keys).size !== keys.length) {
+    return fail(path, 'unique controllable_component_id and command_target_id pairs');
+  }
+  return references;
 }
 
 function parseSceneRuntimeGoodPayload(
@@ -1278,7 +1345,7 @@ function parseSceneRuntimeGoodPayload(
       topic,
     };
   }
-  const referenced = kind === 'simulation_entity_pose_with_reference.v1';
+  const referenced = kind === 'simulation_entity_pose_with_references.v1';
   if (
     kind !== 'simulation_entity_pose'
     && kind !== 'detection3d_pose'
@@ -1289,7 +1356,7 @@ function parseSceneRuntimeGoodPayload(
   exactKeysAt(
     record,
     referenced
-      ? ['api_version', 'kind', 'pose', 'reference', 'source']
+      ? ['api_version', 'kind', 'pose', 'references', 'source']
       : ['api_version', 'kind', 'pose', 'source'],
     path,
   );
@@ -1305,9 +1372,9 @@ function parseSceneRuntimeGoodPayload(
         api_version: 'manyforge.ros_pose_observation.v2',
         kind,
         pose,
-        reference: parseSceneRuntimeObservationReference(
-          record.reference,
-          `${path}.reference`,
+        references: parseSceneRuntimeObservationReferences(
+          record.references,
+          `${path}.references`,
         ),
         source: entitySource,
       };
@@ -1368,7 +1435,7 @@ function parseSceneRuntimeUnknownPayload(
   if (![
     'joint_state',
     'simulation_entity_pose',
-    'simulation_entity_pose_with_reference.v1',
+    'simulation_entity_pose_with_references.v1',
     'detection3d_pose',
   ].includes(kind)) {
     return fail(`${path}.kind`, 'a supported ROS pose-observation kind');
@@ -1401,7 +1468,7 @@ function parseSceneRuntimePoseSource(
   path: string,
 ): SceneRuntimePoseSource {
   const record = objectAt(value, path);
-  exactKeysAt(
+  allowedKeysAt(
     record,
     [
       'buffered',
@@ -1418,8 +1485,18 @@ function parseSceneRuntimePoseSource(
       'source_id',
       'source_sequence',
     ],
+    [
+      'holder',
+      'measured_against',
+      'source_header_frame_id',
+      'frame',
+      'current_offset',
+      'baseline_offset',
+      'drift',
+    ],
     path,
   );
+  const poseMeasurement = parseSceneRuntimePoseMeasurement(record, path);
   const observedAt = monotonicNanosecondsAt(record.observed_at_ns, `${path}.observed_at_ns`);
   const expiresAt = monotonicNanosecondsAt(record.expires_at_ns, `${path}.expires_at_ns`);
   if (BigInt(expiresAt) < BigInt(observedAt)) {
@@ -1447,6 +1524,9 @@ function parseSceneRuntimePoseSource(
   const eligible = booleanAt(record.eligible, `${path}.eligible`);
   const fresh = booleanAt(record.fresh, `${path}.fresh`);
   if (quality === 'unknown') {
+    if (Object.keys(poseMeasurement).length > 0) {
+      return fail(path, 'unknown observations without pose measurements');
+    }
     if (base.buffered || eligible || fresh) {
       return fail(path, 'unknown quality to be unbuffered, ineligible, and stale');
     }
@@ -1465,12 +1545,192 @@ function parseSceneRuntimePoseSource(
   if (base.buffered && (!eligible || !fresh)) {
     return fail(path, 'a buffered observation to be eligible and fresh');
   }
+  const payload = parseSceneRuntimeGoodPayload(record.payload, `${path}.payload`);
+  if (Object.keys(poseMeasurement).length > 0) {
+    if (poseMeasurement.measured_against === 'cell frame') {
+      if (base.policy_id !== 'continuous') {
+        return fail(path, 'cell-frame pose measurements only on continuous rows');
+      }
+    } else {
+      if (
+        base.policy_id !== 'continuous_relative_to_attached'
+        || payload.kind !== 'simulation_entity_pose_with_references.v1'
+      ) {
+        return fail(
+          path,
+          'gripper-relative pose measurements only on continuous_relative_to_attached referenced-pose rows',
+        );
+      }
+      const holder = poseMeasurement.holder!;
+      const measuredAgainst = poseMeasurement.measured_against!;
+      const sourceHeaderFrameId = poseMeasurement.source_header_frame_id;
+      const referenceMatches = payload.references.filter((reference) => (
+        reference.controllable_component_id === holder.controllable_component_id
+        && reference.command_target_id === holder.command_target_id
+      ));
+      if (referenceMatches.length !== 1) {
+        return fail(
+          path,
+          'one referenced-pose row matching the attached holder target',
+        );
+      }
+      const reference = referenceMatches[0];
+      if (
+        reference === undefined
+        || reference.gripper_link !== holder.gripper_link
+        || reference.entity !== measuredAgainst.entity
+        || reference.link !== measuredAgainst.link
+        || (sourceHeaderFrameId !== undefined
+          && reference.source_header_frame_id !== sourceHeaderFrameId)
+        || !reference.coherent
+        || reference.pose_in_reference === null
+      ) {
+        return fail(
+          path,
+          'gripper-relative pose measurements to match a coherent reference in the same observation',
+        );
+      }
+    }
+  }
   return {
     ...base,
+    ...poseMeasurement,
     eligible,
     fresh,
-    payload: parseSceneRuntimeGoodPayload(record.payload, `${path}.payload`),
+    payload,
     payload_quality: quality,
+  };
+}
+
+function parseSceneRuntimePoseMeasurement(
+  record: Record<string, unknown>,
+  path: string,
+): SceneRuntimePoseMeasurementFields {
+  const fieldNames = [
+    'holder',
+    'measured_against',
+    'source_header_frame_id',
+    'frame',
+    'current_offset',
+    'baseline_offset',
+    'drift',
+  ] as const;
+  const present = fieldNames.filter((field) => Object.prototype.hasOwnProperty.call(record, field));
+  if (present.length === 0) return {};
+  for (const field of ['measured_against', 'frame', 'current_offset'] as const) {
+    if (!Object.prototype.hasOwnProperty.call(record, field)) {
+      return fail(`${path}.${field}`, 'present with the pose measurement');
+    }
+  }
+  const hasBaseline = Object.prototype.hasOwnProperty.call(record, 'baseline_offset');
+  const hasDrift = Object.prototype.hasOwnProperty.call(record, 'drift');
+  if (hasBaseline !== hasDrift) {
+    return fail(path, 'baseline_offset and drift to be present together');
+  }
+
+  const holderPresent = Object.prototype.hasOwnProperty.call(record, 'holder');
+  const sourceHeaderPresent = Object.prototype.hasOwnProperty.call(record, 'source_header_frame_id');
+  const cellFrameMeasurement = record.measured_against === 'cell frame';
+  let parsedHolder: SceneRuntimeAttachedPoseReference['holder'] | undefined;
+  let parsedMeasuredAgainst: SceneRuntimeAttachedPoseReference['measured_against'] | 'cell frame';
+  if (cellFrameMeasurement) {
+    if (holderPresent || sourceHeaderPresent) {
+      return fail(path, 'cell-frame measurements without holder or source-header fields');
+    }
+    parsedMeasuredAgainst = 'cell frame';
+  } else {
+    if (!holderPresent) {
+      return fail(`${path}.holder`, 'present for a gripper-relative measurement');
+    }
+    const holder = objectAt(record.holder, `${path}.holder`);
+    exactKeysAt(
+      holder,
+      ['command_target_id', 'controllable_component_id', 'gripper_link'],
+      `${path}.holder`,
+    );
+    parsedHolder = {
+      controllable_component_id: nonEmptyStringAt(
+        holder.controllable_component_id,
+        `${path}.holder.controllable_component_id`,
+      ),
+      command_target_id: nonEmptyStringAt(
+        holder.command_target_id,
+        `${path}.holder.command_target_id`,
+      ),
+      gripper_link: nonEmptyStringAt(holder.gripper_link, `${path}.holder.gripper_link`),
+    };
+
+    const measuredAgainst = objectAt(record.measured_against, `${path}.measured_against`);
+    exactKeysAt(measuredAgainst, ['entity', 'link'], `${path}.measured_against`);
+    parsedMeasuredAgainst = {
+      entity: nonEmptyStringAt(measuredAgainst.entity, `${path}.measured_against.entity`),
+      link: nonEmptyStringAt(measuredAgainst.link, `${path}.measured_against.link`),
+    };
+  }
+
+  const frame = objectAt(record.frame, `${path}.frame`);
+  exactKeysAt(
+    frame,
+    ['kind', 'controllable_component_id', 'model_instance_id', 'frame_role_id'],
+    `${path}.frame`,
+  );
+  if (frame.kind !== 'component') {
+    return fail(`${path}.frame.kind`, 'component');
+  }
+  const parsedFrame = {
+    kind: 'component' as const,
+    controllable_component_id: nonEmptyStringAt(
+      frame.controllable_component_id,
+      `${path}.frame.controllable_component_id`,
+    ),
+    model_instance_id: nonEmptyStringAt(frame.model_instance_id, `${path}.frame.model_instance_id`),
+    frame_role_id: nonEmptyStringAt(frame.frame_role_id, `${path}.frame.frame_role_id`),
+  };
+  if (parsedHolder !== undefined
+    && parsedHolder.controllable_component_id !== parsedFrame.controllable_component_id) {
+    return fail(path, 'holder and frame to identify the same component');
+  }
+
+  const pose = (name: 'current_offset' | 'baseline_offset') => {
+    const posePath = `${path}.${name}`;
+    const value = objectAt(record[name], posePath);
+    exactKeysAt(value, ['position_m', 'orientation_xyzw'], posePath);
+    const position = objectAt(value.position_m, `${posePath}.position_m`);
+    exactKeysAt(position, ['x', 'y', 'z'], `${posePath}.position_m`);
+    return {
+      position_m: {
+        x: numberAt(position.x, `${posePath}.position_m.x`),
+        y: numberAt(position.y, `${posePath}.position_m.y`),
+        z: numberAt(position.z, `${posePath}.position_m.z`),
+      },
+      orientation_xyzw: quaternionAt(value.orientation_xyzw, `${posePath}.orientation_xyzw`),
+    };
+  };
+  const parsedCurrentOffset = pose('current_offset');
+  const sourceHeaderFrameId = Object.prototype.hasOwnProperty.call(record, 'source_header_frame_id')
+    ? nonEmptyStringAt(record.source_header_frame_id, `${path}.source_header_frame_id`)
+    : undefined;
+  const baselineOffset = hasBaseline ? pose('baseline_offset') : undefined;
+  let drift: SceneRuntimeAttachedPoseReference['drift'];
+  if (hasDrift) {
+    const value = objectAt(record.drift, `${path}.drift`);
+    exactKeysAt(value, ['translation_m', 'rotation_rad'], `${path}.drift`);
+    const translation = numberAt(value.translation_m, `${path}.drift.translation_m`);
+    const rotation = numberAt(value.rotation_rad, `${path}.drift.rotation_rad`);
+    if (translation < 0 || rotation < 0) {
+      return fail(`${path}.drift`, 'non-negative translation_m and rotation_rad');
+    }
+    drift = { translation_m: translation, rotation_rad: rotation };
+  }
+
+  return {
+    ...(parsedHolder === undefined ? {} : { holder: parsedHolder }),
+    measured_against: parsedMeasuredAgainst,
+    ...(sourceHeaderFrameId === undefined ? {} : { source_header_frame_id: sourceHeaderFrameId }),
+    frame: parsedFrame,
+    current_offset: parsedCurrentOffset,
+    ...(baselineOffset === undefined ? {} : { baseline_offset: baselineOffset }),
+    ...(drift === undefined ? {} : { drift }),
   };
 }
 

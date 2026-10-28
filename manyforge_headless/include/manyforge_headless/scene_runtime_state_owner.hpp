@@ -1,5 +1,7 @@
 #pragma once
 
+#include <manyforge_core/types/logical_scene_snapshot.hpp>
+
 #include <cstddef>
 #include <cstdint>
 #include <functional>
@@ -129,12 +131,21 @@ struct SceneInitializationCounters final {
 };
 
 /// One `scene.carried_object_lost` event, published for the operator alarm
-/// only. The last kMaximumCarriedObjectLossEvents are kept; nothing else
-/// reads them.
+/// (`on_grasp_lost.raise_alarm`). The last kMaximumCarriedObjectLossEvents are
+/// kept. The Program reads the gripper's system signal, not this event.
 struct CarriedObjectLossEvent final {
   std::string event_id;
   std::string scene_resource_id;
   std::string full_text;
+  std::string carried_object_attachment_id;
+  std::string controllable_component_id;
+  std::string command_target_id;
+  /// The `on_grasp_lost` applied (all four fields): the attachment's, with
+  /// alarm and Stop forced when the signal publication failed.
+  manyforge::core::GraspLostResponseDTO on_grasp_lost;
+  /// The typed publication error when the system signal could not be
+  /// published (SX-204); absent otherwise.
+  std::optional<std::string> signal_error{};
   friend bool operator==(const CarriedObjectLossEvent &,
                          const CarriedObjectLossEvent &) = default;
 };

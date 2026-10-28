@@ -1,6 +1,7 @@
 #include <algorithm>
 #include <atomic>
 #include <condition_variable>
+#include <cstdio>
 #include <deque>
 #include <exception>
 #include <functional>
@@ -397,6 +398,151 @@ enum class UncertainEffectResolution : std::uint8_t {
   return status.phase == ComponentLifecycleTransactionPhaseDTO::kSucceeded ||
          status.phase == ComponentLifecycleTransactionPhaseDTO::kFailed;
 }
+
+// Why a lifecycle transaction stopped without a terminal result. One stderr
+// line per exit; the durable row and the held claim stay for reconciliation.
+enum class LifecycleStallReason : std::uint8_t {
+  kWorkerSubmitRefused,
+  kEffectPrepareJournalRefused,
+  kEffectCompleteJournalRefused,
+  kReconcileJournalRefused,
+  kProgressJournalRefused,
+  kOutcomeUnknownJournalRefused,
+  kTerminalStatusInvalid,
+  kTerminalReadinessRefused,
+  kTerminalCommitRefused,
+  kClaimReleaseUnverified,
+  kDomainReleaseRefused,
+  kApplyStopped,
+  kRecoveryParked,
+  kRecoveryStatusRefused,
+  kRecoveryEvidenceInvalid,
+};
+
+[[nodiscard]] constexpr const char* stall_reason_code(LifecycleStallReason reason) noexcept {
+  switch (reason) {
+    case LifecycleStallReason::kWorkerSubmitRefused:
+      return "worker_submit_refused";
+    case LifecycleStallReason::kEffectPrepareJournalRefused:
+      return "effect_prepare_journal_refused";
+    case LifecycleStallReason::kEffectCompleteJournalRefused:
+      return "effect_complete_journal_refused";
+    case LifecycleStallReason::kReconcileJournalRefused:
+      return "reconcile_journal_refused";
+    case LifecycleStallReason::kProgressJournalRefused:
+      return "progress_journal_refused";
+    case LifecycleStallReason::kOutcomeUnknownJournalRefused:
+      return "outcome_unknown_journal_refused";
+    case LifecycleStallReason::kTerminalStatusInvalid:
+      return "terminal_status_invalid";
+    case LifecycleStallReason::kTerminalReadinessRefused:
+      return "terminal_readiness_refused";
+    case LifecycleStallReason::kTerminalCommitRefused:
+      return "terminal_commit_refused";
+    case LifecycleStallReason::kClaimReleaseUnverified:
+      return "claim_release_unverified";
+    case LifecycleStallReason::kDomainReleaseRefused:
+      return "domain_release_refused";
+    case LifecycleStallReason::kApplyStopped:
+      return "apply_stopped";
+    case LifecycleStallReason::kRecoveryParked:
+      return "recovery_parked";
+    case LifecycleStallReason::kRecoveryStatusRefused:
+      return "recovery_status_refused";
+    case LifecycleStallReason::kRecoveryEvidenceInvalid:
+      return "recovery_evidence_invalid";
+  }
+  return "unknown";
+}
+
+// The component state a succeeded Recover leaves: its domains' observed
+// state, or the least advanced one when they differ (declared < disabled <
+// prepared < active), so the target driver re-drives from the lowest. A
+// Recover never makes the component command-ready: all-Active is Prepared,
+// and Enable establishes Active.
+[[nodiscard]] std::optional<ComponentLifecycleStateDTO> recover_component_state(
+    const ComponentLifecycleStatusDTO& status) noexcept {
+  const auto rank = [](ComponentLifecycleStateDTO state) {
+    return state == ComponentLifecycleStateDTO::kDeclared   ? 0
+           : state == ComponentLifecycleStateDTO::kDisabled ? 1
+           : state == ComponentLifecycleStateDTO::kPrepared ? 2
+                                                            : 3;
+  };
+  std::optional<ComponentLifecycleStateDTO> lowest;
+  for (const auto& domain : status.domains) {
+    if (domain.current_state && (!lowest || rank(*domain.current_state) < rank(*lowest)))
+      lowest = domain.current_state;
+  }
+  if (lowest == ComponentLifecycleStateDTO::kActive) return ComponentLifecycleStateDTO::kPrepared;
+  return lowest ? lowest : status.requested_state.state;
+}
+
+void log_lifecycle_stall(const ComponentLifecycleAcceptedDTO& acceptance,
+                         LifecycleStallReason reason, const std::string& error_code) noexcept {
+  (void)std::fprintf(stderr,
+                     "manyforge_cclc_lifecycle_stall transaction=%.128s generation=%llu "
+                     "reason=%s error=%.128s\n",
+                     acceptance.lifecycle_transaction_id.value().c_str(),
+                     static_cast<unsigned long long>(
+                         acceptance.lifecycle_transaction_generation.value()),
+                     stall_reason_code(reason), error_code.empty() ? "none" : error_code.c_str());
+}
+
+// A settled partial effect records each failed domain's observed fault-free
+// state and the component's settled state (least advanced, never Active).
+// Every domain's evidence, succeeded or failed, counts only while it is still
+// fresh (`fresh_until_ns` after `now`)
+// from the domain's exact provider (matched when it was received), and for a
+// domain with an effect only if it postdates its last step. Otherwise the
+// domain counts as Declared; so does a terminal written by a replacement
+// owner, whose retained states must stay as they were (the journal then
+// records Declared). Either way the status carries the typed
+// `component_state` warning and one log line is written.
+void settle_partial_effect_state(
+    ComponentLifecycleStatusDTO& status, bool observed_by_this_owner,
+    const std::vector<std::optional<BrandLifecycleObservationDTO>>& evidence,
+    std::int64_t now_ns) noexcept {
+  bool reconstructed = !observed_by_this_owner || !status.current_state;
+  if (!reconstructed) {
+    std::vector<std::optional<ComponentLifecycleStateDTO>> states;
+    states.reserve(status.domains.size());
+    for (std::size_t index = 0U; index < status.domains.size(); ++index) {
+      auto& domain = status.domains[index];
+      const bool effect = domain.effect == ComponentLifecycleDomainEffectDTO::kEffectObserved ||
+                          domain.effect == ComponentLifecycleDomainEffectDTO::kPartialEffectObserved;
+      const auto* latest = index < evidence.size() && evidence[index] ? &*evidence[index] : nullptr;
+      const bool fresh =
+          latest != nullptr && now_ns < latest->fresh_until_ns &&
+          (!effect || domain.primitive_attempts.empty() ||
+           latest->observation_generation >
+               domain.primitive_attempts.back().expected_observation_generation);
+      const auto observed =
+          RestingLifecycleState(fresh ? std::optional(latest->observed_state) : std::nullopt);
+      // A succeeded domain keeps its verified state in the status; it counts
+      // for the component only while its evidence is still fresh.
+      if (domain.action_state == ComponentLifecycleDomainActionStateDTO::kSucceeded) {
+        states.push_back(observed ? domain.current_state : std::nullopt);
+        continue;
+      }
+      if (domain.current_state)
+        domain.current_state = observed.value_or(ComponentLifecycleStateDTO::kDeclared);
+      states.push_back(observed);
+    }
+    const auto settled = SettleObservedComponentLifecycleState(states);
+    status.current_state = settled.state;
+    reconstructed = settled.reconstructed;
+  }
+  if (!reconstructed) return;
+  if (status.error && status.error->details.size() < kMaxLifecycleErrorDetails)
+    status.error->details.emplace("component_state",
+                                  std::string(kComponentLifecycleStateReconstructedCode));
+  (void)std::fprintf(stderr,
+                     "manyforge_cclc_lifecycle_state_reconstructed transaction=%.128s "
+                     "component=%.128s state=declared\n",
+                     status.acceptance.lifecycle_transaction_id.value().c_str(),
+                     status.accepted_intent.controllable_component_id.value().c_str());
+}
+
 
 }  // namespace
 
@@ -812,7 +958,9 @@ class ComponentLifecycleCoordinator::Impl final {
           readiness.measured_state.error = coordinator_error("measured_source_unavailable",
               "the captured source view belongs to another component", "measured_component_mismatch");
         else {
-          auto measured = context.measured_state_inventory->ReadComponent(*sources->measured_sources, now);
+          // Fresh boundary: the measured stream (150 Hz on Real) may deliver a sample newer than the pass's
+          // `now`, which the snapshot validator would refuse as observation_metadata_invalid.
+          auto measured = context.measured_state_inventory->ReadComponent(*sources->measured_sources, clock_.now());
           if (!measured.ok()) readiness.measured_state.error = measured.error();
           else readiness.measured_state.available = true;
         }
@@ -899,6 +1047,23 @@ class ComponentLifecycleCoordinator::Impl final {
               owner_wide_containment_gate_count_ == 0U && unresolved_effect_admission_gate_count_ == 0U))
         return ReadResult::Err(coordinator_error("component_lifecycle_facts_stale",
             "the current owner changed during its read", "owner_read_changed"));
+    }
+    // A numbered component without a current fact reads its state from fresh
+    // domain health (the snapshot source settles it by the same rule). With
+    // no fresh fault-free health it reads Declared and carries the warning.
+    if (const auto fact = journal_.LoadCurrentComponentLifecycleFact(component);
+        fact.ok() && fact.value().durable_generation && !fact.value().current_state) {
+      std::vector<std::optional<ComponentLifecycleStateDTO>> observed;
+      observed.reserve(readiness.domains.size());
+      for (const auto& row : readiness.domains)
+        observed.push_back(row.health ? std::optional(row.health->observed_state) : std::nullopt);
+      if (SettleObservedComponentLifecycleState(observed).reconstructed) {
+        auto warning = coordinator_error(std::string(kComponentLifecycleStateReconstructedCode),
+            "the component has no fresh fault-free domain state and reads Declared",
+            "current_state_fact_missing");
+        if (readiness.error) warning.details.emplace("blocking_code", readiness.error->code);
+        readiness.error = std::move(warning);
+      }
     }
     readiness.ready = !readiness.error;
     return ReadResult::Ok(std::move(result));
@@ -1517,6 +1682,7 @@ class ComponentLifecycleCoordinator::Impl final {
           // replacement owner. All successor rows therefore retain zero
           // remaining duration, including reconciliation and fence release.
           runtime->effective_deadline_ns = runtime->status.accepted_at_ns;
+          runtime->deadline_armed = true;  // No budget remains to bound.
           runtime->effect_sequence =
               recovered.value().effect_sequence_watermarks[index].highest_effect_sequence;
           const auto unresolved = std::find_if(recovered.value().unresolved_effect_attempts.begin(),
@@ -2305,6 +2471,7 @@ class ComponentLifecycleCoordinator::Impl final {
         return Result<void>::Err(observed.ok() ? ApplyError("installed_observation_not_fresh")
                                                : observed.error());
       runtime->observations[index] = observed.value();
+      RememberSettleEvidence(runtime, index, observed.value());
       if (!domain.previous_state) domain.previous_state = observed.value().observed_state;
       domain.current_state = observed.value().observed_state;
       const auto decision =
@@ -2337,6 +2504,8 @@ class ComponentLifecycleCoordinator::Impl final {
     status.error = error;
     if (status.locally_valid() && journal_.RecordLifecycleStatus(CurrentOwnerEpoch(), status).ok())
       runtime->status = std::move(status);
+    log_lifecycle_stall(runtime->original_acceptance, LifecycleStallReason::kApplyStopped,
+                        error.code);
     CloseAdmission();
     // No polling can resume effects after this refusal. Replacement may only
     // expose/reconcile the retained row; Manager retains its parent authority.
@@ -2871,10 +3040,16 @@ class ComponentLifecycleCoordinator::Impl final {
       }
       // Only terminal runtimes remain. Their queued polls hold weak pointers;
       // cancelling those polls does not cancel active work or require a fake
-      // clock to advance just to retire an already-completed owner.
+      // clock to advance just to retire an already-completed owner. A handle is
+      // forgotten only when its callback returned or was removed before dequeue;
+      // a dequeued callback stays tracked (also when the drain below times out).
+      std::vector<ScheduleHandle> forgettable;
       try {
         for (const auto& poll : polls) {
-          if (!poll.second->load(std::memory_order_acquire)) scheduler_.cancel(poll.first);
+          if (poll.second->load(std::memory_order_acquire) ||
+              scheduler_.cancel_before_dequeue(poll.first)) {
+            forgettable.push_back(poll.first);
+          }
         }
       } catch (...) {
         // Keep the handles tracked for ordinary shutdown if cancellation fails.
@@ -2883,9 +3058,8 @@ class ComponentLifecycleCoordinator::Impl final {
       {
         std::lock_guard lock(schedule_mutex_);
         std::erase_if(scheduled_handles_, [&](const auto& item) {
-          return std::any_of(polls.begin(), polls.end(), [&](const auto& poll) {
-            return item.first == poll.first;
-          });
+          return std::find(forgettable.begin(), forgettable.end(), item.first) !=
+                 forgettable.end();
         });
       }
       try {
@@ -3118,6 +3292,9 @@ class ComponentLifecycleCoordinator::Impl final {
     std::int64_t effective_deadline_ns;
     std::vector<std::shared_ptr<IBrandLifecyclePort>> ports;
     std::vector<std::optional<BrandLifecycleObservationDTO>> observations;
+    /// Each domain's latest fresh exact-provider observation, for settling a
+    /// partial effect at its observed state (see settle_partial_effect_state).
+    std::vector<std::optional<BrandLifecycleObservationDTO>> settle_evidence;
     std::vector<std::optional<LifecycleDomainPlanDecision>> decisions;
     std::optional<ComponentLifecycleCoordinatorApplyBringUpServices> apply_services;
     /// Nonowning installed port; only the original-live Apply pin grants use.
@@ -3146,7 +3323,15 @@ class ComponentLifecycleCoordinator::Impl final {
     bool permanent_containment_only = false;
     bool owner_wide_containment_gate = false;
     bool unresolved_effect_admission_gate = false;
-    bool scheduled = false;
+    /// Set by the worker and reset by the poll callback on the scheduler lane.
+    std::atomic<bool> scheduled{false};
+    /// Serializes Process: the deadline callback can submit one beside a poll.
+    std::mutex process_mutex;
+    bool deadline_armed = false;
+    std::optional<ScheduleHandle> deadline_handle;
+    /// A durable/Kernel write was refused and admission closed; no further
+    /// worker pass may act on the unrecorded in-memory state.
+    bool stalled = false;
   };
 
   struct RouteRuntimeState final {
@@ -3255,7 +3440,8 @@ class ComponentLifecycleCoordinator::Impl final {
       const CellAdmissionClaimIntentDTO& intent, RecordRejection&& record_rejection,
       const ActiveControlConfigurationDTO* recovery_predecessor = nullptr,
       const SelectedComponentBringUpOfferDTO* selected_offer = nullptr,
-      const ComponentLifecycleIntentDTO* local_output_recovery = nullptr) {
+      const ComponentLifecycleIntentDTO* local_output_recovery = nullptr,
+      const ComponentLifecycleIntentDTO* lifecycle = nullptr) {
     // This submit owns the persistence flag. Closing must not wait for itself.
     const auto close = [&] {
       std::lock_guard lock(admission_mutex_);
@@ -3279,6 +3465,9 @@ class ComponentLifecycleCoordinator::Impl final {
                       : local_output_recovery
                           ? kernel_cell_admission_port_.AcquireIoOutputRecoveryLifecycleClaim(
                                 intent, *local_output_recovery)
+                      : lifecycle
+                          ? kernel_cell_admission_port_.AcquireComponentLifecycleClaim(intent,
+                                                                                        *lifecycle)
                           : kernel_cell_admission_port_.AcquireCellAdmissionClaim(intent);
       if (!acquired.ok() || acquired.value().intent != intent) {
         const bool unstarted =
@@ -5368,7 +5557,7 @@ class ComponentLifecycleCoordinator::Impl final {
           return journal_.RecordLifecycleRejection(CurrentOwnerEpoch(), intent, error,
                                                    claim_intent);
         },
-        nullptr, nullptr, local_output_recovery ? &intent : nullptr);
+        nullptr, nullptr, local_output_recovery ? &intent : nullptr, &intent);
     if (!acquired.ok()) {
       admission_lock.lock();
       admission_persistence_active_ = false;
@@ -5495,9 +5684,13 @@ class ComponentLifecycleCoordinator::Impl final {
       // claim as Prepare and Enable; it never invokes a Kernel Stop.
       if (!worker_pool_.Submit(
               [this, runtime](std::stop_token cancellation) { Process(runtime, cancellation); })) {
+        log_lifecycle_stall(runtime->original_acceptance,
+                            LifecycleStallReason::kWorkerSubmitRefused, {});
         CloseAdmissionLocked();
         // Durable acceptance is already authoritative. Reporting rejection
-        // here would invite a second request; owner replacement will recover.
+        // here would invite a second request. No worker owns the runtime yet:
+        // the deadline pass still settles it with the typed deadline failure.
+        ArmLifecycleDeadline(runtime);
       }
     } catch (...) {
       CloseAdmissionLocked();
@@ -5509,11 +5702,16 @@ class ComponentLifecycleCoordinator::Impl final {
 
   void Process(const std::shared_ptr<RuntimeState>& runtime,
                std::stop_token cancellation) noexcept {
-    runtime->scheduled = false;
-    if (cancellation.stop_requested() || terminal(runtime->status)) {
+    // The poll callback clears `scheduled`; the deadline pass must not, or a
+    // pending poll would be duplicated.
+    std::lock_guard serial(runtime->process_mutex);
+    if (cancellation.stop_requested() || terminal(runtime->status) || runtime->stalled) {
       return;
     }
     try {
+      if (!runtime->deadline_armed && !runtime->recovering) {
+        ArmLifecycleDeadline(runtime);
+      }
       if (runtime->recovering) {
         ProcessRecovered(runtime, cancellation);
         return;
@@ -5571,7 +5769,7 @@ class ComponentLifecycleCoordinator::Impl final {
     adopted.remaining_duration_ns = 0;
     if (!adopted.locally_valid() ||
         !journal_.RecordLifecycleStatus(CurrentOwnerEpoch(), adopted).ok()) {
-      CloseAdmission();
+      StallLifecycle(runtime, LifecycleStallReason::kRecoveryStatusRefused);
       return false;
     }
     runtime->status = std::move(adopted);
@@ -5603,8 +5801,15 @@ class ComponentLifecycleCoordinator::Impl final {
                                  : ComponentLifecycleTerminalResultDTO::kFailedKnownNoEffect;
     failed.error = error;
     failed.remaining_duration_ns = 0;
-    if (!failed.locally_valid() || !PublishTerminalComponentReadiness(runtime, failed).ok()) {
-      CloseAdmission();
+    if (any_observed) settle_partial_effect_state(failed, false, {}, clock_.now());
+    if (!failed.locally_valid()) {
+      StallLifecycle(runtime, LifecycleStallReason::kTerminalStatusInvalid, error.code);
+      return;
+    }
+    if (const auto published = PublishTerminalComponentReadiness(runtime, failed);
+        !published.ok()) {
+      StallLifecycle(runtime, LifecycleStallReason::kTerminalReadinessRefused,
+                     published.error().code);
       return;
     }
     if (!CommitTerminalAndReleaseClaim(runtime, std::move(failed))) {
@@ -5625,6 +5830,8 @@ class ComponentLifecycleCoordinator::Impl final {
       // Keep the claim and selected fence for explicit reconciliation.
       if (AdoptRecoveredStatus(runtime)) {
         AcquireUnresolvedEffectAdmissionGate(runtime);
+        log_lifecycle_stall(runtime->original_acceptance, LifecycleStallReason::kRecoveryParked,
+                            {});
       }
       return;
     }
@@ -5660,7 +5867,7 @@ class ComponentLifecycleCoordinator::Impl final {
           return candidate.control_domain_id == intent.control_domain_id;
         });
     if (domain == runtime->status.domains.end()) {
-      CloseAdmission();
+      StallLifecycle(runtime, LifecycleStallReason::kRecoveryEvidenceInvalid);
       return;
     }
     const auto domain_index = static_cast<std::size_t>(domain - runtime->status.domains.begin());
@@ -5700,7 +5907,7 @@ class ComponentLifecycleCoordinator::Impl final {
     if (!completed_status.locally_valid() ||
         !journal_.RecordEffectCompleted(CurrentOwnerEpoch(), completed_attempt, completed_status)
              .ok()) {
-      CloseAdmission();
+      StallLifecycle(runtime, LifecycleStallReason::kRecoveryStatusRefused);
       return;
     }
     runtime->status = std::move(completed_status);
@@ -5715,7 +5922,7 @@ class ComponentLifecycleCoordinator::Impl final {
     }
     auto& domain = runtime->status.domains[index];
     if (!domain.resolved_provider_occurrence.has_value() || domain.primitive_attempts.empty()) {
-      CloseAdmission();
+      StallLifecycle(runtime, LifecycleStallReason::kRecoveryEvidenceInvalid);
       return;
     }
     const auto& provider = *domain.resolved_provider_occurrence;
@@ -5746,7 +5953,7 @@ class ComponentLifecycleCoordinator::Impl final {
         catalog.value().provider_manifest_id != provider.provider_manifest_id ||
         catalog.value().provider_manifest_revision != provider.provider_manifest_revision ||
         catalog.value().catalog_digest != provider.lifecycle_plan_catalog_digest || !port.value()) {
-      CloseAdmission();
+      StallLifecycle(runtime, LifecycleStallReason::kRecoveryEvidenceInvalid);
       return;
     }
     const auto& last_result = domain.primitive_attempts.back();
@@ -5757,21 +5964,21 @@ class ComponentLifecycleCoordinator::Impl final {
                  candidate.requested_state == *runtime->status.requested_state.state;
         });
     if (plan == catalog.value().plans.end()) {
-      CloseAdmission();
+      StallLifecycle(runtime, LifecycleStallReason::kRecoveryEvidenceInvalid);
       return;
     }
     const LifecyclePrimitiveTransitionDTO* transition = nullptr;
     for (const auto& candidate : plan->transitions) {
       if (candidate.lifecycle_primitive_id == last_result.lifecycle_primitive_id) {
         if (transition != nullptr) {
-          CloseAdmission();
+          StallLifecycle(runtime, LifecycleStallReason::kRecoveryEvidenceInvalid);
           return;
         }
         transition = &candidate;
       }
     }
     if (transition == nullptr) {
-      CloseAdmission();
+      StallLifecycle(runtime, LifecycleStallReason::kRecoveryEvidenceInvalid);
       return;
     }
     Result<BrandLifecycleObservationDTO> observation = Result<BrandLifecycleObservationDTO>::Err(
@@ -5795,6 +6002,7 @@ class ComponentLifecycleCoordinator::Impl final {
       SchedulePoll(runtime);
       return;
     }
+    RememberSettleEvidence(runtime, index, observation.value());
     const auto postcondition =
         EvaluateLifecyclePredicate(transition->postcondition_predicate, observation.value());
     const auto resolution = classify_uncertain_effect(*transition, domain, std::nullopt,
@@ -5852,13 +6060,14 @@ class ComponentLifecycleCoordinator::Impl final {
         break;
     }
     if (!reconciled.locally_valid()) {
-      CloseAdmission();
+      StallLifecycle(runtime, LifecycleStallReason::kRecoveryEvidenceInvalid);
       return;
     }
     const auto recorded_reconciliation =
         journal_.RecordLifecycleStatus(CurrentOwnerEpoch(), reconciled);
     if (!recorded_reconciliation.ok()) {
-      CloseAdmission();
+      StallLifecycle(runtime, LifecycleStallReason::kRecoveryStatusRefused,
+                     recorded_reconciliation.error().code);
       return;
     }
     runtime->status = std::move(reconciled);
@@ -6061,6 +6270,7 @@ class ComponentLifecycleCoordinator::Impl final {
                 : observation.error());
         return false;
       }
+      RememberSettleEvidence(runtime, index, observation.value());
       // Q127: only activation admission consumes endpoint conflict facts.
       // Observe remains usable for Disable/Recover/Close, and unrelated
       // health-source errors retain their existing admission semantics.
@@ -6109,7 +6319,11 @@ class ComponentLifecycleCoordinator::Impl final {
       runtime->decisions[index] = decision.value();
       if (decision.value().kind == LifecycleDomainPlanDecisionKind::kAlreadySatisfied) {
         auto& domain = runtime->status.domains[index];
-        domain.current_state = runtime->status.requested_state.state;
+        // Recover keeps the observed resting state its plan accepted.
+        domain.current_state =
+            runtime->status.accepted_intent.intent == ComponentLifecycleIntentKindDTO::kRecover
+                ? std::optional(runtime->observations[index]->observed_state)
+                : runtime->status.requested_state.state;
         domain.action_state = ComponentLifecycleDomainActionStateDTO::kSucceeded;
         domain.effect = ComponentLifecycleDomainEffectDTO::kKnownNoEffect;
       }
@@ -6191,7 +6405,8 @@ class ComponentLifecycleCoordinator::Impl final {
     const auto prepared =
         journal_.RecordEffectPrepared(CurrentOwnerEpoch(), prepared_attempt, prepared_status);
     if (!prepared.ok()) {
-      CloseAdmission();
+      StallLifecycle(runtime, LifecycleStallReason::kEffectPrepareJournalRefused,
+                     prepared.error().code);
       return;
     }
     runtime->effect_sequence = prepared_attempt.effect_sequence;
@@ -6265,7 +6480,8 @@ class ComponentLifecycleCoordinator::Impl final {
     const auto completed =
         journal_.RecordEffectCompleted(CurrentOwnerEpoch(), completed_attempt, completed_status);
     if (!completed.ok()) {
-      CloseAdmission();
+      StallLifecycle(runtime, LifecycleStallReason::kEffectCompleteJournalRefused,
+                     completed.error().code);
       return;
     }
     runtime->status = std::move(completed_status);
@@ -6312,6 +6528,7 @@ class ComponentLifecycleCoordinator::Impl final {
       SchedulePoll(runtime);
       return;
     }
+    RememberSettleEvidence(runtime, index, observation.value());
 
     if ((now_ns < 0 || now_ns >= runtime->effective_deadline_ns) &&
         domain.effect != ComponentLifecycleDomainEffectDTO::kEffectUncertain) {
@@ -6383,7 +6600,8 @@ class ComponentLifecycleCoordinator::Impl final {
       }
       const auto recorded = journal_.RecordLifecycleStatus(CurrentOwnerEpoch(), reconciled);
       if (!recorded.ok()) {
-        CloseAdmission();
+        StallLifecycle(runtime, LifecycleStallReason::kReconcileJournalRefused,
+                       recorded.error().code);
         return;
       }
       runtime->status = std::move(reconciled);
@@ -6441,9 +6659,19 @@ class ComponentLifecycleCoordinator::Impl final {
                  ComponentLifecycleDomainEffectDTO::kPartialEffectObserved) {
         progressed_domain.effect = ComponentLifecycleDomainEffectDTO::kEffectObserved;
       }
+      // A successor the journal would refuse as invalid ends the transaction
+      // from its last durable status instead of leaving it pending.
+      if (!progressed.locally_valid()) {
+        FailTransaction(runtime, coordinator_error(
+                                     "component_lifecycle_progress_status_invalid",
+                                     "the verified domain progress is not a valid lifecycle status",
+                                     "progress_status_invalid"));
+        return;
+      }
       const auto recorded = journal_.RecordLifecycleStatus(CurrentOwnerEpoch(), progressed);
       if (!recorded.ok()) {
-        CloseAdmission();
+        StallLifecycle(runtime, LifecycleStallReason::kProgressJournalRefused,
+                       recorded.error().code);
         return;
       }
       runtime->status = std::move(progressed);
@@ -6505,6 +6733,14 @@ class ComponentLifecycleCoordinator::Impl final {
                               std::move(reason))};
   }
 
+  static void RememberSettleEvidence(const std::shared_ptr<RuntimeState>& runtime,
+                                     std::size_t index,
+                                     const BrandLifecycleObservationDTO& observation) {
+    if (runtime->settle_evidence.size() < runtime->status.domains.size())
+      runtime->settle_evidence.resize(runtime->status.domains.size());
+    runtime->settle_evidence[index] = observation;
+  }
+
   [[nodiscard]] bool FreshObservation(const ComponentLifecycleStatusDTO& status,
                                       const ComponentLifecycleDomainStatusDTO& domain,
                                       const Result<BrandLifecycleObservationDTO>& observation,
@@ -6543,22 +6779,86 @@ class ComponentLifecycleCoordinator::Impl final {
     }
     runtime->scheduled = true;
     const auto weak = std::weak_ptr<RuntimeState>(runtime);
-    if (!ScheduleLifecycleCallback(
-            checked_schedule_time(clock_.now(), config_.observation_poll_period_ns), [this, weak] {
+    bool armed = false;
+    try {
+      armed = ScheduleLifecycleCallback(
+          checked_schedule_time(clock_.now(), config_.observation_poll_period_ns), [this, weak] {
+            if (shutting_down_.load(std::memory_order_acquire)) {
+              return;
+            }
+            if (const auto state = weak.lock(); state) {
+              state->scheduled = false;
+              SubmitProcessOrClose(state);
+            }
+          });
+    } catch (...) {
+      runtime->scheduled = false;
+      throw;
+    }
+    if (!armed) {
+      runtime->scheduled = false;
+    }
+  }
+
+  /// The route path's deadline mechanism (ScheduleRoute): one Lifecycle
+  /// callback at the fixed deadline, independent of the observation poll. It
+  /// only submits Process, whose existing checks fail the transaction with the
+  /// typed timeout (or keep reconciling an uncertain effect).
+  void ArmLifecycleDeadline(const std::shared_ptr<RuntimeState>& runtime) {
+    runtime->deadline_armed = true;
+    ScheduleHandle handle{};
+    if (ScheduleLifecycleCallback(
+            runtime->effective_deadline_ns,
+            [this, weak = std::weak_ptr<RuntimeState>(runtime)] {
               if (shutting_down_.load(std::memory_order_acquire)) {
                 return;
               }
               if (const auto state = weak.lock(); state) {
-                state->scheduled = false;
-                if (!worker_pool_.Submit([this, state](std::stop_token cancellation) {
-                      Process(state, cancellation);
-                    })) {
-                  CloseAdmission();
-                }
+                SubmitProcessOrClose(state);
               }
-            })) {
-      runtime->scheduled = false;
+            },
+            &handle)) {
+      runtime->deadline_handle = handle;
     }
+  }
+
+  void CancelLifecycleDeadline(const std::shared_ptr<RuntimeState>& runtime) noexcept {
+    if (!runtime->deadline_handle) {
+      return;
+    }
+    const auto handle = *runtime->deadline_handle;
+    runtime->deadline_handle.reset();
+    try {
+      // Forget the handle only when it can never run. A dequeued callback
+      // stays tracked until its `fired` flag proves it returned, so owner
+      // settlement waits for it.
+      if (scheduler_.cancel_before_dequeue(handle)) {
+        std::lock_guard lock(schedule_mutex_);
+        std::erase_if(scheduled_handles_,
+                      [&](const auto& scheduled) { return scheduled.first == handle; });
+      }
+    } catch (...) {
+      // Still tracked; it fires later as a terminal no-op.
+    }
+  }
+
+  /// Called from scheduler callbacks: reads only the immutable acceptance.
+  void SubmitProcessOrClose(const std::shared_ptr<RuntimeState>& state) noexcept {
+    if (!worker_pool_.Submit(
+            [this, state](std::stop_token cancellation) { Process(state, cancellation); })) {
+      log_lifecycle_stall(state->original_acceptance, LifecycleStallReason::kWorkerSubmitRefused,
+                          {});
+      CloseAdmission();
+    }
+  }
+
+  /// A silent non-terminal exit: log it once, keep the durable row and the
+  /// claim, and close admission (fail closed) as these exits always did.
+  void StallLifecycle(const std::shared_ptr<RuntimeState>& runtime, LifecycleStallReason reason,
+                      const std::string& error_code = {}) noexcept {
+    runtime->stalled = true;
+    log_lifecycle_stall(runtime->original_acceptance, reason, error_code);
+    CloseAdmission();
   }
 
   void FailBeforeEffect(const std::shared_ptr<RuntimeState>& runtime, const ErrorDTO& error) {
@@ -6702,7 +7002,8 @@ class ComponentLifecycleCoordinator::Impl final {
   [[nodiscard]] bool CommitTerminalAndReleaseClaim(const std::shared_ptr<RuntimeState>& runtime,
                                                    ComponentLifecycleStatusDTO status) {
     if (!runtime->cell_claim.has_value()) {
-      CloseAdmission();
+      StallLifecycle(runtime, LifecycleStallReason::kTerminalCommitRefused,
+                     "component_lifecycle_claim_absent");
       return false;
     }
     const auto& claim = *runtime->cell_claim;
@@ -6719,12 +7020,18 @@ class ComponentLifecycleCoordinator::Impl final {
     const auto retained =
         journal_.RecordLifecycleTerminalAndClaimRelease(CurrentOwnerEpoch(), status, release);
     if (!retained.ok()) {
-      CloseAdmission();
+      StallLifecycle(runtime, LifecycleStallReason::kTerminalCommitRefused, retained.error().code);
       return false;
     }
     runtime->status = std::move(status);
     runtime->cell_claim_release = release;
-    return ReleaseDurableClaim(runtime, release);
+    if (!ReleaseDurableClaim(runtime, release)) {
+      // Terminal row is durable; the Kernel release receipt is not.
+      log_lifecycle_stall(runtime->original_acceptance,
+                          LifecycleStallReason::kClaimReleaseUnverified, {});
+      return false;
+    }
+    return true;
   }
 
   template <typename Runtime>
@@ -6784,11 +7091,13 @@ class ComponentLifecycleCoordinator::Impl final {
           domain.error = error;
         }
       }
-      if (journal_.RecordLifecycleStatus(CurrentOwnerEpoch(), status).ok()) {
+      if (const auto recorded = journal_.RecordLifecycleStatus(CurrentOwnerEpoch(), status);
+          recorded.ok()) {
         runtime->status = std::move(status);
         SchedulePoll(runtime);
       } else {
-        CloseAdmission();
+        StallLifecycle(runtime, LifecycleStallReason::kOutcomeUnknownJournalRefused,
+                       recorded.error().code);
       }
       return;
     }
@@ -6812,13 +7121,21 @@ class ComponentLifecycleCoordinator::Impl final {
                                         : ComponentLifecycleTerminalResultDTO::kFailedKnownNoEffect;
     status.error = error;
     status.remaining_duration_ns = 0;
+    if (any_effect)
+      settle_partial_effect_state(
+          status, runtime->status.status_owner_epoch == status.status_owner_epoch,
+          runtime->settle_evidence, clock_.now());
     if (!status.locally_valid()) {
+      // No valid terminal row can be built from this state: fail closed.
+      StallLifecycle(runtime, LifecycleStallReason::kTerminalStatusInvalid, error.code);
       return;
     }
     // Release after a known failure requires verified containment: the
     // Kernel must read back the settled result. Otherwise keep the claim.
-    if (!PublishTerminalComponentReadiness(runtime, status).ok()) {
-      CloseAdmission();
+    if (const auto published = PublishTerminalComponentReadiness(runtime, status);
+        !published.ok()) {
+      StallLifecycle(runtime, LifecycleStallReason::kTerminalReadinessRefused,
+                     published.error().code);
       return;
     }
     if (!CommitTerminalAndReleaseClaim(runtime, std::move(status))) {
@@ -6834,12 +7151,18 @@ class ComponentLifecycleCoordinator::Impl final {
     }
     auto status = runtime->status;
     AdvanceStatus(runtime, status, ComponentLifecycleTransactionPhaseDTO::kSucceeded);
-    status.current_state = status.requested_state.state;
+    status.current_state = status.accepted_intent.intent == ComponentLifecycleIntentKindDTO::kRecover
+                               ? recover_component_state(status)
+                               : status.requested_state.state;
     status.terminal_result = ComponentLifecycleTerminalResultDTO::kSucceeded;
     status.error.reset();
     status.reconciliation_required = false;
     status.remaining_duration_ns = 0;
     if (!status.locally_valid()) {
+      // M3 behaviour: stays pending. Logged; the deadline pass must not act.
+      runtime->stalled = true;
+      log_lifecycle_stall(runtime->original_acceptance,
+                          LifecycleStallReason::kTerminalStatusInvalid, {});
       return;
     }
     // Success requires the verified Kernel result. Otherwise this is a
@@ -6855,12 +7178,14 @@ class ComponentLifecycleCoordinator::Impl final {
   }
 
   void Complete(const std::shared_ptr<RuntimeState>& runtime) {
+    CancelLifecycleDeadline(runtime);
     if (!runtime->reserved_domains.empty()) {
       const auto released = domain_reservations_.release(
           reservation_owner(runtime->status.acceptance, runtime->status.accepted_intent),
           runtime->reserved_domains);
       if (!released.ok()) {
-        CloseAdmission();
+        StallLifecycle(runtime, LifecycleStallReason::kDomainReleaseRefused,
+                       released.error().code);
         return;
       }
     }
@@ -7027,7 +7352,8 @@ class ComponentLifecycleCoordinator::Impl final {
     }
   }
 
-  [[nodiscard]] bool ScheduleLifecycleCallback(TimePoint deadline, std::function<void()> callback) {
+  [[nodiscard]] bool ScheduleLifecycleCallback(TimePoint deadline, std::function<void()> callback,
+                                               ScheduleHandle* scheduled_handle = nullptr) {
     const auto fired = std::make_shared<std::atomic<bool>>(false);
     {
       std::lock_guard lock(schedule_mutex_);
@@ -7078,6 +7404,9 @@ class ComponentLifecycleCoordinator::Impl final {
     FinishSchedulePublication();
     if (publication_error) {
       std::rethrow_exception(publication_error);
+    }
+    if (!cancel && scheduled_handle != nullptr) {
+      *scheduled_handle = handle;
     }
     return !cancel;
   }

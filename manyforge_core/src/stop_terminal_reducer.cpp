@@ -453,28 +453,12 @@ struct DerivedTerminal final {
                    "Stop stage result does not join its immutable terminal scope entry",
                    {}});
     }
-    const auto stage_index = *stage_index_of(attempt);
-    const auto& stage =
-        attempt.result.request.participant_stop_plan.stage_commands[stage_index].resolved_stage;
-    for (const auto& evidence : attempt.result.evidence_items) {
-      derived.evidence.push_back(
-          StopCertificateEvidenceItemDTO{attempt.scope_key, stage.stop_escalation_stage_id,
-                                         stage_index, attempt.result_sequence, evidence});
-    }
   }
-  if (derived.evidence.size() > kMaximumStopTerminalEvidenceItems) {
-    return Result<DerivedTerminal>::Err(
-        ErrorDTO{"stop_terminal_evidence_capacity_exceeded",
-                 "Stop terminal evidence exceeds its preflighted bound",
-                 {}});
+  auto evidence = DeriveStopCertificateEvidence(attempts);
+  if (!evidence.ok()) {
+    return Result<DerivedTerminal>::Err(evidence.error());
   }
-  std::sort(derived.evidence.begin(), derived.evidence.end(), evidence_less);
-  if (!canonical_rows(derived.evidence, evidence_less)) {
-    return Result<DerivedTerminal>::Err(
-        ErrorDTO{"stop_terminal_evidence_conflict",
-                 "Stop terminal evidence contains a conflicting duplicate",
-                 {}});
-  }
+  derived.evidence = std::move(evidence.value());
 
   for (const auto& entry : entries) {
     if (entry.dispatch_state == StopScopeDispatchStateDTO::kNeverDispatchedCancelled) {
@@ -974,6 +958,43 @@ Result<StopCertificateDTO> internal::ReduceStopTerminalWithProofScopes(
                                "Settled proof mapping does not identify a source certificate"));
   }
   return reduce_stop_terminal_impl(input, proof_scopes);
+}
+
+Result<std::vector<StopCertificateEvidenceItemDTO>> DeriveStopCertificateEvidence(
+    const std::vector<StopAttemptedStageResultDTO>& attempts) {
+  using Evidence = std::vector<StopCertificateEvidenceItemDTO>;
+  Evidence evidence;
+  for (const auto& attempt : attempts) {
+    const auto stage_index = stage_index_of(attempt);
+    if (!stage_index.has_value()) {
+      return Result<Evidence>::Err(
+          ErrorDTO{"stop_terminal_attempt_join_invalid",
+                   "Stop stage result names a stage outside its participant stop plan",
+                   {}});
+    }
+    const auto& stage =
+        attempt.result.request.participant_stop_plan.stage_commands[*stage_index].resolved_stage;
+    for (const auto& item : attempt.result.evidence_items) {
+      evidence.push_back(StopCertificateEvidenceItemDTO{attempt.scope_key,
+                                                        stage.stop_escalation_stage_id,
+                                                        *stage_index, attempt.result_sequence,
+                                                        item});
+    }
+  }
+  if (evidence.size() > kMaximumStopTerminalEvidenceItems) {
+    return Result<Evidence>::Err(
+        ErrorDTO{"stop_terminal_evidence_capacity_exceeded",
+                 "Stop terminal evidence exceeds its preflighted bound",
+                 {}});
+  }
+  std::sort(evidence.begin(), evidence.end(), evidence_less);
+  if (!canonical_rows(evidence, evidence_less)) {
+    return Result<Evidence>::Err(
+        ErrorDTO{"stop_terminal_evidence_conflict",
+                 "Stop terminal evidence contains a conflicting duplicate",
+                 {}});
+  }
+  return Result<Evidence>::Ok(std::move(evidence));
 }
 
 }  // namespace manyforge::core

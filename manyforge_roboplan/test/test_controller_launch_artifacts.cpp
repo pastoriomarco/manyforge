@@ -104,6 +104,12 @@ struct OfflineProfile final {
        "ur5e_robotiq_2f_85.urdf",
        kUrArm, "robotiq_85_left_knuckle_joint", "MockUR5eRobotiq2F85System",
        "joint_trajectory_controller", "robotiq_gripper_controller"},
+      // E1: added purely as data (mock_controller_profiles.yaml).
+      {"uf850_xarm_gripper",
+       "manyforge_example_models/models/uf850_xarm_gripper/"
+       "uf850_xarm_gripper.urdf",
+       kUFactoryArm, "drive_joint", "MockUF850XArmGripperSystem",
+       "uf850_traj_controller", "xarm_gripper_controller"},
   };
 }
 
@@ -1178,6 +1184,34 @@ TEST(ControllerLaunchArtifacts, MockProfilesCarryQ79FamilyValuesAndTheTemplateCa
                ControllerLaunchArtifactError);
 }
 
+TEST(ControllerLaunchArtifacts, Uf850MockRowComesFromTheDataFile) {
+  // E1: the UF850 row exists only in mock_controller_profiles.yaml.
+  const auto ids = mock_controller_profile_ids();
+  EXPECT_NE(std::find(ids.begin(), ids.end(), "uf850_xarm_gripper"), ids.end());
+  const auto uf850 = mock_controller_profile_facts("uf850_xarm_gripper");
+  EXPECT_EQ(uf850.hardware_component_name, "MockUF850XArmGripperSystem");
+  EXPECT_EQ(uf850.arm_controller_name, "uf850_traj_controller");
+  EXPECT_EQ(uf850.gripper_controller_name, "xarm_gripper_controller");
+  EXPECT_TRUE(uf850.gripper_required);
+  EXPECT_DOUBLE_EQ(uf850.hard_stop_completion_timeout_s, 1.5);
+  EXPECT_DOUBLE_EQ(uf850.gripper_result_timeout_s, 5.0);
+  const auto rates = mock_controller_lane_rates("uf850_xarm_gripper");
+  EXPECT_DOUBLE_EQ(rates.controller_update_rate_hz, 150.0);
+  EXPECT_DOUBLE_EQ(rates.action_monitor_rate_hz, 20.0);
+  const auto yaml = generate_mock_controllers_yaml(
+      uf850, "uf850_robot", kUFactoryArm, cancel_limits(kUFactoryArm, 10.0),
+      std::string("drive_joint"));
+  EXPECT_NE(yaml.find("# Track 2's UFactory mock arm template and the mock "
+                      "gripper template.\n"),
+            std::string::npos);
+  EXPECT_EQ(count(yaml, ": {trajectory: 1.0, goal: 0.01, "
+                        "max_deceleration_on_cancel: 10.0}\n"),
+            kUFactoryArm.size());
+  EXPECT_NE(yaml.find("/**/xarm_gripper_controller:\n  ros__parameters:\n"
+                      "    joint: drive_joint\n"),
+            std::string::npos);
+}
+
 } // namespace
 
 namespace {
@@ -1256,6 +1290,9 @@ TEST(ControllerLaunchArtifactsCharacterization, EveryMockProfileKeepsItsExactArt
                   "robotiq_gripper_controller")}},
   };
   for (const auto &profile : offline_profiles()) {
+    // E1: rows added as data (UF850) are checked structurally above, not
+    // pinned; the pins guard the rows that predate the data file.
+    if (!pinned.contains(profile.mock_profile)) continue;
     SCOPED_TRACE(profile.mock_profile);
     const TemporaryRoot root;
     const auto written = write_host(mock_component(

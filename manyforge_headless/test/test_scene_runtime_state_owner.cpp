@@ -102,14 +102,23 @@ TEST(SceneRuntimeStateOwner, CarriedObjectLossEventsArePublishedAndBounded) {
   EXPECT_EQ(SceneRuntimeStateValue(owner.Snapshot())
                 .find_object_member("carried_object_losses"),
             nullptr);
-  owner.RecordCarriedObjectLoss({"event-0", "box", "box moved"});
+  owner.RecordCarriedObjectLoss(
+      {"event-0", "box", "box moved", "attachment.1", "robot.1", "gripper",
+       core::GraspLostResponseDTO{false, true, "part_lost", false}});
   EXPECT_NE(content_identity::canonical_json(
                 SceneRuntimeStateValue(owner.Snapshot()))
-                .find(R"("carried_object_losses":[{"code":"scene.carried_object_lost","event_id":"event-0","full_text":"box moved","scene_resource_id":"box"}])"),
+                .find(R"("carried_object_losses":[{"carried_object_attachment_id":"attachment.1","code":"scene.carried_object_lost","command_target_id":"gripper","controllable_component_id":"robot.1","event_id":"event-0","full_text":"box moved","on_grasp_lost":{"detach":false,"raise_alarm":false,"set_key":"part_lost","stop_motion":true},"scene_resource_id":"box"}])"),
             std::string::npos);
+  // An alarm without the Stop is refused.
+  EXPECT_THROW(owner.RecordCarriedObjectLoss(
+                   {"event-x", "box", "box moved", "attachment.1", "robot.1",
+                    "gripper",
+                    core::GraspLostResponseDTO{true, false, std::nullopt, true}}),
+               SceneRuntimeStateError);
   for (std::size_t index = 1U; index <= kMaximumCarriedObjectLossEvents; ++index) {
-    owner.RecordCarriedObjectLoss(
-        {"event-" + std::to_string(index), "box", "box moved"});
+    owner.RecordCarriedObjectLoss({"event-" + std::to_string(index), "box",
+                                   "box moved", "attachment.1", "robot.1",
+                                   "gripper", core::GraspLostResponseDTO{}});
   }
   const auto losses = owner.Snapshot().carried_object_losses;
   ASSERT_EQ(losses.size(), kMaximumCarriedObjectLossEvents);

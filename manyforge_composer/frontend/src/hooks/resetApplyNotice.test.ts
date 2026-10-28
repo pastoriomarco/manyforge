@@ -18,8 +18,10 @@ describe('Reset-then-Apply Activity notice', () => {
     const stopped = resetApplyNotice({ plan, phase: {
       kind: 'failed', stage: 'apply', message: 'refused', unknown: false, apply: null,
     } } as ResetApplySequence, vi.fn());
-    expect(stopped.severity).toBe('error');
-    expect(stopped.actions?.map((action) => action.label)).toEqual(['Dismiss']);
+    // A stopped Apply blocks nothing: a warning until acknowledged.
+    expect(stopped).toMatchObject({ severity: 'warning', acknowledgeable: true });
+    expect(stopped.actions?.map((action) => [action.id, action.label]))
+      .toEqual([['acknowledge', 'Acknowledge']]);
     const resetting = resetApplyNotice({ plan, phase: { kind: 'resetting' } } as ResetApplySequence, vi.fn());
     expect(resetting.busy).toBe(true);
   });

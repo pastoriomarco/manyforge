@@ -1,4 +1,5 @@
 #include <manyforge_core/observed_robot_state_provider.hpp>
+#include <manyforge_core/time/received_sample_age.hpp>
 
 #include <algorithm>
 #include <cmath>
@@ -49,8 +50,8 @@ Result<RobotStateDTO> PublishedObservedRobotStateProvider::current_state(
   }
   const auto budget = view.freshness_budget_ns();
   if (budget > 0 &&
-      (view.received_timestamp_ns() < 0 || now_ns < view.received_timestamp_ns() ||
-       now_ns - view.received_timestamp_ns() > budget)) {
+      (now_ns < 0 || view.received_timestamp_ns() < 0 ||
+       !received_sample_current(view.received_timestamp_ns(), now_ns, budget))) {
     return Result<RobotStateDTO>::Err(ErrorDTO{
         to_string(ErrorCode::kExecutionRejected),
         "Observed robot state is stale",

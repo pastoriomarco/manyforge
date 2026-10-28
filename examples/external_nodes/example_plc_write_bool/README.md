@@ -54,6 +54,3 @@ The exact historical source is parent commit
 - the four historical fake-PLC tests map to the pure reducer here and to I6/N
   owner-client integration; Kernel Stop behavior is separately requalified at
   I8/P5.
-
-See [`docs/operations/EXTERNAL_NODES.md`](../../../docs/operations/EXTERNAL_NODES.md)
-for the complete v2 boundary and outage status.

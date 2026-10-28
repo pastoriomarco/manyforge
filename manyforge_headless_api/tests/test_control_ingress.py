@@ -740,6 +740,35 @@ def test_reset_join_requires_exact_accepted_options(accepted, requested):
         ingress.close()
 
 
+@pytest.mark.parametrize("accepted_keep", [None, False, True])
+@pytest.mark.parametrize("requested_keep", [False, True])
+def test_reset_join_requires_the_accepted_keep_stop_fault(accepted_keep, requested_keep):
+    """D6 (SX-324): Close's Reset joins only with its own keep_stop_fault."""
+
+    clock = _Clock()
+    ingress, _stamps = _ingress(clock)
+    try:
+        request = _request(ingress, kind="program_reset").model_copy(update={"payload": {
+            "program_run_id": None, "expected_owner_epoch": "runner.1", "expected_cycle_generation": 3,
+            "reload_initial_scene": False, "reset_robot_position": False,
+            "keep_stop_fault": requested_keep,
+        }})
+        options = {"reload_initial_scene": False, "reset_robot_position": False}
+        if accepted_keep is not None:
+            options["keep_stop_fault"] = accepted_keep
+        cycle = {"program_runner_owner_epoch": "runner.1", "execution_control_revision": 7,
+                 "cycle_generation": 3, "program_run_id": None, "state": "resetting",
+                 "reset_options": options}
+        disposition, _projection = HeadlessExecutionControlDispatch(object())._reduce_unavailable(
+            request, cycle, None)
+        same = bool(accepted_keep) == requested_keep
+        assert disposition.disposition == ("joined" if same else "rejected")
+        assert disposition.code == (
+            "program_reset_already_current" if same else "program_run_request_conflict")
+    finally:
+        ingress.close()
+
+
 def _held_output_reset(payload_patch: dict[str, Any] | None = None) -> ExecutionCommandRequestDTO:
     ingress, _ = _ingress(_Clock())
     try:

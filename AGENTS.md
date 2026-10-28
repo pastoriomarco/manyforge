@@ -13,17 +13,16 @@ the documented operator setup/build commands below do not require that detour.
 
 ManyForge is the deployment-side code and runtime repository. Start with
 [README.md](README.md) and [the operator documentation index](docs/INDEX.md)
-for installation, supported entrypoints and operation. Historical recipes are
-not evidence that a lane is available.
+for installation, supported entrypoints and operation.
 
 ## Runtime and operator work
 
 ### Install and start the available runtime
 
-The current checkout supports a **simulated native workbench**. Packaged
-production installation, physical robots, Isaac/ROS product lanes and the
-historical aggregate launcher are unavailable. Do not substitute historical
-commands or infer physical authorization from a green UI.
+The current checkout runs as a source-built **development workbench** with
+three lanes: Mock, Isaac Sim (attach-only) and Real (Lite 6). There is no
+packaged installer, and physical execution is not yet qualified. Do not infer
+physical authorization from a green UI.
 
 Read [the workbench runbook](docs/operations/DEVELOPMENT_WORKBENCH.md) first.
 It is the public source for prerequisites, startup, ports, caches and diagnosis.
@@ -74,7 +73,7 @@ work around an unhealthy one.
   new motion requests and inspect owner status when observation is uncertain.
 - For API work, use the generated contracts linked below or the running schemas:
   Headless `http://localhost:9010/openapi.json`, Composer
-  `http://localhost:9020/openapi.json`. Do not guess historical endpoints.
+  `http://localhost:9020/openapi.json`. Do not guess endpoints.
 - First diagnosis is read-only:
 
 ```bash
@@ -109,7 +108,7 @@ scenario switching; do not automatically restart/reapply to hide a fault.
   authorization. Never bypass admission, Stop or recovery prerequisites.
 - [scripts/templates/AGENTS.md](scripts/templates/AGENTS.md) is a shipped
   runtime-agent template, not repository development guidance.
-  Historical material under `agent-skills/` is not a current tool contract.
+  Material under `agent-skills/` is not a current tool contract.
 
 ## Code changes — mandatory development entrypoint
 

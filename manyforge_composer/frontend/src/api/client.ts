@@ -36,7 +36,7 @@ import {
   parseGlobalRuleRecoveryOffers,
   parseGlobalRuleRecoveryResult,
   parseStopFaultRecoveryOffer,
-  parseStopFaultRecoveryResult,
+  parseCellRecoverResult,
   parseNodeEnvironmentResponse,
   parsePreparedActivationInput,
   parseManagerDeploymentCandidatePreviewResponse,
@@ -86,7 +86,6 @@ import {
 } from './cclcParsers';
 import type {
   FileBrowseKind,
-  NewScenarioDocumentInput,
   SaveScenarioDocumentInput,
   AppliedProgramSelection,
   AppliedProgramStatus,
@@ -139,6 +138,7 @@ import type {
 } from '../types/headless';
 import type {
   CapabilityCommandPreviewReceipt,
+  CellRecoverResult,
   DirectControlOperationIntent,
   ExecutionIdentity,
   MotionPreviewReceipt,
@@ -166,20 +166,6 @@ import type {
   CCLCRouteTemplateSet,
   CCLCTransactionStatus,
 } from '../types/cclc';
-
-/** Exact verified Close and both-Draft fence for its temporary editor clear. */
-export interface CompletedScenarioCloseContext {
-  sceneOwnerId: string;
-  sceneOwnerEpoch: string;
-  sceneProjectionRevision: import('../types/api').ProjectionRevision;
-  managerOwnerId: string;
-  managerOwnerEpoch: string;
-  retainedBundleId: string;
-  graphRevision: string;
-  publication: Record<string, import('../types/api').JsonValue>;
-  deploymentDraftId: string;
-  expectedDeploymentDraftRevision: number;
-}
 
 export interface HistorianListQuery {
   startNs?: string;
@@ -991,14 +977,6 @@ export const api = {
       signal,
       { method: 'POST', body: JSON.stringify(fence) },
     ),
-    clearClosedScenario: (
-      fence: LocalWorkspaceFenceRequest,
-      completedClose: CompletedScenarioCloseContext,
-      signal?: AbortSignal,
-    ): Promise<ProgramWorkspaceResponse> => requestJson(
-      '/api/program/new-draft', parseProgramWorkspaceResponse, signal,
-      { method: 'POST', body: JSON.stringify({ ...fence, confirmDiscard: true, completedClose }) },
-    ),
     newDraft: (
       fence: LocalWorkspaceFenceRequest,
       confirmDiscard: boolean,
@@ -1026,13 +1004,14 @@ export const api = {
     ),
   },
   scenarioDocuments: {
+    /** Load the built-in, read-only empty Untitled Scenario. */
     new: (
       fence: ScenarioDocumentFenceRequest,
-      input: NewScenarioDocumentInput,
+      confirmDiscard: boolean,
       signal?: AbortSignal,
     ): Promise<ScenarioDocumentLoadResponse> => requestJson(
       '/api/scenario-documents/new', parseScenarioDocumentLoadResponse, signal,
-      { method: 'POST', body: JSON.stringify({ ...fence, ...input }) },
+      { method: 'POST', body: JSON.stringify({ ...fence, confirmDiscard }) },
     ),
     list: (
       directory?: string,
@@ -1533,54 +1512,27 @@ export const api = {
         parseStopFaultRecoveryOffer,
         signal,
       ),
-    recoverStopFault: async (
-      ownerEpoch: string,
-      requestId: string,
-      signal?: AbortSignal,
-    ): Promise<void> => {
-      // Read the current offer immediately before composing the command. The
-      // backend fences every field, so a stale click is rejected safely.
-      const offer = await requestJson(
-        '/api/execution/stop-fault',
-        parseStopFaultRecoveryOffer,
-        signal,
-      );
-      if (offer === null) throw new Error('No cell stop-fault recovery is active.');
-      if (offer.stopCertificate === null) {
-        throw new Error('Cell recovery is missing its stop certificate.');
-      }
-      await requestJson(
-        '/api/execution/stop-fault/recover',
-        (value) => parseStopFaultRecoveryResult(value, requestId),
+    /**
+     * Recover cell: one Headless composite. It acknowledges open component
+     * incidents, waits briefly for the cell latch, and clears it with the
+     * owners' current identities. The browser sends only its request ID.
+     */
+    cellRecover: (requestId: string, signal?: AbortSignal): Promise<CellRecoverResult> =>
+      requestJson(
+        '/api/execution/cell-recover',
+        (value) => parseCellRecoverResult(value, requestId),
         signal,
         {
           method: 'POST',
           body: JSON.stringify({
             request_context: {
               request_id: requestId,
-              request_owner_epoch: ownerEpoch,
               source_label: 'composer_ui',
               correlation_id: null,
             },
-            expected_latch_id: offer.latchId,
-            expected_latch_generation: offer.latchGeneration,
-            expected_recovery_assessment_revision: offer.recoveryAssessmentRevision,
-            expected_stop_certificate_id: offer.stopCertificate.stopCertificateId,
-            expected_stop_certificate_revision: offer.stopCertificate.stopCertificateRevision,
-            expected_cell_id: offer.cellId,
-            expected_retained_bundle_id: offer.retainedBundleId,
-            expected_graph_revision: offer.graphRevision,
-            configuration_expectations: offer.configurationExpectations.map((row) => ({
-              control_domain_id: row.controlDomainId,
-              active_control_configuration_id: row.activeControlConfigurationId,
-              active_control_configuration_generation:
-                row.activeControlConfigurationGeneration,
-            })),
-            reason: 'operator requested cell recovery',
           }),
         },
-      );
-    },
+      ),
     /** Latched global rules' recovery offers from the same stop-fault read (SX-2206). */
     globalRuleRecoveryOffers: (signal?: AbortSignal): Promise<GlobalRuleRecoveryOffer[]> =>
       requestJson('/api/execution/stop-fault', parseGlobalRuleRecoveryOffers, signal),

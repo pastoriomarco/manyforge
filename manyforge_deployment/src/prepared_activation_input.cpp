@@ -345,6 +345,23 @@ parse_prepared_activation_origin(const CanonicalValue &value) {
       core::GraphRevision(digest("graph_revision")), core::ContentDigest(digest("admission_digest"))};
 }
 
+bool prepared_receipt_is_canonical_empty_candidate(
+    const CanonicalValue &prepared_receipt, const core::CellId &cell_id,
+    const core::RetainedBundleId &candidate_retained_bundle_id,
+    const core::GraphRevision &candidate_graph_revision) noexcept {
+  try {
+    const auto *origin_value = prepared_receipt.find_object_member("origin");
+    if (origin_value == nullptr) return false;
+    const auto origin = parse_prepared_activation_origin(*origin_value);
+    const auto *sealed = std::get_if<PreparedSealedCanonicalEmptyOrigin>(&origin);
+    return sealed != nullptr && sealed->cell_id == cell_id &&
+           sealed->retained_bundle_id == candidate_retained_bundle_id &&
+           sealed->graph_revision == candidate_graph_revision;
+  } catch (...) {
+    return false;
+  }
+}
+
 CanonicalValue prepared_activation_origin_value(const PreparedActivationOrigin &origin) {
   if (const auto *scenario = std::get_if<PreparedScenarioOrigin>(&origin))
     return CanonicalValue(CanonicalValue::Object{

@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import errno
+import logging
 import os
 from pathlib import Path
 import stat
@@ -19,6 +20,8 @@ from manyforge_behavior.catalog import NodeCatalog
 from manyforge_behavior.program import Program, ProgramValidationError
 
 from .security import (
+    SCENARIO_PROJECT_READ_ONLY_MESSAGE,
+    inside_untitled_scenario,
     is_path_within_roots,
     normalize_allowed_roots,
     normalize_existing_file_path,
@@ -27,6 +30,7 @@ from .security import (
 
 
 _PROGRAM_SUFFIXES = (".program.yaml", ".program.yml")
+_LOGGER = logging.getLogger(__name__)
 
 
 class ProgramArtifactError(RuntimeError):
@@ -177,7 +181,12 @@ def load_program_artifact(
             )
         before = _regular_descriptor_state(descriptor)
         try:
-            loaded = Program(f"/proc/self/fd/{descriptor}", catalog)
+            # An authored file opened for editing: a stale self-identity is
+            # an `edited_outside_manyforge` warning, not a refusal, and a
+            # compatible older catalog selector loads as the active one.
+            loaded = Program(
+                f"/proc/self/fd/{descriptor}", catalog, authoring_load=True
+            )
         except ProgramValidationError as error:
             _fail(
                 "program_artifact_validation_failed",
@@ -201,10 +210,14 @@ def load_program_artifact(
                 f"Program artifact changed while being read: {resolved}",
                 status_code=409,
             )
-        return (
-            Program.from_dict(loaded.to_dict(), catalog, path=resolved),
-            str(resolved),
-        )
+        program = Program.from_dict(loaded.to_dict(), catalog, path=resolved)
+        # The reload sees the computed identity; keep this read's diagnostics.
+        program.load_diagnostics = loaded.load_diagnostics
+        for diagnostic in loaded.load_diagnostics:
+            _LOGGER.warning(
+                "%s: %s: %s", diagnostic["code"], resolved, diagnostic["message"]
+            )
+        return program, str(resolved)
     finally:
         os.close(descriptor)
 
@@ -293,6 +306,8 @@ def save_program_artifact(
         )
     except HTTPException as error:
         _from_http(error)
+    if inside_untitled_scenario(target):
+        _fail("scenario_project_read_only", SCENARIO_PROJECT_READ_ONLY_MESSAGE, status_code=409)
     raw = _serialized_program(program)
     parent = target.parent.resolve()
     try:

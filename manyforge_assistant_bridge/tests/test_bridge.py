@@ -431,9 +431,8 @@ def test_bridge_assigns_one_composer_idempotency_key_per_mutating_tool_call(
                 "requestOwnerEpoch": body["requestOwnerEpoch"],
                 "sourceLabel": body["sourceLabel"],
                 "correlationId": body["correlationId"],
-                "nextAdmissionGeneration": (
-                    body["expectedAdmissionGeneration"] + 2
-                ),
+                # A claimless Draft edit echoes the admission generation.
+                "nextAdmissionGeneration": body["expectedAdmissionGeneration"],
                 "nextWorkspaceRevision": body["expectedWorkspaceRevision"] + 1,
                 "result": {
                     "kind": "composer_draft_mutation",
@@ -461,7 +460,7 @@ def test_bridge_assigns_one_composer_idempotency_key_per_mutating_tool_call(
     assert [body["expectedDraftRevision"] for body in callback_bodies] == [1, 2]
     assert [
         body["expectedAdmissionGeneration"] for body in callback_bodies
-    ] == [7, 9]
+    ] == [7, 7]
     assert {
         body["expectedWorkspaceEpoch"] for body in callback_bodies
     } == {"workspace.1"}

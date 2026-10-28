@@ -95,7 +95,18 @@ const FORBIDDEN_DYNAMIC_PARAMETERS = new Set<string>([
   'success_through_stage_id',
   // Node Mock simulation rows are literal-only (contract 133).
   'mock_simulation',
+  // The attach node's grasp-lost policy is a literal object.
+  'on_grasp_lost',
 ]);
+
+/** The attach node's key is set to true by the Runner when the object is lost. */
+const EVENT_KEY_PARAMETERS: Readonly<Record<string, Readonly<Record<string, string>>>> = {
+  'scene.attach_carried_object': { on_grasp_lost: 'bool' },
+};
+
+function eventKeyType(entry: CatalogEntry, parameterId: string): string | null {
+  return EVENT_KEY_PARAMETERS[entry.id]?.[parameterId] ?? null;
+}
 
 export interface FlatProgramNode {
   node: ProgramTreeNode;
@@ -348,6 +359,11 @@ function compatibleBlackboardKeys(
   const writes = entry.blackboard.writes.filter(
     (binding) => binding.keyParameter === parameterId,
   );
+  const eventType = eventKeyType(entry, parameterId);
+  if (eventType !== null) {
+    return keys.filter((key) => key.type === eventType && key.access !== 'read'
+      && key.expression === undefined);
+  }
   const expectedTypes = new Set([...reads, ...writes].map((binding) => binding.valueType));
   return keys.filter((key) => (
     (expectedTypes.size === 0 || expectedTypes.has(key.type))
@@ -455,6 +471,8 @@ export function programSemanticExpectedType(
 ): string | null {
   if (semanticType === 'scene_resource') return 'scene_resource';
   if (semanticType !== 'blackboard_key') return null;
+  const eventType = eventKeyType(entry, parameterId);
+  if (eventType !== null) return eventType;
   const types = new Set([
     ...entry.blackboard.reads,
     ...entry.blackboard.writes,
@@ -467,6 +485,8 @@ export function programSemanticExpectedAccess(
   entry: CatalogEntry,
   parameterId: string,
 ): 'read' | 'write' | 'read_write' | null {
+  // The Program reads the key it lets the Runner write.
+  if (eventKeyType(entry, parameterId) !== null) return 'read_write';
   const reads = entry.blackboard.reads.some(
     (binding) => binding.keyParameter === parameterId,
   );

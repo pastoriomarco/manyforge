@@ -1,4 +1,4 @@
-// Copyright 2026 Flexin Group SRL
+// Copyright 2026 Marco Pastorio
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -103,8 +103,12 @@ TEST(XArmRobotStatesTransport, SubscribesAndStampsTheLatestReportAtReceipt) {
   EXPECT_EQ(observed.warning_code, 0);
   EXPECT_EQ(observed.motion_enable_mask, 0);
 
-  // Classified through the adapter: emergency stop with its code.
+  // Classified through the adapter: emergency stop with its code once
+  // ManyForge armed the robot (m5.5: unarmed, an error is facts only).
   XArmBrandLifecyclePort port(transport);
+  port.ObserveHardwareActive(false);
+  EXPECT_EQ(port.Observe(clock.now()).cause, Cause::kNone);
+  port.BeginOwnPrimitive(XArmLifecycleCommand::kArm);
   const auto status = port.Observe(clock.now());
   EXPECT_EQ(status.cause, Cause::kEmergencyStop);
   // 0.5 s without a report is stale.

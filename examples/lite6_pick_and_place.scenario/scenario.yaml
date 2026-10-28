@@ -9,11 +9,11 @@
   "members": {
     "assignment.yaml": "sha256:84e103dc895e6da75d430d5d08f69583126910c832efc100b1f652524690cb46",
     "deployment.yaml": "sha256:c32df5b35344d8146ae26713f453018c1c7239cdc61775a877c676a7bb5182a4",
-    "program.yaml": "sha256:d5889eb00e9ea6520a5da97c7e4eb66f00c936e317367f16198a0909b32bd530"
+    "program.yaml": "sha256:5e3feeb63da69c0a7f579ee479ae90ef00a23e8f3ba4221275839209ed23550d"
   },
   "name": "lite6_pick_and_place",
   "saved_status": {
-    "checked_content_digest": "sha256:ff01ede66916d90f87de3ec29f009ff3138946da5dc575231f817f24cf256cad",
+    "checked_content_digest": "sha256:4c9d97e429c00b714e2487ea6cc097e46d2737198c938fef976a2bb66997b765",
     "last_known_status": "ready",
     "manyforge_version": "0.1.0"
   },

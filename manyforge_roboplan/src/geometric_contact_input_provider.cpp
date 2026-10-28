@@ -1,10 +1,11 @@
-// Copyright 2026 Flexin Group SRL
+// Copyright 2026 Marco Pastorio
 // Licensed under the Apache License, Version 2.0.
 
 #include <manyforge_roboplan/geometric_contact_input_provider.hpp>
 
 #include <manyforge_core/execution_collision_support.hpp>
 #include <manyforge_core/io_signal_descriptor.hpp>
+#include <manyforge_core/time/received_sample_age.hpp>
 #include <algorithm>
 #include <atomic>
 #include <limits>
@@ -185,11 +186,11 @@ struct GeometricContactInputProvider::State final
           position_index > selected->positions.size() ||
           observed.positions_rad().size() >
               selected->positions.size() - position_index ||
-          observed.received_timestamp_ns() < 0 ||
-          observed.received_timestamp_ns() > now ||
+          now < 0 || observed.received_timestamp_ns() < 0 ||
           (observed.freshness_budget_ns() > 0 &&
-           now - observed.received_timestamp_ns() >
-               observed.freshness_budget_ns())) {
+           !core::received_sample_current(observed.received_timestamp_ns(),
+                                          now,
+                                          observed.freshness_budget_ns()))) {
         PublishUnavailable(selected, receipt,
                            "observed_state_missing_or_stale");
         ScheduleNext(expected_generation, cadence_anchor, clock.now());

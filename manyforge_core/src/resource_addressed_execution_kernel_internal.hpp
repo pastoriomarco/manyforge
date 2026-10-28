@@ -6,6 +6,7 @@
 #include <chrono>
 #include <cmath>
 #include <condition_variable>
+#include <cstdio>
 #include <iterator>
 #include <limits>
 #include <manyforge_content_identity/canonical_value.hpp>
@@ -2941,12 +2942,35 @@ inline constexpr std::uint64_t kStopJournalProjectionAttempt = 1U;
       return "stop_physical_rest_unproven";
     case StopFaultTriggerDTO::kPersistenceDegraded:
       return "stop_persistence_degraded";
+    case StopFaultTriggerDTO::kPostReserveFenceFailed:
+      return "stop_post_reserve_fence_failed";
   }
   return "stop_fault";
 }
 
+/// Records one latched trigger in `latch.observed_triggers` (distinct, in
+/// first-seen order, so the enum bounds the list). `latch.trigger` must already
+/// be the primary cause. A new trigger that is not the primary writes one
+/// typed line, so a lower-priority cause is never dropped silently.
+inline void observe_fault_trigger(StopFaultLatchDTO& latch, const StopFaultTriggerDTO trigger) {
+  auto& observed = latch.observed_triggers;
+  if (std::find(observed.begin(), observed.end(), trigger) != observed.end()) return;
+  observed.push_back(trigger);
+  if (trigger == latch.trigger) return;
+  const auto name = stop_fault_trigger_name(trigger);
+  const auto primary = stop_fault_trigger_name(latch.trigger);
+  (void)std::fprintf(stderr,
+                     "manyforge_fault code=stop_fault_trigger_observed trigger=%.*s primary=%.*s\n",
+                     static_cast<int>(name.size()), name.data(),
+                     static_cast<int>(primary.size()), primary.data());
+}
+
 [[nodiscard]] inline int fault_trigger_priority(const StopFaultTriggerDTO trigger) noexcept {
   switch (trigger) {
+    // An unfenced accepted Stop is the root cause; a later certificate never
+    // replaces it.
+    case StopFaultTriggerDTO::kPostReserveFenceFailed:
+      return 7;
     case StopFaultTriggerDTO::kFailedUncontained:
       return 6;
     case StopFaultTriggerDTO::kPartial:
@@ -3035,7 +3059,8 @@ inline constexpr std::uint64_t kStopJournalProjectionAttempt = 1U;
       1U,
       StopFaultRecoveryStatusDTO::kWaitingForDurableRecord,
       "stop_persistence_degraded",
-      {}};
+      {},
+      {StopFaultTriggerDTO::kPersistenceDegraded}};
 }
 
 }  // namespace resource_addressed_kernel_detail
@@ -3297,10 +3322,10 @@ class ResourceAddressedExecutionKernel::CellCloseAdmissionLease final
     // DX583/Q121: inspect actual Kernel facts under the existing admission
     // lease and a brief state lock. Neither state nor submission spans SQL;
     // Stop remains recognizable, and callers recheck immediately precommit.
+    // D6: an active Stop-fault latch never blocks Close. Close moves nothing;
+    // the latch is a fact about its robots and is kept (never cleared here).
     std::lock_guard state_lock(owner_.state_mutex_);
     owner_.refresh_stop_fault_latch_locked();
-    if (is_active_stop_fault_latch(owner_.active_stop_fault_latch_))
-      return Result<void>::Err(error("cell_close_stop_fault", "Close requires the actual StopFault to be reset", "active_stop_fault"));
     for (const auto& [id, operation] : owner_.active_operations_) {
       if (operation->containment_effect_uncertain())
         return Result<void>::Err(ErrorDTO{"cell_close_containment_uncertain", "Close cannot infer rest from an uncertain terminal", {{"operation_id", id.value()}}});
@@ -3372,6 +3397,7 @@ class ResourceAddressedExecutionKernel::CellCloseAdmissionLease final
       return false;
     std::lock_guard state_lock(owner_.state_mutex_);
     for (auto* entry : entries_) entry->command_eligible = false;
+    owner_.close_retired_product_ = true;
     consumed_ = true;
     return true;
   }
@@ -3381,6 +3407,7 @@ class ResourceAddressedExecutionKernel::CellCloseAdmissionLease final
     if (!prepared_ || consumed_ || *prepared_ != intent) return false;
     std::lock_guard state_lock(owner_.state_mutex_);
     for (auto* entry : entries_) entry->command_eligible = false;
+    owner_.close_retired_product_ = true;
     consumed_ = true;
     return true;
   }

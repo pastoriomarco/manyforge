@@ -1,8 +1,10 @@
 import {
   allowedKeysAt,
   booleanAt,
+  boundedArrayAt,
   exactKeysAt,
   fail,
+  nonEmptyStringAt,
   nonnegativeInt64TextAt,
   nullablePositiveUint64TextAt,
   nullableStringAt,
@@ -266,6 +268,58 @@ export interface IoSignalBinding {
     transitionCapability: 'sampled_only' | 'captured';
     signalDescriptorDigest: string;
   }>;
+}
+
+/** One generated read-only signal from `targets.system_signals`. */
+export interface SystemSignalProjection {
+  controllableComponentId: string;
+  commandTargetId: string;
+  signalName: string;
+  sourceKind: 'system_carried_object';
+  direction: 'input';
+  valueType: 'bool';
+  level: boolean;
+}
+
+/** Parse optional `targets.system_signals`, ordered by component and target. */
+export function systemSignalsAt(value: unknown, path: string): SystemSignalProjection[] {
+  const rows = boundedArrayAt(value, path, 4096);
+  const parsed = rows.map((entry, index): SystemSignalProjection => {
+    const at = `${path}[${index}]`;
+    const row = objectAt(entry, at);
+    exactKeysAt(row, [
+      'controllable_component_id', 'command_target_id', 'signal_name', 'source_kind',
+      'direction', 'value_type', 'level',
+    ], at);
+    if (row.source_kind !== 'system_carried_object') {
+      return fail(`${at}.source_kind`, 'system_carried_object');
+    }
+    if (row.direction !== 'input') return fail(`${at}.direction`, 'input');
+    if (row.value_type !== 'bool') return fail(`${at}.value_type`, 'bool');
+    return {
+      controllableComponentId: nonEmptyStringAt(row.controllable_component_id, `${at}.controllable_component_id`),
+      commandTargetId: nonEmptyStringAt(row.command_target_id, `${at}.command_target_id`),
+      signalName: nonEmptyStringAt(row.signal_name, `${at}.signal_name`),
+      sourceKind: 'system_carried_object',
+      direction: 'input',
+      valueType: 'bool',
+      level: booleanAt(row.level, `${at}.level`),
+    };
+  });
+  const seen = new Set<string>();
+  parsed.forEach((row, index) => {
+    const identity = JSON.stringify([row.controllableComponentId, row.commandTargetId, row.signalName]);
+    if (seen.has(identity)) return fail(path, 'unique system signal rows');
+    seen.add(identity);
+    if (index === 0) return;
+    const previous = parsed[index - 1];
+    if (previous.controllableComponentId > row.controllableComponentId
+      || (previous.controllableComponentId === row.controllableComponentId
+        && previous.commandTargetId > row.commandTargetId)) {
+      fail(path, 'rows sorted by controllable_component_id and command_target_id');
+    }
+  });
+  return parsed;
 }
 
 const MAXIMUM_IO_SIGNAL_BINDING_ROWS = 4096;

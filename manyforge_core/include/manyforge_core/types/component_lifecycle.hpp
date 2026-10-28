@@ -184,6 +184,54 @@ enum class ComponentLifecycleTerminalResultDTO : std::uint8_t {
   return {};
 }
 
+/// Typed warning: a component's current state could not be read from fresh
+/// fault-free domain observations and was recorded or read as Declared.
+inline constexpr std::string_view kComponentLifecycleStateReconstructedCode =
+    "component_lifecycle_state_reconstructed";
+
+/// A domain's observed state when it is fault-free and at rest (declared,
+/// disabled, prepared, active); otherwise nothing.
+[[nodiscard]] constexpr std::optional<ComponentLifecycleStateDTO> RestingLifecycleState(
+    std::optional<ComponentLifecycleStateDTO> observed) noexcept {
+  if (observed == ComponentLifecycleStateDTO::kDeclared ||
+      observed == ComponentLifecycleStateDTO::kDisabled ||
+      observed == ComponentLifecycleStateDTO::kPrepared ||
+      observed == ComponentLifecycleStateDTO::kActive) {
+    return observed;
+  }
+  return std::nullopt;
+}
+
+struct SettledComponentLifecycleStateDTO final {
+  ComponentLifecycleStateDTO state;
+  /// Some domain had no fresh fault-free observation and counted as Declared.
+  bool reconstructed;
+};
+
+/// The component state its observed domain states settle at: the least
+/// advanced (declared < disabled < prepared < active), all-Active as Prepared
+/// so a settled failure or a reconstruction never makes it command-ready.
+[[nodiscard]] inline SettledComponentLifecycleStateDTO SettleObservedComponentLifecycleState(
+    const std::vector<std::optional<ComponentLifecycleStateDTO>>& observed) noexcept {
+  const auto rank = [](ComponentLifecycleStateDTO state) {
+    return state == ComponentLifecycleStateDTO::kDeclared   ? 0
+           : state == ComponentLifecycleStateDTO::kDisabled ? 1
+           : state == ComponentLifecycleStateDTO::kPrepared ? 2
+                                                            : 3;
+  };
+  SettledComponentLifecycleStateDTO settled{ComponentLifecycleStateDTO::kActive, observed.empty()};
+  for (const auto& domain : observed) {
+    const auto resting = RestingLifecycleState(domain);
+    settled.reconstructed = settled.reconstructed || !resting;
+    const auto state = resting.value_or(ComponentLifecycleStateDTO::kDeclared);
+    if (rank(state) < rank(settled.state)) settled.state = state;
+  }
+  if (settled.reconstructed) settled.state = ComponentLifecycleStateDTO::kDeclared;
+  if (settled.state == ComponentLifecycleStateDTO::kActive)
+    settled.state = ComponentLifecycleStateDTO::kPrepared;
+  return settled;
+}
+
 struct ComponentLifecycleRequestedStateDTO final {
   ComponentLifecycleRequestedStatePresenceDTO presence;
   std::optional<ComponentLifecycleStateDTO> state;
@@ -442,6 +490,12 @@ struct DeviceConfiguredLifecycleLimitDTO final {
 
 using LifecyclePlanTimeoutPolicyDTO = std::variant<std::int64_t, DeviceConfiguredLifecycleLimitDTO>;
 
+/// Provider contract: a Recover plan whose `requested_postcondition` admits
+/// only the resting states `declared`/`disabled` asserts that the
+/// postcondition implies nothing is engaged (no hardware, controller or
+/// output active). ManyForge relies on this to treat such a `declared` domain
+/// as already Disabled; providers that cannot guarantee it must allow another
+/// state or omit such a plan.
 struct LifecycleIntentPlanDTO final {
   ComponentLifecycleIntentKindDTO intent;
   ComponentLifecycleStateDTO requested_state;

@@ -36,6 +36,7 @@ from manyforge_composer.backend.state import (
     _controllable_composition_change_kinds,
 )
 from manyforge_composer.backend.app import create_app
+from manyforge_composer.backend.security import UNTITLED_SCENARIO_PATH
 from manyforge_headless_api.client import HeadlessClientError
 
 
@@ -1079,6 +1080,44 @@ def test_refused_deployment_save_writes_no_artifact(
     assert source.read_bytes() == source_bytes
     assert not (tmp_path / "saved.deployment.yaml").exists()
     assert client.get("/api/deployment/workspace").json() == workspace
+
+
+def test_deployment_save_as_never_writes_into_the_built_in_untitled_scenario(
+    tmp_path: Path,
+) -> None:
+    # A write root that contains the package still never reaches Untitled.
+    client, state = _client(tmp_path)
+    package = str(UNTITLED_SCENARIO_PATH.parent)
+    state.allowed_fs_roots = [str(tmp_path), package]
+    state.allowed_deployment_write_roots = [str(tmp_path), package]
+    untitled_files = {path.name: path.read_bytes() for path in UNTITLED_SCENARIO_PATH.iterdir()}
+    source = tmp_path / "cell_a.deployment.yaml"
+    source.write_text(json.dumps(_document()), encoding="utf-8")
+    workspace = client.get("/api/deployment/workspace").json()
+    workspace = client.post(
+        "/api/deployment/open-draft",
+        json=_request(workspace, path=str(source), confirmDiscard=False, kind="open"),
+    ).json()
+    for index, path in enumerate(
+        (UNTITLED_SCENARIO_PATH / "extra", UNTITLED_SCENARIO_PATH / "deployment.yaml")
+    ):
+        refused = client.post(
+            "/api/deployment/save-as",
+            json=_request(
+                workspace, path=str(path), confirmOverwrite=True, kind=f"untitled-{index}"
+            ),
+        )
+        assert refused.status_code == 409, refused.text
+        assert refused.json()["detail"]["code"] == "scenario_project_read_only"
+        assert client.get("/api/deployment/workspace").json() == workspace
+    assert {path.name: path.read_bytes() for path in UNTITLED_SCENARIO_PATH.iterdir()} == untitled_files
+
+    saved = client.post(
+        "/api/deployment/save-as",
+        json=_request(workspace, path=str(tmp_path / "saved"), confirmOverwrite=False, kind="save"),
+    )
+    assert saved.status_code == 200, saved.text
+    assert (tmp_path / "saved.deployment.yaml").exists()
 
 
 @pytest.mark.parametrize("stale_at", ["before_write", "after_write"])

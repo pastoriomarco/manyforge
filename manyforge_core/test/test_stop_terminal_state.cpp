@@ -99,6 +99,31 @@ TEST(StopTerminalStateTest, RejectsConflictingTerminalOutcomeAndProjectionPresen
   EXPECT_EQ(stop_status_field_error(status), "stop_status_shape_invalid");
 }
 
+TEST(StopTerminalStateTest, TerminalStatusRestRebuildsTheExactStatus) {
+  // Lean Stop record: a terminal row stores only the status rest; the rest of
+  // the status is rebuilt from the certificate and latch. The reducer fixtures
+  // (test_stop_terminal_reducer) cover partial, failed, latched, surveilled,
+  // escalated and predecessor-merge statuses.
+  const auto certificate = Certificate();
+  const auto status = Status();
+  ASSERT_FALSE(stop_terminal_projection_field_error(status, certificate, std::nullopt).has_value());
+  const auto rest = TerminalStopStatusRest(status);
+  EXPECT_EQ(rest.accepted, status.accepted);
+  EXPECT_EQ(rest.current_stages, status.current_stages);
+  EXPECT_EQ(rest.acceptance_projection, status.acceptance_projection);
+  EXPECT_EQ(rest.terminal_projection.state, StopDurableProjectionStateDTO::kPending);
+  EXPECT_EQ(rest.surveillance_projection, status.surveillance_projection);
+  EXPECT_EQ(rest.surveillance, status.surveillance);
+  EXPECT_EQ(TerminalStopStatusFromCertificate(rest, certificate, std::nullopt), status);
+
+  auto recorded = status;
+  recorded.terminal_projection = StopDurableProjectionStatusDTO{
+      StopDurableProjectionStateDTO::kRecorded, std::nullopt, std::nullopt};
+  EXPECT_EQ(TerminalStopStatusFromCertificate(TerminalStopStatusRest(recorded), certificate,
+                                              std::nullopt),
+            recorded);
+}
+
 TEST(StopTerminalStateTest, ForensicProjectionResultHasClosedPresence) {
   EXPECT_FALSE(stop_forensic_projection_result_field_error(
                    StopForensicProjectionResultDTO{StopForensicProjectionStateDTO::kRecorded, 7U,

@@ -2,6 +2,8 @@
 #include "resource_addressed_execution_kernel_internal.hpp"
 #include "program_stop_projection_internal.hpp"
 
+#include <cstdio>
+
 namespace manyforge::core {
 
 StopScopeResolverSnapshotDTO ResourceAddressedExecutionKernel::capture_stop_scope_locked(
@@ -446,7 +448,8 @@ CellStopActionProjectionDTO ResourceAddressedExecutionKernel::cell_stop_action_p
     const auto& latch = *active_stop_fault_latch_;
     projection.fault = CellStopFaultSummaryDTO{
         latch.latch_id,        latch.latch_generation, latch.state,           latch.trigger,
-        latch.recovery_status, latch.reason_code,      latch.stop_certificate};
+        latch.recovery_status, latch.reason_code,      latch.stop_certificate,
+        latch.observed_triggers};
   }
   if (stop_terminal_history_.empty() || stop_terminal_history_.back() == nullptr) {
     return projection;
@@ -527,6 +530,8 @@ StopFaultLatchOriginDTO ResourceAddressedExecutionKernel::get_stop_fault_latch_o
 
 Result<std::optional<StopFaultRecoveryOfferDTO>>
 ResourceAddressedExecutionKernel::get_stop_fault_recovery_offer() const {
+  // Owner before state lock (the owner's scope callback takes the state lock).
+  const bool closing_only = cell_admission_owner_->AuthoringClosedOnlyByClosing();
   std::lock_guard state_lock(state_mutex_);
   if (!active_stop_fault_latch_.has_value() ||
       active_stop_fault_latch_->state == StopFaultLatchStateDTO::kCleared) {
@@ -572,7 +577,14 @@ ResourceAddressedExecutionKernel::get_stop_fault_recovery_offer() const {
         "stop_fault_recovery_offer_configuration_conflict", ErrorCode::kInvariantViolation);
   }
   StopFaultRecoveryOfferDTO offer{*active_stop_fault_latch_, {}, std::nullopt};
-  if (expectations.ok()) {
+  if (stop_fault_admission_scope_locked() == StopFaultAdmissionScope::kClosing) {
+    // D6: Scenario Close keeps the latch; recovery is unavailable until Close
+    // ends. `stop_fault_recovery_closing` also says that authoring is closed
+    // only by the closing scope (SX-370): the one fact the canonical-empty
+    // preparation may waive. Any other blocker reports `_not_ready`.
+    offer.recovery_unavailable_reason =
+        closing_only ? "stop_fault_recovery_closing" : "stop_fault_recovery_closing_not_ready";
+  } else if (expectations.ok()) {
     offer.configuration_expectations = std::move(expectations.value());
   } else {
     offer.recovery_unavailable_reason = expectations.error().code;
@@ -636,6 +648,17 @@ Result<void> ResourceAddressedExecutionKernel::refresh_stop_fault_recovery_asses
   return publish_stop_fault_assessment_locked(*status, assessed.value());
 }
 
+namespace {
+
+[[nodiscard]] Result<StopFaultRecoveryResultDTO> stop_fault_recovery_closing() {
+  return Result<StopFaultRecoveryResultDTO>::Err(
+      error("stop_fault_recovery_closing",
+            "Scenario Close keeps the Stop fault; use Recover cell after Close",
+            "stop_fault_kept_by_close"));
+}
+
+}  // namespace
+
 Result<StopFaultRecoveryResultDTO> ResourceAddressedExecutionKernel::recover_stop_fault(
     const StopFaultRecoveryIntentDTO& intent) {
   if (stop_fault_recovery_intent_field_error(intent).has_value()) {
@@ -673,6 +696,10 @@ Result<StopFaultRecoveryResultDTO> ResourceAddressedExecutionKernel::recover_sto
       result.replay_status = RequestReplayStatusDTO::kReplayedExact;
       return Result<StopFaultRecoveryResultDTO>::Ok(std::move(result));
     }
+    // D6: no recovery clears the latch while Scenario Close runs (Recover
+    // cell clears it after Close). Rechecked before the durable clear below.
+    if (stop_fault_admission_scope_locked() == StopFaultAdmissionScope::kClosing)
+      return stop_fault_recovery_closing();
     if (std::any_of(stop_fault_recovery_replay_ledger_.begin(),
           stop_fault_recovery_replay_ledger_.end(),
           [](const auto& row) { return row.pending_global_record.has_value(); }))
@@ -736,6 +763,12 @@ Result<StopFaultRecoveryResultDTO> ResourceAddressedExecutionKernel::recover_sto
                                               ErrorCode::kMissingReference);
   }
   auto facts = config_.stop_fault_recovery_facts_resolver(*status, clock_.now());
+  const auto closing = [&] {
+    std::lock_guard state_lock(state_mutex_);
+    return stop_fault_admission_scope_locked() == StopFaultAdmissionScope::kClosing;
+  };
+  // Close may have retired the latched Scenario while facts were resolved.
+  if (closing()) return stop_fault_recovery_closing();
   if (!facts.ok()) {
     return Result<StopFaultRecoveryResultDTO>::Err(facts.error());
   }
@@ -756,6 +789,9 @@ Result<StopFaultRecoveryResultDTO> ResourceAddressedExecutionKernel::recover_sto
         StopFaultRecoveryReplayEntry{intent, evaluated.value().result});
     return Result<StopFaultRecoveryResultDTO>::Ok(std::move(evaluated.value().result));
   }
+  // D6 (no new lock): the last check before the durable clear. A Close that
+  // retires between this check and the write still finds the latch cleared.
+  if (closing()) return stop_fault_recovery_closing();
   const auto persisted = journal_.RecordStopFaultCleared(
       config_.request_owner_epoch, intent, evaluated.value().result, evaluated.value().result.latch,
       *evaluated.value().resulting_stop_status);
@@ -794,8 +830,10 @@ Result<StopFaultRecoveryResultDTO> ResourceAddressedExecutionKernel::recover_sto
   // its Stop is accepted (or acceptance can fail). Its existing pending row
   // is already restrictive truth. Keep the historical clear/replay truthful
   // without reopening admission under that newer incident.
+  // A restart-only fault (internal or journal write) keeps it closed.
   motion_admission_closed_ =
-      manager_liveness_motion_inhibited_ || is_active_stop_fault_latch(active_stop_fault_latch_) ||
+      restart_required_fault_locked() || manager_liveness_motion_inhibited_ ||
+      is_active_stop_fault_latch(active_stop_fault_latch_) ||
       std::any_of(incident_containments_.begin(), incident_containments_.end(),
                   [](const auto& row) { return !row.receipt.has_value(); });
   state_lock.unlock();
@@ -1000,8 +1038,10 @@ Result<StopAcceptedDTO> ResourceAddressedExecutionKernel::accept_stop_locked(
       if (armed) {
         // Once the emergency reserve has accepted a recognized Stop, returning
         // a normal rejection or unwinding would lose its already-linearized
-        // containment authority. Every remaining failure is an owner bug and
-        // terminates fail-closed rather than pretending the Stop was rejected.
+        // containment authority. Restated facts refuse in the reserve's
+        // precommit and a fence failure is accepted-degraded, so what remains
+        // here is an owner bug or allocation failure (D5): it terminates
+        // fail-closed rather than pretending the Stop was rejected.
         std::terminate();
       }
     }
@@ -1781,10 +1821,31 @@ Result<StopAcceptedDTO> ResourceAddressedExecutionKernel::accept_stop_locked(
                                   found->operation_id == operation_id;
                          });
     };
+    // One participant scope rule for the precommit check and the fence below.
+    const auto stop_participant_in_scope = [&](const bool exact_partial_capture,
+                                               const OperationId& operation_id,
+                                               const OperationParticipantId& participant_id) {
+      if (global_selection && exact_partial_capture)
+        return std::any_of(global_selection->participants.begin(),
+                            global_selection->participants.end(), [&](const auto& value) {
+                              return value.operation_id == operation_id &&
+                                     value.participant_id == participant_id;
+                            });
+      return !exact_partial_capture ||
+             (operation_id == partial_dispatch_scope->operation_id &&
+              std::binary_search(partial_dispatch_scope->participant_ids.begin(),
+                                 partial_dispatch_scope->participant_ids.end(), participant_id));
+    };
     // Runs inside the reserve on its own selection, before it commits: every
     // row the fresh fence below will actually name must be held by its
-    // recorded owner (stop_fence_batch semantics). Replays and joins fence
-    // nothing new. Mirrors the post-reserve resolution choice exactly.
+    // recorded owner (stop_fence_batch semantics), and the facts the
+    // post-reserve path restates (resident operation, revision bound,
+    // prepared Stop plan) must hold, so they refuse here, before any reserve.
+    // Replays and joins fence nothing new. Mirrors the post-reserve resolution
+    // choice exactly.
+    const char* precommit_refusal_message =
+        "Stop participant resources are not held by their recorded owner";
+    const char* precommit_refusal_code = "stop_operation_not_fenceable";
     const auto fence_rows_held = [&](const EmergencyStopReservePlan& plan) noexcept {
       if (plan.replay || plan.joined_resident) return true;
       if (plan.resident_work_token.has_value()) {
@@ -1798,21 +1859,52 @@ Result<StopAcceptedDTO> ResourceAddressedExecutionKernel::accept_stop_locked(
       if (fenced->full_stop && !full_predecessor_inputs.empty() && !proof_operations.empty())
         fenced = &proof_captured_resolution;
       const bool aggregate = fenced->full_stop && !full_predecessor_inputs.empty();
+      const bool exact_partial_capture =
+          (partial_dispatch_scope != nullptr || global_selection != nullptr) && !fenced->full_stop;
+      const auto refuse = [&](const char* message, const char* code) noexcept {
+        precommit_refusal_message = message;
+        precommit_refusal_code = code;
+        return true;
+      };
       return std::none_of(fenced->operations.begin(), fenced->operations.end(), [&](const auto& id) {
-        const auto* operation =
-            aggregate && inherited_by_predecessor(id) ? nullptr : find_active_operation_locked(id);
-        return operation != nullptr &&
-               std::any_of(operation->participants.begin(), operation->participants.end(),
-                           [&](const auto& participant) {
-                             return !released_pre_dispatch(participant) &&
-                                    std::any_of(participant.resources.begin(),
-                                                participant.resources.end(),
-                                                [&](const ResourceId& resource) {
-                                                  const auto* slot = find_slot(resource);
-                                                  return slot == nullptr || slot->owner !=
-                                                                                participant.slot_owner;
-                                                });
-                           });
+        if (aggregate && inherited_by_predecessor(id)) return false;
+        const auto* operation = find_active_operation_locked(id);
+        if (operation == nullptr)
+          return refuse("resolved Stop operation is not resident or exhausted",
+                        "stop_operation_not_fenceable");
+        auto revision_before_stop = operation->state.operation_revision;
+        if (operation->pending_control.has_value() &&
+            operation->pending_control->accepted.operation_revision_after_acceptance >
+                revision_before_stop)
+          revision_before_stop =
+              operation->pending_control->accepted.operation_revision_after_acceptance;
+        if (revision_before_stop.value() >= kMaximumKernelJsonInteger)
+          return refuse("resolved Stop operation revision is exhausted",
+                        "stop_operation_not_fenceable");
+        return std::any_of(
+            operation->participants.begin(), operation->participants.end(),
+            [&](const auto& participant) {
+              if (released_pre_dispatch(participant)) return false;
+              if (std::any_of(participant.resources.begin(), participant.resources.end(),
+                              [&](const ResourceId& resource) {
+                                const auto* slot = find_slot(resource);
+                                return slot == nullptr || slot->owner != participant.slot_owner;
+                              }))
+                return true;
+              if (!stop_participant_in_scope(exact_partial_capture, id,
+                                             participant.slot_owner.participant_id) ||
+                  participant.non_motion_transaction())
+                return false;
+              const auto& stop_plan =
+                  runtime_collision_containment &&
+                          participant.payload_kind == OperationParticipantPayloadKind::kMotion &&
+                          participant.fault_stop_plan != nullptr
+                      ? participant.fault_stop_plan
+                      : participant.ordinary_stop_plan;
+              return stop_plan == nullptr &&
+                     refuse("resolved Stop participant has no prepared plan",
+                            "stop_participant_plan_missing");
+            });
       });
     };
 
@@ -1838,8 +1930,7 @@ Result<StopAcceptedDTO> ResourceAddressedExecutionKernel::accept_stop_locked(
     outcome = emergency_stop_reserve_.reserve_or_join(candidate, fence_rows_held);
     if (outcome.error == EmergencyStopReserveError::kPrecommitRefused) {
       motion_admission_closed_ = true;
-      return reject<StopAcceptedDTO>("Stop participant resources are not held by their recorded owner",
-                                     "stop_operation_not_fenceable",
+      return reject<StopAcceptedDTO>(precommit_refusal_message, precommit_refusal_code,
                                      ErrorCode::kInvariantViolation);
     }
     if (!outcome.accepted() || outcome.work_token.slot >= stop_transactions_.size() ||
@@ -1996,16 +2087,7 @@ Result<StopAcceptedDTO> ResourceAddressedExecutionKernel::accept_stop_locked(
           !acceptance_resolution.full_stop;
       const auto participant_selected = [&](const OperationId& operation_id,
                                             const OperationParticipantId& participant_id) {
-        if (global_selection && exact_partial_capture)
-          return std::any_of(global_selection->participants.begin(),
-                              global_selection->participants.end(), [&](const auto& value) {
-                                return value.operation_id == operation_id &&
-                                       value.participant_id == participant_id;
-                              });
-        return !exact_partial_capture ||
-               (operation_id == partial_dispatch_scope->operation_id &&
-                std::binary_search(partial_dispatch_scope->participant_ids.begin(),
-                                   partial_dispatch_scope->participant_ids.end(), participant_id));
+        return stop_participant_in_scope(exact_partial_capture, operation_id, participant_id);
       };
       std::size_t participant_capacity = 0U;
       for (const auto& operation_id : resolution.value().operations) {
@@ -2145,9 +2227,19 @@ Result<StopAcceptedDTO> ResourceAddressedExecutionKernel::accept_stop_locked(
               : resource_slots_->stop_fence_batch(ResourceSlotStopFenceRequestDTO{
                     slot_snapshot.operation_resource_generation, outcome.stop_generation,
                     std::move(owner_rows), orphan_resources, std::move(revision_only_rows)});
-      if (!fenced.ok()) {
+      // Accepted-degraded: the reserve already linearized this Stop, so a
+      // fence failure no longer rejects it. Its work is still handed off;
+      // admission closes and the transaction latches a typed Stop fault.
+      const bool fence_failed = !fenced.ok();
+      if (fence_failed) {
         motion_admission_closed_ = true;
-        return Result<StopAcceptedDTO>::Err(fenced.error());
+        (void)std::fprintf(stderr,
+                           "manyforge_fault code=stop_post_reserve_fence_failed error=%s\n",
+                           fenced.error().details.contains("reason")
+                               ? fenced.error().details.at("reason").c_str()
+                               : fenced.error().code.c_str());
+        fenced = Result<ResourceSlotStopFenceResultDTO>::Ok(ResourceSlotStopFenceResultDTO{
+            slot_snapshot.operation_resource_generation, outcome.stop_generation, {}, {}});
       }
       // The resource/operation Stop fence is now linearized. Install the
       // matching process-local participant fence before publishing any
@@ -2224,7 +2316,12 @@ Result<StopAcceptedDTO> ResourceAddressedExecutionKernel::accept_stop_locked(
             // Containment does not acknowledge or repair a retained fault.
           }
         }
+        // A failed fence changed nothing in the slot table. Keep the Kernel's
+        // slot owner and state equal to the table's, so settlement, reset and
+        // a later Stop fence (including an operator Full Stop) name the owner
+        // the table really holds.
         for (auto& participant : operation->participants) {
+          if (fence_failed) break;
           participant.slot_owner.operation_revision = affected.operation_revision_after_acceptance;
           if (participant.stop_owns_reconciliation() && !released_pre_dispatch(participant))
             participant.slot_state = ResourceSlotState::kStopping;
@@ -2310,6 +2407,9 @@ Result<StopAcceptedDTO> ResourceAddressedExecutionKernel::accept_stop_locked(
       // physical rest after an unexpected loss is not yet proven.
       if (required_fault_latch.has_value()) {
         latch_stop_fault_locked(transaction, *required_fault_latch);
+      }
+      if (fence_failed) {
+        latch_stop_fault_locked(transaction, StopFaultTriggerDTO::kPostReserveFenceFailed);
       }
       if (outcome.correlation_retained) {
         stop_correlations_[outcome.correlation_slot] = *accepted;
@@ -2889,6 +2989,7 @@ void ResourceAddressedExecutionKernel::latch_stop_fault_locked(StopTransaction& 
       latch.reason_code = fault_trigger_reason(trigger);
       ++latch.recovery_assessment_revision;
     }
+    observe_fault_trigger(latch, trigger);
     latch.persistence_degraded = latch.persistence_degraded || transaction.persistence_degraded;
     if (active_stop_fault_latch_.has_value() &&
         active_stop_fault_latch_->latch_id == latch.latch_id)
@@ -2924,7 +3025,8 @@ void ResourceAddressedExecutionKernel::latch_stop_fault_locked(StopTransaction& 
       1U,
       StopFaultRecoveryStatusDTO::kWaitingForObservation,
       fault_trigger_reason(trigger),
-      {}};
+      {},
+      {trigger}};
   if (stop_fault_latch_field_error(latch).has_value()) return;
   cell_stop_fault_latch_generation_ = generation;
   transaction.fault_latch = latch;
@@ -2945,6 +3047,20 @@ void ResourceAddressedExecutionKernel::refresh_stop_fault_latch_locked() {
       retain_newest(transaction->fault_latch);
   for (const auto& record : stop_terminal_history_)
     if (record != nullptr) retain_newest(record->fault_latch);
+}
+
+StopFaultAdmissionScope ResourceAddressedExecutionKernel::stop_fault_admission_scope_locked()
+    const noexcept {
+  if (!is_active_stop_fault_latch(active_stop_fault_latch_)) return StopFaultAdmissionScope::kNone;
+  // D6: the latch names the product it latched. Once Close replaced that
+  // product, the latch stays (a fact about its robots) but blocks only motion.
+  const auto& latch = *active_stop_fault_latch_;
+  if (stop_retained_bundle_id_.has_value() && stop_graph_revision_.has_value() &&
+      (latch.retained_bundle_id != *stop_retained_bundle_id_ ||
+       latch.graph_revision != *stop_graph_revision_))
+    return StopFaultAdmissionScope::kCarried;
+  return close_retired_product_ ? StopFaultAdmissionScope::kClosing
+                                : StopFaultAdmissionScope::kCell;
 }
 
 bool ResourceAddressedExecutionKernel::commit_stop_terminal_locked(
@@ -3186,7 +3302,9 @@ bool ResourceAddressedExecutionKernel::commit_stop_terminal_locked(
                                             certificate.stop_certificate_revision,
                                             certificate.stop_id, certificate.stop_generation};
       auto [operations, resources] = fault_latch_capture(certificate);
-      auto trigger = primary_fault_trigger(certificate, transaction.persistence_degraded);
+      const auto certificate_trigger =
+          primary_fault_trigger(certificate, transaction.persistence_degraded);
+      auto trigger = certificate_trigger;
       if (transaction.fault_latch.has_value() &&
           fault_trigger_priority(transaction.fault_latch->trigger) >
               fault_trigger_priority(trigger))
@@ -3213,7 +3331,11 @@ bool ResourceAddressedExecutionKernel::commit_stop_terminal_locked(
               : 1U,
           StopFaultRecoveryStatusDTO::kWaitingForObservation,
           fault_trigger_reason(trigger),
-          {}};
+          {},
+          transaction.fault_latch.has_value() ? transaction.fault_latch->observed_triggers
+                                              : std::vector<StopFaultTriggerDTO>{}};
+      observe_fault_trigger(*latch, trigger);
+      observe_fault_trigger(*latch, certificate_trigger);
       if (stop_fault_latch_field_error(*latch).has_value()) {
         return false;
       }

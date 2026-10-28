@@ -5,6 +5,12 @@ import type { DeploymentWorkspaceController } from '../hooks/useDeploymentWorksp
 import type { BlackboardKeyDeclaration, JsonValue } from '../types/api';
 import { reactPropsHost, type MountedProps } from '../test/reactPropsHost';
 import type { ConditionOperandChoice } from '../utils/interruptAuthoring';
+import { globalRuleChoices } from '../utils/interruptAuthoring';
+import {
+  draftCarriedObjectLostSignals,
+  resolveCarriedObjectLostSignalChoices,
+  type CarriedObjectLostSignalChoice,
+} from '../utils/systemSignalAuthoring';
 import { DeploymentFocusedEditor } from './DeploymentFocusedEditor';
 import { InterruptConditionEditor } from './InterruptConditionEditor';
 import { StopStagePicker } from './StopStagePicker';
@@ -155,6 +161,8 @@ async function mountDeployment(
   policies: Record<string, JsonValue>,
   executionGroupIds: string[] | null = null,
   programKeys: BlackboardKeyDeclaration[] | null = [],
+  systemSignalChoices: CarriedObjectLostSignalChoice[] = [],
+  systemSignalsNeedApply = false,
 ) {
   const controller = {
     workspace: { draft: { document: {
@@ -166,10 +174,20 @@ async function mountDeployment(
     mutate: vi.fn().mockResolvedValue({}),
     updateMotionTargetLimit: vi.fn(),
   } as unknown as DeploymentWorkspaceController;
-  const mounted = await render(<DeploymentFocusedEditor controller={controller}
-    sourceModel={{ status: 'loading' }} motionDescriptors={[]} gripperDescriptors={[]}
-    executionGroupIds={executionGroupIds} programKeys={programKeys} />);
-  return { ...mounted, controller };
+  const element = (choices: CarriedObjectLostSignalChoice[], needApply: boolean) => (
+    <DeploymentFocusedEditor controller={controller}
+      sourceModel={{ status: 'loading' }} motionDescriptors={[]} gripperDescriptors={[]}
+      executionGroupIds={executionGroupIds} programKeys={programKeys}
+      systemSignalChoices={choices} systemSignalsNeedApply={needApply} />
+  );
+  const mounted = await render(element(systemSignalChoices, systemSignalsNeedApply));
+  return {
+    ...mounted,
+    controller,
+    rerenderSignals: async (choices: CarriedObjectLostSignalChoice[], needApply: boolean) => (
+      act(() => mounted.root.render(element(choices, needApply)))
+    ),
+  };
 }
 
 describe('Deployment interrupt rules and output acknowledgement', () => {
@@ -205,6 +223,97 @@ describe('Deployment interrupt rules and output acknowledgement', () => {
       await edited.click('Remove rule');
       expect(edited.controller.mutate).toHaveBeenLastCalledWith(['policies', 'interrupt_rules'], 'remove');
     } finally { await edited.unmount(); }
+  });
+
+  it('keeps last-Apply choices across Draft edits and hides rows from a stale owner', async () => {
+    const systemSignal = {
+      controllableComponentId: 'robot', commandTargetId: 'gripper',
+      signalName: 'carried_object_lost.gripper', resourceRoleId: 'carried_object_lost',
+      direction: 'input', valueType: 'bool',
+    } as const;
+    const appliedOwner = { graphRevision: 'graph.1', retainedBundleId: 'bundle.1' };
+    const appliedRows = [systemSignal];
+    const initialDraft = {
+      api_version: 'manyforge.deployment_intent.v2', components: [station], attachments: [], policies: {},
+    } as unknown as Record<string, JsonValue>;
+    const initial = resolveCarriedObjectLostSignalChoices(
+      draftCarriedObjectLostSignals(initialDraft), appliedRows,
+      'manyforge.deployment_intent.v2', true, appliedOwner, appliedOwner,
+    );
+    const mounted = await mountDeployment({}, null, [], initial.choices, initial.needApply);
+    try {
+      await mounted.click('Add global rule');
+      const created = (mounted.controller.mutate as ReturnType<typeof vi.fn>).mock.lastCall?.[2] as JsonValue[];
+      expect(created).toHaveLength(1);
+      const workspace = mounted.controller.workspace;
+      if (workspace === null) throw new Error('Deployment test workspace is missing.');
+      const changedDraft = {
+        ...initialDraft,
+        policies: { interrupt_rules: created },
+      };
+      (workspace as unknown as { draft: { document: Record<string, JsonValue> | null } }).draft.document = changedDraft;
+      const changed = resolveCarriedObjectLostSignalChoices(
+        draftCarriedObjectLostSignals(changedDraft), appliedRows,
+        'manyforge.deployment_intent.v2', false, appliedOwner, appliedOwner,
+      );
+      expect(changed.needApply).toBe(false);
+      await mounted.rerenderSignals(changed.choices, changed.needApply);
+
+      const optionId = JSON.stringify({ signal: {
+        controllable_component_id: 'robot', signal_name: 'carried_object_lost.gripper',
+      } });
+      const labels = mounted.all((props) => typeof props['aria-label'] === 'string')
+        .map((props) => String(props['aria-label']));
+      expect(labels).toContain('condition operand');
+      const renderedAppliedOption = mounted.all((props) => props.value === optionId
+        && typeof props.children === 'string');
+      expect(renderedAppliedOption).toHaveLength(1);
+      expect(renderedAppliedOption[0].children).toContain('from last Apply');
+      const displayedChoice = globalRuleChoices(
+        changedDraft,
+        [],
+        created[0] !== null && typeof created[0] === 'object' && !Array.isArray(created[0])
+          ? created[0].condition : undefined,
+        changed.choices,
+      ).find((item) => item.id === optionId);
+      expect(displayedChoice?.label).toContain('from last Apply');
+      // The mounted select's handler only commits values from its current choices.
+      // Selecting the applied candidate here verifies the full add/edit path.
+      await mounted.type('condition operand', optionId);
+      const rules = (mounted.controller.mutate as ReturnType<typeof vi.fn>).mock.lastCall?.[2] as JsonValue[];
+      expect((rules[0] as { condition: { compare: { operand: JsonValue } } }).condition.compare.operand).toEqual({ signal: {
+        controllable_component_id: 'robot', signal_name: 'carried_object_lost.gripper',
+      } });
+    } finally { await mounted.unmount(); }
+
+    const changedDraft = {
+      api_version: 'manyforge.deployment_intent.v2', components: [station], attachments: [], policies: {},
+    } as unknown as Record<string, JsonValue>;
+    const staleOwner = resolveCarriedObjectLostSignalChoices(
+      draftCarriedObjectLostSignals(changedDraft), appliedRows,
+      'manyforge.deployment_intent.v2', false,
+      { graphRevision: 'graph.2', retainedBundleId: 'bundle.1' }, appliedOwner,
+    );
+    expect(staleOwner).toEqual({ choices: [], needApply: true });
+    const stale = await mountDeployment({}, null, [], staleOwner.choices, staleOwner.needApply);
+    try {
+      await stale.click('Add global rule');
+      const optionId = JSON.stringify({ signal: {
+        controllable_component_id: 'robot', signal_name: 'carried_object_lost.gripper',
+      } });
+      expect(stale.all((props) => props.value === optionId
+        && typeof props.children === 'string')).toHaveLength(0);
+      expect(stale.all((props) => typeof props.children === 'string'
+        && props.children.includes('Apply to list system signals.'))).toHaveLength(1);
+    } finally { await stale.unmount(); }
+  });
+
+  it('shows the Apply hint when system signals cannot be derived from this Draft', async () => {
+    const mounted = await mountDeployment({}, null, [], [], true);
+    try {
+      expect(mounted.all((props) => typeof props.children === 'string'
+        && props.children.includes('Apply to list system signals.'))).toHaveLength(1);
+    } finally { await mounted.unmount(); }
   });
 
   it('edits the idle behaviour of a Full Stop rule and drops it when switching back to gate', async () => {

@@ -23,6 +23,24 @@ execution admission, retries or Stop semantics.
   effects, never external control. `CheckActivationGate` is the vendor part of
   the Enable gate: the robot ready and the measured joints within the
   per-robot tolerance of the reported angles.
+- m5.5 (activation and state handling): while ManyForge has not armed the
+  robot, a vendor error (C2 left after an emergency stop) is only facts and
+  vendor codes; Prepare and Recover clear it (`xarm.clear_error`, verified on
+  the reports: an error still reported 5 s after the clear fails the step
+  typed, `xarm_error_persists_after_clear` with the vendor code, and stays
+  facts: no incident). C10-C17 are always a cause. Unrequested states 3/4/5/6 and modes other than
+  0/1 carry a typed condition token (`xarm_paused`, `xarm_stopped`,
+  `xarm_mode_changed`, `xarm_stop_requested`, `xarm_manual_mode`,
+  `xarm_mode_external`, `xarm_moved_externally`). An error-free external
+  change while armed is, under the policy `external_move_rearm: automatic`
+  (default), the `device.moved_externally` fact (with `device.in_motion`):
+  on an idle cell the CCLC target driver shows a non-blocking warning and
+  motion commands are refused `component_rearm_required` (no effect) until
+  Recover cell re-arms it (Recover, then the driver's Prepare and Enable);
+  Composer does that and re-sends the command in one press; while ManyForge work may be in flight it is
+  the `external_control` incident; under `operator` it is always the
+  incident. The Real arm plans are
+  bounded at 10 s.
 - `XArmDriverServices` calls the driver's `clean_error` and `clean_warn`
   (`xarm.clear_error` / `xarm.clear_warning`) once each, bounded at 4 s; no
   answer or a non-zero return is an unknown outcome, never retried.
@@ -32,11 +50,20 @@ execution admission, retries or Stop semantics.
   incidents, retained causes and provider loss.
 - `lifecycle_profile.hpp` holds the Real arm's catalog
   (`manyforge.provider.ros2_control.xarm`): Prepare arms through the stock
-  hardware activation (never over a vendor error) and absorbs the plugin's
-  reactivate-all; Enable is the trajectory-controller activation; Disable
+  hardware activation (never over a vendor error), absorbs the plugin's
+  reactivate-all, switches the joint state broadcaster back on alone
+  (`ros2_control.broadcaster.activate`) when that reactivation left it off,
+  and marks the arm prepared only on a broadcaster sample received after the
+  activation; Enable is the trajectory-controller activation; Disable
   switches off the controller, then the hardware; Recover disarms and clears
   the error, then the warning. It also holds the maintained Lite 6 gripper
   plans and the native `xarm_arm_provider` Recover plan.
+- A Real component's gripper domain has its own provider
+  (`manyforge.provider.ros2_control.xarm.gripper`, its own provider instance):
+  the shared ros2_control plans, with Recover targeting `disabled` like the
+  arm, so the component has one common Recover target. A healthy gripper has
+  nothing to clear. The plans are in `manyforge_roboplan`
+  (`retained_ros2_control_gripper_lifecycle_plans`).
 
 The supervised mode, its restricted transport session, the fork-only
 messages and the supervised Lite 6 lifecycle catalog were removed in R7

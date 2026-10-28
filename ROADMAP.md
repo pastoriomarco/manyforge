@@ -145,16 +145,12 @@ The bar for calling ManyForge production-ready:
 
 ## Out of scope / explicitly deferred
 
-These came up during the launcher pass but are not currently on the roadmap:
+These are not currently on the roadmap:
 
 - **Per-package independent SemVer.** We chose unified-repo SemVer
   for the initial public line. If sub-packages start releasing on independent
   cadences (e.g. `manyforge_core` ships a patch faster than the rest), the
   model can split in a later major release decision.
-- **Single-service hot-restart verbs** (`restart-bridge`,
-  `reload-composer`). Deprecated in favor of the unified
-  `scripts/launch.sh restart`. If iteration velocity loss is
-  meaningful, they can be added back as per-service verbs later.
 - **`Code of Conduct`**. Deferred until the project has external
   contributors. Adding it later is a single-PR change.
 

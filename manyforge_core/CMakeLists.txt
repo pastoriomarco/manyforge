@@ -149,6 +149,7 @@ add_library(manyforge_core
   src/trajectory_cache_compatibility.cpp
   src/trajectory_sampler.cpp
   src/trajectory_splice.cpp
+  src/validation_sampling.cpp
   src/collision_policy_evaluator.cpp
   src/collision_validation_coordinator.cpp
   src/ordered_contact_validation.cpp
@@ -661,6 +662,14 @@ if(BUILD_TESTING)
       manyforge_core_sqlite_operation_journal manyforge::content_identity
       SQLite::SQLite3 GTest::gtest_main)
     gtest_discover_tests(test_sqlite_operation_journal
+      PROPERTIES TIMEOUT ${MANYFORGE_GTEST_TIMEOUT_SECONDS})
+
+    add_executable(test_stop_record_size
+      test/test_stop_record_size.cpp)
+    target_link_libraries(test_stop_record_size PRIVATE
+      manyforge_core_sqlite_operation_journal manyforge::content_identity
+      SQLite::SQLite3 GTest::gtest_main)
+    gtest_discover_tests(test_stop_record_size
       PROPERTIES TIMEOUT ${MANYFORGE_GTEST_TIMEOUT_SECONDS})
 
     add_executable(test_kernel_cell_admission_sqlite

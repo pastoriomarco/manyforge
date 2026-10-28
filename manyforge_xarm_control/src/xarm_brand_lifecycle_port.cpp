@@ -1,4 +1,4 @@
-// Copyright 2026 Flexin Group SRL
+// Copyright 2026 Marco Pastorio
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -13,6 +13,8 @@
 // limitations under the License.
 
 #include <manyforge_xarm_control/xarm_brand_lifecycle_port.hpp>
+
+#include <manyforge_core/time/received_sample_age.hpp>
 
 #include <algorithm>
 #include <cmath>
@@ -34,11 +36,17 @@ constexpr int kPositionMode = 0;
 constexpr int kJointServoMode = 1;
 constexpr int kMovingFeedbackState = 1;
 constexpr int kReadyFeedbackState = 2;
+constexpr int kPausedFeedbackState = 3;
 constexpr int kStoppedFeedbackState = 4;
+constexpr int kModeChangedFeedbackState = 5;
+constexpr int kStopRequestedFeedbackState = 6;
+constexpr int kManualMode = 2;
 
 // An own primitive explains vendor mode/state changes for this long after it
-// returned, unless a report showed its final expected pair earlier.
-constexpr std::int64_t kOwnPrimitiveSettleNs = 5'000'000'000LL;
+// returned, unless a report showed its final expected pair earlier. The same
+// window bounds the verification of an own `clean_error` (m5.5).
+constexpr std::int64_t kOwnPrimitiveSettleNs = kXArmClearVerifyNs;
+
 
 [[nodiscard]] LifecycleFactValueDTO unknown_value() {
   return {LifecycleFactValueKindDTO::kUnknown, std::nullopt, std::nullopt,
@@ -78,27 +86,41 @@ constexpr std::int64_t kOwnPrimitiveSettleNs = 5'000'000'000LL;
 
 constexpr int kCollisionErrorCode = 31;
 
+// A report received after the caller's boundary `now_ns` is current (the
+// shared rule of locally received samples).
 [[nodiscard]] bool fresh_report(const XArmObservedState &observed,
                                 const std::int64_t now_ns,
                                 const std::int64_t freshness_ns) {
   return observed.received_timestamp_ns.has_value() &&
-         *observed.received_timestamp_ns <= now_ns &&
-         now_ns - *observed.received_timestamp_ns <= freshness_ns;
+         core::received_sample_current(*observed.received_timestamp_ns, now_ns,
+                                       freshness_ns);
 }
 
 // Conservative vendor-state classification of one fresh report.
 //
 // A non-zero controller error code is classified by its documented meaning;
 // every other code is `fault`. The protective stop has no documented code and
-// is never inferred. An unrequested mode/state change (see `TrackVendorControl`)
-// is `external_control`; a report whose status fields are not established is
-// `unknown`. Warnings are reported as facts and codes, not as a cause: they do
-// not stop the robot, and the vendor activation clears them (R7 §3.4).
+// is never inferred. m5.5: while ManyForge has not armed the robot, an error
+// is reported only as facts and vendor codes (Prepare and Recover clear it);
+// it is a cause when armed, when it survived ManyForge's own clear, or when
+// it needs a power cycle (C10-C17, never cleared). An unrequested mode/state
+// change (see `TrackVendorControl`) is `external_control` only while armed
+// and only under the operator policy; under the automatic policy it is the
+// `device.moved_externally` fact, and unarmed it is a condition Prepare
+// re-arms. A report whose status fields are not established is `unknown`.
+// Warnings are reported as facts and codes, not as a cause: they do not stop
+// the robot, and the vendor activation clears them (R7 §3.4).
 [[nodiscard]] LifecycleBlockingCauseClassDTO
-vendor_cause(const XArmObservedState &observed,
-             const bool external_control_detected) {
+vendor_cause(const XArmObservedState &observed, const bool armed,
+             const bool external_control_detected,
+             const XArmExternalMoveRearm policy) {
   using Cause = LifecycleBlockingCauseClassDTO;
   if (observed.error_code != 0) {
+    // Unarmed, an error (also one ManyForge's clear could not clear: its
+    // step fails typed) stays facts; only C10-C17 are always a cause.
+    if (!armed && !power_cycle_error(observed.error_code)) {
+      return Cause::kNone;
+    }
     if (emergency_stop_error(observed.error_code)) {
       return Cause::kEmergencyStop;
     }
@@ -107,7 +129,8 @@ vendor_cause(const XArmObservedState &observed,
     }
     return Cause::kFault;
   }
-  if (external_control_detected) {
+  if (external_control_detected && armed &&
+      policy == XArmExternalMoveRearm::kOperator) {
     return Cause::kExternalControl;
   }
   if (observed.mode < 0 || observed.state < 0 || observed.warning_code < 0 ||
@@ -115,6 +138,32 @@ vendor_cause(const XArmObservedState &observed,
     return Cause::kUnknown;
   }
   return Cause::kNone;
+}
+
+// m5.5: the typed reason of the condition, or empty when there is none.
+[[nodiscard]] std::string condition_token(const XArmObservedState &observed,
+                                          const bool error_persists_after_clear,
+                                          const bool external_control_detected) {
+  if (observed.error_code != 0) {
+    return error_persists_after_clear ? "xarm_error_persists_after_clear" : "";
+  }
+  if (!external_control_detected) return "";
+  if (observed.mode == kManualMode) return "xarm_manual_mode";
+  if (observed.mode != kPositionMode && observed.mode != kJointServoMode)
+    return "xarm_mode_external";
+  switch (observed.state) {
+  case kPausedFeedbackState:
+    return "xarm_paused";
+  case kStoppedFeedbackState:
+    return "xarm_stopped";
+  case kModeChangedFeedbackState:
+    return "xarm_mode_changed";
+  case kStopRequestedFeedbackState:
+    return "xarm_stop_requested";
+  default:
+    break;
+  }
+  return "xarm_moved_externally";
 }
 
 // Mode/state pairs equivalent for unrequested-change detection: in joint-servo
@@ -261,10 +310,32 @@ XArmBrandLifecyclePort::XArmBrandLifecyclePort(
 // next own primitive, which it does only after the operator's acknowledgement;
 // that dispatch re-baselines from the latest fresh report. Detection of real
 // Studio jogs and of these vendor sequences is verified on hardware in R7.
+//
+// m5.5 additions on the same fresh report: the verification of an own
+// `clean_error` (an error still reported `kOwnPrimitiveSettleNs` after the
+// clear returned persists; a fact, never a cause) and, under the automatic
+// policy, the
+// `device.moved_externally` latch of an error-free change while armed. The
+// latch ends when ManyForge's own arming completes.
 void XArmBrandLifecyclePort::TrackVendorControl(
     const XArmObservedState &observed, const std::int64_t now_ns,
-    VendorTrackingState &tracking) {
+    VendorTrackingState &tracking) const {
   tracking.last_reported_error_code = observed.error_code;
+  const auto received = observed.received_timestamp_ns.value_or(now_ns);
+  if (observed.error_code == 0) {
+    tracking.clear_settled_at_ns.reset();
+    tracking.error_persists_after_clear = false;
+  } else if (tracking.clear_settled_at_ns.has_value() &&
+             received - *tracking.clear_settled_at_ns >= kOwnPrimitiveSettleNs) {
+    tracking.error_persists_after_clear = true;
+  }
+  const auto latch_external_change = [&] {
+    tracking.external_control_detected = true;
+    if (tracking.armed.value_or(true) && observed.error_code == 0 &&
+        config_.external_move_rearm == XArmExternalMoveRearm::kAutomatic) {
+      tracking.moved_externally = true;
+    }
+  };
   if (observed.mode < 0 || observed.state < 0) {
     return;
   }
@@ -272,8 +343,8 @@ void XArmBrandLifecyclePort::TrackVendorControl(
   tracking.last_reported_pair = reported;
   if (tracking.own_expectation.has_value()) {
     if (tracking.own_expectation->completed_at_ns.has_value() &&
-        now_ns - *tracking.own_expectation->completed_at_ns >
-            kOwnPrimitiveSettleNs) {
+        core::received_sample_age_ns(*tracking.own_expectation->completed_at_ns,
+                                     now_ns) > kOwnPrimitiveSettleNs) {
       tracking.own_expectation.reset();
     } else if (tracking.own_expectation->base.mode < 0 ||
                tracking.own_expectation->base.state < 0) {
@@ -288,7 +359,7 @@ void XArmBrandLifecyclePort::TrackVendorControl(
   }
   // ManyForge only ever selects position or joint-servo mode.
   if (reported.mode != kPositionMode && reported.mode != kJointServoMode) {
-    tracking.external_control_detected = true;
+    latch_external_change();
     return;
   }
   if (!tracking.explained_pair.has_value()) {
@@ -304,7 +375,7 @@ void XArmBrandLifecyclePort::TrackVendorControl(
                              tracking.own_expectation->base.state,
                              reported.mode, reported.state)) {
       // The explained pair stays frozen at the last explained status.
-      tracking.external_control_detected = true;
+      latch_external_change();
       return;
     }
     tracking.explained_pair = reported;
@@ -313,6 +384,9 @@ void XArmBrandLifecyclePort::TrackVendorControl(
       tracking.own_expectation->completed_at_ns.has_value() &&
       own_effect_completed(tracking.own_expectation->command, reported.mode,
                            reported.state)) {
+    if (tracking.own_expectation->command == XArmLifecycleCommand::kArm) {
+      tracking.moved_externally = false;
+    }
     tracking.own_expectation.reset();
   }
 }
@@ -325,8 +399,26 @@ XArmBrandLifecyclePort::Classify(const std::int64_t now_ns,
     return {LifecycleBlockingCauseClassDTO::kAvailability, unavailable_facts()};
   }
   TrackVendorControl(observed, now_ns, tracking);
-  return {vendor_cause(observed, tracking.external_control_detected),
-          fresh_facts(observed, (1 << config_.axis_count) - 1)};
+  auto facts = fresh_facts(observed, (1 << config_.axis_count) - 1);
+  const auto condition =
+      condition_token(observed, tracking.error_persists_after_clear,
+                      tracking.external_control_detected);
+  if (!condition.empty()) {
+    facts.push_back(fact(kVendorCodeConditionFactId, token_value(condition)));
+  }
+  if (tracking.moved_externally) {
+    facts.push_back(fact(core::kDeviceMovedExternallyFactId, boolean_value(true)));
+    facts.push_back(fact(core::kDeviceInMotionFactId,
+                         boolean_value(observed.state ==
+                                       kMovingFeedbackState)));
+  }
+  std::sort(facts.begin(), facts.end(), [](const auto &left, const auto &right) {
+    return left.lifecycle_fact_id < right.lifecycle_fact_id;
+  });
+  return {vendor_cause(observed, tracking.armed.value_or(true),
+                       tracking.external_control_detected,
+                       config_.external_move_rearm),
+          std::move(facts)};
 }
 
 XArmDeviceStatus XArmBrandLifecyclePort::Observe(const std::int64_t now_ns) {
@@ -353,12 +445,23 @@ void XArmBrandLifecyclePort::BeginOwnPrimitive(
   tracking_.own_expectation = OwnPrimitiveExpectation{
       command, tracking_.last_reported_pair.value_or(VendorControlPair{}),
       std::nullopt};
+  if (command == XArmLifecycleCommand::kArm) {
+    tracking_.armed = true;
+  } else if (command == XArmLifecycleCommand::kClearError) {
+    tracking_.clear_settled_at_ns.reset();
+    tracking_.error_persists_after_clear = false;
+  }
 }
 
 void XArmBrandLifecyclePort::SettleOwnPrimitive(
     const XArmLifecycleCommand command, const bool effect_possible,
     const std::int64_t now_ns) {
   std::lock_guard lock(mutex_);
+  // m5.5: the armed state is never cleared here: an own deactivation may be
+  // uncertain; the observed hardware state decides (`ObserveHardwareActive`).
+  if (command == XArmLifecycleCommand::kClearError && effect_possible) {
+    tracking_.clear_settled_at_ns = now_ns;
+  }
   if (!tracking_.own_expectation.has_value() ||
       tracking_.own_expectation->command != command ||
       tracking_.own_expectation->completed_at_ns.has_value()) {
@@ -369,6 +472,34 @@ void XArmBrandLifecyclePort::SettleOwnPrimitive(
   } else {
     tracking_.own_expectation.reset();
   }
+}
+
+void XArmBrandLifecyclePort::ObserveHardwareActive(const bool hardware_active) {
+  std::lock_guard lock(mutex_);
+  // While ManyForge's own arming is in flight or settling, the list may
+  // still show the hardware inactive; it decides again afterwards. An
+  // inactive listing after an own deactivation is its proof.
+  const auto &own = tracking_.own_expectation;
+  if (own.has_value() && own->command == XArmLifecycleCommand::kArm) {
+    return;
+  }
+  tracking_.armed = hardware_active;
+}
+
+XArmClearVerification
+XArmBrandLifecyclePort::VerifyOwnClear(const std::int64_t settled_at_ns) const {
+  const auto observed = transport_->observe();
+  if (!observed.received_timestamp_ns.has_value() ||
+      *observed.received_timestamp_ns <= settled_at_ns)
+    return XArmClearVerification::kPending;
+  if (observed.error_code == 0) return XArmClearVerification::kCleared;
+  return *observed.received_timestamp_ns - settled_at_ns >= kXArmClearVerifyNs
+             ? XArmClearVerification::kPersists
+             : XArmClearVerification::kPending;
+}
+
+int XArmBrandLifecyclePort::LatestErrorCode() const {
+  return transport_->observe().error_code;
 }
 
 bool XArmBrandLifecyclePort::ClearErrorPermitted() const {

@@ -1,4 +1,4 @@
-// Copyright 2026 Flexin Group SRL
+// Copyright 2026 Marco Pastorio
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -43,6 +43,14 @@ inline constexpr std::string_view kVendorCodeStateFactId =
     "manyforge.vendor_code.state";
 inline constexpr std::string_view kVendorCodeWarningFactId =
     "manyforge.vendor_code.warning";
+/// m5.5: the typed reason of a vendor condition ManyForge did not request or
+/// could not clear (token): `xarm_error_persists_after_clear`,
+/// `xarm_manual_mode` (mode 2), `xarm_mode_external` (another mode ManyForge
+/// never selects), `xarm_paused` (state 3), `xarm_stopped` (state 4),
+/// `xarm_mode_changed` (state 5), `xarm_stop_requested` (state 6, the
+/// UFACTORY Studio stop) or `xarm_moved_externally`.
+inline constexpr std::string_view kVendorCodeConditionFactId =
+    "manyforge.vendor_code.condition";
 /// Token value of `kVendorCodePowerCycleFactId` for servo faults C10-C17.
 inline constexpr std::string_view kPowerCycleRequiredToken =
     "power_cycle_required";
@@ -56,6 +64,27 @@ inline constexpr std::int64_t kXArmStatusFreshnessNs = 500'000'000;
 /// zero hold target against the real pose; per robot data, checked live.
 inline constexpr double kXArmJointAgreementToleranceRad = 0.02;
 
+/// m5.5: an own `clean_error` is verified on the reports after it returned:
+/// a report without the error proves it cleared; one this long after it that
+/// still shows the error proves it persists (the emergency stop or its input
+/// is still open). The own-primitive settle window, 5 s.
+inline constexpr std::int64_t kXArmClearVerifyNs = 5'000'000'000LL;
+
+/// m5.5: the verification of an own `clean_error` (`VerifyOwnClear`).
+enum class XArmClearVerification : std::uint8_t { kPending, kCleared, kPersists };
+
+/// m5.5 policy `external_move_rearm`: what an error-free move or mode/state
+/// change from the robot's own interface (UFACTORY Studio) does while
+/// ManyForge has the robot armed.
+enum class XArmExternalMoveRearm : std::uint8_t {
+  /// Reported as `device.moved_externally` (no intervention cause): on an
+  /// idle cell the CCLC target driver re-arms the robot once it is at rest;
+  /// during ManyForge work it is the `external_control` incident.
+  kAutomatic,
+  /// Always the `external_control` incident; the operator's Recover re-arms.
+  kOperator,
+};
+
 /// Adapter data of one xArm-family robot (xArm 5/6/7, Lite 6, UF850).
 struct XArmBrandLifecyclePortConfig {
   /// Message-age freshness of `robot_states`.
@@ -64,6 +93,7 @@ struct XArmBrandLifecyclePortConfig {
   int axis_count = 6;
   /// The Enable gate's measured-versus-reported joint tolerance.
   double joint_agreement_tolerance_rad = kXArmJointAgreementToleranceRad;
+  XArmExternalMoveRearm external_move_rearm = XArmExternalMoveRearm::kAutomatic;
 };
 
 /// The normalized status of one xArm: the common cause class plus the
@@ -121,6 +151,20 @@ public:
   void SettleOwnPrimitive(XArmLifecycleCommand command, bool effect_possible,
                           std::int64_t now_ns);
 
+  /// m5.5: the hardware interface's observed activity (the controller
+  /// manager's list). Outside ManyForge's own activation and its settle
+  /// window it is the armed state: a sent-but-uncertain deactivation stays
+  /// armed until the hardware is observed inactive.
+  void ObserveHardwareActive(bool hardware_active);
+
+  /// m5.5, pure: the latest report after an own `clean_error` returned at
+  /// `settled_at_ns` shows the error cleared, still present
+  /// `kXArmClearVerifyNs` later, or neither yet (no such report).
+  [[nodiscard]] XArmClearVerification VerifyOwnClear(std::int64_t settled_at_ns) const;
+  /// The latest report's error code (-1 before any report), for a typed
+  /// failure's vendor code.
+  [[nodiscard]] int LatestErrorCode() const;
+
   /// Servo faults C10-C17 need a power cycle; clearing the error must not
   /// precede it (R7 verification list).
   [[nodiscard]] bool ClearErrorPermitted() const;
@@ -156,11 +200,26 @@ private:
     bool external_control_detected = false;
     // Vendor error code of the latest fresh report; -1 when unknown.
     int last_reported_error_code = -1;
+    // m5.5: whether the robot is armed (its hardware interface active). Set
+    // by ManyForge's own activation; otherwise reconstructed from the
+    // observed hardware state (`ObserveHardwareActive`), never from an own
+    // deactivation whose effect may be uncertain. Unknown (a new adapter
+    // before the first hardware observation) is treated as armed. While
+    // unarmed, a vendor error or an external change is facts only: Prepare
+    // clears it.
+    std::optional<bool> armed;
+    // m5.5: an own `clean_error` returned at this time; a report this long
+    // after it that still shows the error is `error_persists_after_clear`.
+    std::optional<std::int64_t> clear_settled_at_ns;
+    bool error_persists_after_clear = false;
+    // m5.5: an error-free external change while armed (automatic policy),
+    // until ManyForge's own arming completes.
+    bool moved_externally = false;
   };
 
-  static void TrackVendorControl(const XArmObservedState &observed,
-                                 std::int64_t now_ns,
-                                 VendorTrackingState &tracking);
+  void TrackVendorControl(const XArmObservedState &observed,
+                          std::int64_t now_ns,
+                          VendorTrackingState &tracking) const;
   [[nodiscard]] XArmDeviceStatus Classify(std::int64_t now_ns,
                                           VendorTrackingState &tracking) const;
 

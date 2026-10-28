@@ -8,6 +8,7 @@ from manyforge_example_nodes import (
 )
 
 from .canonical_artifact import load_strict_json_yaml
+from .catalog import EXPECTED_CONTENT_VERSION
 
 DESCRIPTOR_PATH = PACKAGE_ROOT / "descriptor.json"
 PROJECT_SNAPSHOT_PATH = PACKAGE_ROOT / "_retained_source/pyproject.toml"
@@ -22,7 +23,7 @@ def descriptor():
         "extension_id": PACKAGE_ID,
         "version": "0.1.0",
         "catalog_api_version": "manyforge.node_catalog.v2",
-        "catalog_content_version": "2.7.0",
+        "catalog_content_version": EXPECTED_CONTENT_VERSION,
         "dependencies": ["manyforge_behavior"],
         "execution_contract": "read_only_single_invocation",
     }

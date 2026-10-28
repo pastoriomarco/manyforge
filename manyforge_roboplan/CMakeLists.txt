@@ -258,6 +258,26 @@ configure_file(
   COPYONLY)
 unset(_MANYFORGE_CONTROLLER_TEMPLATE_INCLUDES)
 
+# E1: the Mock controller rows are data. The shared loader validates the file
+# (the same rules as scripts/robots/check_robot.py) and writes the rows the
+# launch artifacts compile in; an invalid row stops the configure.
+set(_MANYFORGE_MOCK_CONTROLLER_PROFILES
+  "${_MANYFORGE_CONTROLLER_TEMPLATE_ROOT}/mock_controller_profiles.yaml")
+set(_MANYFORGE_MOCK_CONTROLLER_PROFILE_TOOL
+  "${_MANYFORGE_REPOSITORY_SOURCE_ROOT}/scripts/robots/mock_controller_profiles.py")
+set_property(DIRECTORY APPEND PROPERTY CMAKE_CONFIGURE_DEPENDS
+  "${_MANYFORGE_MOCK_CONTROLLER_PROFILES}"
+  "${_MANYFORGE_MOCK_CONTROLLER_PROFILE_TOOL}")
+execute_process(
+  COMMAND "${Python3_EXECUTABLE}" "${_MANYFORGE_MOCK_CONTROLLER_PROFILE_TOOL}"
+    --input "${_MANYFORGE_MOCK_CONTROLLER_PROFILES}"
+    --output "${CMAKE_CURRENT_BINARY_DIR}/generated/mock_controller_profiles.inc"
+  RESULT_VARIABLE _mock_profiles_result
+  ERROR_VARIABLE _mock_profiles_error)
+if(NOT _mock_profiles_result EQUAL 0)
+  message(FATAL_ERROR "${_mock_profiles_error}")
+endif()
+
 add_library(manyforge_roboplan_controller_launch_artifacts
   src/controller_launch_artifacts.cpp)
 target_include_directories(manyforge_roboplan_controller_launch_artifacts
@@ -953,12 +973,14 @@ if(BUILD_TESTING)
         test/test_simulated_plc_readiness.cpp
         test/test_retained_ros2_control_runtime_handle.cpp
         test/test_retained_ros2_control_lifecycle_product.cpp
-        test/test_retained_native_lifecycle_product.cpp)
+        test/test_retained_native_lifecycle_product.cpp
+        test/test_real_xarm_cclc_lifecycle_integration.cpp)
       target_include_directories(test_retained_ros2_control_runtime_handle PRIVATE
         "${CMAKE_CURRENT_SOURCE_DIR}/src"
         "${MANYFORGE_DEPLOYMENT_SOURCE_DIR}/test"
         "${MANYFORGE_DEPLOYMENT_SOURCE_DIR}/src")
       target_link_libraries(test_retained_ros2_control_runtime_handle PRIVATE
+        manyforge_core_sqlite_cclc_journal
         manyforge_component_manager
         manyforge_roboplan_ros2_control_runtime
         manyforge_roboplan_native_runtime_support
@@ -1160,6 +1182,14 @@ if(BUILD_TESTING)
       manyforge_roboplan_scene_factory
       roboplan_example_models::roboplan_example_models
       Threads::Threads
+      GTest::gtest_main)
+
+    add_executable(test_execution_event_stream
+      test/test_execution_event_stream.cpp)
+    target_include_directories(test_execution_event_stream PRIVATE
+      ${CMAKE_CURRENT_SOURCE_DIR}/src)
+    target_link_libraries(test_execution_event_stream PRIVATE
+      manyforge_core manyforge::content_identity Threads::Threads
       GTest::gtest_main)
 
     add_executable(test_roboplan_worker_protocol
@@ -1899,6 +1929,10 @@ if(BUILD_TESTING)
         MANYFORGE_SCENE_TEST_MANAGED_INTERLOCK=1)
     endif()
     gtest_discover_tests(test_process_contained_candidate_client
+      PROPERTIES
+        ENVIRONMENT "LD_LIBRARY_PATH=${_LIB_PATHS}"
+        TIMEOUT ${MANYFORGE_GTEST_TIMEOUT_SECONDS})
+    gtest_discover_tests(test_execution_event_stream
       PROPERTIES
         ENVIRONMENT "LD_LIBRARY_PATH=${_LIB_PATHS}"
         TIMEOUT ${MANYFORGE_GTEST_TIMEOUT_SECONDS})

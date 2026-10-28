@@ -3605,7 +3605,10 @@ def _scene_port(transport):
             "owner_api": owner_api,
         }
 
-    return HeadlessSceneProgramPort(transport, program_node_evidence=captured_node)
+    return HeadlessSceneProgramPort(
+        transport,
+        program_node_evidence=captured_node,
+    )
 
 
 def _pose_latch_owner_response() -> dict[str, Any]:
@@ -4466,7 +4469,7 @@ def test_scene_nodes_translate_roles_and_detach_at_current_pose() -> None:
     assert transport.attachments == []
 
 
-def test_attach_node_sends_its_grasp_lost_bound_with_the_attachment() -> None:
+def test_attach_node_encodes_on_grasp_lost_only_when_non_default() -> None:
     transport = _SceneTransport()
     transport.objects["graspable"] = _fixed_scene_object("graspable")
     port = _scene_port(transport)
@@ -4479,17 +4482,46 @@ def test_attach_node_sends_its_grasp_lost_bound_with_the_attachment() -> None:
         "touch_body_roles": ["tool_collision"],
     }
 
+    omitted = port.invoke(
+        "scene.attach_carried_object",
+        _identity("attach-omitted"),
+        OwnerNodeInputs(parameters=parameters),
+    )
+    assert omitted.succeeded is True
+    assert "on_grasp_lost" not in transport.submissions[0]["operation"]
+    port.invoke(
+        "scene.detach_carried_object",
+        _identity("detach-omitted"),
+        OwnerNodeInputs(
+            parameters={"scene_resource_id": "graspable", "target_role": "arm"}
+        ),
+    )
+
+    parameters = {
+        **parameters,
+        "on_grasp_lost": {
+            "raise_alarm": True,
+            "stop_motion": True,
+            "set_key": None,
+            "detach": True,
+        },
+    }
+
     plain = port.invoke(
         "scene.attach_carried_object",
         _identity("attach-plain"),
         OwnerNodeInputs(parameters=parameters),
     )
     assert plain.succeeded is True
-    assert "grasp_lost_bound" not in transport.submissions[0]["operation"]
+    plain_operation = transport.submissions[-1]["operation"]
+    assert "grasp_lost_bound" not in plain_operation
+    assert "on_grasp_lost" not in plain_operation
     port.invoke(
         "scene.detach_carried_object",
         _identity("detach-plain"),
-        OwnerNodeInputs(parameters={"scene_resource_id": "graspable", "target_role": "arm"}),
+        OwnerNodeInputs(
+            parameters={"scene_resource_id": "graspable", "target_role": "arm"}
+        ),
     )
 
     bounded = port.invoke(
@@ -4500,6 +4532,12 @@ def test_attach_node_sends_its_grasp_lost_bound_with_the_attachment() -> None:
                 **parameters,
                 "grasp_lost_translation_m": 0.03,
                 "grasp_lost_rotation_rad": 0.26,
+                "on_grasp_lost": {
+                    "raise_alarm": False,
+                    "stop_motion": False,
+                    "set_key": "part.lost",
+                    "detach": False,
+                },
             }
         ),
     )
@@ -4508,8 +4546,12 @@ def test_attach_node_sends_its_grasp_lost_bound_with_the_attachment() -> None:
         "translation_m": 0.03,
         "rotation_rad": 0.26,
     }
-
-
+    assert transport.submissions[-1]["operation"]["on_grasp_lost"] == {
+        "raise_alarm": False,
+        "stop_motion": False,
+        "set_key": "part.lost",
+        "detach": False,
+    }
 def test_scene_node_failure_keeps_the_owner_reason() -> None:
     class _UnavailableStateTransport(_SceneTransport):
         def __init__(self) -> None:

@@ -2503,7 +2503,7 @@ def _check_malformed_stop_recovery(
     assert len(clear_rows) == 1
     durable_clear = json.loads(clear_rows[0][1])
     assert durable_clear[0] == (
-        "manyforge.internal.stop-journal-fault-clear-projection.v2"
+        "manyforge.internal.stop-journal-fault-clear-projection.v3"
     )
     assert durable_clear[2][0] == recovered_result["request_id"]
     clear_page = execution.events(owner_epoch, int(clear_rows[0][0]) - 1, limit=1)

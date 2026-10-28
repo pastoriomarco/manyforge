@@ -10,6 +10,7 @@ import type { CycleRecoveryActionId, CycleRecoveryOffer } from '../types/api';
 import type {
   ActiveConfigurationIdentity,
   AlarmMotionAttentionMember,
+  OperatorAlarmRecord,
   OperatorAlarmSnapshot,
 } from '../types/headless';
 import {
@@ -40,6 +41,31 @@ function gates(member: AlarmMotionAttentionMember, resources: ReadonlySet<string
   // exactly the operations whose reserved resources it intersects.
   return (member.subject.subjectKind === 'cell' && scoped.length === 0)
     || scoped.some((resource) => resources.has(resource));
+}
+
+/** Only a condition interlock gates while acknowledged (spec 530 §4.2);
+ * every acknowledgement-gated member is unacknowledged. */
+export function isMotionInterlock(member: AlarmMotionAttentionMember): boolean {
+  return member.lifecycleState === 'active_acknowledged';
+}
+
+/** The alarm records that gate motion now (the owner's attention set). */
+export function motionGatingAlarms(
+  alarms: OperatorAlarmSnapshot | null | undefined,
+  members: (member: AlarmMotionAttentionMember) => boolean = () => true,
+): OperatorAlarmRecord[] {
+  if (alarms === null || alarms === undefined) return [];
+  const activations = new Set(alarms.motionAttentionMembership
+    .filter(members)
+    .map((member) => member.activationId));
+  return alarms.alarms.filter((alarm) => activations.has(alarm.activationId));
+}
+
+/** The alarm records of the active interlocks that gate motion now. */
+export function activeMotionInterlocks(
+  alarms: OperatorAlarmSnapshot | null | undefined,
+): OperatorAlarmRecord[] {
+  return motionGatingAlarms(alarms, isMotionInterlock);
 }
 
 /**
@@ -89,10 +115,8 @@ export function motionAttentionBlock(
   }
   const resources = new Set(resourceIds);
   const members = alarms.motionAttentionMembership.filter((member) => gates(member, resources));
-  // Only a condition interlock gates while acknowledged (spec 530 §4.2);
-  // every acknowledgement-gated member is unacknowledged.
-  const interlocks = members.filter((member) => member.lifecycleState === 'active_acknowledged');
-  const unacknowledged = members.filter((member) => member.lifecycleState !== 'active_acknowledged');
+  const interlocks = members.filter(isMotionInterlock);
+  const unacknowledged = members.filter((member) => !isMotionInterlock(member));
   if (interlocks.length === 0 && unacknowledged.length === 0) return null;
   const code: OperatorAlarmRefusalCode = interlocks.length > 0
     ? 'operator_alarm_interlock_active'

@@ -64,13 +64,13 @@ def make_configuration(
         HostIdentity(
             host_id="control",
             role=HostRole.CONTROL,
-            hostname_or_address="thor",
+            hostname_or_address="control-host",
             boot_id=BOOT_CONTROL,
         ),
         HostIdentity(
             host_id="runtime",
             role=HostRole.RUNTIME,
-            hostname_or_address="orion",
+            hostname_or_address="runtime-host",
             boot_id=BOOT_RUNTIME,
         ),
     ]
@@ -112,8 +112,8 @@ def make_configuration(
                 ServiceKind.PROGRAM_RUNNER: "127.0.0.1",
             }[service],
             port=SERVICE_PORTS[service.value],
-            advertised_host="orion",
-            url=f"http://orion:{SERVICE_PORTS[service.value]}/",
+            advertised_host="runtime-host",
+            url=f"http://runtime-host:{SERVICE_PORTS[service.value]}/",
         )
         for service in ServiceKind
     ]

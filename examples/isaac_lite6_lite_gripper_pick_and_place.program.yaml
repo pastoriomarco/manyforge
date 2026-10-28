@@ -1,6 +1,6 @@
 api_version: manyforge.program.v2
 program_id: isaac_lite6_lite_gripper_pick_and_place
-program_revision: sha256:8748ad5d99ad478813397f7fddb178bb1e504b403ed3898293504ba1547a0255
+program_revision: sha256:447ac2aa94bba434a60f2f801b8380241820abd01ea150275813ef82e68e2b4e
 program_profile: composable-cell-v1
 name: isaac_lite6_lite_gripper_pick_and_place
 description: >-
@@ -10,7 +10,7 @@ description: >-
   observed-scene latching replaces the retired trajectory-reset node.
 catalog:
   api_version: manyforge.node_catalog.v2
-  content_version: 2.7.0
+  content_version: 2.8.0
 compatibility:
   lanes: [isaac-sim]
   assistant: forbidden

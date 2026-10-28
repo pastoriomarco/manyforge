@@ -1090,6 +1090,9 @@ class HeadlessHttpClient:
     def recover_stop_fault(self, body: Mapping[str, Any]) -> dict[str, Any]:
         return self.request("POST", "/api/execution/stop-fault/recover", body=body)
 
+    def cell_recover(self, body: Mapping[str, Any]) -> dict[str, Any]:
+        return self.request("POST", "/api/execution/cell-recover", body=body)
+
     def set_runtime_scale_control(self, body: Mapping[str, Any]) -> dict[str, Any]:
         return self.request("POST", "/api/execution/runtime-scale-control", body=body)
 

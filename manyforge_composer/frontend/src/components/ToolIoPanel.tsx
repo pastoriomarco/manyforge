@@ -7,6 +7,7 @@ import {
   type IoSignalReading,
   type IoSignalSelector,
   type MockIoInputReceipt,
+  type SystemSignalProjection,
 } from '../api/parsers/ioSignals';
 import type { HeadlessStateSource } from '../hooks/useHeadlessState';
 import type { JsonValue } from '../types/api';
@@ -136,6 +137,8 @@ function sourceText(signal: ToolIoSignal, reading: IoSignalReading | null): stri
 export interface ToolIoPanelViewProps {
   unavailableReason: string | null;
   signals: ToolIoSignal[];
+  /** Generated owner signals, displayed from the target projection without requests. */
+  systemSignals?: SystemSignalProjection[];
   states: Record<string, ToolIoSignalState>;
   /** Null when the declared sources cannot be shown (Draft differs from Applied). */
   sourcesNotice: string | null;
@@ -193,6 +196,7 @@ export function ToolIoPanelView(props: ToolIoPanelViewProps) {
 function ToolIoSignalsView({
   unavailableReason,
   signals,
+  systemSignals = [],
   states,
   sourcesNotice,
   onSetMock,
@@ -200,10 +204,11 @@ function ToolIoSignalsView({
   if (unavailableReason !== null) {
     return <p className="panel-state">{unavailableReason}</p>;
   }
-  if (signals.length === 0) {
+  if (signals.length === 0 && systemSignals.length === 0) {
     return <p className="panel-state">The running cell has no bound I/O signals.</p>;
   }
   const components = [...new Set(signals.map((signal) => signal.controllableComponentId))];
+  const systemComponents = [...new Set(systemSignals.map((signal) => signal.controllableComponentId))];
   return (
     <div className="dpanel" aria-label="Tool and I/O signals">
       {sourcesNotice !== null && <p className="hint">{sourcesNotice}</p>}
@@ -296,7 +301,36 @@ function ToolIoSignalsView({
           })}
         </section>
       ))}
-      <p className="hint">Setting a Mock input simulates its source; it is not a hardware command and is allowed at any time.</p>
+      {systemSignals.length > 0 && (
+        <section className="runtime-control-section" aria-label="System signals">
+          <div className="runtime-control-heading">
+            <strong>System signals</strong><small>Read only</small>
+          </div>
+          {systemComponents.map((controllableComponentId) => (
+            <section className="runtime-control-section" key={controllableComponentId}
+              aria-label={`${controllableComponentId} system signals`}>
+              <div className="runtime-control-heading"><strong>{controllableComponentId}</strong></div>
+              {systemSignals.filter((signal) => signal.controllableComponentId === controllableComponentId).map((signal) => (
+                <div className="runtime-control-record" key={`${signal.commandTargetId}\u0000${signal.signalName}`}
+                  data-system-signal={signal.signalName} data-system-source-kind={signal.sourceKind}>
+                  <div className="runtime-control-heading">
+                    <strong>{signal.signalName}</strong>
+                    <small>{signal.commandTargetId} · input · system</small>
+                  </div>
+                  <div className="deployment-resolved-grid">
+                    <span><small>Level</small><strong data-system-signal-level>{String(signal.level)}</strong></span>
+                    <span><small>Type</small><strong>bool</strong></span>
+                    <span><small>Source</small><strong>Carried object</strong></span>
+                  </div>
+                </div>
+              ))}
+            </section>
+          ))}
+        </section>
+      )}
+      {signals.length > 0 && (
+        <p className="hint">Setting a Mock input simulates its source; it is not a hardware command and is allowed at any time.</p>
+      )}
     </div>
   );
 }
@@ -360,6 +394,8 @@ export interface ToolIoPanelProps {
    * publish it, then the running cell's workspace binding supplies the rows.
    */
   ioSignalBindings?: IoSignalBinding[];
+  /** The owner's generated read-only system signal projection. */
+  systemSignals?: SystemSignalProjection[];
   pollIntervalMs?: number;
   /** The control-state source carrying the global rule states. */
   controlSource?: HeadlessStateSource | null;
@@ -378,6 +414,7 @@ export function ToolIoPanel({
   ownerEpoch,
   retainedBundleId,
   ioSignalBindings,
+  systemSignals: ownerSystemSignals,
   pollIntervalMs = IO_PANEL_POLL_INTERVAL_MS,
   controlSource,
 }: ToolIoPanelProps) {
@@ -394,11 +431,14 @@ export function ToolIoPanel({
   );
   const facts = useDeploymentIoFacts(enabled && ownerEpoch !== null, retainedBundleId);
   const bindings = ioSignalBindings ?? facts.bindings;
+  const systemSignals = enabled && ownerEpoch !== null && retainedBundleId !== null
+    ? ownerSystemSignals ?? []
+    : [];
   const unavailableReason = !enabled
     ? 'Tool and I/O signals require the configured headless runtime.'
     : ownerEpoch === null || retainedBundleId === null
       ? 'Waiting for the execution owner.'
-      : bindings === null
+      : bindings === null && systemSignals.length === 0
         ? 'No applied Program binding of the running cell names I/O signals yet.'
         : null;
   const ready = unavailableReason === null;
@@ -459,6 +499,7 @@ export function ToolIoPanel({
     <ToolIoPanelView
       unavailableReason={unavailableReason}
       signals={signals}
+      systemSignals={systemSignals}
       states={states}
       sourcesNotice={facts.notice}
       onSetMock={setMock}

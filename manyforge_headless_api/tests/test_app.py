@@ -223,9 +223,15 @@ def test_closed_core_invalid_request_maps_to_a_client_error() -> None:
     assert _error_status("activation_preparation_failed") == 409
     assert _error_status("manual_handover_required") == 409
     assert _error_status("deployment_candidate_cell_mismatch") == 409
+    # D6: typed refusals before any effect are client errors, not 500.
+    assert _error_status("cell_close_operation_nonterminal") == 409
+    assert _error_status("cell_close_containment_uncertain") == 409
+    assert _error_status("stop_fault_recovery_closing") == 409
     assert _error_status("manual_operation_scope_stale") == 409
     assert _error_status("program_required_component_not_active") == 409
     assert _error_status("route_selection_component_not_ready") == 409
+    # A lifecycle request while another transaction holds the domain.
+    assert _error_status("cclc_domain_busy") == 409
 
 
 @pytest.mark.parametrize(

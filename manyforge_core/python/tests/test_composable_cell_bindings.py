@@ -1852,7 +1852,7 @@ target: 0.5
         ),
         (
             "manyforge.value_schema.runtime.ros2_control_execution.v1",
-            "sha256:725d71567d7d2a0d9645cd71e657ed123d6ce8829d71cb2ea20b6eb8b392c4e4",
+            "sha256:65622b6edc95e1cfb416345970a805e77ef2a3dd33a7e1f4c5cf4d9ee9ee9274",
         ),
         (
             "manyforge.value_schema.runtime.io_provider_execution.v1",
@@ -1860,7 +1860,7 @@ target: 0.5
         ),
         (
             "manyforge.value_schema.runtime.pose_source.v2",
-            "sha256:f386502468c61bdd672f69069327ef013642ce1b30338ecb1a536655c3833e1d",
+            "sha256:a7e77850ee255f3bfc989e5105e1c37ca7c767fa63768160e75e81bb8e6e7173",
         ),
     }
     assert (

@@ -12,6 +12,8 @@ from fastapi import HTTPException
 
 from .deployment_draft import DeploymentDraftError
 from .security import (
+    SCENARIO_PROJECT_READ_ONLY_MESSAGE,
+    inside_untitled_scenario,
     is_path_within_roots,
     normalize_allowed_roots,
     normalize_existing_file_path,
@@ -144,6 +146,8 @@ def save_deployment_artifact(
             str(error.detail),
             status_code=error.status_code,
         )
+    if inside_untitled_scenario(target):
+        _fail("scenario_project_read_only", SCENARIO_PROJECT_READ_ONLY_MESSAGE, status_code=409)
     parent = target.parent.resolve()
     try:
         parent_fd = os.open(parent, os.O_RDONLY | os.O_DIRECTORY | os.O_CLOEXEC | os.O_NOFOLLOW)

@@ -964,15 +964,26 @@ ReadSceneTransactionStoreState(sqlite3 *database,
   };
   std::size_t next_maintenance_completion =
       history.compacted_maintenance_completion_count;
+  // `committed_sequence` names a Scene transaction that committed (0 when the
+  // next event is not a committed transaction; sequences start at 1). Every
+  // completion captured before it (lower snapshot sequence) precedes it, even
+  // when an Apply chain returned to its prior composite (A -> B -> A, such as
+  // Close -> Load of the same Scenario, which preserves the Scene revision).
   const auto apply_maintenance_until =
-      [&](const std::optional<ProjectionRevisionDTO> &expected) {
+      [&](const std::optional<ProjectionRevisionDTO> &expected,
+          const std::uint64_t committed_sequence) {
         while (next_maintenance_completion < completed_maintenance.size()) {
           const auto &initialization =
               *completed_maintenance[next_maintenance_completion];
+          const bool captured_before_commit =
+              committed_sequence != 0U &&
+              initialization.authoritative_snapshot.transaction_sequence <
+                  committed_sequence;
           // A configuration-only Apply may leave the composite unchanged.
           // Consume those completions before the next Scene transaction, but
           // not across a no-op transaction that kept the same revision.
           if (expected.has_value() && state.active_projection == *expected &&
+              !captured_before_commit &&
               !(initialization.predecessor == state.active_projection &&
                 initialization.target == state.active_projection &&
                 initialization.authoritative_snapshot.transaction_sequence ==
@@ -1198,8 +1209,12 @@ ReadSceneTransactionStoreState(sqlite3 *database,
             "scene transaction owner event exceeds resident history");
       }
       auto &record = records[index];
+      const std::uint64_t committed_sequence =
+          record.outcome.has_value() && record.outcome->success
+              ? record.intent.transaction_sequence
+              : 0U;
       if (transaction_event_seen[index] ||
-          !apply_maintenance_until(record.intent.prior)) {
+          !apply_maintenance_until(record.intent.prior, committed_sequence)) {
         throw LogicalSceneOwnerIntegrityError(
             "scene transaction event does not follow the active composite");
       }
@@ -1274,7 +1289,7 @@ ReadSceneTransactionStoreState(sqlite3 *database,
           "migrated structural completion lacks its owner-order event");
     }
   }
-  static_cast<void>(apply_maintenance_until(std::nullopt));
+  static_cast<void>(apply_maintenance_until(std::nullopt, 0U));
   if (!durable_state.active_projection.has_value() ||
       durable_state.active_projection->retained_bundle_id !=
           state.active_projection.retained_bundle_id ||

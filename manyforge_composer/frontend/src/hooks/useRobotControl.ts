@@ -29,8 +29,7 @@ import type { ComposerHeadlessState } from '../types/headless';
 import type { StructuredError } from '../types/api';
 import type { HeadlessStateSource } from './useHeadlessState';
 import {
-  acknowledgeComponentIncidents,
-  stopFaultRecoveryMissing,
+  cellRecoverMessage,
   useComponentIncidents,
 } from './useComponentIncidents';
 import type { OpenComponentIncident } from './useComponentIncidents';
@@ -39,7 +38,7 @@ import type {
   ManualMotionSettings,
   RobotControlState,
 } from '../state/robotControl';
-import type { RobotControlMode } from '../state/robotControl';
+import type { PoseDragDiscard, RobotControlMode } from '../state/robotControl';
 import { acknowledgedUncertainOutputs, type UncertainOutput } from '../utils/uncertainOutputs';
 import { writeManualPneumaticValves } from '../state/pneumaticManual';
 import type { CartesianMoveDraftOptions, MoveToDraftSource } from '../utils/moveTo';
@@ -280,7 +279,7 @@ export interface RobotControlController {
   selectMoveToSource: (source: MoveToDraftSource) => void;
   editMoveToOptions: (update: Partial<CartesianMoveDraftOptions>) => void;
   beginPoseDrag: () => boolean;
-  finishPoseDrag: (pose: Pose3Value | null) => void;
+  finishPoseDrag: (pose: Pose3Value | null, discard?: PoseDragDiscard) => void;
   authoringPending: boolean;
   reportAuthoringPending: (label: string, pending: boolean) => void;
   editMoveToJoints: (positionsRad: number[]) => void;
@@ -910,9 +909,9 @@ export function useRobotControl(
     dispatch({ type: 'begin_pose_drag' });
     return true;
   }, [state, enabled, headlessSnapshot?.executionControlStatus]);
-  const finishPoseDrag = useCallback((pose: Pose3Value | null) => {
+  const finishPoseDrag = useCallback((pose: Pose3Value | null, discard?: PoseDragDiscard) => {
     const generation = dragGeneration.current;
-    if (generation !== null) dispatch({ type: 'finish_pose_drag', generation, pose });
+    if (generation !== null) dispatch({ type: 'finish_pose_drag', generation, pose, discard });
   }, []);
 
   const editPose = useCallback((pose: Pose3Value) => {
@@ -1042,9 +1041,10 @@ export function useRobotControl(
   const componentIncidents = useComponentIncidents(enabled && cellFaultOpen, incidentComponentIds);
   const refreshComponentIncidents = componentIncidents.refresh;
 
-  // "Recover cell" is one operator action (addendum 2, contract item 6):
-  // acknowledge every open component incident, then submit the exact cell
-  // recovery only when its offer is ready; otherwise say what is missing.
+  // "Recover cell" is one operator action (addendum 2, contract item 6). One
+  // Headless call acknowledges every open component incident, waits briefly
+  // for the cell latch, and clears it only when its owner reports it ready;
+  // otherwise it returns the typed reason, shown here.
   const recoverStopFault = useCallback(async () => {
     const status = state.status;
     const fault = status?.cellStopAction.fault;
@@ -1059,17 +1059,9 @@ export function useRobotControl(
     setStopFaultRecoveryPending(true);
     setStopFaultRecoveryError(null);
     try {
-      const acknowledged = await acknowledgeComponentIncidents(
-        status.components.map((component) => component.controllableComponentId),
-        latestSnapshot.current?.authoringAdmission.admissionGeneration ?? null,
-      );
-      const offer = await api.execution.stopFault();
-      if (offer !== null && offer.recoveryStatus !== 'ready') {
-        if (stopFaultRecoveryRequest.current === pending) {
-          setStopFaultRecoveryError(stopFaultRecoveryMissing(offer, acknowledged));
-        }
-      } else if (offer !== null) {
-        await api.execution.recoverStopFault(status.ownerEpoch, requestId());
+      const message = cellRecoverMessage(await api.execution.cellRecover(requestId()));
+      if (message !== null && stopFaultRecoveryRequest.current === pending) {
+        setStopFaultRecoveryError(message);
       }
     } catch (error: unknown) {
       if (stopFaultRecoveryRequest.current === pending) {

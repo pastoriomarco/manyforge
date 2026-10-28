@@ -34,15 +34,27 @@ Runner's one reader of this event stream, keeps the latest bounded set of
 them by exact Stop id and generation so an interrupt node can read the
 attempted stages of its own Stop; a row is kept as read (a truncated one
 proves no attempt) and never affects the rule states.
+
+Delivery is a streaming subscription (``follow``, contract §8.1): the host
+streams every new journal row as an ``event`` and the reply's non-page facts
+as ``state`` when they change, after a first ``snapshot``. A streamed row is
+applied once (by sequence, also against a ``poll`` that read it first); a ready
+baseline of a new context installs from a ``snapshot`` or ``state`` with its
+``through_sequence`` as the rule-row boundary (the host sends it after every
+row it covers, so nothing is reread). A dead link makes the states
+unavailable until the next snapshot. ``poll`` stays the one-shot read for a
+caller that needs a fresh catalog or Stop terminal at once.
 """
 
 from __future__ import annotations
 
 from collections import OrderedDict
-from collections.abc import Callable, Mapping
+from collections.abc import Callable, Mapping, Sequence
 import logging
-from threading import Lock
+from threading import Event, Lock
 from typing import Any, Final
+
+from manyforge_headless_api.execution_event_stream import follow_execution_events
 
 # The wire parsers are shared with the Headless GUI projection.
 from manyforge_headless_api.global_rule_status import (
@@ -94,6 +106,72 @@ def _page(response: Mapping[str, Any], owner_epoch: str, after: int) -> Mapping[
     return page
 
 
+_LOSS_ROW_KEYS: Final = frozenset({
+    "carried_object_attachment_id",
+    "command_target_id",
+    "controllable_component_id",
+    "lost",
+    "loss_event_id",
+    "scene_resource_id",
+    "set_key",
+    "signal_name",
+})
+_LOSS_ROW_TEXT_KEYS: Final = _LOSS_ROW_KEYS - {"lost", "set_key"}
+
+
+def _carried_object_lost_rows(rows: Any) -> tuple[Mapping[str, Any], ...] | None:
+    """The §8.1/§10 rows, strictly: closed keys, non-empty strings (``set_key``
+    a non-empty string or null), ``lost: true`` and the target's signal name.
+    Any invalid row makes the whole set unknown (None, nothing offered); the
+    rule states are unaffected."""
+
+    if not isinstance(rows, list):
+        _LOGGER.warning("carried_object_lost_signals is not a list")
+        return None
+    for row in rows:
+        if (
+            not isinstance(row, Mapping)
+            or set(row) != _LOSS_ROW_KEYS
+            or row["lost"] is not True
+            or any(type(row[key]) is not str or not row[key] for key in _LOSS_ROW_TEXT_KEYS)
+            or not (row["set_key"] is None or (type(row["set_key"]) is str and row["set_key"]))
+            or row["signal_name"] != f"carried_object_lost.{row['command_target_id']}"
+        ):
+            _LOGGER.warning("carried_object_lost_signals has an invalid row")
+            return None
+    return tuple(rows)
+
+
+_LAST_LOSS_KEYS: Final = frozenset({
+    "command_target_id",
+    "controllable_component_id",
+    "loss_event_id",
+    "set_key",
+})
+
+
+def _carried_object_last_losses(entries: Any) -> tuple[Mapping[str, Any], ...] | None:
+    """The §10 last losses, strictly: closed keys, all non-empty strings, one
+    entry per (robot, target, key). Any invalid entry makes the set unknown."""
+
+    if not isinstance(entries, list):
+        _LOGGER.warning("carried_object_last_losses is not a list")
+        return None
+    seen: set[tuple[str, str, str]] = set()
+    for entry in entries:
+        if (
+            not isinstance(entry, Mapping)
+            or set(entry) != _LAST_LOSS_KEYS
+            or any(type(entry[key]) is not str or not entry[key] for key in _LAST_LOSS_KEYS)
+            or (identity := (entry["controllable_component_id"], entry["command_target_id"],
+                             entry["set_key"])) in seen
+        ):
+            _LOGGER.warning("carried_object_last_losses has an invalid entry")
+            return None
+        seen.add(identity)
+    return tuple(entries)
+
+
 class InterruptRuleStateMirror:
     """Follow the Kernel's global rule states through the events reply.
 
@@ -108,10 +186,25 @@ class InterruptRuleStateMirror:
         owner_epoch: Callable[[], str],
         read_events: Callable[[str, int], Mapping[str, Any]],
         on_change: Callable[[Mapping[str, str] | None], None],
+        subscribe: Callable[[int, str | None], Any] | None = None,
+        on_carried_object_lost: Callable[[tuple[Mapping[str, Any], ...]], None] | None = None,
     ) -> None:
         self._owner_epoch = owner_epoch
         self._read_events = read_events
         self._on_change = on_change
+        # The event subscription (``follow``) and the latest
+        # ``carried_object_lost_signals`` rows read, given to their consumer.
+        self._subscribe = subscribe
+        self._on_carried_object_lost = on_carried_object_lost
+        # None: unknown (no snapshot yet, a gap, a lost stream): nothing is
+        # offered then, never an inferred empty set (SX-194).
+        self._carried_object_lost: tuple[Mapping[str, Any], ...] | None = None
+        # Contract §10 "Coalescing": the last loss per gripper and key; known
+        # and unknown together with the rows.
+        self._carried_object_last_losses: tuple[Mapping[str, Any], ...] | None = None
+        # Streamed rule rows at or below it are covered by the installed
+        # baseline.
+        self._state_boundary = 0
         self._lock = Lock()
         self._owner: str | None = None
         self._context: RuleStateContext | None = None
@@ -213,13 +306,163 @@ class InterruptRuleStateMirror:
             return
         try:
             self._poll_locked()
-            current = self._current_locked()
-            changed = current != self._published
-            self._published = current
+            current, changed = self._publish_locked()
         finally:
             self._lock.release()
         if changed:
             self._on_change(current)
+
+    def _publish_locked(self) -> tuple[Mapping[str, str] | None, bool]:
+        current = self._current_locked()
+        changed = current != self._published
+        self._published = current
+        return current, changed
+
+    # Event subscription (contract §8.1) -------------------------------------
+
+    def follow(self, stop: Event, *, on_read: Callable[[], None] | None = None) -> None:
+        """Apply the event subscription until ``stop`` (reconnecting from the
+        last cursor, dead link after three missed heartbeats). ``on_read`` runs
+        after every message but a row or progress: a reading, also when
+        unchanged."""
+
+        if self._subscribe is None:
+            return
+
+        def on_message(message: Mapping[str, Any]) -> None:
+            self.apply_stream_message(message)
+            if message["type"] not in ("event", "progress") and on_read is not None:
+                on_read()
+
+        follow_execution_events(
+            self._subscribe, on_message, stop, on_disconnect=self._stream_lost
+        )
+
+    def apply_stream_message(self, message: Mapping[str, Any]) -> None:
+        """Apply one validated stream message. A malformed one makes the
+        states unavailable and raises (the subscription reconnects)."""
+
+        kind = message["type"]
+        rows: Sequence[Any] | None = None
+        failure: Exception | None = None
+        with self._lock:
+            try:
+                owner = message["owner_epoch"]
+                if kind == "gap":
+                    self._carried_object_lost = None
+                    self._carried_object_last_losses = None  # Until its snapshot.
+                if kind == "snapshot" and owner != self._owner:
+                    self._owner, self._cursor, self._state_boundary = owner, 0, 0
+                    self._drop()
+                    self._stop_terminals.clear()
+                elif kind != "gap" and owner != self._owner:
+                    # A gap names the new owner; its snapshot follows.
+                    raise InterruptStateWireError("stream message names another Kernel owner")
+                if kind in ("snapshot", "state"):
+                    self._apply_stream_state_locked(owner, message["state"])
+                elif kind == "event":
+                    self._apply_stream_event_locked(owner, message["event"])
+                if kind not in ("event", "progress", "gap"):
+                    rows = self._carried_object_lost
+            except Exception as error:
+                failure = error
+                rows = None
+                self._carried_object_lost = None
+                self._carried_object_last_losses = None
+                self._recapture_locked(error)
+            current, changed = self._publish_locked()
+        if changed:
+            self._on_change(current)
+        if rows is not None and self._on_carried_object_lost is not None:
+            # Also unchanged rows (snapshot, state, heartbeat): a row whose
+            # consumer was not ready yet stays eligible on a later message.
+            self._on_carried_object_lost(rows)
+        if failure is not None:
+            raise failure
+
+    def _stream_lost(self, error: BaseException) -> None:
+        with self._lock:
+            # Unavailable, never stale, until the next snapshot.
+            self._drop()
+            self._catalog = None
+            self._carried_object_lost = None
+            self._carried_object_last_losses = None
+            current, changed = self._publish_locked()
+        if changed:
+            self._on_change(current)
+
+    def _recapture_locked(self, error: Exception) -> None:
+        self._has_more = False
+        _LOGGER.warning("interrupt rule state mirror recaptures: %s", error)
+        self._drop()
+        self._catalog = None
+        self._cursor = 0
+        self._state_boundary = 0
+
+    def _apply_stream_state_locked(self, owner: str, state: Mapping[str, Any]) -> None:
+        self._carried_object_lost = _carried_object_lost_rows(
+            state.get("carried_object_lost_signals")
+        )
+        self._carried_object_last_losses = _carried_object_last_losses(
+            state.get("carried_object_last_losses")
+        )
+        if self._carried_object_lost is None or self._carried_object_last_losses is None:
+            # One loss state: both known or both unknown.
+            self._carried_object_lost = self._carried_object_last_losses = None
+        catalog = parse_catalog(state.get("interrupt_rule_catalog"))
+        if catalog is not None and catalog.owner_epoch != owner:
+            raise InterruptStateWireError("rule catalog names another Kernel owner")
+        self._catalog, self._catalog_read = catalog, True
+        if self._context is not None and (catalog is None or not _proves(catalog, self._context)):
+            self._drop()
+        baseline = parse_baseline(state.get("interrupt_rule_state_baseline"))
+        if baseline is None:
+            self._drop()
+        elif isinstance(baseline, RuleStateBaseline):
+            if baseline.context.owner_epoch != owner:
+                raise InterruptStateWireError("baseline names another Kernel owner")
+            if catalog is None or not _proves(catalog, baseline.context):
+                self._drop()
+            elif baseline.context != self._context:
+                # Every rule row at or below the cut was sent before it.
+                self._context = baseline.context
+                self._states = dict(baseline.states)
+                self._state_boundary = baseline.through_sequence
+
+    def _apply_stream_event_locked(self, owner: str, event: Mapping[str, Any]) -> None:
+        sequence = event.get("sequence")
+        if type(sequence) is not int or sequence <= self._cursor:
+            return  # Already applied (a poll read it first).
+        self._cursor = sequence
+        if event.get("record_kind") == STOP_TERMINAL_EVENT_KIND:
+            self._retain_stop_terminal(owner, event)
+            return
+        if (
+            event.get("record_kind") != STATE_EVENT_KIND
+            or sequence <= self._state_boundary
+            or self._context is None
+        ):
+            return
+        context, rule_id, state = parse_state_event(event.get("payload"))
+        if context != self._context:
+            self._drop()  # Replacement before its baseline arrived.
+            return
+        self._states[rule_id] = state
+
+    def carried_object_last_losses(self) -> tuple[Mapping[str, Any], ...] | None:
+        """The latest validated ``carried_object_last_losses`` (contract §10
+        "Coalescing"): the last loss per gripper and ``set_key``; None while
+        the state is unknown, like the rows."""
+
+        with self._lock:
+            return self._carried_object_last_losses
+
+    def carried_object_lost_signals(self) -> tuple[Mapping[str, Any], ...] | None:
+        """The latest validated ``carried_object_lost_signals`` rows (contract
+        §8.1); None while unknown (no snapshot yet, a gap or a lost stream)."""
+
+        with self._lock:
+            return self._carried_object_lost
 
     def _poll_locked(self) -> None:
         try:
@@ -232,12 +475,8 @@ class InterruptRuleStateMirror:
                 if not self._read_one_page(owner):
                     return
         except Exception as error:
-            self._has_more = False
             # Gap, unreadable reply or malformed row: recapture.
-            _LOGGER.warning("interrupt rule state mirror recaptures: %s", error)
-            self._drop()
-            self._catalog = None
-            self._cursor = 0
+            self._recapture_locked(error)
 
     def _read_one_page(self, owner: str) -> bool:
         """Read one page; True when another page should follow at once."""

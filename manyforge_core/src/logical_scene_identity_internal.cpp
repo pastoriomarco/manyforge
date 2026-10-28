@@ -644,17 +644,33 @@ CanonicalValue AttachmentPayload(const CarriedObjectAttachmentDTO& attachment,
   if (attachment.grasp_lost_check) {
     const auto& check = *attachment.grasp_lost_check;
     const std::string label = std::string(field) + ".grasp_lost_check";
-    result.emplace_back(
-        "grasp_lost_check",
-        CanonicalValue(CanonicalValue::Object{
-            {"bound",
-             CanonicalValue(CanonicalValue::Object{
-                 {"rotation_rad", Number(check.bound.rotation_rad,
-                                         label + ".rotation_rad", true)},
-                 {"translation_m", Number(check.bound.translation_m,
-                                          label + ".translation_m", true)},
-             })},
-        }));
+    CanonicalValue::Object check_value{
+        {"bound",
+         CanonicalValue(CanonicalValue::Object{
+             {"rotation_rad", Number(check.bound.rotation_rad,
+                                     label + ".rotation_rad", true)},
+             {"translation_m", Number(check.bound.translation_m,
+                                      label + ".translation_m", true)},
+         })},
+    };
+    // Present only when not the defaults, so default attachments keep their
+    // identity.
+    if (check.on_grasp_lost && !check.on_grasp_lost->is_default()) {
+      const auto& response = *check.on_grasp_lost;
+      Require(response.valid(), label + ".on_grasp_lost is invalid");
+      check_value.emplace_back(
+          "on_grasp_lost",
+          CanonicalValue(CanonicalValue::Object{
+              {"detach", CanonicalValue(response.detach)},
+              {"raise_alarm", CanonicalValue(response.raise_alarm)},
+              {"set_key", response.set_key
+                              ? CanonicalValue(*response.set_key)
+                              : CanonicalValue(nullptr)},
+              {"stop_motion", CanonicalValue(response.stop_motion)},
+          }));
+    }
+    result.emplace_back("grasp_lost_check",
+                        CanonicalValue(std::move(check_value)));
   }
   return CanonicalValue(std::move(result));
 }

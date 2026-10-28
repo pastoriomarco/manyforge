@@ -15,17 +15,29 @@ export const DEFAULT_GIZMO_SETTINGS: GizmoSettings = {
 export const LINEAR_STEP_OPTIONS = [0.001, 0.01, 0.1] as const;
 export const ANGULAR_STEP_OPTIONS = [0.1, 0.5, 1, 5, 10, 30] as const;
 
-/** Snap the *change* from mouse-down; an off-grid target never jumps to a grid. */
+/**
+ * Snap so the gizmo lands on a snapped position. In world space each moved
+ * axis lands on the world grid of `linearStepM`; an axis the drag did not move
+ * keeps its value. In local space the grid is the start pose's frame, so the
+ * change along each local axis is a whole number of steps. Rotation snaps the
+ * change from mouse-down to whole `angularStepDeg` steps.
+ */
 export function snapGizmoPose(start: PoseTuple, raw: PoseTuple, settings: GizmoSettings): PoseTuple {
   if (!settings.snap || settings.mode === 'scale') return raw;
   const initial = new Quaternion(...start.quaternion).normalize();
   if (settings.mode === 'translate') {
-    const delta = new Vector3(...raw.position).sub(new Vector3(...start.position));
-    if (settings.space === 'local') delta.applyQuaternion(initial.clone().invert());
     const step = settings.linearStepM;
     if (!Number.isFinite(step) || step <= 0) return raw;
-    delta.set(...delta.toArray().map((value) => Math.round(value / step) * step) as [number, number, number]);
-    if (settings.space === 'local') delta.applyQuaternion(initial);
+    const snap = (value: number) => Math.round(value / step) * step;
+    if (settings.space === 'world') {
+      const position = raw.position.map((value, axis) => (
+        value === start.position[axis] ? value : snap(value))) as [number, number, number];
+      return { position, quaternion: raw.quaternion };
+    }
+    const delta = new Vector3(...raw.position).sub(new Vector3(...start.position));
+    delta.applyQuaternion(initial.clone().invert());
+    delta.set(...delta.toArray().map(snap) as [number, number, number]);
+    delta.applyQuaternion(initial);
     delta.add(new Vector3(...start.position));
     return { position: delta.toArray(), quaternion: raw.quaternion };
   }

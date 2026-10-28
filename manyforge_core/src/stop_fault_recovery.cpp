@@ -252,7 +252,10 @@ template <typename T>
       !facts.fenced_or_orphan_resources.empty()) {
     return StopFaultRecoveryStatusDTO::kWaitingForObservation;
   }
-  if (latch.trigger == StopFaultTriggerDTO::kFailedUncontained &&
+  // Every observed trigger's obligation applies: a higher-priority primary
+  // (post_reserve_fence_failed) never waives failed_uncontained's external
+  // reconciliation. The rest gate above stays keyed on the primary.
+  if (stop_fault_trigger_observed(latch, StopFaultTriggerDTO::kFailedUncontained) &&
       resource_ids(facts.external_reconciliation_facts) != latch.captured_resources) {
     return StopFaultRecoveryStatusDTO::kWaitingForExternalReconciliation;
   }

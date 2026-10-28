@@ -1,4 +1,4 @@
-import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
+import { useCallback, useEffect, useMemo, useRef, useState, useSyncExternalStore } from 'react';
 import type { DirectControlMotionStatus } from './types/robotControl';
 import type { CSSProperties } from 'react';
 
@@ -12,8 +12,9 @@ import { DeploymentCompositionPanel } from './components/DeploymentCompositionPa
 import { deploymentDocumentHeader } from './components/DeploymentDocumentControls';
 import {
   HeadlessRuntimeSurfaces,
-  attentionAlarmsNewestFirst,
-  partitionRepresentedAlarms,
+  blockingAlarms,
+  nonBlockingAttentionAlarms,
+  runtimeErrorItemCount,
 } from './components/HeadlessRuntimeSurfaces';
 import {
   RuntimeAttentionAutoOpen,
@@ -28,6 +29,7 @@ import { ProgramWorkspace } from './components/ProgramWorkspace';
 import { runtimeStatusPresentation } from './components/runtimeStatus';
 import { SceneAuthoringWorkspace } from './components/SceneAuthoringWorkspace';
 import { WorkbenchNotificationStack } from './components/WorkbenchNotifications';
+import { useExactAlarmAcknowledgement } from './hooks/useExactAlarmAcknowledgement';
 import {
   useHeadlessStateSource,
   useShellHeadlessState,
@@ -37,7 +39,8 @@ import { useDeploymentWorkspace } from './hooks/useDeploymentWorkspace';
 import { useManagerApplyStatus } from './hooks/useManagerApplyStatus';
 import { activationFailureNotice } from './state/activationNotices';
 import { isaacJointStreamNotices } from './state/isaacJointStreamNotices';
-import { isMotionWaitRefusal } from './state/motionWaitRefusal';
+import { isMotionWaitRefusal, setMotionWaitSourceDescriber } from './state/motionWaitRefusal';
+import { declaredIoInputSourceTexts } from './utils/ioSignalConfiguration';
 import { useProgramRuntime } from './hooks/useProgramRuntime';
 import { useProgramWorkspace, type ScenarioReplacementIdentity } from './hooks/useProgramWorkspace';
 import { useRobotControl } from './hooks/useRobotControl';
@@ -46,6 +49,7 @@ import { useHeldNodePreview } from './hooks/useHeldNodePreview';
 import { useResetApply } from './hooks/useResetApply';
 import { useAppliedSettlementRefresh } from './hooks/useAppliedSettlementRefresh';
 import { appliedCartesianDefaults } from './state/robotControl';
+import { REARM_CANCEL_TITLE } from './state/robotRearm';
 import { closeScenario as closeCurrentScenario, resetCloseSnapshot, type ClosePreparationInputs } from './state/scenarioClose';
 import { useCCLC, waitForObservation } from './hooks/useCCLC';
 import type { ManagerActiveProjection } from './types/api';
@@ -59,6 +63,11 @@ import {
 import { useStructuralResource } from './state/structuralResource';
 import { deriveProgramMotionConfiguration, programBlackboardKeys } from './utils/programAuthoring';
 import { globalRuleIds } from './utils/interruptAuthoring';
+import {
+  CARRIED_OBJECT_LOST_RESOURCE_ROLE,
+  draftCarriedObjectLostSignals,
+  resolveCarriedObjectLostSignalChoices,
+} from './utils/systemSignalAuthoring';
 import {
   useOperationalErrorMirror,
   useOperationalErrors,
@@ -74,6 +83,7 @@ import {
   type ManagerApplyIdentity,
 } from './state/managerApply';
 import {
+  deploymentMatchesApplied,
   deploymentDocumentStates,
   deploymentUnapplied,
   programDocumentStates,
@@ -94,6 +104,13 @@ import {
   type WorkbenchNotice,
 } from './state/workbenchNotices';
 import { startupScenarioNotices } from './state/startupScenarioNotice';
+import {
+  alarmWarningNotices,
+  composerWarningNotices,
+  locallyAcknowledgedWarnings,
+  resetReachedIdle,
+  viewerConditionWarning,
+} from './state/warningNotices';
 import type { ProgramWorkspaceActionName } from './state/programWorkspace';
 import {
   INSPECTOR_WIDTH_MIN,
@@ -114,7 +131,7 @@ const INSPECTOR_SECTION_MIN_HEIGHT = 140;
 const NO_MOTION_TARGETS: readonly DirectControlMotionStatus[] = [];
 
 const PROGRAM_ACTION_LABELS: Partial<Record<ProgramWorkspaceActionName, string>> = {
-  new_scenario_document: 'Creating and activating Scenario',
+  new_scenario_document: 'Opening the Untitled Scenario',
   open_draft: 'Opening Program as Draft',
   apply: 'Submitting Program Apply',
   discard: 'Discarding Program changes',
@@ -278,6 +295,11 @@ export default function App() {
   const assistant = assistantAvailability(assistantModes);
   const headlessStateSource = useHeadlessStateSource(headlessEnabled);
   const headlessState = useShellHeadlessState(headlessStateSource);
+  const rearmStatus = useSyncExternalStore(
+    headlessStateSource.subscribeRearmStatus,
+    headlessStateSource.getRearmStatus,
+    headlessStateSource.getRearmStatus,
+  );
   const headlessSnapshot = headlessState.snapshot;
   // One shared authoring publication for the whole workbench: Program,
   // Deployment and Scenario authoring all read this single snapshot, so no
@@ -357,6 +379,24 @@ export default function App() {
   // system keys (schema04 §3; T2 resolves them against the Applied Program).
   const programDraftAuthoring = programController.state.workspace?.draft.authoring ?? null;
   const deploymentDraftDocument = deploymentController.workspace?.draft.document ?? null;
+  // A motion wait labels its missing signal's source id with the declared
+  // source (ROS topic, xArm pin, ...) only while the Deployment Draft is the
+  // Applied one and declares that same source id for the signal.
+  useEffect(() => {
+    const workspace = deploymentController.workspace;
+    const revision = workspace?.draft.deploymentRevision ?? null;
+    const sources = revision !== null && revision === workspace?.managerApplied.deploymentRevision
+      ? declaredIoInputSourceTexts(workspace.draft.document) : null;
+    setMotionWaitSourceDescriber(sources === null ? null
+      : (componentId, signalName, sourceId) => sources.get(JSON.stringify([componentId, signalName, sourceId])) ?? null);
+  }, [deploymentController.workspace]);
+  const draftSystemSignals = useMemo(
+    () => draftCarriedObjectLostSignals(deploymentDraftDocument),
+    [deploymentDraftDocument],
+  );
+  const deploymentDraftApiVersion = typeof deploymentDraftDocument?.api_version === 'string'
+    ? deploymentDraftDocument.api_version : null;
+  const appliedDeploymentIdentity = deploymentController.workspace?.managerApplied.activationOrder ?? null;
   // Null without a Program Draft: a rule's user keys then wait for one (contract 106).
   const globalRuleProgramKeys = useMemo(() => (programDraftAuthoring === null ? null
     : programBlackboardKeys(programDraftAuthoring, globalRuleIds(deploymentDraftDocument))),
@@ -424,6 +464,29 @@ export default function App() {
     programController.state.workspace?.hasUnappliedChanges === true
       || deploymentUnapplied(deploymentController.workspace),
   );
+  const systemSignalChoiceResolution = useMemo(() => resolveCarriedObjectLostSignalChoices(
+    draftSystemSignals,
+    (robotControl.currentStatus?.systemSignals ?? []).map((row) => ({
+      controllableComponentId: row.controllableComponentId,
+      commandTargetId: row.commandTargetId,
+      signalName: row.signalName,
+      resourceRoleId: CARRIED_OBJECT_LOST_RESOURCE_ROLE,
+      direction: 'input' as const,
+      valueType: 'bool' as const,
+    })),
+    deploymentDraftApiVersion,
+    deploymentMatchesApplied(deploymentController.workspace),
+    robotControl.currentStatus === null ? null : {
+      graphRevision: robotControl.currentStatus.graphRevision,
+      retainedBundleId: robotControl.currentStatus.retainedBundleId,
+    },
+    appliedDeploymentIdentity === null ? null : {
+      graphRevision: appliedDeploymentIdentity.graphRevision,
+      retainedBundleId: appliedDeploymentIdentity.retainedBundleId,
+    },
+  ), [appliedDeploymentIdentity, deploymentController.workspace, deploymentDraftApiVersion,
+    draftSystemSignals, robotControl.currentStatus]);
+  const { choices: systemSignalChoices, needApply: systemSignalsNeedApply } = systemSignalChoiceResolution;
   // Robots are moving: a Program run that is not positively held, a starting or
   // stopping cycle, or an active manual operation. Document actions wait.
   const documentCycle = headlessSnapshot?.programCycle;
@@ -444,11 +507,13 @@ export default function App() {
     message: programController.state.error,
     onDismiss: programController.clearFeedback,
   });
+  // A motion-admission wait (contract 75) refused a past command: like any
+  // refusal it is a warning until acknowledged, titled as the wait it is.
   useOperationalErrorMirror({
     source: 'composer.program_runtime',
-    title: 'Program Run, Stop, or Reset failed',
-    // A motion-admission wait (contract 75) is an amber notice, not an error.
-    message: isMotionWaitRefusal(programRuntime.state.error) ? null : programRuntime.state.error,
+    title: isMotionWaitRefusal(programRuntime.state.error)
+      ? 'Motion waiting' : 'Program Run, Stop, or Reset failed',
+    message: programRuntime.state.error,
     onDismiss: programRuntime.dismissError,
   });
   useOperationalErrorMirror({
@@ -458,14 +523,14 @@ export default function App() {
     onDismiss: robotControl.dismissRuntimeScaleError,
   });
   const robotOperationalError = robotControl.state.error !== null
-    && !isMotionWaitRefusal(robotControl.state.error)
     && !robotControl.state.error.startsWith('The authored ')
     && !robotControl.state.error.startsWith('The stored ')
     ? robotControl.state.error
     : null;
   useOperationalErrorMirror({
     source: 'composer.robot_control',
-    title: 'Robot control request failed',
+    title: isMotionWaitRefusal(robotOperationalError)
+      ? 'Motion waiting' : 'Robot control request failed',
     message: robotOperationalError,
     onDismiss: robotControl.dismissError,
   });
@@ -538,11 +603,15 @@ export default function App() {
   const [trackedApply, setTrackedApply] = useState<ManagerApplyIdentity | null>(null);
   const closeAbort = useRef<AbortController | null>(null);
   const [scenarioCloseProgress, setScenarioCloseProgress] = useState<string | null>(null);
+  // Bumped by Reset reaching Idle and by Scenario Close: clears every warning.
+  const [warningClearEpoch, setWarningClearEpoch] = useState(0);
   useEffect(() => () => closeAbort.current?.abort(), []);
   const latestProgramRuntime = useRef(programRuntime);
   latestProgramRuntime.current = programRuntime;
   const closeCurrent = useCallback(async (expected: ManagerActiveProjection, confirmed?: ScenarioReplacementIdentity, callerSignal?: AbortSignal) => {
     if (closeAbort.current !== null) throw new Error('Scenario Close is already in progress.');
+    // m5.5: Close cancels a motion command waiting for its robot re-arm.
+    headlessStateSource.cancelPendingMotionIntent();
     const abort = new AbortController();
     closeAbort.current = abort;
     const abortFromCaller = () => abort.abort(callerSignal?.reason);
@@ -564,7 +633,7 @@ export default function App() {
           return latest;
         },
       };
-      return await closeCurrentScenario({ expected, signal: abort.signal,
+      const closed = await closeCurrentScenario({ expected, signal: abort.signal,
         preparation,
         admissionGeneration: () => {
           const state = headlessStateSource.getShellSnapshot();
@@ -575,6 +644,8 @@ export default function App() {
         waitForObservation: () => waitForObservation(abort.signal),
         trackApply: setTrackedApply, progress: setScenarioCloseProgress,
       });
+      if (closed !== null) setWarningClearEpoch((epoch) => epoch + 1);
+      return closed;
     } finally {
       callerSignal?.removeEventListener('abort', abortFromCaller);
       closeAbort.current = null; setScenarioCloseProgress(null);
@@ -723,6 +794,22 @@ export default function App() {
       ...authoringContainmentNotices(headlessSnapshot),
       ...isaacJointStreamNotices(headlessSnapshot?.runtime.sections.sceneRuntime ?? null),
     ];
+    if (rearmStatus !== null) {
+      notices.push({
+        id: 'robot.rearm',
+        severity: 'info',
+        domain: 'runtime',
+        title: rearmStatus,
+        message: 'The robot was moved outside ManyForge; Composer re-arms it, then sends the command.',
+        busy: true,
+        actions: [{
+          id: 'cancel',
+          label: 'Cancel',
+          title: REARM_CANCEL_TITLE,
+          run: headlessStateSource.cancelPendingMotionIntent,
+        }],
+      });
+    }
     const label = pendingProgramAction === null
       ? undefined
       : PROGRAM_ACTION_LABELS[pendingProgramAction];
@@ -777,26 +864,10 @@ export default function App() {
         message: reason,
       });
     }
-    for (const [id, message, dismiss] of [
-      ['program', programRuntime.state.error, programRuntime.dismissError],
-      ['robot', robotControl.state.error, robotControl.dismissError],
-    ] as const) {
-      if (message === null || !isMotionWaitRefusal(message)) continue;
-      notices.push({
-        id: `motion.wait.${id}`,
-        severity: 'warning',
-        domain: 'runtime',
-        title: 'Motion waiting',
-        message,
-        actions: [{ id: 'dismiss', label: 'Dismiss', run: dismiss }],
-      });
-    }
     return notices;
   }, [
-    programRuntime.state.error,
-    programRuntime.dismissError,
-    robotControl.state.error,
-    robotControl.dismissError,
+    rearmStatus,
+    headlessStateSource.cancelPendingMotionIntent,
     authoringCause,
     authoringWorkspace.unavailableReason,
     controlNotices.length,
@@ -906,43 +977,104 @@ export default function App() {
     () => classifyWorkbenchNotices(heldNotices, null),
     [heldNotices],
   );
+  // Red is only what blocks now. A viewer condition blocks no command, so it
+  // is a warning; it is still reported as a viewer incident while it lasts.
+  const viewerConditions = useMemo(
+    () => noticesOfSeverity(classifiedNotices, 'error')
+      .filter((notice) => notice.incidentKind !== undefined),
+    [classifiedNotices],
+  );
   const errorConditions = useMemo(
-    () => noticesOfSeverity(classifiedNotices, 'error'),
+    () => noticesOfSeverity(classifiedNotices, 'error')
+      .filter((notice) => notice.incidentKind === undefined),
     [classifiedNotices],
   );
-  const warningNotices = useMemo(
-    () => noticesOfSeverity(classifiedNotices, 'warning'),
-    [classifiedNotices],
+  // Warnings that block nothing stay until acknowledged here (per browser
+  // session), or until Reset or Scenario Close.
+  const [acknowledgedWarnings, setAcknowledgedWarnings] = useState<ReadonlySet<string>>(
+    () => new Set(),
   );
+  const localWarnings = useMemo(() => [
+    ...noticesOfSeverity(classifiedNotices, 'warning'),
+    ...viewerConditions.map(viewerConditionWarning),
+  ], [classifiedNotices, viewerConditions]);
+  const acknowledgeableKey = localWarnings
+    .filter((notice) => notice.acknowledgeable === true)
+    .map((notice) => notice.id)
+    .join('\n');
+  const presentAcknowledgeable = useRef<string[]>([]);
+  useEffect(() => {
+    const present = acknowledgeableKey === '' ? [] : acknowledgeableKey.split('\n');
+    presentAcknowledgeable.current = present;
+    // A warning that has gone is forgotten, so its next occurrence shows again.
+    setAcknowledgedWarnings((current) => ([...current].every((id) => present.includes(id))
+      ? current
+      : new Set([...current].filter((id) => present.includes(id)))));
+  }, [acknowledgeableKey]);
+  const cycleStateNow = headlessSnapshot?.programCycle.state;
+  const previousCycleState = useRef(cycleStateNow);
+  useEffect(() => {
+    const previous = previousCycleState.current;
+    previousCycleState.current = cycleStateNow;
+    if (resetReachedIdle(previous, cycleStateNow)) setWarningClearEpoch((epoch) => epoch + 1);
+  }, [cycleStateNow]);
+  const clearOperationalErrors = operationalErrors.clear;
+  useEffect(() => {
+    if (warningClearEpoch === 0) return;
+    clearOperationalErrors();
+    setAcknowledgedWarnings(new Set(presentAcknowledgeable.current));
+  }, [clearOperationalErrors, warningClearEpoch]);
+  const composerWarnings = useMemo(
+    () => composerWarningNotices(clientErrors, operationalErrors.dismiss),
+    [clientErrors, operationalErrors.dismiss],
+  );
+  const alarmAcknowledgement = useExactAlarmAcknowledgement();
+  const { acknowledge: acknowledgeAlarm, setError: setAlarmAcknowledgementError } = alarmAcknowledgement;
+  useOperationalErrorMirror({
+    source: 'composer.warning_alarm_acknowledgement',
+    title: 'Alarm acknowledgement failed',
+    message: alarmAcknowledgement.error,
+    onDismiss: () => setAlarmAcknowledgementError(null),
+  });
+  // Unacknowledged alarms that gate nothing are warnings with the server's
+  // exact acknowledgement.
+  const alarmWarnings = useMemo(() => {
+    const alarms = headlessSnapshot?.alarms;
+    return alarms === undefined ? [] : alarmWarningNotices(
+      nonBlockingAttentionAlarms(alarms),
+      alarmAcknowledgement.busyActivation,
+      (alarm) => { void acknowledgeAlarm([alarm], alarms.ownerEpoch); },
+    );
+  }, [acknowledgeAlarm, alarmAcknowledgement.busyActivation, headlessSnapshot]);
+  const acknowledgeWarning = useCallback((id: string) => {
+    setAcknowledgedWarnings((current) => new Set(current).add(id));
+  }, []);
+  const warningNotices = useMemo<WorkbenchNotice[]>(() => [
+    ...locallyAcknowledgedWarnings(localWarnings, acknowledgedWarnings, acknowledgeWarning),
+    ...composerWarnings,
+    ...alarmWarnings,
+  ], [acknowledgeWarning, acknowledgedWarnings, alarmWarnings, composerWarnings, localWarnings]);
   const activityNotices = useMemo(
     () => noticesOfSeverity(classifiedNotices, 'info'),
     [classifiedNotices],
   );
   useViewerIncidentReporting(
-    errorConditions,
+    viewerConditions,
     headlessEnabled ? headlessStateSource.reportClientIncident : undefined,
   );
-  const unacknowledgedAlarmCount = headlessSnapshot?.alarms.unacknowledgedCount ?? 0;
-  // An alarm a current notice represents is counted once, with the notice.
-  const representedAlarmCount = useMemo(() => [...partitionRepresentedAlarms(
-    attentionAlarmsNewestFirst(headlessSnapshot?.alarms.alarms ?? []),
+  const errorItemCount = useMemo(() => runtimeErrorItemCount(
+    headlessSnapshot?.alarms,
     errorConditions,
-  ).represented.values()].reduce((count, alarms) => count + alarms.length, 0),
-  [errorConditions, headlessSnapshot]);
-  const errorItemCount = clientErrors.length
-    + Math.max(0, unacknowledgedAlarmCount - representedAlarmCount)
-    + errorConditions.length;
+  ), [errorConditions, headlessSnapshot]);
+  // Only red items open the panel automatically; warnings never do.
   const runtimeAttentionItems = useMemo(() => [
     ...errorConditions.map((condition) => ({
       identity: `condition:${condition.id}`,
     })),
-    ...attentionAlarmsNewestFirst(headlessSnapshot?.alarms.alarms ?? []).map((alarm) => ({
+    ...blockingAlarms(headlessSnapshot?.alarms).map((alarm) => ({
       identity: `backend:${alarm.activationId}`,
     })),
-    ...clientErrors.map((error) => ({
-      identity: `composer:${error.id}`,
-    })),
-  ], [clientErrors, errorConditions, headlessSnapshot]);
+  ], [errorConditions, headlessSnapshot]);
   const openRuntimeAttention = useCallback((identity: string) => {
     setRuntimeAttentionRequest(identity);
     // Automatic attention may choose the initial compact presentation, but it
@@ -1100,7 +1232,6 @@ export default function App() {
     error: headlessState.error,
     connectionDetail,
     unacknowledgedAlarms: headlessSnapshot?.alarms.unacknowledgedCount ?? 0,
-    clientErrorCount: clientErrors.length,
   });
   const deploymentTitle = programInvalidEdit
     ? `Review or discard the invalid Program field edit first. Component status: ${deploymentStatus.accessibleLabel}. ${deploymentStatus.detail}`
@@ -1223,8 +1354,13 @@ export default function App() {
           >
             Runtime / history
             {errorItemCount > 0 && (
-              <span className="global-attention-count">
+              <span className="global-attention-count" title="Errors">
                 {errorItemCount}
+              </span>
+            )}
+            {warningNotices.length > 0 && (
+              <span className="global-attention-count warning" title="Warnings">
+                {warningNotices.length}
               </span>
             )}
           </button>
@@ -1255,6 +1391,8 @@ export default function App() {
               environment={nodeEnvironment}
               sourceModel={sourceModel}
               deploymentWorkspace={deploymentController.workspace}
+              systemSignalChoices={systemSignalChoices}
+              systemSignalsNeedApply={systemSignalsNeedApply}
               programRoleAssignment={authoringWorkspace.project?.programRoleAssignment ?? null}
               motionDescriptors={robotControl.motionTargets.map(
                 (target) => target.targetDescriptor,
@@ -1301,6 +1439,8 @@ export default function App() {
                 programKeys={globalRuleProgramKeys}
                 programSceneIds={programSceneIds}
                 executionGroupIds={appliedExecutionGroupIds}
+                systemSignalChoices={systemSignalChoices}
+                systemSignalsNeedApply={systemSignalsNeedApply}
                 maintenanceStatus={activation}
                 componentOverview={{
                   request: componentOverviewRequest,
@@ -1421,13 +1561,9 @@ export default function App() {
                     // unresolved error, recovery condition or alarm.
                     errorRow={globalPanel === 'runtime' || errorItemCount > 0 ? (
                       <HeadlessRuntimeSurfaces
-                        enabled={headlessEnabled
-                          || errorConditions.length > 0
-                          || clientErrors.length > 0}
+                        enabled={headlessEnabled || errorConditions.length > 0}
                         headlessStateSource={headlessStateSource}
-                        clientErrors={clientErrors}
                         conditions={errorConditions}
-                        onAcknowledgeClientError={operationalErrors.dismiss}
                         attentionRequest={runtimeAttentionRequest}
                         expanded={runtimePanelExpanded}
                         onExpandedChange={setRuntimePanelExpansion}

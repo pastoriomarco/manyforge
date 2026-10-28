@@ -1,6 +1,7 @@
 #pragma once
 
 #include "activation_io_provider_internal.hpp"
+#include "activation_prepared_model_internal.hpp"
 
 namespace manyforge::deployment::detail {
 
@@ -18,6 +19,7 @@ namespace manyforge::deployment::detail {
 prepare_activation_pose_source_types(
     const ActivationDeploymentIntent &intent,
     std::span<const ActivationComponentProfile> profiles,
+    const std::vector<ActivationPreparedModel> &prepared_models,
     std::span<const QualifiedCapabilityDefinition> capabilities);
 
 /// One model-free AI model component (runtime kind `ai_model`, profile

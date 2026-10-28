@@ -54,6 +54,7 @@ _ALLOWED_INLINE_SCHEMA_KEYS = {
     "requires_current_value",
     "semantic_type",
     "semantic_scope_parameter",
+    "nullable",
     "value_type_from_key",
     "value_types",
 }
@@ -166,6 +167,7 @@ class CatalogSchema:
     requires_current_value: bool = False
     semantic_type: str | None = None
     semantic_scope_parameter: str | None = None
+    nullable: bool = False
     value_type_from_key: str | None = None
     value_types: tuple[str, ...] = ()
 
@@ -435,6 +437,12 @@ def parse_schema(raw_schema: Any, *, path: str) -> CatalogSchema:
                 f"{path}.semantic_scope_parameter requires a scoped role semantic_type"
             )
 
+    nullable = raw_schema.get("nullable", False)
+    if not isinstance(nullable, bool):
+        raise CatalogSchemaError(f"{path}.nullable must be a boolean")
+    if nullable and schema_type not in _SCALAR_TYPES:
+        raise CatalogSchemaError(f"{path}.nullable requires a scalar schema")
+
     return CatalogSchema(
         schema_type=str(schema_type),
         description=_optional_string(raw_schema, "description", path),
@@ -456,6 +464,7 @@ def parse_schema(raw_schema: Any, *, path: str) -> CatalogSchema:
         requires_current_value=requires_current_value,
         semantic_type=semantic_type,
         semantic_scope_parameter=semantic_scope_parameter,
+        nullable=nullable,
     )
 
 
@@ -627,6 +636,8 @@ def _validate_value(
     path: str,
     allow_partial: bool,
 ) -> list[CatalogValueIssue]:
+    if value is None and schema.nullable:
+        return []
     issues: list[CatalogValueIssue] = []
     schema_type = schema.schema_type
     if schema_type == "string":
@@ -923,6 +934,8 @@ def _to_json_schema(
         result["x-manyforge-semantic-type"] = schema.semantic_type
     if schema.semantic_scope_parameter is not None:
         result["x-manyforge-semantic-scope-parameter"] = schema.semantic_scope_parameter
+    if schema.nullable:
+        return {"anyOf": [result, {"type": "null"}]}
     return result
 
 

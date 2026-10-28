@@ -99,11 +99,51 @@ def _held_selection_revision(error: KernelOperationAdmissionRejectedError) -> in
 _MAX_CONTEXTS: Final = 4_096
 _MAX_TASKS: Final = 65_536
 _MAX_SCENE_NODE_STALE_RETRIES: Final = 16
+_GRASP_LOST_RESPONSE_DEFAULTS: Final = {
+    "raise_alarm": True,
+    "stop_motion": True,
+    "set_key": None,
+    "detach": True,
+}
 _MAX_PENDING_SIMULATION_RESETS: Final = 4_096
 _SCENE_INITIALIZATION_SETTLEMENT_TIMEOUT_S: Final = 2.0
 _SCENE_INITIALIZATION_SETTLEMENT_POLL_S: Final = 0.01
 _PROGRAM_RESET_SETTLEMENT_TIMEOUT_S: Final = 5.0
 _PROGRAM_RESET_SETTLEMENT_POLL_S: Final = 0.01
+
+
+def _grasp_lost_response(parameters: Mapping[str, Any]) -> dict[str, Any]:
+    """Capture the attach node's literal response with its documented defaults."""
+
+    if "on_grasp_lost" not in parameters:
+        return dict(_GRASP_LOST_RESPONSE_DEFAULTS)
+    raw = parameters["on_grasp_lost"]
+    if not isinstance(raw, Mapping):
+        raise ProductionPortError("on_grasp_lost must be an object")
+    unknown = [
+        key
+        for key in raw
+        if type(key) is not str or key not in _GRASP_LOST_RESPONSE_DEFAULTS
+    ]
+    if unknown:
+        raise ProductionPortError(
+            f"on_grasp_lost has unknown fields: {unknown!r}"
+        )
+    response = {**_GRASP_LOST_RESPONSE_DEFAULTS, **raw}
+    for field_name in ("raise_alarm", "stop_motion", "detach"):
+        if type(response[field_name]) is not bool:
+            raise ProductionPortError(f"on_grasp_lost.{field_name} must be a boolean")
+    if response["set_key"] is not None:
+        response["set_key"] = _text(
+            response["set_key"], field="on_grasp_lost.set_key"
+        )
+    if response["raise_alarm"] and not response["stop_motion"]:
+        raise ProductionPortError(
+            "on_grasp_lost.stop_motion must be true when raise_alarm is true"
+        )
+    return response
+
+
 _AUTHORED_SCENE_OPERATIONS: Final = frozenset(
     {
         "add_object",
@@ -6907,6 +6947,9 @@ class HeadlessSceneProgramPort:
                         )
                     ),
                 }
+                grasp_lost_response = _grasp_lost_response(parameters)
+                if grasp_lost_response != _GRASP_LOST_RESPONSE_DEFAULTS:
+                    operation["on_grasp_lost"] = grasp_lost_response
                 # The node's grasp-lost bound (catalog defaults) travels with
                 # the attachment; the Manager checks later measured offsets.
                 if (
@@ -6947,12 +6990,13 @@ class HeadlessSceneProgramPort:
                     or attachment.get("command_target_id") != target.command_target_id
                 ):
                     raise ProductionPortError("carried-object attachment belongs to another target")
+                detached_attachment_id = _text(
+                    attachment.get("carried_object_attachment_id"),
+                    field="carried_object_attachment_id",
+                )
                 operation = {
                     "kind": "detach_carried_object_at_current_pose",
-                    "carried_object_attachment_id": _text(
-                        attachment.get("carried_object_attachment_id"),
-                        field="carried_object_attachment_id",
-                    ),
+                    "carried_object_attachment_id": detached_attachment_id,
                     "expected_carried_object_attachment_revision": _text(
                         attachment.get("carried_object_attachment_revision"),
                         field="carried_object_attachment_revision",
@@ -6973,6 +7017,7 @@ class HeadlessSceneProgramPort:
             stale_retry_count = 0
             owner_epoch_rotation_used = False
             request_id = base_request_id
+
             while True:
                 try:
                     committed, response = self._commit(

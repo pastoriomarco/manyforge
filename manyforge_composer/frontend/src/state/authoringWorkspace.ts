@@ -147,16 +147,19 @@ export function authoringUnavailableReason(
 /**
  * Why editing the Draft (Program, Scene or Deployment, including Discard) is
  * unavailable, or ``null``. Unlike the other authoring actions, an edit only
- * changes the Draft, so it is also available while a Program run exists with
- * all its motion confirmed stopped (the backend's published
- * `heldRunDraftEditAllowed`); the edits then reach the robot only through
- * Apply, which Resets the run first.
+ * changes the Draft and takes no Kernel claim, so it never waits for Kernel
+ * authoring admission (another client's Apply, a manual operation), and it is
+ * also available while a Program run exists with all its motion confirmed
+ * stopped (the backend's published `heldRunDraftEditAllowed`); the edits then
+ * reach the robot only through Apply, which Resets the run first.
  */
 export function draftEditUnavailableReason(
   published: PublishedAuthoringWorkspace | null,
   snapshot: ComposerHeadlessState | null,
 ): string | null {
-  if (authoringUnavailableCause(published, snapshot) !== 'execution_active') {
+  const cause = authoringUnavailableCause(published, snapshot);
+  if (cause === 'not_admitted') return null;
+  if (cause !== 'execution_active') {
     return authoringUnavailableReason(published, snapshot);
   }
   return snapshot!.heldRunDraftEditAllowed

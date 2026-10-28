@@ -446,16 +446,6 @@ export interface ScenarioDocumentSaveResponse {
   workspace: ProgramWorkspaceResponse;
 }
 
-export interface NewScenarioDocumentInput {
-  /** The parent folder; the project is created as `<directory>/<name>.scenario`. */
-  directory: string;
-  name: string;
-  deploymentChoice: 'empty';
-  expectedRetainedBundleId: string;
-  expectedGraphRevision: string;
-  confirmDiscard: boolean;
-}
-
 /** Save the Scenario as `<directory>/<name>.scenario`; the name is also its ID. */
 export interface SaveScenarioDocumentInput {
   directory: string;
@@ -507,6 +497,8 @@ export type ScenarioDocumentLoadResponse = ScenarioDocumentLoadResponseBase & (
  */
 export interface AuthoringWorkspaceProjectFacts {
   documentPath: string | null;
+  /** The built-in Untitled Scenario: Save As only, never saved in place. */
+  readOnly: boolean;
   documentId: string | null;
   documentName: string | null;
   documentDescription: string | null;
@@ -555,7 +547,9 @@ export interface AuthoringWorkspaceSnapshot {
 }
 
 export interface ScenarioSourceDiagnostic {
-  code: 'scenario_source_changed';
+  /** `edited_outside_manyforge`: a member's bytes differ from the manifest
+   * Save wrote; the project still loads with its current content. */
+  code: 'scenario_source_changed' | 'edited_outside_manyforge';
   sourceId: string;
   message: string;
 }
@@ -835,6 +829,8 @@ export interface ProgramRunStatus {
 export interface ProgramResetSelection {
   reloadInitialScene: boolean;
   resetRobotPosition: boolean;
+  /** D6: the accepted Reset is Scenario Close's and keeps the cell Stop fault. */
+  keepStopFault?: boolean;
 }
 
 export interface ProgramResetRobotPositionAvailability {
@@ -1409,6 +1405,20 @@ export interface SceneRuntimeObservationPose {
   source_stamp_ns: Nanoseconds | null;
 }
 
+export interface SceneRuntimeObservationReference {
+  controllable_component_id: string;
+  command_target_id: string;
+  gripper_link: string;
+  entity: string;
+  link: string;
+  source_header_frame_id: string;
+  coherent: boolean;
+  pose_in_reference: {
+    orientation_xyzw: QuaternionXyzwTuple;
+    position_m: Vector3Tuple;
+  } | null;
+}
+
 export type SceneRuntimeGoodObservationPayload =
   | {
       api_version: 'manyforge.ros_pose_observation.v2';
@@ -1426,18 +1436,10 @@ export type SceneRuntimeGoodObservationPayload =
     }
   | {
       api_version: 'manyforge.ros_pose_observation.v2';
-      kind: 'simulation_entity_pose_with_reference.v1';
+      kind: 'simulation_entity_pose_with_references.v1';
       pose: SceneRuntimeObservationPose;
-      /** Object pose relative to a gripper reference read at one source instant. */
-      reference: {
-        coherent: boolean;
-        entity: string;
-        link: string;
-        pose_in_reference: {
-          orientation_xyzw: QuaternionXyzwTuple;
-          position_m: Vector3Tuple;
-        } | null;
-      };
+      /** Gripper-relative samples, keyed by component and command target. */
+      references: SceneRuntimeObservationReference[];
       source: { entity: string };
     }
   | {
@@ -1458,7 +1460,7 @@ export interface SceneRuntimeUnknownObservationPayload {
   kind:
     | 'joint_state'
     | 'simulation_entity_pose'
-    | 'simulation_entity_pose_with_reference.v1'
+    | 'simulation_entity_pose_with_references.v1'
     | 'detection3d_pose';
   source_error: {
     code: string;
@@ -1467,7 +1469,63 @@ export interface SceneRuntimeUnknownObservationPayload {
   };
 }
 
-interface SceneRuntimePoseSourceBase {
+export interface SceneRuntimeAttachedPoseReference {
+  holder: {
+    controllable_component_id: string;
+    command_target_id: string;
+    gripper_link: string;
+  };
+  measured_against: {
+    entity: string;
+    link: string;
+  };
+  /** Present only when this differs from the carrier frame's source link name. */
+  source_header_frame_id?: string;
+  /** The attachment carrier frame after the Manager's fixed transform. */
+  frame: {
+    kind: 'component';
+    controllable_component_id: string;
+    model_instance_id: string;
+    frame_role_id: string;
+  };
+  current_offset: {
+    position_m: { x: number; y: number; z: number };
+    orientation_xyzw: QuaternionXyzwTuple;
+  };
+  /** Omitted until the existing grasp-lost check has established a baseline. */
+  baseline_offset?: {
+    position_m: { x: number; y: number; z: number };
+    orientation_xyzw: QuaternionXyzwTuple;
+  };
+  /** Omitted with `baseline_offset`. */
+  drift?: {
+    translation_m: number;
+    rotation_rad: number;
+  };
+}
+
+export interface SceneRuntimeCellPoseMeasurement {
+  measured_against: 'cell frame';
+  /** The carrier frame used by the existing grasp-loss measurement. */
+  frame: SceneRuntimeAttachedPoseReference['frame'];
+  current_offset: SceneRuntimeAttachedPoseReference['current_offset'];
+  baseline_offset?: SceneRuntimeAttachedPoseReference['baseline_offset'];
+  drift?: SceneRuntimeAttachedPoseReference['drift'];
+}
+
+export type SceneRuntimePoseMeasurement =
+  | SceneRuntimeAttachedPoseReference
+  | SceneRuntimeCellPoseMeasurement;
+
+export type SceneRuntimePoseMeasurementFields = Omit<
+  Partial<SceneRuntimeAttachedPoseReference>,
+  'measured_against'
+> & {
+  measured_against?: SceneRuntimeAttachedPoseReference['measured_against']
+    | SceneRuntimeCellPoseMeasurement['measured_against'];
+};
+
+type SceneRuntimePoseSourceBase = SceneRuntimePoseMeasurementFields & {
   buffered: boolean;
   expires_at_ns: Nanoseconds;
   object_id: string;
@@ -1502,12 +1560,23 @@ export interface SceneRuntimeConfiguredJointState {
   topic: string;
 }
 
-/** One `scene.carried_object_lost` event (published for its operator alarm). */
+/** One `scene.carried_object_lost` event projected with its attachment policy. */
 export interface SceneRuntimeCarriedObjectLoss {
+  carried_object_attachment_id: string;
   code: 'scene.carried_object_lost';
+  command_target_id: string;
+  controllable_component_id: string;
   event_id: string;
   full_text: string;
+  on_grasp_lost: {
+    detach: boolean;
+    raise_alarm: boolean;
+    set_key: string | null;
+    stop_motion: boolean;
+  };
   scene_resource_id: string;
+  /** The non-empty publication error code, present only when signal publication failed. */
+  signal_error?: string;
 }
 
 export interface SceneRuntimeProjection {
@@ -1619,7 +1688,7 @@ export type SceneTransactionOperation =
     };
 
 interface SceneTransactionRequestBase {
-  /** Opt-in composite fence for the temporary standalone Close cleanup. */
+  /** Opt-in composite fence for Close's carried-object detach. */
   expected_authoring_workspace?: AuthoringWorkspaceIdentity;
   request_context: {
     request_id: string;

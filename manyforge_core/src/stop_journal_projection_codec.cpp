@@ -1,17 +1,17 @@
-#include <algorithm>
 #include <cmath>
 #include <cstdint>
 #include <limits>
 #include <manyforge_content_identity/canonical_value.hpp>
-#include <manyforge_core/io_rule_outcome_codec.hpp>
 #include <manyforge_core/stop_journal_projection_codec.hpp>
+#include <manyforge_core/stop_terminal_reducer.hpp>
+#include <manyforge_core/stop_terminal_state.hpp>
+#include <map>
+#include <set>
 #include <stdexcept>
 #include <string>
 #include <string_view>
 #include <type_traits>
 #include <utility>
-
-#include "stop_fallback_codec_internal.hpp"
 
 namespace manyforge::core {
 namespace {
@@ -381,297 +381,6 @@ template <typename T, typename Decode>
       i64(f[11], "accepted time")};
 }
 
-[[nodiscard]] V certificate_ref_value(const StopCertificateRefDTO& value);
-[[nodiscard]] StopCertificateRefDTO certificate_ref_from(const V& value);
-
-[[nodiscard]] V terminal_fact_value(const ParticipantExecutionFact& fact) {
-  if (static_cast<unsigned>(fact.kind) > 4U || static_cast<unsigned>(fact.effect) > 2U)
-    bad("participant terminal fact enum is invalid");
-  return arr({enc(fact.kind), enc(fact.effect), opt(fact.error, error_value)});
-}
-[[nodiscard]] ParticipantExecutionFact terminal_fact_from(const V& value) {
-  const auto& fields = exact(value, 3U, "participant terminal fact");
-  return {den<ParticipantExecutionFactKind>(fields[0], 4U, "participant fact kind"),
-          den<ParticipantEffectKnowledge>(fields[1], 2U, "participant effect knowledge"),
-          dopt<ErrorDTO>(fields[2], error_from)};
-}
-
-[[nodiscard]] V participant_state_value(const OperationParticipantStateDTO& value) {
-  if (value.terminal_fact &&
-      (value.state != OperationStateKind::kCompleted &&
-       value.state != OperationStateKind::kStopped && value.state != OperationStateKind::kFailed &&
-       value.state != OperationStateKind::kInterrupted &&
-       value.state != OperationStateKind::kInterventionRequired &&
-       value.state != OperationStateKind::kCancelledPreDispatch))
-    bad("participant terminal fact has no matching terminal row");
-  if (!value.binding_identity.locally_valid() ||
-      (value.binding_identity.provider() &&
-       value.payload_kind != OperationParticipantPayloadKind::kCapabilityCommand) ||
-      (value.output_evidence &&
-       (to_string(*value.output_evidence).empty() ||
-        value.payload_kind != OperationParticipantPayloadKind::kCapabilityCommand)))
-    bad("participant binding identity or output evidence is invalid");
-  const auto* controller = value.binding_identity.controller();
-  const auto* provider = value.binding_identity.capability_provider();
-  A fields{enc(value.participant_id),
-           enc(value.command_id),
-           enc(value.command_generation),
-           enc(value.controllable_component_id),
-           enc(value.command_target_id),
-           enc(value.capability_id),
-           enc(value.binding_identity.control_domain_id),
-           enc(value.binding_identity.control_domain_revision),
-           controller ? enc(controller->control_binding_id) : V(nullptr),
-           controller ? enc(controller->control_binding_revision) : V(nullptr),
-           provider ? enc(provider->capability_provider_binding_id) : V(nullptr),
-           provider ? enc(provider->capability_provider_binding_revision) : V(nullptr),
-           enc(value.payload_kind),
-           enc(value.state),
-           V(value.progress),
-           vec(value.resources, id_value),
-           opt(value.terminal_error, error_value)};
-  if (value.execution_scope.has_value()) {
-    if (!valid_program_node_execution_scope(*value.execution_scope)) {
-      bad("operation participant scope is invalid");
-    }
-    fields.push_back(arr(
-        {enc(value.execution_scope->node_instance_id), V(value.execution_scope->node_attempt_id)}));
-  }
-  if (value.terminal_fact) {
-    if (!value.execution_scope) fields.emplace_back(nullptr);
-    fields.push_back(terminal_fact_value(*value.terminal_fact));
-  }
-  if (value.output_evidence) {
-    while (fields.size() < 19U) fields.emplace_back(nullptr);
-    fields.push_back(enc(*value.output_evidence));
-  }
-  if (!value.io_rule_outcomes.empty()) {
-    const auto encoded = EncodeIoRuleOutcomes(value.io_rule_outcomes);
-    if (!encoded.ok()) bad(encoded.error().details.at("reason"));
-    while (fields.size() < 20U) fields.emplace_back(nullptr);
-    fields.push_back(content_identity::parse_canonical_json(encoded.value()));
-  }
-  return V(std::move(fields));
-}
-
-[[nodiscard]] OperationParticipantStateDTO participant_state_from(const V& value) {
-  if (!value.is_array() || (value.as_array().size() != 17U && value.as_array().size() != 18U &&
-                            value.as_array().size() != 19U && value.as_array().size() != 20U &&
-                            value.as_array().size() != 21U)) {
-    bad("operation participant state has an unsupported shape");
-  }
-  const auto& f = value.as_array();
-  std::optional<ProgramNodeExecutionScopeDTO> scope;
-  if (f.size() >= 18U && !f[17].is_null()) {
-    const auto& origin = exact(f[17], 2U, "operation participant scope");
-    scope = ProgramNodeExecutionScopeDTO{did<ProgramNodeInstanceId>(origin[0], "node instance ID"),
-                                         str(origin[1], "node attempt ID")};
-    if (!valid_program_node_execution_scope(*scope)) bad("operation participant scope is invalid");
-  }
-  if (f[8].is_null() != f[9].is_null() || f[10].is_null() != f[11].is_null() ||
-      (f[8].is_null() && f[10].is_null()))
-    bad("participant binding identity is incomplete");
-  std::optional<CapabilityProviderBindingIdentityDTO> provider;
-  if (!f[10].is_null())
-    provider = CapabilityProviderBindingIdentityDTO{
-        did<CapabilityProviderBindingId>(f[10], "provider binding ID"),
-        did<CapabilityProviderBindingRevision>(f[11], "provider binding revision")};
-  ParticipantBindingIdentityDTO identity{
-      did<ControlDomainId>(f[6], "control domain ID"),
-      did<ControlDomainRevision>(f[7], "control domain revision"),
-      f[8].is_null()
-          ? decltype(ParticipantBindingIdentityDTO::binding)(*provider)
-          : decltype(ParticipantBindingIdentityDTO::binding)(
-                ControllerParticipantBindingIdentityDTO{
-                    did<ControlBindingId>(f[8], "control binding ID"),
-                    did<ControlBindingRevision>(f[9], "control binding revision"), provider})};
-  auto result = OperationParticipantStateDTO{
-      did<OperationParticipantId>(f[0], "participant ID"),
-      did<ControllerGoalId>(f[1], "command ID"),
-      did<ControllerGoalGeneration>(f[2], "command generation"),
-      did<ControllableComponentId>(f[3], "component ID"),
-      did<CommandTargetId>(f[4], "command target ID"),
-      did<CapabilityId>(f[5], "capability ID"),
-      std::move(identity),
-      den<OperationParticipantPayloadKind>(f[12], 1U, "participant payload kind"),
-      den<OperationStateKind>(f[13], 14U, "operation state"),
-      number(f[14], "progress"),
-      dvec<ResourceId>(
-          f[15], [](const V& v) { return did<ResourceId>(v, "resource ID"); }, "resources"),
-      dopt<ErrorDTO>(f[16], error_from),
-      std::move(scope)};
-  if (f.size() == 18U && f[17].is_null()) bad("empty participant scope extension");
-  if (f.size() >= 19U && !f[18].is_null()) result.terminal_fact = terminal_fact_from(f[18]);
-  if (f.size() == 19U && f[18].is_null()) bad("empty participant fact extension");
-  if (f.size() >= 20U && !f[19].is_null())
-    result.output_evidence = den<IoOutputEvidence>(f[19], 4U, "output evidence");
-  if (f.size() == 20U && f[19].is_null()) bad("empty output evidence extension");
-  if (f.size() == 21U) {
-    const auto decoded = DecodeIoRuleOutcomes(content_identity::canonical_json(f[20]));
-    if (!decoded.ok()) bad(decoded.error().details.at("reason"));
-    result.io_rule_outcomes = std::move(decoded.value());
-  }
-  (void)participant_state_value(result);
-  return result;
-}
-
-[[nodiscard]] V preemption_value(const OperationPreemptionDTO& value) {
-  if (to_string(value.kind).empty() || value.by.operation_id.empty() ||
-      value.by.operation_id.value().size() > 2048U ||
-      value.by.operation_id.value().find('\0') != std::string::npos ||
-      !valid_program_node_execution_scope({value.by.node_instance_id, value.by.node_attempt_id}))
-    bad("operation preemption identity is invalid");
-  return arr({enc(value.kind), enc(value.by.operation_id), enc(value.by.node_instance_id),
-              V(value.by.node_attempt_id)});
-}
-
-[[nodiscard]] OperationPreemptionDTO preemption_from(const V& value) {
-  const auto& f = exact(value, 4U, "operation preemption");
-  auto result = OperationPreemptionDTO{
-      den<OperationPreemptionKind>(f[0], 1U, "preemption kind"),
-      {did<OperationId>(f[1], "preempting operation ID"),
-       did<ProgramNodeInstanceId>(f[2], "preempting node ID"),
-       str(f[3], "preempting node attempt ID")}};
-  (void)preemption_value(result);
-  return result;
-}
-
-[[nodiscard]] V motion_takeover_value(const MotionTakeoverDecisionDTO& value) {
-  if (!value.locally_valid()) bad("motion takeover decision is invalid");
-  return arr({enc(value.incumbent_operation_id), enc(value.path), opt(value.cause, error_value),
-              content_identity::nonnegative_int64_value(value.decided_at_ns),
-              content_identity::nonnegative_int64_value(value.elapsed_since_acceptance_ns),
-              content_identity::nonnegative_int64_value(value.preparation_budget_ns),
-              opt(value.stop_certificate, certificate_ref_value)});
-}
-
-[[nodiscard]] MotionTakeoverDecisionDTO motion_takeover_from(const V& value) {
-  const auto& f = exact(value, 7U, "motion takeover decision");
-  auto result =
-      MotionTakeoverDecisionDTO{did<OperationId>(f[0], "incumbent operation ID"),
-                                den<MotionTakeoverPathDTO>(f[1], 2U, "motion takeover path"),
-                                dopt<ErrorDTO>(f[2], error_from),
-                                i64(f[3], "takeover decision time"),
-                                i64(f[4], "takeover elapsed time"),
-                                i64(f[5], "takeover preparation budget"),
-                                dopt<StopCertificateRefDTO>(f[6], certificate_ref_from)};
-  (void)motion_takeover_value(result);
-  return result;
-}
-
-[[nodiscard]] V operation_state_value(const OperationStateDTO& value) {
-  if (has_program_execution_scope(value) && value.journal_capture_order == 0U) {
-    bad("captured Program work requires an ordered Stop snapshot");
-  }
-  for (const auto& participant : value.participants) {
-    const auto qualified = ValidateIoRuleOutcomeParticipant(
-        value.operation_id, value.operation_revision, participant);
-    if (!qualified.ok()) bad(qualified.error().details.at("reason"));
-    if (participant.terminal_fact &&
-        participant.terminal_fact->kind == ParticipantExecutionFactKind::kPreemptedByReplacement &&
-        (!value.preemption || value.preemption->kind != OperationPreemptionKind::kPreempted ||
-         participant.state != OperationStateKind::kStopped ||
-         participant.terminal_fact->effect != ParticipantEffectKnowledge::kEffectSettled ||
-         participant.terminal_fact->error))
-      bad("replacement settlement requires exact logical preemption and settled effects");
-  }
-  V::Array fields{enc(value.operation_id),
-                  enc(value.operation_revision),
-                  enc(value.program_binding_id),
-                  enc(value.program_run_id),
-                  enc(value.coordination_policy),
-                  enc(value.state),
-                  vec(value.participants, participant_state_value),
-                  content_identity::nonnegative_int64_value(value.updated_at_ns),
-                  opt(value.active_stop_id, id_value),
-                  opt(value.active_stop_generation, id_value),
-                  opt(value.runtime_scale_generation, id_value)};
-  if (value.journal_capture_order != 0U) {
-    if (value.journal_capture_order > static_cast<std::uint64_t>(INT64_MAX)) {
-      bad("operation journal capture order is out of range");
-    }
-    fields.emplace_back(std::to_string(value.journal_capture_order));
-  }
-  if (value.preemption) {
-    if (!has_program_execution_scope(value) || value.journal_capture_order == 0U ||
-        value.preemption->by.operation_id == value.operation_id)
-      bad("operation preemption requires a distinct captured Program successor");
-    fields.emplace_back(preemption_value(*value.preemption));
-  }
-  if (value.motion_takeover) {
-    if (value.motion_takeover->incumbent_operation_id == value.operation_id)
-      bad("motion takeover requires a distinct incumbent");
-    fields.resize(13U, V(nullptr));
-    fields.emplace_back(motion_takeover_value(*value.motion_takeover));
-  }
-  return V(std::move(fields));
-}
-
-[[nodiscard]] OperationStateDTO operation_state_from(const V& value) {
-  if (!value.is_array() || (value.as_array().size() != 11U && value.as_array().size() != 12U &&
-                            value.as_array().size() != 13U && value.as_array().size() != 14U)) {
-    bad("operation state has an unsupported shape");
-  }
-  const auto& f = value.as_array();
-  std::uint64_t capture_order{};
-  if (f.size() >= 12U && !(f.size() == 14U && f[11].is_null())) {
-    if (!f[11].is_string()) bad("operation journal capture order must be decimal text");
-    capture_order = static_cast<std::uint64_t>(content_identity::parse_nonnegative_int64(f[11]));
-    if (capture_order == 0U) bad("new operation capture order must be positive");
-  }
-  auto result = OperationStateDTO{
-      did<OperationId>(f[0], "operation ID"),
-      did<OperationRevision>(f[1], "operation revision"),
-      did<ProgramBindingId>(f[2], "program binding ID"),
-      did<ProgramRunId>(f[3], "program run ID"),
-      den<OperationCoordinationPolicy>(f[4], 1U, "coordination policy"),
-      den<OperationStateKind>(f[5], 14U, "operation state"),
-      dvec<OperationParticipantStateDTO>(f[6], participant_state_from, "participants"),
-      i64(f[7], "updated time"),
-      dopt<StopId>(f[8], [](const V& v) { return did<StopId>(v, "active Stop ID"); }),
-      dopt<StopGeneration>(
-          f[9], [](const V& v) { return did<StopGeneration>(v, "active Stop generation"); }),
-      dopt<RuntimeScaleGeneration>(
-          f[10], [](const V& v) { return did<RuntimeScaleGeneration>(v, "scale generation"); }),
-      capture_order};
-  if (f.size() == 13U || (f.size() == 14U && !f[12].is_null()))
-    result.preemption = preemption_from(f[12]);
-  if (f.size() == 14U) result.motion_takeover = motion_takeover_from(f[13]);
-  (void)operation_state_value(result);
-  return result;
-}
-
-[[nodiscard]] V affected_value(const EmergencyStopAffectedStateSnapshotDTO& value) {
-  A fields{vec(value.operations, operation_state_value), vec(value.resources, id_value)};
-  if (value.motion_takeover_candidate_snapshot) {
-    const auto& candidate = *value.motion_takeover_candidate_snapshot;
-    if (!candidate.motion_takeover ||
-        std::any_of(value.operations.begin(), value.operations.end(),
-                    [&](const auto& operation) {
-                      return operation.operation_id == candidate.operation_id;
-                    }) ||
-        std::none_of(value.operations.begin(), value.operations.end(), [&](const auto& operation) {
-          return operation.operation_id == candidate.motion_takeover->incumbent_operation_id;
-        }))
-      bad("forensic takeover candidate requires a distinct affected incumbent");
-    fields.emplace_back(operation_state_value(candidate));
-  }
-  return V(std::move(fields));
-}
-
-[[nodiscard]] EmergencyStopAffectedStateSnapshotDTO affected_from(const V& value) {
-  if (!value.is_array() || (value.as_array().size() != 2U && value.as_array().size() != 3U))
-    bad("affected-state snapshot has the wrong structural arity");
-  const auto& f = value.as_array();
-  auto result = EmergencyStopAffectedStateSnapshotDTO{
-      dvec<OperationStateDTO>(f[0], operation_state_from, "affected operations"),
-      dvec<ResourceId>(
-          f[1], [](const V& v) { return did<ResourceId>(v, "resource ID"); },
-          "affected resources")};
-  if (f.size() == 3U) result.motion_takeover_candidate_snapshot = operation_state_from(f[2]);
-  return result;
-}
-
 [[nodiscard]] V artifact_value(const RetainedArtifactRefDTO& value) {
   return arr({enc(value.artifact_role_id), V(value.media_type),
               V(static_cast<double>(value.byte_size)), enc(value.content_digest),
@@ -751,20 +460,11 @@ template <typename T, typename Decode>
 [[nodiscard]] ControlledStopSubstitutionContractDTO substitution_contract_from(const V& v) {
   const auto& f = exact(v, 3U, "substitution contract");
   const auto primary = den<MotionControlledStopMode>(f[1], 3U, "requested Stop mode");
-  std::vector<MotionControlledStopMode> modes;
-  if (f[2].is_array()) {
-    if (f[2].as_array().empty() || f[2].as_array().size() > 2U) bad("invalid fallback count");
-    modes = dvec<MotionControlledStopMode>(
-        f[2],
-        [](const V& mode) { return den<MotionControlledStopMode>(mode, 3U, "fallback Stop mode"); },
-        "fallback modes");
-  } else {
-    const auto legacy = den<MotionControlledStopMode>(f[2], 2U, "executed Stop mode");
-    if (primary != MotionControlledStopMode::kSoftOnPath ||
-        legacy != MotionControlledStopMode::kSpringBackHold)
-      bad("invalid legacy fallback pair");
-    modes = {legacy};
-  }
+  auto modes = dvec<MotionControlledStopMode>(
+      f[2],
+      [](const V& mode) { return den<MotionControlledStopMode>(mode, 3U, "fallback Stop mode"); },
+      "fallback modes");
+  if (modes.empty() || modes.size() > 2U) bad("invalid fallback count");
   if (!motion_controlled_stop_fallbacks_valid(primary, modes)) bad("invalid fallback order");
   return {contract_ref_from(f[0]), primary, std::move(modes)};
 }
@@ -965,7 +665,9 @@ template <typename T, typename Decode>
       bad("default contract parameters are not an object");
     }
     auto parameters = std::get<JsonObjectDTO>(std::move(decoded.value));
-    detail::normalize_stop_fallback_parameters(parameters);
+    if (parameters.contains("recoverable_substitution_mode")) {
+      bad("legacy Stop fallback parameters are refused");
+    }
     return parameters;
   });
   return ResolvedStopEscalationStageDTO{
@@ -1181,18 +883,12 @@ template <typename T, typename Decode>
       structured_from(f[8]),
       enabled,
       std::move(jerk)};
-  if (f[5].is_array()) {
-    if (f[5].as_array().size() > 2U) bad("invalid fallback count");
+  if (!f[5].is_null()) {
     result.fallback_stop_modes = dvec<MotionInterruptStopMode>(
         f[5],
         [](const V& mode) { return den<MotionInterruptStopMode>(mode, 3U, "fallback Stop mode"); },
         "fallback modes");
-  } else if (!f[5].is_null()) {
-    const auto legacy = den<MotionInterruptStopMode>(f[5], 2U, "legacy fallback mode");
-    if (result.stop_mode != MotionInterruptStopMode::kSoftOnPath ||
-        legacy != MotionInterruptStopMode::kSpringBackHold)
-      bad("invalid legacy fallback pair");
-    result.fallback_stop_modes = {legacy};
+    if (result.fallback_stop_modes.size() > 2U) bad("invalid fallback count");
   }
   if (!motion_interrupt_stop_fallbacks_valid(result.stop_mode, result.fallback_stop_modes))
     bad("invalid fallback order");
@@ -1214,7 +910,9 @@ template <typename T, typename Decode>
       bad("validated contract parameters are not an object");
     }
     auto parameters = std::get<JsonObjectDTO>(std::move(decoded.value));
-    detail::normalize_stop_fallback_parameters(parameters);
+    if (parameters.contains("recoverable_substitution_mode")) {
+      bad("legacy Stop fallback parameters are refused");
+    }
     return parameters;
   });
   return PreparedStopStageCommandDTO{resolved_stage_from(f[0]), std::move(parameters),
@@ -1252,6 +950,41 @@ template <typename T, typename Decode>
       dvec<PreparedStopStageCommandDTO>(f[12], prepared_stage_from, "prepared stage commands")};
 }
 
+// Terminal v4 stores each distinct participant plan once, in the root `plans`
+// list; an attempt's resolved stage names its plan by digest (slot 26).
+class TerminalPlanIndex final {
+ public:
+  explicit TerminalPlanIndex(const V& wire) {
+    if (!wire.is_array()) bad("Stop journal terminal plans are not an array");
+    for (const auto& item : wire.as_array()) {
+      auto plan = prepared_plan_from(item);
+      auto digest = plan.participant_stop_invocation_plan_digest.value();
+      if (!plans_.empty() && !(plans_.rbegin()->first < digest)) {
+        bad("Stop journal terminal plans are not sorted and unique by digest");
+      }
+      plans_.emplace_hint(plans_.end(), std::move(digest), std::move(plan));
+    }
+  }
+
+  [[nodiscard]] PreparedParticipantStopPlanDTO resolve(const V& digest_wire) {
+    const auto digest = str(digest_wire, "participant plan digest");
+    const auto found = plans_.find(digest);
+    if (found == plans_.end()) bad("Stop journal terminal attempt names an absent participant plan");
+    referenced_.insert(digest);
+    return found->second;
+  }
+
+  void require_all_referenced() const {
+    if (referenced_.size() != plans_.size()) {
+      bad("Stop journal terminal projection retains an unreferenced participant plan");
+    }
+  }
+
+ private:
+  std::map<std::string, PreparedParticipantStopPlanDTO> plans_;
+  std::set<std::string> referenced_;
+};
+
 [[nodiscard]] V resolved_participant_stage_value(const ResolvedParticipantStopStageDTO& v) {
   return arr({enc(v.stop_id),
               enc(v.stop_generation),
@@ -1279,12 +1012,13 @@ template <typename T, typename Decode>
               enc(v.containment_granularity),
               enc(v.stop_evidence_policy_id),
               enc(v.stop_evidence_policy_revision),
-              prepared_plan_value(v.participant_stop_plan),
+              enc(v.participant_stop_plan.participant_stop_invocation_plan_digest),
               V(static_cast<double>(v.stage_index)),
               enc(v.resolved_stop_scope_policy_digest)});
 }
 
-[[nodiscard]] ResolvedParticipantStopStageDTO resolved_participant_stage_from(const V& v) {
+[[nodiscard]] ResolvedParticipantStopStageDTO resolved_participant_stage_from(
+    const V& v, TerminalPlanIndex& plans) {
   const auto& f = exact(v, 29U, "resolved participant Stop stage");
   return ResolvedParticipantStopStageDTO{
       did<StopId>(f[0], "Stop ID"),
@@ -1323,7 +1057,7 @@ template <typename T, typename Decode>
       den<ContainmentGranularity>(f[23], 2U, "containment granularity"),
       did<StopEvidencePolicyId>(f[24], "evidence policy ID"),
       did<StopEvidencePolicyRevision>(f[25], "evidence policy revision"),
-      prepared_plan_from(f[26]),
+      plans.resolve(f[26]),
       static_cast<std::size_t>(u64(f[27], "stage index")),
       did<ContentDigest>(f[28], "resolved scope policy digest")};
 }
@@ -1368,10 +1102,11 @@ template <typename T, typename Decode>
        vec(v.evidence_items, evidence_item_value), opt(v.error, error_value)});
 }
 
-[[nodiscard]] ParticipantStopStageResultDTO stage_result_from(const V& v) {
+[[nodiscard]] ParticipantStopStageResultDTO stage_result_from(const V& v,
+                                                            TerminalPlanIndex& plans) {
   const auto& f = exact(v, 11U, "participant Stop stage result");
   return ParticipantStopStageResultDTO{
-      resolved_participant_stage_from(f[0]),
+      resolved_participant_stage_from(f[0], plans),
       den<StopStageAttemptDispositionDTO>(f[1], 2U, "attempt disposition"),
       den<ParticipantStopStageOutcomeDTO>(f[2], 3U, "participant Stop outcome"),
       dopt<MotionControlledStopMode>(f[3],
@@ -1611,25 +1346,13 @@ template <typename T, typename Decode>
               stage_result_value(v.result)});
 }
 
-[[nodiscard]] StopAttemptedStageResultDTO attempted_result_from(const V& v) {
+[[nodiscard]] StopAttemptedStageResultDTO attempted_result_from(const V& v,
+                                                              TerminalPlanIndex& plans) {
   const auto& f = exact(v, 5U, "attempted stage result");
   return StopAttemptedStageResultDTO{
       scope_key_from(f[0]), u64(f[1], "result sequence"), i64(f[2], "completed time"),
       den<StopStageResultAuthorityDTO>(f[3], 1U, "stage result authority"),
-      stage_result_from(f[4])};
-}
-
-[[nodiscard]] V certificate_evidence_value(const StopCertificateEvidenceItemDTO& v) {
-  return arr({scope_key_value(v.scope_key), enc(v.stage_id), V(static_cast<double>(v.stage_index)),
-              V(static_cast<double>(v.result_sequence)), evidence_item_value(v.evidence_item)});
-}
-
-[[nodiscard]] StopCertificateEvidenceItemDTO certificate_evidence_from(const V& v) {
-  const auto& f = exact(v, 5U, "certificate evidence item");
-  return StopCertificateEvidenceItemDTO{scope_key_from(f[0]),
-                                        did<StopEscalationStageId>(f[1], "stage ID"),
-                                        static_cast<std::size_t>(u64(f[2], "stage index")),
-                                        u64(f[3], "result sequence"), evidence_item_from(f[4])};
+      stage_result_from(f[4], plans)};
 }
 
 [[nodiscard]] V certificate_ref_value(const StopCertificateRefDTO& v) {
@@ -1721,8 +1444,11 @@ template <typename T, typename Decode>
                                      })};
 }
 
+// Certificate v4: 23 fixed slots. The v3 slots without evidence_items (the
+// decoder derives them from the attempts), then lane_hard_stop_requested,
+// always present. Attempts use the lean wire (plan digest in slot 26).
 [[nodiscard]] V certificate_value(const StopCertificateDTO& v) {
-  auto value = arr({enc(v.stop_certificate_id),
+  return arr({enc(v.stop_certificate_id),
               enc(v.stop_certificate_revision),
               enc(v.stop_id),
               enc(v.stop_generation),
@@ -1734,7 +1460,6 @@ template <typename T, typename Decode>
               vec(v.predecessor_certificates, certificate_ref_value),
               vec(v.scope_entries, scope_entry_value),
               vec(v.attempted_stage_results, attempted_result_value),
-              vec(v.evidence_items, certificate_evidence_value),
               enc(v.result),
               vec(v.pre_dispatch_cancelled, scope_key_value),
               vec(v.dispatched_stopped, scope_key_value),
@@ -1744,27 +1469,13 @@ template <typename T, typename Decode>
               opt(v.fault_latch_id, id_value),
               opt(v.fault_latch_generation, id_value),
               content_identity::nonnegative_int64_value(v.completed_at_ns),
-              opt(v.terminal_error, error_value)});
-  // Q27/Q31: appended only when a Stop requested the lane's hard stop
-  // directly, so every other certificate keeps its established encoding.
-  if (!v.lane_hard_stop_requested.empty()) {
-    auto items = value.as_array();
-    items.push_back(vec(v.lane_hard_stop_requested, scope_key_value));
-    return V(std::move(items));
-  }
-  return value;
+              opt(v.terminal_error, error_value),
+              vec(v.lane_hard_stop_requested, scope_key_value)});
 }
 
-[[nodiscard]] StopCertificateDTO certificate_from(const V& v) {
-  const bool has_lane_hard_stop = v.is_array() && v.as_array().size() == 24U;
-  const auto& f = exact(v, has_lane_hard_stop ? 24U : 23U, "Stop certificate");
-  auto lane_hard_stop_requested =
-      has_lane_hard_stop
-          ? dvec<StopScopeEntryKeyDTO>(f[23], scope_key_from, "lane hard stop requested")
-          : std::vector<StopScopeEntryKeyDTO>{};
-  if (has_lane_hard_stop && lane_hard_stop_requested.empty()) {
-    bad("Stop certificate lane hard stop rows must be absent when empty");
-  }
+/// Leaves evidence_items empty; terminal_root_from derives them.
+[[nodiscard]] StopCertificateDTO certificate_from(const V& v, TerminalPlanIndex& plans) {
+  const auto& f = exact(v, 23U, "Stop certificate");
   return StopCertificateDTO{
       did<StopCertificateId>(f[0], "certificate ID"),
       did<StopCertificateRevision>(f[1], "certificate revision"),
@@ -1778,26 +1489,26 @@ template <typename T, typename Decode>
       dvec<StopScopeCaptureHistoryDTO>(f[8], capture_history_from, "capture history"),
       dvec<StopCertificateRefDTO>(f[9], certificate_ref_from, "predecessor certificates"),
       dvec<StopScopeEntryDTO>(f[10], scope_entry_from, "certificate scope entries"),
-      dvec<StopAttemptedStageResultDTO>(f[11], attempted_result_from,
-                                        "certificate attempted results"),
-      dvec<StopCertificateEvidenceItemDTO>(f[12], certificate_evidence_from,
-                                           "certificate evidence"),
-      den<StopCertificateResultDTO>(f[13], 3U, "certificate result"),
-      dvec<StopScopeEntryKeyDTO>(f[14], scope_key_from, "pre-dispatch cancelled"),
-      dvec<StopScopeEntryKeyDTO>(f[15], scope_key_from, "dispatched stopped"),
-      dvec<StopScopeEntryKeyDTO>(f[16], scope_key_from, "unsettled scope"),
-      dvec<StopScopeEntryKeyDTO>(f[17], scope_key_from, "failed scope"),
-      dopt<StopInterruptCorrelationDTO>(f[18], interrupt_correlation_from),
+      dvec<StopAttemptedStageResultDTO>(
+          f[11], [&](const V& item) { return attempted_result_from(item, plans); },
+          "certificate attempted results"),
+      {},
+      den<StopCertificateResultDTO>(f[12], 3U, "certificate result"),
+      dvec<StopScopeEntryKeyDTO>(f[13], scope_key_from, "pre-dispatch cancelled"),
+      dvec<StopScopeEntryKeyDTO>(f[14], scope_key_from, "dispatched stopped"),
+      dvec<StopScopeEntryKeyDTO>(f[15], scope_key_from, "unsettled scope"),
+      dvec<StopScopeEntryKeyDTO>(f[16], scope_key_from, "failed scope"),
+      dopt<StopInterruptCorrelationDTO>(f[17], interrupt_correlation_from),
       dopt<StopFaultLatchId>(
-          f[19], [](const V& item) { return did<StopFaultLatchId>(item, "fault latch ID"); }),
-      dopt<StopFaultLatchGeneration>(f[20],
+          f[18], [](const V& item) { return did<StopFaultLatchId>(item, "fault latch ID"); }),
+      dopt<StopFaultLatchGeneration>(f[19],
                                      [](const V& item) {
                                        return did<StopFaultLatchGeneration>(
                                            item, "fault latch generation");
                                      }),
-      i64(f[21], "certificate completion time"),
-      dopt<ErrorDTO>(f[22], error_from),
-      std::move(lane_hard_stop_requested)};
+      i64(f[20], "certificate completion time"),
+      dopt<ErrorDTO>(f[21], error_from),
+      dvec<StopScopeEntryKeyDTO>(f[22], scope_key_from, "lane hard stop requested")};
 }
 
 [[nodiscard]] V remaining_budget_value(const RemainingStopBudgetDTO& v) {
@@ -1839,11 +1550,12 @@ template <typename T, typename Decode>
        enc(v.state), V(static_cast<double>(v.recovery_assessment_revision)), enc(v.recovery_status),
        V(v.reason_code), vec(v.evidence_refs, [](const StopFaultRecoveryEvidenceRefDTO& row) {
          return arr({enc(row.kind), enc(row.evidence_digest)});
-       })});
+       }),
+       vec(v.observed_triggers, id_value)});
 }
 
 [[nodiscard]] StopFaultLatchDTO fault_latch_from(const V& v) {
-  const auto& f = exact(v, 19U, "Stop fault latch");
+  const auto& f = exact(v, 20U, "Stop fault latch");
   return StopFaultLatchDTO{
       did<CellId>(f[0], "cell ID"),
       did<StopId>(f[1], "Stop ID"),
@@ -1851,7 +1563,7 @@ template <typename T, typename Decode>
       dopt<StopCertificateRefDTO>(f[3], certificate_ref_from),
       did<StopFaultLatchId>(f[4], "fault latch ID"),
       did<StopFaultLatchGeneration>(f[5], "fault latch generation"),
-      den<StopFaultTriggerDTO>(f[6], 5U, "fault trigger"),
+      den<StopFaultTriggerDTO>(f[6], kStopFaultTriggerCount - 1U, "fault trigger"),
       boolean(f[7], "persistence degraded"),
       dvec<OperationId>(
           f[8], [](const V& item) { return did<OperationId>(item, "operation ID"); },
@@ -1875,7 +1587,14 @@ template <typename T, typename Decode>
                 den<StopFaultRecoveryEvidenceKindDTO>(row[0], 4U, "recovery evidence kind"),
                 did<ContentDigest>(row[1], "recovery evidence digest")};
           },
-          "fault recovery evidence refs")};
+          "fault recovery evidence refs"),
+      dvec<StopFaultTriggerDTO>(
+          f[19],
+          [](const V& item) {
+            return den<StopFaultTriggerDTO>(item, kStopFaultTriggerCount - 1U,
+                                            "observed fault trigger");
+          },
+          "observed fault triggers")};
 }
 
 [[nodiscard]] V public_request_context_value(const PublicRequestContextDTO& v) {
@@ -2024,110 +1743,92 @@ template <typename T, typename Decode>
       projection_status_from(f[17])};
 }
 
-[[nodiscard]] V status_value(const StopStatusDTO& v) {
-  return arr({accepted_value(v.accepted), enc(v.state), vec(v.scope_entries, scope_entry_value),
-              vec(v.current_stages, current_stage_value),
-              vec(v.attempted_stage_results, attempted_result_value),
-              vec(v.evidence_items, certificate_evidence_value), vec(v.unsettled, scope_key_value),
-              vec(v.failed, scope_key_value), projection_status_value(v.acceptance_projection),
+// Terminal v4 status_rest: the StopStatusDTO fields that the certificate and
+// fault latch cannot rebuild (TerminalStopStatusFromCertificate rebuilds the rest).
+[[nodiscard]] V status_rest_value(const StopTerminalStatusRestDTO& v) {
+  return arr({accepted_value(v.accepted), vec(v.current_stages, current_stage_value),
+              projection_status_value(v.acceptance_projection),
               projection_status_value(v.terminal_projection),
               projection_status_value(v.surveillance_projection),
-              opt(v.stop_certificate, certificate_ref_value), opt(v.fault_latch, fault_latch_value),
               opt(v.surveillance, surveillance_value)});
 }
 
-[[nodiscard]] StopStatusDTO status_from(const V& v) {
-  const auto& f = exact(v, 14U, "Stop status");
-  return StopStatusDTO{
+[[nodiscard]] StopTerminalStatusRestDTO status_rest_from(const V& v) {
+  const auto& f = exact(v, 6U, "Stop terminal status rest");
+  return StopTerminalStatusRestDTO{
       accepted_from(f[0]),
-      den<StopStatusStateDTO>(f[1], 5U, "Stop status state"),
-      dvec<StopScopeEntryDTO>(f[2], scope_entry_from, "status scope entries"),
-      dvec<StopCurrentStageDTO>(f[3], current_stage_from, "current stages"),
-      dvec<StopAttemptedStageResultDTO>(f[4], attempted_result_from, "status attempted results"),
-      dvec<StopCertificateEvidenceItemDTO>(f[5], certificate_evidence_from,
-                                           "status evidence items"),
-      dvec<StopScopeEntryKeyDTO>(f[6], scope_key_from, "status unsettled scope"),
-      dvec<StopScopeEntryKeyDTO>(f[7], scope_key_from, "status failed scope"),
-      projection_status_from(f[8]),
-      projection_status_from(f[9]),
-      projection_status_from(f[10]),
-      dopt<StopCertificateRefDTO>(f[11], certificate_ref_from),
-      dopt<StopFaultLatchDTO>(f[12], fault_latch_from),
-      dopt<StopPostTerminalSurveillanceDTO>(f[13], surveillance_from)};
+      dvec<StopCurrentStageDTO>(f[1], current_stage_from, "current stages"),
+      projection_status_from(f[2]),
+      projection_status_from(f[3]),
+      projection_status_from(f[4]),
+      dopt<StopPostTerminalSurveillanceDTO>(f[5], surveillance_from)};
+}
+
+// Checks the version slot before the arity, so every other version (whatever
+// its shape) is refused as unsupported.
+[[nodiscard]] const A& versioned(const V& value, const std::string_view version,
+                                 const std::size_t size, const std::string_view context) {
+  if (!value.is_array() || value.as_array().empty()) {
+    bad(std::string(context) + " has the wrong structural arity");
+  }
+  if (str(value.as_array().front(), std::string(context) + " API version") != version) {
+    bad(std::string(context) + " API version is unsupported");
+  }
+  return exact(value, size, context);
 }
 
 [[nodiscard]] V acceptance_root(const StopJournalAcceptanceProjectionDTO& value) {
-  const bool takeover =
-      value.affected_state.motion_takeover_candidate_snapshot ||
-      std::any_of(value.affected_state.operations.begin(), value.affected_state.operations.end(),
-                  [](const auto& operation) { return operation.motion_takeover.has_value(); });
-  const bool provider_extension = std::any_of(
-      value.affected_state.operations.begin(), value.affected_state.operations.end(),
-      [](const auto& operation) {
-        return std::any_of(
-            operation.participants.begin(), operation.participants.end(),
-            [](const auto& row) { return row.binding_identity.provider() || row.output_evidence || !row.io_rule_outcomes.empty(); });
-      });
-  const bool preemption = std::any_of(
-      value.affected_state.operations.begin(), value.affected_state.operations.end(),
-      [](const auto& operation) { return operation.preemption.has_value(); });
-  const bool facts = std::any_of(
-      value.affected_state.operations.begin(), value.affected_state.operations.end(),
-      [](const auto& operation) {
-        return std::any_of(
-            operation.participants.begin(), operation.participants.end(),
-            [](const auto& participant) { return participant.terminal_fact.has_value(); });
-      });
-  const bool scoped =
-      std::any_of(value.affected_state.operations.begin(), value.affected_state.operations.end(),
-                  has_program_execution_scope);
-  const bool ordered =
-      std::any_of(value.affected_state.operations.begin(), value.affected_state.operations.end(),
-                  [](const auto& row) { return row.journal_capture_order != 0U; });
-  // Q51/Q53: the per-robot Stop timing changed every shape; earlier versions
-  // (v1-v3) are refused, never converted.
-  return arr({V(takeover             ? "manyforge.internal.stop-journal-acceptance-projection.v11"
-                : provider_extension ? "manyforge.internal.stop-journal-acceptance-projection.v10"
-                : preemption         ? "manyforge.internal.stop-journal-acceptance-projection.v9"
-                : facts              ? "manyforge.internal.stop-journal-acceptance-projection.v8"
-                : scoped             ? "manyforge.internal.stop-journal-acceptance-projection.v6"
-                : ordered            ? "manyforge.internal.stop-journal-acceptance-projection.v5"
-                                     : "manyforge.internal.stop-journal-acceptance-projection.v4"),
-              accepted_value(value.accepted), affected_value(value.affected_state)});
+  return arr({V(std::string(kStopJournalAcceptanceProjectionApiVersion)),
+              accepted_value(value.accepted)});
 }
 
 [[nodiscard]] StopJournalAcceptanceProjectionDTO acceptance_root_from(const V& value) {
-  const auto& f = exact(value, 3U, "Stop journal acceptance projection");
-  const auto version = str(f[0], "acceptance API version");
-  if (version != "manyforge.internal.stop-journal-acceptance-projection.v4" &&
-      version != "manyforge.internal.stop-journal-acceptance-projection.v5" &&
-      version != "manyforge.internal.stop-journal-acceptance-projection.v6" &&
-      version != "manyforge.internal.stop-journal-acceptance-projection.v8" &&
-      version != "manyforge.internal.stop-journal-acceptance-projection.v9" &&
-      version != "manyforge.internal.stop-journal-acceptance-projection.v10" &&
-      version != "manyforge.internal.stop-journal-acceptance-projection.v11") {
-    bad("Stop journal acceptance projection API version is unsupported");
-  }
-  auto result = StopJournalAcceptanceProjectionDTO{accepted_from(f[1]), affected_from(f[2])};
-  if (acceptance_root(result).as_array().front().as_string() != version) {
-    bad("Stop acceptance version does not match its capture shape");
-  }
-  return result;
+  const auto& f = versioned(value, kStopJournalAcceptanceProjectionApiVersion, 2U,
+                            "Stop journal acceptance projection");
+  return StopJournalAcceptanceProjectionDTO{accepted_from(f[1])};
 }
 
-[[nodiscard]] V terminal_root(const StopJournalTerminalProjectionDTO& value) {
+using TerminalPlans = std::map<std::string, const PreparedParticipantStopPlanDTO*>;
+
+// The distinct participant plans of the certificate attempts, keyed (and so
+// sorted) by digest. The status attempts equal these (field-join validator).
+// nullopt when two attempts name one digest but carry unequal plans.
+[[nodiscard]] std::optional<TerminalPlans> terminal_plans(const StopCertificateDTO& certificate) {
+  TerminalPlans plans;
+  for (const auto& attempt : certificate.attempted_stage_results) {
+    const auto& plan = attempt.result.request.participant_stop_plan;
+    const auto [found, inserted] =
+        plans.emplace(plan.participant_stop_invocation_plan_digest.value(), &plan);
+    if (!inserted && *found->second != plan) return std::nullopt;
+  }
+  return plans;
+}
+
+[[nodiscard]] V terminal_root(const StopJournalTerminalProjectionDTO& value,
+                              const TerminalPlans& plans) {
+  A plan_values;
+  plan_values.reserve(plans.size());
+  for (const auto& row : plans) plan_values.push_back(prepared_plan_value(*row.second));
   return arr({V(std::string(kStopJournalTerminalProjectionApiVersion)),
-              status_value(value.stop_status), certificate_value(value.certificate),
-              opt(value.fault_latch, fault_latch_value)});
+              status_rest_value(TerminalStopStatusRest(value.stop_status)),
+              certificate_value(value.certificate), opt(value.fault_latch, fault_latch_value),
+              V(std::move(plan_values))});
 }
 
 [[nodiscard]] StopJournalTerminalProjectionDTO terminal_root_from(const V& value) {
-  const auto& f = exact(value, 4U, "Stop journal terminal projection");
-  if (str(f[0], "terminal API version") != kStopJournalTerminalProjectionApiVersion) {
-    bad("Stop journal terminal projection API version is unsupported");
-  }
-  return StopJournalTerminalProjectionDTO{status_from(f[1]), certificate_from(f[2]),
-                                          dopt<StopFaultLatchDTO>(f[3], fault_latch_from)};
+  const auto& f = versioned(value, kStopJournalTerminalProjectionApiVersion, 5U,
+                            "Stop journal terminal projection");
+  TerminalPlanIndex plans(f[4]);
+  auto rest = status_rest_from(f[1]);
+  auto certificate = certificate_from(f[2], plans);
+  plans.require_all_referenced();
+  auto evidence = DeriveStopCertificateEvidence(certificate.attempted_stage_results);
+  if (!evidence.ok()) bad(evidence.error().code);
+  certificate.evidence_items = std::move(evidence.value());
+  auto fault_latch = dopt<StopFaultLatchDTO>(f[3], fault_latch_from);
+  auto status = TerminalStopStatusFromCertificate(rest, certificate, fault_latch);
+  return StopJournalTerminalProjectionDTO{std::move(status), std::move(certificate),
+                                          std::move(fault_latch)};
 }
 
 [[nodiscard]] V surveillance_root(const StopJournalSurveillanceProjectionDTO& value) {
@@ -2147,105 +1848,14 @@ template <typename T, typename Decode>
 [[nodiscard]] V fault_clear_root(const StopJournalFaultClearProjectionDTO& value) {
   return arr({V(std::string(kStopJournalFaultClearProjectionApiVersion)),
               recovery_intent_value(value.recovery_intent),
-              recovery_result_value(value.recovery_result),
-              status_value(value.resulting_stop_status), certificate_value(value.certificate)});
+              recovery_result_value(value.recovery_result)});
 }
 
 [[nodiscard]] StopJournalFaultClearProjectionDTO fault_clear_root_from(const V& value) {
-  const auto& fields = exact(value, 5U, "Stop journal fault-clear projection");
-  if (str(fields[0], "fault-clear API version") != kStopJournalFaultClearProjectionApiVersion) {
-    bad("Stop journal fault-clear projection API version is unsupported");
-  }
+  const auto& fields = versioned(value, kStopJournalFaultClearProjectionApiVersion, 3U,
+                                 "Stop journal fault-clear projection");
   return StopJournalFaultClearProjectionDTO{recovery_intent_from(fields[1]),
-                                            recovery_result_from(fields[2]), status_from(fields[3]),
-                                            certificate_from(fields[4])};
-}
-
-// Compatibility is restricted to the actual typed Stop-plan slots. Never
-// rewrite lookalike arrays in diagnostics, evidence, or arbitrary JSON values.
-[[nodiscard]] V normalized_legacy_stop_plan_wire(const V& value) {
-  auto plan = exact(value, 13U, "prepared participant Stop plan");
-  if (!plan[9].is_null()) {
-    auto profile = exact(plan[9], 12U, "motion interrupt Stop profile");
-    if (!profile[5].is_null() && !profile[5].is_array()) {
-      // The regular decoder already checked the exact soft->hold pair.
-      profile[5] = arr({profile[5]});
-      plan[9] = V(std::move(profile));
-    }
-  }
-  const auto normalize_parameters = [](const V& wire) -> V {
-    if (wire.is_null()) return wire;
-    auto decoded = json_from(wire);
-    if (!std::holds_alternative<JsonObjectDTO>(decoded.value)) return wire;
-    auto& parameters = std::get<JsonObjectDTO>(decoded.value);
-    if (!parameters.contains("recoverable_substitution_mode")) return wire;
-    // Do not accept another noncanonical map ordering or encoding merely
-    // because this object also contains the legacy field.
-    if (json_value(decoded) != wire) bad("legacy Stop parameters are not canonical");
-    detail::normalize_stop_fallback_parameters(parameters);
-    return json_value(decoded);
-  };
-  auto stages = plan[12].as_array();
-  for (auto& stage_wire : stages) {
-    auto stage = exact(stage_wire, 3U, "prepared stage command");
-    auto resolved = exact(stage[0], 11U, "resolved escalation stage");
-    auto qualification = exact(resolved[6], 6U, "command qualification");
-    if (!qualification[1].is_null()) {
-      auto contract = exact(qualification[1], 3U, "substitution contract");
-      if (!contract[2].is_array()) {
-        contract[2] = arr({contract[2]});
-        qualification[1] = V(std::move(contract));
-        resolved[6] = V(std::move(qualification));
-      }
-    }
-    resolved[5] = normalize_parameters(resolved[5]);
-    stage[0] = V(std::move(resolved));
-    stage[1] = normalize_parameters(stage[1]);
-    stage_wire = V(std::move(stage));
-  }
-  plan[12] = V(std::move(stages));
-  return V(std::move(plan));
-}
-
-[[nodiscard]] V normalized_legacy_attempts_wire(const V& value) {
-  auto attempts = value.as_array();
-  for (auto& attempt_wire : attempts) {
-    auto attempt = exact(attempt_wire, 5U, "attempted stage result");
-    auto result = exact(attempt[4], 11U, "participant Stop stage result");
-    auto request = exact(result[0], 29U, "resolved participant Stop stage");
-    request[26] = normalized_legacy_stop_plan_wire(request[26]);
-    result[0] = V(std::move(request));
-    attempt[4] = V(std::move(result));
-    attempt_wire = V(std::move(attempt));
-  }
-  return V(std::move(attempts));
-}
-
-[[nodiscard]] bool matches_normalized_legacy_projection(std::string_view original,
-                                                        std::string_view encoded) {
-  try {
-    auto root = content_identity::parse_canonical_json(
-                    original, content_identity::CanonicalJsonParseLimits{kMaxProjectionBytes, 32U,
-                                                                         1U * 1024U * 1024U})
-                    .as_array();
-    const auto version = str(root[0], "projection API version");
-    const bool terminal = version == kStopJournalTerminalProjectionApiVersion;
-    const bool cleared = version == kStopJournalFaultClearProjectionApiVersion;
-    if (!terminal && !cleared) return false;
-    // These are the only projection roots containing full participant plans.
-    const std::size_t status_index = terminal ? 1U : 3U;
-    const std::size_t certificate_index = terminal ? 2U : 4U;
-    auto status = exact(root[status_index], 14U, "Stop status");
-    status[4] = normalized_legacy_attempts_wire(status[4]);
-    root[status_index] = V(std::move(status));
-    auto certificate = root[certificate_index].as_array();
-    if (certificate.size() != 23U && certificate.size() != 24U) return false;
-    certificate[11] = normalized_legacy_attempts_wire(certificate[11]);
-    root[certificate_index] = V(std::move(certificate));
-    return content_identity::canonical_json(V(std::move(root))) == encoded;
-  } catch (const std::exception&) {
-    return false;
-  }
+                                            recovery_result_from(fields[2])};
 }
 
 template <typename T, typename Root>
@@ -2282,9 +1892,10 @@ template <typename T, typename Root>
   }
 }
 
-}  // namespace
-
-Result<std::string> EncodeStopJournalAcceptanceProjection(
+// Validated canonical bytes of each projection. The decoders compare against
+// these for their canonical re-encode check; the public encoders add the
+// read-back check below.
+[[nodiscard]] Result<std::string> acceptance_bytes(
     const StopJournalAcceptanceProjectionDTO& projection) {
   if (const auto error = stop_accepted_field_error(projection.accepted); error.has_value()) {
     return reject<std::string>(*error);
@@ -2292,16 +1903,75 @@ Result<std::string> EncodeStopJournalAcceptanceProjection(
   return encode_projection(projection, acceptance_root);
 }
 
+[[nodiscard]] Result<std::string> terminal_bytes(
+    const StopJournalTerminalProjectionDTO& projection) {
+  if (const auto error = stop_terminal_projection_field_error(
+          projection.stop_status, projection.certificate, projection.fault_latch);
+      error.has_value()) {
+    return reject<std::string>(*error);
+  }
+  const auto plans = terminal_plans(projection.certificate);
+  if (!plans.has_value()) {
+    return Result<std::string>::Err(
+        ErrorDTO{std::string(kStopJournalProjectionPlanConflictCode),
+                 "Stop journal projection participant plans conflict",
+                 {{"reason", "unequal participant Stop plans share one plan digest"}}});
+  }
+  return encode_projection(projection,
+                           [&](const auto& value) { return terminal_root(value, *plans); });
+}
+
+[[nodiscard]] Result<std::string> fault_clear_bytes(
+    const StopJournalFaultClearProjectionDTO& projection) {
+  // The resulting status and certificate are not stored; the journal writer
+  // derives and checks that join in-process before recording the clear.
+  const auto& intent = projection.recovery_intent;
+  const auto& result = projection.recovery_result;
+  if (stop_fault_recovery_intent_field_error(intent).has_value() ||
+      result.request_id != intent.request_context.request_id ||
+      result.replay_status != RequestReplayStatusDTO::kAcceptedNew || !result.accepted ||
+      result.error.has_value() || result.latch.state != StopFaultLatchStateDTO::kCleared ||
+      stop_fault_latch_field_error(result.latch).has_value()) {
+    return reject<std::string>("fault-clear projection is invalid");
+  }
+  return encode_projection(projection, fault_clear_root);
+}
+
+// Encode never yields bytes its own decoder refuses: the bytes must decode
+// back to exactly `value`, so a journal writer cannot commit an unreadable
+// record. A refusal is the typed "invalid_stop_journal_projection".
+template <typename T, typename RootFrom>
+[[nodiscard]] Result<std::string> readable(Result<std::string> bytes, const T& value,
+                                           RootFrom root_from) {
+  if (!bytes.ok()) return bytes;
+  const auto decoded = decode_projection<T>(bytes.value(), root_from);
+  if (!decoded.ok()) {
+    const auto found = decoded.error().details.find("reason");
+    return reject<std::string>(
+        "projection would not decode: " +
+        (found == decoded.error().details.end() ? decoded.error().message : found->second));
+  }
+  if (!(decoded.value() == value)) {
+    return reject<std::string>("projection does not decode to its exact value");
+  }
+  return bytes;
+}
+
+}  // namespace
+
+Result<std::string> EncodeStopJournalAcceptanceProjection(
+    const StopJournalAcceptanceProjectionDTO& projection) {
+  return readable(acceptance_bytes(projection), projection, acceptance_root_from);
+}
+
 Result<StopJournalAcceptanceProjectionDTO> DecodeStopJournalAcceptanceProjection(
     const std::string_view canonical_bytes) {
   auto decoded =
       decode_projection<StopJournalAcceptanceProjectionDTO>(canonical_bytes, acceptance_root_from);
   if (!decoded.ok()) return decoded;
-  if (const auto error = stop_accepted_field_error(decoded.value().accepted); error.has_value()) {
-    return reject<StopJournalAcceptanceProjectionDTO>(*error);
-  }
-  const auto encoded = EncodeStopJournalAcceptanceProjection(decoded.value());
-  if (!encoded.ok() || encoded.value() != canonical_bytes) {
+  const auto encoded = acceptance_bytes(decoded.value());
+  if (!encoded.ok()) return Result<StopJournalAcceptanceProjectionDTO>::Err(encoded.error());
+  if (encoded.value() != canonical_bytes) {
     return reject<StopJournalAcceptanceProjectionDTO>("acceptance projection is not canonical");
   }
   return decoded;
@@ -2309,12 +1979,7 @@ Result<StopJournalAcceptanceProjectionDTO> DecodeStopJournalAcceptanceProjection
 
 Result<std::string> EncodeStopJournalTerminalProjection(
     const StopJournalTerminalProjectionDTO& projection) {
-  if (const auto error = stop_terminal_projection_field_error(
-          projection.stop_status, projection.certificate, projection.fault_latch);
-      error.has_value()) {
-    return reject<std::string>(*error);
-  }
-  return encode_projection(projection, terminal_root);
+  return readable(terminal_bytes(projection), projection, terminal_root_from);
 }
 
 Result<StopJournalTerminalProjectionDTO> DecodeStopJournalTerminalProjection(
@@ -2322,14 +1987,9 @@ Result<StopJournalTerminalProjectionDTO> DecodeStopJournalTerminalProjection(
   auto decoded =
       decode_projection<StopJournalTerminalProjectionDTO>(canonical_bytes, terminal_root_from);
   if (!decoded.ok()) return decoded;
-  if (const auto error = stop_terminal_projection_field_error(
-          decoded.value().stop_status, decoded.value().certificate, decoded.value().fault_latch);
-      error.has_value()) {
-    return reject<StopJournalTerminalProjectionDTO>(*error);
-  }
-  const auto encoded = EncodeStopJournalTerminalProjection(decoded.value());
-  if (!encoded.ok() || (encoded.value() != canonical_bytes &&
-                        !matches_normalized_legacy_projection(canonical_bytes, encoded.value()))) {
+  const auto encoded = terminal_bytes(decoded.value());
+  if (!encoded.ok()) return Result<StopJournalTerminalProjectionDTO>::Err(encoded.error());
+  if (encoded.value() != canonical_bytes) {
     return reject<StopJournalTerminalProjectionDTO>("terminal projection is not canonical");
   }
   return decoded;
@@ -2339,6 +1999,7 @@ Result<std::string> EncodeStopJournalSurveillanceProjection(
     const StopJournalSurveillanceProjectionDTO& projection) {
   if (stop_post_terminal_surveillance_field_error(projection.checkpoint).has_value() ||
       stop_fault_latch_field_error(projection.fault_latch).has_value() ||
+      !projection.fault_latch.stop_certificate.has_value() ||
       projection.checkpoint.stop_certificate != *projection.fault_latch.stop_certificate ||
       projection.checkpoint.latch_id != projection.fault_latch.latch_id ||
       projection.checkpoint.latch_generation != projection.fault_latch.latch_generation ||
@@ -2362,21 +2023,7 @@ Result<StopJournalSurveillanceProjectionDTO> DecodeStopJournalSurveillanceProjec
 
 Result<std::string> EncodeStopJournalFaultClearProjection(
     const StopJournalFaultClearProjectionDTO& projection) {
-  const auto& intent = projection.recovery_intent;
-  const auto& result = projection.recovery_result;
-  const std::optional<StopFaultLatchDTO> latch(result.latch);
-  if (stop_fault_recovery_intent_field_error(intent).has_value() ||
-      result.request_id != intent.request_context.request_id ||
-      result.replay_status != RequestReplayStatusDTO::kAcceptedNew || !result.accepted ||
-      result.error.has_value() || result.latch.state != StopFaultLatchStateDTO::kCleared ||
-      !projection.resulting_stop_status.fault_latch.has_value() ||
-      *projection.resulting_stop_status.fault_latch != result.latch ||
-      stop_terminal_projection_field_error(projection.resulting_stop_status, projection.certificate,
-                                           latch)
-          .has_value()) {
-    return reject<std::string>("fault-clear projection is invalid");
-  }
-  return encode_projection(projection, fault_clear_root);
+  return readable(fault_clear_bytes(projection), projection, fault_clear_root_from);
 }
 
 Result<StopJournalFaultClearProjectionDTO> DecodeStopJournalFaultClearProjection(
@@ -2384,9 +2031,8 @@ Result<StopJournalFaultClearProjectionDTO> DecodeStopJournalFaultClearProjection
   auto decoded =
       decode_projection<StopJournalFaultClearProjectionDTO>(canonical_bytes, fault_clear_root_from);
   if (!decoded.ok()) return decoded;
-  const auto encoded = EncodeStopJournalFaultClearProjection(decoded.value());
-  if (!encoded.ok() || (encoded.value() != canonical_bytes &&
-                        !matches_normalized_legacy_projection(canonical_bytes, encoded.value()))) {
+  const auto encoded = fault_clear_bytes(decoded.value());
+  if (!encoded.ok() || encoded.value() != canonical_bytes) {
     return reject<StopJournalFaultClearProjectionDTO>("fault-clear projection is not canonical");
   }
   return decoded;

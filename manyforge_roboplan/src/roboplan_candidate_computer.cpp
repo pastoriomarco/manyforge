@@ -1483,6 +1483,10 @@ plan_cartesian_candidate(const std::shared_ptr<roboplan::Scene> &scene,
   return core::Result<roboplan::JointTrajectory>::Ok(std::move(trajectory));
 }
 
+// Internal IK stopping tolerance for pose goals (see solve_ik_locked).
+constexpr double kPoseGoalRefineLinearM = 1e-5;
+constexpr double kPoseGoalRefineAngularRad = 1e-4;
+
 [[nodiscard]] core::Result<std::vector<double>> solve_ik_locked(
     const std::shared_ptr<roboplan::Scene> &scene,
     const RoboPlanCandidateBindingDTO &binding, const core::Pose3DTO &goal,
@@ -1538,10 +1542,43 @@ plan_cartesian_candidate(const std::shared_ptr<roboplan::Scene> &scene,
   const roboplan::JointConfiguration native_seed{
       binding.compiled_joint_names, eigen_vector(positions.value()), {}, {}};
   roboplan::JointConfiguration solution;
+  const auto ik_started = std::chrono::steady_clock::now();
   if (!solver.solveIk(native_goal, native_seed, solution)) {
     return fail<std::vector<double>>(ErrorCode::kIkFailed,
                                      "RoboPlan could not resolve the pose goal",
                                      "native_ik_no_solution");
+  }
+  if (tolerances != nullptr) {
+    // The request tolerances stay the acceptance check above. The first
+    // accepted iterate of the damped solver lands just inside them on the start
+    // side (about 1 mm short), and a goal closer than that accepts the seed
+    // itself. Refine the accepted solution to a tight internal stop so pose
+    // goals land on target; keep the accepted one if refinement cannot.
+    // Cancellation and the deadline are rechecked first, and refinement only
+    // spends what is left of the original IK budget (none left: skip it).
+    if (auto error = control_error(control, "before_ik_refinement");
+        error.has_value()) {
+      return core::Result<std::vector<double>>::Err(std::move(*error));
+    }
+    auto refine = options;
+    refine.max_time =
+        options.max_time - std::chrono::duration<double>(
+                               std::chrono::steady_clock::now() - ik_started)
+                               .count();
+    refine.max_linear_error_norm =
+        std::min(options.max_linear_error_norm, kPoseGoalRefineLinearM);
+    refine.max_angular_error_norm =
+        std::min(options.max_angular_error_norm, kPoseGoalRefineAngularRad);
+    refine.max_restarts = 0;
+    refine.fast_return = true;
+    roboplan::JointConfiguration refined;
+    if (refine.max_time > 0.0 &&
+        roboplan::SimpleIk(scene, refine)
+            .solveIk(native_goal, solution, refined) &&
+        refined.positions.size() == solution.positions.size() &&
+        refined.positions.allFinite()) {
+      solution = std::move(refined);
+    }
   }
   if (auto error = control_error(control, "after_ik"); error.has_value()) {
     return core::Result<std::vector<double>>::Err(std::move(*error));

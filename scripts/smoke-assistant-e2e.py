@@ -1,61 +1,29 @@
 #!/usr/bin/env python3
-"""Assistant sampling configuration, pure validators, and the live gate.
+"""Run a bounded assistant check against a Mock Composer and local model.
 
-The complete historical smoke is pinned at
-``manyforge@08222188293df8e12f90dc72e204c21f22f92ea1`` (blob
-``e8f4ee2143c444acf7d434b399744138064674ad``).  This split retains the
-same-role model sampling profiles and the transport-neutral authoring
-validators covered by the seven cases in
-``tests/test_assistant_e2e_smoke_helpers.py`` (historical blob
-``30498578e8e9ad4b39feafe351e87fa9bf973c24``).
+The read-only phase is delegated to ``smoke-assistant-provider-bridge.py``.
+With the explicit ``--confirm-draft-only`` flag, the second phase offers only
+``scene_draft_add_object`` and leaves its result in the in-memory Program
+Draft. The operator chooses Apply or Discard in Composer. This script never
+saves, Applies, runs a Program, or commands a robot.
 
-Historical live responsibilities are assigned, not hidden:
-
-* ``main``, ``_parse_args``, ``_run_profile`` and ``_run_negative_cases``:
-  N7 bounded live-stack qualification orchestration;
-* ``_bridge_process``, ``_bridge_python``, ``_wait_for_bridge``,
-  ``_stop_existing_bridge`` and ``_direct_vllm_probe``: future
-  N7 launcher/model lifecycle around the current bounded assistant client;
-* ``_query_read_only_case``, ``_composer_draft_add_case``,
-  ``_operator_composer_flow_case``, ``_golden_scene_upsert_case``,
-  ``_golden_tree_insert_case``, ``_golden_parameter_upsert_case``,
-  ``_golden_blackboard_upsert_case`` and ``_draft_tool_surface_case``:
-  current headless query and Draft authoring clients, joined live at N7;
-* ``_cancel_proxy_case``, ``_composer_cancelled_error_case``, the four
-  ``_discard_*_by_reload`` functions, ``_load_baseline``, ``_request_status``,
-  ``_viewer_status``, ``_scene_diagnostic_for_object``,
-  ``_wait_for_request_status``, ``_active_mode_tools`` and
-  ``_active_mode_catalog_hash``: future cancellation, status, mode-catalog,
-  current cancellation/status/catalog clients plus I9 viewer diagnostics;
-* prompt/tool/request-status helpers not retained below: acceptance input for
-  the current strict v1 contract and N7 live-model behavior; and
-* the retained validators below: effect-free acceptance projections only.
-
-No retained helper performs network I/O, starts a process, reads a runtime,
-mutates a draft, or treats the historical v0 wire as currently available.
+The pure validators below remain for their focused helper tests; the live
+workflow uses the current Composer assistant request and status routes.
 """
 
 from __future__ import annotations
 
+import argparse
 from dataclasses import dataclass
-import json
 import math
 from numbers import Real
+import os
+from pathlib import Path
+import subprocess
 import sys
-from typing import Any, Final, NamedTuple
+from typing import Any, Final
 
 
-UNAVAILABLE_EXIT_CODE: Final = 78
-UNAVAILABLE_REASON_CODE: Final = "composable_cell_runtime_unavailable"
-HISTORICAL_SOURCE: Final = (
-    "manyforge@08222188293df8e12f90dc72e204c21f22f92ea1"
-)
-DEFAULT_MODEL: Final = "gemma4-12b-it-gguf"
-RECOMMENDED_PROFILE: Final = "gemma-bridge-default"
-DEFAULT_PROFILES: Final = [
-    "vllm-generation-config",
-    RECOMMENDED_PROFILE,
-]
 MAX_VALIDATION_ITEMS: Final = 4096
 MAX_VALIDATION_NODES: Final = 16_384
 MAX_VALIDATION_DEPTH: Final = 16
@@ -68,272 +36,23 @@ MAX_VALIDATION_ERRORS: Final = 256
 
 @dataclass(frozen=True)
 class Profile:
-    """Effect-free captured sampling input for the N7 live assistant lane."""
+    """Legacy pure-helper profile name kept for bounded selection tests."""
 
     name: str
-    bridge_env: dict[str, str]
-    upstream_body: dict[str, Any]
-    start_bridge: bool = True
-    expect_e2e_success: bool = False
     note: str = ""
 
 
 PROFILES: Final[dict[str, Profile]] = {
-    "vllm-generation-config": Profile(
-        name="vllm-generation-config",
-        bridge_env={},
-        upstream_body={},
-        start_bridge=False,
-        note=(
-            "Direct model-endpoint probe with no per-request generation "
-            "overrides."
-        ),
-    ),
     "bridge-default": Profile(
         name="bridge-default",
-        bridge_env={},
-        upstream_body={"temperature": 0.0, "max_tokens": 512},
-        note="Bridge defaults: deterministic, capped output, thinking unset.",
-    ),
-    "cosmos-bridge-default": Profile(
-        name="cosmos-bridge-default",
-        bridge_env={
-            "BRIDGE_UPSTREAM_MAX_TOKENS": "8192",
-            "BRIDGE_UPSTREAM_TEMPERATURE": "0.0",
-        },
-        upstream_body={"temperature": 0.0, "max_tokens": 8192},
-        expect_e2e_success=True,
-        note=(
-            "Cosmos Reason2 8B bridge smoke profile; uses NemoClaw-Thor "
-            "serving defaults plus a bounded output cap."
-        ),
-    ),
-    "gemma-bridge-default": Profile(
-        name="gemma-bridge-default",
-        bridge_env={
-            "BRIDGE_UPSTREAM_MAX_TOKENS": "8192",
-            "BRIDGE_UPSTREAM_TEMPERATURE": "0.0",
-            "BRIDGE_UPSTREAM_ENABLE_THINKING": "false",
-        },
-        upstream_body={
-            "temperature": 0.0,
-            "max_tokens": 8192,
-            "chat_template_kwargs": {"enable_thinking": False},
-        },
-        expect_e2e_success=True,
-        note=(
-            "Gemma 4 12B GGUF bridge smoke profile; captured pre-cutover "
-            "ManyForge assistant default."
-        ),
-    ),
-    "omni-vendor-tool": Profile(
-        name="omni-vendor-tool",
-        bridge_env={
-            "BRIDGE_UPSTREAM_MAX_TOKENS": "512",
-            "BRIDGE_UPSTREAM_TEMPERATURE": "0.6",
-            "BRIDGE_UPSTREAM_TOP_P": "0.95",
-        },
-        upstream_body={"temperature": 0.6, "top_p": 0.95, "max_tokens": 512},
-        note="NVIDIA tool-call sampling, thinking unset.",
-    ),
-    "omni-vendor-tool-no-think": Profile(
-        name="omni-vendor-tool-no-think",
-        bridge_env={
-            "BRIDGE_UPSTREAM_MAX_TOKENS": "512",
-            "BRIDGE_UPSTREAM_TEMPERATURE": "0.6",
-            "BRIDGE_UPSTREAM_TOP_P": "0.95",
-            "BRIDGE_UPSTREAM_ENABLE_THINKING": "false",
-        },
-        upstream_body={
-            "temperature": 0.6,
-            "top_p": 0.95,
-            "max_tokens": 512,
-            "chat_template_kwargs": {"enable_thinking": False},
-        },
-        note="NVIDIA tool-call sampling with reasoning disabled.",
-    ),
-    "omni-vendor-tool-no-think-32768": Profile(
-        name="omni-vendor-tool-no-think-32768",
-        bridge_env={
-            "BRIDGE_UPSTREAM_MAX_TOKENS": "32768",
-            "BRIDGE_UPSTREAM_TEMPERATURE": "0.6",
-            "BRIDGE_UPSTREAM_TOP_P": "0.95",
-            "BRIDGE_UPSTREAM_ENABLE_THINKING": "false",
-        },
-        upstream_body={
-            "temperature": 0.6,
-            "top_p": 0.95,
-            "max_tokens": 32768,
-            "chat_template_kwargs": {"enable_thinking": False},
-        },
-        note=(
-            "NVIDIA tool-call sampling with reasoning disabled and a "
-            "32768-token cap."
-        ),
-    ),
-    "omni-instruct-no-think": Profile(
-        name="omni-instruct-no-think",
-        bridge_env={
-            "BRIDGE_UPSTREAM_MAX_TOKENS": "512",
-            "BRIDGE_UPSTREAM_TEMPERATURE": "0.2",
-            "BRIDGE_UPSTREAM_TOP_K": "1",
-            "BRIDGE_UPSTREAM_ENABLE_THINKING": "false",
-        },
-        upstream_body={
-            "temperature": 0.2,
-            "top_k": 1,
-            "max_tokens": 512,
-            "chat_template_kwargs": {"enable_thinking": False},
-        },
-        expect_e2e_success=True,
-        note=(
-            "NVIDIA non-thinking instruct profile; captured pre-cutover "
-            "recommended smoke profile."
-        ),
-    ),
-    "omni-instruct-no-think-128": Profile(
-        name="omni-instruct-no-think-128",
-        bridge_env={
-            "BRIDGE_UPSTREAM_MAX_TOKENS": "128",
-            "BRIDGE_UPSTREAM_TEMPERATURE": "0.2",
-            "BRIDGE_UPSTREAM_TOP_K": "1",
-            "BRIDGE_UPSTREAM_ENABLE_THINKING": "false",
-        },
-        upstream_body={
-            "temperature": 0.2,
-            "top_k": 1,
-            "max_tokens": 128,
-            "chat_template_kwargs": {"enable_thinking": False},
-        },
-        note="Output-budget sweep: recommended profile with a 128-token cap.",
-    ),
-    "omni-instruct-no-think-256": Profile(
-        name="omni-instruct-no-think-256",
-        bridge_env={
-            "BRIDGE_UPSTREAM_MAX_TOKENS": "256",
-            "BRIDGE_UPSTREAM_TEMPERATURE": "0.2",
-            "BRIDGE_UPSTREAM_TOP_K": "1",
-            "BRIDGE_UPSTREAM_ENABLE_THINKING": "false",
-        },
-        upstream_body={
-            "temperature": 0.2,
-            "top_k": 1,
-            "max_tokens": 256,
-            "chat_template_kwargs": {"enable_thinking": False},
-        },
-        note="Output-budget sweep: recommended profile with a 256-token cap.",
-    ),
-    "omni-instruct-no-think-1024": Profile(
-        name="omni-instruct-no-think-1024",
-        bridge_env={
-            "BRIDGE_UPSTREAM_MAX_TOKENS": "1024",
-            "BRIDGE_UPSTREAM_TEMPERATURE": "0.2",
-            "BRIDGE_UPSTREAM_TOP_K": "1",
-            "BRIDGE_UPSTREAM_ENABLE_THINKING": "false",
-        },
-        upstream_body={
-            "temperature": 0.2,
-            "top_k": 1,
-            "max_tokens": 1024,
-            "chat_template_kwargs": {"enable_thinking": False},
-        },
-        note="Output-budget sweep: recommended profile with a 1024-token cap.",
-    ),
-    "omni-instruct-no-think-32768": Profile(
-        name="omni-instruct-no-think-32768",
-        bridge_env={
-            "BRIDGE_UPSTREAM_MAX_TOKENS": "32768",
-            "BRIDGE_UPSTREAM_TEMPERATURE": "0.2",
-            "BRIDGE_UPSTREAM_TOP_K": "1",
-            "BRIDGE_UPSTREAM_ENABLE_THINKING": "false",
-        },
-        upstream_body={
-            "temperature": 0.2,
-            "top_k": 1,
-            "max_tokens": 32768,
-            "chat_template_kwargs": {"enable_thinking": False},
-        },
-        note=(
-            "Output-budget sweep: recommended profile with a 32768-token cap."
-        ),
-    ),
-    "omni-deterministic-no-think": Profile(
-        name="omni-deterministic-no-think",
-        bridge_env={
-            "BRIDGE_UPSTREAM_MAX_TOKENS": "512",
-            "BRIDGE_UPSTREAM_TEMPERATURE": "0.0",
-            "BRIDGE_UPSTREAM_TOP_K": "1",
-            "BRIDGE_UPSTREAM_ENABLE_THINKING": "false",
-        },
-        upstream_body={
-            "temperature": 0.0,
-            "top_k": 1,
-            "max_tokens": 512,
-            "chat_template_kwargs": {"enable_thinking": False},
-        },
-        note="Deterministic non-thinking comparison.",
+        note="Uses the active Deployment model request contract; no local overrides.",
     ),
 }
+DEFAULT_PROFILES: Final = ["bridge-default"]
 
 
 class SmokeFailure(RuntimeError):
-    """Raised when an effect-free smoke configuration is invalid."""
-
-
-class RestorationAssignment(NamedTuple):
-    historical_symbols: str
-    required_behavior: str
-
-
-RESTORATION_ASSIGNMENTS: Final = (
-    RestorationAssignment(
-        "main, _parse_args, _run_profile, _run_negative_cases",
-        "bounded N7 live-stack qualification over the strict v1 client",
-    ),
-    RestorationAssignment(
-        "_bridge_process, _bridge_python, _wait_for_bridge, "
-        "_stop_existing_bridge, _direct_vllm_probe",
-        "bounded process and model/provider client lifecycle",
-    ),
-    RestorationAssignment(
-        "_query_read_only_case, _composer_draft_add_case, "
-        "_operator_composer_flow_case, _golden_scene_upsert_case, "
-        "_golden_tree_insert_case, _golden_parameter_upsert_case, "
-        "_golden_blackboard_upsert_case, _draft_tool_surface_case",
-        "headless query and authoring clients over owner-issued facts",
-    ),
-    RestorationAssignment(
-        "_cancel_proxy_case, _composer_cancelled_error_case, "
-        "_discard_draft_by_reload, _discard_tree_by_reload, "
-        "_discard_parameter_by_reload, _discard_blackboard_by_reload, "
-        "_load_baseline, _request_status, _viewer_status, "
-        "_scene_diagnostic_for_object, _wait_for_request_status, "
-        "_active_mode_tools, _active_mode_catalog_hash",
-        "cancellation, status, catalog, viewer, and diagnostic clients",
-    ),
-    RestorationAssignment(
-        "_check_health, _resolve_model, _get_json, _post_json, _open_json, "
-        "_expect_http_error",
-        "authenticated HTTP client with explicit error and timeout behavior",
-    ),
-    RestorationAssignment(
-        "_add_object_prompt, _golden_scene_prompt, "
-        "_golden_tree_insert_prompt, _golden_parameter_upsert_prompt, "
-        "_golden_blackboard_upsert_prompt, _scene_draft_add_tool_descriptor, "
-        "_tool_call_names, _compact_tool_calls, "
-        "_tool_call_names_from_response, _out_of_mode_tool_errors, "
-        "_single_completed_tool_call, _request_status_errors, "
-        "_message_mentions_errors, _program_scene_by_id, "
-        "_program_parameters_by_name, _program_blackboard_maps, "
-        "_unexpected_slugged_values_errors, _draft_request_status_ok, "
-        "_scene_object_ids, _scene_resources, _tree_insert_result_errors, "
-        "_find_tree_node_by_name, _parameter_argument_errors, "
-        "_blackboard_namespace_argument_errors, "
-        "_blackboard_key_argument_errors, _single_item_errors, "
-        "_scene_resource_matches, _slug, _strict_success, _repo_root",
-        "acceptance cases for the strict v1 contract and N7 live-model lane",
-    ),
-)
+    """Raised when a bounded assistant smoke check fails."""
 
 
 def _bounded_identifier(value: Any, *, label: str) -> str:
@@ -1277,25 +996,83 @@ def _float_lists_close(
     return True
 
 
-def unavailable_payload() -> dict[str, object]:
-    return {
-        "schema_version": "manyforge.qualification_unavailable.v1",
-        "reason_code": UNAVAILABLE_REASON_CODE,
-        "script": "smoke-assistant-e2e.py",
-        "historical_source": HISTORICAL_SOURCE,
-        "exit_code": UNAVAILABLE_EXIT_CODE,
-        "assignments": [
-            assignment._asdict() for assignment in RESTORATION_ASSIGNMENTS
-        ],
-    }
+def _parser() -> argparse.ArgumentParser:
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument(
+        "--composer-url",
+        default=os.environ.get("MANYFORGE_COMPOSER_URL", "http://127.0.0.1:3000"),
+        help="Composer API root (default: %(default)s)",
+    )
+    parser.add_argument(
+        "--expected-component-id",
+        help="optionally require this component for the chat alias",
+    )
+    parser.add_argument(
+        "--timeout-seconds",
+        type=float,
+        default=180.0,
+        help="maximum time for each assistant request (default: %(default)s)",
+    )
+    parser.add_argument(
+        "--confirm-draft-only",
+        action="store_true",
+        help="confirm that the second phase may edit the in-memory Program Draft",
+    )
+    return parser
 
 
 def main(argv: list[str] | None = None) -> int:
-    """Fail before environment, filesystem, process, or network effects."""
+    args = _parser().parse_args(argv)
+    if not args.confirm_draft_only:
+        print(
+            "Refusing to run the Draft-mutating phase without --confirm-draft-only.",
+            file=sys.stderr,
+        )
+        return 2
+    if not 1.0 <= args.timeout_seconds <= 900.0:
+        print("--timeout-seconds must be between 1 and 900", file=sys.stderr)
+        return 2
 
-    del argv
-    print(json.dumps(unavailable_payload(), sort_keys=True), file=sys.stderr)
-    return UNAVAILABLE_EXIT_CODE
+    scripts = Path(__file__).resolve().parent
+    common = [
+        "--composer-url",
+        args.composer_url,
+        "--timeout-seconds",
+        str(args.timeout_seconds),
+    ]
+    if args.expected_component_id:
+        common.extend(("--expected-component-id", args.expected_component_id))
+    phases = (
+        (
+            "read-only provider check",
+            scripts / "smoke-assistant-provider-bridge.py",
+            [*common],
+        ),
+        (
+            "Draft-only scene authoring check",
+            scripts / "smoke-assistant-scene-authoring.py",
+            [*common, "--confirm-draft-only"],
+        ),
+    )
+    for label, script, arguments in phases:
+        print(f"Running {label}...", flush=True)
+        try:
+            result = subprocess.run(
+                [sys.executable, str(script), *arguments],
+                check=False,
+            )
+        except OSError as error:
+            print(f"FAIL: could not start {script.name}: {error}", file=sys.stderr)
+            return 1
+        if result.returncode != 0:
+            if label == "read-only provider check":
+                print("Stopped before submitting a Draft edit.", file=sys.stderr)
+            return result.returncode
+    print(
+        "PASS: end-to-end assistant smoke completed. Review the Program Draft "
+        "in Composer, then choose Apply or Discard."
+    )
+    return 0
 
 
 if __name__ == "__main__":

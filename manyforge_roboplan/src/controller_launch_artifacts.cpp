@@ -71,41 +71,23 @@ struct ControllerProfileRow final {
   double gripper_result_timeout_s;
 };
 
-// Q63-Q66/Q74 offline mock controller profiles, one per offline model family.
-// Arm controller names and vendor constraints are the retained controller
-// files' own: xarm_ros2 c3172e57 xarm_controller/config/lite6_controllers.yaml
-// (`lite6_traj_controller`, {trajectory: 1.0, goal: 0.01} on every joint) and
-// ManyMove manymove_bringup/config/ur/ur_with_robotiq_controllers.yaml
-// (sha256 06b1e3c5..., `joint_trajectory_controller`; its constraints are in
-// Track 2's UR template). Gripper controllers follow Track 2's mapping
-// (SX-280); UR5 has no gripper joint. Q79: hard-stop completion and gripper
-// result timeouts are Isaac's values per model family (Lite 6 family 1.5 s /
-// 5 s; UR family 0.5 s / 15 s; UR5 has no gripper, its value is unused).
+// Q63-Q66/Q74 offline mock controller profiles, one per offline model family,
+// as data (E1): manyforge_ros_bringup/config/mock_controller_profiles.yaml,
+// validated and turned into these rows at configure time by
+// scripts/robots/mock_controller_profiles.py. Q79: hard-stop completion and
+// gripper result timeouts are Isaac's values per model family.
+constexpr ControllerProfileRow kMockProfiles[] = {
+#include "mock_controller_profiles.inc"
+};
+// The Real rows below reuse the Lite 6 family's Mock values.
 constexpr double kLite6FamilyHardStopCompletionTimeoutS = 1.5;
 constexpr double kLite6FamilyGripperResultTimeoutS = 5.0;
-constexpr double kUrFamilyHardStopCompletionTimeoutS = 0.5;
-constexpr double kUrFamilyGripperResultTimeoutS = 15.0;
-constexpr std::array<ControllerProfileRow, 4U> kMockProfiles{{
-    {"lite6_lite_gripper", "MockLite6LiteGripperSystem", ArmTemplate::kUFactory,
-     "lite6_traj_controller", VendorJointConstraints{"1.0", "0.01"},
-     "lite_gripper_controller", true, kLite6FamilyHardStopCompletionTimeoutS,
-     kLite6FamilyGripperResultTimeoutS},
-    {"ur10e_robotiq_2f_140", "MockUR10eRobotiq2F140System", ArmTemplate::kUr,
-     "joint_trajectory_controller", std::nullopt, "robotiq_gripper_controller",
-     true, kUrFamilyHardStopCompletionTimeoutS, kUrFamilyGripperResultTimeoutS},
-    {"ur5_roboplan", "MockUR5System", ArmTemplate::kUr,
-     "joint_trajectory_controller", std::nullopt, "", false,
-     kUrFamilyHardStopCompletionTimeoutS, kUrFamilyGripperResultTimeoutS},
-    {"ur5e_robotiq_2f_85", "MockUR5eRobotiq2F85System", ArmTemplate::kUr,
-     "joint_trajectory_controller", std::nullopt, "robotiq_gripper_controller",
-     true, kUrFamilyHardStopCompletionTimeoutS, kUrFamilyGripperResultTimeoutS},
-}};
 
 [[nodiscard]] const ControllerProfileRow &mock_row(const std::string_view id) {
   const auto found =
-      std::find_if(kMockProfiles.begin(), kMockProfiles.end(),
+      std::find_if(std::begin(kMockProfiles), std::end(kMockProfiles),
                    [&](const auto &row) { return row.profile_id == id; });
-  if (found == kMockProfiles.end()) {
+  if (found == std::end(kMockProfiles)) {
     fail("unsupported mock controller profile '" + std::string(id) + "'");
   }
   return *found;

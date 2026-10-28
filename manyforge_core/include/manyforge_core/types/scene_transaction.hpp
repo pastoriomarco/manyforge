@@ -90,6 +90,9 @@ struct AttachCarriedObjectRequestDTO final {
   std::vector<ComponentAttachmentRevision> expected_component_attachment_revisions;
   /// Optional Program attach-node bound, kept with the attachment.
   std::optional<CarriedObjectGraspLostBoundDTO> grasp_lost_bound{};
+  /// The attach node's `on_grasp_lost`; absent means the defaults. A
+  /// non-default response needs a bound and is never encoded equal to them.
+  std::optional<GraspLostResponseDTO> on_grasp_lost{};
 };
 
 struct DetachCarriedObjectRequestDTO final {

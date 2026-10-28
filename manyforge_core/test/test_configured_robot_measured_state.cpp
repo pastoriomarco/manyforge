@@ -189,10 +189,16 @@ TEST(ConfiguredRobotMeasuredState, ValidatesSamplesAndCompleteGeometryRatherThan
     auto wrong = original;
     if (mutation == 0) wrong.complete = false;
     if (mutation == 1) wrong.positions[0] = AngularPositionDTO{std::numeric_limits<double>::quiet_NaN()};
-    if (mutation == 2) wrong.received_timestamp_ns = 1051;
+    if (mutation == 2) wrong.received_timestamp_ns = -1;
     EXPECT_FALSE(ConfiguredRobotMeasuredStateInventory{
         {required(source, std::make_shared<ReturnedSnapshot>(wrong))}}.Read(1050).ok());
   }
+  // A sample received after the read boundary is current
+  // (received_sample_age.hpp): the Real `measured_state` no longer flickers.
+  auto later = original;
+  later.received_timestamp_ns = 1051;
+  EXPECT_TRUE(ConfiguredRobotMeasuredStateInventory{
+      {required(source, std::make_shared<ReturnedSnapshot>(later))}}.Read(1050).ok());
   auto partial = required(source, published(source));
   partial.required_resources.push_back(ResourceId("unobserved-gripper"));
   const ConfiguredRobotMeasuredStateInventory inventory{{std::move(partial)}};

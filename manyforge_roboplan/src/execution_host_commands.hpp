@@ -171,6 +171,7 @@ enum class CommandKind {
   kReadIoWatch,
   kReleaseIoWatch,
   kSetMockIoInput,
+  kSetCarriedObjectLost,
   kPublishProgramBlackboard,
   kQueryOperation,
   kControlState,
@@ -285,6 +286,20 @@ struct MockIoInputSetRequest final {
   bool value;
 };
 
+/// Manager publication of one gripper's `carried_object_lost.<target>`
+/// system signal level (contract §8.4, §10). The ids and the loss event id
+/// are present iff `level`; `set_key` (the attachment's stored
+/// `on_grasp_lost.set_key`) is null with `false`.
+struct CarriedObjectLostSetRequest final {
+  core::ControllableComponentId controllable_component_id;
+  core::CommandTargetId command_target_id;
+  bool level{};
+  std::optional<std::string> carried_object_attachment_id;
+  std::optional<std::string> scene_resource_id;
+  std::optional<std::string> loss_event_id;
+  std::optional<std::string> set_key;
+};
+
 struct ProgramOperationQuery final {
   core::RequestOwnerEpoch owner_epoch;
   core::ProgramBindingId program_binding_id;
@@ -298,6 +313,7 @@ struct Command final {
   CommandKind kind;
   std::optional<TargetObservationQuery> target_query;
   std::optional<MockIoInputSetRequest> mock_io_input_set{};
+  std::optional<CarriedObjectLostSetRequest> carried_object_lost_set{};
   std::optional<core::ProgramNodeMockSimulationRequestDTO> mock_node_simulation{};
   std::optional<core::ProgramNodeMockSimulationScopeDTO> mock_node_simulation_end{};
   std::optional<core::ProgramRunMockSimulationPauseRequestDTO> mock_run_simulation_pause{};

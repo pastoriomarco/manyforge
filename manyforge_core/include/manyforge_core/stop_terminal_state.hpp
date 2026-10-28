@@ -55,7 +55,17 @@ enum class StopFaultTriggerDTO : std::uint8_t {
   kFailedUncontained,
   kPhysicalRestUnproven,
   kPersistenceDegraded,
+  /// The reserve accepted the Stop but its resource fence failed (D4).
+  kPostReserveFenceFailed,
 };
+
+/// Number of StopFaultTriggerDTO values; bounds a latch's observed triggers.
+inline constexpr std::size_t kStopFaultTriggerCount = 7U;
+static_assert(static_cast<std::size_t>(StopFaultTriggerDTO::kPostReserveFenceFailed) + 1U ==
+              kStopFaultTriggerCount);
+
+/// Stable wire name of a trigger (e.g. `physical_rest_unproven`).
+[[nodiscard]] std::string_view stop_fault_trigger_name(StopFaultTriggerDTO trigger) noexcept;
 
 enum class StopFaultLatchStateDTO : std::uint8_t {
   kLatched = 0,
@@ -110,9 +120,22 @@ struct StopFaultLatchDTO final {
   StopFaultRecoveryStatusDTO recovery_status{StopFaultRecoveryStatusDTO::kWaitingForObservation};
   std::string reason_code;
   std::vector<StopFaultRecoveryEvidenceRefDTO> evidence_refs;
+  /// Every distinct trigger latched on this Stop, in first-seen order. It
+  /// always contains `trigger`, the highest-priority (primary) cause.
+  std::vector<StopFaultTriggerDTO> observed_triggers;
 
   friend bool operator==(const StopFaultLatchDTO&, const StopFaultLatchDTO&) = default;
 };
+
+/// Whether `trigger` was latched on this Stop, primary or not. Recovery
+/// obligations that a trigger adds (e.g. external reconciliation for
+/// `failed_uncontained`) apply even when a higher-priority trigger is primary.
+[[nodiscard]] inline bool stop_fault_trigger_observed(const StopFaultLatchDTO& latch,
+                                                      const StopFaultTriggerDTO trigger) noexcept {
+  for (const auto observed : latch.observed_triggers)
+    if (observed == trigger) return true;
+  return false;
+}
 
 struct StopFaultRecoveryConfigurationExpectationDTO final {
   ControlDomainId control_domain_id;
@@ -246,6 +269,38 @@ struct StopStatusDTO final {
 
   friend bool operator==(const StopStatusDTO&, const StopStatusDTO&) = default;
 };
+
+/// The StopStatusDTO fields of a terminal status that its certificate and
+/// fault latch cannot rebuild. The lean terminal record (wire v4 status_rest)
+/// stores exactly these, in this order.
+struct StopTerminalStatusRestDTO final {
+  StopAcceptedDTO accepted;
+  std::vector<StopCurrentStageDTO> current_stages;
+  StopDurableProjectionStatusDTO acceptance_projection;
+  StopDurableProjectionStatusDTO terminal_projection;
+  StopDurableProjectionStatusDTO surveillance_projection;
+  std::optional<StopPostTerminalSurveillanceDTO> surveillance;
+
+  friend bool operator==(const StopTerminalStatusRestDTO&,
+                         const StopTerminalStatusRestDTO&) = default;
+};
+
+/// Copies the stored-only fields out of a terminal status.
+[[nodiscard]] StopTerminalStatusRestDTO TerminalStopStatusRest(const StopStatusDTO& status);
+
+/// Rebuilds the full terminal status: `rest` fields verbatim; state from
+/// certificate.result (succeeded nominal/escalated -> kSucceeded, partial ->
+/// kPartial, failed uncontained -> kFailed); scope_entries,
+/// attempted_stage_results, evidence_items, unsettled and failed from the
+/// certificate; stop_certificate = {id, revision, stop_id, stop_generation} of
+/// the certificate; fault_latch = `fault_latch`. Pure; no validation (callers
+/// run stop_terminal_projection_field_error). For any status S that passes
+/// that validator with certificate C and latch L:
+///   TerminalStopStatusFromCertificate(TerminalStopStatusRest(S), C, L) == S.
+/// The same rule as the Kernel recovery adoption, which may keep its own copy.
+[[nodiscard]] StopStatusDTO TerminalStopStatusFromCertificate(
+    const StopTerminalStatusRestDTO& rest, const StopCertificateDTO& certificate,
+    const std::optional<StopFaultLatchDTO>& fault_latch);
 
 [[nodiscard]] std::optional<std::string_view> stop_forensic_projection_result_field_error(
     const StopForensicProjectionResultDTO& result) noexcept;

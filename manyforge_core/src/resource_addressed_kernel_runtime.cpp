@@ -729,6 +729,11 @@ Result<void> ResourceAddressedExecutionKernel::reconfigure_runtime_participants_
         }
         registry_ = std::move(*candidate_registry);
         registrations_ = std::move(registrations);
+        // D6: a new product ends any Close of the previous one; a latch of the
+        // previous product is now carried (stop_fault_admission_scope_locked).
+        if (stop_retained_bundle_id_ != candidate_stop_facts->retained_bundle_id ||
+            stop_graph_revision_ != candidate_stop_facts->graph_revision)
+          close_retired_product_ = false;
         stop_retained_bundle_id_ = std::move(candidate_stop_facts->retained_bundle_id);
         stop_graph_revision_ = std::move(candidate_stop_facts->graph_revision);
         config_.graph_revision = stop_graph_revision_;

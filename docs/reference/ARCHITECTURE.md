@@ -1,15 +1,9 @@
 # ManyForge Architecture
 
-> **Current `dev` status:** the maintained execution host uses ROS controller
-> adapters for mock, Isaac and real components. The native simulator is removed;
-> governance contracts, shared planning and cell/runtime-unit ownership remain.
-> The addressed Kernel owns execution and Stop; Manager owns convergence and
-> runtime children; Headless and Program runner expose those owners; Composer
-> remains a client. ROS Workbench empty-ready and mock Phase A
-> `qualified-live02` are the current live evidence. Isaac, physical operation,
-> the complete Compose wrapper and an observed GUI journey are unqualified.
-> Native multi-unit references retained under DX-753 are compatibility and
-> discussion inputs, not qualification of multi-container ROS operation.
+The execution host uses ROS controller adapters for Mock, Isaac and Real
+components. The addressed Kernel owns execution and Stop; Manager owns
+convergence and runtime children; Headless and Program runner expose those
+owners; Composer remains a client.
 
 A coherent, mid-depth map of how ManyForge is put together: the components, how
 a program flows through them, and — most importantly — which layer owns which
@@ -17,10 +11,7 @@ decision. For install and operation see
 [`../INDEX.md`](../INDEX.md); for exact wire contracts see the generated
 references linked at the end.
 
-This document records the baseline's **observable runtime behavior and
-structure** together with explicitly identified target foundations. It is not
-a tutorial and not a spec; it is the picture to recover before rebuilding any
-single component in depth.
+It is not a tutorial and not a spec.
 
 ______________________________________________________________________
 
@@ -134,8 +125,7 @@ Only the matching generation/token may complete the phase. Stale completion is
 ignored; a failed candidate restores the retained runtime's barrier state.
 Expected waiting while the barrier is closed is status/history, not an alarm.
 A definitive initialization failure, or a pose-apply failure after readiness,
-is a typed condition with an authoritative clear path. See
-[`SCENE_AUTHORITY.md`](SCENE_AUTHORITY.md).
+is a typed condition with an authoritative clear path.
 
 ### Scene Viewer data plane
 
@@ -154,8 +144,7 @@ Native current observation -> Headless credited socket -> Composer latest slot
                                                    applied-frame credit back
 ```
 
-The current native protocol is separate from the historical manifest/frame
-worker described in the old viewer schema. `GET /api/source-model` supplies
+`GET /api/source-model` supplies
 the retained model/topology on demand. `/ws/scene/viewer` supplies addressed
 current joint observations; scene facts and other cold operator state arrive
 through `/ws/control`. Neither heartbeat passage nor volatile sample counters
@@ -193,8 +182,7 @@ consume several host cores even when the viewer worker and transport are idle.
 
 Presentation rates and quality are observer concerns, not Program execution
 rates or deployment pose-source sampling authority. Faster rendering cannot
-create newer observed facts. Historical layer negotiation and a supervised
-visual-worker process are not current native protocol requirements.
+create newer observed facts.
 
 ______________________________________________________________________
 
@@ -263,10 +251,18 @@ particular robot transport.
 
 Collision protection is dual-layered and configurable:
 
-- **Plan-time validation** checks the trajectory per waypoint before it is
-  dispatched; a trajectory that fails is never sent to the robot.
+- **Plan-time validation** checks the trajectory before it is dispatched; a
+  trajectory that fails is never sent to the robot. It checks the stored
+  waypoints and samples of the curve the controller executes between them
+  (linear, cubic or quintic from the waypoints' positions, velocities and
+  accelerations), so that no joint moves more than 0.0005 rad between two
+  checked configurations. A contact thinner than that step can still be
+  missed. A trajectory that would need more than 200,000 checked
+  configurations is refused (`collision_validation_sample_budget_exceeded`).
 - **Runtime monitoring** re-checks the lane-selected authoritative execution
-  state periodically during execution and faults on a policy violation.
+  state periodically during execution and faults on a policy violation. The
+  runtime lookahead is a quick check and does not sample every point; for
+  expanded collision models it uses the chord between waypoints.
 
 Both layers use the same authority — the motion planner does not get to certify
 its own trajectories. Each state query first determines the colliding body-pair
@@ -342,12 +338,11 @@ through a live file watch or an importer-owned runtime action.
 
 ## Deployment lanes
 
-The same public contracts drive three lanes; they differ only in what sits
-behind the execution backend.
+The same public contracts drive the Mock, Isaac and Real lanes; they differ
+only in what sits behind the execution backend. All three use stock
+ros2_control / FollowJointTrajectory.
 
-- **ManyForge-only native.** Backend-authored state with RoboPlan/native
-  execution. The offline, deterministic lane — used for model-authority and
-  collision-validation work with no ROS or hardware in the loop.
+- **Mock.** ros2_control mock hardware; no simulator or robot.
 - **Isaac commanded simulation.** Stock ros2_control / FollowJointTrajectory
   plus an Isaac topic bridge. Composer/ManyForge remain the command authority;
   Isaac is the streamed plant. The explicit `commanded_sim` profile uses the
@@ -569,13 +564,10 @@ create or clear one.
 
 Exposed through:
 
-- `GET /api/execution/digest` — active span, headline cause, recovery state.
 - `GET /api/cycle/status` — cycle state and the one current versioned recovery
   offer; `POST /api/cycle/recovery-actions` applies an exact offered action.
 - `GET /api/execution/history` — filterable by run, span, node, move, and
   contact policy.
-- `GET /api/execution/channels` and incident snapshots — span-local chain plus
-  labelled context windows.
 - `GET /api/execution/alarms` — current four-state alarm snapshot, manager/
   source reconciliation, and bounded lifecycle history; acknowledgement routes
   are revision/activation fenced.
@@ -585,17 +577,15 @@ ______________________________________________________________________
 
 ## Extending ManyForge
 
-- **New robot** — supply URDF/SRDF and a deployment YAML; see
-  [`../operations/ADDING_A_ROBOT.md`](../operations/ADDING_A_ROBOT.md).
+- **New robot** — robots come from the included arm and gripper profiles;
+  adding a robot from your own URDF/SRDF or MoveIt configuration is not
+  supported yet.
 - **New planner** — implement `IPlannerBackend` plus the focused
   revision-bound scene projection and model/reference adapters it requires;
   candidate search never replaces ManyForge validation or collision admission.
   **New execution transport** — implement `IExecutionBackend` and its observed
   state/progression contract. The two extension seams are independent, and the
-  kernel/program artifacts remain backend-neutral. See
-  [`ROBOPLAN_ADAPTER_NOTES.md`](ROBOPLAN_ADAPTER_NOTES.md).
-- **Scene / collision authority** — see
-  [`SCENE_AUTHORITY.md`](SCENE_AUTHORITY.md).
+  kernel/program artifacts remain backend-neutral.
 - **Trusted external behavior node** — use the statically selected
   [`manyforge_example_nodes`](../../manyforge_example_nodes/README.md) package
   as the build/owner-adapter example. Its descriptor, actual source and
@@ -615,7 +605,7 @@ The current generated contracts are:
 
 - [`REST_API.md`](REST_API.md) — the retained structural Composer REST surface,
   generated from the current FastAPI application.
-- [`HEADLESS_REST_API.md`](HEADLESS_REST_API.md) — the independent I5/H0
+- [`HEADLESS_REST_API.md`](HEADLESS_REST_API.md) — the independent Headless
   Manager, runtime, scene, alarm, history, and health projection.
 
 The current versioned WebSocket contract is:
@@ -626,16 +616,7 @@ The current versioned WebSocket contract is:
 
 The optional MCP adapter is described by the generated
 [`MCP_RUNTIME_CONTRACT.md`](MCP_RUNTIME_CONTRACT.md). Tool discovery is not
-evidence that an external assistant provider or every historical workflow has
-been qualified.
-
-The following files are pinned historical reimplementation inputs. Their
-product surfaces are unavailable on the current cutover branch; they are not
-generated from, or evidence for, a running current product:
-
-- [`VIEWER_DATA_PLANE_V1.schema.json`](VIEWER_DATA_PLANE_V1.schema.json) —
-  historical manifest, transform-frame, diagnostics, and lease/control wire
-  contracts.
+evidence that an external assistant provider has been qualified.
 
 For the repository/component index and assistant-provider setup, see
 [`../../AGENTS.md`](../../AGENTS.md).

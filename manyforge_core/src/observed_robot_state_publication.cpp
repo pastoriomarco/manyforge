@@ -2,6 +2,7 @@
 #include <cmath>
 #include <limits>
 #include <manyforge_core/observed_robot_state_publication.hpp>
+#include <manyforge_core/time/received_sample_age.hpp>
 #include <stdexcept>
 #include <utility>
 
@@ -388,7 +389,8 @@ ObservedRobotStatePublication::ReadView ObservedRobotStatePublication::acquire(
     }
     const auto budget = candidate.freshness_budget_ns();
     const auto received = candidate.received_timestamp_ns();
-    const bool fresh = budget == 0 || (now_ns >= received && now_ns - received <= budget);
+    const bool fresh =
+        budget == 0 || (now_ns >= 0 && received_sample_current(received, now_ns, budget));
     if (candidate.complete() && fresh) {
       return candidate;
     }

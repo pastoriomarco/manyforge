@@ -5,10 +5,11 @@ from __future__ import annotations
 from collections.abc import Callable, Mapping, Sequence
 from copy import deepcopy
 from dataclasses import dataclass, replace
+from itertools import count
 import hashlib
 import logging
 from pathlib import Path
-from threading import Event, Lock, RLock
+from threading import Event, Lock, RLock, Thread, current_thread
 import time
 from typing import Any, Final, NoReturn
 import unicodedata
@@ -108,12 +109,10 @@ from .bbkey_publication import (
     FAULT_CODE as BBKEY_PUBLICATION_FAULT_CODE,
     ProgramBlackboardKeyPublisher,
     ProgramBlackboardPublicationScope,
-    publisher_fault_error,
 )
 from .execution_transport import ProgramRunnerExecutionTransport
 from .interrupt_state_mirror import InterruptRuleStateMirror, RuleCatalog
 from .liveness import (
-    RENEWAL_INTERVAL_NS,
     ProgramRunnerLivenessError,
     ProgramRunnerLivenessReceiver,
 )
@@ -446,13 +445,30 @@ class ProgramRuntime:
         self._applied_condition_keys: tuple[str, ...] = ()
         self._bbkey_idle_store: ProgramValueStore | None = None
         self._bbkey_publishers_lock = RLock()
+        # F-2: one source creation at a time (check, retire, create, install,
+        # start). Held across I/O, so never the publishers lock above.
+        self._bbkey_source_lock = RLock()
+        # F-2: the publisher fence held by between-Runs faults until every
+        # loss is confirmed or superseded by an ACKed successor.
+        self._bbkey_fence_lock = Lock()
+        # Unconfirmed losses: token -> the lost source's creation ordinal.
+        self._bbkey_open_losses: dict[object, int] = {}
+        self._bbkey_source_ordinals = count(1)
+        self._bbkey_fence_reference: str | None = None
+        self._bbkey_fence_permanent = False
         # Contract 64: the Kernel's global rule states, mirrored into the
         # reserved interrupt_state.<rule_id> keys of the current stores.
         self._interrupt_state_mirror: InterruptRuleStateMirror | None = None
         self._interrupt_state_run_id: str | None = None
-        self._interrupt_state_poll_lock = Lock()
-        self._interrupt_state_poll_due_ns = 0
-        self._interrupt_state_polling = False
+        # The grasp-lost key mirror's own Run binding (SX-261): bound before
+        # the Running CAS, separate from the interrupt-state mirror's.
+        self._carried_object_lost_run_id: str | None = None
+        self._carried_object_lost_run_active = False
+        self._carried_object_lost_seen_event_ids: set[str] = set()
+        # The mirror's event subscription (one thread, started with the Runner).
+        self._interrupt_state_stop = Event()
+        self._interrupt_state_follower: Thread | None = None
+        self._grasp_lost_mirror_lock = Lock()
         self._liveness: ProgramRunnerLivenessReceiver | None = None
         if config.manager_liveness_socket is not None:
             if self._journal is None:
@@ -504,10 +520,13 @@ class ProgramRuntime:
         )
         read_rule_states = getattr(execution_transport, "read_interrupt_rule_state_events", None)
         if callable(read_rule_states):
+            subscribe = getattr(execution_transport, "subscribe_events", None)
             self._interrupt_state_mirror = InterruptRuleStateMirror(
                 owner_epoch=self._current_kernel_owner_epoch,
                 read_events=read_rule_states,
                 on_change=self._apply_interrupt_states,
+                subscribe=subscribe if callable(subscribe) else None,
+                on_carried_object_lost=self._mirror_carried_object_lost_signals,
             )
         self._reset_position_identity: dict[str, Any] | None = None
         # Starting has no bound tree yet. Retain its already-read Kernel
@@ -2778,6 +2797,7 @@ class ProgramRuntime:
         if self._liveness is not None:
             self._liveness.start()
         self._started = True
+        self._start_interrupt_state_follower()
         self._establish_startup_bbkey_source()
 
     def _establish_startup_bbkey_source(self) -> None:
@@ -3038,12 +3058,63 @@ class ProgramRuntime:
                 "the execution transport cannot publish BB keys",
             )
         liveness = self._liveness
+        created: list[ProgramBlackboardKeyPublisher] = []
+        ordinal = next(self._bbkey_source_ordinals)
 
         def on_fault(fault: Mapping[str, Any], reference: str) -> None:
-            if liveness is not None:
-                liveness.latch_publisher_fault(fault, reference)
+            # The fence first, for every source: nothing gated by the failed
+            # source's last value can be admitted while its fate is unknown.
+            token = object()
+            with self._bbkey_fence_lock:
+                if liveness is not None and liveness.latch_publisher_fault(
+                    fault, reference
+                ):
+                    self._bbkey_fence_reference = reference
+                if scope.program_run_id is not None:
+                    self._bbkey_fence_permanent = True
+                    return
+                self._bbkey_open_losses[token] = ordinal
+            # F-2: the cell-level source between Runs guards no Run. Drop it
+            # locally, then fail closed in the Kernel: the sender declares
+            # its own continuity lost (an exact-sender sequence gap), so every
+            # BB-backed global-rule input becomes unavailable and gated motion
+            # is refused until the next Reset or Run installs a new source.
+            # The fence is released only when every such loss is confirmed,
+            # or superseded by a successor whose baseline the Kernel ACKed.
+            with self._bbkey_publishers_lock:
+                if created and self._bbkey_publishers.get(None) is created[0]:
+                    self._bbkey_publishers.pop(None)
+                    self._bbkey_idle_store = None
 
-        return ProgramBlackboardKeyPublisher(
+            def contain() -> None:
+                if created and created[0].declare_lost():
+                    self._settle_bbkey_losses(
+                        lambda key, _ordinal: key is token,
+                        "declared lost in the Kernel",
+                    )
+                    return
+                with self._bbkey_publishers_lock:
+                    current = self._bbkey_publishers.get(None)
+                if current is not None and current.baseline_accepted:
+                    self._settle_superseded_bbkey_losses(current.source_ordinal)
+                # Otherwise the fence stays; a later ACKed successor settles it.
+
+            try:
+                self._host.submit_run_work(contain)
+            except Exception:
+                contain()
+
+        def on_baseline_accepted() -> None:
+            # Only the current between-Runs source proves a handoff: a late
+            # ACK of an older, already replaced sender settles nothing.
+            if scope.program_run_id is not None:
+                return
+            with self._bbkey_publishers_lock:
+                current = bool(created) and self._bbkey_publishers.get(None) is created[0]
+            if current:
+                self._settle_superseded_bbkey_losses(ordinal)
+
+        publisher = ProgramBlackboardKeyPublisher(
             scope,
             publish=publish,
             submit=self._host.submit_run_work,
@@ -3052,6 +3123,48 @@ class ProgramRuntime:
             fault_reference=self._digest,
             # The same bounded command budget as every execution request.
             budget_ns=self._bbkey_budget_ns(),
+            on_baseline_accepted=on_baseline_accepted,
+            source_ordinal=ordinal,
+        )
+        created.append(publisher)
+        return publisher
+
+    def _settle_superseded_bbkey_losses(self, successor_ordinal: int) -> None:
+        """The Kernel ACKed the current between-Runs source's baseline: it
+        replaced every source created before it (lower ordinal)."""
+
+        self._settle_bbkey_losses(
+            lambda _key, lost: lost < successor_ordinal,
+            "superseded by an ACKed newer source",
+        )
+
+    def _settle_bbkey_losses(
+        self, settles: Callable[[object, int], bool], outcome: str
+    ) -> None:
+        """Settle the matching unconfirmed between-Runs losses; release the
+        fence only when none is left and no Run fault holds it (F-2)."""
+
+        with self._bbkey_fence_lock:
+            settled = [key for key, lost in self._bbkey_open_losses.items() if settles(key, lost)]
+            if not settled:
+                return
+            for key in settled:
+                del self._bbkey_open_losses[key]
+            reference = self._bbkey_fence_reference
+            if self._bbkey_open_losses or self._bbkey_fence_permanent or reference is None:
+                released = False
+            else:
+                self._bbkey_fence_reference = None
+                released = (
+                    self._liveness is not None
+                    and self._liveness.clear_publisher_fault(reference)
+                )
+        _LOGGER.warning(
+            "between-Run BB key source %s (%d); fence %s; BB-gated motion waits "
+            "for the next Reset or Run",
+            outcome,
+            len(settled),
+            "released" if released else "kept",
         )
 
     def _bbkey_budget_ns(self) -> int:
@@ -3090,6 +3203,19 @@ class ProgramRuntime:
                     self._bbkey_publishers.pop(name)
             publisher.retire()
             return
+        scope = publisher.scope
+        # Diagnostic (F-2): one bounded line per baseline sender, so two
+        # senders of one scope can be told apart (WARNING: the Runner
+        # configures no log level, so INFO would not reach the container log).
+        _LOGGER.warning(
+            "BB baseline sender %x: name=%s thread=%s owner=%.24s run=%s claim=%s "
+            "cycle=%s publication=%s bundle=%.19s graph=%.19s binding=%.19s "
+            "sequence=1 keys=%d",
+            id(publisher), name, current_thread().name, scope.owner_epoch,
+            scope.program_run_id, scope.claim_generation, scope.cycle_generation,
+            scope.active_publication_generation, context[2], context[3],
+            scope.program_binding_id, len(keys),
+        )
         publisher.start(store, keys)
 
     def _retry_pending_bbkey_sources(self) -> None:
@@ -3136,6 +3262,32 @@ class ProgramRuntime:
     ) -> ProgramBlackboardKeyPublisher | None:
         """Subscribe the Run's fixed key union and send its baseline first."""
 
+        with self._bbkey_source_lock:
+            return self._start_run_bbkey_publication(
+                program_run_id,
+                owner_epoch=owner_epoch,
+                claim_generation=claim_generation,
+                program_binding_id=program_binding_id,
+                active_publication_generation=active_publication_generation,
+                cycle_generation=cycle_generation,
+                keys=keys,
+                retained_bundle_id=retained_bundle_id,
+                graph_revision=graph_revision,
+            )
+
+    def _start_run_bbkey_publication(
+        self,
+        program_run_id: str,
+        *,
+        owner_epoch: str,
+        claim_generation: int,
+        program_binding_id: str,
+        active_publication_generation: int,
+        cycle_generation: int,
+        keys: tuple[str, ...],
+        retained_bundle_id: str,
+        graph_revision: str,
+    ) -> ProgramBlackboardKeyPublisher | None:
         # Previous sources (a reset Run's, the cell-level one) end here.
         self._retire_bbkey_publishers()
         self._interrupt_state_run_id = program_run_id
@@ -3168,7 +3320,8 @@ class ProgramRuntime:
 
         Identity: Runner owner epoch + Applied binding and publication +
         Program-cycle generation. Baseline: persistent keys' stored values,
-        run-only keys null, node_outcome.* `none` (contract 105). Every new
+        run-only keys their declared `initial` (else null), node_outcome.*
+        `none` (contract 105). Every new
         Applied publication is a new source; unchanged identity (a repeated
         Apply notice) keeps the source.
         """
@@ -3189,19 +3342,25 @@ class ProgramRuntime:
             str(applied.get("retained_bundle_id")),
             str(applied.get("graph_revision")),
         )
-        catalog = self._catalog_for_context(context)
-        if not keys and catalog is not None and not catalog.referenced_program_blackboard_keys:
-            self._retire_bbkey_publishers(idle_only=True)  # W0: no sender, no baseline.
-            return
         cycle_generation = self._journal.read().cycle_generation
         with self._bbkey_publishers_lock:
             current = self._bbkey_publishers.get(None)
+        # F-2: an unchanged identity keeps its source before anything else.
+        # The Kernel keeps the baseline of this exact scope; a local retire
+        # followed by a new sender of the same scope (e.g. W0 below on a
+        # transient catalog read) would send that baseline again, and the
+        # Kernel refuses the repeat (`program_bb_sequence_stale`).
         if (
             current is not None
+            and current.scope.owner_epoch == context[0]
             and current.scope.program_binding_id == applied["program_binding_id"]
             and current.scope.active_publication_generation == publication_generation
             and current.scope.cycle_generation == cycle_generation
         ):
+            return
+        catalog = self._catalog_for_context(context)
+        if not keys and catalog is not None and not catalog.referenced_program_blackboard_keys:
+            self._retire_bbkey_publishers(idle_only=True)  # W0: no sender, no baseline.
             return
         self._retire_bbkey_publishers(idle_only=True)
         program = self._with_global_rule_keys(
@@ -3221,7 +3380,9 @@ class ProgramRuntime:
             persistent_commit=lambda _declaration, _value, _metadata: None,
             persistent_forget=lambda _declaration, _metadata: None,
         )
-        store.clear_run_values()
+        # A fresh store: run-scoped keys hold their declared `initial`, or null
+        # when omitted (the value the next Run starts from, contract 105),
+        # node_outcome.* `none`.
         publisher = self._new_bbkey_publisher(
             ProgramBlackboardPublicationScope(
                 owner_epoch=self._current_kernel_owner_epoch(),
@@ -3285,13 +3446,18 @@ class ProgramRuntime:
     def _reset_bbkey_publication(self, program_run_id: str) -> None:
         """Reset retires the Run's source locally (DX-1281): no clearing
         frame; the between-Runs baseline that follows carries run-only keys
-        as null. Keys keep their last value while the Run is held or finished,
-        so the sender lives until here."""
+        at their declared `initial`, or null when omitted. Keys keep their last value while the
+        Run is held or finished, so the sender lives until here."""
 
         with self._bbkey_publishers_lock:
             publisher = self._bbkey_publishers.pop(program_run_id, None)
         if self._interrupt_state_run_id == program_run_id:
             self._interrupt_state_run_id = None
+        with self._grasp_lost_mirror_lock:
+            if self._carried_object_lost_run_id == program_run_id:
+                self._carried_object_lost_run_id = None
+                self._carried_object_lost_run_active = False
+                self._carried_object_lost_seen_event_ids = set()
         if publisher is not None:
             publisher.retire()
 
@@ -3314,33 +3480,19 @@ class ProgramRuntime:
     def _follow_cell_bbkey_source(self) -> None:
         """Start the between-Runs source (Reset already advanced the cycle).
 
-        A start failure while the Applied Program references keys is the
-        contract-52 publisher fault, not a logged success: no baseline means
-        no truthful source. With no referenced key there is nothing to fail.
+        A start failure is logged, never a logged success, and changes no
+        source (F-2): an unchanged identity keeps its source, which the Kernel
+        still holds, and a new Applied publication retires the old source in
+        the Kernel itself. The next Reset or Run start establishes the source.
+        Startup, Apply notices and Reset reach here on different workers: one
+        source creation at a time, so one scope never gets two senders.
         """
 
-        keys: tuple[str, ...] = ()
-        try:
-            keys = self._cell_bbkey_union()
-            self._start_idle_bbkey_publication(keys=keys)
-        except Exception as error:
-            _LOGGER.exception("cell-level BB key source could not start")
-            catalog = self._global_rule_catalog()
-            if keys or (catalog is not None and catalog.referenced_program_blackboard_keys):
-                self._latch_bbkey_start_fault(
-                    f"between-Run BB key baseline could not start: {error}"
-                )
-
-    def _latch_bbkey_start_fault(self, message: str) -> None:
-        self._retire_bbkey_publishers(idle_only=True)
-        liveness = self._liveness
-        if liveness is None:
-            return
-        fault = publisher_fault_error(message)
-        try:
-            liveness.latch_publisher_fault(fault, self._digest(fault))
-        except Exception:
-            _LOGGER.exception("BB publication start fault could not reach liveness")
+        with self._bbkey_source_lock:
+            try:
+                self._start_idle_bbkey_publication(keys=self._cell_bbkey_union())
+            except Exception:
+                _LOGGER.exception("cell-level BB key source could not start")
 
     def _check_bbkey_publication_budgets(self) -> None:
         with self._bbkey_publishers_lock:
@@ -3348,7 +3500,6 @@ class ProgramRuntime:
         for publisher in publishers:
             publisher.check_budget()
         self._retry_pending_bbkey_sources()
-        self._schedule_interrupt_state_poll()
 
     # Global-rule state mirror (contract 64) ---------------------------------
 
@@ -3410,37 +3561,30 @@ class ProgramRuntime:
         )
         return program.with_interrupt_state_keys(rule_ids) if rule_ids else program
 
-    def _schedule_interrupt_state_poll(self) -> None:
-        """Poll on the liveness cadence (renewal interval), off the watchdog
-        thread so its I/O never delays expiry checks."""
+    def _start_interrupt_state_follower(self) -> None:
+        """Follow the event subscription on its own thread (where the liveness
+        watchdog used to schedule a 250 ms poll), so changes arrive as the host
+        streams them; ``shutdown`` stops it within one receive slice."""
 
         mirror = self._interrupt_state_mirror
-        if mirror is None or not self._started or self._closed:
+        if mirror is None or self._liveness is None or self._interrupt_state_follower is not None:
             return
-        now = time.monotonic_ns()
-        with self._interrupt_state_poll_lock:
-            if self._interrupt_state_polling or now < self._interrupt_state_poll_due_ns:
-                return
-            self._interrupt_state_polling = True
-            self._interrupt_state_poll_due_ns = now + RENEWAL_INTERVAL_NS
+        follower = Thread(
+            target=mirror.follow,
+            args=(self._interrupt_state_stop,),
+            kwargs={"on_read": self._on_interrupt_state_read},
+            name="interrupt-state-mirror",
+            daemon=True,
+        )
+        self._interrupt_state_follower = follower
+        follower.start()
 
-        def poll() -> None:
-            try:
-                mirror.poll()
-                # Every read is a reading, also when no state changed: a
-                # motion node waiting for a gate rule re-evaluates on it.
-                self._apply_interrupt_states(mirror.current())
-            except Exception:
-                _LOGGER.exception("interrupt rule state mirror poll failed")
-            finally:
-                with self._interrupt_state_poll_lock:
-                    self._interrupt_state_polling = False
-
-        try:
-            self._host.submit_run_work(poll)
-        except Exception:
-            with self._interrupt_state_poll_lock:
-                self._interrupt_state_polling = False
+    def _on_interrupt_state_read(self) -> None:
+        # Every read is a reading, also when no state changed: a motion node
+        # waiting for a gate rule re-evaluates on it.
+        mirror = self._interrupt_state_mirror
+        if mirror is not None:
+            self._apply_interrupt_states(mirror.current())
 
     def _interrupt_state_stores(self) -> list[ProgramValueStore]:
         stores: list[ProgramValueStore] = []
@@ -3482,6 +3626,165 @@ class ProgramRuntime:
                 self._write_interrupt_states(store, states)
             except Exception:
                 _LOGGER.exception("interrupt rule state could not be mirrored")
+
+    @staticmethod
+    def _carried_object_loss_event_ids(rows: object) -> set[str] | None:
+        """Return IDs from a known, validated last-loss snapshot.
+
+        ``None`` is kept distinct from an empty known snapshot: an unknown
+        mirror must not erase the Run's previous event baseline.
+        """
+
+        if not isinstance(rows, Sequence) or isinstance(rows, (str, bytes)):
+            return None
+        event_ids: set[str] = set()
+        for entry in rows:
+            if not isinstance(entry, Mapping):
+                return None
+            event_id = entry.get("loss_event_id")
+            if (
+                type(event_id) is not str
+                or not event_id
+                or type(entry.get("set_key")) is not str
+                or not entry["set_key"]
+            ):
+                return None
+            event_ids.add(event_id)
+        return event_ids
+
+    def _begin_carried_object_lost_run(self, program_run_id: str) -> None:
+        """Capture an inactive Run's baseline from the known last losses.
+
+        The binding remains inactive until the cycle's admission request is
+        fully completed, so a later failed start cannot have written a key.
+        """
+
+        with self._grasp_lost_mirror_lock:
+            self._carried_object_lost_run_id = program_run_id
+            self._carried_object_lost_run_active = False
+            self._carried_object_lost_seen_event_ids = set()
+            mirror = self._interrupt_state_mirror
+            if mirror is None:
+                return
+            try:
+                rows = mirror.carried_object_last_losses()
+            except Exception:
+                _LOGGER.exception("current carried-object last losses could not be read")
+                return
+            event_ids = self._carried_object_loss_event_ids(rows)
+            if event_ids is not None:
+                # All keyed losses already present at Run start are old for
+                # this Run.
+                self._carried_object_lost_seen_event_ids = event_ids
+
+    def _activate_carried_object_lost_run(self, program_run_id: str) -> None:
+        """Activate the admitted Run and re-evaluate the retained loss set."""
+
+        with self._grasp_lost_mirror_lock:
+            if self._carried_object_lost_run_id != program_run_id:
+                return
+            self._carried_object_lost_run_active = True
+            mirror = self._interrupt_state_mirror
+        if mirror is None:
+            return
+        try:
+            rows = mirror.carried_object_lost_signals()
+        except Exception:
+            _LOGGER.exception("current carried-object loss rows could not be read")
+            return
+        if rows is not None:
+            try:
+                self._mirror_carried_object_lost_signals(rows)
+            except Exception:
+                _LOGGER.exception("carried-object last losses could not be re-evaluated")
+
+    def _retire_carried_object_lost_run(self, program_run_id: str | None) -> None:
+        """Retire only the exact Run whose admission did not complete."""
+
+        if program_run_id is None:
+            return
+        with self._grasp_lost_mirror_lock:
+            if self._carried_object_lost_run_id != program_run_id:
+                return
+            self._carried_object_lost_run_id = None
+            self._carried_object_lost_run_active = False
+            self._carried_object_lost_seen_event_ids = set()
+
+    def _mirror_carried_object_lost_signals(self, rows: object) -> None:
+        """Mirror each newly observed last loss into the current Run's key.
+
+        ``rows`` is the existing mirror callback's notification that a known
+        loss state arrived. The durable per-key loss set is read from the
+        mirror because the current rows can clear before this callback runs.
+        Unknown state makes no change to the baseline.
+        """
+
+        if rows is None:
+            return
+        mirror = self._interrupt_state_mirror
+        if mirror is None:
+            return
+        try:
+            last_losses = mirror.carried_object_last_losses()
+        except Exception:
+            _LOGGER.exception("carried-object last losses could not be read")
+            return
+        if last_losses is None:
+            return
+        event_ids = self._carried_object_loss_event_ids(last_losses)
+        if event_ids is None:
+            _LOGGER.warning("carried-object last losses are not usable")
+            return
+        with self._grasp_lost_mirror_lock:
+            program_run_id = self._carried_object_lost_run_id
+            if program_run_id is None or not self._carried_object_lost_run_active:
+                return
+            try:
+                store = self._owner.value_store(program_run_id)
+            except Exception:
+                return
+            seen_event_ids = self._carried_object_lost_seen_event_ids
+            processed_event_ids: set[str] = set()
+            for row in last_losses:
+                event_id = row["loss_event_id"]
+                if event_id in seen_event_ids or event_id in processed_event_ids:
+                    continue
+                processed_event_ids.add(event_id)
+                key = row.get("set_key")
+                if key is None:
+                    continue
+                if type(key) is not str or not key:
+                    _LOGGER.warning(
+                        "grasp-lost key in loss event %s is not a valid key name",
+                        event_id,
+                    )
+                    continue
+                declaration = store.program.blackboard_keys.get(key)
+                if (
+                    declaration is None
+                    or declaration.type != "bool"
+                    or declaration.access not in {"write", "read_write"}
+                    or declaration.expression is not None
+                ):
+                    _LOGGER.warning(
+                        "grasp-lost key %s in loss event %s is not a writable bool key",
+                        key,
+                        event_id,
+                    )
+                    continue
+                try:
+                    store.write(
+                        key,
+                        True,
+                        metadata={"writer": "grasp_lost", "loss_event_id": event_id},
+                    )
+                except Exception:
+                    _LOGGER.exception("grasp-lost key %s could not be written", key)
+                    # Keep the event in the seen baseline below. The mirror
+                    # continues with other keys from this known snapshot.
+            # The baseline is all rows from the last known snapshot, including
+            # new events without a set_key and events whose key was unusable.
+            self._carried_object_lost_seen_event_ids = event_ids
 
     def _seed_interrupt_states(
         self, store: ProgramValueStore, context: tuple[str, int, str, str]
@@ -3670,6 +3973,8 @@ class ProgramRuntime:
             scene_proof: dict[str, Any] | None = None
             started_snapshot: dict[str, Any] | None = None
             host_start_invoked = False
+            carried_object_run_id: str | None = None
+            admission_complete = False
 
             def release_scene_context() -> None:
                 nonlocal scene_context_id
@@ -4040,6 +4345,10 @@ class ProgramRuntime:
                 identities = {key: capture[key] for key in identity_fields}
                 identities["runtime_recovery_fences"] = recovery_fences
                 identities["prepared_scene"] = deepcopy(scene_proof)
+                # Capture the baseline before the Running CAS, but keep this
+                # binding inactive until the start request has fully completed.
+                carried_object_run_id = program_run_id
+                self._begin_carried_object_lost_run(program_run_id)
                 try:
                     with self._terminal_observation_lock:
                         journal.transition(
@@ -4089,6 +4398,8 @@ class ProgramRuntime:
                     request_id=request.request_id,
                     result=result,
                 )
+                admission_complete = True
+                self._activate_carried_object_lost_run(program_run_id)
             except HeadlessClientError as error:
                 outcome = self._headless_error(error)
                 release_scene_context()
@@ -4158,6 +4469,8 @@ class ProgramRuntime:
                 return result
             finally:
                 self._starting_kernel_owner_epoch = None
+                if not admission_complete:
+                    self._retire_carried_object_lost_run(carried_object_run_id)
             if acquired_for_request:
                 failed_cycle = journal.read()
                 if (
@@ -6559,7 +6872,9 @@ class ProgramRuntime:
             "request_owner_epoch": row["request_owner_epoch"],
             "request_id": row["request_id"],
             "request_payload_digest": ProgramRuntime._digest(row["intent"]),
-            **options,
+            # The private Kernel proof keeps exactly its two selectors.
+            "reload_initial_scene": options["reload_initial_scene"],
+            "reset_robot_position": options["reset_robot_position"],
             "reset_claim_generation": None if claim is None else claim["claim_generation"],
         }
 
@@ -6583,7 +6898,7 @@ class ProgramRuntime:
         # implicit-scene journals are rejected intact, never reinterpreted.
         return {
             key: row["intent"].get(key, False)
-            for key in ("reload_initial_scene", "reset_robot_position")
+            for key in ("reload_initial_scene", "reset_robot_position", "keep_stop_fault")
         }
 
     def _reset_robot_position_availability(self) -> dict[str, Any]:
@@ -6711,8 +7026,15 @@ class ProgramRuntime:
     def _require_same_reset_options(
         request: ProgramCycleResetRequest, accepted: ProgramCycleResetRequest
     ) -> None:
-        if (request.reload_initial_scene, request.reset_robot_position) != (
-            accepted.reload_initial_scene, accepted.reset_robot_position
+        # D6: whether the Reset keeps the Stop fault is part of the occurrence.
+        if (
+            request.reload_initial_scene,
+            request.reset_robot_position,
+            request.keep_stop_fault,
+        ) != (
+            accepted.reload_initial_scene,
+            accepted.reset_robot_position,
+            accepted.keep_stop_fault,
         ):
             raise ProgramRunnerError(
                 "program_run_request_conflict",
@@ -7242,8 +7564,11 @@ class ProgramRuntime:
                         terminal_reference=reference,
                     )
                 # Any entrypoint must reconcile the exact Kernel Stop-fault
-                # latch before publishing Idle for the next Run.
-                self._clear_reset_stop_fault(confirmation_request)
+                # latch before publishing Idle for the next Run, except the
+                # Reset of Scenario Close (D6): Close never clears the latch,
+                # which then refuses the next Run until Recover cell.
+                if not confirmation_request.keep_stop_fault:
+                    self._clear_reset_stop_fault(confirmation_request)
                 cycle = journal.read()
                 request = request.model_copy(
                     update={
@@ -7616,6 +7941,11 @@ class ProgramRuntime:
             self._control_state_observers.clear()
         errors: list[Exception] = []
         self._retire_bbkey_publishers()
+        # The subscription loop sees its flag within one receive slice.
+        self._interrupt_state_stop.set()
+        follower = self._interrupt_state_follower
+        if follower is not None:
+            follower.join(timeout=2.0)
         if self._liveness is not None:
             try:
                 self._liveness.close()

@@ -1,3 +1,4 @@
+#include <manyforge_core/execution_event_change_signal.hpp>
 #include <manyforge_core/io_rule_stop_response.hpp>
 #include "resource_addressed_execution_kernel_internal.hpp"
 
@@ -417,6 +418,7 @@ Result<void> ResourceAddressedExecutionKernel::install_global_io_rule_catalog_lo
       set_global_io_rule_state_locked(index, IoGlobalRuleState::kTripped,
                                       evidence->trip->triggering_acquisition);
   }
+  execution_event_change_signal().Notify();  // New catalog for event streams.
   return Result<void>::Ok();
 }
 
@@ -550,6 +552,9 @@ void ResourceAddressedExecutionKernel::ProjectGlobalIoRuleStates() noexcept {
     global_io_rule_through_sequence_ = recorded.value();
     global_io_rule_projection_queue_.erase(global_io_rule_projection_queue_.begin());
     global_io_rule_projection_error_.reset();
+    // The baseline may now be ready: event streams re-read it (the journal
+    // commit above signalled before this cut moved).
+    execution_event_change_signal().Notify();
   }
   std::lock_guard lock(state_mutex_);
   if (!global_io_rule_projection_queue_.empty())
@@ -610,12 +615,20 @@ std::optional<ErrorDTO> ResourceAddressedExecutionKernel::global_io_rule_command
     // A consumed rule still requires its actual inactive rearm. Other failed
     // qualifications also retain their existing missing-registration refusal.
     bool unavailable = predecessor_only || (!row.registration && !waiting_for_key_baseline);
+    // The first signal without a fresh reading, so the operator sees what is missing.
+    std::map<std::string, std::string> waiting_signal;
     for (const auto& input : rule.condition->inputs()) {
       const auto* signal = std::get_if<IoSignalId>(&input.source);
       if (!signal) continue;
       const auto observed = global_io_rule_service_->ReadSignal(*signal);
-      unavailable = unavailable || !observed.ok() ||
-          observed.value().availability != IoSignalAvailability::kFresh;
+      const bool fresh = observed.ok() &&
+          observed.value().availability == IoSignalAvailability::kFresh;
+      unavailable = unavailable || !fresh;
+      if (fresh || !waiting_signal.empty()) continue;
+      waiting_signal = {{"signal_component_id", signal->controllable_component_id.value()},
+                        {"signal_name", signal->name}};
+      if (observed.ok())
+        waiting_signal.emplace("source_id", observed.value().descriptor.source_id.value());
     }
     bool actual_loss = row.last_source_loss.has_value();
     if (row.registration) {
@@ -632,11 +645,12 @@ std::optional<ErrorDTO> ResourceAddressedExecutionKernel::global_io_rule_command
       // still close its full scope above; normal output lifecycle admission
       // remains independently required by component_command_refusal_locked.
       if (initial && binding.io_output_binding) continue;
+      auto details = std::move(waiting_signal);
+      details.emplace("reason", initial ? "global_interrupt_source_not_ready"
+                                        : "global_interrupt_source_unavailable");
+      details.emplace("rule_id", rule.policy_id.value());
       return ErrorDTO{std::string(to_string(ErrorCode::kInvalidStateTransition)),
-          "Rule " + rule.policy_id.value() + " waiting for its source",
-          {{"reason", initial ? "global_interrupt_source_not_ready"
-                              : "global_interrupt_source_unavailable"},
-           {"rule_id", rule.policy_id.value()}}};
+          "Rule " + rule.policy_id.value() + " waiting for its source", std::move(details)};
     }
   }
   return std::nullopt;

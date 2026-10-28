@@ -198,12 +198,15 @@ TEST(ManagerProgramRunnerPublicationFault,
             {"details",
              CanonicalValue(CanonicalValue::Object{
                  {"failure_predicate", CanonicalValue("caller.asserted")}})}}),
-        fault(std::string(1025U, 'x')),
-        fault(std::string("bad") + static_cast<char>(0xff))}) {
+        fault(std::string(1025U, 'x'))}) {
     EXPECT_THROW(
         static_cast<void>(detail::DecodeProgramRunnerPublisherFault(invalid)),
         std::invalid_argument);
   }
+  // Invalid UTF-8 never reaches the decoder: no CanonicalValue can hold it.
+  EXPECT_THROW(static_cast<void>(
+                   fault(std::string("bad") + static_cast<char>(0xff))),
+               content_identity::CanonicalValueError);
 }
 
 TEST(ManagerProgramRunnerPublicationFault,
@@ -2765,7 +2768,8 @@ TEST(ManagerDaemonProcess,
     const auto conflict = SendCommand(
         directory.socket_path(),
         SceneAddRequest(*initial, "scene-process-request.1", 1U, 0.15));
-    EXPECT_NE(conflict.find("\"request_id_conflict\""), std::string::npos);
+    EXPECT_NE(conflict.find("\"request_id_conflict\""), std::string::npos)
+        << conflict;
     const auto stale = SendCommand(
         directory.socket_path(),
         SceneAddRequest(*initial, "scene-process-request.stale", 1U));
@@ -3999,9 +4003,10 @@ TEST(ManagerDaemonProcess,
     EXPECT_EQ(RequiredText(response, "owner_epoch"), event_owner_epoch);
     EXPECT_EQ(RequiredMember(response, "execution_owner_ready"), CanonicalValue(expected_ready));
     const auto& faults = RequiredMember(response, "runtime_faults");
-    EXPECT_EQ(faults.as_object().size(), 2U);
+    EXPECT_EQ(faults.as_object().size(), 3U);
     EXPECT_EQ(RequiredMember(faults, "operation_journal_write_fault"), CanonicalValue(nullptr));
     EXPECT_EQ(RequiredMember(faults, "program_runner_loss"), CanonicalValue(nullptr));
+    EXPECT_EQ(RequiredMember(faults, "kernel_internal_fault"), CanonicalValue(nullptr));
     if (stale_cursor) {
       EXPECT_EQ(RequiredText(RequiredMember(response, "error"), "code"),
                 "operation_journal_owner_epoch_stale");

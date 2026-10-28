@@ -125,9 +125,14 @@ public:
         plan_repository(existing_repository != nullptr
                             ? *existing_repository
                             : InitializePlanRepository(repository, config)),
-        lifecycle_snapshot_source(*retained_bundle, publication_reader,
-                                  expected_publication, journal, catalog_source,
-                                  std::move(providers)),
+        lifecycle_snapshot_source(
+            *retained_bundle, publication_reader, expected_publication,
+            journal, catalog_source, std::move(providers),
+            [this, &clock](const core::ResolvedLifecycleProviderOccurrenceDTO
+                               &provider) {
+              return port_registry.ReadExactLifecycleHealth(provider,
+                                                            clock.now());
+            }),
         route_snapshot_source(*retained_bundle, publication_reader,
                               expected_publication, journal, artifact_source,
                               std::move(controllers),

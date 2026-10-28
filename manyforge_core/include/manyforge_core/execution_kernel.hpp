@@ -562,8 +562,12 @@ class ExecutionKernel : public IResolvedParticipantExecutionEngine,
   };
   /// A prepare failure leaves the generation active but unarmed; the caller
   /// must stop it fail-closed and must not dispatch.
+  /// keep_admitted_policy: the move admitted an operation-local contact policy;
+  /// the monitor keeps admission_inventory's policy for the whole move and
+  /// pairs it with the latest published world.
   CollisionMonitoringStart start_collision_monitoring(
-      std::string reason, const CollisionWorldLeaseInventory* admission_inventory);
+      std::string reason, const CollisionWorldLeaseInventory* admission_inventory,
+      bool keep_admitted_policy = false);
   void stop_collision_monitoring(RuntimeCollisionMonitorRelease release,
                                  std::optional<std::uint64_t> expected_generation = std::nullopt,
                                  bool drain_callbacks = false);

@@ -395,8 +395,10 @@ describe('viewer failure isolation', () => {
       attachmentRevision: 'attachment-revision-1',
       carrierComponentId: 'robot-1',
       commandTargetId: 'arm',
+      carrierModelInstanceId: 'model-instance-1',
       carrierFrameRoleId: 'tcp',
       carrierCompiledFrameName: 'tool0',
+      poseMeasurement: null,
       poseInCarrierFrame: {
         position_m: { x: 0.01, y: -0.02, z: 0.03 },
         orientation_xyzw: [0, 0, 0, 1],
@@ -832,6 +834,12 @@ describe('viewer failure isolation', () => {
     expect(workspace).toContain("robotControl.state.mode === 'cartesian_path'");
     // Identity-stable Canvas callbacks delegate to the latest drag closures.
     expect(workspace.includes('onEditCandidateTcpPose={finishCandidateDragStable}')).toBe(true);
+    // Zero-change and robot-moved releases reach the panel as typed reasons.
+    expect(viewer).toContain('onEdit(null, noChange);');
+    expect(workspace).toContain("robotControl.finishPoseDrag(null, 'context_changed');");
+    expect(workspace).toContain('robotControl.finishPoseDrag(null, noChange);');
+    const gizmo = readFileSync(new URL('./AuthoringTransformControls.tsx', import.meta.url), 'utf8');
+    expect(gizmo).toContain("onCancel(start.moved && settings.snap ? 'snapped_no_change' : 'no_change')");
     expect(workspace).toContain('candidateDragHandlers.current = { begin: beginCandidateDrag, finish: finishCandidateDrag }');
     expect(workspace).toContain('candidateTcpPoseFromCell(');
     expect(workspace).toContain('robotControlCandidatePresentationAllowed(');

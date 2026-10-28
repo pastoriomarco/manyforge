@@ -16,6 +16,7 @@ from manyforge_behavior.canonical_artifact import (
 from manyforge_behavior.program import (
     BlackboardKey,
     Program,
+    ProgramNodeValidationError,
     ProgramValidationError,
     ProgramTreeNode,
     TreeNode,
@@ -502,6 +503,123 @@ def test_program_default_policy_identity_migration_obeys_tree_bound(
 
     with pytest.raises(ProgramValidationError, match="content identity mismatch"):
         Program.from_dict(document, _catalog())
+
+
+def test_program_hand_edit_loads_with_edited_outside_diagnostic() -> None:
+    catalog = _catalog()
+    document = load_strict_json_yaml(_ROOT / _MINIMAL_PROGRAM)
+    assert Program.from_dict(document, catalog).load_diagnostics == ()
+    document["name"] = "changed without updating identity"
+
+    program = Program.from_dict(document, catalog, authoring_load=True)
+
+    assert [row["code"] for row in program.load_diagnostics] == [
+        "edited_outside_manyforge"
+    ]
+    assert program.load_diagnostics[0]["path"].endswith(".program_revision")
+    # The computed revision is the one recorded, and it reloads cleanly.
+    assert program.program_revision == _identified(document)["program_revision"]
+    assert program.to_dict()["program_revision"] == program.program_revision
+    assert Program.from_dict(program.to_dict(), catalog).load_diagnostics == ()
+
+
+def test_program_stale_revision_does_not_hide_semantic_errors() -> None:
+    document = load_strict_json_yaml(_ROOT / _MINIMAL_PROGRAM)
+    document["program_revision"] = "sha256:" + "f" * 64
+    document["tree"]["children"][0]["node_id"] = "motion.not_in_catalog"
+
+    with pytest.raises(ProgramNodeValidationError, match="absent from the active v2 catalog"):
+        Program.from_dict(document, _catalog(), authoring_load=True)
+
+
+def test_program_explicit_defaults_migrate_and_stale_identity_is_diagnosed() -> None:
+    catalog = _catalog()
+    source = load_strict_json_yaml(_ROOT / _MINIMAL_PROGRAM)
+    baseline = Program.from_dict(source, catalog)
+    explicit = deepcopy(source)
+    explicit["tree"]["children"][0]["operator_stop_policy"] = "inherit"
+    explicit["program_revision"] = "sha256:" + "f" * 64
+
+    stale = Program.from_dict(explicit, catalog, authoring_load=True)
+    assert [row["code"] for row in stale.load_diagnostics] == ["edited_outside_manyforge"]
+    assert stale.program_revision == baseline.program_revision
+
+    explicit["program_revision"] = baseline.program_revision
+    migrated = Program.from_dict(explicit, catalog)
+    assert migrated.program_revision == baseline.program_revision
+    assert migrated.load_diagnostics == ()
+
+
+def _with_catalog_version(document: dict[str, Any], version: str) -> dict[str, Any]:
+    changed = deepcopy(document)
+    changed["catalog"]["content_version"] = version
+    return _identified(changed)
+
+
+def test_program_saved_under_older_catalog_minor_loads_as_active() -> None:
+    catalog = _catalog()
+    major, minor, _patch = catalog.content_version.split(".")
+    assert int(minor) > 0
+    source = load_strict_json_yaml(_ROOT / _MINIMAL_PROGRAM)
+    active = Program.from_dict(source, catalog)
+    older = _with_catalog_version(source, f"{major}.{int(minor) - 1}.0")
+
+    # Strict (Applied/runtime) reads keep M3: an older selector is refused.
+    with pytest.raises(ProgramValidationError, match="exact active v2 catalog"):
+        Program.from_dict(older, catalog)
+    program = Program.from_dict(older, catalog, authoring_load=True)
+
+    # Not an edit outside ManyForge: its own identity matches.
+    assert program.load_diagnostics == ()
+    assert program.saved_catalog_content_version == f"{major}.{int(minor) - 1}.0"
+    # Save writes the active version; the recorded revision is the active one.
+    assert program.to_dict()["catalog"]["content_version"] == catalog.content_version
+    assert program.program_revision == active.program_revision
+    assert program.to_dict() == active.to_dict()
+
+
+@pytest.mark.parametrize("offset", ("next_major", "previous_major", "next_minor"))
+def test_program_incompatible_catalog_version_is_refused(offset: str) -> None:
+    catalog = _catalog()
+    major, minor, _patch = (int(part) for part in catalog.content_version.split("."))
+    version = {
+        "next_major": f"{major + 1}.0.0",
+        "previous_major": f"{major - 1}.{minor}.0",
+        "next_minor": f"{major}.{minor + 1}.0",
+    }[offset]
+    source = load_strict_json_yaml(_ROOT / _MINIMAL_PROGRAM)
+
+    with pytest.raises(ProgramValidationError, match="compatible active v2 catalog"):
+        Program.from_dict(
+            _with_catalog_version(source, version), catalog, authoring_load=True
+        )
+
+
+def test_program_node_errors_name_the_node_and_field() -> None:
+    catalog = _catalog()
+    source = load_strict_json_yaml(_ROOT / _MINIMAL_PROGRAM)
+    node = source["tree"]["children"][0]
+
+    unknown = deepcopy(source)
+    unknown["tree"]["children"][0]["parameters"]["removed_parameter"] = 1
+    with pytest.raises(ProgramNodeValidationError) as raised:
+        Program.from_dict(_identified(unknown), catalog)
+    assert raised.value.code == "program_node_invalid"
+    assert (raised.value.instance_id, raised.value.node_id, raised.value.field) == (
+        node["instance_id"],
+        node["node_id"],
+        "parameters.removed_parameter",
+    )
+
+    removed = deepcopy(source)
+    removed["tree"]["children"][0]["node_id"] = "motion.removed"
+    with pytest.raises(ProgramNodeValidationError) as raised:
+        Program.from_dict(_identified(removed), catalog)
+    assert (raised.value.instance_id, raised.value.node_id, raised.value.field) == (
+        node["instance_id"],
+        "motion.removed",
+        "node_id",
+    )
 
 
 def test_program_identity_migration_does_not_enter_cyclic_json_model() -> None:

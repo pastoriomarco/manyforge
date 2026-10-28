@@ -24,7 +24,11 @@ from manyforge_behavior.canonical_artifact import (
     load_strict_json_yaml,
     verify_content_identity,
 )
-from manyforge_behavior.catalog import NodeCatalog
+from manyforge_behavior.catalog import (
+    EDITED_OUTSIDE_MANYFORGE,
+    SEMVER_RE,
+    NodeCatalog,
+)
 from manyforge_behavior.interrupt_condition import (
     InterruptConditionError,
     check_condition,
@@ -76,6 +80,14 @@ _MAX_RESOLVED_GROUP_MEMBERSHIPS: Final = _MAX_TREE_NODES
 _MAX_RESOLVED_TARGET_EFFECTS: Final = _MAX_TREE_NODES
 _PROGRAM_PROFILE: Final = "composable-cell-v1"
 _CATALOG_API_VERSION: Final = "manyforge.node_catalog.v2"
+_GRASP_LOST_RESPONSE_DEFAULTS: Final = MappingProxyType(
+    {
+        "raise_alarm": True,
+        "stop_motion": True,
+        "set_key": None,
+        "detach": True,
+    }
+)
 _IDENTIFIER_RE: Final = re.compile(r"^[a-z][a-z0-9_.-]*$")
 _MAX_PROGRAM_ROLES: Final = 4096
 _MAX_PROGRAM_DECLARATIONS: Final = 100_000
@@ -94,6 +106,41 @@ _PROGRAM_MOTION_CEILINGS: Final = frozenset(
 
 class ProgramValidationError(ValueError):
     """A Program artifact or retained tree-document value is malformed."""
+
+
+class ProgramNodeValidationError(ProgramValidationError):
+    """One tree node does not validate against the active catalog schema.
+
+    ``code`` is ``program_node_invalid``; ``instance_id`` and ``node_id`` name
+    the node (``None`` when its own fields are unusable) and ``field`` is the
+    failing path below the node (``""`` for the node as a whole).
+    """
+
+    code: Final = "program_node_invalid"
+
+    def __init__(
+        self,
+        message: str,
+        *,
+        instance_id: str | None,
+        node_id: str | None,
+        field: str,
+    ) -> None:
+        super().__init__(message)
+        self.instance_id = instance_id
+        self.node_id = node_id
+        self.field = field
+
+
+def catalog_version_compatible(selected: Any, active: str) -> bool:
+    """A Program's catalog version loads under ``active``: the same major
+    version and a minor version not above the active one."""
+
+    if type(selected) is not str or SEMVER_RE.fullmatch(selected) is None:
+        return False
+    major, minor, _patch = selected.split(".")
+    active_major, active_minor, _active_patch = active.split(".")
+    return int(major) == int(active_major) and int(minor) <= int(active_minor)
 
 
 class _TraversalBudget:
@@ -648,12 +695,17 @@ def _select_identity_verified_program_root(
     *,
     source: str,
     api_version: str = _PROGRAM_API_VERSION,
+    authoring_load: bool = False,
 ) -> dict[str, Any]:
-    """Verify identity before semantic validation, with one bounded migration."""
+    """Verify identity before semantic validation, with one bounded migration.
+
+    With ``authoring_load`` (an authored file opened for editing) a root
+    whose identity matches neither spelling is returned unchanged: the
+    mismatch is reported after validation as ``edited_outside_manyforge``.
+    """
 
     # Preserve the established shape diagnostics for documents that do not
-    # contain a usable identity field at all.  A stale, otherwise well-shaped
-    # identity must not be hidden by authored semantic errors.
+    # contain a usable identity field at all.
     if (
         root.get("api_version") != api_version
         or type(root.get("program_revision")) is not str
@@ -678,9 +730,6 @@ def _select_identity_verified_program_root(
             candidate = _remove_explicit_default_policy_spelling(
                 root, execution_groups_supported=api_version == _PROGRAM_API_VERSION
             )
-        except ProgramValidationError:
-            _program_error(f"{source}.program_revision", str(raw_identity_error))
-        try:
             verify_content_identity(
                 candidate,
                 own_field="program_revision",
@@ -688,8 +737,13 @@ def _select_identity_verified_program_root(
                 api_version=api_version,
                 label=source,
             )
-        except StrictArtifactError as exc:
-            _program_error(f"{source}.program_revision", str(exc))
+        except (ProgramValidationError, StrictArtifactError) as exc:
+            if not authoring_load:
+                _program_error(
+                    f"{source}.program_revision",
+                    str(exc if isinstance(exc, StrictArtifactError) else raw_identity_error),
+                )
+            return root
         return candidate
 
 
@@ -2014,6 +2068,8 @@ _DYNAMIC_SOURCE_FORBIDDEN_PARAMETERS: Final = frozenset(
         "success_through_stage_id",
         # Node Mock simulation rows are literal-only (contract item 133).
         "mock_simulation",
+        # The attach node's grasp-lost response is literal-only.
+        "on_grasp_lost",
     }
 )
 
@@ -3373,6 +3429,8 @@ def _validate_semantic_value(
     otherwise it is scoped by the schema's semantic scope parameter."""
 
     concrete = context.catalog.schema_registry.resolve(schema)
+    if concrete.nullable and value is None:
+        return
     semantic_type = concrete.semantic_type
     if semantic_type is not None:
         if semantic_type == "source_joint":
@@ -4024,6 +4082,50 @@ def _goal_frame(
     return frame
 
 
+def _validate_on_grasp_lost(
+    parameters: Mapping[str, Any],
+    *,
+    path: str,
+    context: _ProgramValidationContext,
+) -> None:
+    """Validate the attach node's literal loss response and optional key."""
+
+    supplied = parameters.get("on_grasp_lost")
+    if supplied is None:
+        return
+    response = {**_GRASP_LOST_RESPONSE_DEFAULTS, **supplied}
+    field = f"{path}.parameters.on_grasp_lost"
+    if response["raise_alarm"] and not response["stop_motion"]:
+        _program_error(
+            f"{field}.stop_motion",
+            "must be true when raise_alarm is true",
+        )
+    key = response["set_key"]
+    if key is None:
+        return
+    key_field = f"{field}.set_key"
+    if is_node_outcome_key(key) or is_interrupt_state_key(key):
+        _program_error(
+            key_field,
+            f"names system-owned key {key!r}, which nodes cannot write",
+        )
+    declaration = context.blackboard_keys.get(key)
+    if declaration is None:
+        _program_error(key_field, "does not name a declared blackboard key")
+    if declaration.type != "bool":
+        _program_error(
+            key_field,
+            f"declares type {declaration.type!r}, expected 'bool'",
+        )
+    if declaration.expression is not None:
+        _program_error(
+            key_field,
+            f"names computed key {key!r}, which nodes cannot write",
+        )
+    if declaration.access not in {"write", "read_write"}:
+        _program_error(key_field, "does not permit write access")
+
+
 def _validate_node_cross_fields(
     node_id: str,
     parameters: Mapping[str, Any],
@@ -4036,6 +4138,8 @@ def _validate_node_cross_fields(
     parameter in ``sourced`` comes whole from a value source and is checked
     when its value is resolved at node start."""
 
+    if node_id == "scene.attach_carried_object":
+        _validate_on_grasp_lost(parameters, path=path, context=context)
     goal = parameters.get("goal")
     if node_id == "motion.move_to_joint_target" and type(goal) is list:
         joints = [item.get("joint_name") for item in goal if type(item) is dict]
@@ -4194,6 +4298,40 @@ def _validate_program_tree(
     node_budget: list[int],
     context: _ProgramValidationContext,
 ) -> ProgramTreeNode:
+    """Validate one tree node; a failure is typed with the node it names."""
+
+    try:
+        return _validate_program_tree_node(
+            value, path=path, depth=depth, node_budget=node_budget, context=context
+        )
+    except ProgramNodeValidationError:
+        raise
+    except ProgramValidationError as error:
+        message = str(error)
+        field = ""
+        if message.startswith(f"{path}."):
+            field = message[len(path) + 1 :].split(": ", 1)[0]
+
+        def text(name: str) -> str | None:
+            selected = value.get(name) if type(value) is dict else None
+            return selected if type(selected) is str else None
+
+        raise ProgramNodeValidationError(
+            message,
+            instance_id=text("instance_id"),
+            node_id=text("node_id"),
+            field=field,
+        ) from error
+
+
+def _validate_program_tree_node(
+    value: Any,
+    *,
+    path: str,
+    depth: int,
+    node_budget: list[int],
+    context: _ProgramValidationContext,
+) -> ProgramTreeNode:
     if depth > _MAX_TREE_DEPTH:
         _program_error(path, "exceeds the fixed tree-depth bound")
     node_budget[0] -= 1
@@ -4264,7 +4402,12 @@ def _validate_program_tree(
         - set(catalog_parameters)
     )
     if unknown:
-        _program_error(path, f"supplies unknown catalog parameters {unknown}")
+        raise ProgramNodeValidationError(
+            f"{path}: supplies unknown catalog parameters {unknown}",
+            instance_id=instance_id,
+            node_id=node_id,
+            field=f"parameters.{unknown[0]}",
+        )
 
     condition_parameters = {
         requirement.when_parameter
@@ -4320,9 +4463,11 @@ def _validate_program_tree(
             and not supplied_literal
             and not supplied_source
         ):
-            _program_error(
-                path,
-                f"is missing required catalog parameter {parameter_id!r}",
+            raise ProgramNodeValidationError(
+                f"{path}: is missing required catalog parameter {parameter_id!r}",
+                instance_id=instance_id,
+                node_id=node_id,
+                field=f"parameters.{parameter_id}",
             )
         if supplied_literal:
             _reject_legacy_parameter_interpolation(
@@ -4621,16 +4766,21 @@ def _validate_program_document(
     catalog: NodeCatalog,
     source: str,
     api_version: str = _PROGRAM_API_VERSION,
+    authoring_load: bool = False,
 ) -> tuple[
     dict[str, Any],
     ProgramTreeNode,
     dict[str, ProgramParameterDeclaration],
     dict[str, BlackboardKeyDeclaration],
     "ProgramExpressions",
+    tuple[dict[str, str], ...],
 ]:
     root = _program_mapping(data, path=source)
     root = _select_identity_verified_program_root(
-        root, source=source, api_version=api_version
+        root,
+        source=source,
+        api_version=api_version,
+        authoring_load=authoring_load,
     )
     _program_closed(
         root,
@@ -4676,11 +4826,21 @@ def _validate_program_document(
     if (
         catalog_ref["api_version"] != _CATALOG_API_VERSION
         or catalog_ref["api_version"] != catalog.api_version
-        or catalog_ref["content_version"] != catalog.content_version
+    ) or (
+        not authoring_load
+        and catalog_ref["content_version"] != catalog.content_version
     ):
         _program_error(
             f"{source}.catalog",
             "does not select the exact active v2 catalog version",
+        )
+    if authoring_load and not catalog_version_compatible(
+        catalog_ref["content_version"], catalog.content_version
+    ):
+        _program_error(
+            f"{source}.catalog",
+            "does not select a compatible active v2 catalog version (same "
+            f"major, minor not above {catalog.content_version})",
         )
     if "compatibility" in root:
         _validate_compatibility(root["compatibility"], path=f"{source}.compatibility")
@@ -4781,22 +4941,55 @@ def _validate_program_document(
         }
     else:
         normalized_root.pop("execution_groups", None)
-    try:
-        verify_content_identity(
-            normalized_root,
-            own_field="program_revision",
-            identity_domain="program-revision",
-            api_version=api_version,
-            label=source,
+
+    def revision() -> str:
+        try:
+            return compute_content_identity(
+                normalized_root,
+                own_field="program_revision",
+                identity_domain="program-revision",
+                api_version=api_version,
+            )
+        except StrictArtifactError as exc:
+            _program_error(f"{source}.program_revision", str(exc))
+
+    # Strict by default (Applied and runtime reads). For an authored file
+    # opened for editing, a stale stored revision is a diagnostic: the
+    # computed revision is the identity recorded in Binding, Apply and journal.
+    if not authoring_load:
+        try:
+            verify_content_identity(
+                normalized_root,
+                own_field="program_revision",
+                identity_domain="program-revision",
+                api_version=api_version,
+                label=source,
+            )
+        except StrictArtifactError as exc:
+            _program_error(f"{source}.program_revision", str(exc))
+    diagnostics: list[dict[str, str]] = []
+    if revision() != normalized_root["program_revision"]:
+        diagnostics.append(
+            {
+                "code": EDITED_OUTSIDE_MANYFORGE,
+                "path": f"{source}.program_revision",
+                "message": "The stored program_revision differs from the "
+                "content; the computed revision is used.",
+            }
         )
-    except StrictArtifactError as exc:
-        _program_error(f"{source}.program_revision", str(exc))
+    # With ``authoring_load`` a compatible older catalog selector loads as the
+    # active one, so Save writes the active version (strict: already equal).
+    normalized_root["catalog"] = {
+        "api_version": catalog.api_version,
+        "content_version": catalog.content_version,
+    }
+    normalized_root["program_revision"] = revision()
     return normalized_root, tree, parameters, blackboard_keys, ProgramExpressions(
         environment=expressions,
         computed_keys=MappingProxyType(computed_keys),
         computed_key_order=computed_key_order(computed_keys),
         value_expressions=MappingProxyType(dict(context.value_expressions)),
-    )
+    ), tuple(diagnostics)
 
 
 class Program:
@@ -4815,6 +5008,7 @@ class Program:
         *,
         skill_catalog: SkillCatalog | None = None,
         deployment_capability_keys: set[str] | None = None,
+        authoring_load: bool = False,
     ) -> None:
         if skill_catalog is not None:
             raise ProgramValidationError(
@@ -4830,7 +5024,12 @@ class Program:
             data = load_strict_json_yaml(source_path)
         except StrictArtifactError as exc:
             raise ProgramValidationError(str(exc)) from exc
-        self._initialize(data, catalog=catalog, source=str(source_path))
+        self._initialize(
+            data,
+            catalog=catalog,
+            source=str(source_path),
+            authoring_load=authoring_load,
+        )
         self.source_path: Path | None = source_path
 
     @classmethod
@@ -4842,6 +5041,7 @@ class Program:
         *,
         skill_catalog: SkillCatalog | None = None,
         deployment_capability_keys: set[str] | None = None,
+        authoring_load: bool = False,
     ) -> "Program":
         if skill_catalog is not None:
             raise ProgramValidationError(
@@ -4859,7 +5059,12 @@ class Program:
         except StrictArtifactError as exc:
             raise ProgramValidationError(str(exc)) from exc
         self = cls.__new__(cls)
-        self._initialize(deepcopy(data), catalog=catalog, source=str(path))
+        self._initialize(
+            deepcopy(data),
+            catalog=catalog,
+            source=str(path),
+            authoring_load=authoring_load,
+        )
         self.source_path = None if str(path) == "<memory>" else Path(path)
         return self
 
@@ -4869,6 +5074,7 @@ class Program:
         *,
         catalog: NodeCatalog,
         source: str,
+        authoring_load: bool = False,
     ) -> None:
         try:
             (
@@ -4877,10 +5083,12 @@ class Program:
                 parameters,
                 blackboard_keys,
                 expressions,
+                diagnostics,
             ) = _validate_program_document(
                 data,
                 catalog=catalog,
                 source=source,
+                authoring_load=authoring_load,
             )
             canonical = canonical_json_bytes(normalized)
         except ProgramValidationError:
@@ -4896,6 +5104,10 @@ class Program:
         self.description = str(normalized.get("description", ""))
         self.catalog_api_version = str(normalized["catalog"]["api_version"])
         self.catalog_content_version = str(normalized["catalog"]["content_version"])
+        # The catalog version the source was saved with (traceability).
+        self.saved_catalog_content_version = str(data["catalog"]["content_version"])
+        # ``edited_outside_manyforge`` diagnostics of this load; never refusals.
+        self.load_diagnostics = diagnostics
         self.validated_catalog_digest = catalog.catalog_digest
         self.tree = tree
         self.execution_selections = _resolve_execution_selections(tree)

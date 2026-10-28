@@ -1534,6 +1534,7 @@ describe('Program runtime projection', () => {
     const fault = {
       latchId: 'latch', latchGeneration: 1, state: 'latched' as const,
       trigger: 'physical_rest_unproven' as const, recoveryStatus: 'waiting_for_observation' as const,
+      observedTriggers: ['physical_rest_unproven' as const],
       reasonCode: 'physical_rest_unproven', certificate: null,
     };
     robot.state.status.cellStopAction.fault = fault;
@@ -1556,6 +1557,7 @@ describe('Program runtime projection', () => {
     robot.state.status.cellStopAction.fault = {
       latchId: 'latch', latchGeneration: 1, state: 'latched' as const,
       trigger: 'physical_rest_unproven' as const, recoveryStatus: 'waiting_for_configuration' as const,
+      observedTriggers: ['physical_rest_unproven' as const],
       reasonCode: 'physical_rest_unproven', certificate: null,
     };
     robot.componentIncidents = [{
@@ -1634,6 +1636,7 @@ describe('Program runtime projection', () => {
     robot.state.status.cellStopAction.fault = {
       latchId: 'latch', latchGeneration: 1, state: 'latched',
       trigger: 'physical_rest_unproven', recoveryStatus: 'waiting_for_observation',
+      observedTriggers: ['physical_rest_unproven'],
       reasonCode: 'physical_rest_unproven', certificate: null,
     };
     robot.currentStatus = null;
@@ -1736,10 +1739,16 @@ it('shows a failed accepted start and native comparison facts while Reset remain
   };
   const robot = robotController();
   robot.currentStatus = statusFixture();
+  const reset = vi.fn();
   const [notice] = deriveTransportGuidance({
     enabled: true, program, robot, motionActive: false, onReviewProgramRecovery: vi.fn(),
+    onReset: { run: reset, disabled: false },
   });
   expect(notice).toMatchObject({ id: 'program.reset-required', severity: 'error', title: 'Run failed' });
+  // Red always carries the action that clears it: the Program-panel Reset.
+  expect(notice.actions?.map((action) => [action.label, action.disabled])).toEqual([['Reset', false]]);
+  notice.actions?.[0].run();
+  expect(reset).toHaveBeenCalledOnce();
   expect(notice.message).toContain('program-cycle.2');
   expect(notice.message).toContain('Admission changed: true');
   expect(notice.message).toContain('Admission generation before: 36');

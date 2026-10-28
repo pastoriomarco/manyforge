@@ -5,6 +5,7 @@ import { DocumentStateLetters } from '../components/DocumentStateLetters';
 import type { DeploymentWorkspaceResponse, ProgramWorkspaceResponse } from '../types/api';
 import {
   deploymentDocumentStates,
+  deploymentMatchesApplied,
   deploymentUnapplied,
   programDocumentStates,
 } from './documentStates';
@@ -20,10 +21,15 @@ function program(overrides: {
   } as unknown as ProgramWorkspaceResponse;
 }
 
-function deployment(draftRevision: string, applied: string, differsFromSaved = false): DeploymentWorkspaceResponse {
+function deployment(
+  draftRevision: string,
+  applied: string,
+  differsFromSaved = false,
+  savedRevision = 'x',
+): DeploymentWorkspaceResponse {
   return {
     draft: { document: {}, deploymentRevision: draftRevision, differsFromSaved },
-    saved: { path: 'cell/deployment.yaml', deploymentRevision: 'x', differsFromApplied: null },
+    saved: { path: 'cell/deployment.yaml', deploymentRevision: savedRevision, differsFromApplied: null },
     managerApplied: { activationOrder: null, deploymentRevision: applied, scenarioId: 'cell' },
     // The backend compares the documents; revisions may be absent.
     runAdmission: { ready: draftRevision === applied, reason: null },
@@ -65,5 +71,13 @@ describe('document state letters', () => {
     } as unknown as DeploymentWorkspaceResponse;
     expect(deploymentUnapplied(unrevisioned)).toBe(false);
     expect(deploymentDocumentStates(unrevisioned).pending).toBe(false);
+  });
+
+  it('uses the Draft-versus-Applied comparison independently of Saved', () => {
+    // The Saved file differs, but the current Draft is the applied revision.
+    expect(deploymentMatchesApplied(deployment('r1', 'r1', true, 'saved-r0'))).toBe(true);
+
+    // The Saved file matches Applied, but the current Draft has since changed.
+    expect(deploymentMatchesApplied(deployment('r2', 'r1', true, 'r1'))).toBe(false);
   });
 });

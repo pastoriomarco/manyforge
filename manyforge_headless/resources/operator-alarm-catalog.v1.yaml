@@ -1,6 +1,6 @@
 schema_version: manyforge.operator_alarm_catalog.v1
-catalog_version: 2.7.0
-descriptor_digest: sha256:eae2f502411ddcb0aacb0d71cf73716ecb833dbf5d0496d5cb2d5cfe292b6049
+catalog_version: 2.8.0
+descriptor_digest: sha256:267c161200260de6c51198b872f2da7a53239847979bdf39fac0d462dabe7a68
 definitions:
   - definition_id: manyforge.motion.runtime_collision
     version: 2
@@ -310,6 +310,32 @@ definitions:
       attention and a Workbench restart.
     consequence: >-
       The operation journal has failed and admission remains closed. Unresolved write outcomes remain retained; no automatic write retry or in-app Reset clears this fault.
+    operator_response: >-
+      Review the fault details and containment status, acknowledge attention,
+      then restart the Workbench. Acknowledgement does not clear the fault.
+    scope_fields: [subject_kind, subject_id, resource_ids]
+    set_authority: manyforge.kernel.runtime_fault_condition
+    clear_authority: manyforge.kernel.runtime_fault_condition
+    adapter_id: manyforge.alarm_adapter.runtime_fault_condition
+    runtime_modes:
+      - program
+      - direct_control
+    acknowledgement_required: true
+    acknowledgement_reason_required: false
+    requires_motion_attention: true
+    max_evidence_refs: 1
+
+  - definition_id: manyforge.runtime.kernel_internal_fault
+    version: 1
+    title: Internal fault
+    message_template: "Internal fault; new motion is inhibited until restart"
+    alarm_class: runtime_health
+    priority: high
+    priority_rationale: >-
+      An unrecoverable Workbench runtime fault requires prompt operator
+      attention and a Workbench restart.
+    consequence: >-
+      A callback on the Stop or safety path failed. The Kernel requested one Full Stop, not retried, and keeps new motion admission closed; clearing a Stop fault does not reopen it. The details name the first typed cause, whether that Full Stop was accepted (or its refusal code) and how many later failures followed.
     operator_response: >-
       Review the fault details and containment status, acknowledge attention,
       then restart the Workbench. Acknowledgement does not clear the fault.

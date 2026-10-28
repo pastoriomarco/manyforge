@@ -23,6 +23,11 @@ import {
 } from './ioSignalConfiguration';
 import { INTERRUPT_MOTION_NODE_IDS, programBlackboardKeys } from './programAuthoring';
 import { resolvedInputSignals, resolvedTargetRoles } from './targetRoleResolution';
+import {
+  CARRIED_OBJECT_LOST_RESOURCE_ROLE,
+  systemSignalOriginSuffix,
+  type CarriedObjectLostSignalChoice,
+} from './systemSignalAuthoring';
 
 /**
  * Interrupt rule authoring (schema04): the closed condition grammar shared by
@@ -120,6 +125,7 @@ export function nodeConditionChoices(
   globalRuleIds: readonly string[],
   deploymentDocument: Record<string, JsonValue> | null = null,
   roleAssignment: Record<string, JsonValue> | null = null,
+  systemSignals: readonly CarriedObjectLostSignalChoice[] = [],
 ): ConditionOperandChoice[] {
   const declared = declaredIoSources(deploymentDocument);
   const targets = binding == null
@@ -132,20 +138,47 @@ export function nodeConditionChoices(
   const signals: ConditionOperandChoice[] = [];
   for (const target of targets) {
     if (!Object.hasOwn(program.target_roles ?? {}, target.target_role_id)) continue;
+    const requiredRoles = objectOf(program.target_roles[target.target_role_id])?.required_resource_roles;
+    const requiresCarriedObjectLost = Array.isArray(requiredRoles)
+      && requiredRoles.includes(CARRIED_OBJECT_LOST_RESOURCE_ROLE);
+    const systemSignal = systemSignals.find((row) => (
+      row.controllableComponentId === target.controllable_component_id
+      && row.commandTargetId === target.command_target_id
+    ));
     for (const row of target.signal_role_bindings ?? []) {
       if (row.direction !== 'input') continue;
+      if (row.resource_role_id === CARRIED_OBJECT_LOST_RESOURCE_ROLE
+        && (!requiresCarriedObjectLost || systemSignal?.signalName !== row.signal_name)) continue;
       const operand = { signal: { target_role: target.target_role_id, resource_role: row.resource_role_id } };
       const liveness = declared.get(ioSourceKey(
         target.controllable_component_id, target.command_target_id, row.resource_role_id,
       ))?.liveness;
+      const originSuffix = row.resource_role_id === CARRIED_OBJECT_LOST_RESOURCE_ROLE
+        ? systemSignalOriginSuffix(systemSignal) : '';
+      const label = `${target.target_role_id} · ${row.resource_role_id} (${row.signal_name}, input)`;
       signals.push({
         id: operandId(operand),
         operand,
-        label: signalLabel(`${target.target_role_id} · ${row.resource_role_id} (${row.signal_name}, input)`, liveness),
+        label: `${signalLabel(label, liveness)}${originSuffix}`,
         key: '',
         valueType: row.value_type,
         ...(liveness === undefined ? {} : { liveness }),
       });
+    }
+    if (systemSignal !== undefined && requiresCarriedObjectLost) {
+      const operand = {
+        signal: { target_role: target.target_role_id, resource_role: CARRIED_OBJECT_LOST_RESOURCE_ROLE },
+      };
+      const id = operandId(operand);
+      if (!signals.some((choice) => choice.id === id)) {
+        signals.push({
+          id,
+          operand,
+          label: `${target.target_role_id} · ${CARRIED_OBJECT_LOST_RESOURCE_ROLE} (${systemSignal.signalName}, input)${systemSignalOriginSuffix(systemSignal)}`,
+          key: '',
+          valueType: 'bool',
+        });
+      }
     }
   }
   const keys = programBlackboardKeys(program, globalRuleIds)
@@ -159,6 +192,7 @@ export interface DeploymentInputSignal {
   signalName: string;
   valueType: ConditionValueType;
   liveness?: IoLivenessMode;
+  provenance?: 'last_apply';
 }
 
 /** Global-rule operands: Deployment input signals, then the given scalar keys. */
@@ -171,10 +205,12 @@ export function globalConditionChoices(
       const operand = {
         signal: { controllable_component_id: signal.controllableComponentId, signal_name: signal.signalName },
       };
+      const originSuffix = signal.provenance === 'last_apply' ? ' · from last Apply' : '';
+      const label = `${signal.controllableComponentId} · ${signal.signalName} (input)`;
       return {
         id: operandId(operand),
         operand,
-        label: signalLabel(`${signal.controllableComponentId} · ${signal.signalName} (input)`, signal.liveness),
+        label: `${signalLabel(label, signal.liveness)}${originSuffix}`,
         key: '',
         valueType: signal.valueType,
         ...(signal.liveness === undefined ? {} : { liveness: signal.liveness }),
@@ -614,6 +650,7 @@ export function globalRuleChoices(
   document: Record<string, JsonValue> | null,
   programKeys: readonly BlackboardKeyDeclaration[] | null,
   condition: JsonValue | undefined,
+  systemSignals: readonly CarriedObjectLostSignalChoice[] = [],
 ): ConditionOperandChoice[] {
   const declared = (programKeys ?? []).filter((key) => !isStateKey(key.key));
   const known = new Set(declared.map((key) => key.key));
@@ -622,7 +659,29 @@ export function globalRuleChoices(
     const type = comparedType(condition, key);
     return type === null ? [] : [{ key, type, access: 'read', persistence: 'run' }];
   });
-  return globalConditionChoices(deploymentInputSignals(document), [...declared, ...pending]);
+  const inputs = deploymentInputSignals(document);
+  const knownInputs = new Set(inputs.map((signal) => `${signal.controllableComponentId}\u0000${signal.signalName}`));
+  for (const signal of systemSignals) {
+    const key = `${signal.controllableComponentId}\u0000${signal.signalName}`;
+    if (knownInputs.has(key)) {
+      if (signal.provenance === 'last_apply') {
+        const existing = inputs.find((row) => (
+          row.controllableComponentId === signal.controllableComponentId
+          && row.signalName === signal.signalName
+        ));
+        if (existing !== undefined) existing.provenance = 'last_apply';
+      }
+      continue;
+    }
+    knownInputs.add(key);
+    inputs.push({
+      controllableComponentId: signal.controllableComponentId,
+      signalName: signal.signalName,
+      valueType: signal.valueType,
+      ...(signal.provenance === undefined ? {} : { provenance: signal.provenance }),
+    });
+  }
+  return globalConditionChoices(inputs, [...declared, ...pending]);
 }
 
 /**

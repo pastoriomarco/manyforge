@@ -192,9 +192,12 @@ Result<void> AddressedObservedStatePublication::rebind_route_context(
       return Result<void>::Err(state_error("observed_state_route_rebind_source_not_current"));
     }
 
+    // A source sample received after the transition is current
+    // (received_sample_age.hpp): the seed is never stamped before it.
+    const auto seeded_at = std::max(transition_time_ns, latest.received_timestamp_ns());
     const auto seeded =
         publication_.publish(latest.source_kind(), latest.joint_names(), latest.positions_rad(),
-                             latest.velocities_rad_s(), transition_time_ns, transition_time_ns);
+                             latest.velocities_rad_s(), seeded_at, seeded_at);
     if (!seeded.published || !seeded.complete || !seeded.velocities_complete) {
       return Result<void>::Err(state_error("observed_state_route_rebind_publish_failed"));
     }

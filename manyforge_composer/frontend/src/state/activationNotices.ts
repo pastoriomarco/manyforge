@@ -78,9 +78,11 @@ export function activationFailureNotice(
     && failure.phase === 'accepted'
     && failure.effectDisposition === 'known';
   if (isKnownPreEffectRefusal) {
+    // Nothing was applied and nothing is locked: a warning until acknowledged.
     return {
       id,
-      severity: 'error',
+      severity: 'warning',
+      acknowledgeable: true,
       domain: 'activation',
       title: 'Activation failed',
       message: `${detail} Applied state was not confirmed (${applyId}). `

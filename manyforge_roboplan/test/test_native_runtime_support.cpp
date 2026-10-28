@@ -6,13 +6,16 @@
 #include <manyforge_roboplan/retained_native_view_predecessor.hpp>
 #include <manyforge_roboplan/writer_preferring_shared_gate.hpp>
 
+#include <algorithm>
 #include <atomic>
 #include <chrono>
 #include <future>
 #include <map>
 #include <memory>
+#include <mutex>
 #include <stdexcept>
 #include <string>
+#include <string_view>
 #include <thread>
 #include <utility>
 #include <vector>
@@ -464,6 +467,63 @@ TEST(NativeSchedulerTest, BackgroundCallbackExceptionDoesNotStopWorker) {
       << "Background worker stopped after a contained callback exception";
   EXPECT_TRUE(
       scheduler.drain_for(SchedulerPriority::Background, std::chrono::seconds(1)));
+}
+
+TEST(NativeSchedulerTest,
+     SafetyPathCallbackExceptionIsContainedThroughTheSinkInsteadOfTerminating) {
+  std::mutex reasons_mutex;
+  std::vector<std::string> reasons;
+  std::atomic<bool> stop_followup_fired{false};
+  std::atomic<bool> background_followup_fired{false};
+  SimpleScheduler scheduler;
+  scheduler.set_safety_path_fault_sink([&](const std::string_view reason) {
+    std::lock_guard<std::mutex> lock(reasons_mutex);
+    reasons.emplace_back(reason);
+  });
+
+  const auto now_ns =
+      std::chrono::duration_cast<std::chrono::nanoseconds>(
+          std::chrono::steady_clock::now().time_since_epoch())
+          .count();
+  scheduler.schedule(
+      now_ns, []() { throw std::runtime_error("stop stage failed"); },
+      SchedulerPriority::StopControl);
+  scheduler.schedule(
+      now_ns + 1'000'000LL, [&]() { stop_followup_fired.store(true); },
+      SchedulerPriority::StopControl);
+  scheduler.schedule(
+      now_ns, []() { throw 1; }, SchedulerPriority::RuntimeSafety);
+  scheduler.schedule(
+      now_ns, []() { throw std::runtime_error("diagnostic failed"); },
+      SchedulerPriority::Background);
+  scheduler.schedule(
+      now_ns + 1'000'000LL, [&]() { background_followup_fired.store(true); },
+      SchedulerPriority::Background);
+
+  const auto contained_both = [&]() {
+    std::lock_guard<std::mutex> lock(reasons_mutex);
+    return reasons.size() >= 2U;
+  };
+  const auto deadline =
+      std::chrono::steady_clock::now() + std::chrono::seconds(2);
+  while ((!contained_both() || !stop_followup_fired.load() ||
+          !background_followup_fired.load()) &&
+         std::chrono::steady_clock::now() < deadline) {
+    std::this_thread::sleep_for(std::chrono::milliseconds(5));
+  }
+
+  EXPECT_TRUE(stop_followup_fired.load())
+      << "StopControl lane stopped after a contained callback exception";
+  EXPECT_TRUE(background_followup_fired.load());
+  {
+    std::lock_guard<std::mutex> lock(reasons_mutex);
+    std::sort(reasons.begin(), reasons.end());
+    EXPECT_EQ(reasons, (std::vector<std::string>{
+                           "scheduler_runtime_safety_callback_exception",
+                           "scheduler_stop_control_callback_exception"}));
+  }
+  EXPECT_TRUE(scheduler.drain_all_for(std::chrono::seconds(1)));
+  scheduler.set_safety_path_fault_sink({});
 }
 
 TEST(NativeSchedulerTest, DrainWaitsForDequeuedRuntimeSafetyCallback) {

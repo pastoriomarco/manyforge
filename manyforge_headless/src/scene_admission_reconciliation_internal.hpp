@@ -23,6 +23,9 @@ core::SceneCommitResultDTO CommitSceneWithAdmissionObservation(
               core::SceneProjectionCommitStatusDTO::kNotAttempted &&
           result.error.has_value() &&
           result.error->code != "kernel_owner_unavailable" &&
+          // The ID's retained outcome belongs to another request: the lookup
+          // would refuse it, and that outcome keeps reconciliation required.
+          result.error->code != "request_id_conflict" &&
           !owner.ReadCommitResult(request).has_value()) {
         const auto access = owner.ReadAccessStatus();
         needs_reconciliation =

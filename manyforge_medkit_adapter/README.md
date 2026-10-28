@@ -16,7 +16,7 @@ consume addressed owner-issued diagnostics while preserving FAILED-on-latch,
 PASSED healing, severity, archive-reference, discovery, and fail-closed
 behavior.
 
-**Historical restoration runbook:**
+**Status and medkit notes:**
 [`docs/operations/ROS2_MEDKIT.md`](../docs/operations/ROS2_MEDKIT.md)
 
 Hermetic reducer and mapping tests remain part of the ROS lane. No current

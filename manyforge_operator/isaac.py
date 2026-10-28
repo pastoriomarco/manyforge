@@ -1,9 +1,9 @@
 """Supported O1 split Isaac operator profile.
 
-The profile is an outer lifecycle owner only. It starts Isaac Sim on the
-laptop, starts the source-matched ManyForge/ROS composition on the configured
-runtime host through an explicit SSH command, and records exact process
-identities from both hosts. Manager, Headless, Program runner, Composer, and
+The profile is an outer lifecycle owner only. It attaches to an Isaac Sim run
+on its own simulator host, starts the source-matched ManyForge/ROS composition
+on the configured runtime host through an explicit SSH command, and records
+exact runtime identities. Manager, Headless, Program runner, Composer, and
 the Isaac ROS adapters retain semantic ownership of their respective state.
 
 The remote helpers are deliberately small and identity-scoped. They never
@@ -66,9 +66,6 @@ from .orchestrator import (
 
 
 DEFAULT_RUNTIME_NAMESPACE = "/manyforge/isaac_ur10e_light_robot"
-DEFAULT_SIMULATOR_HOST = "192.168.1.132"
-DEFAULT_RUNTIME_HOST = "tndlux@192.168.1.68"
-DEFAULT_STATIC_PEERS = ("192.168.1.132", "192.168.1.68")
 DEFAULT_ROS_DOMAIN = 0
 DEFAULT_RMW = "rmw_fastrtps_cpp"
 DEFAULT_DISCOVERY_RANGE = "LOCALHOST"
@@ -126,10 +123,13 @@ def _namespace_to_dict(value: Any) -> Any:
 
 @dataclass(frozen=True, slots=True)
 class RemoteNativeConfig:
-    """All remote paths and identities required for one Orin launch."""
+    """All remote paths and identities required for one runtime-host launch.
 
-    target: str = DEFAULT_RUNTIME_HOST
-    source_root: str = "/mnt/nova_ssd/codex-manyforge/runners/manyforge"
+    Host and path fields have no defaults: an empty value is refused below.
+    """
+
+    target: str = ""
+    source_root: str = ""
     manager_executable: str = ""
     install_root: str = ""
     node_catalog_path: str = ""
@@ -138,13 +138,13 @@ class RemoteNativeConfig:
     composer_static_dir: str = ""
     canonical_empty_admission_filename: str = "canonical-empty-admission.json"
     cell_id: str = "ur10e_isaac_cell"
-    advertised_host: str = "192.168.1.68"
+    advertised_host: str = ""
     package_aggregate_sha256: str = ""
     compiler_build_manifest_sha256: str = ""
     node_environment_sha256: str = ""
     simulation_control_config: str = ""
-    bridge_state_root: str = "/mnt/nova_ssd/codex-manyforge/runners/isaac-bridge"
-    ros_setup_script: str = "/opt/ros/jazzy/setup.bash"
+    bridge_state_root: str = ""
+    ros_setup_script: str = ""
     ros_environment_script: str = ""
     python_executable: str = "python3"
     container_image_id: str = ""
@@ -201,15 +201,15 @@ class RemoteNativeConfig:
 
 @dataclass(frozen=True, slots=True)
 class IsaacLauncherConfig:
-    """Laptop outer-lifecycle configuration for the split Isaac profile."""
+    """Control-host outer-lifecycle configuration for the split Isaac profile."""
 
     source_root: Path
     remote: RemoteNativeConfig
+    simulator_host: str
+    static_peers: tuple[str, ...]
     state_root: Path = DEFAULT_STATE_ROOT
     instance_id: str = "isaac"
-    simulator_host: str = DEFAULT_SIMULATOR_HOST
     control_host: str = ""
-    static_peers: tuple[str, ...] = DEFAULT_STATIC_PEERS
     ros_domain: int = DEFAULT_ROS_DOMAIN
     rmw: str = DEFAULT_RMW
     discovery_range: str = DEFAULT_DISCOVERY_RANGE
@@ -493,7 +493,7 @@ class IsaacLauncher:
     def _ssh(self, remote_command: str, *, timeout: float | None = None) -> str:
         config = self._require_config()
         executable = Path(getattr(config, "ssh_executable", "/usr/bin/ssh"))
-        target = getattr(getattr(config, "remote", None), "target", DEFAULT_RUNTIME_HOST)
+        target = getattr(getattr(config, "remote", None), "target", "")
         command = [
             str(executable),
             "-o", "BatchMode=yes",
@@ -553,7 +553,7 @@ class IsaacLauncher:
             "ROS_DOMAIN_ID": str(getattr(config, "ros_domain", DEFAULT_ROS_DOMAIN)),
             "RMW_IMPLEMENTATION": str(getattr(config, "rmw", DEFAULT_RMW)),
             "ROS_AUTOMATIC_DISCOVERY_RANGE": str(getattr(config, "discovery_range", DEFAULT_DISCOVERY_RANGE)),
-            "ROS_STATIC_PEERS": ";".join(getattr(config, "static_peers", DEFAULT_STATIC_PEERS)),
+            "ROS_STATIC_PEERS": ";".join(getattr(config, "static_peers", ())),
         }
 
     def _remote_source_prefix(self) -> str:

@@ -9,11 +9,11 @@
   "members": {
     "assignment.yaml": "sha256:0609b83a2c63f70215b846bae55b156fc1e15046d49c48f2c7b579f7b4be09a0",
     "deployment.yaml": "sha256:edfcb566577af2eeba6a15861edf499885b17298e5d05a06e414b6bd56ffb419",
-    "program.yaml": "sha256:c48ca87053ec7832ce5767a67b36fb8b44a892ddb16aaa5187b5429a197ec2fc"
+    "program.yaml": "sha256:dfbdb8c843fad31739f4790e78ac27ba1fa0a5aec4c4cc37178eae3d53c4bbe8"
   },
   "name": "isaac-ur10e-light-scene-assistant",
   "saved_status": {
-    "checked_content_digest": "sha256:61a22d60e4677641b7c2d1888d85b806545e5375a7fa4c9605b368e09390b9c1",
+    "checked_content_digest": "sha256:3f754c38425b8ee1e0cd1126eded41a6aab52cb2bf406d61b2e5030f3ae35429",
     "last_known_status": "ready",
     "manyforge_version": "0.1.0"
   },

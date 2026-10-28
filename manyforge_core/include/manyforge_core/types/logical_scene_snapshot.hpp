@@ -167,9 +167,44 @@ struct CarriedObjectGraspLostBoundDTO final {
                          const CarriedObjectGraspLostBoundDTO&) = default;
 };
 
-/// The attach node's grasp-lost bound.
+/// What a loss of the attachment does: the attach node's `on_grasp_lost`.
+/// The defaults are the CP9 behaviour (alarm, Stop, detach). The
+/// `carried_object_lost.<command_target_id>` system signal of the gripper is
+/// published on every loss, whatever the flags.
+struct GraspLostResponseDTO final {
+  /// Raise `scene.carried_object_lost`; requires `stop_motion`.
+  bool raise_alarm{true};
+  /// Request the carrier's operational Stop.
+  bool stop_motion{true};
+  /// Blackboard key the Program Runner mirrors the signal into; the scene only
+  /// carries it.
+  std::optional<std::string> set_key{};
+  /// Detach the object at its observed pose.
+  bool detach{true};
+
+  /// Refused: an alarm without the Stop, or an empty key name.
+  [[nodiscard]] bool valid() const noexcept {
+    return (!raise_alarm || stop_motion) &&
+           (!set_key ||
+            (!set_key->empty() && set_key->find('\0') == std::string::npos));
+  }
+  [[nodiscard]] bool is_default() const noexcept {
+    return *this == GraspLostResponseDTO{};
+  }
+  friend bool operator==(const GraspLostResponseDTO&,
+                         const GraspLostResponseDTO&) = default;
+};
+
+/// The attach node's grasp-lost bound and response.
 struct CarriedObjectGraspLostCheckDTO final {
   CarriedObjectGraspLostBoundDTO bound;
+  /// Absent means the defaults; never present and equal to them, so older
+  /// attachments keep their identity.
+  std::optional<GraspLostResponseDTO> on_grasp_lost{};
+
+  [[nodiscard]] GraspLostResponseDTO response() const {
+    return on_grasp_lost.value_or(GraspLostResponseDTO{});
+  }
   friend bool operator==(const CarriedObjectGraspLostCheckDTO&,
                          const CarriedObjectGraspLostCheckDTO&) = default;
 };

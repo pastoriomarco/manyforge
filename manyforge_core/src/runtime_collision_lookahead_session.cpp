@@ -375,6 +375,7 @@ RuntimeCollisionLookaheadSession::RuntimeCollisionLookaheadSession(
     AuthorityCallback authority_callback)
     : config_(config),
       clock_(&clock),
+      scheduler_(&scheduler),
       publisher_(&publisher),
       progress_publication_(&progress_publication),
       engines_(std::move(engines)),
@@ -659,6 +660,7 @@ void RuntimeCollisionLookaheadSession::worker_loop(std::stop_token stop_token) {
     // handoff so a late clear can never be published as authoritative.
     refresh_completion_deadline();
     bool authority_completed = false;
+    bool authority_faulted = false;
     const auto apply_authority_if_required = [&]() {
       if (stale_arm || authority_completed || !requires_authority()) {
         return;
@@ -679,10 +681,12 @@ void RuntimeCollisionLookaheadSession::worker_loop(std::stop_token stop_token) {
           stale_arm = authority_callback_(this, result) ==
                       RuntimeCollisionLookaheadAuthorityDisposition::kStale;
         } catch (...) {
-          // Authority callbacks are part of the fail-closed stop path. An
-          // escaped exception means the process can no longer prove that the
-          // detected/inconclusive hazard reached stop authority.
-          std::terminate();
+          // The hazard may not have reached Stop authority. Clear permits are
+          // already withdrawn above; the host contains the cell. No observer
+          // evidence follows for this result.
+          authority_faulted = true;
+          scheduler_->contain_safety_path_fault(
+              "runtime_collision_lookahead_authority_exception");
         }
       }
     };
@@ -738,12 +742,14 @@ void RuntimeCollisionLookaheadSession::worker_loop(std::stop_token stop_token) {
       // status snapshot when their callback returns.
       record_result(result);
       try {
-        callback_(this, result);
+        if (!authority_faulted) {
+          callback_(this, result);
+        }
       } catch (...) {
-        // Production result observers emit kernel evidence. Losing that
-        // evidence after authority is a process-integrity failure, matching
-        // the existing kernel event-publisher policy.
-        std::terminate();
+        // Production result observers emit kernel evidence. Losing it after
+        // authority is an internal fault: the host contains the cell.
+        scheduler_->contain_safety_path_fault(
+            "runtime_collision_lookahead_result_observer_exception");
       }
       std::lock_guard<std::mutex> lock(mutex_);
       callback_active_ = false;
@@ -1016,9 +1022,15 @@ RuntimeCollisionLookaheadResult RuntimeCollisionLookaheadSession::run_job(const 
     result.reason = "runtime_lookahead_deadline_exceeded";
     return finish(std::move(result));
   }
-  // A different handle is a newer publication; its world may have moved.
-  if (!latest || latest != job.bundle || !latest->world ||
-      !revisions_equal(latest->world->revision, job.bundle->world->revision)) {
+  // A different handle is a newer publication; its world may have moved. A job
+  // on a move's admitted operation-local policy keeps that policy whatever the
+  // published one, so only a newer world supersedes it.
+  const bool superseded =
+      !latest || !latest->world ||
+      (job.bundle->admitted_operation_policy ? latest->world != job.bundle->world
+                                             : latest != job.bundle) ||
+      !revisions_equal(latest->world->revision, job.bundle->world->revision);
+  if (superseded) {
     result.status = RuntimeCollisionLookaheadResultStatus::kSupersededRevision;
     result.reason = "runtime_lookahead_revision_superseded";
     return finish(std::move(result));

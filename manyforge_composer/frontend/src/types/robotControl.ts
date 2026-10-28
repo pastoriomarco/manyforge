@@ -1,4 +1,4 @@
-import type { IoSignalBinding } from '../api/parsers/ioSignals';
+import type { IoSignalBinding, SystemSignalProjection } from '../api/parsers/ioSignals';
 
 export interface SceneRevisionValue {
   scene_id: string;
@@ -267,6 +267,21 @@ export interface StopFaultRecoveryOffer {
   recoveryUnavailableReason: string | null;
 }
 
+/** The one typed result of Recover cell (Headless `POST /api/execution/cell-recover`). */
+export interface CellRecoverResult {
+  outcome: 'done' | 'not_recovered';
+  acknowledgedIncidents: Array<{
+    controllableComponentId: string;
+    incidentId: string;
+    causeClass: string;
+  }>;
+  latchCleared: boolean;
+  /** Components whose ordinary Recover CCLC accepted (cause released after a first press). */
+  recoveredComponents: string[];
+  /** The owner's typed reason when not recovered; null when done. */
+  reason: { code: string; message: string; details: Record<string, string> } | null;
+}
+
 /**
  * The exact selector of one latched global rule's recovery offer (SX-2206),
  * kept in its wire form so the clear command sends it back unchanged.
@@ -313,6 +328,15 @@ export interface CellStopStageSummary {
   substitutionReason: string | null;
 }
 
+export type StopFaultTrigger =
+  | 'scope_promotion'
+  | 'escalated'
+  | 'partial'
+  | 'failed_uncontained'
+  | 'physical_rest_unproven'
+  | 'persistence_degraded'
+  | 'post_reserve_fence_failed';
+
 export interface CellStopActionStatus {
   available: boolean;
   unavailableReason: string | null;
@@ -328,13 +352,10 @@ export interface CellStopActionStatus {
     latchId: string;
     latchGeneration: number;
     state: 'latched' | 'recovery_pending' | 'cleared';
-    trigger:
-      | 'scope_promotion'
-      | 'escalated'
-      | 'partial'
-      | 'failed_uncontained'
-      | 'physical_rest_unproven'
-      | 'persistence_degraded';
+    /** The primary (highest-priority) cause. */
+    trigger: StopFaultTrigger;
+    /** Every distinct cause latched on this Stop, in first-seen order. */
+    observedTriggers: StopFaultTrigger[];
     recoveryStatus:
       | 'waiting_for_observation'
       | 'waiting_for_quiescence'
@@ -383,6 +404,8 @@ export interface ExecutionOwnerStatus {
   runtimeScaleControl: RuntimeScaleControlStatus | null;
   /** `targets.io_signal_bindings` when the owner publishes it (static per activation). */
   ioSignalBindings?: IoSignalBinding[];
+  /** Normalized `targets.system_signals`; empty when the owner omits it. */
+  systemSignals: SystemSignalProjection[];
 }
 
 export interface ExecutionIdentity {

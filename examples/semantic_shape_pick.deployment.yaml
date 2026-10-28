@@ -1194,11 +1194,11 @@
         "schema_revision": "sha256:b242431032bf183f81718ae1b7b8501ee5f705e52d455732e0052215565bf4cc"
       },
       {
-        "content_addressed_store_key": "catalog/maintained/runtime_profile/manyforge.ros2_control_execution_runtime/b096aa212e1ad67f246a5203ffafa39e832bb405292270acde121ae780f27d06",
-        "content_digest": "sha256:af2713420310df874fef2bef33e38300b54d3575f981023adbf3fac93bfa3c7b",
+        "content_addressed_store_key": "catalog/maintained/runtime_profile/manyforge.ros2_control_execution_runtime/feabe0423d63dd1971537d5cf72381a2d7b1b8ee965b1d62be178e96c93e469f",
+        "content_digest": "sha256:f650c84f2498f701b31a4cb4fa86cda385aecad50a17cbd6e10231724e30cddd",
         "record_id": "manyforge.ros2_control_execution_runtime",
         "record_kind": "runtime_profile",
-        "record_revision": "sha256:b096aa212e1ad67f246a5203ffafa39e832bb405292270acde121ae780f27d06",
+        "record_revision": "sha256:feabe0423d63dd1971537d5cf72381a2d7b1b8ee965b1d62be178e96c93e469f",
         "schema_id": "manyforge.runtime_profile.v1",
         "schema_revision": "sha256:c254afa8c2bfcc803f12a7af63b1f09a8ee804b1ffa2a65b7361ad9309b87ae7"
       },
@@ -1234,7 +1234,7 @@
     ]
   },
   "deployment_artifact_id": "ur5_roboplan_local_semantic_shape_pick",
-  "deployment_revision": "sha256:3fa19621fab20cb51858702212ece9dc20c481bb85bc6638963f461aed9eecec",
+  "deployment_revision": "sha256:8c546afc90eb00473300ef7f26a78eb8b7c554beac4b652693cc1d273f3c7f8a",
   "description": "Local deployment for the semantic object-selection demo. A model selects one backend-authoritative scene object from a deterministic manifest plus an auxiliary viewer snapshot, and the backend computes the actual pick sequence deterministically from backend scene state.",
   "desired_control_configurations": [
     {
@@ -2102,7 +2102,7 @@
         },
         "dependency_runtime_unit_ids": [],
         "runtime_profile_id": "manyforge.ros2_control_execution_runtime",
-        "runtime_profile_revision": "sha256:b096aa212e1ad67f246a5203ffafa39e832bb405292270acde121ae780f27d06",
+        "runtime_profile_revision": "sha256:feabe0423d63dd1971537d5cf72381a2d7b1b8ee965b1d62be178e96c93e469f",
         "runtime_unit_id": "robot_cell.ros2_control_execution"
       }
     ]

@@ -434,6 +434,15 @@ class CCLCLifecycleTargetDriver final {
     bool retired_reached_observation{};
     /// CP9 stream verdict read at the start of this pass.
     ComponentStreamVerdictDTO streams;
+    /// Recovery generation under which this driver's last Recover of the
+    /// current target settled: a still-observed recovered cause gets one
+    /// driver Recover per operator Recover (ADR-0026 §7).
+    std::optional<std::uint64_t> recover_settled_generation;
+    /// m5.5: the Kernel's authoring admission read when this external-move
+    /// episode was decided (no lifecycle work of the component in flight).
+    /// Kept while the component's own re-arm holds the cell's lifecycle
+    /// claim; cleared once no domain reports `device.moved_externally`.
+    std::optional<AuthoringAdmissionDTO> external_move_decision;
   };
   /// The Kernel's answer to one incident's containment request.
   struct ContainmentOutcome final {
@@ -560,6 +569,7 @@ class CCLCLifecycleTargetDriver final {
   bool any_waiting_{};
   // Protected by run_mutex_ for use/mutation, state_mutex_ for readiness reads.
   std::shared_ptr<ProgramResetPositionScope> program_reset_position_scope_;
+
   /// Containment outcomes of incidents this driver already contained (run
   /// lane), so neither a retried record nor a later pass requests it again.
   std::map<std::string, ContainmentOutcome> containments_;

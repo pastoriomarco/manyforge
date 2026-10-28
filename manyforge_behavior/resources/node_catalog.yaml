@@ -1,8 +1,8 @@
 # Generated extension composition; edit extension entries in their package descriptor.
 api_version: manyforge.node_catalog.v2
-content_version: 2.7.0
+content_version: 2.8.0
 catalog_id: manyforge_builtin
-catalog_digest: sha256:b9d90f6ec180af69c9f342b4d7c995668693ef16854e7ab8df177381c5db9806
+catalog_digest: sha256:5ffd4dac211459905977367414bfb7684842045ee4b32c5cb3da5f513a03d134
 schema_types:
   motion_endpoint_ref:
     type: object
@@ -2198,6 +2198,27 @@ entries:
       type: float
       constraints:
         min_exclusive: 0.0
+  - id: on_grasp_lost
+    required: false
+    default:
+      raise_alarm: true
+      stop_motion: true
+      set_key: null
+      detach: true
+    schema:
+      type: object
+      properties:
+        raise_alarm:
+          type: bool
+        stop_motion:
+          type: bool
+        set_key:
+          type: string
+          nullable: true
+          semantic_type: blackboard_key
+        detach:
+          type: bool
+      additional_properties: false
   required_capabilities:
   - capability_id: scene.edit.attach_detach
     scope: cell_global

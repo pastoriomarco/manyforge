@@ -1,19 +1,13 @@
 # Isaac Lite6 Trocar FoundationPose Bring-Up
 
-> **Cutover status:** retained as a restoration and behavior reference. The
-> command recipes below are not qualified on the current `dev` branch and
-> must not be executed until I9/I and its prerequisite headless gates pass.
-> Unless explicitly marked as retained static configuration, present-tense
-> wording below describes the captured baseline, not a live Isaac lane.
-
-This runbook records the former operator path for the Lite6 trocar pick
-scenario:
+This runbook covers the Lite6 trocar pick Scenario
+(`examples/isaac-lite6-trocar-foundationpose.scenario`):
 
 - Isaac Sim runs the Lite6/trocar USD on the simulator host.
 - Isaac ROS 4.4 runs YOLOv8 + FoundationPose and publishes
   `vision_msgs/msg/Detection3DArray` on `/output`.
-- ManyForge runs its ROS-capable Composer and topic-control services and
-  consumes `/output` through a `detection3d_array_topic` pose source.
+- ManyForge runs in the workbench container and consumes `/output` through
+  the Deployment's `foundationpose_trocar` pose-source component.
 
 Do not install ManyForge into the Isaac ROS perception container, and do not
 install ManyForge into Isaac Sim. Keep the processes separate and connect them
@@ -21,16 +15,17 @@ through ROS 2/DDS.
 
 ## Network and DDS Baseline
 
-The known Thor/laptop topology is:
+The DDS profile's default topology is (override the IPs for your hosts, see
+below):
 
-- Thor / ManyForge / Isaac ROS host: `192.168.1.136`
-- Isaac Sim laptop: `192.168.1.132`
+- Jetson Thor (ManyForge and Isaac ROS host): `192.168.1.136`
+- Isaac Sim host: `192.168.1.132`
 - ROS domain: `0`
 - RMW: Fast DDS (`rmw_fastrtps_cpp`)
 
 Set these in every shell that launches a ROS participant: Isaac Sim on the
-laptop, the Isaac ROS 4.4 container on Thor, and the ManyForge launcher shell on
-Thor. Set `MANYFORGE_ROOT` to the checkout visible in that shell; do not copy a
+laptop, the Isaac ROS 4.4 container on Thor, and the ManyForge workbench shell
+on Thor. Set `MANYFORGE_ROOT` to the checkout visible in that shell; do not copy a
 user-specific absolute path between hosts.
 
 ```bash
@@ -115,6 +110,10 @@ Press Play only after the DDS environment and QoS are set.
 
 ## Isaac ROS 4.4 Perception Container
 
+The perception graph comes from your own Isaac ROS workspace: the
+`isaac_ros_custom_bringup` package, the YOLOv8/FoundationPose models and the
+trocar mesh below are not part of ManyForge.
+
 On Thor:
 
 ```bash
@@ -179,48 +178,36 @@ Avoid `ros2 topic echo` or `ros2 topic hz` on raw image topics while diagnosing
 network saturation. They add subscribers to the heavy stream and can change the
 problem being measured.
 
-The ManyForge deployment currently uses `stale_after_s: 5.0` for the
-FoundationPose source. That budget is intentionally larger than the observed
-Isaac ROS 4.4 FoundationPose cadence on Thor/laptop commissioning hardware
-(`~0.4 Hz`, one `/output` message every `2.1-2.5 s`). If `/output` slows below
-that, treat it as a perception performance fault instead of widening the budget
-again. For production, derive this value from the qualified worst-case
-FoundationPose period plus bounded scheduling jitter for the specific cell.
+The Deployment's stream budget for the FoundationPose pose (`poses/graspable`)
+is 5 s. On Thor/laptop commissioning hardware FoundationPose publishes roughly
+one `/output` message every 2.1–2.5 s. If `/output` is slower than the budget,
+treat it as a perception performance fault rather than widening the budget.
+For production, derive the budget from the qualified worst-case FoundationPose
+period plus bounded scheduling jitter for the specific cell.
 
 ## ManyForge Runtime
 
 Start from the ManyForge checkout on Thor. The DDS variables must be exported in
-the shell that runs `scripts/launch.sh`; `docker-compose.yaml` passes them into
-the ROS-capable services.
+the shell that runs `./scripts/compose-dev.sh start`; the workbench passes them
+into its container unchanged (see
+[`DEVELOPMENT_WORKBENCH.md`](DEVELOPMENT_WORKBENCH.md)).
 
 ```bash
 export MANYFORGE_ROOT="${MANYFORGE_ROOT:-${HOME}/workspaces/dev_ws/src/manyforge}"
 cd "${MANYFORGE_ROOT}"
 source config/ros/isaac_lite6_trocar_foundationpose.env.sh
 
-./scripts/launch.sh --lane isaac-sim --assistant off \
-  --scenario isaac-lite6-trocar-foundationpose --non-interactive --yes start
+./scripts/compose-dev.sh start --project examples/isaac-lite6-trocar-foundationpose.scenario
+./scripts/compose-dev.sh status
 ```
 
-For strict qualification:
+A successful start reports the Scenario with `"ready": true`. Stop with
+`./scripts/compose-dev.sh stop`.
 
-```bash
-./scripts/launch.sh --lane isaac-sim --assistant off \
-  --scenario isaac-lite6-trocar-foundationpose --non-interactive --yes smoke
-```
-
-The smoke path checks:
-
-- Isaac joint-state visibility.
-- Lite6 `FollowJointTrajectory` action.
-- Lite6 gripper `GripperCommand` bridge.
-- Arm controller state.
-- FoundationPose `/output` as a `Detection3DArray` pose source.
-
-The FoundationPose smoke validator deliberately passes
-`--allow-zero-confidence` and `--allow-zero-covariance` because the currently
-observed Isaac ROS `/output` publishes empty id/class, score `0.0`, and zero
-covariance. This is a bootstrap allowance, not a production perception gate.
+The Isaac ROS `/output` publishes empty id/class, score
+`0.0`, and zero covariance. The trocar deployment accepts that
+(`confidence_min: 0`, see the frame contract below) as a bootstrap allowance,
+not a production perception gate.
 
 ## Frame Contract
 
@@ -257,46 +244,22 @@ but inaccurate camera transform will produce a plausible but wrong pick pose.
 
 ## Plan Pick Authoring And Execution
 
-`Plan Pick Sequence` is a no-motion planning node. It reads the selected
+**Plan pick sequence** is a no-motion planning node. It reads the selected
 detached object from the backend-authoritative scene, synthesizes bounded pick
-and approach poses, and validates the three planning legs before publishing a
-`pick_plan_v1` blackboard bundle. It does not close the gripper, attach the
-object, or execute an arm trajectory.
+and approach poses, and validates the planning legs before publishing its
+result to the blackboard. It does not close the gripper, attach the object, or
+execute an arm trajectory.
 
-In Composer, **Pick Plan Subtree** inserts the ordinary editable nodes needed
-for the pick half of the workflow:
+In Composer, the **Pick subtree** button opens a short form and then inserts
+ordinary, editable nodes for the pick half of the workflow. The generated
+nodes remain fully visible and editable; the template itself is never saved or
+run.
 
-```text
-Sequence
-  Plan Pick Sequence
-  Sequence
-    Move to approach
-    Cartesian descend to pick
-    Close gripper
-    Attach selected object
-    Cartesian retreat to approach
-```
-
-Insertion requires exactly one active deployment gripper and one selected,
-detached scene object. Failure is atomic: Composer adds no partial nodes or
-blackboard declarations. The generated nodes remain fully visible and editable;
-the template itself is never saved or run. Repeated insertions receive one
-deterministic suffix across node names and the generated blackboard namespace.
-
-The approach move is an absolute pose motion. Descend and retreat are
-fail-closed Cartesian paths and require the deployment to advertise
-`planning.motion.cartesian_path`. Each generated motion has independent
-selectors for motion type (`joint`, `pose`, `cartesian`), target mode
-(`absolute`, `relative`), and planner-neutral planning profile
-(`first_feasible`, `balanced`, `quality_bounded`). Relative describes how a
-target is resolved; it is not a motion type. Unsupported choices are rejected
+Each generated motion has independent selectors for motion type (`joint`,
+`pose`, `cartesian`), target mode (`absolute`, `relative`), and
+planner-neutral planning profile. Cartesian paths require the Deployment to
+advertise `planning.motion.cartesian_path`. Unsupported choices are rejected
 instead of silently falling back to another planner behavior.
-
-When a stage fails, inspect the Plan Pick report and the failing motion node.
-The report retains the requested stage target/path and identifies whether pose
-synthesis, planning, collision validation, support-contact release, or another
-authoritative gate failed. A failed Cartesian descend or retreat is not retried
-as endpoint-only pose planning.
 
 Use a narrow `contact_grasp` policy only for the intended tool/object contact.
 After attachment, `touch_links` are the only gripper/object collision allowance.
@@ -319,21 +282,17 @@ for production gating:
 - `results[0].hypothesis.score`: `0.0`
 - `pose.covariance`: all zeros
 
-Because of that, the deployment uses `metadata.selection: first` and
-`confidence_min: 0.0`. This is acceptable only while a single trocar is present
+Because of that, the Deployment uses `selection: first` and
+`confidence_min: 0`. This is acceptable only while a single trocar is present
 and the scene is controlled. Before industrial use, restore nonzero perception
 quality signals or add a separately qualified gate that proves the selected pose
 is the intended object.
 
-The program also enables `plan_pick_sequence.force_vertical_pick: true`,
-`enable_min_tcp_z: true`, and `min_tcp_z_m: 0.016`. This is a planner-side
-top-down grasp constraint: the generated pick and approach TCP poses force the
-local TCP Z axis downward while preserving the selected object's horizontal
-heading, and clamp generated TCP Z above the configured floor before preview
-validation. `enable_min_tcp_z` can be switched off to keep the threshold value
-visible in Composer without enforcing the clamp. It does not replace a future
-pose-source conditioning policy for cleaning the scene object's stored
-orientation.
+The Program also sets `force_vertical_pick: true` and `min_tcp_z_m: 0.016`
+on the Plan pick sequence node. This is a planner-side top-down grasp
+constraint: the generated pick and approach TCP poses force the local TCP Z
+axis downward while preserving the selected object's horizontal heading, and
+clamp generated TCP Z above the configured floor before preview validation.
 
 The pick planner's pose-construction order is intentional:
 
@@ -344,7 +303,7 @@ The pick planner's pose-construction order is intentional:
    the TCP local Z axis is forced vertical-down while preserving the object's
    horizontal heading; the object pose itself is not moved or re-oriented.
 1. Apply `pick_offset_envelope` XYZ modifiers in `pick_offset_reference`.
-1. Apply `min_tcp_z_m` if enabled; this happens after the reference-basis
+1. Apply `min_tcp_z_m`; this happens after the reference-basis
    offset and can change the final TCP Z from the pure rotated offset.
 1. Apply `approach_offset_envelope` XYZ modifiers relative to the final pick
    pose in `approach_offset_reference`.
@@ -373,10 +332,8 @@ trajectory separates that exact pair and does not re-contact. Do not replace
 this with a global collision exemption; only the picked-object/support pair
 should receive this policy.
 
-In Composer, edit these relationships from **Scene -> Support Contacts**. The
-section only offers authored scene objects, rejects duplicate object/support
-pairs, and prompts before deleting an object that participates in a support
-contact. `Limit start penetration` maps to
+In Composer, edit these relationships in the Scene's **Support contacts**
+section. **Limit the starting penetration** maps to
 `enforce_max_start_penetration`; disabling it removes the first-waypoint
 penetration envelope only. Release, final separation, and re-contact checks
 remain active.
@@ -403,22 +360,21 @@ ros2 topic echo /output vision_msgs/msg/Detection3DArray --once --timeout 120 \
   --qos-reliability reliable --qos-durability volatile
 ```
 
-If Composer reports `no fresh pose-source update for: graspable`, check the
+If Composer reports the `graspable` pose as stale or missing, check the
 perception rate before pressing Run:
 
 ```bash
 ros2 topic hz /output
 ```
 
-The scenario is sized for `/output` periods up to roughly `5 s`. A 1 Hz or
-faster stream should stay fresh continuously. A `~0.4 Hz` stream will now remain
-fresh long enough for the before-planning pose apply step, but it is still a
-commissioning-grade perception rate, not a production throughput target.
+The Scenario is sized for `/output` periods up to 5 s. A 1 Hz or faster
+stream stays fresh continuously. A ~0.4 Hz stream stays fresh long enough for
+the before-planning pose apply step, but it is a commissioning-grade
+perception rate, not a production throughput target.
 
-If ManyForge smoke fails with `tf_lookup_failed`, the perception stream is
+If ManyForge reports `tf_lookup_failed`, the perception stream is
 arriving but the `link_base <- camera_color_optical_frame` transform is missing
 or not visible to the ManyForge ROS sidecar. Fix TF before running motion.
 
-If the arm or gripper actions are missing, confirm the scenario is
-`isaac-lite6-trocar-foundationpose`. The launcher sets the Lite6 topic-control
-profile and gripper action defaults for this scenario.
+If the arm or gripper actions are missing, confirm the workbench was started
+with `--project examples/isaac-lite6-trocar-foundationpose.scenario`.

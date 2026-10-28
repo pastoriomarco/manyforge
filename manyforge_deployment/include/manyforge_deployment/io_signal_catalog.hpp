@@ -86,6 +86,38 @@ ResolveRetainedIoSignalCatalog(
     const core::CellGraphDTO &graph,
     const std::optional<core::RuntimeUnitId> &runtime_unit_id = std::nullopt);
 
+/// System signals (grasp lost as a signal, contract §2): one compiled input
+/// per gripper target, never authored. A gripper target is a command target
+/// with a `tool.gripper.command` control binding; the signal lives on that
+/// target's component (the robot carrying the object).
+inline constexpr std::string_view kSystemCarriedObjectProfile =
+    "system_carried_object";
+inline constexpr std::string_view kCarriedObjectLostSignalPrefix =
+    "carried_object_lost.";
+/// The compiled resource role of the signal on its gripper target (wait and
+/// check input nodes); component types do not declare it.
+inline constexpr std::string_view kCarriedObjectLostResourceRole =
+    "carried_object_lost";
+/// One in-process source for every system signal of the execution host.
+inline constexpr std::string_view kCarriedObjectLostSourceId =
+    "system.carried_object_lost";
+inline constexpr std::size_t kCarriedObjectLostIngressDepth = 16U;
+inline constexpr std::string_view kGripperCommandCapabilityId =
+    "tool.gripper.command";
+
+[[nodiscard]] std::string
+CarriedObjectLostSignalName(std::string_view command_target_id);
+
+/// The authored catalog plus the compiled system signals: input, bool,
+/// change_only, sampled_only, freshness `provider_validity`, in-process
+/// liveness, profile `system_carried_object`. Every reader of signal values
+/// (node and global rule conditions, Program signal roles, the host signal
+/// installation) uses this; provider domains, devices, lifecycle and output
+/// channels keep the authored catalog. An authored row that takes a system
+/// identity is refused (`io_system_signal_conflict`).
+[[nodiscard]] core::Result<std::vector<RetainedIoSignalConfiguration>>
+ResolveCompiledIoSignalCatalog(const core::CellGraphDTO &graph);
+
 /// CP9: one model-free pose-source row (`pose_sources`) of a runtime unit.
 struct RetainedPoseSourceConfiguration final {
   core::RuntimeUnitId runtime_unit_id;

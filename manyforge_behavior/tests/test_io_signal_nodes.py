@@ -18,7 +18,7 @@ from manyforge_behavior.canonical_artifact import (
     compute_content_identity,
     load_strict_json_yaml,
 )
-from manyforge_behavior.catalog import NodeCatalog
+from manyforge_behavior.catalog import EXPECTED_CONTENT_VERSION, NodeCatalog
 from manyforge_behavior.kernel_client import KernelClient
 from manyforge_behavior.nodes.v2_owner import IoInputWaitAdapter
 from manyforge_behavior.orchestration_ports import (
@@ -266,7 +266,7 @@ def _read(port, node_id: str, **parameters):
 
 def test_reads_waits_and_outputs_are_executable() -> None:
     catalog = NodeCatalog(_ROOT / "manyforge_behavior/resources/node_catalog.yaml")
-    assert catalog.content_version == "2.7.0"
+    assert catalog.content_version == EXPECTED_CONTENT_VERSION
     timeout = next(
         row for row in catalog.get("io.wait_for_input").parameters if row.id == "timeout_s"
     )
@@ -445,6 +445,75 @@ def test_program_validation_refuses_edge_waits(edge: str) -> None:
 def test_program_validation_accepts_level_waits(edge, timeout_s) -> None:
     catalog = NodeCatalog(_ROOT / "manyforge_behavior/resources/node_catalog.yaml")
     Program.from_dict(_wait_program(edge, timeout_s=timeout_s), catalog)
+
+
+def _gripper_check_program(resource_roles: tuple[str, ...], *, role_reads_input: bool) -> dict[str, Any]:
+    """A gripper role read by Check Input (contract §8.3, SX-269).
+
+    The Program role declares what its nodes need; whether the bound target
+    must also provide ``io.gpio.get_input`` is decided per operand at binding
+    (a compiled system signal such as ``carried_object_lost`` serves itself).
+    """
+    document = load_strict_json_yaml(_ROOT / "examples/pick_and_place_minimal.program.yaml")
+    capabilities = ["tool.gripper.command"]
+    if role_reads_input:
+        capabilities.insert(0, "io.gpio.get_input")
+    document["target_roles"]["gripper"] = {
+        "component_role": "robot",
+        "required_capabilities": [
+            {"capability_id": capability, "parameters": {}, "disposition": "required"}
+            for capability in capabilities
+        ],
+        "required_resource_roles": sorted({"carried_object_lost", *resource_roles}),
+    }
+    document["tree"] = {
+        "node_id": "sequence",
+        "instance_id": "root",
+        "parameters": {},
+        "children": [
+            {
+                "node_id": "io.check_input",
+                "instance_id": f"check_{role}",
+                "parameters": {
+                    "target_role": "gripper",
+                    "resource_role": role,
+                    "expected_value": True,
+                },
+                "children": [],
+            }
+            for role in resource_roles
+        ],
+    }
+    document["program_revision"] = compute_content_identity(
+        document,
+        own_field="program_revision",
+        identity_domain="program-revision",
+        api_version="manyforge.program.v2",
+    )
+    return document
+
+
+@pytest.mark.parametrize(
+    "resource_roles", [("carried_object_lost",), ("carried_object_lost", "fingers")]
+)
+def test_program_validation_accepts_check_input_on_the_gripper_system_signal(
+    resource_roles,
+) -> None:
+    catalog = NodeCatalog(_ROOT / "manyforge_behavior/resources/node_catalog.yaml")
+    Program.from_dict(
+        _gripper_check_program(resource_roles, role_reads_input=True), catalog
+    )
+
+
+@pytest.mark.parametrize("resource_role", ["carried_object_lost", "fingers"])
+def test_program_validation_still_requires_the_role_input_capability(
+    resource_role: str,
+) -> None:
+    catalog = NodeCatalog(_ROOT / "manyforge_behavior/resources/node_catalog.yaml")
+    with pytest.raises(ProgramValidationError, match="io.gpio.get_input"):
+        Program.from_dict(
+            _gripper_check_program((resource_role,), role_reads_input=False), catalog
+        )
 
 
 # --- Native watch port ------------------------------------------------------

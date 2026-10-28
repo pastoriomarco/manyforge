@@ -148,6 +148,65 @@ VerifyPickReferenceTargets(const ProductBackedRuntimeParticipantResolver &resolv
   return core::Result<void>::Ok();
 }
 
+/// Manager publication of one gripper's grasp-lost level (contract §8.4):
+/// recorded in the host store, then delivered to the composed source.
+CanonicalValue
+CarriedObjectLostResponse(const CarriedObjectLostSetRequest &request) {
+  std::optional<HostCarriedObjectLostSignals::Loss> loss;
+  if (request.level)
+    loss = HostCarriedObjectLostSignals::Loss{
+        request.controllable_component_id, request.command_target_id,
+        *request.carried_object_attachment_id, *request.scene_resource_id,
+        request.set_key, *request.loss_event_id};
+  const auto refused = host_carried_object_lost_signals().Publish(
+      request.controllable_component_id, request.command_target_id,
+      std::move(loss));
+  return CanonicalValue(CanonicalValue::Object{
+      {"api_version", CanonicalValue(std::string(kResponseApiVersion))},
+      {"command", CanonicalValue("set_carried_object_lost")},
+      {"level", CanonicalValue(request.level)},
+      {"ok", CanonicalValue(true)},
+      // The level is recorded either way; a refused delivery is reported.
+      {"publication_error",
+       refused ? ErrorValue(*refused) : CanonicalValue(nullptr)},
+  });
+}
+
+/// The last loss per gripper and key (contract §10 "Coalescing").
+CanonicalValue CarriedObjectLastLossesValue() {
+  CanonicalValue::Array rows;
+  for (const auto &last : host_carried_object_lost_signals().LastLosses())
+    rows.emplace_back(CanonicalValue::Object{
+        {"command_target_id", CanonicalValue(last.command_target_id.value())},
+        {"controllable_component_id",
+         CanonicalValue(last.controllable_component_id.value())},
+        {"loss_event_id", CanonicalValue(last.loss_event_id)},
+        {"set_key", CanonicalValue(last.set_key)},
+    });
+  return CanonicalValue(std::move(rows));
+}
+
+/// Every lost attachment of this host (contract §8.1).
+CanonicalValue CarriedObjectLostSignalsValue() {
+  CanonicalValue::Array rows;
+  for (const auto &loss : host_carried_object_lost_signals().Losses())
+    rows.emplace_back(CanonicalValue::Object{
+        {"carried_object_attachment_id",
+         CanonicalValue(loss.carried_object_attachment_id)},
+        {"command_target_id", CanonicalValue(loss.command_target_id.value())},
+        {"controllable_component_id",
+         CanonicalValue(loss.controllable_component_id.value())},
+        {"lost", CanonicalValue(true)},
+        {"loss_event_id", CanonicalValue(loss.loss_event_id)},
+        {"scene_resource_id", CanonicalValue(loss.scene_resource_id)},
+        {"set_key", loss.set_key ? CanonicalValue(*loss.set_key)
+                                 : CanonicalValue(nullptr)},
+        {"signal_name",
+         CanonicalValue(deployment::CarriedObjectLostSignalName(
+             loss.command_target_id.value()))},
+    });
+  return CanonicalValue(std::move(rows));
+}
 
 } // namespace
 
@@ -178,7 +237,8 @@ ExecutionCommandSurface::ExecutionCommandSurface(
         manager_liveness_admission_(manager_liveness_admission),
         host_lock_(run_root), command_socket_(run_root, kSocketFileName),
         control_socket_(run_root, kControlSocketFileName),
-        observation_socket_(run_root, kObservationSocketFileName) {
+        observation_socket_(run_root, kObservationSocketFileName),
+        event_stream_socket_(run_root, kEventStreamSocketFileName) {
     if (!lane_wake_) {
       FailErrno("create execution lane wake");
     }
@@ -199,6 +259,11 @@ int ExecutionCommandSurface::Run(const std::stop_token stop_token) {
         });
     std::jthread scene_read_thread([this](std::stop_token stop_token) {
       RunDeferredLane(scene_read_lane_, stop_token);
+    });
+    // Subscriber writers never take a command lane or its locks while they
+    // send; a slow subscriber only lags in the journal.
+    std::jthread event_stream_thread([this](std::stop_token stop_token) {
+      event_stream_.Run(event_stream_socket_.get(), stop_token);
     });
     while (g_stop_requested == 0 && !stop_token.stop_requested() &&
            !reconciliation_lane_failed_.load(std::memory_order_acquire)) {
@@ -231,6 +296,8 @@ int ExecutionCommandSurface::Run(const std::stop_token stop_token) {
     observation_thread.request_stop();
     submission_ordered_thread.request_stop();
     scene_read_thread.request_stop();
+    event_stream_thread.request_stop();
+    event_stream_thread.join();
     submission_ordered_thread.join();
     scene_read_thread.join();
     reconciliation_thread.join();
@@ -2112,6 +2179,30 @@ CanonicalValue ExecutionCommandSurface::IoWatchResponse(
     if (!io_bindings.empty())
       target_fields.emplace_back("io_signal_bindings",
                                  CanonicalValue(std::move(io_bindings)));
+    // Read-only compiled system signals (contract §8.2); present when any.
+    CanonicalValue::Array system_signals;
+    const auto compiled = deployment::ResolveCompiledIoSignalCatalog(
+        composition.bundle->value().cell_graph);
+    Require(compiled.ok(), "applied I/O signal catalog is invalid");
+    for (const auto &row : compiled.value()) {
+      if (row.provider.profile != deployment::kSystemCarriedObjectProfile)
+        continue;
+      system_signals.emplace_back(CanonicalValue::Object{
+          {"command_target_id", CanonicalValue(row.command_target_id.value())},
+          {"controllable_component_id",
+           CanonicalValue(
+               row.descriptor.signal_id.controllable_component_id.value())},
+          {"direction", CanonicalValue("input")},
+          {"level", CanonicalValue(host_carried_object_lost_signals().Level(
+                        row.descriptor.signal_id))},
+          {"signal_name", CanonicalValue(row.descriptor.signal_id.name)},
+          {"source_kind", CanonicalValue(row.provider.profile)},
+          {"value_type", CanonicalValue("bool")},
+      });
+    }
+    if (!system_signals.empty())
+      target_fields.emplace_back("system_signals",
+                                 CanonicalValue(std::move(system_signals)));
     return CanonicalValue(CanonicalValue::Object{
         {"api_version", CanonicalValue(std::string(kResponseApiVersion))},
         {"command", CanonicalValue("targets")},
@@ -2912,6 +3003,8 @@ ExecutionCommandSurface::EventsResponse(const Command &command) const {
       {"api_version", CanonicalValue(std::string(kResponseApiVersion))},
       {"command", CanonicalValue("events")},
       {"execution_owner_ready", CanonicalValue(execution_owner_ready)},
+      {"carried_object_last_losses", CarriedObjectLastLossesValue()},
+      {"carried_object_lost_signals", CarriedObjectLostSignalsValue()},
       {"owner_epoch", CanonicalValue(actual_owner_epoch.value())},
       {"runtime_faults", RuntimeFaultsValue(owner)},
   };
@@ -2948,25 +3041,11 @@ ExecutionCommandSurface::EventsResponse(const Command &command) const {
     if (!page.ok()) return failure(page.error());
     const auto admission = owner.GetAuthoringAdmission();
     // Progress remains presentation-only on this same existing read.
-    CanonicalValue::Array operation_progress;
-    for (const auto &operation : owner.get_resident_operations(
-             {direct_control_program_run_id_, direct_control_gripper_program_run_id_,
-              direct_control_io_program_run_id_})) {
-      if (operation.state != core::OperationStateKind::kExecuting ||
-          operation.participants.size() != 1U)
-        continue;
-      operation_progress.emplace_back(CanonicalValue::Object{
-          {"owner_epoch", CanonicalValue(actual_owner_epoch.value())},
-          {"operation_id", CanonicalValue(operation.operation_id.value())},
-          {"operation_revision", CanonicalValue(static_cast<double>(
-                                     operation.operation_revision.value()))},
-          {"progress", CanonicalValue(operation.participants.front().progress)},
-      });
-    }
     metadata.emplace_back("admission_generation", CanonicalValue(
         static_cast<double>(admission.admission_generation.value())));
     metadata.emplace_back("event_page", OperationEventPageValue(page.value()));
-    metadata.emplace_back("operation_progress", CanonicalValue(std::move(operation_progress)));
+    metadata.emplace_back("operation_progress",
+                          OperationProgressValue(owner, actual_owner_epoch));
     metadata.emplace_back("ok", CanonicalValue(true));
     return CanonicalValue(std::move(metadata));
   } catch (const std::exception &error) {
@@ -2976,6 +3055,71 @@ ExecutionCommandSurface::EventsResponse(const Command &command) const {
     return failure(core::ErrorDTO{"execution_command_invalid",
                                  "operational event page read threw", {}});
   }
+}
+
+std::pair<std::string, CanonicalValue>
+ExecutionCommandSurface::EventStreamState() const {
+  bool execution_owner_ready;
+  {
+    std::shared_lock composition_lock(composition_access_.mutex);
+    execution_owner_ready = composition_access_.product() != nullptr;
+  }
+  auto &owner = StableKernel();
+  const auto owner_epoch = owner.request_owner_epoch();
+  // The same owner facts as the `events` reply, read the same way.
+  auto state = InterruptRuleEventMetadataFields(
+      owner.ReadInterruptRuleStateBaseline(), owner_epoch);
+  state.emplace_back("admission_generation",
+                     CanonicalValue(static_cast<double>(
+                         owner.GetAuthoringAdmission()
+                             .admission_generation.value())));
+  state.emplace_back("carried_object_last_losses",
+                     CarriedObjectLastLossesValue());
+  state.emplace_back("carried_object_lost_signals",
+                     CarriedObjectLostSignalsValue());
+  state.emplace_back("execution_owner_ready",
+                     CanonicalValue(execution_owner_ready));
+  state.emplace_back("runtime_faults", RuntimeFaultsValue(owner));
+  return {owner_epoch.value(), CanonicalValue(std::move(state))};
+}
+
+CanonicalValue ExecutionCommandSurface::OperationProgressValue(
+    core::ResourceAddressedExecutionKernel &owner,
+    const core::RequestOwnerEpoch &owner_epoch) const {
+  CanonicalValue::Array operation_progress;
+  for (const auto &operation : owner.get_resident_operations(
+           {direct_control_program_run_id_, direct_control_gripper_program_run_id_,
+            direct_control_io_program_run_id_})) {
+    if (operation.state != core::OperationStateKind::kExecuting ||
+        operation.participants.size() != 1U)
+      continue;
+    operation_progress.emplace_back(CanonicalValue::Object{
+        {"owner_epoch", CanonicalValue(owner_epoch.value())},
+        {"operation_id", CanonicalValue(operation.operation_id.value())},
+        {"operation_revision", CanonicalValue(static_cast<double>(
+                                   operation.operation_revision.value()))},
+        {"progress", CanonicalValue(operation.participants.front().progress)},
+    });
+  }
+  return CanonicalValue(std::move(operation_progress));
+}
+
+CanonicalValue ExecutionCommandSurface::EventStreamProgress() const {
+  auto &owner = StableKernel();
+  return OperationProgressValue(owner, owner.request_owner_epoch());
+}
+
+CanonicalValue
+ExecutionCommandSurface::EventStreamPage(const std::string &owner_epoch,
+                                         const std::uint64_t after) const {
+  auto *const journal = composition_access_.operation_journal.load();
+  Require(journal != nullptr,
+          "operational events have no stable cell journal owner");
+  const auto page = journal->ReadOperationalEvents(
+      core::RequestOwnerEpoch(owner_epoch), after, kMaximumEventPage);
+  if (!page.ok())
+    Fail(page.error().code + ": " + page.error().message);
+  return OperationEventPageValue(page.value());
 }
 
 std::optional<CanonicalValue> ExecutionCommandSurface::ExecuteProgramCommand(
@@ -3652,6 +3796,7 @@ CanonicalValue ExecutionCommandSurface::ExecuteLogicalProduct(
       case CommandKind::kReadIoWatch:
       case CommandKind::kReleaseIoWatch:
       case CommandKind::kSetMockIoInput:
+      case CommandKind::kSetCarriedObjectLost:
       case CommandKind::kPublishProgramBlackboard:
       case CommandKind::kQueryOperation:
       case CommandKind::kControlState:
@@ -4040,11 +4185,15 @@ void ExecutionCommandSurface::HandleOneClient(const CommandSocket &socket, const
                 // while no physical product is composed; the host cannot
                 // infer rest from the absence of one.
                 auto &owner = StableKernel();
-                response = command.kind == CommandKind::kReadStop
-                               ? ReadStop(command, owner)
-                           : command.kind == CommandKind::kGetStopFault
-                               ? ReadStopFault(owner)
-                               : ExecuteStop(command, owner);
+                response =
+                    command.kind == CommandKind::kSetCarriedObjectLost
+                        ? CarriedObjectLostResponse(
+                              *command.carried_object_lost_set)
+                    : command.kind == CommandKind::kReadStop
+                        ? ReadStop(command, owner)
+                    : command.kind == CommandKind::kGetStopFault
+                        ? ReadStopFault(owner)
+                        : ExecuteStop(command, owner);
               } else if (lane == CommandLane::kObservation &&
                          command.kind != CommandKind::kObservation &&
                          command.kind != CommandKind::kReadVolatileMotionTrace) {
@@ -4052,6 +4201,11 @@ void ExecutionCommandSurface::HandleOneClient(const CommandSocket &socket, const
                     "execution_observation_command_unsupported",
                     "the independent observation socket accepts only "
                     "observation");
+              } else if (command.kind == CommandKind::kSetCarriedObjectLost) {
+                response = ErrorResponse(
+                    "execution_ordinary_command_unsupported",
+                    "carried-object-lost signals are published on the "
+                    "independent Stop control socket");
               } else if (IsStopLaneRead(command.kind)) {
                 response = ErrorResponse(
                     "execution_ordinary_command_unsupported",

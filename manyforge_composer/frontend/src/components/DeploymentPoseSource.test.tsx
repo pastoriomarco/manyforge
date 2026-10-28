@@ -16,6 +16,27 @@ const arm = {
   configuration: { mode: 'simulated', execution_tick_hz: 100 },
 };
 
+const armWithGripperTargets = (targetIds: string[]) => ({
+  ...arm,
+  configuration: {
+    ...arm.configuration,
+    gripper_target_configurations: targetIds.map((command_target_id) => ({
+      controllable_component_id: 'arm',
+      command_target_id,
+      description: `Test ${command_target_id}`,
+      actuation_kind: 'position_commanded',
+      open_state_ref: 'open',
+      closed_state_ref: 'closed',
+      command_duration_s: 0.8,
+      touch_links: ['tool_base_link'],
+      mount_frame: 'tool0',
+      attach_frame: 'tool0',
+      tcp_frame: 'tool0',
+      auxiliary_frames: [],
+    })),
+  },
+});
+
 const device = {
   component_id: 'station_io',
   component_profile_id: 'io_device_v0',
@@ -150,6 +171,153 @@ describe('Deployment pose sources', () => {
       const items = mounted.all((props) => Array.isArray(props.children)).flatMap((props) => props.children as unknown[]);
       expect(items).toContain('cheese');
       expect(items).toContain('/cheese');
+    } finally { await mounted.unmount(); }
+  });
+
+  it('stores a per-robot reference only after every explicit field is complete', async () => {
+    const legacyPoseSource = {
+      ...poseSource,
+      configuration: {
+        ...poseSource.configuration,
+        runtime_configuration: {
+          ...poseSource.configuration.runtime_configuration,
+          simulation: {
+            ...poseSource.configuration.runtime_configuration.simulation,
+            relative_reference: {
+              entity: '/World/legacy-tool',
+              link: 'legacy_base_link',
+              source_header_frame_id: 'legacy_base_link',
+            },
+          },
+        },
+      },
+    };
+    const mounted = await mount([armWithGripperTargets(['gripper']), legacyPoseSource]);
+    try {
+      const notice = mounted.all((props) => props.role === 'status')
+        .map((props) => props.children)
+        .find((children) => String(children).includes('legacy single reference'));
+      expect(notice).toContain(
+        'legacy single reference: migrated at Apply only if the cell has exactly one gripper target; otherwise set per-target references',
+      );
+      const add = mounted.control('isaac_scene_objects add gripper target reference');
+      expect(add).toBeDefined();
+      await act(() => add.onClick?.());
+      expect(mounted.controller.mutate).not.toHaveBeenCalled();
+
+      await mounted.type('isaac_scene_objects relative reference 1 robot component', 'arm');
+      await mounted.type('isaac_scene_objects relative reference 1 gripper command target', 'gripper');
+      await mounted.commit('isaac_scene_objects relative reference 1 Measured entity', '/World/robot/tool');
+      await mounted.commit('isaac_scene_objects relative reference 1 Measured body link', 'tool_base_link');
+      expect(mounted.controller.mutate).not.toHaveBeenCalled();
+
+      const expectedSimulation: Record<string, JsonValue> = {
+        ...legacyPoseSource.configuration.runtime_configuration.simulation,
+        relative_references: [{
+          controllable_component_id: 'arm',
+          command_target_id: 'gripper',
+          entity: '/World/robot/tool',
+          link: 'tool_base_link',
+          source_header_frame_id: 'tool_base_link',
+        }],
+      };
+      delete expectedSimulation.relative_reference;
+      await mounted.commit('isaac_scene_objects relative reference 1 Source header frame', 'tool_base_link');
+      expect(mounted.controller.mutate).toHaveBeenCalledExactlyOnceWith(
+        ['components', 1, 'configuration', 'runtime_configuration'], 'set',
+        {
+          ...legacyPoseSource.configuration.runtime_configuration,
+          simulation: expectedSimulation,
+        },
+      );
+      const saved = vi.mocked(mounted.controller.mutate).mock.calls[0]?.[2] as {
+        simulation: Record<string, unknown>;
+      };
+      expect(saved.simulation).not.toHaveProperty('relative_reference');
+    } finally { await mounted.unmount(); }
+  });
+
+  it('allows distinct gripper targets for the same robot component', async () => {
+    const firstReference = {
+      controllable_component_id: 'arm',
+      command_target_id: 'gripper',
+      entity: '/World/robot/tool',
+      link: 'tool_base_link',
+      source_header_frame_id: 'tool_base_link',
+    };
+    const configured = {
+      ...poseSource,
+      configuration: {
+        ...poseSource.configuration,
+        runtime_configuration: {
+          ...poseSource.configuration.runtime_configuration,
+          simulation: {
+            ...poseSource.configuration.runtime_configuration.simulation,
+            relative_references: [firstReference],
+          },
+        },
+      },
+    };
+    const mounted = await mount([armWithGripperTargets(['gripper', 'parallel_jaw']), configured]);
+    try {
+      await act(() => mounted.control('isaac_scene_objects add gripper target reference').onClick?.());
+      await mounted.type('isaac_scene_objects relative reference 2 robot component', 'arm');
+      await mounted.type('isaac_scene_objects relative reference 2 gripper command target', 'parallel_jaw');
+      await mounted.commit('isaac_scene_objects relative reference 2 Measured entity', '/World/robot/parallel_jaw');
+      await mounted.commit('isaac_scene_objects relative reference 2 Measured body link', 'parallel_jaw_base');
+      expect(mounted.controller.mutate).not.toHaveBeenCalled();
+      await mounted.commit('isaac_scene_objects relative reference 2 Source header frame', 'parallel_jaw_base');
+      expect(mounted.controller.mutate).toHaveBeenCalledExactlyOnceWith(
+        ['components', 1, 'configuration', 'runtime_configuration'], 'set',
+        {
+          ...configured.configuration.runtime_configuration,
+          simulation: {
+            ...configured.configuration.runtime_configuration.simulation,
+            relative_references: [firstReference, {
+              controllable_component_id: 'arm',
+              command_target_id: 'parallel_jaw',
+              entity: '/World/robot/parallel_jaw',
+              link: 'parallel_jaw_base',
+              source_header_frame_id: 'parallel_jaw_base',
+            }],
+          },
+        },
+      );
+    } finally { await mounted.unmount(); }
+  });
+
+  it('removes the relative_references property when the last robot row is removed', async () => {
+    const configured = {
+      ...poseSource,
+      configuration: {
+        ...poseSource.configuration,
+        runtime_configuration: {
+          ...poseSource.configuration.runtime_configuration,
+          simulation: {
+            ...poseSource.configuration.runtime_configuration.simulation,
+            relative_references: [{
+              controllable_component_id: 'arm',
+              command_target_id: 'gripper',
+              entity: '/World/robot/tool',
+              link: 'tool_base_link',
+              source_header_frame_id: 'tool_base_link',
+            }],
+          },
+        },
+      },
+    };
+    const mounted = await mount([armWithGripperTargets(['gripper']), configured]);
+    try {
+      const remove = mounted.control('Remove isaac_scene_objects relative reference 1');
+      await act(() => remove.onClick?.());
+      const expectedSimulation = {
+        ...poseSource.configuration.runtime_configuration.simulation,
+      };
+      expect(expectedSimulation).not.toHaveProperty('relative_references');
+      expect(mounted.controller.mutate).toHaveBeenCalledExactlyOnceWith(
+        ['components', 1, 'configuration', 'runtime_configuration'], 'set',
+        { ...poseSource.configuration.runtime_configuration, simulation: expectedSimulation },
+      );
     } finally { await mounted.unmount(); }
   });
 

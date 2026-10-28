@@ -42,6 +42,10 @@ NOT (section 2).
 
 - A key that a rule reads must declare `initial:`, so that the rule has a
   value from the start.
+- Between Runs, with an Applied Program, rules see each referenced run-scoped
+  key's declared `initial` after Reset or a cold Apply; persistent keys use
+  their stored value, or their declared `initial` when none is stored. A
+  finished Run's keys keep their last value until Reset.
 - Every write to such a key is sent to the rule evaluation at once; the rule
   does not wait for a periodic check.
 - A formula key (`expression:`) cannot be read by a rule: it has no
@@ -67,10 +71,11 @@ A global rule reacts in one of two ways (`on_trip`, section 4):
 
 - `gate` (default): while the condition is true, new motion in the scope is
   not started, and a motion that is moving gets its Stop. When the condition
-  clears, motion is allowed again with no acknowledgement. A motion node of a
-  running Program that is held back this way does not fail: it **waits**
-  ("Motion waits"), within its `execution_timeout_s`, and starts when the
-  rule clears.
+  clears, motion is allowed again with no acknowledgement (a motion it stopped
+  while moving can need Reset and an alarm acknowledgement; section 4). A motion
+  node of a running Program that is held back this way does not fail: it
+  **waits** ("Motion waits"), within its `execution_timeout_s`, and starts
+  when the rule clears.
 - `full_stop`: a moving robot in the scope triggers a cell Full Stop, and the
   rule latches until the operator releases it in the GUI. The
   `idle_behaviour` setting exists only for this reaction.
@@ -151,14 +156,127 @@ also protects motion when no Program is applied.
 These checks also stop motion, but through their own owners. They are not
 configured as interrupt rules and do not appear in `interrupt_state.*`:
 
-- **Grasp lost:** when a carried object leaves its bound, the robot gets its
-  Stop, the object is detached, and the alarm `scene.carried_object_lost` is
-  raised.
+- **Grasp lost:** when a carried object leaves its bound, the **Attach object**
+  node's `on_grasp_lost` settings choose whether to Stop, raise an alarm, set a
+  key, or detach the object. The system signal is published on every loss; see
+  [Grasp lost as a Program event](#grasp-lost-as-a-program-event).
 - **Runtime collision monitor:** a collision it finds stops the motion
   through the normal Stop path.
 - **Component stream faults:** when a required stream of a component stops
   reporting, the component is shown as faulted and motion is stopped and
   blocked.
+
+### Grasp lost as a Program event
+
+The grasp-lost check compares the measured pose of an attached object with the
+bound on its **Attach object** node (`grasp_lost_translation_m`,
+`grasp_lost_rotation_rad`). The source must measure the carried offset (for
+example, `continuous_relative_to_attached`). A commanded-only Mock pose does
+not measure object loss. Mock can exercise a writable key through the runtime
+blackboard control, but it cannot trigger the measured-loss system signal or
+qualify the grasp-loss detector.
+
+The Attach object node's `on_grasp_lost` settings control the response:
+
+| Setting | Default | Effect on loss |
+| --- | --- | --- |
+| `raise_alarm` | `true` | Raise the `scene.carried_object_lost` alarm. When true, `stop_motion` must also be true. |
+| `stop_motion` | `true` | Request the existing Stop path for the carrier. |
+| `set_key` | `null` | Optional declared writable `bool` key. The Runner writes `true` once for this attachment's loss. |
+| `detach` | `true` | Detach the object at its observed pose. |
+
+If ManyForge cannot publish the grasp-lost signal, it raises the alarm and Stops regardless of these settings; the alarm names the publication error.
+
+The default is alarm + Stop + detach. A Program-handled response can set
+`raise_alarm: false`, `stop_motion: false`, name a writable key in `set_key`,
+and keep `detach: true`. The loss also raises the system input signal
+`carried_object_lost.<command_target_id>` for the gripper target. It is
+read-only and declared by the Deployment automatically. It becomes `true` on
+loss and becomes `false` on the next attach by that gripper, a Program detach,
+or cell Reset. Detach-on-loss does not clear it.
+
+The Runner's key mirror is event-driven; it writes `true` for the loss and
+does not write `false`. Reset the key explicitly with a **Set value** node
+before the next carry. Give the key `initial: false` so a Deployment rule can
+read it (section 1). The system signal is the immediate input for motion and
+Deployment rules; the optional key is a separate Program value mirror.
+
+**Mock key simulation:** use
+[`examples/lite6_grasp_lost.scenario`](../../examples/lite6_grasp_lost.scenario)
+to exercise the key-triggered global gate and recovery. Mock does not measure
+grasp loss, so start a Run, wait until `pick_retreat` is running, then in the
+**Program run** panel open **Advanced: runtime blackboard**, choose `part_lost`,
+enter `true`, and click **Write current-run value**. This simulates the key
+value; it does not publish a grasp-loss event, change the read-only
+`carried_object_lost.<target>` signal, or qualify the measured-loss detector.
+When `pick_retreat` is already moving, the global gate requests Stop. The
+example's Fallback is authored to reset `part_lost`, move to the safe pose
+outside the carry group, detach `graspable` (the manual write did not detach
+it) and skip the item. In this build, though, a moving gate Stop leaves the
+operation intervention-required and raises the
+`manyforge.motion.execution_fault` alarm: the Fallback resets `part_lost`, but
+its safe-pose move is refused (`participant_engine_busy`) and the Run fails.
+Clear the rule condition and inspect the fault; Reset retires the affected
+operation, and the execution-fault alarm requires acknowledgement before
+motion can proceed. Apply the usual readiness checks before the next Run. The
+same current-Run write is available through
+`POST /api/program/runs/{program_run_id}/blackboard-values`; include the live
+Run's `program_run_id`, `expected_owner_epoch`, and `expected_run_revision`,
+plus `key` and the JSON boolean `value: true`, and the ordinary request
+attribution fields (`request_id`, `request_owner_epoch`, `source_label`, and
+`correlation_id`).
+
+**Isaac measured-loss example:**
+[`examples/isaac-ur10e-grasp-lost.scenario`](../../examples/isaac-ur10e-grasp-lost.scenario)
+uses the UR10e light scene's actual `continuous_relative_to_attached` source
+for `/mac_n_cheese_centered`. Run it in Isaac, cause the attached cheese box's
+measured pose to leave the configured translation or rotation bound while
+`pick_retreat` is running. The intended result is that the signal trips, the
+Fallback moves to the safe pose, and the item is skipped; this recovery is not
+yet verified on this build. Writing `part_lost` manually is not measured-loss
+evidence.
+
+In that node-level pattern, **Move until signal** reads the gripper's
+`carried_object_lost` resource role and uses `on_signal: failure`. That field
+chooses the node result; it does not name a recovery subtree. A **Fallback**
+has the carry Sequence first and a second sequence guarded by **Check input**
+for that same signal to be `true`; it moves to the safe pose and skips the
+item. The system signal remains true until the next attach by that gripper, a
+Program detach, or cell Reset. Detaching because of the loss does not clear
+it.
+
+The key example uses a global `on_trip: gate` on the writable `part_lost` key,
+scoped to the `carry` execution group. The group resolves to exact Applied motion
+subjects: component, command target, control domain, binding and revision. The
+gate blocks motions whose compiled subject matches one of those entries, including
+recovery and manual moves on the same target bindings; clear the key before moving.
+Safe-pose and recovery nodes remain outside the authored `carry` group, but a
+matching subject does not exempt their motions. While the key is true,
+the gate stops a matching move already running and refuses a new matching move.
+A Stop on an already-moving carry motion fails the node, so the Fallback checks
+that `part_lost` is still true and resets it to `false` to clear the gate. In
+this build its safe-pose move is then refused, as described in the Mock
+walkthrough above, so detach and skip are not reached. Because the key clears
+before the recovery motion, it stays false after that refusal. If the gate
+refuses a motion before it starts, that motion stays RUNNING as **Motion
+waits** and the Fallback cannot run while the carry Sequence is waiting. It
+starts if the key clears before the node's `execution_timeout_s` and the rule's clear state is observed; otherwise the node
+fails at its 30-second timeout and the Fallback can recover. In the Mock
+walkthrough, write the key while `pick_retreat` is already running to exercise
+the immediate Stop path. The gate is a motion guard; it does not select or run a
+recovery subtree. Do not combine the node-level system-signal rule and a global
+gate on that same signal: a global winner can pre-empt the node's `on_signal`
+result.
+
+A global `full_stop` latches and requires operator recovery, so it is not an
+automatic Program recovery path.
+
+If an object rotates in the fingers but remains in contact, a continuing move
+may instead be stopped by the runtime collision monitor. While no Run is active,
+there is no current-Run blackboard to receive the key write; during a later Run,
+a loss on an attachment from an earlier Run can set its `set_key` if the current
+Program declares that key as a writable `bool`. The key means a loss happened
+during the current Run.
 
 ### Interrupts are operational
 
@@ -320,8 +438,11 @@ A global rule has no `on_signal`, `on_no_signal` or
   on expiry the node fails with the gate refusal, as it would have at once.
   Halt pauses the wait and its time; Stop and Reset end it like any running
   node, and no motion starts by itself after them. A motion that
-  was already moving is stopped, not waited: its normal failure handling
-  applies.
+  was already moving is stopped, not waited: its node fails. In this build
+  that Stop can leave the operation intervention-required and raise the
+  `manyforge.motion.execution_fault` alarm; in that case the next motion on
+  that robot is refused until Reset retires the operation, and motion needs
+  the alarm acknowledged.
 - `full_stop`: a motion in the scope that is moving trips a cell Full Stop:
   all motion and all other commands stop, also outside the scope. The rule
   latches; new motion in its scope is refused (`global_interrupt_latched`)

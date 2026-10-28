@@ -343,11 +343,13 @@ if(BUILD_TESTING OR MANYFORGE_SCENE_BUILD_TESTS_IN_CONSUMER)
     MANYFORGE_LITE6_STRUCTURAL_SOURCE_ROOT="${_MANYFORGE_SCENE_LITE6_SOURCE_ROOT}")
   target_include_directories(test_canonical_empty_scene_owner PRIVATE
     "${CMAKE_CURRENT_SOURCE_DIR}/src"
+    "${CMAKE_CURRENT_BINARY_DIR}/generated"
     "${MANYFORGE_DEPLOYMENT_SOURCE_DIR}/src"
     "${MANYFORGE_DEPLOYMENT_SOURCE_DIR}/test")
   target_link_libraries(test_canonical_empty_scene_owner PRIVATE
     manyforge_scene
     manyforge::scene_value_codec
+    manyforge::persistence
     manyforge_deployment
     manyforge::deployment_admission
     SQLite::SQLite3

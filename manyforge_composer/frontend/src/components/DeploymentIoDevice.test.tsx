@@ -89,11 +89,11 @@ describe('Deployment I/O devices', () => {
       await mounted.click('Add I/O device');
       expect(mounted.control('I/O device component id').value).toBe('io_device_1');
       expect(mounted.control('I/O device lifecycle command time limit').value).toBe('30');
-      // The first signal belongs to the device; every R5 source incl. robot-hosted UR / GPIO is offered (contract 84).
+      // The first signal belongs to the device; every R5 source incl. robot-hosted UR / GPIO / xArm is offered (contract 84).
       expect(mounted.control('Signal 1 Component').readOnly).toBe(true);
       const profiles = (mounted.control('Signal 1 Source profile').children as Array<{ props: { value: string } }>)
         .map((option) => option.props.value);
-      expect(profiles).toEqual(['mock', 'ros_bool', 'ur_io_states', 'ros2_control_gpio', 'geometric_contact']);
+      expect(profiles).toEqual(['mock', 'ros_bool', 'ur_io_states', 'ros2_control_gpio', 'geometric_contact', 'xarm_digital']);
       await mounted.click('Create I/O device');
       expect(mounted.controller.mutate).not.toHaveBeenCalled();
       expect(alerts(mounted.all).join()).toContain('signal name');

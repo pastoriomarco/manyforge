@@ -1,4 +1,4 @@
-# Copyright 2026 ManyForge contributors
+# Copyright 2026 Marco Pastorio
 # SPDX-License-Identifier: Apache-2.0
 uint32 index
 float32 detection_score

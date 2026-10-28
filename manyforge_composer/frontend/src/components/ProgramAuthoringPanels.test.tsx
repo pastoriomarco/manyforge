@@ -14,10 +14,12 @@ import type {
   CatalogEntry,
   NodeEnvironmentResponse,
   ProgramAuthoringDocument,
+  ProgramBindingDocument,
   ProgramParameterDeclaration,
   ProgramTreeNode,
   ProgramWorkspaceResponse,
 } from '../types/api';
+import type { CarriedObjectLostSignalChoice } from '../utils/systemSignalAuthoring';
 import { ProgramDeclarationsEditor } from './ProgramDeclarationsEditor';
 import { ProgramContactPolicyEditor } from './ProgramContactPolicyEditor';
 import { DocumentControls } from './DocumentControls';
@@ -885,6 +887,45 @@ describe('Program authoring panels', () => {
     expect(catalogParameterSourceable(setOutput, 'value')).toBe(true);
   });
 
+  it('shows the generated carried-object-lost input in an I/O node role picker', () => {
+    const wait: CatalogEntry = { ...timer, id: 'io.wait_for_input', parameters: [
+      { id: 'target_role', required: true,
+        schema: { type: 'string', 'x-manyforge-semantic-type': 'target_role' },
+        schemaHash: 'sha256:t', hasDefault: false },
+      { id: 'resource_role', required: true,
+        schema: { type: 'string', 'x-manyforge-semantic-type': 'resource_role' },
+        schemaHash: 'sha256:r', hasDefault: false },
+    ] };
+    const node: ProgramTreeNode = {
+      node_id: 'io.wait_for_input', instance_id: 'wait_lost', children: [],
+      parameters: { target_role: 'gripper', resource_role: 'carried_object_lost' },
+    };
+    const binding = { target_role_bindings: [{ target_role_id: 'gripper',
+      controllable_component_id: 'robot', command_target_id: 'gripper', signal_role_bindings: [] }] } as unknown as ProgramBindingDocument;
+    const systemSignal: CarriedObjectLostSignalChoice = {
+      controllableComponentId: 'robot', commandTargetId: 'gripper',
+      signalName: 'carried_object_lost.gripper', resourceRoleId: 'carried_object_lost',
+      direction: 'input', valueType: 'bool', provenance: 'last_apply',
+    };
+    const program = { ...authoringProgram([node]), target_roles: {
+      gripper: { required_resource_roles: ['carried_object_lost'] },
+    } };
+    const markup = renderToStaticMarkup(
+      <ProgramPropertyEditor roots={[node]} selectedId="wait_lost" catalogEntries={[wait]}
+        deploymentWorkspace={{ binding } as unknown as DeploymentWorkspaceResponse} program={program}
+        systemSignalChoices={[systemSignal]} busy={false} onMutate={vi.fn()} onUpdateNodePolicies={vi.fn()} />,
+    );
+
+    expect(markup).toContain('carried_object_lost · carried_object_lost.gripper (input) · from last Apply');
+    expect(markup).toContain('gripper input signals');
+    const unavailableMarkup = renderToStaticMarkup(
+      <ProgramPropertyEditor roots={[node]} selectedId="wait_lost" catalogEntries={[wait]}
+        deploymentWorkspace={{ binding } as unknown as DeploymentWorkspaceResponse} program={program}
+        systemSignalsNeedApply busy={false} onMutate={vi.fn()} onUpdateNodePolicies={vi.fn()} />,
+    );
+    expect(unavailableMarkup).toContain('Apply to list system signals.');
+  });
+
   it('edits the interrupt node rule: structured condition, stage labels after Apply, literal-only fields', () => {
     const until: CatalogEntry = { ...timer, id: 'motion.move_until_signal', parameters: [
       { id: 'target_role', required: true,
@@ -1271,10 +1312,7 @@ describe('Program authoring panels', () => {
       mutationUnavailableReason: null,
       documentUnavailableReason: null,
       scenarioReplacementIdentity: null,
-      scenarioCloseSceneHandoff: vi.fn(() => ({ status: 'ready' as const, message: null, objectId: null, progress: { ownerId: 'scene', ownerEpoch: 'scene.1', expected: { retained_bundle_id: 'empty', graph_revision: 'empty', scene_revision: { scene_id: 'scene', revision_id: 1, content_hash: 'scene' } }, predecessor: null, remaining: [], removed: 0, admissionGeneration: null } })),
-      removeClosedSceneObject: vi.fn(),
       reportCloseCancellation: vi.fn(),
-      clearClosedScenario: vi.fn(async () => null),
       scenarioCloseHandoff: vi.fn(() => ({ status: 'waiting' as const, message: null })),
       admissionObserved: true,
       fenceDraft: null,
@@ -1338,7 +1376,7 @@ describe('Program authoring panels', () => {
       exportScenarioDocument: vi.fn(),
       loadScenarioDocument: vi.fn(),
       scenarioDocumentPath: null,
-      scenarioDocument: { id: null, name: null, description: null },
+      scenarioDocument: { id: null, name: null, description: null, readOnly: false },
       scenarioSourceDiagnostics: [],
       updateNodePolicies: vi.fn(),
       updateNodePresentation: vi.fn(),
@@ -1505,10 +1543,7 @@ describe('Program authoring panels', () => {
       mutationUnavailableReason: null,
       documentUnavailableReason: null,
       scenarioReplacementIdentity: null,
-      scenarioCloseSceneHandoff: vi.fn(() => ({ status: 'ready' as const, message: null, objectId: null, progress: { ownerId: 'scene', ownerEpoch: 'scene.1', expected: { retained_bundle_id: 'empty', graph_revision: 'empty', scene_revision: { scene_id: 'scene', revision_id: 1, content_hash: 'scene' } }, predecessor: null, remaining: [], removed: 0, admissionGeneration: null } })),
-      removeClosedSceneObject: vi.fn(),
       reportCloseCancellation: vi.fn(),
-      clearClosedScenario: vi.fn(async () => null),
       scenarioCloseHandoff: vi.fn(() => ({ status: 'waiting' as const, message: null })),
       admissionObserved: true,
       fenceDraft: null,
@@ -1536,7 +1571,7 @@ describe('Program authoring panels', () => {
       exportScenarioDocument: vi.fn(),
       loadScenarioDocument: vi.fn(),
       scenarioDocumentPath: null,
-      scenarioDocument: { id: null, name: null, description: null },
+      scenarioDocument: { id: null, name: null, description: null, readOnly: false },
       scenarioSourceDiagnostics: [],
       updateNodePolicies: vi.fn(),
       updateNodePresentation: vi.fn(),

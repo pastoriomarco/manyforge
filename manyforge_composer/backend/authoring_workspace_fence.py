@@ -136,8 +136,8 @@ def commit_draft_edit(
     """Commit one Draft-only edit (no cell claim; see ``execute_draft_edit``).
 
     The same composite and domain fences as :func:`commit_local_authoring`
-    apply; admission is Idle authoring or a held run whose motion is
-    confirmed stopped.
+    apply; admission is an Idle Program cycle or a held run whose motion is
+    confirmed stopped, never Kernel authoring admission.
     """
 
     coordinator = _require_coordinator(state)

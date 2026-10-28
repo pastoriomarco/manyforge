@@ -134,6 +134,73 @@ TEST(ProgramBlackboardCommandCodecTest,
   EXPECT_THROW(DecodeFrame(Replace(Frame(), "message_sequence", Value(1.0))),
                std::exception);
 }
+Command DecodeCarriedObjectLost(Value level, Value attachment, Value object,
+                                std::string transport = "internal",
+                                Value loss_event_id = Value(nullptr),
+                                Value set_key = Value(nullptr)) {
+  return DecodeCommand(content_identity::canonical_json(Value(Value::Object{
+      {"api_version", Value(std::string(kCommandApiVersion))},
+      {"command", Value("set_carried_object_lost")},
+      {"attribution", Value(Value::Object{{"transport", Value(transport)},
+                                          {"assurance", Value("unverified")},
+                                          {"principal_id", Value(nullptr)}})},
+      {"request",
+       Value(Value::Object{{"carried_object_attachment_id", std::move(attachment)},
+                           {"command_target_id", Value("gripper")},
+                           {"controllable_component_id", Value("robot.1")},
+                           {"level", std::move(level)},
+                           {"loss_event_id", std::move(loss_event_id)},
+                           {"scene_resource_id", std::move(object)},
+                           {"set_key", std::move(set_key)}})}})));
+}
+
+TEST(ProgramBlackboardCommandCodecTest,
+     CarriedObjectLostLevelNamesItsAttachmentOnlyWhenTrue) {
+  const auto lost = DecodeCarriedObjectLost(Value(true), Value("attachment.1"),
+                                            Value("box"), "internal",
+                                            Value("loss.7"), Value("part_lost"));
+  ASSERT_EQ(lost.kind, CommandKind::kSetCarriedObjectLost);
+  ASSERT_TRUE(lost.carried_object_lost_set.has_value());
+  EXPECT_EQ(lost.carried_object_lost_set->controllable_component_id.value(),
+            "robot.1");
+  EXPECT_EQ(lost.carried_object_lost_set->command_target_id.value(), "gripper");
+  EXPECT_TRUE(lost.carried_object_lost_set->level);
+  EXPECT_EQ(lost.carried_object_lost_set->carried_object_attachment_id,
+            std::optional<std::string>("attachment.1"));
+  // Contract §10: the loss event id and the stored key travel with `true`.
+  EXPECT_EQ(lost.carried_object_lost_set->loss_event_id,
+            std::optional<std::string>("loss.7"));
+  EXPECT_EQ(lost.carried_object_lost_set->set_key,
+            std::optional<std::string>("part_lost"));
+  // A key is optional with `true`; the loss event id is not.
+  EXPECT_FALSE(DecodeCarriedObjectLost(Value(true), Value("attachment.1"),
+                                       Value("box"), "internal", Value("loss.7"))
+                   .carried_object_lost_set->set_key.has_value());
+  EXPECT_THROW(DecodeCarriedObjectLost(Value(true), Value("attachment.1"),
+                                       Value("box")),
+               std::exception);
+  // `false` names no loss event and no key.
+  EXPECT_THROW(DecodeCarriedObjectLost(Value(false), Value(nullptr), Value(nullptr),
+                                       "internal", Value("loss.7")),
+               std::exception);
+  EXPECT_THROW(DecodeCarriedObjectLost(Value(false), Value(nullptr), Value(nullptr),
+                                       "internal", Value(nullptr), Value("part_lost")),
+               std::exception);
+  const auto cleared =
+      DecodeCarriedObjectLost(Value(false), Value(nullptr), Value(nullptr));
+  EXPECT_FALSE(cleared.carried_object_lost_set->level);
+  EXPECT_FALSE(cleared.carried_object_lost_set->scene_resource_id.has_value());
+  EXPECT_THROW(DecodeCarriedObjectLost(Value(true), Value(nullptr), Value("box"),
+                                       "internal", Value("loss.7")),
+               std::exception);
+  EXPECT_THROW(
+      DecodeCarriedObjectLost(Value(false), Value("attachment.1"), Value("box")),
+      std::exception);
+  EXPECT_THROW(DecodeCarriedObjectLost(Value(true), Value("attachment.1"),
+                                       Value("box"), "public", Value("loss.7")),
+               std::exception);
+}
+
 } // namespace
 } // namespace manyforge::roboplan_backend::host_detail
 

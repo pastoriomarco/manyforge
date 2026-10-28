@@ -10,6 +10,7 @@
 #include <cstdint>
 #include <limits>
 #include <map>
+#include <set>
 #include <stdexcept>
 #include <string>
 #include <type_traits>
@@ -28,10 +29,10 @@ using content_identity::CanonicalValue;
 
 constexpr std::string_view kPoseObservationPayloadApiVersion =
     "manyforge.ros_pose_observation.v2";
-// A simulation entity pose that also carries the object pose relative to a
-// gripper reference entity read in the same source snapshot.
+// A simulation entity pose with one reference-relative pose per configured
+// robot/gripper base, all read in the same source snapshot.
 constexpr std::string_view kReferencedSimulationPoseKind =
-    "simulation_entity_pose_with_reference.v1";
+    "simulation_entity_pose_with_references.v1";
 constexpr std::string_view kRelativeToAttachedPolicy =
     "continuous_relative_to_attached";
 constexpr std::string_view kPoseApplicationRequestApiVersion =
@@ -127,14 +128,19 @@ void ValidateSource(const std::string_view kind, const CanonicalValue &source) {
 }
 
 struct DecodedReference final {
+  std::string controllable_component_id;
+  std::string command_target_id;
+  std::string gripper_link;
+  std::string entity;
   std::string link;
+  std::string source_header_frame_id;
   bool coherent{};
   std::optional<core::Pose3DTO> pose_in_reference;
 };
 
 struct DecodedPose final {
   core::Pose3DTO pose;
-  std::optional<DecodedReference> reference;
+  std::vector<DecodedReference> references;
 };
 
 core::Pose3DTO DecodeRigidPose(const CanonicalValue &pose,
@@ -170,19 +176,47 @@ core::Pose3DTO DecodeRigidPose(const CanonicalValue &pose,
 }
 
 DecodedReference DecodeReference(const CanonicalValue &reference) {
-  ExactObject(reference, 4U, "pose reference");
-  static_cast<void>(Text(Member(reference, "entity"), "reference entity"));
+  ExactObject(reference, 8U, "pose reference");
   const auto *coherent =
       std::get_if<bool>(&Member(reference, "coherent").storage());
   if (coherent == nullptr) {
     throw std::invalid_argument("reference coherent must be a boolean");
   }
-  DecodedReference result{Text(Member(reference, "link"), "reference link"),
-                          *coherent, std::nullopt};
+  DecodedReference result{
+      Text(Member(reference, "controllable_component_id"),
+           "reference controllable_component_id"),
+      Text(Member(reference, "command_target_id"),
+           "reference command_target_id"),
+      Text(Member(reference, "gripper_link"), "reference gripper_link"),
+      Text(Member(reference, "entity"), "reference entity"),
+      Text(Member(reference, "link"), "reference link"),
+      Text(Member(reference, "source_header_frame_id"),
+           "reference source_header_frame_id"),
+      *coherent,
+      std::nullopt};
   const auto &pose = Member(reference, "pose_in_reference");
   if (!std::holds_alternative<std::nullptr_t>(pose.storage())) {
     ExactObject(pose, 2U, "reference pose");
     result.pose_in_reference = DecodeRigidPose(pose, "reference pose");
+  }
+  return result;
+}
+
+std::vector<DecodedReference>
+DecodeReferences(const CanonicalValue &references) {
+  const auto *values = std::get_if<CanonicalValue::Array>(&references.storage());
+  if (values == nullptr || values->empty())
+    throw std::invalid_argument(
+        "pose references must be one non-empty array");
+  std::vector<DecodedReference> result;
+  result.reserve(values->size());
+  std::set<std::pair<std::string, std::string>> keys;
+  for (const auto &value : *values) {
+    auto decoded = DecodeReference(value);
+    if (!keys.emplace(decoded.controllable_component_id,
+                      decoded.command_target_id).second)
+      throw std::invalid_argument("pose references repeat a gripper key");
+    result.push_back(std::move(decoded));
   }
   return result;
 }
@@ -210,8 +244,8 @@ DecodedPose DecodePose(const CanonicalValue &payload) {
   static_cast<void>(Text(Member(pose, "frame_id"), "pose frame_id"));
   static_cast<void>(SourceTimestampNs(Member(pose, "source_stamp_ns")));
   return {DecodeRigidPose(pose, "pose"),
-          referenced ? std::optional(DecodeReference(Member(payload, "reference")))
-                     : std::nullopt};
+          referenced ? DecodeReferences(Member(payload, "references"))
+                     : std::vector<DecodedReference>{}};
 }
 
 const core::CapabilityProviderBindingDTO *SelectProvider(
@@ -366,6 +400,7 @@ struct CarrierPose final {
   core::Pose3DTO observed_in_carrier;
   core::CarriedObjectAttachmentDTO attachment;
   core::ComponentSceneFrameRefDTO carrier;
+  SceneRuntimePoseMeasurement measurement;
 };
 
 // The observed reference-relative object pose composed onto the attachment's
@@ -378,28 +413,62 @@ RelativeCarrierPose(const core::ISceneAuthority &scene_authority,
                     const core::SceneObjectStateDTO &object_state,
                     const DecodedPose &decoded) {
   using Reply = core::Result<CarrierPose>;
-  if (!decoded.reference.has_value()) {
+  if (decoded.references.empty()) {
     return Reply::Err(Error(
         "scene_runtime_pose_reference_missing",
-        "relative attached pose update requires an observation relative to "
-        "a gripper reference",
+        "relative attached pose update requires gripper reference observations",
         {{"scene_resource_id", object_state.scene_resource_id.value()}}));
-  }
-  const auto &reference = *decoded.reference;
-  if (!reference.pose_in_reference.has_value()) {
-    return Reply::Err(Error("scene_runtime_pose_reference_unavailable",
-                            "source has no reference-relative object pose",
-                            {{"reference_link", reference.link}}));
-  }
-  if (!reference.coherent) {
-    return Reply::Err(Error(
-        "scene_runtime_pose_reference_not_coherent",
-        "source did not read object and reference at one instant",
-        {{"reference_link", reference.link}}));
   }
   auto attachment = CurrentAttachment(scene_authority, projection, object_state);
   if (!attachment.ok()) {
     return Reply::Err(attachment.error());
+  }
+  const auto holder_id = attachment.value().controllable_component_id.value();
+  const auto holder_target_id = attachment.value().command_target_id.value();
+  const auto selected = std::find_if(
+      decoded.references.begin(), decoded.references.end(),
+      [&](const auto &reference) {
+        return reference.controllable_component_id == holder_id &&
+               reference.command_target_id == holder_target_id;
+      });
+  if (selected == decoded.references.end()) {
+    return Reply::Err(Error(
+        "scene_runtime_pose_reference_missing",
+        "source has no gripper reference observation for the attached holder",
+        {{"scene_resource_id", object_state.scene_resource_id.value()},
+         {"holder_component_id", holder_id},
+         {"holder_command_target_id", holder_target_id}}));
+  }
+  if (std::count_if(decoded.references.begin(), decoded.references.end(),
+                     [&](const auto &reference) {
+                       return reference.controllable_component_id == holder_id &&
+                              reference.command_target_id == holder_target_id;
+                     }) != 1) {
+    return Reply::Err(Error(
+        "scene_runtime_pose_reference_unresolved",
+        "source has multiple gripper reference observations for the attached holder",
+        {{"scene_resource_id", object_state.scene_resource_id.value()},
+         {"holder_component_id", holder_id},
+         {"holder_command_target_id", holder_target_id}}));
+  }
+  const auto &reference = *selected;
+  const std::map<std::string, std::string> reference_details{
+      {"holder_component_id", holder_id},
+      {"holder_command_target_id", holder_target_id},
+      {"gripper_link", reference.gripper_link},
+      {"measured_entity", reference.entity},
+      {"measured_link", reference.link}};
+  if (!reference.pose_in_reference.has_value()) {
+    return Reply::Err(Error(
+        "scene_runtime_pose_reference_unavailable",
+        "source has no reference-relative object pose for the attached holder",
+        reference_details));
+  }
+  if (!reference.coherent) {
+    return Reply::Err(Error(
+        "scene_runtime_pose_reference_not_coherent",
+        "source did not read object and the attached holder body at one instant",
+        reference_details));
   }
   const auto *carrier = std::get_if<core::ComponentSceneFrameRefDTO>(
       &attachment.value().carrier_frame_ref);
@@ -407,17 +476,33 @@ RelativeCarrierPose(const core::ISceneAuthority &scene_authority,
     return Reply::Err(Error(
         "scene_runtime_pose_reference_unresolved",
         "attachment carrier has no retained-model reference resolution",
-        {{"reference_link", reference.link}}));
+        reference_details));
   }
   auto carrier_in_reference = resolver(projection.retained_bundle_id, *carrier,
-                                       reference.link);
+                                       reference.gripper_link);
   if (!carrier_in_reference.ok()) {
     return Reply::Err(carrier_in_reference.error());
   }
+  const auto observed_in_carrier = core::multiply_poses(
+      core::inverse_pose(
+          carrier_in_reference.value().carrier_in_reference),
+      *reference.pose_in_reference);
+  SceneRuntimePoseMeasurement measurement{
+      SceneRuntimePoseHolder{attachment.value().controllable_component_id,
+                             attachment.value().command_target_id,
+                             reference.gripper_link},
+      SceneRuntimeMeasuredBody{reference.entity, reference.link},
+      reference.source_header_frame_id ==
+              carrier_in_reference.value().carrier_link_name
+          ? std::nullopt
+          : std::optional(reference.source_header_frame_id),
+      *carrier,
+      observed_in_carrier,
+      std::nullopt,
+      std::nullopt};
   return Reply::Ok(CarrierPose{
-      core::multiply_poses(core::inverse_pose(carrier_in_reference.value()),
-                           *reference.pose_in_reference),
-      attachment.value(), *carrier});
+      observed_in_carrier, attachment.value(), *carrier,
+      std::move(measurement)});
 }
 
 } // namespace
@@ -551,6 +636,19 @@ bool SceneRuntimePoseApplicationRetainsPlanningEvidence(
 }
 
 bool SceneRuntimePoseApplicationResult::valid() const noexcept {
+  if (pose_measurement &&
+      (pose_measurement->baseline_offset.has_value() !=
+           pose_measurement->drift.has_value() ||
+       (std::holds_alternative<SceneRuntimeMeasuredBody>(
+            pose_measurement->measured_against) !=
+        pose_measurement->holder.has_value()) ||
+       (std::holds_alternative<std::string>(
+            pose_measurement->measured_against) &&
+        (std::get<std::string>(pose_measurement->measured_against) !=
+             "cell frame" ||
+         pose_measurement->source_header_frame_id.has_value())))) {
+    return false;
+  }
   switch (status) {
   case SceneRuntimePoseApplicationStatus::kNotRequested:
   case SceneRuntimePoseApplicationStatus::kDeferredBeforePlanning:
@@ -575,10 +673,12 @@ bool SceneRuntimePoseApplicationResult::valid() const noexcept {
 SceneRuntimePoseProjector::SceneRuntimePoseProjector(
     core::ISceneAuthority &scene_authority, core::CellId cell_id,
     SceneRuntimeReferenceLinkResolver reference_resolver,
-    SceneRuntimeCarrierStopRequester carrier_stop_requester)
+    SceneRuntimeCarrierStopRequester carrier_stop_requester,
+    SceneRuntimeCarriedObjectLostSignalPublisher signal_publisher)
     : scene_authority_(scene_authority), cell_id_(std::move(cell_id)),
       reference_resolver_(std::move(reference_resolver)),
-      carrier_stop_requester_(std::move(carrier_stop_requester)) {
+      carrier_stop_requester_(std::move(carrier_stop_requester)),
+      signal_publisher_(std::move(signal_publisher)) {
   if (cell_id_.empty()) {
     throw std::invalid_argument("pose projector cell_id must be non-empty");
   }
@@ -674,7 +774,7 @@ SceneRuntimePoseProjector::Apply(
       (policy == "before_planning" || policy == "continuous_unattached")) {
     auto result = SceneRuntimePoseApplicationResult{
         SceneRuntimePoseApplicationStatus::kSkippedAttached, request_id,
-        projection, std::nullopt};
+        projection, std::nullopt, std::nullopt};
     return core::Result<SceneRuntimePoseApplicationResult>::Ok(
         std::move(result));
   }
@@ -690,7 +790,7 @@ SceneRuntimePoseProjector::Apply(
     // may have moved since; never reapply the same old world observation to it.
     return core::Result<SceneRuntimePoseApplicationResult>::Ok(
         {SceneRuntimePoseApplicationStatus::kAlreadyApplied, request_id,
-         projection, std::nullopt});
+         projection, std::nullopt, prior_application->pose_measurement});
   }
   if (!object_state.attached) {
     ForgetGraspBaseline(observation.key.object_id);
@@ -708,6 +808,7 @@ SceneRuntimePoseProjector::Apply(
   // The object's pose already in the scene in the update frame, when the
   // update frame is the cell or the attachment's carrier.
   std::optional<core::Pose3DTO> current_pose;
+  std::optional<SceneRuntimePoseMeasurement> pose_measurement;
   if (object_state.attached && policy == kRelativeToAttachedPolicy) {
     core::Result<CarrierPose> carried;
     try {
@@ -721,15 +822,21 @@ SceneRuntimePoseProjector::Apply(
       return core::Result<SceneRuntimePoseApplicationResult>::Err(
           carried.error());
     }
-    if (const auto lost = GraspDrift(carried.value().attachment,
-                                     carried.value().observed_in_carrier)) {
-      return CarriedObjectLost(carried.value().attachment, *lost, projection,
-                               request_id, decoded.pose);
+    auto measurement = std::move(carried.value().measurement);
+    if (const auto grasp = MeasureGrasp(carried.value().attachment,
+                                        carried.value().observed_in_carrier)) {
+      measurement.baseline_offset = grasp->baseline_offset;
+      measurement.drift = grasp->drift;
+      if (grasp->lost)
+        return CarriedObjectLost(carried.value().attachment, grasp->drift,
+                                 projection, request_id, decoded.pose,
+                                 measurement);
     }
     update_pose = carried.value().observed_in_carrier;
     update_frame = carried.value().carrier;
     current_pose = carried.value().attachment.pose_in_carrier_frame;
     expected_attached = true;
+    pose_measurement = std::move(measurement);
   } else if (object_state.attached && policy == "continuous") {
     // The cell-frame observation expressed on the carrier through the
     // object's current resolved pose: the measured carried offset. Without
@@ -751,9 +858,23 @@ SceneRuntimePoseProjector::Apply(
             core::multiply_poses(attachment.value().pose_in_carrier_frame,
                                  core::inverse_pose(object_pose.value())),
             decoded.pose);
-        if (const auto lost = GraspDrift(attachment.value(), measured)) {
-          return CarriedObjectLost(attachment.value(), *lost, projection,
-                                   request_id, decoded.pose);
+        if (const auto grasp = MeasureGrasp(attachment.value(), measured)) {
+          if (grasp->lost) {
+            return CarriedObjectLost(attachment.value(), grasp->drift,
+                                     projection, request_id, decoded.pose);
+          }
+          if (const auto *carrier =
+                  std::get_if<core::ComponentSceneFrameRefDTO>(
+                      &attachment.value().carrier_frame_ref)) {
+            pose_measurement = SceneRuntimePoseMeasurement{
+                std::nullopt,
+                std::string("cell frame"),
+                std::nullopt,
+                *carrier,
+                measured,
+                grasp->baseline_offset,
+                grasp->drift};
+          }
         }
       }
     } catch (const std::exception &error) {
@@ -786,7 +907,7 @@ SceneRuntimePoseProjector::Apply(
       WithinDeadband(*current_pose, update_pose, deadband)) {
     return core::Result<SceneRuntimePoseApplicationResult>::Ok(
         {SceneRuntimePoseApplicationStatus::kUnchanged, request_id, projection,
-         std::nullopt});
+         std::nullopt, pose_measurement});
   }
 
   std::optional<core::SceneCommitResultDTO> submitted;
@@ -828,7 +949,8 @@ SceneRuntimePoseProjector::Apply(
   }
   auto result = SceneRuntimePoseApplicationResult{
       SceneRuntimePoseApplicationStatus::kCommitted, committed.request_id,
-      *committed.committed_projection_revision, committed.update_status};
+      *committed.committed_projection_revision, committed.update_status,
+      pose_measurement};
   if (!result.valid()) {
     return core::Result<SceneRuntimePoseApplicationResult>::Err(Error(
         "scene_runtime_pose_commit_invalid",
@@ -881,7 +1003,8 @@ SceneRuntimePoseProjector::Commit(core::RequestId request_id,
   return committed;
 }
 
-std::optional<SceneRuntimePoseDistance> SceneRuntimePoseProjector::GraspDrift(
+std::optional<SceneRuntimePoseProjector::GraspMeasurement>
+SceneRuntimePoseProjector::MeasureGrasp(
     const core::CarriedObjectAttachmentDTO &attachment,
     const core::Pose3DTO &measured_in_carrier) {
   if (!attachment.grasp_lost_check) {
@@ -900,16 +1023,18 @@ std::optional<SceneRuntimePoseDistance> SceneRuntimePoseProjector::GraspDrift(
         attachment.scene_resource_id.value(),
         GraspBaseline{attachment.carried_object_attachment_id,
                       measured_in_carrier});
+    return GraspMeasurement{measured_in_carrier, {}, false};
+  }
+  if (found->second.lost) {
     return std::nullopt;
   }
   const auto &bound = attachment.grasp_lost_check->bound;
   const auto distance = SceneRuntimePoseDistanceBetween(
       found->second.measured_in_carrier, measured_in_carrier);
-  if (distance.translation_m <= bound.translation_m &&
-      distance.rotation_rad <= bound.rotation_rad) {
-    return std::nullopt;
-  }
-  return distance;
+  return GraspMeasurement{
+      found->second.measured_in_carrier, distance,
+      distance.translation_m > bound.translation_m ||
+          distance.rotation_rad > bound.rotation_rad};
 }
 
 void SceneRuntimePoseProjector::ForgetGraspBaseline(
@@ -918,57 +1043,140 @@ void SceneRuntimePoseProjector::ForgetGraspBaseline(
   grasp_baselines_.erase(scene_resource_id);
 }
 
+void SceneRuntimePoseProjector::MarkGraspLost(
+    const std::string &scene_resource_id) {
+  std::lock_guard lock(grasp_baselines_mutex_);
+  if (const auto found = grasp_baselines_.find(scene_resource_id);
+      found != grasp_baselines_.end()) {
+    found->second.lost = true;
+  }
+}
+
 core::Result<SceneRuntimePoseApplicationResult>
 SceneRuntimePoseProjector::CarriedObjectLost(
     const core::CarriedObjectAttachmentDTO &attachment,
     const SceneRuntimePoseDistance &distance,
     const core::ProjectionRevisionDTO &projection,
     const core::RequestId &request_id,
-    const core::Pose3DTO &observed_in_cell) {
-  ForgetGraspBaseline(attachment.scene_resource_id.value());
+    const core::Pose3DTO &observed_in_cell,
+    std::optional<SceneRuntimePoseMeasurement> pose_measurement) {
   const auto &bound = attachment.grasp_lost_check->bound;
+  auto response = attachment.grasp_lost_check->response();
+  const auto flag = [](const bool value) {
+    return std::string(value ? "true" : "false");
+  };
   std::map<std::string, std::string> details{
       {"scene_resource_id", attachment.scene_resource_id.value()},
       {"carried_object_attachment_id",
        attachment.carried_object_attachment_id.value()},
       {"controllable_component_id",
        attachment.controllable_component_id.value()},
+      {"command_target_id", attachment.command_target_id.value()},
       {"translation_m", std::to_string(distance.translation_m)},
       {"rotation_rad", std::to_string(distance.rotation_rad)},
       {"bound_translation_m", std::to_string(bound.translation_m)},
       {"bound_rotation_rad", std::to_string(bound.rotation_rad)},
       {"event_id", request_id.value()},
+      {"detach", flag(response.detach)},
   };
-  // 1. Stop the carrier's motion first, so the next motion leaves the
-  //    contact through the start-contact allowance instead of a misleading
-  //    runtime-collision Stop.
-  if (carrier_stop_requester_) {
-    const auto refused = carrier_stop_requester_(SceneRuntimeCarriedObjectLoss{
-        attachment.scene_resource_id, attachment.carried_object_attachment_id,
-        attachment.controllable_component_id, projection.graph_revision,
-        request_id.value() + ".stop"});
+  const auto *measured_body =
+      pose_measurement
+          ? std::get_if<SceneRuntimeMeasuredBody>(
+                &pose_measurement->measured_against)
+          : nullptr;
+  if (pose_measurement && pose_measurement->holder && measured_body) {
+    details.emplace(
+        "holder_component_id",
+        pose_measurement->holder->controllable_component_id.value());
+    details.emplace("holder_command_target_id",
+                    pose_measurement->holder->command_target_id.value());
+    details.emplace("gripper_link", pose_measurement->holder->gripper_link);
+    details.emplace("measured_entity", measured_body->entity);
+    details.emplace("measured_link", measured_body->link);
+  }
+  // Present only with a key; the Runner mirrors the signal into it.
+  if (response.set_key) {
+    details.emplace("set_key", *response.set_key);
+  }
+  const SceneRuntimeCarriedObjectLoss loss{
+      attachment.scene_resource_id, attachment.carried_object_attachment_id,
+      attachment.controllable_component_id, attachment.command_target_id,
+      projection.graph_revision, request_id.value() + ".stop",
+      request_id.value(), response.set_key};
+  // 1. The gripper's system signal, for every response: Program rules,
+  //    move-until-signal and wait nodes react to it like an I/O input.
+  //    A target without that signal (not a gripper target of the committed
+  //    composition: the host answers `io_signal_unbound`) is not applicable:
+  //    the flags apply as configured. A failed publication of an existing
+  //    signal fails closed (SX-204, component fault): the loss raises the
+  //    alarm and stops the motion whatever `on_grasp_lost` says and carries
+  //    the typed publication error; like any loss it fires once.
+  if (signal_publisher_) {
+    const auto refused = signal_publisher_(loss);
+    if (!refused) {
+      details.emplace("signal", "published");
+    } else if (refused->code == kCarriedObjectLostSignalNotApplicable) {
+      details.emplace("signal", "not_applicable");
+    } else {
+      details.emplace("signal", refused->code);
+      details.emplace("signal_error", refused->code);
+      response.raise_alarm = true;
+      response.stop_motion = true;
+    }
+  }
+  details.emplace("raise_alarm", flag(response.raise_alarm));
+  details.emplace("stop_motion", flag(response.stop_motion));
+  // 2. Stop the carrier's motion before the detach, so the next motion leaves
+  //    the contact through the start-contact allowance instead of a
+  //    misleading runtime-collision Stop.
+  if (response.stop_motion && carrier_stop_requester_) {
+    const auto refused = carrier_stop_requester_(loss);
     details.emplace("stop", refused ? refused->code : "requested");
   }
-  // 2. Detach it as an ordinary world object at the observed pose.
-  try {
-    const auto detached = Commit(
-        core::RequestId(request_id.value() + ".detach"), projection,
-        core::DetachCarriedObjectRequestDTO{
-            attachment.carried_object_attachment_id,
-            attachment.carried_object_attachment_revision, observed_in_cell,
-            core::CellSceneFrameRefDTO{cell_id_}});
-    details.emplace("detach", detached.success
-                                  ? "committed"
-                                  : (detached.error ? detached.error->code
-                                                    : "rejected"));
-  } catch (const std::exception &) {
-    details.emplace("detach", "scene_runtime_pose_scene_unavailable");
+  // 3. Detach it as an ordinary world object at the observed pose.
+  if (response.detach) {
+    bool detached_ok = false;
+    try {
+      const auto detached = Commit(
+          core::RequestId(request_id.value() + ".detach"), projection,
+          core::DetachCarriedObjectRequestDTO{
+              attachment.carried_object_attachment_id,
+              attachment.carried_object_attachment_revision, observed_in_cell,
+              core::CellSceneFrameRefDTO{cell_id_}});
+      detached_ok = detached.success;
+      details.emplace("detach_result",
+                      detached.success ? "committed"
+                                       : (detached.error ? detached.error->code
+                                                         : "rejected"));
+    } catch (const std::exception &) {
+      details.emplace("detach_result", "scene_runtime_pose_scene_unavailable");
+    }
+    // DX-2562: only a successful detach ends this attachment's check; after a
+    // refused detach the next sample detects the loss again and retries.
+    if (detached_ok) {
+      ForgetGraspBaseline(attachment.scene_resource_id.value());
+    }
+  } else {
+    // Kept attached by request: the loss fires once for this attachment.
+    MarkGraspLost(attachment.scene_resource_id.value());
   }
+  const auto full_text = pose_measurement && pose_measurement->holder &&
+                                 measured_body
+      ? core::CarriedObjectLostFullTextWithReference(
+            attachment.scene_resource_id.value(),
+            pose_measurement->holder->controllable_component_id.value(),
+            pose_measurement->holder->command_target_id.value(),
+            pose_measurement->holder->gripper_link,
+            measured_body->entity, measured_body->link,
+            distance.translation_m, distance.rotation_rad,
+            bound.translation_m, bound.rotation_rad, response.stop_motion,
+            response.detach)
+      : core::CarriedObjectLostFullText(
+            attachment.scene_resource_id.value(), distance.translation_m,
+            distance.rotation_rad, bound.translation_m, bound.rotation_rad,
+            response.stop_motion, response.detach);
   return core::Result<SceneRuntimePoseApplicationResult>::Err(Error(
-      core::kCarriedObjectLostReason,
-      core::CarriedObjectLostFullText(
-          attachment.scene_resource_id.value(), distance.translation_m,
-          distance.rotation_rad, bound.translation_m, bound.rotation_rad),
+      core::kCarriedObjectLostReason, full_text,
       std::move(details)));
 }
 

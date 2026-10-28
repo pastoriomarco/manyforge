@@ -75,6 +75,25 @@ def pose_source_schema() -> dict:
             _field("poll_period_ms", _scalar("integer", minimum=20, maximum=60000)),
             _field("source_coordinate_frame_id", _text(0, 1024)),
             _field("target_frame_id", _text(1, 1024)),
+            _field("relative_references", {
+                "kind": "array", "min_items": 1, "max_items": 128,
+                "collection": {
+                    "kind": "keyed_record_set",
+                    "key_paths": [["controllable_component_id"],
+                                  ["command_target_id"]],
+                },
+                "item_schema": _object(
+                    _field("controllable_component_id",
+                           _scalar("string", string_format="portable_id")),
+                    _field("command_target_id", _text(1, 256)),
+                    _field("gripper_link", _text(1, 256), optional=True),
+                    _field("entity", _text(1, 1024)),
+                    _field("link", _text(1, 256)),
+                    _field("source_header_frame_id", _text(1, 1024)),
+                ),
+            }, optional=True),
+            # Compatibility input only. Activation folds this legacy
+            # source-wide row into the per-target map before compilation.
             _field("relative_reference", _object(
                 _field("entity", _text(1, 1024)),
                 _field("link", _text(1, 256)),

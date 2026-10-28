@@ -204,6 +204,7 @@ def test_snapshot_shape_is_closed_and_carries_the_composite_identity() -> None:
     }
     assert set(payload["project"]) == {
         "document_path",
+        "read_only",
         "document_id",
         "document_name",
         "document_description",
@@ -400,6 +401,7 @@ def test_whole_workspace_replacement_rotates_both_identities_in_one_advance() ->
         install=install,
         project={
             "document_path": "/tmp/cell-b",
+            "read_only": False,
             "document_id": "cell-b",
             "document_name": "Cell B",
             "document_description": "",

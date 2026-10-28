@@ -22,6 +22,7 @@ from manyforge_behavior.canonical_artifact import (
     load_strict_json_yaml_bytes,
     raw_sha256_digest,
 )
+from manyforge_behavior.catalog import EDITED_OUTSIDE_MANYFORGE
 from manyforge_behavior.model_source_capture import (
     MAX_ARTIFACT_BYTES,
     MAX_XML_BYTES,
@@ -31,6 +32,9 @@ from manyforge_behavior.model_source_capture import (
 )
 
 from .security import (
+    SCENARIO_PROJECT_READ_ONLY_MESSAGE,
+    UNTITLED_SCENARIO_PATH,
+    inside_untitled_scenario,
     is_path_within_roots,
     normalize_allowed_roots,
     normalize_existing_file_path,
@@ -80,7 +84,7 @@ SCENARIO_SAVE_MARKER = ".manyforge-save-pending.json"
 SCENARIO_SAVE_INCOMPLETE = "scenario_artifact_save_incomplete"
 SCENARIO_SOURCE_SNAPSHOT_VERSION = "manyforge.scenario.source_snapshot.v1"
 # One Scenario name: the project folder name without its ``.scenario``
-# suffix, which Save and New also write as the scenario_id and manifest name.
+# suffix, which Save also writes as the scenario_id and manifest name.
 # Letters, digits, "_" and "-", starting with a letter or digit; no dots or
 # spaces. The frontend twin is ``SCENARIO_NAME_PATTERN`` in
 # ``frontend/src/state/newScenario.ts``.
@@ -88,6 +92,10 @@ SCENARIO_NAME_MAX = 128
 SCENARIO_NAME_PATTERN = r"^[A-Za-z0-9][A-Za-z0-9_-]{0,127}$"
 SCENARIO_PROJECT_SUFFIX = ".scenario"
 _SCENARIO_NAME = re.compile(SCENARIO_NAME_PATTERN)
+# The one built-in empty Scenario that New opens (``UNTITLED_SCENARIO_PATH``,
+# defined with the shared write guard in ``security``) is package data,
+# readable outside the allowed roots and never written: Save As places it
+# elsewhere.
 _STATUS_VALUES = frozenset({"ready", "incomplete", "unknown"})
 
 
@@ -139,6 +147,16 @@ def require_scenario_project_identity(
             f"characters); found folder {folder_name!r}, scenario_id "
             f"{scenario_id!r}, name {name!r}",
         )
+
+
+def scenario_project_read_only(path: str | Path | None) -> bool:
+    """Whether *path* is the built-in Untitled Scenario (never saved in place)."""
+
+    return path is not None and Path(path) == UNTITLED_SCENARIO_PATH
+
+
+def _readable_project(path: Path, roots: list[str]) -> bool:
+    return path == UNTITLED_SCENARIO_PATH or is_path_within_roots(path, roots)
 
 
 def scenario_project_stem(path: str | Path) -> str:
@@ -579,6 +597,24 @@ def _source_change_diagnostics(
     return diagnostics
 
 
+def _edited_outside_diagnostics(
+    saved: dict[str, Any],
+    current: dict[str, str],
+) -> list[dict[str, str]]:
+    """Members whose bytes differ from the manifest Save wrote: a warning, the
+    project still loads and its current content is what is captured."""
+
+    return [
+        {
+            "code": EDITED_OUTSIDE_MANYFORGE,
+            "source_id": f"member:{filename}",
+            "message": "Edited outside ManyForge since the last Save",
+        }
+        for filename, digest in sorted(current.items())
+        if saved.get(filename) != digest
+    ]
+
+
 def _existing_project(raw_path: str, roots: list[str]) -> Path:
     candidate = Path(raw_path).expanduser()
     try:
@@ -591,7 +627,7 @@ def _existing_project(raw_path: str, roots: list[str]) -> Path:
         _fail("scenario_artifact_path_invalid", str(error))
     if not resolved.is_dir():
         _fail("scenario_artifact_path_invalid", "Scenario project is not a directory")
-    if not is_path_within_roots(resolved, roots):
+    if not _readable_project(resolved, roots):
         _fail(
             "scenario_artifact_path_invalid",
             "Scenario project is outside allowed roots",
@@ -665,7 +701,7 @@ def _capture_project(
             project, os.O_RDONLY | os.O_DIRECTORY | os.O_CLOEXEC | os.O_NOFOLLOW
         )
         actual = Path(f"/proc/self/fd/{directory_fd}").resolve(strict=True)
-        if actual != project or not is_path_within_roots(actual, roots):
+        if actual != project or not _readable_project(actual, roots):
             _fail("scenario_artifact_changed", "Scenario project changed", status_code=409)
         try:
             os.stat(SCENARIO_SAVE_MARKER, dir_fd=directory_fd, follow_symlinks=False)
@@ -745,9 +781,9 @@ def _capture_project(
         current_snapshot, _ = _source_snapshot(
             document["deployment_draft"], project_root=project
         )
-        source_diagnostics = _source_change_diagnostics(
-            manifest["source_snapshot"], current_snapshot
-        )
+        source_diagnostics = _edited_outside_diagnostics(
+            manifest["members"], member_digests
+        ) + _source_change_diagnostics(manifest["source_snapshot"], current_snapshot)
         capture_digest = raw_sha256_digest(
             canonical_json_bytes(
                 {
@@ -867,6 +903,12 @@ def _writable_project(raw_path: str, roots: list[str]) -> tuple[Path, Path]:
             "Scenario project is outside allowed roots",
             status_code=403,
         )
+    if inside_untitled_scenario(parent / target.name):
+        _fail(
+            "scenario_project_read_only",
+            SCENARIO_PROJECT_READ_ONLY_MESSAGE,
+            status_code=409,
+        )
     return parent / target.name, parent
 
 
@@ -877,7 +919,7 @@ def prepare_scenario_artifact(
     allowed_roots: list[str],
     source_project_path: str | None = None,
 ) -> tuple[dict[str, Any], Path, dict[str, bytes], bytes]:
-    """Resolve and encode one project without writing it (Save and New)."""
+    """Resolve and encode one project without writing it."""
     roots = _roots(allowed_roots)
     target, _parent = _writable_project(raw_path, roots)
     require_scenario_project_identity(
@@ -923,7 +965,6 @@ def save_scenario_artifact(
     allowed_roots: list[str],
     overwrite: bool,
     source_project_path: str | None = None,
-    expected_source_digest: str | None = None,
     effects: OperationEffects | None = None,
 ) -> str:
     """Publish one project; record each destination effect in ``effects``.
@@ -942,8 +983,6 @@ def save_scenario_artifact(
         document, raw_path, allowed_roots=roots, source_project_path=source_project_path
     )
     intended_digest = prepared_scenario_source_digest(member_bytes, manifest_raw)
-    if expected_source_digest is not None and intended_digest != expected_source_digest:
-        _fail("scenario_artifact_changed", "Scenario sources changed before creation", status_code=409)
     parent = target.parent
     parent_fd = -1
     project_fd = -1

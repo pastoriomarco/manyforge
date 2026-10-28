@@ -139,6 +139,17 @@ def _append_openapi_routes(body: list[str], spec: dict) -> None:
                 f"| `{method.upper()}` | `{_markdown_cell(path)}` | "
                 f"{_markdown_cell(tag)} | {_markdown_cell(summary)} |\n"
             )
+    # Owner-maintained request/outcome notes (``x-manyforge-reference-note``).
+    notes = [
+        (path, method, operation["x-manyforge-reference-note"])
+        for path, methods in sorted(paths.items())
+        for method, operation in sorted((methods or {}).items())
+        if isinstance(operation, dict) and operation.get("x-manyforge-reference-note")
+    ]
+    if notes:
+        body.append("\n## Route notes\n")
+        for path, method, note in notes:
+            body.append(f"\n### `{method.upper()} {path}`\n\n{note.strip()}\n")
 
 
 def gen_rest_api() -> str:

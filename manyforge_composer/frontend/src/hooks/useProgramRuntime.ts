@@ -108,6 +108,13 @@ export function programTerminalFailureMessage(
   return `Program execution failed. ${programCurrentStatusSummary(run, controls, cycle)}`;
 }
 
+/** Identity of a failed run's notice: run id and revision; null otherwise. */
+export function programFailureNoticeKey(run: ProgramRunStatus | null): string | null {
+  return run?.state === 'failed'
+    ? `${run.capture.programRunId}@${run.runRevision}`
+    : null;
+}
+
 export function programRuntimeWakeKey(snapshot: ComposerHeadlessState | null): string {
   if (snapshot === null) return 'unavailable';
   // Catalog and Applied reads follow their own owner identities. Program-cycle
@@ -173,6 +180,11 @@ interface ProgramRuntimeState {
   selectionPending: ProgramSelectionPending[];
   controlPending: string | null;
   error: string | null;
+  /** The failed run (`programFailureNoticeKey`) whose synthesized notice
+   * `error` holds; null when `error` is a command message. */
+  failureNoticeKey?: string | null;
+  /** The failed run whose notice was dismissed or superseded by a command. */
+  dismissedFailureKey?: string | null;
 }
 
 /** Commands that start or resume Program progression or motion. */
@@ -408,6 +420,8 @@ export interface ProgramResetOptions {
 export interface ProgramResetCallOptions extends ProgramResetOptions {
   correlationId?: string;
   expected?: ProgramResetExpectation;
+  /** D6: Scenario Close's Reset ends the run but never clears the cell Stop fault. */
+  keepStopFault?: boolean;
 }
 
 /** What one Reset call established; never settlement on its own. */
@@ -424,7 +438,7 @@ export function buildProgramResetRequest(
   requestOwnerEpoch: string,
   requestId: string,
   correlationId: string = requestId,
-  options: ProgramResetOptions = {},
+  options: ProgramResetOptions & { keepStopFault?: boolean } = {},
 ): Record<string, JsonValue> | null {
   const cycle = snapshot?.programCycle;
   const allowed = cycle?.allowedCommands.some(
@@ -455,6 +469,9 @@ export function buildProgramResetRequest(
     settlement_evidence_digest: cycle.terminalOrSettlementReference,
     reload_initial_scene: selected.reloadInitialScene ?? false,
     reset_robot_position: selected.resetRobotPosition ?? false,
+    // A retained Reset continues with its own accepted keep_stop_fault (D6).
+    ...((retainedReset !== null ? retainedReset.keepStopFault === true : options.keepStopFault === true)
+      ? { keep_stop_fault: true } : {}),
   };
 }
 
@@ -756,15 +773,31 @@ export function useProgramRuntime(
         projected.run,
         projected.controls,
       );
-      const error = current.error ?? (
-        cycle.state === 'idle_after_reset'
-          ? null
-          : programTerminalFailureMessage(
-            projected.run,
-            projected.controls,
-            cycleDebugProjection,
-          )
-      );
+      // The failed-run notice is shown once per run revision: it clears when
+      // Reset reaches idle or another run is observed, and stays away after
+      // Dismiss or a Program command.
+      const failureKey = programFailureNoticeKey(projected.run);
+      let error = current.error;
+      let failureNoticeKey = current.failureNoticeKey ?? null;
+      if (failureNoticeKey !== null && (
+        cycle.state === 'idle_after_reset' || failureKey !== failureNoticeKey
+      )) {
+        error = null;
+        failureNoticeKey = null;
+      }
+      if (
+        cycle.state !== 'idle_after_reset'
+        && error === null
+        && failureKey !== null
+        && failureKey !== current.dismissedFailureKey
+      ) {
+        error = programTerminalFailureMessage(
+          projected.run,
+          projected.controls,
+          cycleDebugProjection,
+        );
+        failureNoticeKey = failureKey;
+      }
       if (
         programRunProjectionKey(current.run) === programRunProjectionKey(projected.run)
         && controlsKey(current.controls) === controlsKey(projected.controls)
@@ -773,6 +806,7 @@ export function useProgramRuntime(
         && sameSelectionPending(current.selectionPending, selectionPending)
         && current.controlPending === controlPending
         && current.error === error
+        && (current.failureNoticeKey ?? null) === failureNoticeKey
       ) return current;
       return {
         ...current,
@@ -783,6 +817,7 @@ export function useProgramRuntime(
         selectionPending,
         controlPending,
         error,
+        failureNoticeKey,
       };
     });
   }, [
@@ -891,7 +926,13 @@ export function useProgramRuntime(
   const dismissError = useCallback(() => {
     setState((current) => current.error === null
       ? current
-      : { ...current, error: null });
+      : {
+        ...current,
+        error: null,
+        failureNoticeKey: null,
+        dismissedFailureKey: programFailureNoticeKey(current.run)
+          ?? current.dismissedFailureKey,
+      });
   }, []);
 
   const beginProgramCommand = useCallback((
@@ -917,11 +958,17 @@ export function useProgramRuntime(
         ]
         : current.selectionPending,
       error: null,
+      // A Program command (Reset, Run, ...) supersedes the failed-run notice.
+      failureNoticeKey: null,
+      dismissedFailureKey: programFailureNoticeKey(current.run)
+        ?? current.dismissedFailureKey,
     }));
   }, []);
 
   const beginControlCommand = useCallback((pending: string) => {
-    setState((current) => ({ ...current, controlPending: pending, error: null }));
+    setState((current) => ({
+      ...current, controlPending: pending, error: null, failureNoticeKey: null,
+    }));
   }, []);
 
   const recordCommandFailure = useCallback(async (
@@ -964,6 +1011,7 @@ export function useProgramRuntime(
           errorMessage(reason, fallback),
           `Request ${requestId}. Backend state remains authoritative.`,
         ].join(' '),
+        failureNoticeKey: null,
       };
     });
   }, []);
@@ -1042,7 +1090,9 @@ export function useProgramRuntime(
       const message = request === null
         ? 'Program Reset was not sent because its backend permission or cycle identity changed. Controls were refreshed.'
         : 'Program Reset was not sent because the execution control connection is unavailable. Controls were refreshed.';
-      if (mounted.current) setState((current) => ({ ...current, error: message }));
+      if (mounted.current) {
+        setState((current) => ({ ...current, error: message, failureNoticeKey: null }));
+      }
       await refresh();
       return { status: 'refused', message };
     }
@@ -1771,7 +1821,9 @@ export function useProgramRuntime(
     setActivationOffer(null);
     setActivationPending(false);
     setActivationWaiting(false);
-    if (message !== undefined) setState((current) => ({ ...current, error: message }));
+    if (message !== undefined) {
+      setState((current) => ({ ...current, error: message, failureNoticeKey: null }));
+    }
   }, []);
   const cancelActivationExecute = useCallback(() => finishExecuteFlow(), [finishExecuteFlow]);
   useEffect(() => () => {

@@ -9,6 +9,8 @@
 #include <manyforge_deployment/scene_pose_source_policy_codec.hpp>
 #include <algorithm>
 #include <array>
+#include <map>
+#include <set>
 #include <stdexcept>
 #include <tuple>
 
@@ -33,6 +35,209 @@ const Value &member(const Value &value, std::string_view name) {
     throw std::invalid_argument("pose-source configuration missing " +
                                 std::string(name));
   return *result;
+}
+
+[[nodiscard]] const Value *gripper_target_configuration(
+    const ActivationDeploymentComponent &component,
+    const std::string_view command_target_id) {
+  const auto *configuration =
+      component.configuration.find_object_member("runtime_configuration");
+  const auto *targets = configuration
+                            ? configuration->find_object_member(
+                                  "gripper_target_configurations")
+                            : nullptr;
+  if (targets == nullptr || !targets->is_array())
+    return nullptr;
+  const Value *selected = nullptr;
+  for (const auto &row : targets->as_array()) {
+    const auto *target = row.find_object_member("command_target_id");
+    if (target == nullptr || !target->is_string() ||
+        target->as_string() != command_target_id)
+      continue;
+    if (selected != nullptr)
+      return nullptr;
+    selected = &row;
+  }
+  return selected;
+}
+
+[[nodiscard]] std::string unique_gripper_base_link(
+    const ActivationPreparedModel &model, const Value &target_configuration) {
+  const auto &asset = model.verified_asset.value();
+  const auto binding = std::find_if(
+      asset.collision_body_role_bindings.begin(),
+      asset.collision_body_role_bindings.end(), [](const auto &row) {
+        return row.collision_body_role_id.value() == "gripper_collision";
+      });
+  if (binding == asset.collision_body_role_bindings.end())
+    return {};
+  const std::set<std::string, std::less<>> collision_links(
+      binding->source_link_names.begin(), binding->source_link_names.end());
+  const auto *touch_links =
+      target_configuration.find_object_member("touch_links");
+  if (touch_links == nullptr || !touch_links->is_array())
+    return {};
+  std::set<std::string, std::less<>> target_gripper_links;
+  for (const auto &touch_link : touch_links->as_array()) {
+    if (!touch_link.is_string())
+      return {};
+    if (collision_links.contains(touch_link.as_string()))
+      target_gripper_links.insert(touch_link.as_string());
+  }
+  if (target_gripper_links.empty())
+    return {};
+  std::vector<std::string> candidates;
+  for (const auto &joint : model.verified_asset.source_ir().urdf().joints) {
+    if (joint.type == UrdfJointType::kFixed &&
+        target_gripper_links.contains(joint.child_link_name) &&
+        collision_links.contains(joint.child_link_name) &&
+        !collision_links.contains(joint.parent_link_name))
+      candidates.push_back(joint.child_link_name);
+  }
+  if (candidates.size() != 1U)
+    return {};
+  return candidates.front();
+}
+
+[[nodiscard]] bool has_gripper_target(
+    const ActivationDeploymentComponent &component) {
+  const auto *configuration =
+      component.configuration.find_object_member("runtime_configuration");
+  const auto *grippers = configuration
+                             ? configuration->find_object_member(
+                                   "gripper_target_configurations")
+                             : nullptr;
+  if (grippers == nullptr || !grippers->is_array())
+    return false;
+  return !grippers->as_array().empty();
+}
+
+[[nodiscard]] Value relative_references(
+    const Value &configuration, const ActivationDeploymentIntent &intent,
+    const std::map<std::string, const ActivationPreparedModel *,
+                   std::less<>> &models_by_component) {
+  const auto *simulation = configuration.find_object_member("simulation");
+  if (simulation == nullptr)
+    return Value(nullptr);
+  const auto *references =
+      simulation->find_object_member("relative_references");
+  const auto *legacy = simulation->find_object_member("relative_reference");
+  if (references != nullptr && legacy != nullptr)
+    throw std::invalid_argument(
+        "scene_pose_source_relative_references_conflict");
+
+  Value result(nullptr);
+  if (references != nullptr) {
+    result = *references;
+  } else if (legacy != nullptr) {
+    std::vector<std::pair<const ActivationDeploymentComponent *,
+                          const Value *>>
+        gripper_targets;
+    for (const auto &component : intent.components) {
+      const auto *configuration =
+          component.configuration.find_object_member("runtime_configuration");
+      const auto *targets = configuration
+                                ? configuration->find_object_member(
+                                      "gripper_target_configurations")
+                                : nullptr;
+      if (targets == nullptr || !targets->is_array())
+        continue;
+      for (const auto &target : targets->as_array())
+        gripper_targets.emplace_back(&component, &target);
+    }
+    if (gripper_targets.size() != 1U)
+      throw std::invalid_argument(
+          "scene_pose_source_relative_references_required: set per-robot references");
+    const auto &[component, target] = gripper_targets.front();
+    const auto &robot = *component;
+    const auto &command_target_id =
+        member(*target, "command_target_id").as_string();
+    const auto model = models_by_component.find(robot.component_id);
+    if (model == models_by_component.end())
+      throw std::invalid_argument(
+          "scene_pose_source_relative_reference_gripper_link_invalid");
+    const auto gripper_link =
+        unique_gripper_base_link(*model->second, *target);
+    if (gripper_link.empty())
+      throw std::invalid_argument(
+          "scene_pose_source_relative_reference_gripper_link_invalid");
+    result = Value(Array{Value(Object{
+        {"controllable_component_id", Value(robot.component_id)},
+        {"command_target_id", Value(command_target_id)},
+        {"gripper_link", Value(gripper_link)},
+        {"entity", member(*legacy, "entity")},
+        {"link", member(*legacy, "link")},
+        {"source_header_frame_id",
+         member(*legacy, "source_header_frame_id")},
+    })});
+  }
+
+  if (std::holds_alternative<std::nullptr_t>(result.storage()))
+    return result;
+  if (!result.is_array() || result.as_array().empty())
+    throw std::invalid_argument(
+        "scene_pose_source_relative_reference_gripper_link_invalid");
+  std::set<std::pair<std::string, std::string>> seen;
+  Array normalized;
+  normalized.reserve(result.as_array().size());
+  for (const auto &row : result.as_array()) {
+    const auto &component_id =
+        member(row, "controllable_component_id").as_string();
+    const auto &command_target_id =
+        member(row, "command_target_id").as_string();
+    const auto model = models_by_component.find(component_id);
+    const auto component = std::find_if(
+        intent.components.begin(), intent.components.end(),
+        [&](const auto &candidate) {
+          return candidate.component_id == component_id;
+        });
+    const auto *target = component == intent.components.end()
+                             ? nullptr
+                             : gripper_target_configuration(*component,
+                                                            command_target_id);
+    if (model == models_by_component.end() || target == nullptr ||
+        !has_gripper_target(*component))
+      throw std::invalid_argument(
+          "scene_pose_source_relative_reference_gripper_link_invalid");
+    const auto gripper_link =
+        unique_gripper_base_link(*model->second, *target);
+    const auto *stated_link = row.find_object_member("gripper_link");
+    if (gripper_link.empty() ||
+        (stated_link != nullptr &&
+         (!stated_link->is_string() ||
+          stated_link->as_string() != gripper_link)) ||
+        !seen.emplace(component_id, command_target_id).second)
+      throw std::invalid_argument(
+          "scene_pose_source_relative_reference_gripper_link_invalid");
+    auto normalized_row = row.as_object();
+    std::erase_if(normalized_row, [](const auto &field) {
+      return field.first == "gripper_link";
+    });
+    normalized_row.emplace_back("gripper_link", Value(gripper_link));
+    normalized.emplace_back(Value(std::move(normalized_row)));
+  }
+  return Value(std::move(normalized));
+}
+
+[[nodiscard]] Value with_relative_references(Value configuration,
+                                              const Value &references) {
+  if (!configuration.is_object() ||
+      std::holds_alternative<std::nullptr_t>(references.storage()))
+    return configuration;
+  auto root = configuration.as_object();
+  for (auto &[name, value] : root) {
+    if (name != "simulation")
+      continue;
+    auto simulation = value.as_object();
+    std::erase_if(simulation, [](const auto &field) {
+      return field.first == "relative_reference" ||
+             field.first == "relative_references";
+    });
+    simulation.emplace_back("relative_references", references);
+    value = Value(std::move(simulation));
+    return Value(std::move(root));
+  }
+  return configuration;
 }
 
 Value with(Value value, std::string_view field, Value selected) {
@@ -87,7 +292,7 @@ Value expand_pose_source(
   const auto *detection = config.find_object_member("detection3d");
   const auto *overlay = config.find_object_member("robot_overlay");
   const auto *relative =
-      simulation ? simulation->find_object_member("relative_reference")
+      simulation ? simulation->find_object_member("relative_references")
                  : nullptr;
   const auto entity_row = [&](const std::string &object_id,
                               std::string_view policy_id, bool eligible,
@@ -111,7 +316,7 @@ Value expand_pose_source(
     // Object rows carry it whenever the component has one, so a policy edit
     // never changes the observer document; overlay rows never do.
     if (relative && eligible)
-      row.emplace_back("relative_reference", *relative);
+      row.emplace_back("relative_references", *relative);
     return Value(std::move(row));
   };
   const auto offset = [](const Value &object, std::string_view name,
@@ -132,7 +337,9 @@ Value expand_pose_source(
             &link.source_key)) {
       if (!simulation)
         throw std::invalid_argument("scene_pose_source_mode_missing");
-      if (relative_policy && !relative)
+      if (relative_policy &&
+          (relative == nullptr || !relative->is_array() ||
+           relative->as_array().empty()))
         throw std::invalid_argument(
             "scene_pose_source_relative_reference_missing");
       entities.emplace_back(
@@ -362,6 +569,7 @@ Value ai_model_row(const std::string &component_id, const Value &config) {
 std::vector<ActivationPreparedIoType> prepare_activation_pose_source_types(
     const ActivationDeploymentIntent &intent,
     std::span<const ActivationComponentProfile> profiles,
+    const std::vector<ActivationPreparedModel> &prepared_models,
     std::span<const QualifiedCapabilityDefinition> capabilities) {
   if (intent.components.size() != profiles.size())
     throw std::invalid_argument("pose-source component profile join differs");
@@ -373,6 +581,23 @@ std::vector<ActivationPreparedIoType> prepare_activation_pose_source_types(
   const auto streams =
       stream_rows ? decode_component_stream_overrides(*stream_rows)
                   : std::vector<core::StreamParameterOverrideDTO>{};
+  std::map<std::string, const ActivationPreparedModel *, std::less<>>
+      models_by_component;
+  std::size_t prepared_index = 0U;
+  for (const auto &profile : profiles) {
+    if (is_model_free_runtime_kind(profile.runtime_kind))
+      continue;
+    if (prepared_index >= prepared_models.size() ||
+        !models_by_component
+             .emplace(profile.component_id,
+                      &prepared_models[prepared_index++])
+             .second)
+      throw std::invalid_argument(
+          "pose-source component profile/model join differs");
+  }
+  if (prepared_index != prepared_models.size())
+    throw std::invalid_argument(
+        "pose-source component profile/model join differs");
   // Every link names a pose-source component of this Deployment. A link whose
   // object is not in the Program is allowed (runtime ignores it).
   for (const auto &link : links)
@@ -390,13 +615,16 @@ std::vector<ActivationPreparedIoType> prepare_activation_pose_source_types(
           "pose-source component profile ordering differs");
     if (profile.runtime_kind != ActivationRuntimeKind::kPoseSource)
       continue;
+    auto configuration = normalize_configuration(
+        member(component.configuration, "runtime_configuration"));
+    const auto references =
+        relative_references(configuration, intent, models_by_component);
+    configuration = with_relative_references(
+        std::move(configuration), references);
     result.push_back(prepare_model_free_type(
         kPoseSourceType, component.component_id,
-        expand_pose_source(
-            component.component_id,
-            normalize_configuration(
-                member(component.configuration, "runtime_configuration")),
-            links, streams),
+        expand_pose_source(component.component_id, configuration, links,
+                           streams),
         capabilities));
   }
   return result;

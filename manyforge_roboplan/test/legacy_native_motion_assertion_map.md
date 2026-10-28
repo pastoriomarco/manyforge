@@ -54,7 +54,7 @@ fault immediately after malformed-Stop recovery. No product code changed.
 Neither the two process tests nor Q was run while creating this map; the
 coordinator owns the ROS build and test lane.
 
-Counts: E=190, A=42, P=9, C=3, S=4, O=4; total=252.
+Counts: E=189, A=42, P=9, C=4, S=4, O=4; total=252.
 
 | Old line | Legacy assertion / expected exception | Status | Current reference / disposition |
 |---:|---|:---:|---|
@@ -283,7 +283,7 @@ Counts: E=190, A=42, P=9, C=3, S=4, O=4; total=252.
 | 2806 | <code>recovered_result[&#x27;latch&#x27;][&#x27;state&#x27;] == &#x27;cleared&#x27;</code> | E | H:2493 — same assertion expression; origin-scope caveat below |
 | 2807 | <code>headless.stop_fault()[&#x27;stop_fault&#x27;] is None</code> | A | D:2677 — restored post-recovery query; origin-scope caveat below |
 | 2816 | <code>len(clear_rows) == 1</code> | E | H:2503 — same assertion expression; origin-scope caveat below |
-| 2818 | <code>durable_clear[0] == &#x27;manyforge.internal.stop-journal-fault-clear-projection.v2&#x27;</code> | E | H:2505 — same assertion expression; origin-scope caveat below |
+| 2818 | <code>durable_clear[0] == &#x27;manyforge.internal.stop-journal-fault-clear-projection.v2&#x27;</code> | C | H:2505 — expects v3 instead of v2 (lean Stop record, operation journal v17); origin-scope caveat below |
 | 2821 | <code>durable_clear[2][0] == recovered_result[&#x27;request_id&#x27;]</code> | E | H:2508 — same assertion expression; origin-scope caveat below |
 | 2825 | <code>len(clear_page[&#x27;events&#x27;]) == 1</code> | E | H:2510 — same assertion expression; origin-scope caveat below |
 | 2827 | <code>clear_event[&#x27;record_kind&#x27;] == &#x27;stop_fault_cleared&#x27;</code> | E | H:2512 — same assertion expression; origin-scope caveat below |

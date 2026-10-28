@@ -15,6 +15,7 @@ from manyforge_behavior.value_path import ValuePathError, parse_value_path
 from manyforge_behavior.program import (
     Program,
     ProgramValidationError,
+    catalog_version_compatible,
     check_draft_formulas,
 )
 from manyforge_behavior.program_expressions import CheckedExpression
@@ -55,6 +56,25 @@ def from_program(program: Program) -> dict[str, Any]:
         "forest": [root],
         "positions": {},
     }
+
+
+def adopt_active_catalog(authoring: dict[str, Any], catalog: NodeCatalog) -> None:
+    """Select the active catalog version in one loaded authoring source.
+
+    Only an older compatible ``content_version`` (same major, lower minor) is
+    replaced, so Save writes the active version. Every other field, and any
+    other selector, is kept for the normal validator to report.
+    """
+
+    selected = authoring.get("catalog")
+    if (
+        type(selected) is dict
+        and selected.get("content_version") != catalog.content_version
+        and catalog_version_compatible(
+            selected.get("content_version"), catalog.content_version
+        )
+    ):
+        selected["content_version"] = catalog.content_version
 
 
 def empty_authoring(catalog: NodeCatalog) -> dict[str, Any]:

@@ -2,12 +2,10 @@ import { useCallback, useEffect, useState } from 'react';
 
 import { api } from '../api/client';
 import type { CCLCComponentIncident, CCLCComponentSnapshot } from '../types/cclc';
-import type { StopFaultRecoveryOffer } from '../types/robotControl';
+import type { CellRecoverResult } from '../types/robotControl';
 import {
   cclcControlModeUnavailableReason,
   cclcRequestOwnerEpoch,
-  lifecycleRequestFromSnapshot,
-  requestContext,
 } from './useCCLC';
 
 const OBSERVATION_INTERVAL_MS = 2000;
@@ -60,66 +58,51 @@ export async function readOpenComponentIncidents(
   }));
 }
 
-/**
- * The operator's acknowledgement (addendum 2, contract item 3): one CCLC
- * lifecycle `recover` request per component with an open incident, built
- * from that component's fresh snapshot like the lifecycle panel's requests.
- * CCLC accepts it either authorization-only (`incidentRecovery`, no
- * transaction: the incident is closed and the cell recovery follows) or, when
- * the incident already closed, as an ordinary lifecycle transaction.
- * Returns how many were accepted; throws on the first refusal.
- */
-export async function acknowledgeComponentIncidents(
-  componentIds: readonly string[],
-  admissionGeneration: number | null,
-  signal?: AbortSignal,
-): Promise<number> {
-  const { ownerEpoch, snapshots } = await readIncidentSnapshots(componentIds, signal);
-  if (snapshots.length === 0 || ownerEpoch === null) return 0;
-  if (admissionGeneration === null) {
-    throw new Error(
-      'Current authoring admission is unavailable; component incidents cannot be acknowledged.',
-    );
-  }
-  for (const snapshot of snapshots) {
-    const result = await api.cclc.submitLifecycle(
-      lifecycleRequestFromSnapshot(
-        snapshot,
-        'recover',
-        requestContext(ownerEpoch, 'lifecycle:recover'),
-        admissionGeneration,
-      ),
-      signal,
-    );
-    if (result.incidentRecovery === null && result.transactionId === null) {
-      throw new Error(
-        `Acknowledgement of the ${snapshot.controllableComponentId} incident was ${result.replayStatus}.`,
-      );
-    }
-  }
-  return snapshots.length;
-}
-
-const MISSING_RECOVERY_FACTS: Record<StopFaultRecoveryOffer['recoveryStatus'], string> = {
-  waiting_for_observation: 'a fresh controller observation',
-  waiting_for_quiescence: 'all motion to settle',
-  waiting_for_configuration: 'the control configuration to be confirmed',
-  waiting_for_external_reconciliation: 'external reconciliation',
-  waiting_for_durable_record: 'the Stop record to be saved',
-  recovery_pending: 'the recovery already in progress',
-  ready: 'nothing',
+const WAITING_FOR: Record<string, string> = {
+  stop_fault_recovery_waiting_for_observation:
+    'a fresh controller observation or an uncertain operation to resolve',
+  stop_fault_recovery_waiting_for_quiescence: 'the arm to be proven at rest',
+  stop_fault_recovery_waiting_for_configuration: 'the control configuration to be confirmed',
+  stop_fault_recovery_waiting_for_external_reconciliation: 'external reconciliation',
+  stop_fault_recovery_waiting_for_durable_record: 'the Stop record to be saved',
+  stop_fault_recovery_pending: 'the recovery already in progress',
 };
 
-/** What the cell recovery offer still waits for, worded for the operator. */
-export function stopFaultRecoveryMissing(
-  offer: StopFaultRecoveryOffer,
-  acknowledged: number,
-): string {
+/**
+ * Word Recover cell's typed result for the operator; null when it is done.
+ * The reason code is the owner's; only the wording is decided here.
+ */
+export function cellRecoverMessage(result: CellRecoverResult): string | null {
+  const { reason } = result;
+  if (result.outcome === 'done' || reason === null) return null;
+  const acknowledged = result.acknowledgedIncidents.length;
+  const waitingFor = WAITING_FOR[reason.code];
+  let text: string;
+  if (reason.code === 'incident_open') {
+    const component = reason.details.controllable_component_id ?? 'a component';
+    const cause = reason.details.cause_class?.replaceAll('_', ' ') ?? 'unknown cause';
+    text = `The ${component} incident is open again (${cause}): its cause is still present, `
+      + 'for example an e-stop still pressed. Clear the cause, then press Recover cell again.';
+  } else if (waitingFor !== undefined) {
+    text = `Cell recovery is not ready yet: waiting for ${waitingFor}. `
+      + 'Press Recover cell again when it is ready.';
+  } else if (reason.code === 'cell_recover_outcome_unknown') {
+    text = 'Recover cell outcome not confirmed — check the cell state. '
+      + 'Steps not listed here may or may not have run.';
+  } else if (reason.code === 'stop_fault_latch_replaced') {
+    text = 'A newer cell stop replaced the one this press saw. Press Recover cell again.';
+  } else if (reason.code === 'stop_fault_recovery_unavailable') {
+    text = 'Cell recovery is unavailable: '
+      + `${reason.details.recovery_unavailable_reason ?? reason.message}.`;
+  } else {
+    text = `Cell recovery was refused: ${reason.message} (${reason.code}).`;
+  }
   return [
     acknowledged === 0 ? null : `${acknowledged} component incident(s) acknowledged.`,
-    `Cell recovery is not ready yet: waiting for ${MISSING_RECOVERY_FACTS[offer.recoveryStatus]}.`,
-    offer.recoveryUnavailableReason,
-    'Press Recover cell again when it is ready.',
+    result.latchCleared ? 'The cell latch was cleared.' : null,
+    result.recoveredComponents.length === 0
+      ? null : `Recover started for ${result.recoveredComponents.join(', ')}.`,
+    text,
   ].filter((part): part is string => part !== null).join(' ');
 }
 

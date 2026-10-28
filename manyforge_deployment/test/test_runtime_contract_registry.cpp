@@ -173,11 +173,13 @@ TEST(RuntimeContractRegistry,
     EXPECT_NE(std::find(ros->offer().provided_capabilities.begin(),
                         ros->offer().provided_capabilities.end(), expected),
               ros->offer().provided_capabilities.end());
-    for (const auto &other : rows)
-      if (&other != &*ros)
+    for (const auto &other : rows) {
+      if (&other != &*ros) {
         EXPECT_EQ(std::find(other.offer().provided_capabilities.begin(),
                             other.offer().provided_capabilities.end(), expected),
                   other.offer().provided_capabilities.end());
+      }
+    }
   }
   const auto required = core::MakeRuntimeContractRequirement(
       ros->offer().runtime_implementation_id, {}, services);

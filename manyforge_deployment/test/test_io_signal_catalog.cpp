@@ -105,6 +105,96 @@ TEST(IoSignalCatalogTest, XArmBankRequiresOneSourceAndDriverExposedPins) {
   EXPECT_FALSE(ResolveRetainedIoSignalCatalog(io_graph({JsonValueDTO{first}})).ok());
 }
 
+ControlBindingDTO capability_binding(std::string component, std::string target,
+                                     std::string capability) {
+  const std::string digest = "sha256:" + std::string(64, 'a');
+  return {ControlBindingId{component + "." + target + "." + capability},
+          ControlBindingRevision{digest},
+          ControllableComponentId{component},
+          CommandTargetId{target},
+          CapabilityId{std::move(capability)},
+          CapabilityDefinitionRevision{digest},
+          ControlDomainId{"domain.robot"},
+          {},
+          ControlInterfaceContractId{"interface"},
+          ControlInterfaceRevision{digest},
+          ControllerTopologyId{"topology"},
+          TopologyRevision{digest},
+          {},
+          {},
+          ProviderInstanceId{"provider"},
+          RuntimeUnitId("host.io"),
+          ProviderManifestId{"manifest"},
+          ProviderManifestRevision{digest},
+          StateAuthorityId{"state"},
+          StateAuthorityClass::kMeasured,
+          StopEvidencePolicyId{"stop"},
+          StopEvidencePolicyRevision{digest},
+          ContainmentGranularity::kResource,
+          {}};
+}
+
+TEST(IoSignalCatalogTest, CompiledCatalogDeclaresOneLostSignalPerGripperTarget) {
+  using manyforge::deployment::ResolveCompiledIoSignalCatalog;
+  auto graph = io_graph();
+  graph.control_bindings = {
+      capability_binding("robot.a", "gripper", "tool.gripper.command"),
+      // A second capability of the same gripper target adds nothing.
+      capability_binding("robot.a", "gripper", "tool.gripper.feedback"),
+      capability_binding("robot.a", "arm", "execution.trajectory.execute"),
+      capability_binding("robot.b", "hand", "tool.gripper.command")};
+  // The authored catalog is unchanged.
+  const auto authored = ResolveRetainedIoSignalCatalog(graph);
+  ASSERT_TRUE(authored.ok());
+  ASSERT_EQ(authored.value().size(), 1U);
+  const auto compiled = ResolveCompiledIoSignalCatalog(graph);
+  ASSERT_TRUE(compiled.ok()) << compiled.error().message;
+  ASSERT_EQ(compiled.value().size(), 3U);
+  std::vector<std::pair<std::string, std::string>> system;
+  for (const auto &row : compiled.value()) {
+    if (row.provider.profile != "system_carried_object")
+      continue;
+    system.emplace_back(row.descriptor.signal_id.controllable_component_id.value(),
+                        row.descriptor.signal_id.name);
+    EXPECT_EQ(row.resource_role_id.value(), "carried_object_lost");
+    EXPECT_EQ(row.runtime_unit_id, RuntimeUnitId("host.io"));
+    EXPECT_EQ(row.descriptor.source_id.value(), "system.carried_object_lost");
+    EXPECT_EQ(row.descriptor.direction, IoSignalDirection::kInput);
+    EXPECT_EQ(row.descriptor.value_type, IoSignalValueType::kBoolean);
+    EXPECT_EQ(row.descriptor.update_mode, IoSignalUpdateMode::kChangeOnly);
+    EXPECT_EQ(row.descriptor.transition_capability,
+              IoTransitionCapability::kSampledOnly);
+    EXPECT_EQ(row.descriptor.freshness.mode, IoFreshnessMode::kProviderValidity);
+    EXPECT_EQ(row.descriptor.liveness, IoSignalLivenessMode::kInProcess);
+    EXPECT_TRUE(ComputeIoSignalDescriptorDigest(row.descriptor).ok());
+  }
+  EXPECT_EQ(system, (std::vector<std::pair<std::string, std::string>>{
+                        {"robot.a", "carried_object_lost.gripper"},
+                        {"robot.b", "carried_object_lost.hand"}}));
+  // An authored row cannot take a system identity.
+  auto taken = input_row("carried_object_lost.gripper");
+  taken["controllable_component_id"] = JsonValueDTO{std::string("robot.a")};
+  graph.controllable_components.push_back(
+      {ControllableComponentId("robot.a"), ComponentTypeId("robot"),
+       ComponentTypeRevision("revision.robot"), {}, {RuntimeUnitId("host.io")}, {}});
+  graph.runtime_units.front().configuration["io_signals"] =
+      JsonValueDTO{Array{JsonValueDTO{input_row()}, JsonValueDTO{taken}}};
+  ASSERT_TRUE(ResolveRetainedIoSignalCatalog(graph).ok());
+  const auto conflict = ResolveCompiledIoSignalCatalog(graph);
+  ASSERT_FALSE(conflict.ok());
+  EXPECT_EQ(conflict.error().details.at("reason"), "io_system_signal_conflict");
+  // An authored row on the reserved system source is refused too (SX-205: the
+  // generated rows share that source with each other, never with authored).
+  const auto reserved = input_row("authored_name", "system.carried_object_lost");
+  graph.runtime_units.front().configuration["io_signals"] =
+      JsonValueDTO{Array{JsonValueDTO{input_row()}, JsonValueDTO{reserved}}};
+  ASSERT_TRUE(ResolveRetainedIoSignalCatalog(graph).ok());
+  const auto reserved_conflict = ResolveCompiledIoSignalCatalog(graph);
+  ASSERT_FALSE(reserved_conflict.ok());
+  EXPECT_EQ(reserved_conflict.error().details.at("reason"),
+            "io_system_signal_conflict");
+}
+
 TEST(IoSignalCatalogTest, MockEchoRequiresDeclaredSameDeviceMockOutput) {
   auto sensor = input_row();
   provider(sensor)["echo"] = JsonValueDTO{Object{

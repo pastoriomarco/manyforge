@@ -94,6 +94,9 @@ def test_native_commands_retain_five_owner_entrypoints(tmp_path: Path):
     )
     assert "--port 9010" in commands[1]
     assert "--port 9011" in commands[2]
+    assert specs[2].argv[
+        specs[2].argv.index("--snapshot-url") + 1
+    ] == "http://127.0.0.1:9000/api/scene/snapshot/render"
     expected_liveness = str(
         config.manager_run_root / "program-runner-liveness.sock"
     )

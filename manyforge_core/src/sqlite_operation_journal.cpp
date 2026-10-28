@@ -1,3 +1,4 @@
+#include <manyforge_core/execution_event_change_signal.hpp>
 #include <manyforge_core/io_rule_outcome_codec.hpp>
 #include <sqlite3.h>
 
@@ -103,25 +104,11 @@ CREATE TABLE stop_projections (
   stop_id TEXT NOT NULL,
   stop_generation INTEGER NOT NULL,
   acceptance_sequence INTEGER NOT NULL UNIQUE,
-  acceptance_payload TEXT NOT NULL,
-  acceptance_digest TEXT NOT NULL,
+  accepted_payload TEXT NOT NULL,
+  accepted_digest TEXT NOT NULL,
   terminal_sequence INTEGER UNIQUE,
-  terminal_payload TEXT,
-  terminal_digest TEXT,
   surveillance_sequence INTEGER UNIQUE,
-  surveillance_payload TEXT,
-  surveillance_digest TEXT,
   clear_sequence INTEGER UNIQUE,
-  clear_request_id TEXT,
-  clear_payload TEXT,
-  clear_digest TEXT,
-  CHECK ((terminal_sequence IS NULL) = (terminal_payload IS NULL)),
-  CHECK ((terminal_sequence IS NULL) = (terminal_digest IS NULL)),
-  CHECK ((surveillance_sequence IS NULL) = (surveillance_payload IS NULL)),
-  CHECK ((surveillance_sequence IS NULL) = (surveillance_digest IS NULL)),
-  CHECK ((clear_sequence IS NULL) = (clear_request_id IS NULL)),
-  CHECK ((clear_sequence IS NULL) = (clear_payload IS NULL)),
-  CHECK ((clear_sequence IS NULL) = (clear_digest IS NULL)),
   PRIMARY KEY(stop_id, stop_generation),
   FOREIGN KEY(acceptance_sequence) REFERENCES journal_records(sequence),
   FOREIGN KEY(terminal_sequence) REFERENCES journal_records(sequence),
@@ -490,6 +477,8 @@ class Transaction final {
   void Commit() {
     Exec(database_, "COMMIT");
     committed_ = true;
+    // After COMMIT: a woken event-stream reader sees this write.
+    execution_event_change_signal().Notify();
   }
 
  private:
@@ -2263,6 +2252,79 @@ void RequireEmergencyStopProjection(const RequestOwnerEpoch& owner_epoch,
   return result;
 }
 
+// Lean Stop record (journal v17). `stop_projections` is an index: each Stop
+// payload is stored once, in journal_records (payload_json + payload_digest).
+// `accepted_payload` is the positional acceptance projection v12 (accepted
+// only), with its own SHA-256 in `accepted_digest` (verified on every read,
+// as v16 verified acceptance_digest). Every other reader joins the journal row by sequence; with the FKs and
+// foreign_keys=ON a non-NULL *_sequence always names an existing row, so a
+// NULL joined payload_json means "not yet recorded", as the v16 NULL payload
+// columns did. All statements below are the only stop_projections SQL.
+constexpr std::string_view kStopProjectionInsertSql =
+    "INSERT INTO stop_projections(stop_id,stop_generation,acceptance_sequence,accepted_payload,"
+    "accepted_digest,terminal_sequence,surveillance_sequence,clear_sequence) "
+    "VALUES(?,?,?,?,?,NULL,NULL,NULL)";
+/// Acceptance replay: stop_generation, acceptance_sequence, accepted_payload, accepted_digest.
+constexpr std::string_view kStopProjectionAcceptanceSelectSql =
+    "SELECT stop_generation,acceptance_sequence,accepted_payload,accepted_digest "
+    "FROM stop_projections WHERE stop_id=? AND stop_generation=?";
+/// Joined-receipt scope check: accepted_payload, accepted_digest of the creating request.
+constexpr std::string_view kStopProjectionAcceptedPayloadSelectSql =
+    "SELECT accepted_payload,accepted_digest FROM stop_projections "
+    "WHERE stop_id=? AND stop_generation=?";
+/// Terminal writer replay and predecessor check: terminal_sequence, terminal payload_json.
+constexpr std::string_view kStopProjectionTerminalSelectSql =
+    "SELECT p.terminal_sequence,t.payload_json FROM stop_projections p "
+    "LEFT JOIN journal_records t ON t.sequence=p.terminal_sequence "
+    "WHERE p.stop_id=? AND p.stop_generation=?";
+constexpr std::string_view kStopProjectionTerminalUpdateSql =
+    "UPDATE stop_projections SET terminal_sequence=? WHERE stop_id=? AND stop_generation=? "
+    "AND terminal_sequence IS NULL";
+/// Surveillance writer: terminal payload_json, surveillance_sequence, surveillance payload_json.
+constexpr std::string_view kStopProjectionSurveillanceSelectSql =
+    "SELECT t.payload_json,p.surveillance_sequence,s.payload_json FROM stop_projections p "
+    "LEFT JOIN journal_records t ON t.sequence=p.terminal_sequence "
+    "LEFT JOIN journal_records s ON s.sequence=p.surveillance_sequence "
+    "WHERE p.stop_id=? AND p.stop_generation=?";
+constexpr std::string_view kStopProjectionSurveillanceUpdateSql =
+    "UPDATE stop_projections SET surveillance_sequence=? WHERE stop_id=? AND stop_generation=?";
+/// Fault-clear writer: terminal payload_json, surveillance payload_json,
+/// clear_sequence, clear request_id, clear payload_json (v16 column order).
+constexpr std::string_view kStopProjectionClearSelectSql =
+    "SELECT t.payload_json,s.payload_json,p.clear_sequence,c.request_id,c.payload_json "
+    "FROM stop_projections p "
+    "LEFT JOIN journal_records t ON t.sequence=p.terminal_sequence "
+    "LEFT JOIN journal_records s ON s.sequence=p.surveillance_sequence "
+    "LEFT JOIN journal_records c ON c.sequence=p.clear_sequence "
+    "WHERE p.stop_id=? AND p.stop_generation=?";
+constexpr std::string_view kStopProjectionClearUpdateSql =
+    "UPDATE stop_projections SET clear_sequence=? WHERE stop_id=? AND stop_generation=? "
+    "AND clear_sequence IS NULL";
+/// Recovery (BeginOwnerEpoch): accepted_payload and accepted_digest, then
+/// payload_json and payload_digest of the terminal, surveillance and clear
+/// rows. Each present payload is checked against its digest before decoding.
+constexpr std::string_view kStopProjectionRecoverySelectSql =
+    "SELECT p.accepted_payload,p.accepted_digest,t.payload_json,t.payload_digest,s.payload_json,s.payload_digest,"
+    "c.payload_json,c.payload_digest FROM stop_projections p "
+    "LEFT JOIN journal_records t ON t.sequence=p.terminal_sequence "
+    "LEFT JOIN journal_records s ON s.sequence=p.surveillance_sequence "
+    "LEFT JOIN journal_records c ON c.sequence=p.clear_sequence "
+    "ORDER BY p.stop_id,p.stop_generation";
+/// CloseOwnerEpoch blockers: terminal payload_json, surveillance_sequence, clear_sequence.
+constexpr std::string_view kStopProjectionCloseBlockersSelectSql =
+    "SELECT t.payload_json,p.surveillance_sequence,p.clear_sequence FROM stop_projections p "
+    "LEFT JOIN journal_records t ON t.sequence=p.terminal_sequence";
+
+/// The `accepted_payload` at `column`, verified against `accepted_digest` at
+/// `column + 1`. Every read of the lean acceptance goes through this check.
+[[nodiscard]] std::string VerifiedAcceptedPayload(const Statement& row, const int column) {
+  auto payload = row.Text(column);
+  Require(content_identity::sha256_digest(payload) == row.Text(column + 1),
+          "operation_journal_corrupt",
+          "Stop acceptance recovery projection digest does not match its bytes");
+  return payload;
+}
+
 [[nodiscard]] const std::set<std::string>& ExpectedSchemaObjects() {
   static const std::set<std::string> names{
       "index:journal_operation_sequence",
@@ -3456,11 +3518,11 @@ class SqliteOperationJournal::Impl final {
       Require(!metadata.Step(), "operation_journal_corrupt",
               "operation journal metadata insert returned an unexpected row");
     }
-    // Contract130: common command identities changed the unreleased format.
-    // Earlier journals are refused without converting their retained evidence.
+    // v17 lean Stop record changed the unreleased format. Earlier journals are
+    // refused and left untouched, without converting their retained evidence.
     Require(ScalarInteger(database_, "PRAGMA user_version") >= kOperationJournalSchemaVersion,
             "operation_journal_format_unsupported",
-            "operation journal predates the common command identity format and is not converted");
+            "operation journal predates the lean Stop record (v17) and is not converted");
     Require(SchemaObjectNames(database_) == ExpectedSchemaObjects(),
             "operation_journal_storage_foreign", "operation journal contains an unexpected schema");
     Require(
@@ -3693,13 +3755,11 @@ std::uint64_t SqliteOperationJournal::Impl::AppendStopAcceptance(
   const bool joined_receipt =
       acceptance.acceptance_path == EmergencyStopAcceptancePathDTO::kJoinedResident;
   const auto require_joined_transaction = [&] {
-    Statement creator(database_,
-                      "SELECT acceptance_payload FROM stop_projections "
-                      "WHERE stop_id=? AND stop_generation=?");
+    Statement creator(database_, kStopProjectionAcceptedPayloadSelectSql);
     creator.Bind(1, accepted.stop_id.value());
     creator.Bind(2, static_cast<std::int64_t>(accepted.stop_generation.value()));
     if (!creator.Step()) return;
-    auto decoded = DecodeStopJournalAcceptanceProjection(creator.Text(0));
+    auto decoded = DecodeStopJournalAcceptanceProjection(VerifiedAcceptedPayload(creator, 0));
     Require(decoded.ok() && !creator.Step() &&
                 decoded.value().accepted.captured_scope_digest == accepted.captured_scope_digest,
             "operation_journal_stop_projection_conflict",
@@ -3727,14 +3787,11 @@ std::uint64_t SqliteOperationJournal::Impl::AppendStopAcceptance(
       transaction.Commit();
       return sequence;
     }
-    const auto acceptance_projection = EncodeStopJournalAcceptanceProjection(
-        StopJournalAcceptanceProjectionDTO{accepted, affected_state});
+    const auto acceptance_projection =
+        EncodeStopJournalAcceptanceProjection(StopJournalAcceptanceProjectionDTO{accepted});
     Require(acceptance_projection.ok(), "operation_journal_record_invalid",
             "Stop acceptance recovery projection is invalid");
-    Statement existing_projection(
-        database_,
-        "SELECT stop_generation,acceptance_sequence,acceptance_payload FROM stop_projections "
-        "WHERE stop_id=? AND stop_generation=?");
+    Statement existing_projection(database_, kStopProjectionAcceptanceSelectSql);
     existing_projection.Bind(1, accepted.stop_id.value());
     existing_projection.Bind(2, static_cast<std::int64_t>(accepted.stop_generation.value()));
     Require(existing_projection.Step() &&
@@ -3742,7 +3799,7 @@ std::uint64_t SqliteOperationJournal::Impl::AppendStopAcceptance(
                     accepted.stop_generation.value() &&
                 PositiveIdentifier(existing_projection.Integer(1), "operation journal sequence") ==
                     sequence &&
-                existing_projection.Text(2) == acceptance_projection.value() &&
+                VerifiedAcceptedPayload(existing_projection, 2) == acceptance_projection.value() &&
                 !existing_projection.Step(),
             "operation_journal_stop_projection_conflict",
             "Stop acceptance replay conflicts with its durable recovery projection");
@@ -3778,17 +3835,13 @@ std::uint64_t SqliteOperationJournal::Impl::AppendStopAcceptance(
   for (const auto& state : affected_state.operations) {
     StoreOperationSnapshotMonotonic(database_, owner_epoch, state, sequence, payload_digest);
   }
-  const auto acceptance_projection = EncodeStopJournalAcceptanceProjection(
-      StopJournalAcceptanceProjectionDTO{accepted, affected_state});
+  // The index row keeps only the positional `accepted` (v12); the affected
+  // state stays in the journal row written above.
+  const auto acceptance_projection =
+      EncodeStopJournalAcceptanceProjection(StopJournalAcceptanceProjectionDTO{accepted});
   Require(acceptance_projection.ok(), "operation_journal_record_invalid",
           "Stop acceptance recovery projection is invalid");
-  Statement insert_projection(
-      database_,
-      "INSERT INTO stop_projections(stop_id,stop_generation,acceptance_sequence,"
-      "acceptance_payload,acceptance_digest,terminal_sequence,terminal_payload,terminal_digest,"
-      "surveillance_sequence,surveillance_payload,surveillance_digest,clear_sequence,"
-      "clear_request_id,clear_payload,clear_digest) "
-      "VALUES(?,?,?,?,?,NULL,NULL,NULL,NULL,NULL,NULL,NULL,NULL,NULL,NULL)");
+  Statement insert_projection(database_, kStopProjectionInsertSql);
   insert_projection.Bind(1, accepted.stop_id.value());
   insert_projection.Bind(2, static_cast<std::int64_t>(accepted.stop_generation.value()));
   insert_projection.Bind(3, static_cast<std::int64_t>(sequence));
@@ -3819,9 +3872,7 @@ std::uint64_t SqliteOperationJournal::Impl::AppendStopSurveillanceCheckpoint(
           "operation_journal_owner_epoch_stale",
           "Stop surveillance projection names a non-active owner epoch");
 
-  Statement current(database_,
-                    "SELECT terminal_payload,surveillance_sequence,surveillance_payload "
-                    "FROM stop_projections WHERE stop_id=? AND stop_generation=?");
+  Statement current(database_, kStopProjectionSurveillanceSelectSql);
   current.Bind(1, projection.checkpoint.stop_id.value());
   current.Bind(2, static_cast<std::int64_t>(projection.checkpoint.stop_generation.value()));
   Require(current.Step() && !current.IsNull(0), "operation_journal_stop_terminal_missing",
@@ -3877,14 +3928,10 @@ std::uint64_t SqliteOperationJournal::Impl::AppendStopSurveillanceCheckpoint(
           "Stop surveillance journal insert returned an unexpected row");
   const auto sequence =
       PositiveIdentifier(sqlite3_last_insert_rowid(database_), "operation journal sequence");
-  Statement update(database_,
-                   "UPDATE stop_projections SET surveillance_sequence=?,surveillance_payload=?,"
-                   "surveillance_digest=? WHERE stop_id=? AND stop_generation=?");
+  Statement update(database_, kStopProjectionSurveillanceUpdateSql);
   update.Bind(1, static_cast<std::int64_t>(sequence));
-  update.Bind(2, payload_json);
-  update.Bind(3, payload_digest);
-  update.Bind(4, projection.checkpoint.stop_id.value());
-  update.Bind(5, static_cast<std::int64_t>(projection.checkpoint.stop_generation.value()));
+  update.Bind(2, projection.checkpoint.stop_id.value());
+  update.Bind(3, static_cast<std::int64_t>(projection.checkpoint.stop_generation.value()));
   Require(!update.Step() && sqlite3_changes(database_) == 1, "operation_journal_corrupt",
           "Stop surveillance durable projection update did not affect exactly one row");
   Statement prune_checkpoints(
@@ -3921,9 +3968,7 @@ std::uint64_t SqliteOperationJournal::Impl::AppendStopTerminal(
           "operation_journal_owner_epoch_stale",
           "Stop terminal projection names a non-active owner epoch");
 
-  Statement acceptance(database_,
-                       "SELECT terminal_sequence,terminal_payload FROM stop_projections "
-                       "WHERE stop_id=? AND stop_generation=?");
+  Statement acceptance(database_, kStopProjectionTerminalSelectSql);
   acceptance.Bind(1, projection.certificate.stop_id.value());
   acceptance.Bind(2, static_cast<std::int64_t>(projection.certificate.stop_generation.value()));
   Require(acceptance.Step(), "operation_journal_stop_acceptance_missing",
@@ -3940,15 +3985,13 @@ std::uint64_t SqliteOperationJournal::Impl::AppendStopTerminal(
           "Stop terminal acceptance lookup returned duplicate rows");
 
   for (const auto& predecessor : projection.certificate.predecessor_certificates) {
-    Statement predecessor_record(database_,
-                                 "SELECT terminal_payload FROM stop_projections "
-                                 "WHERE stop_id=? AND stop_generation=?");
+    Statement predecessor_record(database_, kStopProjectionTerminalSelectSql);
     predecessor_record.Bind(1, predecessor.stop_id.value());
     predecessor_record.Bind(2, static_cast<std::int64_t>(predecessor.stop_generation.value()));
-    Require(predecessor_record.Step() && !predecessor_record.IsNull(0),
+    Require(predecessor_record.Step() && !predecessor_record.IsNull(1),
             "operation_journal_stop_predecessor_unresolved",
             "Stop terminal predecessor has no durable terminal certificate truth");
-    auto decoded_predecessor = DecodeStopJournalTerminalProjection(predecessor_record.Text(0));
+    auto decoded_predecessor = DecodeStopJournalTerminalProjection(predecessor_record.Text(1));
     Require(decoded_predecessor.ok() &&
                 decoded_predecessor.value().certificate.stop_certificate_id ==
                     predecessor.stop_certificate_id &&
@@ -3977,15 +4020,10 @@ std::uint64_t SqliteOperationJournal::Impl::AppendStopTerminal(
           "Stop terminal journal insert returned an unexpected row");
   const auto sequence =
       PositiveIdentifier(sqlite3_last_insert_rowid(database_), "operation journal sequence");
-  Statement update(database_,
-                   "UPDATE stop_projections SET terminal_sequence=?,terminal_payload=?,"
-                   "terminal_digest=? WHERE stop_id=? AND stop_generation=? "
-                   "AND terminal_sequence IS NULL");
+  Statement update(database_, kStopProjectionTerminalUpdateSql);
   update.Bind(1, static_cast<std::int64_t>(sequence));
-  update.Bind(2, payload_json);
-  update.Bind(3, payload_digest);
-  update.Bind(4, projection.certificate.stop_id.value());
-  update.Bind(5, static_cast<std::int64_t>(projection.certificate.stop_generation.value()));
+  update.Bind(2, projection.certificate.stop_id.value());
+  update.Bind(3, static_cast<std::int64_t>(projection.certificate.stop_generation.value()));
   Require(!update.Step() && sqlite3_changes(database_) == 1, "operation_journal_corrupt",
           "Stop terminal durable projection update did not affect exactly one row");
   transaction.Commit();
@@ -4382,31 +4420,28 @@ OperationJournalRecoveryDTO SqliteOperationJournal::Impl::BeginOwnerEpoch(
     recovery.historical_operations.push_back(
         LoadOperationState(database_, OperationId(retained.Text(0))));
   }
-  Statement retained_stops(
-      database_,
-      "SELECT acceptance_payload,acceptance_digest,terminal_payload,terminal_digest,"
-      "surveillance_payload,surveillance_digest,clear_payload,clear_digest "
-      "FROM stop_projections ORDER BY stop_id,stop_generation");
-  while (retained_stops.Step()) {
-    const auto acceptance_payload = retained_stops.Text(0);
-    Require(content_identity::sha256_digest(acceptance_payload) == retained_stops.Text(1),
+  // Each Stop payload is the single copy in its joined journal row; its
+  // digest is that row's payload_digest. A NULL joined payload means "not
+  // recorded" (the FKs keep every non-NULL sequence pointing at a row).
+  const auto joined_payload = [](const Statement& row, const int column,
+                                 const std::string_view kind) -> std::optional<std::string> {
+    if (row.IsNull(column)) return std::nullopt;
+    auto payload = row.Text(column);
+    Require(content_identity::sha256_digest(payload) == row.Text(column + 1),
             "operation_journal_corrupt",
-            "Stop acceptance recovery projection digest does not match its bytes");
-    auto acceptance = DecodeStopJournalAcceptanceProjection(acceptance_payload);
+            "Stop " + std::string(kind) + " recovery projection digest does not match its bytes");
+    return payload;
+  };
+  Statement retained_stops(database_, kStopProjectionRecoverySelectSql);
+  while (retained_stops.Step()) {
+    auto acceptance =
+        DecodeStopJournalAcceptanceProjection(VerifiedAcceptedPayload(retained_stops, 0));
     Require(acceptance.ok(), "operation_journal_corrupt",
             "Stop acceptance recovery projection cannot be decoded");
-    RecoveredStopJournalStateDTO recovered{std::move(acceptance.value().accepted),
-                                           std::move(acceptance.value().affected_state),
-                                           std::nullopt, std::nullopt, std::nullopt};
-    const bool has_terminal_payload = !retained_stops.IsNull(2);
-    Require(has_terminal_payload == !retained_stops.IsNull(3), "operation_journal_corrupt",
-            "Stop terminal recovery projection presence is inconsistent");
-    if (has_terminal_payload) {
-      const auto terminal_payload = retained_stops.Text(2);
-      Require(content_identity::sha256_digest(terminal_payload) == retained_stops.Text(3),
-              "operation_journal_corrupt",
-              "Stop terminal recovery projection digest does not match its bytes");
-      auto terminal = DecodeStopJournalTerminalProjection(terminal_payload);
+    RecoveredStopJournalStateDTO recovered{std::move(acceptance.value().accepted), std::nullopt,
+                                           std::nullopt, std::nullopt};
+    if (const auto terminal_payload = joined_payload(retained_stops, 2, "terminal")) {
+      auto terminal = DecodeStopJournalTerminalProjection(*terminal_payload);
       Require(terminal.ok() && terminal.value().stop_status.accepted == recovered.accepted,
               "operation_journal_corrupt",
               "Stop terminal recovery projection cannot be decoded or joined to acceptance");
@@ -4414,15 +4449,8 @@ OperationJournalRecoveryDTO SqliteOperationJournal::Impl::BeginOwnerEpoch(
       recovered.fault_latch = std::move(terminal.value().fault_latch);
       recovered.surveillance = std::move(terminal.value().stop_status.surveillance);
     }
-    const bool has_surveillance_payload = !retained_stops.IsNull(4);
-    Require(has_surveillance_payload == !retained_stops.IsNull(5), "operation_journal_corrupt",
-            "Stop surveillance recovery projection presence is inconsistent");
-    if (has_surveillance_payload) {
-      const auto payload = retained_stops.Text(4);
-      Require(content_identity::sha256_digest(payload) == retained_stops.Text(5),
-              "operation_journal_corrupt",
-              "Stop surveillance recovery projection digest does not match its bytes");
-      auto surveillance = DecodeStopJournalSurveillanceProjection(payload);
+    if (const auto payload = joined_payload(retained_stops, 4, "surveillance")) {
+      auto surveillance = DecodeStopJournalSurveillanceProjection(*payload);
       Require(surveillance.ok() && recovered.terminal_certificate.has_value() &&
                   surveillance.value().checkpoint.stop_certificate.stop_certificate_id ==
                       recovered.terminal_certificate->stop_certificate_id &&
@@ -4433,23 +4461,26 @@ OperationJournalRecoveryDTO SqliteOperationJournal::Impl::BeginOwnerEpoch(
       recovered.surveillance = std::move(surveillance.value().checkpoint);
       recovered.fault_latch = std::move(surveillance.value().fault_latch);
     }
-    const bool has_clear_payload = !retained_stops.IsNull(6);
-    Require(has_clear_payload == !retained_stops.IsNull(7), "operation_journal_corrupt",
-            "Stop fault-clear recovery projection presence is inconsistent");
-    if (has_clear_payload) {
-      const auto payload = retained_stops.Text(6);
-      Require(content_identity::sha256_digest(payload) == retained_stops.Text(7),
-              "operation_journal_corrupt",
-              "Stop fault-clear recovery projection digest does not match its bytes");
-      auto cleared = DecodeStopJournalFaultClearProjection(payload);
-      Require(cleared.ok() &&
-                  cleared.value().resulting_stop_status.accepted == recovered.accepted &&
-                  cleared.value().recovery_result.latch.state == StopFaultLatchStateDTO::kCleared,
+    if (const auto payload = joined_payload(retained_stops, 6, "fault-clear")) {
+      // The lean clear stores only intent + result. The certificate stays the
+      // terminal's and the surveillance stays the latest checkpoint's (else the
+      // terminal status's), exactly as the clear writer derived them.
+      auto cleared = DecodeStopJournalFaultClearProjection(*payload);
+      Require(cleared.ok() && recovered.terminal_certificate.has_value(),
               "operation_journal_corrupt",
               "Stop fault-clear recovery projection cannot be decoded or joined");
-      recovered.terminal_certificate = std::move(cleared.value().certificate);
-      recovered.fault_latch = std::move(cleared.value().recovery_result.latch);
-      recovered.surveillance = std::move(cleared.value().resulting_stop_status.surveillance);
+      auto& latch = cleared.value().recovery_result.latch;
+      Require(latch.state == StopFaultLatchStateDTO::kCleared &&
+                  latch.stop_id == recovered.accepted.stop_id &&
+                  latch.stop_generation == recovered.accepted.stop_generation &&
+                  latch.stop_certificate.has_value() &&
+                  latch.stop_certificate->stop_certificate_id ==
+                      recovered.terminal_certificate->stop_certificate_id &&
+                  latch.stop_certificate->stop_certificate_revision ==
+                      recovered.terminal_certificate->stop_certificate_revision,
+              "operation_journal_corrupt",
+              "Stop fault-clear recovery projection cannot be decoded or joined");
+      recovered.fault_latch = std::move(latch);
     }
     recovery.recovered_stops.push_back(std::move(recovered));
   }
@@ -4616,10 +4647,7 @@ std::uint64_t SqliteOperationJournal::Impl::RecordStopFaultCleared(
   const auto occurred_at_wall = wall_time_text_();
   ValidateWallTimeText(occurred_at_wall);
   Transaction transaction(database_);
-  Statement current(database_,
-                    "SELECT terminal_payload,surveillance_payload,clear_sequence,"
-                    "clear_request_id,clear_payload FROM stop_projections "
-                    "WHERE stop_id=? AND stop_generation=?");
+  Statement current(database_, kStopProjectionClearSelectSql);
   current.Bind(1, cleared_latch.stop_id.value());
   current.Bind(2, static_cast<std::int64_t>(cleared_latch.stop_generation.value()));
   Require(current.Step() && !current.IsNull(0), "operation_journal_stop_terminal_missing",
@@ -4675,8 +4703,10 @@ std::uint64_t SqliteOperationJournal::Impl::RecordStopFaultCleared(
   Require(cleared_latch == expected_cleared_latch && resulting_stop_status == expected_status,
           "operation_journal_stop_projection_conflict",
           "Stop fault clear does not equal the exact durable successor state");
-  const StopJournalFaultClearProjectionDTO clear_projection{
-      recovery_intent, recovery_result, resulting_stop_status, terminal.value().certificate};
+  // The successor status is checked above but not stored (clear v3): recovery
+  // takes the certificate from the terminal row, the surveillance from the
+  // latest checkpoint (else the terminal status) and the latch from this result.
+  const StopJournalFaultClearProjectionDTO clear_projection{recovery_intent, recovery_result};
   auto encoded = EncodeStopJournalFaultClearProjection(clear_projection);
   Require(encoded.ok(), "operation_journal_record_invalid",
           "Stop fault-clear durable payload is invalid");
@@ -4710,16 +4740,10 @@ std::uint64_t SqliteOperationJournal::Impl::RecordStopFaultCleared(
           "Stop fault-clear journal insert returned an unexpected row");
   const auto sequence =
       PositiveIdentifier(sqlite3_last_insert_rowid(database_), "operation journal sequence");
-  Statement update(database_,
-                   "UPDATE stop_projections SET clear_sequence=?,clear_request_id=?,"
-                   "clear_payload=?,clear_digest=? WHERE stop_id=? AND stop_generation=? "
-                   "AND clear_sequence IS NULL");
+  Statement update(database_, kStopProjectionClearUpdateSql);
   update.Bind(1, static_cast<std::int64_t>(sequence));
-  update.Bind(2, recovery_result.request_id.value());
-  update.Bind(3, encoded.value());
-  update.Bind(4, payload_digest);
-  update.Bind(5, cleared_latch.stop_id.value());
-  update.Bind(6, static_cast<std::int64_t>(cleared_latch.stop_generation.value()));
+  update.Bind(2, cleared_latch.stop_id.value());
+  update.Bind(3, static_cast<std::int64_t>(cleared_latch.stop_generation.value()));
   Require(!update.Step() && sqlite3_changes(database_) == 1, "operation_journal_corrupt",
           "Stop fault-clear projection update did not affect exactly one row");
   transaction.Commit();
@@ -4759,9 +4783,7 @@ std::uint64_t SqliteOperationJournal::Impl::CloseOwnerEpoch(const RequestOwnerEp
   Require(
       operation_blockers.Step() && operation_blockers.Integer(0) == 0 && !operation_blockers.Step(),
       "operation_journal_owner_close_blocked", "owner close is blocked by unresolved durable work");
-  Statement stop_blockers(database_,
-                          "SELECT terminal_payload,surveillance_payload,clear_payload "
-                          "FROM stop_projections");
+  Statement stop_blockers(database_, kStopProjectionCloseBlockersSelectSql);
   while (stop_blockers.Step()) {
     Require(!stop_blockers.IsNull(0), "operation_journal_owner_close_blocked",
             "owner close is blocked by a nonterminal Stop");

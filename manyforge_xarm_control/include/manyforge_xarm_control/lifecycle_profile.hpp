@@ -1,4 +1,4 @@
-// Copyright 2026 Flexin Group SRL
+// Copyright 2026 Marco Pastorio
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -56,8 +56,11 @@ inline constexpr std::string_view kXArmRos2ControlLifecycleProviderManifestId =
 
 /// The Real xArm arm plans (mirrors the deployment generator), on stock
 /// ros2_control plus the two vendor services (R7 §3.1, D1, D4, D10):
-/// - Prepare arms through the hardware activation (the plugin's
-///   `on_activate`), only with fresh status and no vendor error; it then
+/// - Prepare first clears a vendor error left on the unarmed robot (m5.5:
+///   C2 after an emergency stop; the adapter verifies the clear), then arms
+///   through the hardware activation (the plugin's `on_activate`: clear,
+///   motion enable, servo mode, ready state), only with fresh status and no
+///   vendor error; it then
 ///   absorbs the plugin's reactivate-all (the trajectory controller it turned
 ///   on is switched off again) and marks the arm prepared once the robot is
 ///   ready, the broadcaster active and the measured joints valid.
@@ -69,6 +72,7 @@ inline constexpr std::string_view kXArmRos2ControlLifecycleProviderManifestId =
 /// - Recover switches off the controller and the hardware, then clears the
 ///   vendor error and the warning; the target driver re-drives Prepare and
 ///   Enable.
+/// Every step of these plans is bounded at 10 s (m5.5).
 [[nodiscard]] std::vector<core::LifecycleIntentPlanDTO>
 make_xarm_ros2_control_lifecycle_plans();
 

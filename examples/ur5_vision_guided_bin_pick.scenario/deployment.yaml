@@ -1,5 +1,8 @@
 {
   "api_version": "manyforge.deployment_intent.v2",
+  "assistant_model_components": {
+    "vision_model": "vision_model"
+  },
   "assistant_profile_id": "vision_bin_selection",
   "attachments": [],
   "compatibility": {
@@ -163,6 +166,19 @@
           "maximum_tcp_linear_speed_mps": 0.25
         }
       }
+    },
+    {
+      "component_id": "vision_model",
+      "component_profile_id": "ai_model_v0",
+      "configuration": {
+        "runtime_configuration": {
+          "api_key_env": null,
+          "base_url": "http://127.0.0.1:8000/v1",
+          "model": "qwen3.6-35b-a3b-nvfp4-tq-mtp-manyforge"
+        },
+        "runtime_kind": "ai_model"
+      },
+      "target_settings": {}
     }
   ],
   "deployment_artifact_id": "ur5_roboplan_local_vision_guided_pick",

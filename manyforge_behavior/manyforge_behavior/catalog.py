@@ -7,6 +7,7 @@ implementation identities, not Python imports or runtime availability.
 from __future__ import annotations
 
 import ipaddress
+import logging
 import re
 from copy import deepcopy
 from dataclasses import dataclass, field
@@ -16,8 +17,9 @@ from typing import Any, Mapping
 
 from manyforge_behavior.canonical_artifact import (
     StrictArtifactError,
+    compute_omitted_field_digest,
     load_strict_json_yaml,
-    verify_omitted_field_digest,
+    require_sha256_digest,
 )
 from manyforge_behavior.catalog_schema import (
     CatalogSchema,
@@ -30,10 +32,10 @@ from manyforge_behavior.catalog_schema import (
 
 
 EXPECTED_API_VERSION = "manyforge.node_catalog.v2"
-EXPECTED_CONTENT_VERSION = "2.7.0"
+EXPECTED_CONTENT_VERSION = "2.8.0"
 BUILTIN_CATALOG_ID = "manyforge_builtin"
 EXPECTED_BUILTIN_CATALOG_DIGEST = (
-    "sha256:b9d90f6ec180af69c9f342b4d7c995668693ef16854e7ab8df177381c5db9806"
+    "sha256:5ffd4dac211459905977367414bfb7684842045ee4b32c5cb3da5f513a03d134"
 )
 SEMVER_RE = re.compile(r"^\d+\.\d+\.\d+$")
 _COMPOSABLE_PROFILE_RE = re.compile(r"^composable-cell-v(\d+)$")
@@ -258,6 +260,13 @@ _ENTRY_OPTIONAL_FIELDS = {
     "observability",
     "assistant",
 }
+
+
+# Typed diagnostic of every authored artifact with a stored self-digest
+# (catalog, Program, Scenario): the stored value differs from the content.
+# The artifact still loads; the computed value is the one used and recorded.
+EDITED_OUTSIDE_MANYFORGE = "edited_outside_manyforge"
+_LOGGER = logging.getLogger(__name__)
 
 
 class CatalogValidationError(ValueError):
@@ -630,13 +639,34 @@ class NodeCatalog:
             )
         self._catalog_id = _identifier(data["catalog_id"], f"{self._path}.catalog_id")
         try:
-            self._catalog_digest = verify_omitted_field_digest(
-                data,
-                own_field="catalog_digest",
-                label=str(self._path),
+            declared = require_sha256_digest(
+                data.get("catalog_digest"), f"{self._path}.catalog_digest"
+            )
+            self._catalog_digest = compute_omitted_field_digest(
+                data, own_field="catalog_digest"
             )
         except StrictArtifactError as exc:
             raise CatalogValidationError(str(exc)) from exc
+        # A stale stored digest is a diagnostic, never a refusal: the computed
+        # digest is the catalog identity recorded downstream.
+        self._diagnostics: tuple[dict[str, str], ...] = ()
+        if declared != self._catalog_digest:
+            self._diagnostics = (
+                {
+                    "code": EDITED_OUTSIDE_MANYFORGE,
+                    "path": f"{self._path}.catalog_digest",
+                    "message": "The stored catalog_digest differs from the "
+                    "content; the computed digest is used.",
+                },
+            )
+            _LOGGER.warning(
+                "%s: node catalog %s was edited outside ManyForge; using "
+                "computed digest %s",
+                EDITED_OUTSIDE_MANYFORGE,
+                self._path,
+                self._catalog_digest,
+            )
+            data["catalog_digest"] = self._catalog_digest
 
         try:
             self._schema_registry = parse_schema_registry(data["schema_types"])
@@ -1315,6 +1345,12 @@ class NodeCatalog:
     @property
     def catalog_digest(self) -> str:
         return self._catalog_digest
+
+    @property
+    def diagnostics(self) -> tuple[dict[str, str], ...]:
+        """Load diagnostics (``edited_outside_manyforge``); never refusals."""
+
+        return self._diagnostics
 
     @property
     def schema_registry(self) -> CatalogSchemaRegistry:

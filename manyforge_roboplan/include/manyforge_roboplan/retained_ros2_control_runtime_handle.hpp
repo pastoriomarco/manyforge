@@ -62,7 +62,8 @@ struct RetainedRos2ControlArmActivity final {
 
 /// The joint state broadcaster of every generated controllers file. A vendor
 /// plugin that deactivates all controllers while its robot is not ready
-/// deactivates it too; ManyForge never does (R7 §3.3).
+/// deactivates it too; ManyForge never does (R7 §3.3). A Real arm's Prepare
+/// switches it back on alone when the plugin's reactivation did not.
 inline constexpr std::string_view kJointStateBroadcasterControllerName =
     "joint_state_broadcaster";
 
@@ -166,6 +167,12 @@ public:
   /// `on_activate`) or deactivation is in flight: its vendor mode/state
   /// changes are ManyForge's own, never external control.
   virtual void BeginHardwareTransition(bool activate) = 0;
+  /// m5.5: the hardware interface's observed activity (controller-manager
+  /// list), read before each Observe/ReadHealth; the vendor adapter
+  /// reconstructs whether the robot is armed from it.
+  virtual void ObserveHardwareActive(bool hardware_active) {
+    static_cast<void>(hardware_active);
+  }
   /// It returned; with a possible effect the explanation lasts a bounded
   /// settle window.
   virtual void SettleHardwareTransition(bool activate, bool effect_possible,
@@ -487,9 +494,24 @@ public:
   /// active controller or no loaded controller. Already active hardware
   /// succeeds without a request. One request bounded at 4 s; no answer is an
   /// uncertain outcome. The lifecycle state stays unarmed until
-  /// `PrepareArmController`.
+  /// `PrepareArmController`. Measured joints received before the answer plus
+  /// one freshness budget are never valid again (the plugin's first write()
+  /// may stall the loop right after one more sample; the cutoff is on receipt
+  /// time). After a success it returns once the measured joints are valid
+  /// as Prepare requires them (after the cutoff, fresh, complete, finite), at
+  /// most after the vendor plugin's activation transient (5 s), without
+  /// holding the switch lock.
   [[nodiscard]] RetainedRos2ControlSwitchResult
   ActivateArmHardware(std::stop_token cancellation);
+
+  /// Real arm only (`ros2_control.broadcaster.activate`): switch the joint
+  /// state broadcaster on alone (`switch_controller`, strict) when the
+  /// vendor plugin's reactivate-all left it off on active hardware. An
+  /// already active broadcaster succeeds without a request.
+  [[nodiscard]] RetainedRos2ControlSwitchResult
+  ActivateJointStateBroadcaster(
+      std::stop_token cancellation,
+      std::optional<MockResetPositionStepDeadline> deadline = {});
 
   /// R7 package 4 (`ros2_control.hardware.deactivate`, D4): set it inactive
   /// (the vendor plugin selects position mode); the arm is then Disabled, not
@@ -503,18 +525,22 @@ public:
   /// A Real arm passes the Enable gate first (R7 §3.6): fresh, finite
   /// measured joints and the vendor adapter's readiness and agreement check.
   [[nodiscard]] RetainedRos2ControlSwitchResult
-  ActivateArmController(std::stop_token cancellation);
+  ActivateArmController(std::stop_token cancellation,
+                        std::optional<MockResetPositionStepDeadline> deadline = {});
 
   /// CCLC Disable primitive: deactivate it. Known success without a request
   /// when the controller manager already reports it inactive.
   [[nodiscard]] RetainedRos2ControlSwitchResult
-  DeactivateArmController(std::stop_token cancellation);
+  DeactivateArmController(
+      std::stop_token cancellation,
+      std::optional<MockResetPositionStepDeadline> deadline = {});
 
   /// CCLC Recover primitive (the operator's Reset of an incident, Q41): the
   /// guard hook first, then the controller is left inactive and prepared; the
   /// target driver's next Enable activates it on a new binding epoch.
   [[nodiscard]] RetainedRos2ControlSwitchResult
-  RecoverArmController(std::stop_token cancellation);
+  RecoverArmController(std::stop_token cancellation,
+                       std::optional<MockResetPositionStepDeadline> deadline = {});
 
   /// The guard trip's containment (Q41): deactivate the controller through
   /// the same switch path CCLC uses, without changing the requested state.
@@ -602,7 +628,9 @@ private:
   [[nodiscard]] std::optional<core::ErrorDTO> ReadEndpointDiagnostic() const;
   [[nodiscard]] RetainedRos2ControlSwitchResult PrepareGripperController();
   [[nodiscard]] RetainedRos2ControlSwitchResult
-  SwitchGripperController(bool activate, std::stop_token cancellation);
+  SwitchGripperController(
+      bool activate, std::stop_token cancellation,
+      std::optional<MockResetPositionStepDeadline> deadline = {});
   void PublishReadinessLocked();
   [[nodiscard]] core::Result<void> RotateEpochLocked();
   /// A Real arm's measured joints in controller joint order: fresh within the
@@ -612,14 +640,21 @@ private:
   [[nodiscard]] RetainedRos2ControlSwitchResult
   SendHardwareState(bool active, std::stop_token cancellation,
                     IRetainedDeviceStatusAdapter &device);
+  /// One strict switch of one controller. `bounded` (every lifecycle
+  /// primitive): no answer by `lifecycle_deadline` (the CCLC transaction's
+  /// remaining command time; 10 s when absent) is an uncertain outcome
+  /// (SX-291/SX-297); the guard trip's containment keeps its unbounded wait.
   [[nodiscard]] RetainedRos2ControlSwitchResult
   SendSwitch(bool activate, std::stop_token cancellation,
-             std::optional<std::string> selected_controller = {});
+             std::optional<std::string> selected_controller = {},
+             bool bounded = true,
+             std::optional<MockResetPositionStepDeadline> lifecycle_deadline = {});
   [[nodiscard]] RetainedRos2ControlSwitchResult
   SendControllerSwitch(std::vector<std::string> activate,
                        std::vector<std::string> deactivate,
                        std::stop_token cancellation,
-                       std::optional<MockResetPositionStepDeadline> response_deadline = {});
+                       std::optional<MockResetPositionStepDeadline> response_deadline = {},
+                       std::optional<MockResetPositionStepDeadline> lifecycle_deadline = {});
 
   struct DomainGenerationState final {
     std::uint64_t publication_generation{};

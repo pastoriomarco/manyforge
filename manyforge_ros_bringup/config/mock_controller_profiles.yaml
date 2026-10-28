@@ -1,0 +1,59 @@
+# Mock lane controller rows, one per `mock_profile` id (robots as data, E1).
+# Embedded at build time into the host's controller launch artifacts
+# (scripts/robots/mock_controller_profiles.py); a Deployment component's
+# `mock_profile` selects its row. Field names follow the package manifest's
+# `lanes.mock.controllers` (CP8 step 3), so the later package conversion is a
+# move. Validate with `python3 scripts/robots/check_robot.py`.
+#
+# template: closed list in code. `ufactory` = Track 2's UFACTORY template
+#   (xArm 5/6/7, Lite 6, UF850); `ur` = the UR template, which carries its
+#   retained constraints, so `vendor_joint_constraints` stays absent.
+# vendor_joint_constraints: copied exactly from the model's vendor controller
+#   file (every joint has the same value); required for `ufactory`.
+# gripper_controller: the GripperActionController name; absent when the
+#   model has no commanded gripper joint (UR5).
+# Timeouts (Q79): Isaac's values per model family.
+#
+# Arm controller names and constraints are the retained controller files' own:
+# xarm_ros2 c3172e57 xarm_controller/config/<model>_controllers.yaml
+# (`<model>_traj_controller`, {trajectory: 1.0, goal: 0.01} on every joint) and
+# ManyMove manymove_bringup/config/ur/ur_with_robotiq_controllers.yaml
+# (`joint_trajectory_controller`). Gripper controllers follow Track 2's mapping
+# (SX-280).
+mock_profiles:
+  - mock_profile: lite6_lite_gripper
+    template: ufactory
+    hardware_component_name: MockLite6LiteGripperSystem
+    arm_controller: lite6_traj_controller
+    vendor_joint_constraints: {trajectory: "1.0", goal: "0.01"}
+    gripper_controller: lite_gripper_controller
+    hard_stop_completion_timeout_s: 1.5
+    gripper_result_timeout_s: 5.0
+  - mock_profile: uf850_xarm_gripper
+    template: ufactory
+    hardware_component_name: MockUF850XArmGripperSystem
+    arm_controller: uf850_traj_controller
+    vendor_joint_constraints: {trajectory: "1.0", goal: "0.01"}
+    gripper_controller: xarm_gripper_controller
+    hard_stop_completion_timeout_s: 1.5
+    gripper_result_timeout_s: 5.0
+  - mock_profile: ur10e_robotiq_2f_140
+    template: ur
+    hardware_component_name: MockUR10eRobotiq2F140System
+    arm_controller: joint_trajectory_controller
+    gripper_controller: robotiq_gripper_controller
+    hard_stop_completion_timeout_s: 0.5
+    gripper_result_timeout_s: 15.0
+  - mock_profile: ur5_roboplan
+    template: ur
+    hardware_component_name: MockUR5System
+    arm_controller: joint_trajectory_controller
+    hard_stop_completion_timeout_s: 0.5
+    gripper_result_timeout_s: 15.0
+  - mock_profile: ur5e_robotiq_2f_85
+    template: ur
+    hardware_component_name: MockUR5eRobotiq2F85System
+    arm_controller: joint_trajectory_controller
+    gripper_controller: robotiq_gripper_controller
+    hard_stop_completion_timeout_s: 0.5
+    gripper_result_timeout_s: 15.0

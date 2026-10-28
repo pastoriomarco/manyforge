@@ -1,7 +1,6 @@
 #!/usr/bin/env bash
-# Historical assistant demo entrypoint retained for truthful runbook links.
-# The former compatibility forwarding behavior is removed; restoration gate: N/I6.
+# Run the read-only provider check, then the confirmed Draft-only scene edit.
 
 set -euo pipefail
-source "$(dirname "${BASH_SOURCE[0]}")/lib/composable-cell-runtime-availability.sh"
-manyforge_fail_composable_cell_runtime_unavailable
+SCRIPT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
+exec "${PYTHON:-python3}" "$SCRIPT_DIR/smoke-assistant-e2e.py" "$@"

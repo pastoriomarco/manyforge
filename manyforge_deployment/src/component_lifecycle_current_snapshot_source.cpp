@@ -4,6 +4,7 @@
 #include <manyforge_deployment/io_signal_catalog.hpp>
 
 #include <algorithm>
+#include <cstdio>
 #include <set>
 #include <string>
 #include <tuple>
@@ -177,13 +178,17 @@ VerifiedComponentLifecycleCurrentSnapshotSource::
         core::ICCLCCurrentFactReader &current_fact_reader,
         const core::ICCLCLifecyclePlanCatalogSource &lifecycle_catalog_source,
         std::vector<core::ResolvedLifecycleProviderOccurrenceDTO>
-            provider_occurrences)
+            provider_occurrences,
+        std::function<core::Result<core::LifecycleDomainHealthDTO>(
+            const core::ResolvedLifecycleProviderOccurrenceDTO &)>
+            domain_health)
     : retained_bundle_(retained_bundle),
       active_publication_reader_(active_publication_reader),
       expected_active_publication_(std::move(expected_active_publication)),
       current_fact_reader_(current_fact_reader),
       lifecycle_catalog_source_(lifecycle_catalog_source),
-      provider_occurrences_(std::move(provider_occurrences)) {
+      provider_occurrences_(std::move(provider_occurrences)),
+      domain_health_(std::move(domain_health)) {
   if (!verify_retained_bundle_identity(retained_bundle_) ||
       !expected_active_publication_.valid() ||
       expected_active_publication_.request.candidate_retained_bundle_id !=
@@ -292,14 +297,13 @@ VerifiedComponentLifecycleCurrentSnapshotSource::ReadCurrentComponentSnapshot(
   core::ComponentLifecycleGeneration lifecycle_generation(1U);
   auto lifecycle_state = core::ComponentLifecycleStateDTO::kDeclared;
   const auto &component_fact = current_facts.value().components.front();
+  // Settled below from fresh domain health when the numbered fact is missing.
+  const bool settle_from_health = component_fact.durable_generation.has_value() &&
+                                  !component_fact.current_state.has_value();
   if (component_fact.durable_generation.has_value()) {
-    if (!component_fact.current_state.has_value()) {
-      return fail<core::ComponentLifecycleCurrentSnapshotDTO>(
-          "current_lifecycle_state_unresolved",
-          "durably numbered component has no coherent current lifecycle state");
-    }
     lifecycle_generation = *component_fact.durable_generation;
-    lifecycle_state = *component_fact.current_state;
+    lifecycle_state = component_fact.current_state.value_or(
+        core::ComponentLifecycleStateDTO::kDeclared);
   } else if (component_fact.current_state.has_value()) {
     return fail<core::ComponentLifecycleCurrentSnapshotDTO>(
         "current_lifecycle_generation_missing",
@@ -471,6 +475,48 @@ VerifiedComponentLifecycleCurrentSnapshotSource::ReadCurrentComponentSnapshot(
     }
     domains.push_back(std::move(built.value()));
     providers.push_back(*occurrence);
+  }
+
+  if (settle_from_health) {
+    std::vector<std::optional<core::ComponentLifecycleStateDTO>> observed;
+    observed.reserve(providers.size());
+    for (const auto &provider : providers) {
+      const auto health = domain_health_
+                              ? domain_health_(provider)
+                              : core::Result<core::LifecycleDomainHealthDTO>::Err(
+                                    core::ErrorDTO{"lifecycle_health_unavailable", "", {}});
+      observed.push_back(health.ok() ? std::optional(health.value().observed_state)
+                                     : std::nullopt);
+    }
+    // The lifecycle facts must not change during the health join: a
+    // transaction accepted meanwhile would otherwise pair its generation
+    // with a state settled before it.
+    const auto facts_after = current_fact_reader_.LoadCurrentSnapshotFacts(
+        {controllable_component_id}, domain_ids);
+    if (!facts_after.ok()) {
+      return core::Result<core::ComponentLifecycleCurrentSnapshotDTO>::Err(
+          facts_after.error());
+    }
+    if (facts_after.value().components != current_facts.value().components ||
+        facts_after.value().domains != current_facts.value().domains) {
+      return fail<core::ComponentLifecycleCurrentSnapshotDTO>(
+          "current_fact_changed_during_read",
+          "lifecycle facts changed while domain health was joined");
+    }
+    const auto settled = core::SettleObservedComponentLifecycleState(observed);
+    lifecycle_state = settled.state;
+    if (settled.reconstructed) {
+      std::lock_guard lock(reconstructed_log_mutex_);
+      auto &logged = reconstructed_logged_[controllable_component_id];
+      if (logged != lifecycle_generation.value()) {
+        logged = lifecycle_generation.value();
+        (void)std::fprintf(stderr,
+                           "manyforge_cclc_lifecycle_state_reconstructed "
+                           "component=%.128s generation=%llu state=declared\n",
+                           controllable_component_id.value().c_str(),
+                           static_cast<unsigned long long>(logged));
+      }
+    }
   }
 
   const auto active_reread =

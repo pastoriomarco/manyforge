@@ -11,6 +11,7 @@
 #include <limits>
 #include <sstream>
 #include <string_view>
+#include <thread>
 #include <utility>
 
 #include <controller_manager_msgs/msg/controller_manager_activity.hpp>
@@ -18,6 +19,7 @@
 #include <controller_manager_msgs/srv/switch_controller.hpp>
 #include <lifecycle_msgs/msg/state.hpp>
 #include <manyforge_roboplan/host_component_stream_health.hpp>
+#include <manyforge_core/time/received_sample_age.hpp>
 #include <manyforge_roboplan/retained_native_runtime.hpp>
 #include <manyforge_ros2_control_execution/selected_ros_endpoint_facts.hpp>
 #include <sensor_msgs/msg/joint_state.hpp>
@@ -38,6 +40,10 @@ constexpr std::string_view kHardwareActivatePrimitiveId =
     "ros2_control.hardware.activate";
 constexpr std::string_view kHardwareDeactivatePrimitiveId =
     "ros2_control.hardware.deactivate";
+// A Real arm's Prepare re-activates the joint state broadcaster on its own
+// when the vendor plugin's reactivate-all left it off (strict switch).
+constexpr std::string_view kBroadcasterActivatePrimitiveId =
+    "ros2_control.broadcaster.activate";
 constexpr std::string_view kBroadcasterActiveFactId =
     "external.broadcaster_active";
 constexpr std::string_view kControllerActiveFactId =
@@ -51,6 +57,26 @@ constexpr std::string_view kMeasuredJointsValidFactId =
 // uncertain outcome reconciled from the controller manager's activity.
 constexpr std::chrono::nanoseconds kHardwareStateResponseTimeout =
     std::chrono::seconds(4);
+// After a successful hardware activation the xArm plugin's first write()
+// cycles deactivate every controller and later reactivate them, each through
+// blocking controller-manager calls from its RT loop (list and switch, 1 s
+// client timeout each; its switch requests a 2 s manager-side timeout). The
+// activation primitive waits at most this long for that transient to end.
+constexpr std::chrono::nanoseconds kVendorActivationTransientBound =
+    std::chrono::seconds(5);
+// SX-291/SX-297: a lifecycle controller switch the manager accepts but never
+// answers ends as an unknown effect (CCLC reconciles and fences the claim) at
+// the end of the transaction's remaining command time; only where none is
+// available (a direct call outside CCLC) at this fallback.
+constexpr std::chrono::nanoseconds kLifecycleSwitchFallbackBound =
+    std::chrono::seconds(10);
+
+[[nodiscard]] std::chrono::steady_clock::time_point
+lifecycle_switch_deadline(const std::optional<std::chrono::steady_clock::time_point>
+                              &transaction_deadline) {
+  return transaction_deadline.value_or(std::chrono::steady_clock::now() +
+                                       kLifecycleSwitchFallbackBound);
+}
 
 template <typename Value>
 [[nodiscard]] core::Result<Value> reject(std::string reason,
@@ -484,6 +510,12 @@ struct RetainedRos2ControlRuntimeHandle::DeviceMeasuredJoints final {
   std::vector<std::string> names;
   std::vector<double> positions;
   std::optional<core::TimePoint> received;
+  /// The handle's last hardware activation plus one freshness budget, on the
+  /// receipt clock: an earlier sample may precede the vendor plugin's
+  /// activation stall, so it never counts as current (live 2026-10-28). A
+  /// receipt cutoff with one budget of margin makes a later sample very
+  /// likely post-activation; a late-delivered older message still passes.
+  std::optional<core::TimePoint> not_before;
 };
 
 struct PreparedMeasuredStateSources::Storage final {
@@ -1701,7 +1733,8 @@ core::Result<void> RetainedRos2ControlRuntimeHandle::RotateEpochLocked() {
 
 RetainedRos2ControlSwitchResult RetainedRos2ControlRuntimeHandle::SendSwitch(
     const bool activate, const std::stop_token cancellation,
-    const std::optional<std::string> selected_controller) {
+    const std::optional<std::string> selected_controller, const bool bounded,
+    const std::optional<MockResetPositionStepDeadline> lifecycle_deadline) {
   std::string controller;
   {
     std::lock_guard lock(mutex_);
@@ -1716,7 +1749,11 @@ RetainedRos2ControlSwitchResult RetainedRos2ControlRuntimeHandle::SendSwitch(
                                        : std::vector<std::string>{},
                               activate ? std::vector<std::string>{}
                                        : std::vector<std::string>{controller},
-                              cancellation);
+                              cancellation, std::nullopt,
+                              bounded ? std::optional<MockResetPositionStepDeadline>(
+                                            lifecycle_switch_deadline(
+                                                lifecycle_deadline))
+                                      : std::nullopt);
 }
 
 RetainedRos2ControlSwitchResult
@@ -1724,7 +1761,8 @@ RetainedRos2ControlRuntimeHandle::SendControllerSwitch(
     std::vector<std::string> activate_controllers,
     std::vector<std::string> deactivate_controllers,
     const std::stop_token cancellation,
-    const std::optional<MockResetPositionStepDeadline> response_deadline) {
+    const std::optional<MockResetPositionStepDeadline> response_deadline,
+    const std::optional<MockResetPositionStepDeadline> lifecycle_deadline) {
   rclcpp::Client<SwitchService>::SharedPtr client;
   rclcpp::Node::SharedPtr node;
   const bool activate = !activate_controllers.empty();
@@ -1768,6 +1806,17 @@ RetainedRos2ControlRuntimeHandle::SendControllerSwitch(
               switch_error("ros2_control_switch_timeout",
                            "The controller switch response exceeded the stock "
                            "CM 1 s fault bound; its effect is unknown")};
+    }
+    // A response that is ready is still accepted below (the lifecycle
+    // callers' existing semantics); only a missing one ends here.
+    if (lifecycle_deadline &&
+        std::chrono::steady_clock::now() >= *lifecycle_deadline) {
+      client->remove_pending_request(future);
+      return {RetainedRos2ControlSwitchOutcome::kUncertain,
+              switch_error("ros2_control_switch_timeout",
+                           "the controller manager did not answer the "
+                           "controller switch within the lifecycle command "
+                           "time; its effect is unknown")};
     }
   }
   const auto response = future.get();
@@ -1838,7 +1887,8 @@ RetainedRos2ControlRuntimeHandle::PrepareArmController() {
 
 RetainedRos2ControlSwitchResult
 RetainedRos2ControlRuntimeHandle::ActivateArmController(
-    const std::stop_token cancellation) {
+    const std::stop_token cancellation,
+    const std::optional<MockResetPositionStepDeadline> deadline) {
   std::lock_guard switch_lock(switch_mutex_);
   RefreshEndpointFacts();
   if (auto error = ReadEndpointDiagnostic())
@@ -1883,7 +1933,7 @@ RetainedRos2ControlRuntimeHandle::ActivateArmController(
     if (!rotated.ok())
       return {RetainedRos2ControlSwitchOutcome::kNotSent, rotated.error()};
   }
-  const auto result = SendSwitch(true, cancellation);
+  const auto result = SendSwitch(true, cancellation, std::nullopt, true, deadline);
   std::lock_guard lock(mutex_);
   if (result.outcome != RetainedRos2ControlSwitchOutcome::kNotSent)
     arm_->epoch_used = true;  // it may be active on this epoch now
@@ -1899,7 +1949,8 @@ RetainedRos2ControlRuntimeHandle::ActivateArmController(
 
 RetainedRos2ControlSwitchResult
 RetainedRos2ControlRuntimeHandle::DeactivateArmController(
-    const std::stop_token cancellation) {
+    const std::stop_token cancellation,
+    const std::optional<MockResetPositionStepDeadline> deadline) {
   std::lock_guard switch_lock(switch_mutex_);
   bool active = false;
   {
@@ -1909,7 +1960,7 @@ RetainedRos2ControlRuntimeHandle::DeactivateArmController(
     active = !arm_->activity.observed || arm_->activity.controller_active;
   }
   const auto result =
-      active ? SendSwitch(false, cancellation)
+      active ? SendSwitch(false, cancellation, std::nullopt, true, deadline)
              : RetainedRos2ControlSwitchResult{
                    RetainedRos2ControlSwitchOutcome::kSucceeded, std::nullopt};
   std::lock_guard lock(mutex_);
@@ -1936,10 +1987,16 @@ RetainedRos2ControlRuntimeHandle::MeasuredJointsLocked(
   const auto &joints = arm_->transport.adapter.lane_facts.joint_names;
   std::lock_guard lock(device_measured_joints_->mutex);
   const auto &sample = *device_measured_joints_;
-  if (!sample.received.has_value() || *sample.received > now_ns ||
-      now_ns - *sample.received > budget)
+  // A sample received after the caller's boundary `now_ns` (taken before an
+  // endpoint refresh, or by the coordinator for a whole readiness pass) is
+  // newer than it, never stale.
+  if (!sample.received.has_value() ||
+      !core::received_sample_current(*sample.received, now_ns, budget))
     return refuse("ros2_control_measured_joints_stale",
                   "the measured joint state is missing or stale");
+  if (sample.not_before.has_value() && *sample.received < *sample.not_before)
+    return refuse("ros2_control_measured_joints_stale",
+                  "no measured joint state since the hardware activation");
   std::vector<double> result;
   result.reserve(joints.size());
   for (const auto &joint : joints) {
@@ -2018,7 +2075,7 @@ RetainedRos2ControlRuntimeHandle::SendHardwareState(
 RetainedRos2ControlSwitchResult
 RetainedRos2ControlRuntimeHandle::ActivateArmHardware(
     const std::stop_token cancellation) {
-  std::lock_guard switch_lock(switch_mutex_);
+  std::unique_lock switch_lock(switch_mutex_);
   RefreshEndpointFacts();
   if (auto error = ReadEndpointDiagnostic())
     return {RetainedRos2ControlSwitchOutcome::kNotSent, std::move(error)};
@@ -2055,7 +2112,77 @@ RetainedRos2ControlRuntimeHandle::ActivateArmHardware(
     return not_sent("ros2_control_device_not_armable",
                     "the robot reports an error or no fresh status; arming "
                     "is refused");
-  return SendHardwareState(true, cancellation, *device);
+  const auto result = SendHardwareState(true, cancellation, *device);
+  if (result.outcome == RetainedRos2ControlSwitchOutcome::kNotSent)
+    return result;
+  // Only a broadcaster sample received one freshness budget after the answer
+  // counts as showing the controller manager's loop running again after the
+  // plugin's activation (the loop can publish one more sample before the
+  // plugin's first write() blocks it). The cutoff is on receipt time, so
+  // this makes a post-activation sample very likely; it does not prove it.
+  std::shared_ptr<DeviceMeasuredJoints> joints;
+  core::TimePoint not_before{};
+  {
+    std::lock_guard lock(mutex_);
+    joints = device_measured_joints_;
+    if (joints)
+      not_before = clock_->now() +
+                   arm_->transport.measured_joint_state_lane->freshness_budget_ns;
+  }
+  if (!joints)
+    return result;
+  {
+    std::lock_guard lock(joints->mutex);
+    joints->not_before = not_before;
+  }
+  switch_lock.unlock();
+  if (result.outcome != RetainedRos2ControlSwitchOutcome::kSucceeded)
+    return result;
+  // Return once the plugin's transient is over: the measured joints Prepare
+  // requires (fresh, after the cutoff, every joint present and finite) are
+  // there (it reactivated the broadcaster, or never stopped it), or its bound
+  // elapsed with the broadcaster still off. The switch lock is released.
+  const auto deadline =
+      std::chrono::steady_clock::now() + kVendorActivationTransientBound;
+  const auto measured_valid = [&] {
+    const auto now = clock_->now();
+    std::lock_guard lock(mutex_);
+    return MeasuredJointsLocked(now).ok();
+  };
+  while (!cancellation.stop_requested() &&
+         std::chrono::steady_clock::now() < deadline && !measured_valid())
+    std::this_thread::sleep_for(std::chrono::milliseconds(10));
+  return result;
+}
+
+RetainedRos2ControlSwitchResult
+RetainedRos2ControlRuntimeHandle::ActivateJointStateBroadcaster(
+    const std::stop_token cancellation,
+    const std::optional<MockResetPositionStepDeadline> deadline) {
+  std::lock_guard switch_lock(switch_mutex_);
+  RefreshEndpointFacts();
+  if (auto error = ReadEndpointDiagnostic())
+    return {RetainedRos2ControlSwitchOutcome::kNotSent, std::move(error)};
+  {
+    std::lock_guard lock(mutex_);
+    if (!arm_)
+      return not_sent("ros2_control_arm_unbound", "no arm controller is bound");
+    if (!device_status_adapter_)
+      return not_sent("ros2_control_hardware_primitive_unsupported",
+                      "only a Real arm with a vendor adapter re-activates its "
+                      "joint state broadcaster");
+    const auto &activity = arm_->activity;
+    if (!activity.controller_manager_present || !activity.observed ||
+        !activity.hardware_active)
+      return not_sent("ros2_control_hardware_inactive",
+                      "the joint state broadcaster is re-activated only on "
+                      "active hardware");
+    if (activity.broadcaster_active)
+      return {RetainedRos2ControlSwitchOutcome::kSucceeded, std::nullopt};
+  }
+  return SendSwitch(true, cancellation,
+                    std::string(kJointStateBroadcasterControllerName), true,
+                    deadline);
 }
 
 RetainedRos2ControlSwitchResult
@@ -2115,13 +2242,13 @@ RetainedRos2ControlRuntimeHandle::DeactivateArmControllerForFault(
       writer = arm_->transport.mock_reset_position->controller_name;
   }
   if (writer) {
-    const auto contained = SendSwitch(false, cancellation, *writer);
+    const auto contained = SendSwitch(false, cancellation, *writer, false);
     if (contained.outcome != RetainedRos2ControlSwitchOutcome::kSucceeded)
       return contained;
     std::lock_guard lock(mutex_);
     arm_->reset_writer_possibly_active = false;
   }
-  return SendSwitch(false, cancellation);
+  return SendSwitch(false, cancellation, std::nullopt, false);
 }
 
 std::optional<MockResetPositionTarget>
@@ -2434,7 +2561,8 @@ RetainedRos2ControlRuntimeHandle::ResetMockPosition(
 
 RetainedRos2ControlSwitchResult
 RetainedRos2ControlRuntimeHandle::RecoverArmController(
-    const std::stop_token cancellation) {
+    const std::stop_token cancellation,
+    const std::optional<MockResetPositionStepDeadline> deadline) {
   std::lock_guard switch_lock(switch_mutex_);
   std::function<void()> on_recover;
   bool active = false;
@@ -2449,7 +2577,8 @@ RetainedRos2ControlRuntimeHandle::RecoverArmController(
   if (active) {
     // A controller still active after an incident is deactivated first; the
     // next Enable reactivates it on a new binding epoch.
-    const auto result = SendSwitch(false, cancellation);
+    const auto result =
+        SendSwitch(false, cancellation, std::nullopt, true, deadline);
     if (result.outcome != RetainedRos2ControlSwitchOutcome::kSucceeded)
       return result;
   }
@@ -2497,7 +2626,8 @@ RetainedRos2ControlRuntimeHandle::PrepareGripperController() {
 
 RetainedRos2ControlSwitchResult
 RetainedRos2ControlRuntimeHandle::SwitchGripperController(
-    const bool activate, const std::stop_token cancellation) {
+    const bool activate, const std::stop_token cancellation,
+    const std::optional<MockResetPositionStepDeadline> deadline) {
   std::lock_guard switch_lock(switch_mutex_);
   if (activate) {
     RefreshEndpointFacts();
@@ -2532,7 +2662,7 @@ RetainedRos2ControlRuntimeHandle::SwitchGripperController(
   }
   const auto result =
       needs_switch
-          ? SendSwitch(activate, cancellation, controller)
+          ? SendSwitch(activate, cancellation, controller, true, deadline)
           : RetainedRos2ControlSwitchResult{
                 RetainedRos2ControlSwitchOutcome::kSucceeded, std::nullopt};
   if (result.outcome == RetainedRos2ControlSwitchOutcome::kSucceeded) {
@@ -2550,7 +2680,13 @@ RetainedRos2ControlRuntimeHandle::lifecycle_primitive_dispatcher() {
   const std::weak_ptr<RetainedRos2ControlRuntimeHandle> weak = external_owner_;
   return [weak](const core::ControlDomainId &domain,
                 const core::LifecyclePrimitiveId &primitive,
-                const std::stop_token cancellation) {
+                const std::stop_token cancellation,
+                const std::optional<core::Duration> remaining) {
+    // The transaction's remaining command time bounds a switch's answer.
+    std::optional<MockResetPositionStepDeadline> deadline;
+    if (remaining && *remaining > 0)
+      deadline = std::chrono::steady_clock::now() +
+                 std::chrono::nanoseconds(*remaining);
     const auto self = weak.lock();
     if (self) {
       bool gripper_domain = false;
@@ -2572,17 +2708,38 @@ RetainedRos2ControlRuntimeHandle::lifecycle_primitive_dispatcher() {
           return primitive_outcome(self->PrepareGripperController());
         if (primitive.value() == "ros2_control.controller.activate")
           return primitive_outcome(
-              self->SwitchGripperController(true, cancellation));
+              self->SwitchGripperController(true, cancellation, deadline));
         if (primitive.value() == "ros2_control.controller.deactivate")
           return primitive_outcome(
-              self->SwitchGripperController(false, cancellation));
+              self->SwitchGripperController(false, cancellation, deadline));
         return primitive_outcome(
             not_sent("ros2_control_lifecycle_primitive_unknown",
                      "the gripper has no such controller primitive"));
       }
       if (command_bridge_domain) {
+        // The Isaac effort transport has no remote command owner to prepare,
+        // authorize or cancel. As the no-output owner, its lifecycle is the
+        // local request; transport readiness stays observed.
+        const auto transport =
+            self->gripper_->gripper_transport_readiness(*self->gripper_id_);
+        const bool local_owner =
+            transport.transport_kind == "isaac_joint_state_effort";
         const auto bridge_result = [&]()
             -> ros2_control_execution::Ros2GripperLifecycleResult {
+          if (local_owner) {
+            if (primitive.value() != "ros2_control.controller.prepare" &&
+                primitive.value() != "ros2_control.controller.activate" &&
+                primitive.value() != "ros2_control.controller.deactivate")
+              return {false, false, core::ErrorDTO{
+                  "ros2_control_lifecycle_primitive_unknown",
+                  "the gripper bridge has no such lifecycle primitive", {}}};
+            if (primitive.value() != "ros2_control.controller.deactivate" &&
+                !transport.ready)
+              return {false, false, core::ErrorDTO{
+                  "ros2_control_gripper_bridge_not_ready",
+                  "The exact gripper command transport is not ready", {}}};
+            return {true, false, std::nullopt};
+          }
           if (primitive.value() == "ros2_control.controller.prepare")
             return self->gripper_->prepare_lifecycle_gripper(*self->gripper_id_);
           if (primitive.value() == "ros2_control.controller.activate") {
@@ -2629,11 +2786,14 @@ RetainedRos2ControlRuntimeHandle::lifecycle_primitive_dispatcher() {
     if (id == "ros2_control.controller.prepare")
       return primitive_outcome(self->PrepareArmController());
     if (id == "ros2_control.controller.activate")
-      return primitive_outcome(self->ActivateArmController(cancellation));
+      return primitive_outcome(
+          self->ActivateArmController(cancellation, deadline));
     if (id == "ros2_control.controller.deactivate")
-      return primitive_outcome(self->DeactivateArmController(cancellation));
+      return primitive_outcome(
+          self->DeactivateArmController(cancellation, deadline));
     if (id == "ros2_control.controller.recover")
-      return primitive_outcome(self->RecoverArmController(cancellation));
+      return primitive_outcome(
+          self->RecoverArmController(cancellation, deadline));
     // R7 package 4: a Real arm's hardware pair and its vendor's primitives.
     std::shared_ptr<IRetainedDeviceStatusAdapter> device;
     {
@@ -2645,6 +2805,9 @@ RetainedRos2ControlRuntimeHandle::lifecycle_primitive_dispatcher() {
         return primitive_outcome(self->ActivateArmHardware(cancellation));
       if (id == kHardwareDeactivatePrimitiveId)
         return primitive_outcome(self->DeactivateArmHardware(cancellation));
+      if (id == kBroadcasterActivatePrimitiveId)
+        return primitive_outcome(
+            self->ActivateJointStateBroadcaster(cancellation, deadline));
       // One vendor call at a time, as for every other primitive here.
       std::lock_guard switch_lock(self->switch_mutex_);
       return primitive_outcome(device->Dispatch(primitive, cancellation));
@@ -2705,6 +2868,8 @@ struct RetainedRos2ControlRuntimeHandle::LifecycleHealthInputs final {
   std::function<core::Result<std::optional<std::string>>()>
       process_health_source;
   std::optional<std::string> process_fault;
+  /// The shared ROS executor stopped on an exception; no callbacks run.
+  std::optional<std::string> transport_fault;
   std::optional<std::string> guard_fault;
   std::shared_ptr<ros2_control_execution::Ros2ControlExecutionBackend> adapter;
   ros2_control_execution::Ros2GripperCommandBackend *gripper{};
@@ -2766,6 +2931,8 @@ RetainedRos2ControlRuntimeHandle::CaptureLifecycleHealthInputs(
   }
   inputs.process_fault_source = process_fault_source_;
   inputs.process_health_source = process_health_source_;
+  if (resources_)
+    inputs.transport_fault = resources_->executor_fault();
   inputs.diagnostic_snapshot = process_diagnostic_snapshot_;
   inputs.diagnostic_incident_id = process_diagnostic_incident_id_;
   if (const auto found = domain_generations_.find(domain);
@@ -2779,7 +2946,8 @@ RetainedRos2ControlRuntimeHandle::CaptureLifecycleHealthInputs(
 void RetainedRos2ControlRuntimeHandle::ReadLifecycleMonitorFacts(
     LifecycleHealthInputs &inputs) {
   using State = core::ComponentLifecycleStateDTO;
-  if (inputs.process_fault && (inputs.is_motion || inputs.is_gripper))
+  if ((inputs.process_fault || inputs.transport_fault) &&
+      (inputs.is_motion || inputs.is_gripper))
     return;
   if (inputs.is_motion) {
     inputs.guard_fault = inputs.fault_hook ? inputs.fault_hook() : std::nullopt;
@@ -2825,13 +2993,19 @@ RetainedRos2ControlRuntimeHandle::ComputeLifecycleHealth(
   Cause cause = Cause::kAvailability;
   std::string signature;
   std::vector<core::LifecycleFactDTO> device_facts;
-  // Q80: an exited Manager-owned controller launch fails the component.
+  // Q80: an exited Manager-owned controller launch fails the component, and
+  // so does a ROS executor thread that failed on an exception.
   const auto &process_fault = inputs.process_fault;
-  if (process_fault.has_value() && (is_motion || is_gripper)) {
+  const auto &transport_fault = inputs.transport_fault;
+  if ((process_fault.has_value() || transport_fault.has_value()) &&
+      (is_motion || is_gripper)) {
     state = State::kFaulted;
     cause = Cause::kFault;
     fault_present = true;
-    auto message = *process_fault;
+    auto message = process_fault
+                       ? *process_fault
+                       : "ROS transport executor thread failed (the other "
+                         "threads keep running): " + *transport_fault;
     if (message.size() > core::kMaxLifecycleErrorMessageBytes) {
       auto end = core::kMaxLifecycleErrorMessageBytes;
       while (end > 0U &&
@@ -2839,10 +3013,12 @@ RetainedRos2ControlRuntimeHandle::ComputeLifecycleHealth(
         --end;
       message.resize(end);
     }
-    diagnostic =
-        core::ErrorDTO{"controller_launch_exited", std::move(message), {}};
+    diagnostic = core::ErrorDTO{process_fault ? "controller_launch_exited"
+                                              : "ros_transport_executor_failed",
+                                std::move(message), {}};
     signature = std::string(is_motion ? "arm" : "gripper") +
-                ":controller_process:" + *process_fault +
+                (process_fault ? ":controller_process:" + *process_fault
+                               : ":ros_transport_executor:" + *transport_fault) +
                 ":diagnostic:" + diagnostic_incident_id;
   } else if (is_motion) {
     const auto &guard_fault = inputs.guard_fault;
@@ -2904,6 +3080,19 @@ RetainedRos2ControlRuntimeHandle::ComputeLifecycleHealth(
                  !core::lifecycle_cause_requires_intervention(cause)) {
         cause = Cause::kAvailability;
         state = State::kDegraded;
+      } else if ((requested == State::kPrepared || requested == State::kActive) &&
+                 !core::lifecycle_cause_requires_intervention(cause) &&
+                 std::any_of(inputs.device_status->facts.begin(),
+                             inputs.device_status->facts.end(),
+                             [](const core::LifecycleFactDTO &fact) {
+                               return fact.lifecycle_fact_id.value() ==
+                                          core::kDeviceMovedExternallyFactId &&
+                                      fact.value.boolean_value == true;
+                             })) {
+        // m5.5: moved from the robot's own interface while armed: not servo
+        // ready until ManyForge re-arms it (CCLC decides how).
+        cause = Cause::kAvailability;
+        state = State::kDegraded;
       }
       device_facts = inputs.device_status->facts;
       // R7 package 4: the activity the Real catalog sequences on.
@@ -2961,6 +3150,14 @@ RetainedRos2ControlRuntimeHandle::ComputeLifecycleHealth(
         state = gripper_requested;
       ready = owner_ready && state == State::kActive;
       signature += ":logical:" + std::string(core::to_string(gripper_requested));
+    } else if (!cm_gripper &&
+               snapshot.transport_kind == "isaac_joint_state_effort") {
+      // As before b9c5798c, the ready effort transport is the active owner
+      // until a local lifecycle request is recorded (the no-output rule).
+      if (owner_ready && gripper_requested != State::kDeclared)
+        state = gripper_requested;
+      ready = owner_ready && state == State::kActive;
+      signature += ":local:" + std::string(core::to_string(gripper_requested));
     } else if (!cm_gripper) {
       // The action bridge has no controller-manager primitive. Its lifecycle
       // owns command admission while transport readiness remains observed.
@@ -3043,8 +3240,11 @@ RetainedRos2ControlRuntimeHandle::ReadLifecycleHealth(
   if (auto endpoint_error = ReadEndpointDiagnostic())
     return core::Result<core::LifecycleDomainHealthDTO>::Err(*endpoint_error);
   ReadLifecycleMonitorFacts(inputs);
-  if (inputs.device_adapter && !inputs.process_fault)
+  if (inputs.device_adapter && !inputs.process_fault) {
+    if (inputs.activity.controller_manager_present && inputs.activity.observed)
+      inputs.device_adapter->ObserveHardwareActive(inputs.activity.hardware_active);
     inputs.device_status = inputs.device_adapter->ReadHealth(now_ns);
+  }
   auto classification = ComputeLifecycleHealth(inputs);
   const auto reported = classification.cause == Cause::kAvailability &&
                                 inputs.retained_cause != Cause::kNone
@@ -3097,8 +3297,11 @@ RetainedRos2ControlRuntimeHandle::ReadLifecycleSnapshot(
         "ros2_control_lifecycle_domain_unknown",
         "requested lifecycle domain is not bound to this ROS runtime");
   ReadLifecycleMonitorFacts(inputs);
-  if (inputs.device_adapter && !inputs.process_fault)
+  if (inputs.device_adapter && !inputs.process_fault) {
+    if (inputs.activity.controller_manager_present && inputs.activity.observed)
+      inputs.device_adapter->ObserveHardwareActive(inputs.activity.hardware_active);
     inputs.device_status = inputs.device_adapter->Observe(now_ns);
+  }
   auto classification = ComputeLifecycleHealth(inputs);
   return CommitLifecycleObservation(domain, std::move(inputs),
                                     std::move(classification));

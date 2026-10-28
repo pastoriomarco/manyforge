@@ -9,8 +9,8 @@ import {
 
 import { api, authoringRefusalMessage, isStaleWorkspaceError, savedNotAdoptedMessage } from '../api/client';
 import { errorMessage } from '../state/structuralResource';
-import { parseManagerApplyAvailability, parseLogicalSceneProjection } from '../api/parsers';
-import { freshClosePolicy, managerPublicationMatches, sceneAtOrAfter } from '../state/scenarioClose';
+import { parseManagerApplyAvailability } from '../api/parsers';
+import { managerPublicationMatches } from '../state/scenarioClose';
 import type { ManagerApplyIdentity } from '../state/managerApply';
 import {
   programLocalFence,
@@ -29,7 +29,6 @@ import {
 } from '../state/programWorkspace';
 import type {
   DraftMutationResponse,
-  NewScenarioDocumentInput,
   SaveScenarioDocumentInput,
   JsonValue,
   LocalWorkspaceFenceRequest,
@@ -41,8 +40,6 @@ import type {
   ProgramWorkspaceTransitionStatus,
   ScenarioDocumentFenceRequest,
   ManagerActiveProjection,
-  ProjectionRevision,
-  LogicalSceneObject,
 } from '../types/api';
 import type { AuthoringWorkspaceIdentity, ComposerHeadlessState } from '../types/headless';
 import type { AuthoringWorkspaceController } from './useAuthoringWorkspace';
@@ -74,52 +71,6 @@ export interface ScenarioReplacementIdentity {
 }
 
 type ScenarioCloseHandoff = { status: 'waiting' | 'ready' | 'refused'; message: string | null };
-
-export interface ScenarioCloseSceneProgress {
-  ownerId: string;
-  ownerEpoch: string;
-  expected: ProjectionRevision;
-  predecessor: ProjectionRevision | null;
-  remaining: string[];
-  removed: number;
-  admissionGeneration: number | null;
-  policyReset?: boolean;
-}
-type ScenarioCloseSceneHandoff = ScenarioCloseHandoff & {
-  progress?: ScenarioCloseSceneProgress;
-  objectId?: string | null;
-  policyResetRequired?: boolean;
-  policy?: Record<string, JsonValue>;
-};
-function closeSceneRemovalOrder(objects: LogicalSceneObject[]): string[] {
-  // Same dependent-before-support order as initial Scene reconciliation.
-  const dependents = new Map(objects.map((object) => [object.scene_resource_id, 0]));
-  const supports = new Map<string, string[]>();
-  if (dependents.size !== objects.length) throw new Error('The Scene contains duplicate object identities.');
-  for (const object of objects) {
-    const ids = object.support_contacts.map((contact) => contact.support_object_id);
-    if (new Set(ids).size !== ids.length) throw new Error('The Scene contains duplicate support dependencies.');
-    const validated: string[] = [];
-    for (const id of ids) {
-      if (typeof id !== 'string' || !dependents.has(id)) throw new Error('The Scene contains an unknown support dependency.');
-      dependents.set(id, dependents.get(id)! + 1); validated.push(id);
-    }
-    supports.set(object.scene_resource_id, validated);
-  }
-  const ready = [...dependents.keys()].filter((id) => dependents.get(id) === 0).sort();
-  const order: string[] = [];
-  while (ready.length > 0) {
-    const next = ready.shift()!;
-    order.push(next);
-    for (const support of supports.get(next)!) {
-      const count = dependents.get(support)! - 1;
-      dependents.set(support, count);
-      if (count === 0) { ready.push(support); ready.sort(); }
-    }
-  }
-  if (order.length !== objects.length) throw new Error('The Scene contains a cyclic support dependency.');
-  return order;
-}
 
 /**
  * The installed Draft is not the content the caller confirmed: nothing was
@@ -325,59 +276,6 @@ export function useProgramWorkspace(
     if (state.status === 'loading' || state.pendingAction !== null) return waiting();
     return { status: 'ready', message: null };
   }, [authoring, documentUnavailableReason, published, snapshot, state.error, state.pendingAction, state.status]);
-  const scenarioCloseSceneHandoff = useCallback((
-    predecessor: ManagerActiveProjection,
-    closed: ManagerActiveProjection,
-    confirmed: ScenarioReplacementIdentity,
-    progress: ScenarioCloseSceneProgress | null,
-  ): ScenarioCloseSceneHandoff => {
-    const admission = scenarioCloseHandoff(predecessor, closed, confirmed);
-    if (admission.status !== 'ready' || snapshot === null) return admission;
-    const section = snapshot.runtime.sections.logicalScene;
-    if (section === undefined || !section.available || section.freshness !== 'fresh'
-      || section.knownGaps.length > 0 || section.payload === null
-      || !section.sourceOwnerId || !section.sourceOwnerEpoch) {
-      return { status: 'waiting', message: 'Scenario closed. Waiting for the current logical Scene owner.' };
-    }
-    try {
-      if (progress !== null && (section.sourceOwnerId !== progress.ownerId || section.sourceOwnerEpoch !== progress.ownerEpoch))
-        throw new Error('The logical Scene owner changed. No further object removal was sent.');
-      const scene = parseLogicalSceneProjection(section.payload);
-      const active = scene.access.active_projection;
-      const content = scene.snapshot;
-      if (active === null || content === null || !scene.access.scene_writes_open || !scene.access.projection_leases_open)
-        throw new Error('The logical Scene is unavailable or its writes are fenced.');
-      if (active.retained_bundle_id !== closed.retainedBundleId || active.graph_revision !== closed.graphRevision)
-        return { status: 'waiting', message: 'Waiting for the closed configuration in the logical Scene.' };
-      if (content.carried_object_attachments.length > 0 || content.objects.some((object) => object.placement.kind !== 'cell_fixed'))
-        throw new Error('Close cannot clear carried Scene objects after their carrier was retired. The editors were kept; no detach or object removal was sent.');
-      // Same Scene at its latest revision: pose updates may advance it at any time.
-      if (progress !== null && !sceneAtOrAfter(active, progress.expected)) {
-        if (progress.predecessor !== null && sceneAtOrAfter(active, progress.predecessor))
-          return { status: 'waiting', message: 'Waiting for the accepted Scene removal publication.' };
-        throw new Error('The logical Scene changed outside this Close. No further object removal was sent.');
-      }
-      if (progress !== null && progress.admissionGeneration !== null
-        && snapshot.authoringAdmission.admissionGeneration <= progress.admissionGeneration)
-        return { status: 'waiting', message: 'Waiting for current authoring admission after the Scene removal.' };
-      const next = progress !== null ? { ...progress, expected: active } : { ownerId: section.sourceOwnerId,
-        ownerEpoch: section.sourceOwnerEpoch, expected: active, predecessor: null,
-        remaining: closeSceneRemovalOrder(content.objects), removed: 0, admissionGeneration: null };
-      if (progress === null && !sceneAtOrAfter(active, closed.publication.projection_revision as unknown as ProjectionRevision))
-        throw new Error('The logical Scene changed after the completed Close. No object removal was sent.');
-      if (content.objects.length !== next.remaining.length
-        || content.objects.some((object) => !next.remaining.includes(object.scene_resource_id)))
-        throw new Error('The logical Scene object inventory changed. No further object removal was sent.');
-      if (next.policyReset && !freshClosePolicy(content.configured_collision_policy))
-        throw new Error('The accepted collision policy reset was not published. Editors were kept; nothing was retried.');
-      return { status: 'ready', message: null, progress: next, objectId: next.remaining[0] ?? null,
-        policyResetRequired: next.remaining.length === 0 && !freshClosePolicy(content.configured_collision_policy),
-        policy: content.configured_collision_policy };
-    } catch (error: unknown) {
-      return { status: 'refused', message: errorMessage(error, 'The logical Scene could not be verified.') };
-    }
-  }, [scenarioCloseHandoff, snapshot]);
-
   // The Draft content the next fence would act upon. A mutation reply can be
   // ahead of the publication; a caller that names exact content waits for it.
   const fenceDraftId = published?.identity.programDraftId ?? null;
@@ -778,101 +676,18 @@ export function useProgramWorkspace(
     });
   }, [requireWorkspace, run, scenarioFence]);
 
-  const removeClosedSceneObject = useCallback(async (
-    predecessor: ManagerActiveProjection, closed: ManagerActiveProjection,
-    confirmed: ScenarioReplacementIdentity, progress: ScenarioCloseSceneProgress,
-  ): Promise<ScenarioCloseSceneProgress> => {
-    const step = scenarioCloseSceneHandoff(predecessor, closed, confirmed, progress);
-    const fence = scenarioFence();
-    if (step.status !== 'ready' || step.progress === undefined || (!step.objectId && !step.policyResetRequired) || fence === null)
-      throw new Error(step.message ?? 'Scene cleanup is not admitted.');
-    // The handoff rebased the expected projection onto the latest revision of the same Scene.
-    const latest = step.progress;
-    const requestId = identity('composer-close-scene');
-    const revision = step.policy?.revision;
-    if (!step.objectId && (revision === null || typeof revision !== 'object' || Array.isArray(revision)
-      || typeof revision?.revision_id !== 'number' || !Number.isSafeInteger(revision.revision_id) || revision.revision_id < 1
-      || typeof revision.content_hash !== 'string' || !revision.content_hash))
-      throw new Error('The current collision policy revision is unavailable. Editors were kept.');
-    const response = await api.scene.commit({
-      request_context: { request_id: requestId, request_owner_epoch: latest.ownerEpoch,
-        source_label: 'composer_ui', correlation_id: requestId },
-      expected_projection_revision: latest.expected,
-      expected_authoring_workspace: confirmed.authoring,
-      expected_admission_generation: fence.expectedAdmissionGeneration,
-      expected_draft_id: fence.draftId, expected_draft_revision: fence.expectedDraftRevision,
-      operation: step.objectId ? { kind: 'remove_object', scene_resource_id: step.objectId } : {
-        kind: 'set_collision_policy',
-        expected_configured_policy_revision: revision as { revision_id: number; content_hash: string },
-        configured_policy: { policy_id: 'free_space', revision: revision!, allowed_static_static_pairs: [],
-          allowed_touch_link_pairs: [], support_contacts: [], contact_grasps: [], require_full_diagnostics: true },
-      },
-    });
-    const committed = response.committed_projection_revision;
-    if (response.request_id !== requestId || response.request_owner_epoch !== latest.ownerEpoch
-      || !sceneAtOrAfter(committed, latest.expected)
-      || committed.scene_revision.revision_id === latest.expected.scene_revision.revision_id)
-      throw new Error('The Scene cleanup receipt is not a successor of the requested Scene; its outcome is unresolved.');
-    return { ...latest, predecessor: latest.expected, expected: committed,
-      remaining: step.objectId ? latest.remaining.slice(1) : latest.remaining,
-      removed: latest.removed + (step.objectId ? 1 : 0),
-      admissionGeneration: fence.expectedAdmissionGeneration, policyReset: !step.objectId };
-  }, [scenarioCloseSceneHandoff, scenarioFence]);
-
-  const clearClosedScenario = useCallback((
-    predecessor: ManagerActiveProjection,
-    closed: ManagerActiveProjection,
-    confirmed: ScenarioReplacementIdentity,
-    progress: ScenarioCloseSceneProgress,
-  ) => run('open_draft', async () => {
-    const admission = scenarioCloseSceneHandoff(predecessor, closed, confirmed, progress);
-    const fence = scenarioFence();
-    if (admission.status !== 'ready' || admission.objectId !== null || admission.policyResetRequired || fence === null
-      || confirmed.managerOwnerId === null || confirmed.managerOwnerEpoch === null) {
-      throw new Error(admission.message ?? 'Clearing the closed Scenario is not admitted.');
-    }
-    const { deploymentDraftId, expectedDeploymentDraftRevision, ...programFence } = fence;
-    const next = await api.programWorkspace.clearClosedScenario(programFence, {
-      managerOwnerId: confirmed.managerOwnerId, managerOwnerEpoch: confirmed.managerOwnerEpoch,
-      retainedBundleId: closed.retainedBundleId, graphRevision: closed.graphRevision,
-      publication: closed.publication, deploymentDraftId, expectedDeploymentDraftRevision,
-      sceneOwnerId: progress.ownerId, sceneOwnerEpoch: progress.ownerEpoch,
-      sceneProjectionRevision: admission.progress?.expected ?? progress.expected,
-    });
-    return workspaceResult(next, 'Scenario closed. Program and Scene editors emptied; saved files are unchanged.');
-  }), [run, scenarioCloseSceneHandoff, scenarioFence]);
-
-  const newScenarioDocument = useCallback((input: NewScenarioDocumentInput) => {
-    return run('new_scenario_document', async () => {
-      const requestFence = scenarioFence();
-      if (requestFence === null) throw new Error('New Scenario is not admitted.');
-      const response = await api.scenarioDocuments.new(requestFence, input);
-      scenarioOpened.current?.();
-      return {
-        workspace: response.workspace,
-        message: response.status === 'accepted'
-          ? `New Scenario saved; activation accepted (${response.activation.apply_id}). No Program or motion starts automatically.`
-          : 'New Scenario saved and configured. Activate components separately before execution.',
-        transitionStatus: response.status,
-        acceptedApply: response.status === 'accepted'
-          ? acceptedApplyIdentity(response.activation.apply_id, response.activation.apply_generation)
-          : null,
-      };
-    });
-  }, [run, scenarioFence]);
-
-  const loadScenarioDocument = useCallback((
-    path: string,
+  // New is the ordinary Load of the built-in Untitled Scenario (path null).
+  const activateScenarioDocument = useCallback((
+    path: string | null,
     confirmDiscard: boolean,
   ) => {
-    return run('load_scenario_document', async () => {
+    const label = path === null ? 'New Scenario' : 'Scenario Load';
+    return run(path === null ? 'new_scenario_document' : 'load_scenario_document', async () => {
       const requestFence = scenarioFence();
-      if (requestFence === null) throw new Error('Scenario Load is not admitted.');
-      const response = await api.scenarioDocuments.load(
-        requestFence,
-        path,
-        confirmDiscard,
-      );
+      if (requestFence === null) throw new Error(`${label} is not admitted.`);
+      const response = path === null
+        ? await api.scenarioDocuments.new(requestFence, confirmDiscard)
+        : await api.scenarioDocuments.load(requestFence, path, confirmDiscard);
       scenarioOpened.current?.();
       if (response.status === 'applied') {
         return {
@@ -884,7 +699,7 @@ export function useProgramWorkspace(
       const applyId = response.activation.apply_id;
       return {
         workspace: response.workspace,
-        message: `Scenario Load accepted (${applyId}); configuration progress is shown under Activity. Motion does not start automatically.`,
+        message: `${label} accepted (${applyId}); configuration progress is shown under Activity. Motion does not start automatically.`,
         transitionStatus: 'accepted',
         acceptedApply: acceptedApplyIdentity(
           applyId,
@@ -893,6 +708,14 @@ export function useProgramWorkspace(
       };
     });
   }, [run, scenarioFence]);
+  const loadScenarioDocument = useCallback(
+    (path: string, confirmDiscard: boolean) => activateScenarioDocument(path, confirmDiscard),
+    [activateScenarioDocument],
+  );
+  const newScenarioDocument = useCallback(
+    (confirmDiscard: boolean) => activateScenarioDocument(null, confirmDiscard),
+    [activateScenarioDocument],
+  );
 
   const updateNodePolicies = useCallback((
     instanceId: string,
@@ -917,9 +740,8 @@ export function useProgramWorkspace(
       collapsed_by_default: collapsedByDefault,
     });
   }, [mutate]);
-  const reportCloseCancellation = useCallback((removed: number, detail?: string) => {
-    dispatch({ type: 'close_canceled',
-      message: detail ?? `Close cleanup canceled. ${removed} Scene object removal(s) confirmed; editors were kept. No further removal was sent.` });
+  const reportCloseCancellation = useCallback((message: string) => {
+    dispatch({ type: 'close_canceled', message });
   }, []);
 
   const clearFeedback = useCallback(() => {
@@ -934,15 +756,12 @@ export function useProgramWorkspace(
     documentUnavailableReason,
     scenarioReplacementIdentity,
     scenarioCloseHandoff,
-    scenarioCloseSceneHandoff,
-    removeClosedSceneObject,
     admissionObserved,
     fenceDraft,
     refresh,
     refreshApplied,
     mutate,
     newScenarioDocument,
-    clearClosedScenario,
     openDraft,
     save,
     saveAs,
@@ -960,6 +779,7 @@ export function useProgramWorkspace(
       id: project?.documentId ?? null,
       name: project?.documentName ?? null,
       description: project?.documentDescription ?? null,
+      readOnly: project?.readOnly === true,
     },
     scenarioSourceDiagnostics: project === null ? [] : project.sourceDiagnostics,
     updateNodePolicies,
@@ -977,8 +797,6 @@ export function useProgramWorkspace(
     documentUnavailableReason,
     scenarioReplacementIdentity,
     scenarioCloseHandoff,
-    scenarioCloseSceneHandoff,
-    removeClosedSceneObject,
     loadScenarioDocument,
     exportScenarioDocument,
     fenceDraft,
@@ -986,7 +804,6 @@ export function useProgramWorkspace(
     mutationAvailable,
     mutationUnavailableReason,
     newScenarioDocument,
-    clearClosedScenario,
     openDraft,
     project,
     refresh,

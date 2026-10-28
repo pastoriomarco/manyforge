@@ -10,13 +10,16 @@ explicit `superseded` reply (the frame's occurrence was retired by an
 authoritative replacement) retires only that exact obligation, with no fault.
 A source the Runner itself retired (its own Reset, a new Run or a new Applied
 publication) never faults: a late reply for one of its frames is recorded
-only. `bb_source_not_ready` (SX-2143: the matching Apply is still installing)
-keeps the frame and retries it on the next liveness observation within the
+only. `bb_source_not_ready` (SX-2143: the matching Apply is still installing;
+or the Kernel has not yet observed the Runner's newer Program cycle, e.g. the
+between-Runs baseline right after Reset journals the new Idle cycle) keeps the frame and retries it on the next liveness observation within the
 same overall command budget. An obligation older than the command budget, or
 an unknown/failed reply for the current source, latches a publisher fault:
 publishing stops for good, the Run's Program Stop is requested first, then the
-fault is reported to the Manager-presence liveness receiver. There are no
-renewals and no resends of an unknown reply.
+fault is reported to the owner's ``on_fault``. For a Run's source the owner
+fences the Manager-presence liveness receiver; for the cell-level source
+between Runs (no Run to stop) the fence is held until the Kernel confirms
+the source lost (`declare_lost`) or a newer source superseded it (F-2). There are no renewals and no resends of an unknown reply.
 """
 
 from __future__ import annotations
@@ -40,8 +43,11 @@ from manyforge_behavior.orchestration_values import (
 SCHEMA_VERSION: Final = "manyforge.program_bbkey_publication.v1"
 COMMAND: Final = "publish_program_bbkeys"
 FAULT_CODE: Final = "program_bbkey_publication_failed"
-# SX-2143/2146: the matching current Apply is still installing the source.
+# SX-2143/2146: the matching current Apply is still installing the source, or
+# the Kernel has not yet observed the Runner's newer Program cycle.
 SOURCE_NOT_READY_CODE: Final = "bb_source_not_ready"
+# The Kernel's typed proof that an exact-sender gap lost this source (F-2).
+SEQUENCE_GAP_REASON: Final = "program_bb_sequence_gap"
 # Unsent frames beyond this fail closed as source loss; the same depth as the
 # host's per-source I/O ingress default (contract 48).
 MAXIMUM_PENDING_FRAMES: Final = 64
@@ -140,6 +146,8 @@ class ProgramBlackboardKeyPublisher:
         fault_reference: Callable[[Mapping[str, Any]], str],
         budget_ns: int,
         monotonic_ns: Callable[[], int] = time.monotonic_ns,
+        on_baseline_accepted: Callable[[], None] | None = None,
+        source_ordinal: int = 0,
     ) -> None:
         if type(budget_ns) is not int or budget_ns <= 0:
             raise ValueError("publication budget must be a positive integer")
@@ -148,6 +156,11 @@ class ProgramBlackboardKeyPublisher:
         self._submit = submit
         self._stop_run = stop_run
         self._on_fault = on_fault
+        # The Kernel ACKed this source's baseline (F-2 successor proof).
+        self._on_baseline_accepted = on_baseline_accepted
+        # The owner's monotonic creation order of its sources (F-2).
+        self._source_ordinal = source_ordinal
+        self._baseline_accepted = False
         self._fault_reference = fault_reference
         self._budget_ns = budget_ns
         self._clock = monotonic_ns
@@ -169,6 +182,15 @@ class ProgramBlackboardKeyPublisher:
     @property
     def scope(self) -> ProgramBlackboardPublicationScope:
         return self._scope
+
+    @property
+    def source_ordinal(self) -> int:
+        return self._source_ordinal
+
+    @property
+    def baseline_accepted(self) -> bool:
+        with self._lock:
+            return self._baseline_accepted
 
     @property
     def fault(self) -> dict[str, Any] | None:
@@ -353,14 +375,21 @@ class ProgramBlackboardKeyPublisher:
                     )
                     return
                 if not_ready:
+                    details = getattr(error, "details", None)
                     _LOGGER.info(
-                        "BB publication %s: source not ready yet; retrying",
+                        "BB publication %s: source not ready yet (reason=%s); retrying",
                         frame.sequence,
+                        details.get("reason") if isinstance(details, Mapping) else None,
                     )
                     return
-                # Unknown or refused: never resend, never renew.
+                # Unknown or refused: never resend, never renew. The owner's
+                # typed code and details.reason stay visible in the fault.
+                details = getattr(error, "details", None)
+                reason = details.get("reason") if isinstance(details, Mapping) else None
                 self.fail(
-                    f"BB publication {frame.sequence} was not acknowledged: {error}"
+                    f"BB publication {frame.sequence} was not acknowledged: "
+                    f"code={getattr(error, 'code', type(error).__name__)} "
+                    f"reason={reason}: {error}"
                 )
                 return
             if status == "superseded":
@@ -385,10 +414,15 @@ class ProgramBlackboardKeyPublisher:
                     self._source_epoch = source_epoch
                     if self._frames and self._frames[0] is frame:
                         self._frames.popleft()
+                    first_ack = frame.kind == "baseline" and not self._baseline_accepted
+                    if first_ack:
+                        self._baseline_accepted = True
                 self._in_flight = False
             if failure is not None:
                 self.fail(failure)
                 return
+            if first_ack and self._on_baseline_accepted is not None:
+                self._on_baseline_accepted()
 
     def check_budget(self) -> bool:
         """Latch the fault when the oldest obligation outlived the budget.
@@ -445,11 +479,41 @@ class ProgramBlackboardKeyPublisher:
             error["message"],
         )
 
+    def declare_lost(self) -> bool:
+        """After a fault: make the Kernel's source of this exact scope
+        unavailable, never stale-but-usable (F-2). One update frame with a
+        sequence gap is the Kernel's existing exact-sender loss
+        (`program_bb_sequence_gap`); every BB-backed rule input of this source
+        then fails closed until a new source (Reset or Run) replaces it.
+        True only when the Kernel answered with that typed loss."""
+
+        with self._lock:
+            if self._fault is None or not self._current:
+                return False
+            name = min(self._current)
+            request = self._request(
+                _Frame(
+                    sequence=MAXIMUM_SEQUENCE,
+                    kind="update",
+                    recorded_ns=self._clock(),
+                    values={name: dict(self._current[name])},
+                )
+            )
+        try:
+            self._publish(request)
+        except Exception as error:
+            details = getattr(error, "details", None)
+            return (
+                isinstance(details, Mapping)
+                and details.get("reason") == SEQUENCE_GAP_REASON
+            )
+        return False
+
     def retire(self) -> None:
         """Reset, next Run start, new Applied publication or shutdown: the
         Runner retires this source itself and drops its pending frames; the
-        replacement baseline carries the current values (run-only keys null
-        after Reset)."""
+        replacement baseline carries the current values (run-only keys at
+        their declared `initial` after Reset)."""
 
         with self._lock:
             self._retired = True

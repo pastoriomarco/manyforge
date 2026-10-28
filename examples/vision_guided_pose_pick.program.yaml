@@ -1,6 +1,6 @@
 api_version: manyforge.program.v2
 program_id: vision_guided_pose_pick
-program_revision: sha256:83058dd90181e965d7e08ee54760c391d8a5bc10b02fcc33d633406a0f24fa8b
+program_revision: sha256:77ce76e6a3087c9a26355f390a205ef82d1215e5199eaeb4b0c76e2bfe904544
 program_profile: composable-cell-v1
 name: vision_guided_pose_pick
 description: >-
@@ -11,7 +11,7 @@ description: >-
   grounding them in an authoritative pose source.
 catalog:
   api_version: manyforge.node_catalog.v2
-  content_version: 2.7.0
+  content_version: 2.8.0
 compatibility:
   lanes: [manyforge-only]
   assistant: required

@@ -6,6 +6,9 @@ import type {
   LogicalSceneProjection,
   LogicalSceneObject,
   QuaternionXyzwTuple,
+  SceneRuntimeCellPoseMeasurement,
+  SceneRuntimeAttachedPoseReference,
+  SceneRuntimePoseMeasurement,
   SceneRuntimeGoodObservationPayload,
   SceneRuntimeObservationPose,
   SceneRuntimePoseSource,
@@ -107,10 +110,20 @@ export interface AttachedObjectPresentation {
   attachmentRevision: string;
   carrierComponentId: string;
   commandTargetId: string;
+  carrierModelInstanceId: string;
   carrierFrameRoleId: string;
   carrierCompiledFrameName: string;
   poseInCarrierFrame: CarriedObjectAttachment['pose_in_carrier_frame'];
+  poseMeasurement: AttachedObjectPoseMeasurement | null;
 }
+
+export type AttachedObjectPoseMeasurement = SceneRuntimePoseMeasurement & {
+  fresh: boolean;
+  observedAtNs: Nanoseconds;
+  sourceId: string;
+  sourceEpoch: string;
+  sourceSequence: number;
+};
 
 export interface AttachmentPresentationDiagnostic {
   code:
@@ -647,9 +660,11 @@ export function attachedScenePresentation(
       attachmentRevision: attachment.carried_object_attachment_revision,
       carrierComponentId: attachment.controllable_component_id,
       commandTargetId: attachment.command_target_id,
+      carrierModelInstanceId: attachment.carrier_frame_ref.model_instance_id,
       carrierFrameRoleId: attachment.carrier_frame_ref.frame_role_id,
       carrierCompiledFrameName: carrierFrame.compiledFrameName,
       poseInCarrierFrame: attachment.pose_in_carrier_frame,
+      poseMeasurement: null,
     });
   }
 
@@ -671,6 +686,72 @@ export function attachedScenePresentation(
   return { objects, diagnostics };
 }
 
+type ResolvedPoseMeasurementSource = SceneRuntimePoseSource & {
+  measured_against: SceneRuntimeAttachedPoseReference['measured_against']
+    | SceneRuntimeCellPoseMeasurement['measured_against'];
+  frame: SceneRuntimeAttachedPoseReference['frame'];
+  current_offset: SceneRuntimeAttachedPoseReference['current_offset'];
+};
+
+function hasResolvedPoseMeasurement(source: SceneRuntimePoseSource): source is ResolvedPoseMeasurementSource {
+  return source.payload_quality === 'good'
+    && source.measured_against !== undefined
+    && source.frame !== undefined
+    && source.current_offset !== undefined;
+}
+
+function attachedPoseMeasurement(
+  attached: AttachedObjectPresentation,
+  sources: readonly SceneRuntimePoseSource[],
+): AttachedObjectPoseMeasurement | null {
+  const matches = sources.filter((source) => (
+    source.object_id === attached.object.scene_resource_id
+    && hasResolvedPoseMeasurement(source)
+    && source.frame.controllable_component_id === attached.carrierComponentId
+    && source.frame.model_instance_id === attached.carrierModelInstanceId
+    && source.frame.frame_role_id === attached.carrierFrameRoleId
+  ));
+  const source = matches[0];
+  if (matches.length !== 1 || source === undefined || !hasResolvedPoseMeasurement(source)) return null;
+  if (source.measured_against === 'cell frame') {
+    if (source.policy_id !== 'continuous' || source.holder !== undefined) return null;
+    return {
+      measured_against: 'cell frame',
+      frame: source.frame,
+      current_offset: source.current_offset,
+      ...(source.baseline_offset === undefined ? {} : { baseline_offset: source.baseline_offset }),
+      ...(source.drift === undefined ? {} : { drift: source.drift }),
+      fresh: source.fresh,
+      observedAtNs: source.observed_at_ns,
+      sourceId: source.source_id,
+      sourceEpoch: source.source_epoch,
+      sourceSequence: source.source_sequence,
+    };
+  }
+  if (
+    source.policy_id !== 'continuous_relative_to_attached'
+    || source.holder === undefined
+    || source.holder.controllable_component_id !== attached.carrierComponentId
+    || source.holder.command_target_id !== attached.commandTargetId
+  ) return null;
+  return {
+    holder: source.holder,
+    measured_against: source.measured_against,
+    ...(source.source_header_frame_id === undefined
+      ? {}
+      : { source_header_frame_id: source.source_header_frame_id }),
+    frame: source.frame,
+    current_offset: source.current_offset,
+    ...(source.baseline_offset === undefined ? {} : { baseline_offset: source.baseline_offset }),
+    ...(source.drift === undefined ? {} : { drift: source.drift }),
+    fresh: source.fresh,
+    observedAtNs: source.observed_at_ns,
+    sourceId: source.source_id,
+    sourceEpoch: source.source_epoch,
+    sourceSequence: source.source_sequence,
+  };
+}
+
 type GoodObservationSource = Extract<
   SceneRuntimePoseSource,
   { payload_quality: 'good' }
@@ -687,7 +768,7 @@ type PoseObservationSource = GoodObservationSource & {
     {
       kind:
         | 'simulation_entity_pose'
-        | 'simulation_entity_pose_with_reference.v1'
+        | 'simulation_entity_pose_with_references.v1'
         | 'detection3d_pose';
     }
   >;
@@ -707,7 +788,7 @@ function isPoseObservation(
   source: GoodObservationSource,
 ): source is PoseObservationSource {
   return source.payload.kind === 'simulation_entity_pose'
-    || source.payload.kind === 'simulation_entity_pose_with_reference.v1'
+    || source.payload.kind === 'simulation_entity_pose_with_references.v1'
     || source.payload.kind === 'detection3d_pose';
 }
 
@@ -768,6 +849,10 @@ export function runtimeScenePresentation(
   }
 
   const sources = sceneRuntime.state.pose_sources;
+  const attachedObjects = attached.objects.map((item) => ({
+    ...item,
+    poseMeasurement: attachedPoseMeasurement(item, sources),
+  }));
   const fresh = sources.filter(isFreshGood);
   const measuredRobotSources = fresh.filter(
     (source): source is JointObservationSource => isJointObservation(source)
@@ -869,7 +954,7 @@ export function runtimeScenePresentation(
     measuredRobot,
     measuredTcp,
     measuredObjects,
-    attachedObjects: attached.objects,
+    attachedObjects,
     attachmentDiagnostics: attached.diagnostics,
     status: {
       total: sources.length,

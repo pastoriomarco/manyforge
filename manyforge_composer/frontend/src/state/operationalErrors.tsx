@@ -9,7 +9,15 @@ import {
   type ReactNode,
 } from 'react';
 
-import type { ClientOperationalError } from '../components/HeadlessRuntimeSurfaces';
+/** One Composer request failure. It blocks nothing, so it is a warning. */
+export interface ClientOperationalError {
+  id: string;
+  title: string;
+  message: string;
+  active: boolean;
+  acknowledgementRequired: boolean;
+  severity: 'warning';
+}
 
 export type OperationalErrorAttentionPolicy =
   | 'transient'
@@ -32,6 +40,8 @@ interface OperationalErrorRegistry {
   ) => void;
   resolve: (source: string) => void;
   dismiss: (id: string) => void;
+  /** Reset and Scenario Close clear every message. */
+  clear: () => void;
 }
 
 const EMPTY_REGISTRY: OperationalErrorRegistry = {
@@ -39,6 +49,7 @@ const EMPTY_REGISTRY: OperationalErrorRegistry = {
   report: () => undefined,
   resolve: () => undefined,
   dismiss: () => undefined,
+  clear: () => undefined,
 };
 
 export interface OperationalErrorState {
@@ -56,7 +67,8 @@ export type OperationalErrorAction =
       dismissSource?: () => void;
     }
   | { kind: 'resolve'; source: string }
-  | { kind: 'dismiss'; id: string };
+  | { kind: 'dismiss'; id: string }
+  | { kind: 'clear' };
 
 export function initialOperationalErrorState(): OperationalErrorState {
   return { records: new Map(), sequence: 0 };
@@ -66,6 +78,11 @@ export function reduceOperationalErrors(
   state: OperationalErrorState,
   action: OperationalErrorAction,
 ): OperationalErrorState {
+  if (action.kind === 'clear') {
+    return state.records.size === 0
+      ? state
+      : { records: new Map(), sequence: state.sequence + 1 };
+  }
   if (action.kind === 'report') {
     const existing = state.records.get(action.source);
     if (
@@ -84,7 +101,7 @@ export function reduceOperationalErrors(
       active: true,
       acknowledgementRequired:
         action.attentionPolicy === 'acknowledgement_required',
-      severity: 'error',
+      severity: 'warning',
       attentionPolicy: action.attentionPolicy,
       dismissSource: action.dismissSource,
     };
@@ -120,11 +137,10 @@ export function reduceOperationalErrors(
 const OperationalErrorContext = createContext<OperationalErrorRegistry>(EMPTY_REGISTRY);
 
 /**
- * One session-local registry for dismissible Composer failures (red row).
+ * One session-local registry for Composer request failures (warning row).
  * It is only a presentation source: backend alarms and runtime authority stay
- * with their owners. Every record is an error by construction; warnings and
- * current conditions are derived notices, never registry entries, so no
- * severity is ever inferred from message text.
+ * with their owners. A failure blocks nothing, so every record is a warning
+ * that stays until acknowledged, or until Reset or Scenario Close clears it.
  */
 export function OperationalErrorProvider({ children }: { children: ReactNode }) {
   const [state, setState] = useState<OperationalErrorState>(
@@ -160,12 +176,16 @@ export function OperationalErrorProvider({ children }: { children: ReactNode }) 
     }));
     callback?.();
   }, [state.records]);
+  const clear = useCallback(() => {
+    setState((current) => reduceOperationalErrors(current, { kind: 'clear' }));
+  }, []);
   const value = useMemo<OperationalErrorRegistry>(() => ({
     errors: [...state.records.values()].reverse(),
     report,
     resolve,
     dismiss,
-  }), [dismiss, report, resolve, state.records]);
+    clear,
+  }), [clear, dismiss, report, resolve, state.records]);
   return (
     <OperationalErrorContext.Provider value={value}>
       {children}
@@ -182,7 +202,8 @@ export function useOperationalErrorMirror({
   title,
   message,
   onDismiss,
-  attentionPolicy = 'transient',
+  // A newer command does not clear a failure: it stays until acknowledged.
+  attentionPolicy = 'acknowledgement_required',
 }: {
   source: string;
   title: string;

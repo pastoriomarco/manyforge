@@ -1994,6 +1994,38 @@ TEST(ProgramBindingCompilerTest,
 
 } // namespace
 
+// D6 (SX-318): only the exact sealed canonical-empty origin of the candidate
+// admits an Apply while Close of a latched Scenario runs.
+TEST(ProgramBindingCompilerTest, CanonicalEmptyCandidateIsTheExactSealedOrigin) {
+  namespace d = manyforge::deployment;
+  namespace core = manyforge::core;
+  const auto digest = [](char digit) { return "sha256:" + std::string(64U, digit); };
+  const d::PreparedSealedCanonicalEmptyOrigin sealed{
+      core::CellId("cell.a"), core::DeploymentArtifactId("artifact.a"),
+      core::DeploymentRevision(digest('1')), core::RetainedBundleId(digest('2')),
+      core::GraphRevision(digest('3')), core::ContentDigest(digest('4'))};
+  const auto receipt = [](const d::PreparedActivationOrigin& origin) {
+    return d::CanonicalValue(d::CanonicalValue::Object{
+        {"origin", d::prepared_activation_origin_value(origin)}});
+  };
+  EXPECT_TRUE(d::prepared_receipt_is_canonical_empty_candidate(
+      receipt(sealed), sealed.cell_id, sealed.retained_bundle_id, sealed.graph_revision));
+  // A different candidate (for example a component-free Scenario) is refused.
+  EXPECT_FALSE(d::prepared_receipt_is_canonical_empty_candidate(
+      receipt(sealed), sealed.cell_id, core::RetainedBundleId(digest('5')),
+      sealed.graph_revision));
+  EXPECT_FALSE(d::prepared_receipt_is_canonical_empty_candidate(
+      receipt(sealed), core::CellId("cell.b"), sealed.retained_bundle_id,
+      sealed.graph_revision));
+  const d::PreparedScenarioOrigin scenario{"Untitled", core::ContentDigest(digest('6')),
+                                           "/projects/Untitled.scenario"};
+  EXPECT_FALSE(d::prepared_receipt_is_canonical_empty_candidate(
+      receipt(scenario), sealed.cell_id, sealed.retained_bundle_id, sealed.graph_revision));
+  EXPECT_FALSE(d::prepared_receipt_is_canonical_empty_candidate(
+      d::CanonicalValue(d::CanonicalValue::Object{}), sealed.cell_id,
+      sealed.retained_bundle_id, sealed.graph_revision));
+}
+
 TEST(ProgramBindingCompilerTest, PreparedOriginIsClosedAndScenarioAccessIsChecked) {
   namespace d = manyforge::deployment;
   ScopedTrustedRoot root;
@@ -2328,6 +2360,149 @@ TEST(ProgramBindingCompilerTest, CompilesPortableReleaseWithoutChangingItsEnvelo
   EXPECT_EQ(manyforge::deployment::reload_verified_program_binding(
                 binding->canonical_bytes(), *context.bundle, context.model_map)->value(),
             binding->value());
+}
+
+using GripperRead = std::pair<std::string_view, std::string_view>;
+
+// The aggregate arm+gripper Program whose gripper role also declares the
+// given input capabilities (sorted, before `tool.gripper.command`) and the
+// `carried_object_lost` system resource role, read by the given
+// (node_id, resource_role) input nodes. The Lite6 gripper target offers no
+// input capability (contract §8.3, SX-269).
+[[nodiscard]] std::string gripper_input_program(
+    const RetainedBundle &bundle, const std::vector<std::string_view> &input_capabilities,
+    const std::vector<GripperRead> &reads) {
+  auto root = make_aggregate_program_root(bundle);
+  auto targets = root.find_object_member("target_roles")->as_object();
+  for (auto &[name, value] : targets) {
+    if (name != "gripper") continue;
+    CanonicalValue::Array capabilities;
+    for (const auto id : input_capabilities)
+      capabilities.emplace_back(CanonicalValue::Object{
+          {"capability_id", CanonicalValue(std::string(id))},
+          {"parameters", CanonicalValue(CanonicalValue::Object{})},
+          {"disposition", CanonicalValue("required")}});
+    for (const auto &existing :
+         value.find_object_member("required_capabilities")->as_array())
+      capabilities.push_back(existing);
+    value = with_member(value, "required_capabilities",
+                        CanonicalValue(std::move(capabilities)));
+    value = with_member(value, "required_resource_roles",
+                        CanonicalValue(CanonicalValue::Array{
+                            CanonicalValue("carried_object_lost"),
+                            CanonicalValue("fingers")}));
+  }
+  root = with_member(root, "target_roles", CanonicalValue(std::move(targets)));
+  CanonicalValue::Array children;
+  for (const auto &[node_id, resource] : reads)
+    children.emplace_back(CanonicalValue::Object{
+        {"node_id", CanonicalValue(std::string(node_id))},
+        {"instance_id", CanonicalValue("read_" + std::to_string(children.size()))},
+        {"parameters", CanonicalValue(CanonicalValue::Object{
+                           {"target_role", CanonicalValue("gripper")},
+                           {"resource_role", CanonicalValue(std::string(resource))},
+                           {"expected_value", CanonicalValue(true)}})},
+        {"children", CanonicalValue(CanonicalValue::Array{})}});
+  root = with_member(root, "tree",
+                     CanonicalValue(CanonicalValue::Object{
+                         {"node_id", CanonicalValue("sequence")},
+                         {"instance_id", CanonicalValue("root")},
+                         {"parameters", CanonicalValue(CanonicalValue::Object{})},
+                         {"children", CanonicalValue(std::move(children))}}));
+  root = manyforge::deployment::normalize_program_authoring(root);
+  root = with_member(root, "program_revision",
+                     CanonicalValue(compute_content_identity(
+                         root, ContentIdentitySpec{"program-revision", "manyforge.program.v2",
+                                                   "program_revision"})));
+  return canonical_json(root);
+}
+
+TEST(ProgramBindingCompilerTest,
+     InputReadOfCompiledSystemSignalBindsWithoutTargetInputCapability) {
+  ScopedTrustedRoot root;
+  const auto context = make_context(root.path(), true);
+  FilesystemCatalogArtifactStore catalog_store(root.path());
+  const std::vector<std::pair<std::string_view, GripperRead>> cases{
+      {"io.gpio.get_input", {"io.check_input", "carried_object_lost"}},
+      {"io.gpio.wait_for_input", {"io.wait_for_input", "carried_object_lost"}}};
+  for (const auto &row : cases) {
+    const std::string_view capability = row.first;
+    const auto contract = verify_program_binding_contract(
+        gripper_input_program(*context.bundle, {capability}, {row.second}),
+        *context.bundle);
+    const auto binding = compile_program_binding(
+        *contract, valid_assignment(true), *context.bundle, context.model_map, catalog_store);
+    ASSERT_NE(binding, nullptr);
+    const auto &targets = binding->value().target_role_bindings;
+    const auto gripper = std::find_if(targets.begin(), targets.end(), [](const auto &row) {
+      return row.target_role_id == TargetRoleId("gripper");
+    });
+    ASSERT_NE(gripper, targets.end());
+    ASSERT_EQ(gripper->signal_role_bindings.size(), 1U);
+    const auto &signal = gripper->signal_role_bindings.front();
+    EXPECT_EQ(signal.resource_role_id.value(), "carried_object_lost");
+    EXPECT_EQ(signal.signal_name,
+              "carried_object_lost." + std::string(kLite6GripperTargetId));
+    EXPECT_EQ(signal.direction, manyforge::core::IoSignalDirection::kInput);
+    // The system signal serves the read; no input capability is invented.
+    EXPECT_TRUE(std::none_of(
+        gripper->capability_bindings.begin(), gripper->capability_bindings.end(),
+        [&](const auto &row) { return row.capability_id.value() == capability; }));
+    EXPECT_EQ(manyforge::deployment::reload_verified_program_binding(
+                  binding->canonical_bytes(), *context.bundle, context.model_map)->value(),
+              binding->value());
+  }
+}
+
+TEST(ProgramBindingCompilerTest,
+     OrdinaryInputReadOnGripperTargetIsStillRefusedAlsoBesideTheSystemSignal) {
+  ScopedTrustedRoot root;
+  const auto context = make_context(root.path(), true);
+  FilesystemCatalogArtifactStore catalog_store(root.path());
+  // Ordinary read alone, then mixed with the system read on the same role:
+  // the exemption follows each operand, never the whole target role.
+  const std::vector<std::vector<GripperRead>> cases{
+      {{"io.check_input", "fingers"}},
+      {{"io.check_input", "carried_object_lost"}, {"io.check_input", "fingers"}}};
+  for (const auto &reads : cases) {
+    const auto contract = verify_program_binding_contract(
+        gripper_input_program(*context.bundle, {"io.gpio.get_input"}, reads),
+        *context.bundle);
+    const auto outcome = compile_program_binding_outcome(
+        *contract, valid_assignment(true), *context.bundle, context.model_map, catalog_store);
+    EXPECT_EQ(outcome.binding, nullptr);
+    ASSERT_TRUE(outcome.non_executable.has_value());
+    const auto &rows = outcome.non_executable->unresolved_roles;
+    ASSERT_EQ(rows.size(), 1U);
+    EXPECT_EQ(rows.front().target_role_id, TargetRoleId("gripper"));
+    EXPECT_EQ(rows.front().reason, ProgramBindingUnresolvedReason::kTargetIncompatible);
+    EXPECT_THROW(static_cast<void>(compile_program_binding(
+                     *contract, valid_assignment(true), *context.bundle,
+                     context.model_map, catalog_store)),
+                 ProgramBindingCompilerError);
+  }
+}
+
+TEST(ProgramBindingCompilerTest,
+     InputCapabilityWithoutItsOwnSystemSignalReadIsStillRefused) {
+  ScopedTrustedRoot root;
+  const auto context = make_context(root.path(), true);
+  FilesystemCatalogArtifactStore catalog_store(root.path());
+  // The system signal is read by Wait Input only. `io.gpio.get_input` has no
+  // read requirement of its own on the role, so the target must offer it.
+  const auto contract = verify_program_binding_contract(
+      gripper_input_program(*context.bundle,
+                            {"io.gpio.get_input", "io.gpio.wait_for_input"},
+                            {{"io.wait_for_input", "carried_object_lost"}}),
+      *context.bundle);
+  const auto outcome = compile_program_binding_outcome(
+      *contract, valid_assignment(true), *context.bundle, context.model_map, catalog_store);
+  EXPECT_EQ(outcome.binding, nullptr);
+  ASSERT_TRUE(outcome.non_executable.has_value());
+  const auto &rows = outcome.non_executable->unresolved_roles;
+  ASSERT_EQ(rows.size(), 1U);
+  EXPECT_EQ(rows.front().target_role_id, TargetRoleId("gripper"));
+  EXPECT_EQ(rows.front().reason, ProgramBindingUnresolvedReason::kCapabilityUnavailable);
 }
 
 } // namespace

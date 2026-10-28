@@ -110,6 +110,30 @@ template <typename Health>
   return &*match;
 }
 
+// Whether a Declared domain has nothing engaged, by the provider contract on
+// `LifecycleIntentPlanDTO`: its Recover plan's postcondition admits only the
+// resting states declared/disabled, includes declared, and holds on the
+// fresh observation (the Real xArm arm: hardware and controller inactive,
+// no vendor error or warning, no fault, transport ready). This relies on the
+// provider contract; a provider without such a plan gives no such assurance,
+// and its Disable fails closed as before.
+template <typename Health>
+[[nodiscard]] bool unarmed_resting_proven(const BrandLifecyclePlanCatalogDTO& catalog,
+                                          const Health& fresh_observation) {
+  return std::any_of(catalog.plans.begin(), catalog.plans.end(), [&](const auto& plan) {
+    const auto& states = plan.requested_postcondition.allowed_states;
+    return plan.intent == ComponentLifecycleIntentKindDTO::kRecover &&
+           std::find(states.begin(), states.end(), ComponentLifecycleStateDTO::kDeclared) !=
+               states.end() &&
+           std::all_of(states.begin(), states.end(), [](ComponentLifecycleStateDTO state) {
+             return state == ComponentLifecycleStateDTO::kDeclared ||
+                    state == ComponentLifecycleStateDTO::kDisabled;
+           }) &&
+           EvaluateLifecyclePredicate(plan.requested_postcondition, fresh_observation) ==
+               LifecyclePostconditionResultDTO::kSatisfied;
+  });
+}
+
 template <typename Health>
 [[nodiscard]] Result<LifecycleDomainPlanDecision> evaluate_normalized_plan(
     ComponentLifecycleIntentKindDTO intent, ComponentLifecycleStateDTO requested_state,
@@ -154,6 +178,15 @@ template <typename Health>
         "component_lifecycle_transition_inconclusive",
         "every non-selected lifecycle transition must be conclusively ineligible",
         "transition_eligibility_inconclusive", fresh_observation);
+  }
+  if (selected_transition == nullptr && intent == ComponentLifecycleIntentKindDTO::kDisable &&
+      fresh_observation.observed_state == ComponentLifecycleStateDTO::kDeclared &&
+      unarmed_resting_proven(catalog, fresh_observation)) {
+    // No Disable step applies and, relying on the provider contract, its
+    // unarmed resting predicate holds: nothing is engaged, so the domain is
+    // already at its Disabled target (CCLC records it Disabled).
+    return Result<LifecycleDomainPlanDecision>::Ok(
+        {LifecycleDomainPlanDecisionKind::kAlreadySatisfied, *selected_plan, std::nullopt});
   }
   if (selected_transition == nullptr) {
     return reject_evaluation("component_lifecycle_transition_missing",

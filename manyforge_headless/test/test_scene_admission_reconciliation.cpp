@@ -99,6 +99,22 @@ TEST(SceneAdmissionReconciliation,
 }
 
 TEST(SceneAdmissionReconciliation,
+     RequestIdConflictStaysTypedAndKeepsReconciliationRequired) {
+  SceneOwner owner;
+  owner.lookup_throws = true; // the owner refuses a lookup of another intent
+  owner.result.replay_status = core::RequestReplayStatusDTO::kRequestIdConflict;
+  owner.result.error = core::ErrorDTO{
+      "request_id_conflict", "scene request ID was reused with different intent",
+      {}};
+  std::atomic<bool> reconciled{true};
+  const auto result =
+      detail::CommitSceneWithAdmissionObservation(owner, Request(), reconciled);
+  EXPECT_EQ(result.error->code, "request_id_conflict");
+  EXPECT_FALSE(reconciled.load());
+  EXPECT_EQ(owner.lookups, 0U);
+}
+
+TEST(SceneAdmissionReconciliation,
      ClosedSceneGatesRemainUnresolvedWithoutAnOutcome) {
   for (bool leases_closed : {false, true}) {
     SceneOwner owner;

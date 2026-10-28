@@ -424,7 +424,8 @@ MakeAlarmLifecycleHistorianEvent(const AlarmLifecycleFact &fact) {
   const bool runtime_fault_raised =
       fact.event_type == "alarm_raised" &&
       (fact.definition_id == "manyforge.runtime.program_runner_loss" ||
-       fact.definition_id == "manyforge.runtime.operation_journal_write_fault");
+       fact.definition_id == "manyforge.runtime.operation_journal_write_fault" ||
+       fact.definition_id == "manyforge.runtime.kernel_internal_fault");
   return MakeHistorianEvent("manyforge.alarm", fact.event_type,
                             runtime_fault_raised ? "ERROR" : "INFO",
                             fact.occurred_at_ns, fact.occurred_at_wall,

@@ -9,11 +9,11 @@
   "members": {
     "assignment.yaml": "sha256:10e42acc3e46a6f842fc6fd5e2bb3eef41f005fb4ea03423f340ac4c2b34eee6",
     "deployment.yaml": "sha256:4c060d08a229b464956d3473859a85619ae3f450d9493276d84c2fbba172f3eb",
-    "program.yaml": "sha256:d2dd052e6ac73532455e06b91226326f46ccb6ec3869b6a0311065aa44b91322"
+    "program.yaml": "sha256:de7dd34103a027c726c84a0be2ed3643dab68df7b598c63d499592249a5b3282"
   },
   "name": "ur5_pick_and_place_minimal",
   "saved_status": {
-    "checked_content_digest": "sha256:190bc871e21f067895d16192538a51d1f4a8bc727bf4b13d438118bb276ac755",
+    "checked_content_digest": "sha256:02e679c4f7efb65866d5c4210336f0d33654266279bb7c058bbedde000cfe580",
     "last_known_status": "ready",
     "manyforge_version": "0.1.0"
   },

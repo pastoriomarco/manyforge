@@ -660,21 +660,17 @@ StopStatusStateName(const core::StopStatusStateDTO state) noexcept {
 
 [[nodiscard]] std::string_view
 StopFaultTriggerName(const core::StopFaultTriggerDTO trigger) noexcept {
-  switch (trigger) {
-  case core::StopFaultTriggerDTO::kScopePromotion:
-    return "scope_promotion";
-  case core::StopFaultTriggerDTO::kEscalated:
-    return "escalated";
-  case core::StopFaultTriggerDTO::kPartial:
-    return "partial";
-  case core::StopFaultTriggerDTO::kFailedUncontained:
-    return "failed_uncontained";
-  case core::StopFaultTriggerDTO::kPhysicalRestUnproven:
-    return "physical_rest_unproven";
-  case core::StopFaultTriggerDTO::kPersistenceDegraded:
-    return "persistence_degraded";
-  }
-  return "unknown";
+  return core::stop_fault_trigger_name(trigger);
+}
+
+[[nodiscard]] CanonicalValue
+StopFaultObservedTriggersValue(
+    const std::vector<core::StopFaultTriggerDTO> &triggers) {
+  CanonicalValue::Array names;
+  names.reserve(triggers.size());
+  for (const auto trigger : triggers)
+    names.emplace_back(std::string(StopFaultTriggerName(trigger)));
+  return CanonicalValue(std::move(names));
 }
 
 [[nodiscard]] std::string_view
@@ -897,6 +893,7 @@ StopFaultLatchValue(const core::StopFaultLatchDTO &value) {
       {"latch_generation",
        CanonicalValue(static_cast<double>(value.latch_generation.value()))},
       {"latch_id", CanonicalValue(value.latch_id.value())},
+      {"observed_triggers", StopFaultObservedTriggersValue(value.observed_triggers)},
       {"persistence_degraded", CanonicalValue(value.persistence_degraded)},
       {"reason_code", CanonicalValue(value.reason_code)},
       {"recovery_assessment_revision",
@@ -1915,6 +1912,8 @@ CellStopActionValue(const core::CellStopActionProjectionDTO &value) {
                   CanonicalValue(static_cast<double>(
                       value.fault->latch_generation.value()))},
                  {"latch_id", CanonicalValue(value.fault->latch_id.value())},
+                 {"observed_triggers",
+                  StopFaultObservedTriggersValue(value.fault->observed_triggers)},
                  {"reason_code", CanonicalValue(value.fault->reason_code)},
                  {"recovery_status",
                   CanonicalValue(std::string(StopFaultRecoveryStatusName(
@@ -2410,6 +2409,7 @@ OperationStateValue(const core::OperationStateDTO &value) {
     const core::ResourceAddressedExecutionKernel &owner) {
   const auto journal_fault = owner.get_operation_journal_write_fault();
   const auto runner_loss = owner.get_program_runner_loss();
+  const auto internal_fault = owner.get_internal_fault();
   CanonicalValue journal_value(nullptr);
   if (journal_fault) {
     const auto &fault = *journal_fault;
@@ -2437,6 +2437,18 @@ OperationStateValue(const core::OperationStateDTO &value) {
       {"operation_journal_write_fault", std::move(journal_value)},
       {"program_runner_loss", runner_loss
            ? detail::ProgramRunnerLossValue(*runner_loss, owner.request_owner_epoch())
+           : CanonicalValue(nullptr)},
+      {"kernel_internal_fault", internal_fault
+           ? CanonicalValue(CanonicalValue::Object{
+                 {"request_owner_epoch",
+                  CanonicalValue(internal_fault->request_owner_epoch.value())},
+                 {"reason_code", CanonicalValue(internal_fault->reason_code)},
+                 {"stop_accepted", CanonicalValue(internal_fault->stop_accepted)},
+                 {"stop_refusal_code", internal_fault->stop_refusal_code
+                      ? CanonicalValue(*internal_fault->stop_refusal_code)
+                      : CanonicalValue(nullptr)},
+                 {"later_count",
+                  CanonicalValue(static_cast<double>(internal_fault->later_count))}})
            : CanonicalValue(nullptr)},
   });
 }

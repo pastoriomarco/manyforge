@@ -304,6 +304,16 @@
       "acceptance_obligations": []
     },
     {
+      "runtime_restoration_profile_id": "uf850_xarm_gripper_mock_commanded_v0",
+      "model_family_id": "uf850_xarm_gripper",
+      "ros2_control_runtime": {
+        "mock_profile": "uf850_xarm_gripper"
+      },
+      "source_fields": {},
+      "stop_profiles": {},
+      "acceptance_obligations": []
+    },
+    {
       "runtime_restoration_profile_id": "ur10e_robotiq_assistant_isaac_commanded_v0",
       "model_family_id": "ur10e_robotiq_2f_140",
       "source_fields": {
@@ -1393,11 +1403,16 @@
             "poll_period_ms": 250,
             "source_coordinate_frame_id": "universe",
             "target_frame_id": "universe",
-            "relative_reference": {
-              "entity": "/World/ur10e_robotiq2f_140_ROS/ur10e_robotiq2f_140/ee_link/robotiq_arg2f_base_link",
-              "source_header_frame_id": "robotiq_arg2f_base_link",
-              "link": "robotiq_base_link"
-            }
+            "relative_references": [
+              {
+                "controllable_component_id": "isaac_ur10e_light_robot",
+                "command_target_id": "gripper",
+                "gripper_link": "robotiq_base_link",
+                "entity": "/World/ur10e_robotiq2f_140_ROS/ur10e_robotiq2f_140/ee_link/robotiq_arg2f_base_link",
+                "source_header_frame_id": "robotiq_arg2f_base_link",
+                "link": "robotiq_base_link"
+              }
+            ]
           },
           "robot_overlay": {
             "robot_component_id": "isaac_ur10e_light_robot",
@@ -1951,6 +1966,19 @@
         ]
       },
       "assistant_profile_id": "vision_bin_selection",
+      "ai_models": [
+        {
+          "component_id": "vision_model",
+          "runtime_configuration": {
+            "base_url": "http://127.0.0.1:8000/v1",
+            "model": "qwen3.6-35b-a3b-nvfp4-tq-mtp-manyforge",
+            "api_key_env": null
+          }
+        }
+      ],
+      "assistant_model_components": {
+        "vision_model": "vision_model"
+      },
       "historical_blob": "332b8b6daa93cf4b0533e93a42736fd67b8654c5",
       "model_family_id": "ur5e_robotiq_2f_85",
       "runtime_restoration_profile_id": "ur5e_robotiq_mock_commanded_v0",
@@ -1985,6 +2013,28 @@
         ]
       },
       "assistant_profile_id": "vision_pose_selection",
+      "ai_models": [
+        {
+          "component_id": "assistant_model",
+          "runtime_configuration": {
+            "base_url": "http://127.0.0.1:8200/v1",
+            "model": "cosmos-reason2-8b",
+            "api_key_env": null
+          }
+        },
+        {
+          "component_id": "vision_model",
+          "runtime_configuration": {
+            "base_url": "http://127.0.0.1:8000/v1",
+            "model": "cosmos-reason2-8b",
+            "api_key_env": null
+          }
+        }
+      ],
+      "assistant_model_components": {
+        "assistant_model": "assistant_model",
+        "vision_model": "vision_model"
+      },
       "historical_blob": "a65a0011ee0247cb3bb0281360fa4c46073bbf9d",
       "model_family_id": "ur5_roboplan",
       "runtime_restoration_profile_id": "ur5_mock_commanded_v0",

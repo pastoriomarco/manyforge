@@ -1,4 +1,4 @@
-// Copyright 2026 Flexin Group SRL
+// Copyright 2026 Marco Pastorio
 // Licensed under the Apache License, Version 2.0.
 
 #pragma once

@@ -1216,8 +1216,9 @@ struct RetainedNativeRuntimeUnitAdapter::Impl final
     if (!packet.has_value()) {
       // A late response on this untagged request/reply channel could otherwise
       // be consumed as the reply to a later command.  Once a request times
-      // out, the stream is no longer usable: stop this exact child and let
-      // normal convergence create a fresh epoch.
+      // out, the stream is no longer usable: stop this exact child.  Periodic
+      // convergence only observes the lost unit; only the Manager daemon
+      // bootstrap (a workbench restart) creates a fresh epoch.
       child.channel.Reset();
       StopChildNoThrow(child);
       Fail("native projection " +
@@ -1603,14 +1604,12 @@ struct RetainedNativeRuntimeUnitAdapter::Impl final
         detail::EncodeSelectedRuntimeCompositionRpcRequest(effective_request);
     // On first convergence the child may be completing the bounded retained
     // CCLC recovery before it can service the ordinary command channel.  This
-    // is cold composition work, not a steady-state status exchange.
-    SendPacket(found->second.channel.get(), encoded,
-               std::chrono::duration_cast<std::chrono::milliseconds>(
-                   kProjectionPreparationTimeout));
-    const auto packet =
-        ReceivePacket(found->second.channel.get(),
-                      std::chrono::duration_cast<std::chrono::milliseconds>(
-                          kProjectionPreparationTimeout));
+    // is cold composition work, not a steady-state status exchange: the child
+    // installs every added or replaced component inside this one exchange, so
+    // the budget grows with their number.
+    const auto timeout = detail::SelectedRuntimeCompositionTimeout(request.component_delta);
+    SendPacket(found->second.channel.get(), encoded, timeout);
+    const auto packet = ReceivePacket(found->second.channel.get(), timeout);
     if (!packet.has_value()) {
       found->second.channel.Reset();
       StopChildNoThrow(found->second);

@@ -22,13 +22,6 @@ _UNAVAILABLE_MESSAGE = (
     "Headless, Program runner, and Composer entrypoints for maintained "
     "ManyForge-only runtime functions."
 )
-_LAUNCH_UNAVAILABLE_MESSAGE = (
-    "composable_cell_runtime_unavailable: this legacy aggregate launcher is not "
-    "a current product entrypoint; maintained ManyForge-only runtime functions "
-    "use the Component Manager, Headless, Program runner, and Composer "
-    "entrypoints, while unified Isaac, real-robot, and owner-issued cleanup "
-    "orchestration remain at their later gates."
-)
 _BENCHMARK_UNAVAILABLE_MESSAGE = (
     "composable_cell_runtime_unavailable: the addressed native benchmark "
     "requires the build-qualified N7 process fixture; run its RoboPlan process "
@@ -522,76 +515,6 @@ def test_current_build_lanes_use_fresh_container_local_products() -> None:
     assert 'cache_volume="manyforge-local-ci-build-' not in local_ci
 
 
-def test_product_launcher_gates_operational_verbs_before_external_effect(
-    tmp_path: Path,
-) -> None:
-    launcher = _REPO_ROOT / "scripts" / "launch.sh"
-    source = launcher.read_text(encoding="utf-8")
-
-    assert "manyforge_roboplan/python" not in source
-    assert "stop_assistant_stack" not in source
-    assert "pkill" not in source
-    assert "scripts/lib/assistant.sh" not in source
-
-    marker = tmp_path / "external-effect"
-    fake_bin = tmp_path / "bin"
-    fake_bin.mkdir()
-    for command in (
-        "docker",
-        "curl",
-        "ros2",
-        "dirname",
-        "realpath",
-        "stat",
-        "id",
-        "kill",
-        "sleep",
-        "python3",
-    ):
-        stub = fake_bin / command
-        stub.write_text(
-            f"#!/bin/sh\nprintf '%s\\n' called >> {str(marker)!r}\n",
-            encoding="utf-8",
-        )
-        stub.chmod(0o755)
-
-    invocations = (
-        ("start",),
-        ("status",),
-        ("restart",),
-        ("smoke",),
-        ("preflight",),
-        ("stop",),
-        ("--help",),
-        ("start", "--lane", "not-a-lane"),
-        ("stop", "--help"),
-    )
-    for invocation in invocations:
-        completed = subprocess.run(
-            ["bash", str(launcher), *invocation],
-            cwd=_REPO_ROOT,
-            env={**os.environ, "PATH": f"{fake_bin}:{os.environ['PATH']}"},
-            capture_output=True,
-            text=True,
-            check=False,
-        )
-        assert completed.returncode == 78, invocation
-        assert completed.stderr.strip() == _LAUNCH_UNAVAILABLE_MESSAGE
-        assert not marker.exists(), invocation
-
-
-def test_product_launcher_maps_removed_cleanup_without_dormant_effects() -> None:
-    launcher = _REPO_ROOT / "scripts" / "launch.sh"
-    source = launcher.read_text(encoding="utf-8")
-
-    assert "f11f1344ae2fc8b8d3875318f8d60aef7a1b6766" in source
-    assert "owner-issued process/container identities at I4/I5/I9/I10" in source
-    assert "verb_stop" not in source
-    assert "docker " not in source
-    assert "kill " not in source
-    assert "rm " not in source
-
-
 def test_hermes_gateway_matrix_cannot_activate_the_deleted_bridge() -> None:
     matrix_path = _REPO_ROOT / "scripts" / "hermes" / "managed-tool-gateway-matrix.json"
     payload = json.loads(matrix_path.read_text(encoding="utf-8"))
@@ -604,68 +527,6 @@ def test_hermes_gateway_matrix_cannot_activate_the_deleted_bridge() -> None:
     )
     assert "mcp_servers" not in source
     assert "host.openshell.internal" not in source
-
-
-@pytest.mark.parametrize(
-    ("relative", "historical_blob", "entrypoint", "forbidden"),
-    (
-        (
-            "scripts/lib/composer.sh",
-            "40cb4124eee7d998ad18e820b4a369208a52a411",
-            "load_program",
-            ("curl", "/api/"),
-        ),
-        (
-            "scripts/lib/compose.sh",
-            "4d7e0ecc6a1be6aabd123417e03141f52da6755a",
-            "start_composer_dev_container",
-            ("docker run", "python -m manyforge_composer"),
-        ),
-        (
-            "scripts/lib/isaac.sh",
-            "cfe20a23a5a26d13f09cff879c11bb0ffc718c65",
-            "start_isaac_services",
-            ("ros2 ", "docker "),
-        ),
-        (
-            "scripts/lib/real_robot.sh",
-            "62da0b3f83d60750195e7d2154732a46f34262f2",
-            "start_real_robot_lane",
-            ("docker ", "/api/runtime"),
-        ),
-    ),
-)
-def test_launcher_libraries_have_no_dormant_runtime_body(
-    relative: str,
-    historical_blob: str,
-    entrypoint: str,
-    forbidden: tuple[str, ...],
-    tmp_path: Path,
-) -> None:
-    path = _REPO_ROOT / relative
-    source = path.read_text(encoding="utf-8")
-    marker = tmp_path / "external-effect"
-    completed = subprocess.run(
-        [
-            "bash",
-            "-c",
-            (
-                f"docker() {{ printf 'called\\n' >> {str(marker)!r}; }}\n"
-                f"source {str(path)!r}\n"
-                f"{entrypoint}\n"
-            ),
-        ],
-        cwd=_REPO_ROOT,
-        capture_output=True,
-        text=True,
-        check=False,
-    )
-
-    assert historical_blob in source
-    assert not any(token in source for token in forbidden)
-    assert completed.returncode == 78
-    assert "composable_cell_runtime_unavailable" in completed.stderr
-    assert not marker.exists()
 
 
 @pytest.mark.parametrize(

@@ -137,6 +137,15 @@ public:
     }
     if (const auto *detach =
             std::get_if<core::DetachCarriedObjectRequestDTO>(&request.operation)) {
+      if (detach_refusals > 0U) {
+        --detach_refusals;
+        return {request.request_context.request_id,
+                core::RequestReplayStatusDTO::kAcceptedNew, false,
+                core::ErrorDTO{"scene_object_state_conflict", "refused", {}},
+                std::nullopt, std::nullopt,
+                core::SceneProjectionCommitStatusDTO::kRejectedRollbackProven,
+                std::nullopt};
+      }
       // Detach at the given cell pose.
       detached_at = detach->pose;
       state.attached = false;
@@ -211,6 +220,7 @@ public:
   std::string owner_epoch{"scene-owner.1"};
   std::size_t compaction_refusals{};
   bool compaction_proof{true};
+  std::size_t detach_refusals{};
 };
 
 PoseSourceObservation Newer(PoseSourceObservation observation,
@@ -557,12 +567,16 @@ CanonicalValue ReferencedPayload(const bool coherent = true,
                                  const double reference_yaw = 0.0) {
   return WithMember(
       WithMember(PosePayload(), "kind",
-                 CanonicalValue("simulation_entity_pose_with_reference.v1")),
-      "reference",
-      CanonicalValue(CanonicalValue::Object{
+                 CanonicalValue("simulation_entity_pose_with_references.v1")),
+      "references",
+      CanonicalValue(CanonicalValue::Array{CanonicalValue(CanonicalValue::Object{
+          {"controllable_component_id", CanonicalValue("robot")},
+          {"command_target_id", CanonicalValue("arm")},
+          {"gripper_link", CanonicalValue("gripper_base")},
           {"coherent", CanonicalValue(coherent)},
           {"entity", CanonicalValue("/gripper")},
           {"link", CanonicalValue("gripper_base")},
+          {"source_header_frame_id", CanonicalValue("gripper_base")},
           {"pose_in_reference",
            relative
                ? CanonicalValue(CanonicalValue::Object{
@@ -577,7 +591,7 @@ CanonicalValue ReferencedPayload(const bool coherent = true,
                                         CanonicalValue(0.25)})},
                  })
                : CanonicalValue(nullptr)},
-      }));
+      })}));
 }
 
 const core::ComponentSceneFrameRefDTO kCarrier{
@@ -616,8 +630,10 @@ SceneRuntimeReferenceLinkResolver TcpAboveReference(std::size_t &calls) {
     ++calls;
     EXPECT_EQ(carrier, kCarrier);
     EXPECT_EQ(reference_link, "gripper_base");
-    return core::Result<core::Pose3DTO>::Ok(
-        core::Pose3DTO{{0.0, 0.0, 0.2}, {0.0, 0.0, 0.0, 1.0}});
+    return core::Result<SceneRuntimeReferenceLinkResolution>::Ok(
+        SceneRuntimeReferenceLinkResolution{
+            core::Pose3DTO{{0.0, 0.0, 0.2}, {0.0, 0.0, 0.0, 1.0}},
+            "gripper_tcp_link"});
   };
 }
 
@@ -644,6 +660,58 @@ TEST(SceneRuntimePoseProjector,
   EXPECT_NEAR(update.pose.position_m.y_m, 0.0, 1e-12);
   EXPECT_NEAR(update.pose.position_m.z_m, 0.05, 1e-12);
   EXPECT_TRUE(update.provider_evidence.has_value());
+  ASSERT_TRUE(result.value().pose_measurement.has_value());
+  const auto &measurement = *result.value().pose_measurement;
+  ASSERT_TRUE(measurement.holder.has_value());
+  EXPECT_EQ(measurement.holder->controllable_component_id.value(), "robot");
+  EXPECT_EQ(measurement.holder->command_target_id.value(), "arm");
+  EXPECT_EQ(measurement.holder->gripper_link, "gripper_base");
+  EXPECT_EQ(std::get<SceneRuntimeMeasuredBody>(measurement.measured_against),
+            (SceneRuntimeMeasuredBody{"/gripper", "gripper_base"}));
+  EXPECT_EQ(measurement.source_header_frame_id, "gripper_base");
+  EXPECT_FALSE(measurement.baseline_offset.has_value());
+  EXPECT_FALSE(measurement.drift.has_value());
+}
+
+TEST(SceneRuntimePoseProjector, RelativePolicySelectsExactHolderTarget) {
+  const core::CellId cell_id("cell.1");
+  const auto matching = ReferencedPayload();
+  const auto other = ReferencedPayload(true, true, 0.9);
+  const auto other_target = WithMember(
+      other.find_object_member("references")->as_array().front(),
+      "command_target_id", CanonicalValue("other_gripper"));
+  const auto matching_target =
+      matching.find_object_member("references")->as_array().front();
+  const auto apply = [&](const CanonicalValue &payload) {
+    FakeSceneAuthority scene;
+    AttachInSnapshot(scene);
+    std::size_t calls = 0U;
+    SceneRuntimePoseProjector projector(scene, cell_id, TcpAboveReference(calls));
+    const auto result = projector.Apply(
+        std::vector{Provider(cell_id)}, scene.projection.retained_bundle_id,
+        scene.projection.graph_revision, Observation(payload), std::nullopt,
+        "continuous_relative_to_attached");
+    return std::pair{result, scene.last_request};
+  };
+
+  const auto selected = apply(WithMember(
+      matching, "references",
+      CanonicalValue(CanonicalValue::Array{other_target, matching_target})));
+  ASSERT_TRUE(selected.first.ok()) << selected.first.error().message;
+  ASSERT_TRUE(selected.second.has_value());
+  EXPECT_NEAR(std::get<core::UpdateObjectPoseRequestDTO>(selected.second->operation)
+                  .pose.position_m.x_m,
+              0.02, 1e-12);
+
+  const auto missing = apply(WithMember(
+      matching, "references", CanonicalValue(CanonicalValue::Array{other_target})));
+  ASSERT_FALSE(missing.first.ok());
+  EXPECT_EQ(missing.first.error().code, "scene_runtime_pose_reference_missing");
+  const auto duplicate = apply(WithMember(
+      matching, "references",
+      CanonicalValue(CanonicalValue::Array{matching_target, matching_target})));
+  ASSERT_FALSE(duplicate.first.ok());
+  EXPECT_EQ(duplicate.first.error().code, "scene_runtime_pose_payload_invalid");
 }
 
 TEST(SceneRuntimePoseProjector,
@@ -720,7 +788,7 @@ TEST(SceneRuntimePoseProjector,
       scene, cell_id,
       [](const core::RetainedBundleId &, const core::ComponentSceneFrameRefDTO &,
          const std::string &) {
-        return core::Result<core::Pose3DTO>::Err(core::ErrorDTO{
+        return core::Result<SceneRuntimeReferenceLinkResolution>::Err(core::ErrorDTO{
             "scene_runtime_pose_reference_not_fixed", "finger joint", {}});
       });
   const auto unresolved = projector.Apply(
@@ -864,7 +932,8 @@ void ExpectLostStoppedThenDetached(
   ASSERT_FALSE(result.ok());
   EXPECT_EQ(result.error().code, "carried_object_lost");
   EXPECT_EQ(result.error().details.at("stop"), "requested");
-  EXPECT_EQ(result.error().details.at("detach"), "committed");
+  EXPECT_EQ(result.error().details.at("detach"), "true");
+  EXPECT_EQ(result.error().details.at("detach_result"), "committed");
   EXPECT_NE(result.error().message.find("box moved "), std::string::npos);
   EXPECT_NE(result.error().message.find("it was detached and the motion stopped"),
             std::string::npos);
@@ -973,6 +1042,43 @@ TEST(SceneRuntimePoseProjector, LostSampleReappliedForPlanningRetainsEvidence) {
   EXPECT_EQ(scene.commit_count, 2U);
 }
 
+TEST(SceneRuntimePoseProjector, FailedDetachKeepsLossBaselineOnReplay) {
+  const core::CellId cell_id("cell.1");
+  FakeSceneAuthority scene;
+  const auto attach_offset = YawPose(0.02, 0.0);
+  AttachInSnapshot(scene, attach_offset, GraspCheck());
+  std::size_t calls = 0U;
+  StopRecorder stops;
+  SceneRuntimePoseProjector projector(scene, cell_id, TcpAboveReference(calls),
+                                      stops.Requester(scene));
+  const auto apply = [&](const PoseSourceObservation &observation) {
+    return projector.Apply(
+        std::vector{Provider(cell_id)}, scene.projection.retained_bundle_id,
+        scene.projection.graph_revision, observation, std::nullopt,
+        "continuous_relative_to_attached");
+  };
+  ASSERT_TRUE(apply(Newer(Observation(ReferencedPayload(true, true, 0.02)), 2U)).ok());
+  AttachInSnapshot(scene, attach_offset, GraspCheck());
+  scene.failure = core::ErrorDTO{"detach_refused", "detach refused", {}};
+  const auto lost_sample =
+      Newer(Observation(ReferencedPayload(true, true, 0.08)), 3U);
+  const auto first = apply(lost_sample);
+  ASSERT_FALSE(first.ok());
+  EXPECT_EQ(first.error().code, "carried_object_lost");
+  EXPECT_EQ(first.error().details.at("detach"), "true");
+  EXPECT_EQ(first.error().details.at("detach_result"), "detach_refused");
+  EXPECT_TRUE(scene.state.attached);
+
+  // Retrying the same out-of-bounds observation must not re-baseline it.
+  const auto replay = apply(lost_sample);
+  ASSERT_FALSE(replay.ok());
+  EXPECT_EQ(replay.error().code, "carried_object_lost");
+  EXPECT_EQ(replay.error().details.at("detach"), "true");
+  EXPECT_EQ(replay.error().details.at("detach_result"), "detach_refused");
+  EXPECT_TRUE(scene.state.attached);
+  EXPECT_EQ(stops.requests.size(), 2U);
+}
+
 TEST(SceneRuntimePoseProjector, ContinuousGraspLostComparesWithTheFirstMeasuredOffset) {
   // The carrier sits at (0.25, -0.5, 0.75); the attachment's stored offset is
   // identity, but the first sample measures (0.05, 0, 0): that is the
@@ -1020,6 +1126,220 @@ TEST(SceneRuntimePoseProjector, CarriedObjectLostTextComesFromItsErrorRow) {
   EXPECT_EQ(core::CarriedObjectLostFullText("box", 0.052, 0.0523599, 0.03, 0.26),
             "box moved 52.0 mm / 3.0° from its grasp pose (bound 30.0 mm / "
             "14.9°); it was detached and the motion stopped.");
+  EXPECT_EQ(
+      core::CarriedObjectLostFullText("box", 0.052, 0.0523599, 0.03, 0.26, false),
+      "box moved 52.0 mm / 3.0° from its grasp pose (bound 30.0 mm / "
+      "14.9°); it was detached.");
+  EXPECT_EQ(core::CarriedObjectLostFullText("box", 0.052, 0.0523599, 0.03, 0.26,
+                                            true, false),
+            "box moved 52.0 mm / 3.0° from its grasp pose (bound 30.0 mm / "
+            "14.9°); the motion stopped.");
+  EXPECT_EQ(core::CarriedObjectLostFullText("box", 0.052, 0.0523599, 0.03, 0.26,
+                                            false, false),
+            "box moved 52.0 mm / 3.0° from its grasp pose (bound 30.0 mm / "
+            "14.9°).");
+}
+
+// Records each signal publication.
+struct SignalRecorder final {
+  std::vector<SceneRuntimeCarriedObjectLoss> published;
+  SceneRuntimeCarriedObjectLostSignalPublisher Publisher() {
+    return [this](const SceneRuntimeCarriedObjectLoss &loss) {
+      published.push_back(loss);
+      return std::optional<core::ErrorDTO>{};
+    };
+  }
+};
+
+TEST(SceneRuntimePoseProjector, OnGraspLostFlagsDriveSignalStopDetachAndAlarm) {
+  // Every combination the attach node allows (an alarm forces the Stop): the
+  // signal is always published; Stop and detach follow their flags; the
+  // alarm selector and the key travel in the details.
+  const std::vector<core::GraspLostResponseDTO> responses{
+      {true, true, std::nullopt, true},    {true, true, std::nullopt, false},
+      {false, true, std::nullopt, true},   {false, true, "part_lost", false},
+      {false, false, "part_lost", true},   {false, false, std::nullopt, false}};
+  for (const auto &response : responses) {
+    const core::CellId cell_id("cell.1");
+    FakeSceneAuthority scene;
+    scene.pose = core::Pose3DTO{{0.25, -0.5, 0.75}, {}};
+    auto check = GraspCheck();
+    if (!response.is_default())
+      check.on_grasp_lost = response;
+    AttachInSnapshot(scene, {}, check);
+    StopRecorder stops;
+    SignalRecorder signals;
+    SceneRuntimePoseProjector projector(scene, cell_id, {},
+                                        stops.Requester(scene),
+                                        signals.Publisher());
+    const auto apply = [&](const std::uint64_t sequence, const double x) {
+      return projector.Apply(
+          std::vector{Provider(cell_id)}, scene.projection.retained_bundle_id,
+          scene.projection.graph_revision,
+          Newer(Observation(PosePayload(x)), sequence), std::nullopt,
+          "continuous");
+    };
+    const auto first = apply(2U, 0.30);
+    ASSERT_TRUE(first.ok()) << first.error().message;
+    AttachInSnapshot(scene, core::Pose3DTO{{0.05, 0.0, 0.0}, {}}, check);
+    const auto lost = apply(3U, 0.40);
+    ASSERT_FALSE(lost.ok());
+    const auto &details = lost.error().details;
+    EXPECT_EQ(lost.error().code, "carried_object_lost");
+    ASSERT_EQ(signals.published.size(), 1U);
+    EXPECT_EQ(signals.published.front().command_target_id,
+              core::CommandTargetId("arm"));
+    EXPECT_EQ(signals.published.front().carried_object_attachment_id,
+              core::CarriedObjectAttachmentId("attachment.1"));
+    EXPECT_EQ(details.at("signal"), "published");
+    // Contract §10: the loss event id and the stored key reach the host row.
+    EXPECT_EQ(signals.published.front().loss_event_id, details.at("event_id"));
+    EXPECT_EQ(signals.published.front().set_key, response.set_key);
+    EXPECT_EQ(details.at("command_target_id"), "arm");
+    EXPECT_EQ(details.at("raise_alarm"), response.raise_alarm ? "true" : "false");
+    EXPECT_EQ(details.at("stop_motion"), response.stop_motion ? "true" : "false");
+    EXPECT_EQ(details.at("detach"), response.detach ? "true" : "false");
+    EXPECT_EQ(details.contains("set_key"), response.set_key.has_value());
+    EXPECT_EQ(stops.requests.size(), response.stop_motion ? 1U : 0U);
+    EXPECT_EQ(details.contains("stop"), response.stop_motion);
+    EXPECT_EQ(scene.detached_at.has_value(), response.detach);
+    EXPECT_EQ(details.contains("detach_result"), response.detach);
+    EXPECT_EQ(lost.error().message.find("the motion stopped") != std::string::npos,
+              response.stop_motion);
+    EXPECT_EQ(lost.error().message.find("it was detached") != std::string::npos,
+              response.detach);
+    if (!response.detach) {
+      // Kept attached: the loss fires once for this attachment.
+      AttachInSnapshot(scene, core::Pose3DTO{{0.05, 0.0, 0.0}, {}}, check);
+      const auto again = apply(4U, 0.45);
+      ASSERT_TRUE(again.ok()) << again.error().message;
+      EXPECT_EQ(signals.published.size(), 1U);
+      EXPECT_EQ(stops.requests.size(), response.stop_motion ? 1U : 0U);
+    }
+  }
+}
+
+TEST(SceneRuntimePoseProjector, FailedSignalPublicationFailsClosedOncePerLoss) {
+  // SX-204: a loss whose `true` cannot be published (Manager transport, or
+  // the host refusing it) is a component fault: alarm and Stop whatever
+  // `on_grasp_lost` says, the typed error in the details; like any loss it
+  // fires once (no retry), and the detach still follows its flag.
+  for (const std::string code :
+       {"carried_object_lost_signal_unavailable", "io_signal_service_unavailable"}) {
+    for (const bool detach : {false, true}) {
+      const core::CellId cell_id("cell.1");
+      FakeSceneAuthority scene;
+      scene.pose = core::Pose3DTO{{0.25, -0.5, 0.75}, {}};
+      auto check = GraspCheck();
+      check.on_grasp_lost = core::GraspLostResponseDTO{false, false, std::nullopt, detach};
+      AttachInSnapshot(scene, {}, check);
+      StopRecorder stops;
+      std::size_t publications = 0U;
+      SceneRuntimePoseProjector projector(
+          scene, cell_id, {}, stops.Requester(scene),
+          [&](const SceneRuntimeCarriedObjectLoss &) {
+            ++publications;
+            return std::optional(core::ErrorDTO{code, "refused", {}});
+          });
+      const auto apply = [&](const std::uint64_t sequence, const double x) {
+        return projector.Apply(
+            std::vector{Provider(cell_id)}, scene.projection.retained_bundle_id,
+            scene.projection.graph_revision,
+            Newer(Observation(PosePayload(x)), sequence), std::nullopt,
+            "continuous");
+      };
+      ASSERT_TRUE(apply(2U, 0.30).ok());
+      AttachInSnapshot(scene, core::Pose3DTO{{0.05, 0.0, 0.0}, {}}, check);
+      const auto lost = apply(3U, 0.40);
+      ASSERT_FALSE(lost.ok());
+      const auto &details = lost.error().details;
+      EXPECT_EQ(details.at("signal"), code);
+      EXPECT_EQ(details.at("signal_error"), code);
+      EXPECT_EQ(details.at("raise_alarm"), "true");
+      EXPECT_EQ(details.at("stop_motion"), "true");
+      EXPECT_EQ(stops.requests.size(), 1U);
+      EXPECT_EQ(scene.detached_at.has_value(), detach);
+      if (!detach) {
+        // Kept attached: the next sample raises nothing again.
+        AttachInSnapshot(scene, core::Pose3DTO{{0.05, 0.0, 0.0}, {}}, check);
+        const auto again = apply(4U, 0.45);
+        ASSERT_TRUE(again.ok()) << again.error().message;
+        EXPECT_EQ(publications, 1U);
+        EXPECT_EQ(stops.requests.size(), 1U);
+      }
+    }
+  }
+}
+
+TEST(SceneRuntimePoseProjector, TargetWithoutSignalFollowsItsFlags) {
+  // A grasp check on a target without the system signal (not a gripper
+  // target: the host answers `io_signal_unbound`) is not a failure: the
+  // configured flags apply as before.
+  const core::CellId cell_id("cell.1");
+  FakeSceneAuthority scene;
+  scene.pose = core::Pose3DTO{{0.25, -0.5, 0.75}, {}};
+  auto check = GraspCheck();
+  check.on_grasp_lost = core::GraspLostResponseDTO{false, false, std::nullopt, false};
+  AttachInSnapshot(scene, {}, check);
+  StopRecorder stops;
+  SceneRuntimePoseProjector projector(
+      scene, cell_id, {}, stops.Requester(scene),
+      [](const SceneRuntimeCarriedObjectLoss &) {
+        return std::optional(core::ErrorDTO{"io_signal_unbound", "no signal", {}});
+      });
+  const auto apply = [&](const std::uint64_t sequence, const double x) {
+    return projector.Apply(
+        std::vector{Provider(cell_id)}, scene.projection.retained_bundle_id,
+        scene.projection.graph_revision,
+        Newer(Observation(PosePayload(x)), sequence), std::nullopt, "continuous");
+  };
+  ASSERT_TRUE(apply(2U, 0.30).ok());
+  AttachInSnapshot(scene, core::Pose3DTO{{0.05, 0.0, 0.0}, {}}, check);
+  const auto lost = apply(3U, 0.40);
+  ASSERT_FALSE(lost.ok());
+  const auto &details = lost.error().details;
+  EXPECT_EQ(details.at("signal"), "not_applicable");
+  EXPECT_FALSE(details.contains("signal_error"));
+  EXPECT_EQ(details.at("raise_alarm"), "false");
+  EXPECT_EQ(details.at("stop_motion"), "false");
+  EXPECT_TRUE(stops.requests.empty());
+  EXPECT_FALSE(scene.detached_at.has_value());
+}
+
+TEST(SceneRuntimePoseProjector, RefusedDetachKeepsTheGraspBaseline) {
+  // DX-2562: a refused detach leaves the attachment and its baseline, so the
+  // next sample detects the loss again and retries the detach.
+  const core::CellId cell_id("cell.1");
+  FakeSceneAuthority scene;
+  scene.pose = core::Pose3DTO{{0.25, -0.5, 0.75}, {}};
+  AttachInSnapshot(scene, {}, GraspCheck());
+  StopRecorder stops;
+  SignalRecorder signals;
+  SceneRuntimePoseProjector projector(scene, cell_id, {}, stops.Requester(scene),
+                                      signals.Publisher());
+  const auto apply = [&](const std::uint64_t sequence, const double x) {
+    return projector.Apply(
+        std::vector{Provider(cell_id)}, scene.projection.retained_bundle_id,
+        scene.projection.graph_revision,
+        Newer(Observation(PosePayload(x)), sequence), std::nullopt, "continuous");
+  };
+  ASSERT_TRUE(apply(2U, 0.30).ok());
+  AttachInSnapshot(scene, core::Pose3DTO{{0.05, 0.0, 0.0}, {}}, GraspCheck());
+  scene.detach_refusals = 1U;
+  const auto refused = apply(3U, 0.40);
+  ASSERT_FALSE(refused.ok());
+  EXPECT_EQ(refused.error().details.at("detach_result"),
+            "scene_object_state_conflict");
+  EXPECT_FALSE(scene.detached_at.has_value());
+  // Still attached, same baseline: the next sample is lost again (not a new
+  // baseline) and this time the detach commits.
+  AttachInSnapshot(scene, core::Pose3DTO{{0.05, 0.0, 0.0}, {}}, GraspCheck());
+  const auto retried = apply(4U, 0.41);
+  ASSERT_FALSE(retried.ok());
+  EXPECT_EQ(retried.error().code, "carried_object_lost");
+  EXPECT_EQ(retried.error().details.at("detach_result"), "committed");
+  ASSERT_TRUE(scene.detached_at.has_value());
+  EXPECT_EQ(signals.published.size(), 2U);
 }
 
 TEST(SceneRuntimePoseProjector, GraspLostCheckOnlyForMeasuredOffsetPolicies) {

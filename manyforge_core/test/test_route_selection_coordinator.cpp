@@ -60,6 +60,9 @@ class WaitableManualScheduler final : public IScheduler {
   }
 
   void cancel(ScheduleHandle handle) override { scheduler_.cancel(handle); }
+  bool cancel_before_dequeue(ScheduleHandle handle) override {
+    return scheduler_.cancel_before_dequeue(handle);
+  }
 
   void drain(SchedulerPriority priority) override { scheduler_.drain(priority); }
 

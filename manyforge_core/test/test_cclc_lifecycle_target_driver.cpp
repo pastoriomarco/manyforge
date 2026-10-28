@@ -1,5 +1,7 @@
 #include <gtest/gtest.h>
 
+#include <algorithm>
+
 #include <atomic>
 #include <condition_variable>
 #include <functional>
@@ -420,13 +422,20 @@ class FakePorts final : public ICCLCLifecycleTargetDriverPorts {
       current.provider_occurrences.push_back(Occurrence());
       current.provider_occurrences.back().control_domain_id = kOtherDomain;
     }
+    if (catalog_override) {
+      for (auto& occurrence : current.provider_occurrences)
+        occurrence.lifecycle_plan_catalog_digest = catalog_override->catalog_digest;
+    }
     return Result<ComponentLifecycleCurrentSnapshotDTO>::Ok(std::move(current));
   }
 
   Result<BrandLifecyclePlanCatalogDTO> LoadLifecyclePlanCatalog(
       const ResolvedLifecycleProviderOccurrenceDTO&) override {
-    return Result<BrandLifecyclePlanCatalogDTO>::Ok(catalog_);
+    return Result<BrandLifecyclePlanCatalogDTO>::Ok(catalog_override.value_or(catalog_));
   }
+  /// A catalog the occurrences are bound to exactly (Recover target selection
+  /// checks the occurrence's catalog digest).
+  std::optional<BrandLifecyclePlanCatalogDTO> catalog_override;
 
   Result<BrandLifecycleObservationDTO> Observe(
       const ResolvedLifecycleProviderOccurrenceDTO&,
@@ -450,6 +459,9 @@ class FakePorts final : public ICCLCLifecycleTargetDriverPorts {
                         std::string(to_string(*domain_cause))}});
     }
     facts.insert(facts.end(), vendor_facts.begin(), vendor_facts.end());
+    std::sort(facts.begin(), facts.end(), [](const auto& left, const auto& right) {
+      return left.lifecycle_fact_id < right.lifecycle_fact_id;
+    });
     const auto now = clock_.now();
     return Result<BrandLifecycleObservationDTO>::Ok(
         {query.lifecycle_transaction_id, query.lifecycle_transaction_generation,
@@ -459,7 +471,9 @@ class FakePorts final : public ICCLCLifecycleTargetDriverPorts {
          observation_epoch.value_or(query.provider_runtime_epoch), observation_generation,
          observation_generation, now - (stale_observation ? kSecond : 0),
          now - (stale_observation ? kSecond : 0),
-         now + (stale_observation ? 0 : kSecond), observed, std::move(facts), diagnostic,
+         now + (stale_observation ? 0 : kSecond),
+         other_observed && query.control_domain_id == kOtherDomain ? *other_observed : observed,
+         std::move(facts), diagnostic,
          diagnostic_snapshot});
   }
 
@@ -613,6 +627,8 @@ class FakePorts final : public ICCLCLifecycleTargetDriverPorts {
   // A second domain of the same component, with its own reported cause.
   bool other_domain{};
   std::optional<LifecycleBlockingCauseClassDTO> other_cause;
+  /// The other domain's observed state when it differs (mixed outcomes).
+  std::optional<ComponentLifecycleStateDTO> other_observed;
   std::uint64_t observation_generation{1U};
   std::optional<RuntimeEpoch> observation_epoch;
   bool stale_observation{};
@@ -758,6 +774,100 @@ TestLaunchDiagnosticSnapshot() {
   return std::make_shared<
       const content_identity::CanonicalValue>(content_identity::parse_canonical_json(
       R"snapshot({"context":{"controllable_component_id":"component.arm","generator_identity":null,"graph_revision":"graph.1","launch_identity":"sha256:0000000000000000000000000000000000000000000000000000000000000000","request_context":"Apply=apply.7","retained_bundle_id":"bundle.1","runtime_epoch":"epoch.1","runtime_unit_id":"robot_cell.ros2_control_execution"},"core_dump_link":null,"exit":{"core_dumped":false,"observed_utc":"2026-10-11T18:00:00Z","signal":11,"status":null},"generated":{"controllers_sha256":"sha256:2222222222222222222222222222222222222222222222222222222222222222","robot_description_sha256":"sha256:1111111111111111111111111111111111111111111111111111111111111111"},"launch_readiness":{"arm_controller_active":null,"binding_epoch":null,"captured_utc":null,"controller_bound":null,"controller_loaded":null,"controller_manager_present":null,"controller_observed":null,"hardware_ready":null,"joint_sample_available":null,"known":null,"sample_age_ns":null},"output":{"dropped_forward_bytes":0,"dropped_forward_lines":0,"invalid_text_bytes":0,"line_count":1,"tail":"controller crashed\n","truncated":false},"settings":{"argv":["ros2","launch"],"arm_controller_name":"arm","controller_profile":"ur5","controllers_yaml":"arm: effective settings","frame_prefix":"","gripper_controller_name":null,"retained_configuration_json":"{}","runtime_namespace":"/robot"}})snapshot"));
+}
+
+/// The fake plans with an unarmed resting Recover postcondition in the shape
+/// of the Real xArm arm's (declared or disabled; controller and hardware
+/// inactive, no fault, transport ready), so it honours the provider contract.
+[[nodiscard]] BrandLifecyclePlanCatalogDTO UnarmedRestingCatalog() {
+  auto plans = ObservedControllerPlans();
+  plans.back().requested_postcondition = LifecyclePredicateDTO{
+      {ComponentLifecycleStateDTO::kDeclared, ComponentLifecycleStateDTO::kDisabled},
+      {{LifecycleFactId("external.controller_active"), Boolean(false)},
+       {LifecycleFactId("external.fault_present"), Boolean(false)},
+       {LifecycleFactId("external.hardware_active"), Boolean(false)},
+       {LifecycleFactId("external.transport_ready"), Boolean(true)}}};
+  return MakeBrandLifecyclePlanCatalog(ProviderManifestId("manifest.arm"),
+                                       ProviderManifestRevision(Sha('f')), std::move(plans))
+      .value();
+}
+
+/// Controller and hardware inactive, as the unarmed resting predicate needs.
+[[nodiscard]] std::vector<LifecycleFactDTO> UnarmedFacts() {
+  return {{LifecycleFactId("external.controller_active"), Boolean(false)},
+          {LifecycleFactId("external.hardware_active"), Boolean(false)}};
+}
+
+// Real xArm: a controller error left at startup, then the operator's Recover
+// while the target is Disabled. The arm was never armed, so the Recover
+// leaves it Declared. That meets the Disabled target: no Disable is submitted
+// (no Disable plan starts from Declared) and nothing is reported as an error.
+TEST_F(LifecycleTargetDriverTest, DeclaredComponentMeetsADisabledTargetWithoutDisable) {
+  ports_.catalog_override = UnarmedRestingCatalog();
+  ports_.vendor_facts = UnarmedFacts();
+  Target(LifecycleTargetStateDTO::kDisabled, LifecycleTargetOriginDTO::kOperator);
+  ports_.achieved = ComponentLifecycleStateDTO::kDeclared;
+  ports_.observed = ComponentLifecycleStateDTO::kDeclared;
+  ports_.ready = false;
+  Driver().RunOnce();
+  Driver().RunOnce();
+  EXPECT_TRUE(ports_.submitted.empty());
+  const auto progress = Progress();
+  EXPECT_EQ(progress.phase, LifecycleProgressPhaseDTO::kSatisfied);
+  EXPECT_FALSE(progress.next_intent.has_value());
+  EXPECT_FALSE(progress.incident.has_value());
+  EXPECT_FALSE(progress.blocking_reason.has_value());
+  // An armed component still disables as before
+  // (PlannedDisableWithAStaleFaultStreamIsNoIncident: Active → Disable).
+}
+
+// Mixed Recover outcome (Real xArm: the arm at Declared, a healthy gripper
+// still Prepared). An armed domain is not hidden: the Disable path stays.
+// Without the provider's unarmed resting predicate a Declared domain proves
+// nothing: the Disable path stays (fails closed as in M4).
+TEST_F(LifecycleTargetDriverTest, DeclaredWithoutAnUnarmedRestingPredicateKeepsTheDisablePath) {
+  Target(LifecycleTargetStateDTO::kDisabled, LifecycleTargetOriginDTO::kOperator);
+  ports_.achieved = ComponentLifecycleStateDTO::kDeclared;
+  ports_.observed = ComponentLifecycleStateDTO::kDeclared;
+  ports_.ready = false;
+  Driver().RunOnce();
+  const auto progress = Progress();
+  EXPECT_NE(progress.phase, LifecycleProgressPhaseDTO::kSatisfied);
+  EXPECT_EQ(progress.next_intent, ComponentLifecycleIntentKindDTO::kDisable);
+  EXPECT_TRUE(ports_.submitted.empty());
+}
+
+TEST_F(LifecycleTargetDriverTest, DeclaredWithAPreparedDomainKeepsTheDisablePath) {
+  ports_.catalog_override = UnarmedRestingCatalog();
+  ports_.vendor_facts = UnarmedFacts();
+  ports_.other_domain = true;
+  Target(LifecycleTargetStateDTO::kDisabled, LifecycleTargetOriginDTO::kOperator);
+  ports_.achieved = ComponentLifecycleStateDTO::kDeclared;
+  ports_.observed = ComponentLifecycleStateDTO::kDeclared;
+  ports_.other_observed = ComponentLifecycleStateDTO::kPrepared;
+  ports_.ready = false;
+  Driver().RunOnce();
+  const auto progress = Progress();
+  EXPECT_NE(progress.phase, LifecycleProgressPhaseDTO::kSatisfied);
+  EXPECT_EQ(progress.next_intent, ComponentLifecycleIntentKindDTO::kDisable);
+}
+
+TEST_F(LifecycleTargetDriverTest, DeclaredWithADisabledDomainMeetsADisabledTarget) {
+  ports_.catalog_override = UnarmedRestingCatalog();
+  ports_.vendor_facts = UnarmedFacts();
+  ports_.other_domain = true;
+  Target(LifecycleTargetStateDTO::kDisabled, LifecycleTargetOriginDTO::kOperator);
+  ports_.achieved = ComponentLifecycleStateDTO::kDeclared;
+  ports_.observed = ComponentLifecycleStateDTO::kDeclared;
+  ports_.other_observed = ComponentLifecycleStateDTO::kDisabled;
+  ports_.ready = false;
+  Driver().RunOnce();
+  Driver().RunOnce();
+  EXPECT_TRUE(ports_.submitted.empty());
+  const auto progress = Progress();
+  EXPECT_EQ(progress.phase, LifecycleProgressPhaseDTO::kSatisfied);
+  EXPECT_FALSE(progress.next_intent.has_value());
+  EXPECT_FALSE(progress.incident.has_value());
 }
 
 TEST_F(LifecycleTargetDriverTest, LateReadinessIsFollowedByPrepareThenEnableWithoutAnOperator) {
@@ -3427,6 +3537,107 @@ TEST_F(StreamHealthIncidentTest, PlannedDisableWithAStaleFaultStreamIsNoIncident
   EXPECT_EQ(Progress().blocking_cause_class, LifecycleBlockingCauseClassDTO::kNone);
 }
 
+// Live 2026-10-28 (Real Lite 6): Active → Disable → Enable. The operator
+// target keeps `reached`; /joint_states stopped with the hardware, so the
+// fault stream is stale while the driver re-Prepares from Disabled.
+class StreamReactivationTest : public StreamHealthIncidentTest {
+ protected:
+  /// Reached Active, disabled by the operator, the stream stale, then the
+  /// operator's Enable: the driver's Prepare is accepted and in its deadline.
+  void ReactivateWithStaleStream() {
+    recorder_ = Declare(StreamSeverityDTO::kFault);
+    recorder_->Record(1);
+    Settle();
+    ReachTarget();
+    Target(LifecycleTargetStateDTO::kDisabled, LifecycleTargetOriginDTO::kOperator);
+    ports_.observed = ComponentLifecycleStateDTO::kDisabled;
+    ports_.ready = false;
+    Driver().RunOnce();
+    ASSERT_EQ(ports_.submitted.size(), 1U);
+    ports_.Finish(ComponentLifecycleTerminalResultDTO::kSucceeded,
+                  ComponentLifecycleTransactionPhaseDTO::kSucceeded);
+    Driver().RunOnce();
+    ASSERT_EQ(ports_.achieved, ComponentLifecycleStateDTO::kDisabled);
+    clock_.advance(101 * kMs);
+    Settle();
+    ASSERT_TRUE(health_->Verdict(kComponent).fault_loss);
+    // In this fake world the Prepare plan needs armed status to submit.
+    Target(LifecycleTargetStateDTO::kActive, LifecycleTargetOriginDTO::kOperator);
+    ASSERT_TRUE(store_.targets.at(kComponent).reached);
+    ports_.observed = ComponentLifecycleStateDTO::kPrepared;
+    ports_.ready = true;
+    ++ports_.observation_generation;
+    Driver().RunOnce();
+    ASSERT_EQ(ports_.submitted.size(), 2U);
+    ASSERT_EQ(ports_.submitted.back().intent, ComponentLifecycleIntentKindDTO::kPrepare);
+    ports_.statuses.at(LifecycleTransactionId("lifecycle.2")).acceptance.accepted_at_ns =
+        clock_.now();
+    Driver().RunOnce();
+    Driver().RunOnce();
+  }
+  std::unique_ptr<StreamRecorder> recorder_;
+};
+
+TEST_F(StreamReactivationTest, StaleFaultStreamDuringTheReactivatingPrepareIsNoIncident) {
+  ReactivateWithStaleStream();
+  EXPECT_FALSE(Progress().incident.has_value());
+  EXPECT_TRUE(ports_.containments.empty());
+  // The Prepare brings the stream back; Enable follows and reaches Active.
+  recorder_->Record(2);
+  Settle();
+  ports_.Finish(ComponentLifecycleTerminalResultDTO::kSucceeded,
+                ComponentLifecycleTransactionPhaseDTO::kSucceeded);
+  ports_.BecomeReady();
+  Driver().RunOnce();
+  ASSERT_EQ(ports_.submitted.size(), 3U);
+  EXPECT_EQ(ports_.submitted.back().intent, ComponentLifecycleIntentKindDTO::kEnable);
+  ports_.Finish(ComponentLifecycleTerminalResultDTO::kSucceeded,
+                ComponentLifecycleTransactionPhaseDTO::kSucceeded);
+  recorder_->Record(3);
+  Settle();
+  Driver().RunOnce();
+  EXPECT_FALSE(Progress().incident.has_value());
+  EXPECT_EQ(Progress().phase, LifecycleProgressPhaseDTO::kSatisfied);
+  // Once Active again, a stale fault stream is a loss as before.
+  clock_.advance(101 * kMs);
+  Settle();
+  ASSERT_TRUE(health_->Verdict(kComponent).fault_loss);
+  Driver().RunOnce();
+  Driver().RunOnce();
+  ASSERT_TRUE(Progress().incident.has_value());
+  EXPECT_EQ(Progress().incident->cause_class, LifecycleBlockingCauseClassDTO::kProviderLost);
+}
+
+TEST_F(StreamReactivationTest, StreamStillStaleWhenTheReactivatingPrepareEndsIsAnIncident) {
+  ReactivateWithStaleStream();
+  EXPECT_FALSE(Progress().incident.has_value());
+  ports_.Finish(ComponentLifecycleTerminalResultDTO::kSucceeded,
+                ComponentLifecycleTransactionPhaseDTO::kSucceeded);
+  Driver().RunOnce();
+  Driver().RunOnce();
+  ASSERT_TRUE(Progress().incident.has_value());
+  EXPECT_EQ(Progress().incident->cause_class, LifecycleBlockingCauseClassDTO::kProviderLost);
+  ASSERT_TRUE(Progress().incident->diagnostic);
+  EXPECT_EQ(Progress().incident->diagnostic->code, kComponentStreamStaleCode);
+}
+
+// Unchanged from M4: no transaction re-establishes the stream.
+TEST_F(StreamHealthIncidentTest, ReachedActiveTargetNotActiveWithoutTransactionKeepsStreamLoss) {
+  auto recorder = Declare(StreamSeverityDTO::kFault);
+  recorder->Record(1);
+  Settle();
+  ReachTarget();
+  ports_.achieved = ComponentLifecycleStateDTO::kPrepared;
+  ports_.observed = ComponentLifecycleStateDTO::kPrepared;
+  clock_.advance(101 * kMs);
+  Settle();
+  ASSERT_TRUE(health_->Verdict(kComponent).fault_loss);
+  Driver().RunOnce();
+  Driver().RunOnce();
+  ASSERT_TRUE(Progress().incident.has_value());
+  EXPECT_EQ(Progress().incident->cause_class, LifecycleBlockingCauseClassDTO::kProviderLost);
+}
+
 TEST_F(StreamHealthIncidentTest, PreparedTargetIsReachedWithoutItsFaultStream) {
   auto recorder = Declare(StreamSeverityDTO::kFault);
   clock_.advance(100 * kMs);
@@ -3534,6 +3745,411 @@ TEST_F(StreamHealthIncidentTest, FaultEventIsAnImmediateIncidentAcknowledgedByRe
   ASSERT_TRUE(recovered.ok()) << recovered.error().message;
   Settle();
   EXPECT_FALSE(health_->Verdict(kComponent).fault_event);
+}
+
+/// ObservedControllerPlans, but Recover dispatches one vendor clear while
+/// the domain is faulted (like the xArm `clean_error` step) and ends Disabled.
+[[nodiscard]] BrandLifecyclePlanCatalogDTO VendorClearCatalog() {
+  auto plans = ObservedControllerPlans();
+  auto& recover = plans.back();
+  recover.recover_target_eligibility = LifecyclePredicateDTO{
+      {ComponentLifecycleStateDTO::kDegraded, ComponentLifecycleStateDTO::kFaulted},
+      {{LifecycleFactId("external.transport_ready"), Boolean(true)}}};
+  recover.transitions = {
+      {LifecyclePrimitiveId("test.vendor.clear_error"),
+       {{ComponentLifecycleStateDTO::kDegraded, ComponentLifecycleStateDTO::kFaulted},
+        {{LifecycleFactId("external.fault_present"), Boolean(true)},
+         {LifecycleFactId("external.transport_ready"), Boolean(true)}}},
+       recover.requested_postcondition}};
+  return MakeBrandLifecyclePlanCatalog(ProviderManifestId("manifest.arm"),
+                                       ProviderManifestRevision(Sha('f')), std::move(plans))
+      .value();
+}
+
+/// Recovery step 0.2: after the operator's Recover the driver runs the
+/// component Recover itself while a domain still reports the recovered
+/// cause, whatever CCLC's achieved state is (ADR-0026 §7).
+class ObservedCauseRecoverTest : public LifecycleIncidentTest {
+ protected:
+  /// A Real arm that boots with its emergency-stop input latched (C2): the
+  /// operator's Prepare recorded the target, achieved stays Declared, and
+  /// the fault is an incident before the arm was ever armed.
+  void FaultBeforeArming() {
+    ports_.catalog_override = VendorClearCatalog();
+    Target(LifecycleTargetStateDTO::kPrepared, LifecycleTargetOriginDTO::kOperator);
+    ports_.achieved = ComponentLifecycleStateDTO::kDeclared;
+    ports_.observed = ComponentLifecycleStateDTO::kFaulted;
+    ports_.fault_present = true;
+    ports_.cause = LifecycleBlockingCauseClassDTO::kEmergencyStop;
+    ports_.vendor_facts = {VendorToken("error", "C2")};
+    Driver().RunOnce();
+    ASSERT_TRUE(Progress().incident.has_value());
+    ASSERT_EQ(ports_.containments.size(), 1U);
+    ASSERT_TRUE(ports_.submitted.empty());
+  }
+  void OperatorRecovers() {
+    clock_.advance(kSecond);
+    const auto recovered = Driver().RecoverIncident(OperatorRecover("operator.recover.1"));
+    ASSERT_TRUE(recovered.ok() && recovered.value().has_value());
+    ASSERT_EQ(store_.targets.at(kComponent).recovered_cause,
+              LifecycleBlockingCauseClassDTO::kEmergencyStop);
+  }
+  /// The vendor error is gone and the controller reports ready.
+  void VendorErrorCleared() {
+    ports_.fault_present = false;
+    ports_.cause.reset();
+    ports_.vendor_facts.clear();
+    ports_.BecomeReady();
+  }
+  void ExpectSingleIncident() {
+    EXPECT_EQ(store_.incidents.size(), 1U);
+    EXPECT_EQ(ports_.containments.size(), 1U);
+  }
+};
+
+TEST_F(ObservedCauseRecoverTest, OneOperatorRecoverRunsTheVendorClearAndReturnsToTheTarget) {
+  FaultBeforeArming();
+  OperatorRecovers();
+  Driver().RunOnce();
+  ASSERT_EQ(ports_.submitted.size(), 1U);
+  const auto& recover = ports_.submitted.front();
+  EXPECT_EQ(recover.intent, ComponentLifecycleIntentKindDTO::kRecover);
+  EXPECT_EQ(recover.request_context.source_label, kLifecycleTargetSourceLabel);
+  EXPECT_EQ(recover.request_context.request_id.value(),
+            "manyforge_lifecycle_target.component.arm.g1.s0.recover.a1");
+  EXPECT_TRUE(recover.locally_valid());
+  EXPECT_EQ(Progress().phase, LifecycleProgressPhaseDTO::kTransitionInProgress);
+  EXPECT_FALSE(Progress().incident.has_value());
+
+  // CCLC verified the clear (Disabled); the driver continues to the target.
+  ports_.Finish(ComponentLifecycleTerminalResultDTO::kSucceeded,
+                ComponentLifecycleTransactionPhaseDTO::kSucceeded);
+  VendorErrorCleared();
+  Driver().RunOnce();
+  ASSERT_EQ(ports_.submitted.size(), 2U);
+  EXPECT_EQ(ports_.submitted.back().intent, ComponentLifecycleIntentKindDTO::kPrepare);
+  ports_.Finish(ComponentLifecycleTerminalResultDTO::kSucceeded,
+                ComponentLifecycleTransactionPhaseDTO::kSucceeded);
+  Driver().RunOnce();
+  EXPECT_EQ(Progress().phase, LifecycleProgressPhaseDTO::kSatisfied);
+  EXPECT_TRUE(store_.targets.at(kComponent).reached);
+  EXPECT_FALSE(store_.targets.at(kComponent).recovered_cause.has_value());
+  EXPECT_EQ(ports_.submitted.size(), 2U);
+  ExpectSingleIncident();
+}
+
+TEST_F(ObservedCauseRecoverTest, WithoutTheOperatorsRecoverNothingRuns) {
+  FaultBeforeArming();
+  for (int pass = 0; pass < 5; ++pass) {
+    clock_.advance(kSecond);
+    ++ports_.observation_generation;
+    Driver().RunOnce();
+  }
+  const auto progress = Progress();
+  ASSERT_TRUE(progress.incident.has_value());
+  EXPECT_EQ(progress.phase, LifecycleProgressPhaseDTO::kBlocked);
+  EXPECT_EQ(progress.next_intent, ComponentLifecycleIntentKindDTO::kRecover);
+  EXPECT_TRUE(ports_.submitted.empty());
+  EXPECT_FALSE(store_.targets.at(kComponent).recovered_cause.has_value());
+  ExpectSingleIncident();
+}
+
+TEST_F(ObservedCauseRecoverTest, EmergencyStopStillEngagedBlocksTypedAndAnotherRecoverContinues) {
+  FaultBeforeArming();
+  OperatorRecovers();
+  Driver().RunOnce();
+  ASSERT_EQ(ports_.submitted.size(), 1U);
+  ASSERT_EQ(ports_.submitted.front().intent, ComponentLifecycleIntentKindDTO::kRecover);
+  // Still engaged: the clear has no effect and CCLC fails the step.
+  ports_.Finish(ComponentLifecycleTerminalResultDTO::kFailedKnownNoEffect,
+                ComponentLifecycleTransactionPhaseDTO::kFailed);
+  for (int pass = 0; pass < 5; ++pass) {
+    clock_.advance(kSecond);
+    ++ports_.observation_generation;
+    Driver().RunOnce();
+  }
+  EXPECT_EQ(ports_.submitted.size(), 1U);
+  const auto blocked = Progress();
+  EXPECT_EQ(blocked.phase, LifecycleProgressPhaseDTO::kBlocked);
+  EXPECT_EQ(blocked.next_intent, ComponentLifecycleIntentKindDTO::kRecover);
+  EXPECT_EQ(blocked.blocking_cause_class, LifecycleBlockingCauseClassDTO::kEmergencyStop);
+  EXPECT_EQ(blocked.blocking_reason,
+            "recovered_cause_persists:emergency_stop:step_failed:"
+            "component_lifecycle_postcondition_not_satisfied");
+  EXPECT_FALSE(blocked.incident.has_value());
+  ExpectSingleIncident();
+
+  // Released; the operator presses Recover again. With no open incident it
+  // is an ordinary CCLC Recover (its acceptance advances the recovery
+  // generation) that runs the clear itself. Nothing is wedged.
+  clock_.advance(kSecond);
+  const auto again = Driver().RecoverIncident(OperatorRecover("operator.recover.2"));
+  ASSERT_TRUE(again.ok());
+  EXPECT_FALSE(again.value().has_value());
+  store_.OrdinaryRecover(kComponent);
+  ASSERT_TRUE(ports_.SubmitLifecycle(OperatorRecover("operator.recover.2")).ok());
+  ports_.Finish(ComponentLifecycleTerminalResultDTO::kSucceeded,
+                ComponentLifecycleTransactionPhaseDTO::kSucceeded);
+  VendorErrorCleared();
+  Driver().RunOnce();
+  ASSERT_EQ(ports_.submitted.size(), 3U);
+  EXPECT_EQ(ports_.submitted.back().intent, ComponentLifecycleIntentKindDTO::kPrepare);
+  EXPECT_EQ(ports_.submitted.back().request_context.source_label, kLifecycleTargetSourceLabel);
+  ports_.Finish(ComponentLifecycleTerminalResultDTO::kSucceeded,
+                ComponentLifecycleTransactionPhaseDTO::kSucceeded);
+  Driver().RunOnce();
+  EXPECT_EQ(Progress().phase, LifecycleProgressPhaseDTO::kSatisfied);
+  EXPECT_TRUE(store_.targets.at(kComponent).reached);
+  ExpectSingleIncident();
+}
+
+TEST_F(ObservedCauseRecoverTest, ACauseThatSurvivesASucceededRecoverIsNotRecoveredAgain) {
+  FaultBeforeArming();
+  OperatorRecovers();
+  Driver().RunOnce();
+  ASSERT_EQ(ports_.submitted.size(), 1U);
+  ports_.Finish(ComponentLifecycleTerminalResultDTO::kSucceeded,
+                ComponentLifecycleTransactionPhaseDTO::kSucceeded);
+  for (int pass = 0; pass < 5; ++pass) {
+    clock_.advance(kSecond);
+    ++ports_.observation_generation;
+    Driver().RunOnce();
+  }
+  EXPECT_EQ(ports_.submitted.size(), 1U);
+  EXPECT_EQ(Progress().phase, LifecycleProgressPhaseDTO::kBlocked);
+  EXPECT_EQ(Progress().blocking_reason, "recovered_cause_persists:emergency_stop");
+  ExpectSingleIncident();
+}
+
+TEST_F(ObservedCauseRecoverTest, ProviderLossRecoveryKeepsTheOrdinaryIntent) {
+  // Mock/Isaac: the recovered cause (`provider_lost`) is never reported by
+  // an adapter; a degraded `availability` observation is ordinary waiting.
+  ReachTarget();
+  ports_.reachable = false;
+  Driver().RunOnce();
+  ASSERT_TRUE(Progress().incident.has_value());
+  ASSERT_TRUE(Driver().RecoverIncident(OperatorRecover("operator.recover.1")).ok());
+  ASSERT_EQ(store_.targets.at(kComponent).recovered_cause,
+            LifecycleBlockingCauseClassDTO::kProviderLost);
+  ports_.reachable = true;
+  ports_.ready = false;
+  ports_.observed = ComponentLifecycleStateDTO::kDegraded;
+  ports_.cause = LifecycleBlockingCauseClassDTO::kAvailability;
+  for (const auto achieved :
+       {ComponentLifecycleStateDTO::kActive, ComponentLifecycleStateDTO::kPrepared}) {
+    ports_.achieved = achieved;
+    ++ports_.observation_generation;
+    Driver().RunOnce();
+    EXPECT_NE(Progress().next_intent, ComponentLifecycleIntentKindDTO::kRecover);
+  }
+  for (const auto& intent : ports_.submitted)
+    EXPECT_NE(intent.intent, ComponentLifecycleIntentKindDTO::kRecover);
+  EXPECT_EQ(store_.incidents.size(), 1U);
+}
+
+
+// m5.5: an error-free move from the robot's own interface (UFACTORY Studio).
+// The xArm adapter reports `device.moved_externally` (and `device.at_rest`)
+// under its default policy `external_move_rearm: automatic`.
+[[nodiscard]] BrandLifecyclePlanCatalogDTO ExternalMoveCatalog() {
+  auto plans = ObservedControllerPlans();
+  auto& recover = plans.back();
+  recover.recover_target_eligibility = LifecyclePredicateDTO{
+      {ComponentLifecycleStateDTO::kDegraded, ComponentLifecycleStateDTO::kFaulted},
+      {{LifecycleFactId("external.transport_ready"), Boolean(true)}}};
+  // The Real arm's Recover disarms the hardware (the vendor deactivation).
+  recover.transitions = {
+      {LifecyclePrimitiveId("test.vendor.disarm"),
+       {{ComponentLifecycleStateDTO::kDegraded, ComponentLifecycleStateDTO::kFaulted},
+        {{LifecycleFactId("external.transport_ready"), Boolean(true)}}},
+       recover.requested_postcondition}};
+  return MakeBrandLifecyclePlanCatalog(ProviderManifestId("manifest.arm"),
+                                       ProviderManifestRevision(Sha('f')), std::move(plans))
+      .value();
+}
+
+class ExternalMoveTest : public StreamHealthIncidentTest {
+ protected:
+  [[nodiscard]] static LifecycleFactDTO DeviceFact(std::string_view id, bool value) {
+    return {LifecycleFactId(std::string(id)), Boolean(value)};
+  }
+  /// Active and reached, with a live `fault` measured-joints stream.
+  void ActiveArm() {
+    ports_.catalog_override = ExternalMoveCatalog();
+    recorder_ = Declare(StreamSeverityDTO::kFault);
+    recorder_->Record(1);
+    Settle();
+    ReachTarget();
+  }
+  /// The live trace of 2026-10-28: Studio switches to position mode and
+  /// moves (state 1, mode 0), then stops (state 5); the vendor plugin turns
+  /// the broadcaster and the trajectory controller off, so the measured
+  /// joints go stale.
+  void StudioMove(bool in_motion) {
+    ports_.ready = false;
+    ports_.observed = ComponentLifecycleStateDTO::kDegraded;
+    ports_.cause = LifecycleBlockingCauseClassDTO::kAvailability;
+    ports_.vendor_facts = {DeviceFact(kDeviceInMotionFactId, in_motion),
+                           DeviceFact(kDeviceMovedExternallyFactId, true),
+                           VendorToken("condition", "xarm_moved_externally"),
+                           VendorInteger("mode", 0),
+                           VendorInteger("state", in_motion ? 1 : 5)};
+    ++ports_.observation_generation;
+    clock_.advance(101 * kMs);
+    Settle();
+  }
+  /// ManyForge's own arming completed: servo mode, ready, broadcasting.
+  void Armed() {
+    ports_.cause.reset();
+    ports_.vendor_facts.clear();
+    ports_.observed = ComponentLifecycleStateDTO::kPrepared;
+    ports_.ready = true;
+    ++ports_.observation_generation;
+    recorder_->Record(2);
+    Settle();
+  }
+  std::unique_ptr<StreamRecorder> recorder_;
+};
+
+TEST_F(ExternalMoveTest, IdleMoveIsAWarningAndTheNextMotionsRecoverReArms) {
+  ActiveArm();
+  StudioMove(true);
+  ASSERT_TRUE(health_->Verdict(kComponent).fault_loss);
+  Driver().RunOnce();
+  Driver().RunOnce();
+  // A non-blocking warning at the target: no incident, no Stop, the stale
+  // stream is not a loss, nothing is submitted (no automatic re-arm).
+  auto progress = Progress();
+  EXPECT_FALSE(progress.incident.has_value());
+  EXPECT_EQ(progress.phase, LifecycleProgressPhaseDTO::kSatisfied);
+  EXPECT_FALSE(progress.next_intent.has_value());
+  EXPECT_EQ(progress.blocking_cause_class, LifecycleBlockingCauseClassDTO::kAvailability);
+  EXPECT_EQ(progress.blocking_reason, "moved_externally:in_motion");
+  StudioMove(false);
+  for (int pass = 0; pass < 3; ++pass) {
+    clock_.advance(kSecond);
+    Driver().RunOnce();
+  }
+  progress = Progress();
+  EXPECT_EQ(progress.phase, LifecycleProgressPhaseDTO::kSatisfied);
+  EXPECT_EQ(progress.blocking_reason, "moved_externally:rearm_at_next_motion");
+  EXPECT_TRUE(ports_.containments.empty());
+  EXPECT_TRUE(store_.incidents.empty());
+  EXPECT_TRUE(ports_.submitted.empty());
+
+  // The next motion command first re-arms: Headless submits the operator's
+  // ordinary Recover (disarm); this driver then re-drives Prepare and Enable
+  // to the Active target.
+  store_.OrdinaryRecover(kComponent);
+  ASSERT_TRUE(ports_.SubmitLifecycle(OperatorRecover("operator.rearm.1")).ok());
+  Driver().RunOnce();
+  EXPECT_FALSE(Progress().incident.has_value());
+  ports_.Finish(ComponentLifecycleTerminalResultDTO::kSucceeded,
+                ComponentLifecycleTransactionPhaseDTO::kSucceeded);
+  ASSERT_EQ(ports_.achieved, ComponentLifecycleStateDTO::kDisabled);
+  ports_.observed = ComponentLifecycleStateDTO::kDisabled;
+  ports_.cause.reset();
+  ++ports_.observation_generation;
+  Driver().RunOnce();
+  EXPECT_FALSE(Progress().incident.has_value());
+  Armed();
+  Driver().RunOnce();
+  // `submitted` also holds the operator's Recover.
+  ASSERT_EQ(ports_.submitted.size(), 2U);
+  EXPECT_EQ(ports_.submitted.back().intent, ComponentLifecycleIntentKindDTO::kPrepare);
+  EXPECT_EQ(ports_.submitted.back().request_context.source_label, kLifecycleTargetSourceLabel);
+  ports_.Finish(ComponentLifecycleTerminalResultDTO::kSucceeded,
+                ComponentLifecycleTransactionPhaseDTO::kSucceeded);
+  // In this fake world the Enable plan needs ready status to submit.
+  ports_.BecomeReady();
+  Driver().RunOnce();
+  ASSERT_EQ(ports_.submitted.size(), 3U);
+  EXPECT_EQ(ports_.submitted.back().intent, ComponentLifecycleIntentKindDTO::kEnable);
+  ports_.Finish(ComponentLifecycleTerminalResultDTO::kSucceeded,
+                ComponentLifecycleTransactionPhaseDTO::kSucceeded);
+  recorder_->Record(3);
+  Settle();
+  Driver().RunOnce();
+  progress = Progress();
+  EXPECT_EQ(progress.phase, LifecycleProgressPhaseDTO::kSatisfied);
+  EXPECT_FALSE(progress.blocking_reason.has_value() &&
+               progress.blocking_reason->rfind("moved_externally", 0) == 0);
+  EXPECT_TRUE(ports_.containments.empty());
+  EXPECT_TRUE(store_.incidents.empty());
+}
+
+TEST_F(ExternalMoveTest, ExternalMoveDuringManyForgeWorkIsTheExternalControlIncident) {
+  // A Program cycle or a claim is held: the Kernel's authoring admission is
+  // closed while the component is at its target.
+  ports_.authoring_allowed = false;
+  ActiveArm();
+  StudioMove(true);
+  Driver().RunOnce();
+  const auto progress = Progress();
+  ASSERT_TRUE(progress.incident.has_value());
+  EXPECT_EQ(progress.incident->cause_class, LifecycleBlockingCauseClassDTO::kExternalControl);
+  EXPECT_EQ(progress.incident->vendor_codes,
+            (std::vector<std::string>{"xarm_moved_externally", "mode=0", "state=1"}));
+  EXPECT_EQ(ports_.containments.size(), 1U);
+  // Never re-armed by itself, also at rest: only the operator's Recover.
+  StudioMove(false);
+  for (int pass = 0; pass < 3; ++pass) {
+    clock_.advance(kSecond);
+    Driver().RunOnce();
+  }
+  EXPECT_TRUE(ports_.submitted.empty());
+  EXPECT_EQ(store_.incidents.size(), 1U);
+  EXPECT_EQ(ports_.containments.size(), 1U);
+
+  // The operator ends the Program and acknowledges the incident (the cell
+  // admits lifecycle work again): no new incident; the robot is in the idle
+  // warning, re-armed by Recover cell's re-enable or the next motion command
+  // (Headless, see test_component_rearm.py), never by itself.
+  ports_.authoring_allowed = true;
+  clock_.advance(kSecond);
+  const auto recovered = Driver().RecoverIncident(OperatorRecover("operator.recover.1"));
+  ASSERT_TRUE(recovered.ok() && recovered.value().has_value());
+  ++ports_.observation_generation;
+  Driver().RunOnce();
+  const auto after = Progress();
+  EXPECT_FALSE(after.incident.has_value());
+  EXPECT_EQ(after.blocking_reason, "moved_externally:rearm_at_next_motion");
+  EXPECT_TRUE(ports_.submitted.empty());
+  EXPECT_EQ(store_.incidents.size(), 1U);
+}
+
+// SX-447: the decision reads the Kernel's current admission, never a value
+// saved at an earlier pass: a Program that started after the last pass at
+// the target makes the move the incident.
+TEST_F(ExternalMoveTest, ProgramStartedSinceTheLastTargetPassMakesTheMoveAnIncident) {
+  ActiveArm();
+  // A Program cycle starts; no healthy pass of this component follows.
+  ports_.authoring_allowed = false;
+  ++ports_.admission_generation;
+  StudioMove(true);
+  Driver().RunOnce();
+  const auto progress = Progress();
+  ASSERT_TRUE(progress.incident.has_value());
+  EXPECT_EQ(progress.incident->cause_class, LifecycleBlockingCauseClassDTO::kExternalControl);
+  EXPECT_EQ(progress.blocking_cause_class, LifecycleBlockingCauseClassDTO::kExternalControl);
+  // The fault hold: containment (the cell Full Stop and its Stop fault).
+  EXPECT_EQ(ports_.containments.size(), 1U);
+  EXPECT_TRUE(ports_.submitted.empty());
+}
+
+TEST_F(ExternalMoveTest, AVendorErrorDuringAnIdleMoveKeepsTheErrorHandling) {
+  ActiveArm();
+  StudioMove(false);
+  ports_.cause = LifecycleBlockingCauseClassDTO::kEmergencyStop;
+  ports_.fault_present = true;
+  ports_.observed = ComponentLifecycleStateDTO::kFaulted;
+  ports_.vendor_facts.push_back(VendorToken("error", "C2"));
+  Driver().RunOnce();
+  const auto progress = Progress();
+  ASSERT_TRUE(progress.incident.has_value());
+  EXPECT_EQ(progress.incident->cause_class, LifecycleBlockingCauseClassDTO::kEmergencyStop);
+  EXPECT_EQ(ports_.containments.size(), 1U);
+  EXPECT_TRUE(ports_.submitted.empty());
 }
 
 }  // namespace manyforge::core

@@ -32,6 +32,8 @@ inline constexpr std::string_view kSocketFileName = "execution-command.sock";
 inline constexpr std::string_view kControlSocketFileName = "execution-control.sock";
 inline constexpr std::string_view kObservationSocketFileName =
     "execution-observation.sock";
+/// Event subscription stream (contract §8.1): one subscription per connection.
+inline constexpr std::string_view kEventStreamSocketFileName = "execution-events.sock";
 inline constexpr std::string_view kManagerSocketFileName = "manager-command.sock";
 inline constexpr std::string_view kManagerCommandApiVersion =
     "manyforge.manager_command.v1";

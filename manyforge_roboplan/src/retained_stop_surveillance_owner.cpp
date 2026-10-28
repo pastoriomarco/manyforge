@@ -852,6 +852,13 @@ observe_selected(const core::StopSurveillanceObservationQueryDTO &query,
         "stop_surveillance_source_unavailable", observed.error().message);
   }
   const auto &snapshot = observed.value();
+  // Stop evidence is as of the evaluation time: a sample received after it is
+  // not evidence (the M3 outcome of `current_state` for such a sample).
+  if (snapshot.received_timestamp_ns > query.evaluation_time_ns) {
+    return unavailable_sample(
+        query, core::StopSurveillanceSourceAvailabilityDTO::kUnavailable,
+        "stop_surveillance_source_unavailable", "coordinate state is invalid");
+  }
   const auto expected_context = core::make_observed_state_query_context(
       selected.source.binding, snapshot.freshness_budget_ns);
   if (!expected_context.ok() ||
@@ -1388,7 +1395,8 @@ RetainedStopSurveillanceOwner::BuildRecoveryFacts(
     }
 
     std::vector<core::StopFaultRecoveryResourceFactDTO> external_facts;
-    if (latch.trigger == core::StopFaultTriggerDTO::kFailedUncontained) {
+    if (core::stop_fault_trigger_observed(
+            latch, core::StopFaultTriggerDTO::kFailedUncontained)) {
       for (const auto &source : sources) {
         std::vector<core::ResourceId> selected_resources;
         for (const auto &resource : binding_resources(source.binding)) {

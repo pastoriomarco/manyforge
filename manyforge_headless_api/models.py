@@ -850,6 +850,16 @@ class ProgramSelectionStartRequest(ProgramSelectionResumeRequest):
 class ProgramCycleResetRequest(ExecutionControlAttributionRequest):
     reload_initial_scene: bool = False
     reset_robot_position: bool = False
+    # D6: a public option that only ever keeps the cell Stop fault (the
+    # conservative side). Scenario Close sets it; ordinary Reset (False)
+    # reconciles the fault as before.
+    keep_stop_fault: bool = Field(
+        default=False,
+        description=(
+            "End the run without clearing the cell Stop fault; Recover cell "
+            "clears it later. Scenario Close sets it. It can only keep the fault."
+        ),
+    )
     program_run_id: str | None
     expected_owner_epoch: str
     expected_cycle_generation: Annotated[int, Field(ge=1, le=9_007_199_254_740_991)]
@@ -1876,6 +1886,19 @@ class CarriedObjectGraspLostBound(StrictRequest):
     rotation_rad: Annotated[float, Field(gt=0, allow_inf_nan=False)]
 
 
+class CarriedObjectGraspLostResponse(StrictRequest):
+    """Attach-node loss response (grasp-lost contract section 6).
+
+    Sent only when it differs from the defaults; all four keys are present.
+    The scene owner refuses a default-equal member and an alarm without Stop.
+    """
+
+    raise_alarm: bool
+    stop_motion: bool
+    set_key: str | None
+    detach: bool
+
+
 class AttachCarriedObjectRequest(StrictRequest):
     kind: Literal["attach_carried_object"]
     carried_object_attachment_id: str
@@ -1889,6 +1912,7 @@ class AttachCarriedObjectRequest(StrictRequest):
         Field(max_length=4096),
     ]
     grasp_lost_bound: CarriedObjectGraspLostBound | None = None
+    on_grasp_lost: CarriedObjectGraspLostResponse | None = None
 
     @field_validator(
         "carried_object_attachment_id",
@@ -3672,6 +3696,36 @@ class StopFaultRecoveryIntentRequest(StrictRequest):
             maximum_bytes=MAX_STOP_IDENTITY_BYTES,
         )
         return self
+
+
+class CellRecoverRequestContext(StrictRequest):
+    """Caller identity only: Recover cell reads every fence server-side."""
+
+    request_id: str
+    source_label: str
+    correlation_id: str | None = None
+
+    @field_validator("request_id", "source_label")
+    @classmethod
+    def validate_identity(cls, value: str, info) -> str:
+        return _bounded_nfc(
+            value, label=info.field_name, maximum_bytes=MAX_STOP_IDENTITY_BYTES
+        )
+
+    @field_validator("correlation_id")
+    @classmethod
+    def validate_correlation(cls, value: str | None) -> str | None:
+        if value is None:
+            return None
+        return _bounded_nfc(
+            value, label="correlation_id", maximum_bytes=MAX_STOP_IDENTITY_BYTES
+        )
+
+
+class CellRecoverRequest(StrictRequest):
+    """One operator Recover cell: incidents, then the current Stop-fault latch."""
+
+    request_context: CellRecoverRequestContext
 
 
 class GlobalIoRuleRecoveryContext(StrictRequest):

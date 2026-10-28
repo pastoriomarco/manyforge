@@ -37,6 +37,7 @@
 
 #include "lite6_retained_consumer_fixture.hpp"
 #include "logical_scene_codec_internal.hpp"
+#include "logical_scene_owner_internal.hpp"
 #include "manyforge_scene/logical_scene_owner.hpp"
 #include "manyforge_scene/logical_scene_value_codec.hpp"
 #include "manyforge_scene/scene_transaction_codec.hpp"
@@ -1390,6 +1391,49 @@ TEST(LogicalSceneTransactionCodec, AttachGraspLostBoundIsOptionalAndRoundTrips) 
                 .grasp_lost_bound,
             (core::CarriedObjectGraspLostBoundDTO{0.03, 0.26}));
   EXPECT_EQ(logical_scene_codec_internal::EncodeRequest(decoded), bounded);
+  // The defaults are absent on the wire, also when given explicitly.
+  EXPECT_EQ(bounded.find("on_grasp_lost"), std::string::npos);
+  auto &attach = std::get<core::AttachCarriedObjectRequestDTO>(request.operation);
+  attach.on_grasp_lost = core::GraspLostResponseDTO{};
+  EXPECT_EQ(logical_scene_codec_internal::EncodeRequest(request), bounded);
+  // A non-default response carries all four keys and round-trips.
+  attach.on_grasp_lost =
+      core::GraspLostResponseDTO{false, false, "part_lost", true};
+  const auto keyed = logical_scene_codec_internal::EncodeRequest(request);
+  EXPECT_NE(
+      keyed.find(
+          R"("on_grasp_lost":{"detach":true,"raise_alarm":false,"set_key":"part_lost","stop_motion":false})"),
+      std::string::npos);
+  const auto keyed_decoded = DecodeCanonicalSceneTransactionRequest(keyed);
+  EXPECT_EQ(std::get<core::AttachCarriedObjectRequestDTO>(keyed_decoded.operation)
+                .on_grasp_lost,
+            attach.on_grasp_lost);
+  EXPECT_EQ(logical_scene_codec_internal::EncodeRequest(keyed_decoded), keyed);
+  // Without a key: `set_key` is null.
+  attach.on_grasp_lost = core::GraspLostResponseDTO{false, true, std::nullopt, false};
+  const auto unkeyed = logical_scene_codec_internal::EncodeRequest(request);
+  EXPECT_NE(unkeyed.find(R"("set_key":null)"), std::string::npos);
+  EXPECT_EQ(std::get<core::AttachCarriedObjectRequestDTO>(
+                DecodeCanonicalSceneTransactionRequest(unkeyed).operation)
+                .on_grasp_lost,
+            attach.on_grasp_lost);
+  const auto refused = [&](std::string from, const std::string &to) {
+    auto text = keyed;
+    text.replace(text.find(from), from.size(), to);
+    EXPECT_THROW(DecodeCanonicalSceneTransactionRequest(text),
+                 std::invalid_argument)
+        << text;
+  };
+  // An alarm without the Stop.
+  refused(R"("raise_alarm":false)", R"("raise_alarm":true)");
+  // A present member equal to the defaults.
+  refused(
+      R"({"detach":true,"raise_alarm":false,"set_key":"part_lost","stop_motion":false})",
+      R"({"detach":true,"raise_alarm":true,"set_key":null,"stop_motion":true})");
+  // A missing key, an empty key name, a wrong type.
+  refused(R"("detach":true,)", "");
+  refused(R"("set_key":"part_lost")", R"("set_key":"")");
+  refused(R"("detach":true)", R"("detach":"yes")");
 }
 
 TEST(LogicalSceneTransactionCodec,
@@ -4055,6 +4099,99 @@ TEST(CanonicalEmptySceneOwner,
   }
 }
 
+// D-M4-3: Close (canonical-empty Apply) and a Load of the same product both
+// preserve the Scene revision, so the composite returns to the exact prior
+// head (A -> B -> A). Replay must still order both completions before the
+// next committed edit instead of stranding them behind it.
+TEST(CanonicalEmptySceneOwner,
+     ConfigurationAdoptionChainBackToThePriorHeadReplaysBeforeTheNextEdit) {
+  SceneProductAdoptionFixture fixture(true);
+  const auto added = fixture.owner->Commit(AddBoxRequest(
+      fixture.owner->CurrentProjectionRevision(), fixture.admission.cell_id(),
+      "aba-add"));
+  ASSERT_TRUE(added.success);
+  const auto product_head = fixture.owner->CurrentProjectionRevision();
+  std::uint64_t publication_generation = 2U;
+  const auto adopt = [&](const std::string &id,
+                         const core::RetainedBundleDTO &bundle,
+                         const std::vector<ProjectionNativeRuntimeBindingDTO> &bindings) {
+    const core::ApplyFenceOwnerDTO manager{ApplyId(id), ApplyGeneration(1U)};
+    const auto claim = fixture.cell_admission.AcquireCellAdmissionClaim(
+        {core::CellAdmissionClaimKindDTO::kManagerApply,
+         core::CellAdmissionOwnerRoleDTO::kManager,
+         RequestOwnerEpoch("manager.1"), id, core::RequestId(id + ".request"),
+         Digest('b'), core::AdmissionGeneration(1U), {}, std::nullopt,
+         std::nullopt});
+    ASSERT_TRUE(claim.ok());
+    const auto previous = fixture.publication_reader.ReadActiveBundlePublication(
+        ActiveBundlePublicationGeneration(publication_generation));
+    ASSERT_TRUE(previous.ok());
+    const core::ConfigurationFenceStatusQueryDTO query{
+        manager, core::ConfigurationFenceId(id + ".fence"),
+        core::ConfigurationFenceGeneration(1U), {},
+        core::RuntimeEpoch("manager-runtime.1")};
+    fixture.fence.Configure(query, previous.value());
+    const QualifiedSceneConfigurationAdoptionRequest request{
+        {manager, Digest('b'), claim.value(), query}, previous.value(),
+        fixture.owner->CurrentProjectionRevision(),
+        fixture.owner->LogicalSnapshot()->identity(), bundle, bindings};
+    static_cast<void>(fixture.owner->StageOriginalManagerConfigurationAdoption(
+        request, fixture.fence, fixture.fence.OriginalAttemptQuery()));
+    const auto ready = fixture.owner->BeginOriginalManagerConfigurationAdoption(
+        request, fixture.fence);
+    ASSERT_TRUE(ready.ready_for_publication());
+    const ActiveBundlePublicationReceiptDTO publication{
+        {NamedApplyPublicationTransactionDTO{manager.apply_id,
+                                            manager.apply_generation},
+         ready.target_projection_revision,
+         ready.target_projection_revision.retained_bundle_id,
+         ready.target_projection_revision.graph_revision,
+         previous.value().publication_generation, Digest('7')},
+        ActiveBundlePublicationGeneration(++publication_generation),
+        Digest('8')};
+    fixture.publication_reader.SetCurrent(publication);
+    ASSERT_EQ(fixture.owner
+                  ->CompleteOriginalManagerConfigurationAdoption(
+                      request, publication, fixture.fence)
+                  .state,
+              core::ProjectionMaintenanceInitializationState::kCompleted);
+    const auto &held = claim.value();
+    ASSERT_TRUE(fixture.cell_admission.ReleaseCellAdmissionClaim(
+        {held.intent.owner_role, held.intent.owner_epoch,
+         held.intent.owner_transaction_id, held.intent.request_id,
+         held.intent.request_payload_digest, held.acquired_admission_generation,
+         held.claim_generation,
+         {core::CellAdmissionSettlementKindDTO::kOwnerCommit, Digest('b')}}).ok());
+  };
+  // Close: canonical-empty Apply. Load: the same product again.
+  ASSERT_NO_FATAL_FAILURE(
+      adopt("aba-close", fixture.admission.retained_bundle().value(), {}));
+  EXPECT_NE(fixture.owner->CurrentProjectionRevision(), product_head);
+  ASSERT_NO_FATAL_FAILURE(adopt("aba-load", fixture.predecessor.bundle->value(),
+                                fixture.predecessor_bindings));
+  ASSERT_EQ(fixture.owner->CurrentProjectionRevision(), product_head);
+
+  // The first edit after the Load (live: the gripper attach).
+  const core::SceneTransactionRequestDTO remove{
+      SceneRequestContext("aba-remove", product_head), {}, product_head,
+      core::RemoveObjectRequestDTO{core::SceneResourceId("scene-box")},
+      core::AdmissionGeneration(1U)};
+  const auto removed = fixture.owner->Commit(remove);
+  ASSERT_TRUE(removed.success);
+  ASSERT_TRUE(removed.committed_projection_revision.has_value());
+  const auto final_projection = *removed.committed_projection_revision;
+  // A full replay of the durable history (periodic reconciliation, restart).
+  EXPECT_NO_THROW(static_cast<void>(fixture.owner->VerifyIntegrity()));
+  fixture.owner.reset();
+  ASSERT_NO_THROW(fixture.owner = std::make_unique<LogicalSceneOwner>(
+      fixture.database_path, fixture.admission, fixture.publication_reader,
+      fixture.bundle_source, fixture.resolver, fixture.cell_admission));
+  EXPECT_EQ(fixture.owner->CurrentProjectionRevision(), final_projection);
+  EXPECT_TRUE(fixture.owner->LogicalSnapshot()->objects.empty());
+  EXPECT_EQ(fixture.owner->LogicalSnapshot()->transaction_sequence, 2U);
+  EXPECT_TRUE(fixture.owner->ReadAccessStatus().scene_writes_open);
+}
+
 TEST(CanonicalEmptySceneOwner, ConfigurationAdoptionRefusesForeignClaimIntentFenceAndScene) {
   for (const bool same_product : {false, true}) {
     SCOPED_TRACE(same_product);
@@ -5523,8 +5660,9 @@ TEST(CanonicalEmptySceneOwner,
 
   for (std::size_t index = 0U; index < projections.size(); ++index) {
     EXPECT_EQ(projections[index]->calls(), 6U);
+    // One runtime unit hosts every projection: only its first answers.
     EXPECT_EQ(projections[index]->frame_resolution_calls(),
-              index == 0U ? 10U : 9U);
+              index == 0U ? 10U : 0U);
     EXPECT_EQ(projections[index]->policy_projection_calls(), index == 0U ? 8U : 7U);
     EXPECT_EQ(projections[index]->retained_lease_count(), 0U);
   }
@@ -5533,6 +5671,178 @@ TEST(CanonicalEmptySceneOwner,
   EXPECT_EQ(integrity.request_outcome_count, 6);
   EXPECT_EQ(integrity.projection_attempt_count,
             static_cast<std::int64_t>(6U * projections.size()));
+}
+
+TEST(CanonicalEmptySceneOwner,
+     LiveFrameIsResolvedOnceByItsOwningRuntimeUnit) {
+  TemporaryDirectory directory("scene-frame-owner-only");
+  const auto package_root = directory.path() / "packages";
+  CopyCanonicalEmptyPackage(package_root);
+  const auto admission = LoadAdmission(package_root);
+  const auto candidate = deployment::test::
+      materialize_lite6_ros2_control_motion_retained_consumer_fixture_for_cell(
+          package_root, admission.cell_id().value());
+  const auto native_bindings = NativeRuntimeBindings(
+      candidate.bundle->value(), "runtime-epoch-frame-owner-only");
+
+  ControlledPublicationReader publication_reader;
+  deployment::FilesystemVerifiedRetainedBundleSource bundle_source(
+      package_root);
+  std::vector<std::unique_ptr<FakePlannerSceneProjection>> projections;
+  std::vector<FakePlannerSceneProjection *> projection_clients;
+  for (const auto &binding : native_bindings) {
+    projections.push_back(
+        std::make_unique<FakePlannerSceneProjection>(binding));
+    projection_clients.push_back(projections.back().get());
+  }
+  // Real-lane shape: several native projections hosted by one runtime unit.
+  ASSERT_GE(projections.size(), 2U);
+  for (const auto &projection : projections) {
+    ASSERT_EQ(projection->binding().runtime_unit_id,
+              projections.front()->binding().runtime_unit_id);
+  }
+  FakePlannerSceneProjectionResolver projection_resolver(projection_clients);
+  TestCellAdmissionPort cell_admission;
+  LogicalSceneOwner owner(directory.path() / "logical-scene.sqlite3",
+                          admission, publication_reader, bundle_source,
+                          projection_resolver, cell_admission);
+  auto active = FinalizeNativeCandidate(
+      owner, publication_reader, admission, *candidate.bundle,
+      native_bindings, "apply-frame-owner-only");
+  for (auto &participant : projections) {
+    participant->Reset(active, FakePlannerSceneProjection::Mode::kCommit);
+  }
+
+  // Each projection would read a different measured sample of an arm at rest.
+  for (std::size_t index = 0U; index < projections.size(); ++index) {
+    projections[index]->SetFrameResolution(
+        core::Pose3DTO{{1.0 + 1.0e-5 * static_cast<double>(index), 2.0, 3.0},
+                       {0.0, 0.0, 0.0, 1.0}});
+  }
+  auto add = AddBoxRequest(active, admission.cell_id(),
+                           "scene-request-owner-only-frame");
+  std::get<core::AddObjectRequestDTO>(add.operation).frame_ref =
+      core::ComponentSceneFrameRefDTO{
+          core::ControllableComponentId("component.1"),
+          core::ModelInstanceId("model.1"),
+          core::FrameRoleId("tool_frame")};
+  const auto added = owner.Commit(add);
+  ASSERT_TRUE(added.success)
+      << (added.error.has_value() ? added.error->message : "missing error");
+  const auto snapshot = owner.LogicalSnapshot();
+  ASSERT_EQ(snapshot->objects.size(), 1U);
+  const auto *fixed = std::get_if<core::CellFixedSceneObjectPlacementDTO>(
+      &snapshot->objects.front().placement);
+  ASSERT_NE(fixed, nullptr);
+  EXPECT_DOUBLE_EQ(fixed->pose_in_cell.position_m.x_m, 1.25);
+  EXPECT_DOUBLE_EQ(fixed->pose_in_cell.position_m.y_m, 1.5);
+  EXPECT_DOUBLE_EQ(fixed->pose_in_cell.position_m.z_m, 3.75);
+  // Only the owning unit's view answered, exactly once.
+  EXPECT_EQ(projections.front()->frame_resolution_calls(), 1U);
+  for (std::size_t index = 1U; index < projections.size(); ++index) {
+    EXPECT_EQ(projections[index]->frame_resolution_calls(), 0U);
+  }
+  for (const auto &participant : projections) {
+    EXPECT_EQ(participant->retained_lease_count(), 0U);
+  }
+}
+
+TEST(CanonicalEmptySceneOwner,
+     FrameOwnershipAcrossRuntimeUnitsIsTypedNeverCompared) {
+  using scene::logical_scene_owner_detail::RequiredSceneProjection;
+  using scene::logical_scene_owner_detail::ResolveFrameAcrossProjections;
+  using scene::logical_scene_owner_detail::SceneRequestRejectionError;
+  const ProjectionRevisionDTO active{
+      core::RetainedBundleId(Digest('b').value()),
+      GraphRevision(Digest('c').value()),
+      core::SceneRevision{core::SceneId(Digest('d').value()), 1U, Digest('a')},
+  };
+  const auto make = [&](const std::string &provider, const std::string &unit) {
+    auto projection = std::make_shared<FakePlannerSceneProjection>(
+        ProjectionNativeRuntimeBindingDTO{
+            core::CapabilityProviderBindingId("provider-" + provider),
+            core::CapabilityProviderBindingRevision("binding-revision"),
+            core::RuntimeUnitId(unit), core::RuntimeEpoch("epoch-" + unit)});
+    projection->Reset(active, FakePlannerSceneProjection::Mode::kCommit);
+    return projection;
+  };
+  // Two projections share the robot's unit; a gripper unit hosts a third.
+  const auto robot_a = make("a", "runtime.robot");
+  const auto robot_b = make("b", "runtime.robot");
+  const auto gripper = make("c", "runtime.gripper");
+  robot_a->SetFrameResolution(
+      core::Pose3DTO{{1.0, 2.0, 3.0}, {0.0, 0.0, 0.0, 1.0}});
+  robot_b->SetFrameResolution(
+      core::Pose3DTO{{1.00004, 2.0, 3.0}, {0.0, 0.0, 0.0, 1.0}});
+  const auto health = [&](const auto &projection) {
+    return projection->ProjectionHealthForRevision(active);
+  };
+  const std::vector<RequiredSceneProjection> projections{
+      {robot_a, health(robot_a)},
+      {robot_b, health(robot_b)},
+      {gripper, health(gripper)}};
+  const core::SceneFrameResolutionSelectorDTO tcp{
+      core::TargetCarrierSceneFrameRefDTO{
+          core::ControllableComponentId("component.1"),
+          core::CommandTargetId("arm"), core::FrameRoleId("tcp")}};
+  const auto reject_missing = [](const auto &projection) {
+    projection->RejectFrameResolution(core::ErrorDTO{
+        "missing_reference", "frame is not owned here",
+        {{"reason", "kinematic_state_source_unavailable"}}});
+  };
+
+  // A non-owner declines; the owner answers once from one view.
+  reject_missing(gripper);
+  const auto owned =
+      ResolveFrameAcrossProjections(tcp, active, projections, "owner");
+  ASSERT_TRUE(owned.has_value());
+  EXPECT_DOUBLE_EQ(owned->frame_pose_in_cell.position_m.x_m, 1.0);
+  EXPECT_EQ(robot_a->frame_resolution_calls(), 1U);
+  EXPECT_EQ(robot_b->frame_resolution_calls(), 0U);
+  EXPECT_EQ(gripper->frame_resolution_calls(), 1U);
+
+  // Two runtime units claiming one robot frame is a typed configuration
+  // error, whatever their poses.
+  gripper->Reset(active, FakePlannerSceneProjection::Mode::kCommit);
+  gripper->SetFrameResolution(
+      core::Pose3DTO{{1.0, 2.0, 3.0}, {0.0, 0.0, 0.0, 1.0}});
+  try {
+    static_cast<void>(
+        ResolveFrameAcrossProjections(tcp, active, projections, "dual"));
+    FAIL() << "dual robot-frame ownership resolved";
+  } catch (const SceneRequestRejectionError &error) {
+    EXPECT_EQ(error.code(), "missing_reference");
+    EXPECT_EQ(error.details().at("reason"), "scene_frame_owner_ambiguous");
+  }
+
+  // Cell and passive fixture frames are Scene-owned static geometry: every
+  // unit that answers must agree exactly, and the agreed frame is served.
+  const core::SceneFrameResolutionSelectorDTO fixture{
+      std::in_place_type<core::SceneFrameRefDTO>,
+      core::SceneFrameRefDTO{core::PassiveModelSceneFrameRefDTO{
+          core::ModelInstanceId("fixture.1"), core::FrameRoleId("origin")}}};
+  gripper->SetFrameResolution(
+      core::Pose3DTO{{1.0, 2.0, 3.0}, {0.0, 0.0, 0.0, 1.0}});
+  const auto static_frame =
+      ResolveFrameAcrossProjections(fixture, active, projections, "fixture");
+  ASSERT_TRUE(static_frame.has_value());
+  EXPECT_DOUBLE_EQ(static_frame->frame_pose_in_cell.position_m.x_m, 1.0);
+
+  // Two units that disagree on a static fixture frame are refused.
+  gripper->SetFrameResolution(
+      core::Pose3DTO{{1.0, 2.0, 3.5}, {0.0, 0.0, 0.0, 1.0}});
+  try {
+    static_cast<void>(ResolveFrameAcrossProjections(fixture, active,
+                                                    projections, "fixture-x"));
+    FAIL() << "disagreeing static frame resolved";
+  } catch (const SceneRequestRejectionError &error) {
+    EXPECT_EQ(error.code(), "missing_reference");
+    EXPECT_EQ(error.details().at("reason"),
+              "scene_frame_resolution_ambiguous");
+  }
+  for (const auto &projection : {robot_a, robot_b, gripper}) {
+    EXPECT_EQ(projection->retained_lease_count(), 0U);
+  }
 }
 
 TEST(CanonicalEmptySceneOwner,
@@ -6710,7 +7020,9 @@ TEST(CanonicalEmptySceneOwnerProviderFreshness,
   added_object.pose = core::Pose3DTO{{1.5, 2.0, 3.25}, {0, 0, 0, 1}};
   ASSERT_TRUE(owner.Commit(add).success);
   const auto attach_with = [&](const std::string &id,
-                               const core::CarriedObjectGraspLostBoundDTO &bound) {
+                               const std::optional<core::CarriedObjectGraspLostBoundDTO> &bound,
+                               const std::optional<core::GraspLostResponseDTO>
+                                   &response = std::nullopt) {
     const auto active = owner.CurrentProjectionRevision();
     core::SceneTransactionRequestDTO attach{
         SceneRequestContext(id, active),
@@ -6725,6 +7037,7 @@ TEST(CanonicalEmptySceneOwnerProviderFreshness,
             {core::CollisionBodyRoleId("finger")},
             {structural_revision},
             bound,
+            response,
         },
         core::AdmissionGeneration(1U),
     };
@@ -6737,12 +7050,30 @@ TEST(CanonicalEmptySceneOwnerProviderFreshness,
         "scene.carried_attachment"};
     return owner.Commit(attach);
   };
-  const auto invalid = attach_with("grasp-bound-invalid", {0.0, 0.26});
+  const auto invalid = attach_with(
+      "grasp-bound-invalid", core::CarriedObjectGraspLostBoundDTO{0.0, 0.26});
   ASSERT_FALSE(invalid.success);
   EXPECT_FALSE(
       owner.GetObjectState(core::SceneResourceId("carried-box")).attached);
+  // A non-default response needs a bound.
+  const core::GraspLostResponseDTO keyed{false, false, "part_lost", true};
+  const auto unbounded =
+      attach_with("grasp-response-unbounded", std::nullopt, keyed);
+  ASSERT_FALSE(unbounded.success);
+  EXPECT_FALSE(
+      owner.GetObjectState(core::SceneResourceId("carried-box")).attached);
+  // An alarm without the Stop is refused.
+  const auto alarm_without_stop =
+      attach_with("grasp-response-alarm-no-stop",
+                  core::CarriedObjectGraspLostBoundDTO{0.03, 0.26},
+                  core::GraspLostResponseDTO{true, false, std::nullopt, true});
+  ASSERT_FALSE(alarm_without_stop.success);
+  EXPECT_FALSE(
+      owner.GetObjectState(core::SceneResourceId("carried-box")).attached);
 
-  const auto attached = attach_with("grasp-bound-attach", {0.03, 0.26});
+  const auto attached = attach_with(
+      "grasp-bound-attach", core::CarriedObjectGraspLostBoundDTO{0.03, 0.26},
+      keyed);
   ASSERT_TRUE(attached.success)
       << (attached.error.has_value() ? attached.error->message
                                      : "missing error");
@@ -6752,6 +7083,7 @@ TEST(CanonicalEmptySceneOwnerProviderFreshness,
   ASSERT_TRUE(row.grasp_lost_check.has_value());
   EXPECT_EQ(row.grasp_lost_check->bound,
             (core::CarriedObjectGraspLostBoundDTO{0.03, 0.26}));
+  EXPECT_EQ(row.grasp_lost_check->on_grasp_lost, std::optional(keyed));
 
   // A measured update moves the offset; the bound stays.
   const auto expected = owner.CurrentProjectionRevision();

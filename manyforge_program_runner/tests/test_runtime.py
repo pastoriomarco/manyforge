@@ -4,23 +4,32 @@ from __future__ import annotations
 
 from copy import deepcopy
 from dataclasses import replace
+from pathlib import Path
 from threading import Barrier, Event, Thread
 from types import SimpleNamespace
-from typing import Any, Mapping
+from typing import Any, Callable, Mapping
 
 import pytest
 
+from manyforge_behavior.canonical_artifact import compute_content_identity
 from manyforge_behavior.node_availability import AvailabilityFact, NodeExecutionReadiness
+from manyforge_behavior.node_environment import build_node_environment
 from manyforge_behavior.orchestration_ports import (
+    PersistentValueUncertainError,
     ProgramRunScopeSnapshot,
     ProgramRunScopeState,
 )
+from manyforge_behavior.orchestration_values import (
+    ProgramValueStore,
+)
+from manyforge_behavior.program import Program
 from manyforge_behavior.program_run_owner import (
     ProgramRunOwnerError,
     ProgramRunOwnerOutcomeUnknownError,
     ProgramRunOwnerRecoveryIncompleteError,
     ProgramRunOwnerStaleRevisionError,
 )
+from manyforge_behavior.orchestration_values import ProgramValueUncertainError
 from manyforge_behavior.program_scheduling import ProgramSchedulingError
 from manyforge_headless_api.models import (
     CycleRecoveryActionRequest,
@@ -39,13 +48,23 @@ from manyforge_program_runner.runtime import (
     ProgramRunnerError,
     ProgramRuntime,
 )
+from manyforge_program_runner.interrupt_state_mirror import (
+    InterruptRuleStateMirror,
+    RuleCatalog,
+)
+from manyforge_program_runner.persistent_keys import (
+    CommittedActivation,
+    PersistentKeyRegister,
+)
 from manyforge_headless_api.client import HeadlessClientError
 from manyforge_headless_api.cell_admission import (
     CellAdmissionError,
     cell_admission_owner_epoch_reconciliation_evidence_digest,
 )
 from manyforge_program_runner.cycle_journal import ProgramCycleJournal
-from manyforge_program_runner.runtime_controls import ProgramRuntimeControls
+from manyforge_program_runner.runtime_controls import (
+    ProgramRuntimeControls,
+)
 from manyforge_program_runner.models import (
     ProgramCycleResetRequest,
     ProgramNodeAvailabilityRequest,
@@ -56,6 +75,7 @@ from manyforge_behavior.nodes.stop_policy import OperatorMotionStopSnapshot
 
 _DIGEST_A = "sha256:" + "a" * 64
 _DIGEST_B = "sha256:" + "b" * 64
+_ROOT = Path(__file__).resolve().parents[2]
 _ACTIVE_STATES = {
     "running",
     "intervention_required",
@@ -2085,6 +2105,773 @@ def test_immediate_run_after_idle_reset_uses_server_generation_and_exact_program
         runtime.shutdown()
 
 
+class _CarriedObjectLossStore:
+    def __init__(
+        self,
+        declarations: Mapping[str, Any],
+        *,
+        failure: Exception | None = None,
+    ) -> None:
+        self.program = SimpleNamespace(blackboard_keys=dict(declarations))
+        self.writes: list[tuple[str, bool, Mapping[str, Any]]] = []
+        self.failure = failure
+
+    def write(self, key: str, value: bool, *, metadata: Mapping[str, Any]) -> None:
+        if self.failure is not None:
+            raise self.failure
+        self.writes.append((key, value, dict(metadata)))
+
+
+def _carried_object_last_loss(
+    event_id: str,
+    *,
+    key: str = "part_lost",
+) -> dict[str, Any]:
+    return {
+        "command_target_id": "gripper.command",
+        "controllable_component_id": "robot.1",
+        "loss_event_id": event_id,
+        "set_key": key,
+    }
+
+
+def _carried_object_loss_runtime(
+    initial_losses: object,
+    stores: Mapping[str, _CarriedObjectLossStore] | _CarriedObjectLossStore,
+) -> tuple[ProgramRuntime, dict[str, object]]:
+    from threading import Lock
+
+    snapshot: dict[str, object] = {"last_losses": initial_losses, "rows": ()}
+    runtime = object.__new__(ProgramRuntime)
+    runtime._interrupt_state_run_id = None  # noqa: SLF001
+    runtime._carried_object_lost_run_id = None  # noqa: SLF001
+    runtime._carried_object_lost_seen_event_ids = set()  # noqa: SLF001
+    runtime._grasp_lost_mirror_lock = Lock()  # noqa: SLF001
+    runtime._interrupt_state_mirror = SimpleNamespace(  # noqa: SLF001
+        carried_object_last_losses=lambda: snapshot["last_losses"],
+        carried_object_lost_signals=lambda: snapshot["rows"],
+        catalog=lambda: None,
+        poll=lambda: None,
+    )
+    runtime._carried_object_lost_run_active = False  # noqa: SLF001
+    run_ids = tuple(stores) if isinstance(stores, Mapping) else ("run.1",)
+    runtime._runtime_controls_lock = Lock()  # noqa: SLF001
+    runtime._runtime_controls = {  # noqa: SLF001
+        run_id: ProgramRuntimeControls(
+            {
+                "program_run_id": run_id,
+                "program_id": "program.1",
+                "program_revision": _DIGEST_A,
+                "program_binding_id": _DIGEST_B,
+                "retained_bundle_id": _DIGEST_A,
+                "graph_revision": _DIGEST_B,
+                "node_environment_digest": _DIGEST_A,
+            }
+        )
+        for run_id in run_ids
+    }
+    runtime._bbkey_publishers_lock = Lock()  # noqa: SLF001
+    runtime._bbkey_publishers = {}  # noqa: SLF001
+    runtime._owner = SimpleNamespace(  # noqa: SLF001
+        value_store=lambda run_id: (
+            stores[run_id]
+            if isinstance(stores, Mapping)
+            else stores
+        )
+    )
+    return runtime, snapshot
+
+
+def _install_startable_loss_mirror(
+    runtime: ProgramRuntime,
+    owner: Any,
+    store: ProgramValueStore | _CarriedObjectLossStore,
+) -> dict[str, object]:
+    snapshot: dict[str, object] = {"last_losses": (), "rows": ()}
+    owner.value_store = lambda _program_run_id: store
+    runtime._interrupt_state_mirror = SimpleNamespace(  # noqa: SLF001
+        carried_object_last_losses=lambda: snapshot["last_losses"],
+        carried_object_lost_signals=lambda: snapshot["rows"],
+        catalog=lambda: RuleCatalog(
+            "execution.epoch.1", None, 1, _DIGEST_A, _DIGEST_B, (), ()
+        ),
+        poll=lambda: None,
+    )
+    return snapshot
+
+
+def _writable_bool_declaration() -> SimpleNamespace:
+    return SimpleNamespace(type="bool", access="write", expression=None)
+
+
+def _real_persistent_loss_program() -> Program:
+    environment = build_node_environment()
+    catalog = environment.catalog
+    document = Program(
+        _ROOT / "examples/pick_and_place_minimal.program.yaml", catalog
+    ).to_dict()
+    document["blackboard"] = {
+        "namespaces": [],
+        "keys": [
+            {
+                "key": "part_lost",
+                "type": "bool",
+                "access": "read_write",
+                "persistence": "persistent",
+            }
+        ],
+    }
+    document["program_revision"] = compute_content_identity(
+        deepcopy(document),
+        own_field="program_revision",
+        identity_domain="program-revision",
+        api_version="manyforge.program.v2",
+    )
+    return Program.from_dict(document, catalog)
+
+
+def _real_persistent_loss_store(
+    persistent_commit: Callable[[Any, Any, Mapping[str, Any]], None],
+) -> ProgramValueStore:
+    return ProgramValueStore(
+        _real_persistent_loss_program(), persistent_commit=persistent_commit
+    )
+
+
+def test_carried_object_loss_known_last_losses_at_run_start_are_already_seen() -> None:
+    loss = _carried_object_last_loss("loss.before-run")
+    store = _CarriedObjectLossStore({"part_lost": _writable_bool_declaration()})
+    runtime, _snapshot = _carried_object_loss_runtime((loss,), store)
+
+    runtime._begin_carried_object_lost_run("run.1")  # noqa: SLF001
+    runtime._activate_carried_object_lost_run("run.1")  # noqa: SLF001
+    runtime._mirror_carried_object_lost_signals(())  # noqa: SLF001
+
+    assert runtime._carried_object_lost_seen_event_ids == {"loss.before-run"}  # noqa: SLF001
+    assert store.writes == []
+
+
+def test_carried_object_lost_unknown_at_run_start_reports_first_known_losses() -> None:
+    loss = _carried_object_last_loss("loss.after-unknown-start")
+    store = _CarriedObjectLossStore({"part_lost": _writable_bool_declaration()})
+    runtime, snapshot = _carried_object_loss_runtime(None, store)
+
+    runtime._begin_carried_object_lost_run("run.1")  # noqa: SLF001
+    runtime._activate_carried_object_lost_run("run.1")  # noqa: SLF001
+    runtime._mirror_carried_object_lost_signals(None)  # noqa: SLF001
+    assert runtime._carried_object_lost_seen_event_ids == set()  # noqa: SLF001
+
+    snapshot["last_losses"] = (loss,)
+    runtime._mirror_carried_object_lost_signals(())  # noqa: SLF001
+
+    assert [write[:2] for write in store.writes] == [("part_lost", True)]
+    assert store.writes[0][2] == {
+        "writer": "grasp_lost",
+        "loss_event_id": "loss.after-unknown-start",
+    }
+
+
+def test_carried_object_lost_repeated_loss_and_new_event_for_key() -> None:
+    first = _carried_object_last_loss("loss.first")
+    second = _carried_object_last_loss("loss.second")
+    store = _CarriedObjectLossStore({"part_lost": _writable_bool_declaration()})
+    runtime, _snapshot = _carried_object_loss_runtime((), store)
+    runtime._begin_carried_object_lost_run("run.1")  # noqa: SLF001
+    runtime._activate_carried_object_lost_run("run.1")  # noqa: SLF001
+
+    _snapshot["last_losses"] = (first,)
+    runtime._mirror_carried_object_lost_signals(())  # noqa: SLF001
+    runtime._mirror_carried_object_lost_signals(None)  # noqa: SLF001
+    runtime._mirror_carried_object_lost_signals(())  # noqa: SLF001
+    assert [write[:2] for write in store.writes] == [("part_lost", True)]
+
+    # A known empty snapshot of current rows does not erase the durable last
+    # loss. A later event for this key replaces it with a new event ID.
+    _snapshot["last_losses"] = (second,)
+    runtime._mirror_carried_object_lost_signals(())  # noqa: SLF001
+
+    assert [write[:2] for write in store.writes] == [
+        ("part_lost", True),
+        ("part_lost", True),
+    ]
+    assert runtime._carried_object_lost_seen_event_ids == {"loss.second"}  # noqa: SLF001
+
+
+def test_mirror_delivers_cleared_losses_per_key_and_unknown_stays_unknown() -> None:
+    first = _carried_object_last_loss("loss.first-key", key="part_lost")
+    second = _carried_object_last_loss("loss.second-key", key="other_lost")
+    store = _CarriedObjectLossStore(
+        {
+            "part_lost": _writable_bool_declaration(),
+            "other_lost": _writable_bool_declaration(),
+        }
+    )
+    runtime, _snapshot = _carried_object_loss_runtime((), store)
+    mirror = InterruptRuleStateMirror(
+        owner_epoch=lambda: "kernel.1",
+        read_events=lambda _owner, _after: {},
+        on_change=lambda _states: None,
+        on_carried_object_lost=runtime._mirror_carried_object_lost_signals,  # noqa: SLF001
+    )
+    runtime._interrupt_state_mirror = mirror  # noqa: SLF001
+
+    def apply_state(last_losses: tuple[Mapping[str, Any], ...]) -> None:
+        mirror.apply_stream_message(
+            {
+                "type": "snapshot" if mirror.carried_object_last_losses() is None else "state",
+                "owner_epoch": "kernel.1",
+                "cursor": 0,
+                "reason": "subscribed",
+                "state": {
+                    "interrupt_rule_catalog": None,
+                    "interrupt_rule_state_baseline": None,
+                    "carried_object_lost_signals": [],
+                    "carried_object_last_losses": list(last_losses),
+                },
+            }
+        )
+
+    apply_state(())
+    assert mirror.carried_object_lost_signals() == ()
+    runtime._begin_carried_object_lost_run("run.1")  # noqa: SLF001
+    runtime._activate_carried_object_lost_run("run.1")  # noqa: SLF001
+
+    # The current rows remain clear, but the per-key loss state keeps both
+    # independent losses until each key is lost again.
+    apply_state((first, second))
+    assert mirror.carried_object_lost_signals() == ()
+    assert mirror.carried_object_last_losses() == (first, second)
+    assert [write[:2] for write in store.writes] == [
+        ("part_lost", True),
+        ("other_lost", True),
+    ]
+    seen = set(runtime._carried_object_lost_seen_event_ids)  # noqa: SLF001
+    assert seen == {"loss.first-key", "loss.second-key"}
+
+    mirror.apply_stream_message(
+        {"type": "gap", "owner_epoch": "kernel.2", "reason": "owner_epoch_changed"}
+    )
+    assert mirror.carried_object_last_losses() is None
+    # A known-row notification during an unknown loss state cannot erase the
+    # last-known IDs or cause another write.
+    runtime._mirror_carried_object_lost_signals(())  # noqa: SLF001
+    assert runtime._carried_object_lost_seen_event_ids == seen  # noqa: SLF001
+    assert len(store.writes) == 2
+
+
+def test_start_stages_pre_cas_loss_until_admission_request_completes(
+    monkeypatch: pytest.MonkeyPatch, tmp_path
+) -> None:
+    runtime, journal, _admission, owner, _host = _terminal_cycle_reset_runtime(
+        monkeypatch,
+        tmp_path,
+        "runner.loss-start-success.1",
+        finish_cycle=False,
+    )
+    store = _CarriedObjectLossStore({"part_lost": _writable_bool_declaration()})
+    state = _install_startable_loss_mirror(runtime, owner, store)
+    original_transition = journal.transition
+    intercepted: list[bool] = []
+    loss = _carried_object_last_loss("loss.before-running-cas")
+
+    def transition(**kwargs: Any) -> None:
+        if kwargs.get("state") == "running":
+            assert journal.read().state == "starting"
+            assert runtime._carried_object_lost_run_id == "program-cycle.1"  # noqa: SLF001
+            assert runtime._interrupt_state_run_id is None  # noqa: SLF001  (SX-261: not exposed before admission)
+            assert runtime._carried_object_lost_run_active is False  # noqa: SLF001
+            state["last_losses"] = (loss,)
+            runtime._mirror_carried_object_lost_signals(())  # noqa: SLF001
+            assert store.writes == []
+            intercepted.append(True)
+        original_transition(**kwargs)
+
+    original_complete_request = journal.complete_request
+    completed: list[bool] = []
+
+    def complete_request(**kwargs: Any) -> Any:
+        # SX-263: the staged loss is still unwritten when admission completes.
+        assert store.writes == []
+        assert runtime._carried_object_lost_run_active is False  # noqa: SLF001
+        completed.append(True)
+        return original_complete_request(**kwargs)
+
+    monkeypatch.setattr(journal, "transition", transition)
+    monkeypatch.setattr(journal, "complete_request", complete_request)
+    try:
+        result = runtime.start_run(_start_request())
+
+        assert intercepted == [True]
+        assert completed == [True]
+        assert result["state"] == "running"
+        assert journal.read().state == "running"
+        assert runtime._carried_object_lost_run_active is True  # noqa: SLF001
+        assert [write[:2] for write in store.writes] == [("part_lost", True)]
+        assert runtime._carried_object_lost_seen_event_ids == {  # noqa: SLF001
+            "loss.before-running-cas"
+        }
+    finally:
+        runtime.shutdown()
+
+
+def test_start_complete_request_failure_never_writes_the_key_and_retires_binding(
+    monkeypatch: pytest.MonkeyPatch, tmp_path
+) -> None:
+    """SX-263: a raising admission completion leaves the staged loss unwritten."""
+
+    runtime, journal, _admission, owner, _host = _terminal_cycle_reset_runtime(
+        monkeypatch,
+        tmp_path,
+        "runner.loss-start-complete-fails.1",
+        finish_cycle=False,
+    )
+    store = _CarriedObjectLossStore({"part_lost": _writable_bool_declaration()})
+    state = _install_startable_loss_mirror(runtime, owner, store)
+    original_transition = journal.transition
+    staged: list[bool] = []
+
+    def transition(**kwargs: Any) -> None:
+        if kwargs.get("state") == "running":
+            state["last_losses"] = (_carried_object_last_loss("loss.before-failed-complete"),)
+            runtime._mirror_carried_object_lost_signals(())  # noqa: SLF001
+            staged.append(True)
+        original_transition(**kwargs)
+
+    original_complete_request = journal.complete_request
+    bindings_at_complete: list[str | None] = []
+
+    def fail_complete_request(**kwargs: Any) -> Any:
+        # Only the admission completion fails; the failed-start
+        # terminalization records its own result through the journal.
+        bindings_at_complete.append(runtime._carried_object_lost_run_id)  # noqa: SLF001
+        if len(bindings_at_complete) == 1:
+            runtime._mirror_carried_object_lost_signals(())  # noqa: SLF001
+            assert store.writes == []
+            raise RuntimeError("admission completion failed")
+        return original_complete_request(**kwargs)
+
+    monkeypatch.setattr(journal, "transition", transition)
+    monkeypatch.setattr(journal, "complete_request", fail_complete_request)
+    try:
+        with pytest.raises((ProgramRunnerError, RuntimeError)):
+            runtime.start_run(_start_request())
+
+        assert staged == [True]
+        assert bindings_at_complete[0] == "program-cycle.1"
+        assert store.writes == []
+        assert runtime._carried_object_lost_run_id is None  # noqa: SLF001
+        assert runtime._carried_object_lost_run_active is False  # noqa: SLF001
+        # A later known loss state cannot reach the retired binding.
+        runtime._mirror_carried_object_lost_signals(())  # noqa: SLF001
+        assert store.writes == []
+    finally:
+        runtime.shutdown()
+
+
+def test_stop_won_running_cas_discards_inactive_loss_binding(
+    monkeypatch: pytest.MonkeyPatch, tmp_path
+) -> None:
+    runtime, journal, _admission, owner, _host = _terminal_cycle_reset_runtime(
+        monkeypatch,
+        tmp_path,
+        "runner.loss-start-stop-cas.1",
+        finish_cycle=False,
+    )
+    store = _CarriedObjectLossStore({"part_lost": _writable_bool_declaration()})
+    state = _install_startable_loss_mirror(runtime, owner, store)
+    original_transition = journal.transition
+    stop_acceptances: list[dict[str, Any]] = []
+    loss = _carried_object_last_loss("loss.before-stop-won-cas")
+    monkeypatch.setattr(runtime._native.scope, "request_stop", lambda *_args, **_kwargs: None)
+
+    def transition(**kwargs: Any) -> None:
+        if kwargs.get("state") == "running" and not stop_acceptances:
+            assert runtime._carried_object_lost_run_id == "program-cycle.1"  # noqa: SLF001
+            assert runtime._carried_object_lost_run_active is False  # noqa: SLF001
+            state["last_losses"] = (loss,)
+            runtime._mirror_carried_object_lost_signals(())  # noqa: SLF001
+            assert store.writes == []
+            stop_acceptances.append(
+                runtime.stop_run(
+                    "program-cycle.1",
+                    ProgramRunStopRequest.model_validate(
+                        {
+                            "request_id": "stop.before-running-cas",
+                            "request_owner_epoch": "composer.epoch.1",
+                            "source_label": "operator_ui",
+                            "correlation_id": None,
+                            "program_run_id": "program-cycle.1",
+                            "expected_owner_epoch": runtime.owner_epoch,
+                            "reason": "Stop wins the Running CAS",
+                        }
+                    ),
+                )
+            )
+            assert journal.read().state == "stopping"
+        original_transition(**kwargs)
+
+    monkeypatch.setattr(journal, "transition", transition)
+    try:
+        with pytest.raises(ProgramRunnerError):
+            runtime.start_run(_start_request())
+
+        assert stop_acceptances and stop_acceptances[0]["state"] == "stopping"
+        assert journal.read().state == "terminal_awaiting_reset"
+        assert store.writes == []
+        assert runtime._carried_object_lost_run_id is None  # noqa: SLF001
+        assert runtime._carried_object_lost_run_active is False  # noqa: SLF001
+    finally:
+        runtime.shutdown()
+
+
+@pytest.mark.parametrize("terminalization", ["normal", "early_return", "raises"])
+def test_post_cas_start_failure_discards_inactive_binding_on_all_exits(
+    monkeypatch: pytest.MonkeyPatch, tmp_path, terminalization: str
+) -> None:
+    runtime, journal, _admission, owner, host = _terminal_cycle_reset_runtime(
+        monkeypatch,
+        tmp_path,
+        f"runner.loss-start-failed-{terminalization}.1",
+        finish_cycle=False,
+    )
+    store = _CarriedObjectLossStore({"part_lost": _writable_bool_declaration()})
+    state = _install_startable_loss_mirror(runtime, owner, store)
+
+    def fail_schedule(program_run_id: str) -> None:
+        assert program_run_id == "program-cycle.1"
+        assert journal.read().state == "running"
+        assert runtime._carried_object_lost_run_active is False  # noqa: SLF001
+        state["last_losses"] = (
+            _carried_object_last_loss(f"loss.after-cas-{terminalization}"),
+        )
+        runtime._mirror_carried_object_lost_signals(())  # noqa: SLF001
+        assert store.writes == []
+        raise RuntimeError("host schedule failed after the Running CAS")
+
+    monkeypatch.setattr(host, "schedule", fail_schedule)
+    if terminalization == "early_return":
+        monkeypatch.setattr(
+            runtime,
+            "_terminalize_failed_start",
+            lambda *_args, **_kwargs: None,
+        )
+    elif terminalization == "raises":
+        def fail_terminalization(*_args: Any, **_kwargs: Any) -> None:
+            raise RuntimeError("terminalization failed")
+
+        monkeypatch.setattr(runtime, "_terminalize_failed_start", fail_terminalization)
+
+    try:
+        with pytest.raises(RuntimeError if terminalization == "raises" else ProgramRunnerError):
+            runtime.start_run(_start_request())
+
+        assert store.writes == []
+        assert runtime._carried_object_lost_run_id is None  # noqa: SLF001
+        assert runtime._carried_object_lost_run_active is False  # noqa: SLF001
+        if terminalization == "normal":
+            assert journal.read().state == "terminal_awaiting_reset"
+        assert not runtime._carried_object_lost_seen_event_ids  # noqa: SLF001
+    finally:
+        runtime.shutdown()
+
+
+def test_loss_writes_during_stopping_and_terminal_until_reset(
+    monkeypatch: pytest.MonkeyPatch, tmp_path
+) -> None:
+    runtime, journal, _admission, owner, host = _terminal_cycle_reset_runtime(
+        monkeypatch,
+        tmp_path,
+        "runner.loss-stop-terminal.1",
+        finish_cycle=False,
+    )
+    store = _CarriedObjectLossStore(
+        {
+            "part_lost": _writable_bool_declaration(),
+            "other_lost": _writable_bool_declaration(),
+            "third_lost": _writable_bool_declaration(),
+        }
+    )
+    state = _install_startable_loss_mirror(runtime, owner, store)
+    try:
+        runtime.start_run(_start_request())
+        assert runtime._carried_object_lost_run_active is True  # noqa: SLF001
+
+        original_stop_run = host.stop_run
+        during_stop = _carried_object_last_loss("loss.during-stopping", key="part_lost")
+
+        def stop_while_loss_arrives(
+            program_run_id: str, *, reason: str | None, stop_request_id: str | None = None
+        ) -> _Snapshot:
+            assert journal.read().state == "stopping"
+            state["last_losses"] = (during_stop,)
+            runtime._mirror_carried_object_lost_signals(())  # noqa: SLF001
+            assert [write[:2] for write in store.writes] == [("part_lost", True)]
+            return original_stop_run(
+                program_run_id, reason=reason, stop_request_id=stop_request_id
+            )
+
+        monkeypatch.setattr(host, "stop_run", stop_while_loss_arrives)
+        stopped = runtime.stop_run(
+            "program-cycle.1",
+            ProgramRunStopRequest.model_validate(
+                {
+                    "request_id": "stop.loss-terminal",
+                    "request_owner_epoch": "composer.epoch.1",
+                    "source_label": "operator_ui",
+                    "correlation_id": None,
+                    "program_run_id": "program-cycle.1",
+                    "expected_owner_epoch": runtime.owner_epoch,
+                    "reason": "test stop lifecycle delivery",
+                }
+            ),
+        )
+        assert stopped["state"] == "stopped"
+        assert journal.read().state == "terminal_awaiting_reset"
+
+        after_terminal = _carried_object_last_loss(
+            "loss.after-terminal", key="other_lost"
+        )
+        state["last_losses"] = (during_stop, after_terminal)
+        runtime._mirror_carried_object_lost_signals(())  # noqa: SLF001
+        assert [write[:2] for write in store.writes] == [
+            ("part_lost", True),
+            ("other_lost", True),
+        ]
+        assert runtime._carried_object_lost_run_id == "program-cycle.1"  # noqa: SLF001
+
+        # The explicit Run Reset retires the consumer binding.
+        runtime._reset_bbkey_publication("program-cycle.1")  # noqa: SLF001
+        state["last_losses"] = (
+            during_stop,
+            after_terminal,
+            _carried_object_last_loss("loss.after-reset", key="third_lost"),
+        )
+        runtime._mirror_carried_object_lost_signals(())  # noqa: SLF001
+        assert len(store.writes) == 2
+        assert runtime._carried_object_lost_run_id is None  # noqa: SLF001
+    finally:
+        runtime.shutdown()
+
+
+def test_terminal_carried_loss_restores_from_persistent_register_for_next_run(
+    monkeypatch: pytest.MonkeyPatch, tmp_path
+) -> None:
+    runtime, journal, _admission, owner, _host = _terminal_cycle_reset_runtime(
+        monkeypatch,
+        tmp_path,
+        "runner.loss-terminal-persistent.1",
+        finish_cycle=False,
+    )
+    program = _real_persistent_loss_program()
+    project_path = "/projects/terminal-loss-persistence.scenario"
+    register = PersistentKeyRegister(tmp_path / "persistent-keys.json")
+    activation_digest = "sha256:" + "c" * 64
+    register.reconcile(
+        CommittedActivation(
+            record_digest=activation_digest,
+            project_path=project_path,
+            declarations=program.blackboard_keys,
+            committed_applies={activation_digest: project_path},
+        )
+    )
+    current_store = ProgramValueStore.from_program(
+        program,
+        project_path=project_path,
+        register=register,
+        program_run_id="program-cycle.1",
+    )
+    state = _install_startable_loss_mirror(runtime, owner, current_store)
+    try:
+        runtime.start_run(_start_request())
+        stopped = runtime.stop_run(
+            "program-cycle.1",
+            ProgramRunStopRequest.model_validate(
+                {
+                    "request_id": "stop.loss-terminal-persistent",
+                    "request_owner_epoch": "composer.epoch.1",
+                    "source_label": "operator_ui",
+                    "correlation_id": None,
+                    "program_run_id": "program-cycle.1",
+                    "expected_owner_epoch": runtime.owner_epoch,
+                    "reason": "test terminal persistent loss",
+                }
+            ),
+        )
+        assert stopped["state"] == "stopped"
+        assert journal.read().state == "terminal_awaiting_reset"
+
+        state["last_losses"] = (
+            _carried_object_last_loss(
+                "loss.after-terminal-persistent", key="part_lost"
+            ),
+        )
+        runtime._mirror_carried_object_lost_signals(())  # noqa: SLF001
+        assert current_store.read("part_lost") is True
+
+        next_run_store = ProgramValueStore.from_program(
+            program,
+            project_path=project_path,
+            register=register,
+            program_run_id="program-cycle.2",
+        )
+        assert next_run_store.read("part_lost") is True
+    finally:
+        runtime.shutdown()
+
+
+@pytest.mark.parametrize(
+    ("key", "declarations"),
+    [
+        ("undeclared", {}),
+        (
+            "read_only",
+            {
+                "read_only": SimpleNamespace(
+                    type="bool", access="read", expression=None
+                )
+            },
+        ),
+        (
+            "wrong_type",
+            {
+                "wrong_type": SimpleNamespace(
+                    type="int", access="write", expression=None
+                )
+            },
+        ),
+        (
+            "computed",
+            {
+                "computed": SimpleNamespace(
+                    type="bool", access="write", expression="true"
+                )
+            },
+        ),
+    ],
+)
+def test_carried_object_lost_invalid_key_is_logged_and_seen(
+    caplog: pytest.LogCaptureFixture,
+    key: str,
+    declarations: Mapping[str, Any],
+) -> None:
+    row = _carried_object_last_loss("loss.invalid-key", key=key)
+    store = _CarriedObjectLossStore(declarations)
+    runtime, _snapshot = _carried_object_loss_runtime((), store)
+    runtime._begin_carried_object_lost_run("run.1")  # noqa: SLF001
+    runtime._activate_carried_object_lost_run("run.1")  # noqa: SLF001
+
+    _snapshot["last_losses"] = (row,)
+    runtime._mirror_carried_object_lost_signals(())  # noqa: SLF001
+
+    assert store.writes == []
+    assert runtime._carried_object_lost_seen_event_ids == {"loss.invalid-key"}  # noqa: SLF001
+    assert "not a writable bool key" in caplog.text
+
+
+def test_old_attachment_loss_during_new_run_sets_current_key() -> None:
+    prior_loss = _carried_object_last_loss("loss.first-run")
+    loss_during_new_run = _carried_object_last_loss("loss.second-run")
+    declarations = {"part_lost": _writable_bool_declaration()}
+    old_run_store = _CarriedObjectLossStore(declarations)
+    current_run_store = _CarriedObjectLossStore(declarations)
+    runtime, snapshot = _carried_object_loss_runtime(
+        (), {"run.1": old_run_store, "run.2": current_run_store}
+    )
+
+    runtime._begin_carried_object_lost_run("run.1")  # noqa: SLF001
+    runtime._activate_carried_object_lost_run("run.1")  # noqa: SLF001
+    snapshot["last_losses"] = (prior_loss,)
+    runtime._mirror_carried_object_lost_signals(())  # noqa: SLF001
+    assert [write[2]["loss_event_id"] for write in old_run_store.writes] == [
+        "loss.first-run"
+    ]
+
+    # At the next Run boundary, the retained last-loss entry is already
+    # baseline state. A later event on the earlier-Run attachment updates the
+    # same per-key entry and belongs to Run 2.
+    runtime._begin_carried_object_lost_run("run.2")  # noqa: SLF001
+    runtime._activate_carried_object_lost_run("run.2")  # noqa: SLF001
+    snapshot["last_losses"] = (loss_during_new_run,)
+    runtime._mirror_carried_object_lost_signals(())  # noqa: SLF001
+
+    assert [write[2]["loss_event_id"] for write in old_run_store.writes] == [
+        "loss.first-run"
+    ]
+    assert [write[2]["loss_event_id"] for write in current_run_store.writes] == [
+        "loss.second-run"
+    ]
+
+
+def test_carried_object_lost_uncertain_write_is_seen_and_logged(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    attempts: list[str] = []
+
+    def uncertain_commit(_declaration, _value, _metadata) -> None:
+        attempts.append("write")
+        raise PersistentValueUncertainError("directory sync failed")
+
+    store = _real_persistent_loss_store(uncertain_commit)
+    runtime, snapshot = _carried_object_loss_runtime((), store)
+    runtime._begin_carried_object_lost_run("run.1")  # noqa: SLF001
+    runtime._activate_carried_object_lost_run("run.1")  # noqa: SLF001
+
+    snapshot["last_losses"] = (_carried_object_last_loss("loss.uncertain"),)
+    runtime._mirror_carried_object_lost_signals(())  # noqa: SLF001
+    runtime._mirror_carried_object_lost_signals(())  # noqa: SLF001
+
+    controls = runtime._runtime_controls["run.1"]  # noqa: SLF001
+    assert store.read("part_lost") is True
+    assert attempts == ["write"]
+    assert runtime._carried_object_lost_seen_event_ids == {  # noqa: SLF001
+        "loss.uncertain"
+    }
+    assert controls.snapshot()["audit"] == []
+    assert "grasp-lost key part_lost could not be written" in caplog.text
+
+
+def test_carried_object_lost_failed_write_is_logged_seen_and_other_keys_continue(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    store = _CarriedObjectLossStore(
+        {
+            "part_lost": _writable_bool_declaration(),
+            "other_lost": _writable_bool_declaration(),
+        }
+    )
+    attempts: list[str] = []
+
+    def write(key: str, value: bool, *, metadata: Mapping[str, Any]) -> None:
+        attempts.append(key)
+        if key == "part_lost":
+            raise RuntimeError("persistent register rejected the write")
+        store.writes.append((key, value, dict(metadata)))
+
+    store.write = write  # type: ignore[method-assign]
+    runtime, snapshot = _carried_object_loss_runtime((), store)
+    runtime._begin_carried_object_lost_run("run.1")  # noqa: SLF001
+    runtime._activate_carried_object_lost_run("run.1")  # noqa: SLF001
+
+    losses = (
+        _carried_object_last_loss("loss.failed", key="part_lost"),
+        _carried_object_last_loss("loss.continues", key="other_lost"),
+    )
+    snapshot["last_losses"] = losses
+    runtime._mirror_carried_object_lost_signals(())  # noqa: SLF001
+    assert "grasp-lost key part_lost could not be written" in caplog.text
+
+    # The known snapshot remains seen after a failed write, and a second
+    # valid key in that same snapshot is still handled.
+    runtime._mirror_carried_object_lost_signals(())  # noqa: SLF001
+
+    assert runtime._carried_object_lost_seen_event_ids == {  # noqa: SLF001
+        "loss.failed",
+        "loss.continues",
+    }
+    assert attempts == ["part_lost", "other_lost"]
+    assert [write[:2] for write in store.writes] == [("other_lost", True)]
+
+
 def test_scene_preparation_failure_blocks_run_until_idle_reset_converges(
     monkeypatch: pytest.MonkeyPatch, tmp_path,
 ) -> None:
@@ -2156,7 +2943,9 @@ def test_scene_preparation_failure_blocks_run_until_idle_reset_converges(
     runtime.shutdown()
 
 
-def _terminal_cycle_reset_runtime(monkeypatch, tmp_path, owner_epoch):
+def _terminal_cycle_reset_runtime(
+    monkeypatch, tmp_path, owner_epoch, *, finish_cycle: bool = True
+):
     """A public Run/Stop cycle with deterministic owner observations."""
 
     monkeypatch.setattr(
@@ -2183,6 +2972,8 @@ def _terminal_cycle_reset_runtime(monkeypatch, tmp_path, owner_epoch):
     runtime._owner = owner  # type: ignore[assignment]  # noqa: SLF001
     runtime._host = host  # type: ignore[assignment]  # noqa: SLF001
     runtime.start()
+    if not finish_cycle:
+        return runtime, runtime._journal, admission, owner, host  # noqa: SLF001
     runtime.start_run(_start_request())
     stopped = runtime.stop_run(
         "program-cycle.1",
@@ -5098,6 +5889,122 @@ def test_reset_confirmation_uses_fresh_fault_recovery_identity(uncertain_reset_r
         "reset.0",
         "reset.1",
     ]
+
+
+def test_reset_during_scenario_close_keeps_the_stop_fault_and_settles(
+    uncertain_reset_runtime,
+):
+    """D6 (a): Close's Reset never tries to clear the latch, whatever the order."""
+
+    runtime, journal, _admission, _owner, _host = uncertain_reset_runtime
+    recoveries = []
+    offer = {
+        "latch": {
+            "latch_id": "latch.1",
+            "latch_generation": 1,
+            "recovery_assessment_revision": 1,
+            "stop_certificate": {
+                "stop_certificate_id": "stop.1",
+                "stop_certificate_revision": 1,
+            },
+        },
+        "configuration_expectations": [],
+    }
+    runtime._kernel = SimpleNamespace(
+        stop_fault=lambda: {"stop_fault": deepcopy(offer)},
+        identity=lambda: {"identity": {"owner_epoch": "kernel.1"}},
+        recover_stop_fault=lambda intent: recoveries.append(intent)
+        or {"result": {"accepted": True}},
+    )
+    request = _current_reset_request(runtime, journal, "reset.0").model_copy(
+        update={"keep_stop_fault": True}
+    )
+    result = runtime.reset_cycle(request)
+    assert result["idle_cycle_generation"] == 2
+    assert recoveries == []
+
+
+def test_failed_close_reset_publishes_and_requires_its_keep_stop_fault(
+    uncertain_reset_runtime,
+):
+    """D6 (SX-324): a Close Reset failing in a resumable phase is published with
+    keep_stop_fault, continues only with it, and the private proof keeps two
+    selectors."""
+
+    runtime, journal, _admission, _owner, _host = uncertain_reset_runtime
+    request = _current_reset_request(runtime, journal, "reset.0").model_copy(
+        update={"keep_stop_fault": True}
+    )
+
+    recoveries = []
+    runtime._kernel = SimpleNamespace(
+        stop_fault=lambda: {"stop_fault": {
+            "latch": {"latch_id": "latch.1", "latch_generation": 1,
+                      "recovery_assessment_revision": 1,
+                      "stop_certificate": {"stop_certificate_id": "stop.1",
+                                           "stop_certificate_revision": 1}},
+            "configuration_expectations": [],
+        }},
+        identity=lambda: {"identity": {"owner_epoch": "kernel.1"}},
+        recover_stop_fault=lambda intent: recoveries.append(intent)
+        or {"result": {"accepted": True}},
+    )
+    contain = _host.contain_reset_run
+
+    def lost(_run_id, *, stop_request_id, timeout_s):
+        raise ProgramRunOwnerOutcomeUnknownError("Stop response lost")
+
+    _host.contain_reset_run = lost
+    with pytest.raises(ProgramRunnerError):
+        runtime.reset_cycle(request)
+    status = runtime.cycle_status()
+    assert status["reset_options"]["keep_stop_fault"] is True
+    status_core, accepted = runtime._cycle_status_projection()
+    assert accepted is None or "keep_stop_fault" not in accepted
+    with pytest.raises(ProgramRunnerError) as conflict:
+        runtime.reset_cycle(_current_reset_request(runtime, journal, "reset.1"))
+    assert conflict.value.code == "program_run_request_conflict"
+
+    # SX-329: a fresh confirmation with the retained value settles the Reset,
+    # and the latch is still kept (no recover call was ever made).
+    _host.contain_reset_run = contain
+    retry = _current_reset_request(runtime, journal, "reset.2").model_copy(
+        update={"keep_stop_fault": True}
+    )
+    assert runtime.reset_cycle(retry)["idle_cycle_generation"] == 2
+    assert recoveries == []
+
+
+@pytest.mark.parametrize(
+    ("accepted_keep", "continuation_keep", "refused"),
+    [(False, True, True), (True, False, True), (True, True, False), (False, False, False)],
+)
+def test_reset_continuation_compares_keep_stop_fault(
+    accepted_keep, continuation_keep, refused
+):
+    """SX-317: a retained Reset continues only with its own keep_stop_fault."""
+
+    def reset(request_id, keep):
+        return ProgramCycleResetRequest.model_validate(
+            {
+                "request_id": request_id,
+                "request_owner_epoch": "operator.1",
+                "source_label": "operator_ui",
+                "expected_owner_epoch": "runner.1",
+                "program_run_id": "run.1",
+                "expected_cycle_generation": 1,
+                "keep_stop_fault": keep,
+            }
+        )
+
+    accepted = reset("reset.accepted", accepted_keep)
+    continuation = reset("reset.continuation", continuation_keep)
+    if refused:
+        with pytest.raises(ProgramRunnerError) as conflict:
+            ProgramRuntime._require_same_reset_options(continuation, accepted)
+        assert conflict.value.code == "program_run_request_conflict"
+    else:
+        ProgramRuntime._require_same_reset_options(continuation, accepted)
 
 
 def test_recovery_reset_classifies_retained_intents_not_failure_text(

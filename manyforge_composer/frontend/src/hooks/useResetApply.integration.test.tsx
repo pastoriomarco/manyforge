@@ -290,7 +290,7 @@ function publication(environment: Environment): PublishedAuthoringWorkspace {
         || environment.savedDeployment !== undefined,
     },
     project: {
-      documentPath: '/cell', documentId: null, documentName: null, documentDescription: null,
+      documentPath: '/cell', readOnly: false, documentId: null, documentName: null, documentDescription: null,
       sourceDiagnostics: [], sourceDocumentDigest: null, programRoleAssignment: null,
       sourceProgramDigest: null, sourceDeploymentDigest: null,
     },

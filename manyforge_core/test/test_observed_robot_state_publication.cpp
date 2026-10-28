@@ -3,6 +3,7 @@
 #include <atomic>
 #include <cmath>
 #include <cstdint>
+#include <limits>
 #include <manyforge_content_identity/canonical_value.hpp>
 #include <manyforge_core/observed_robot_state_provider.hpp>
 #include <manyforge_core/observed_robot_state_publication.hpp>
@@ -448,6 +449,62 @@ TEST(ObservedRobotStatePublicationTest, BoundedConcurrentAsOfReaderNeverObserves
   writer.join();
   reader.join();
   EXPECT_FALSE(mixed_sample.load(std::memory_order_acquire));
+}
+
+TEST(ObservedRobotStatePublicationTest, SampleReceivedAfterTheReadBoundaryIsCurrent) {
+  // The reader takes its boundary first; the writer then stamps a newer
+  // sample. That sample is current (received_sample_age.hpp), so precedence
+  // keeps the higher-priority source and the provider does not refuse it.
+  ObservedRobotStatePublication publication(
+      {"j1"}, {source(ObservedRobotStateSourceKind::kActionFeedback, "action"),
+               source(ObservedRobotStateSourceKind::kJointState, "joint")});
+  const std::vector<std::string> joints{"j1"};
+  const std::vector<double> action_positions{1.0};
+  const std::vector<double> joint_positions{2.0};
+  ASSERT_TRUE(publication
+                  .publish(ObservedRobotStateSourceKind::kJointState, joints, joint_positions, {},
+                           50, 50)
+                  .published);
+  ASSERT_TRUE(publication
+                  .publish(ObservedRobotStateSourceKind::kActionFeedback, joints,
+                           action_positions, {}, 105, 105)
+                  .published);
+
+  auto selected = publication.acquire(100);
+  ASSERT_TRUE(selected);
+  EXPECT_EQ(selected.source_id(), "action");
+
+  PublishedObservedRobotStateProvider provider(publication,
+                                               ObservedRobotStateAuthorityProfile::kMeasured);
+  const auto state = provider.current_state(100);
+  ASSERT_TRUE(state.ok()) << state.error().message;
+  EXPECT_EQ(state.value().positions_rad, action_positions);
+  // The budget still applies from the receipt: 105 + 100 is the last current
+  // boundary for the action sample.
+  EXPECT_TRUE(provider.current_state(205).ok());
+  const auto stale = provider.current_state(206);
+  ASSERT_FALSE(stale.ok());
+  EXPECT_EQ(stale.error().details.at("reason"), "stale_observed_robot_state");
+}
+
+TEST(ObservedRobotStatePublicationTest, NegativeBoundaryWithExtremeReceiptIsNotCurrent) {
+  ObservedRobotStatePublication publication(
+      {"j1"}, {source(ObservedRobotStateSourceKind::kJointState, "joint")});
+  const std::vector<std::string> joints{"j1"};
+  const std::vector<double> positions{1.0};
+  constexpr auto kMax = std::numeric_limits<std::int64_t>::max();
+  ASSERT_TRUE(publication
+                  .publish(ObservedRobotStateSourceKind::kJointState, joints, positions, {},
+                           kMax, kMax)
+                  .published);
+  PublishedObservedRobotStateProvider provider(publication,
+                                               ObservedRobotStateAuthorityProfile::kMeasured);
+  for (const std::int64_t now : {-1, -2}) {
+    SCOPED_TRACE(now);
+    const auto refused = provider.current_state(now);
+    ASSERT_FALSE(refused.ok());
+    EXPECT_EQ(refused.error().details.at("reason"), "stale_observed_robot_state");
+  }
 }
 
 }  // namespace

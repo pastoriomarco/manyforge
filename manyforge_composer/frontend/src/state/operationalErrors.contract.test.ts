@@ -53,6 +53,16 @@ describe('operational error lifecycle', () => {
     expect(acknowledged.sequence).toBe(3);
   });
 
+  it('clears every message at Reset or Scenario Close', () => {
+    const state = report(
+      report(initialOperationalErrorState(), 'composer.a', 'acknowledgement_required'),
+      'composer.b', 'acknowledgement_required',
+    );
+    const cleared = reduceOperationalErrors(state, { kind: 'clear' });
+    expect(cleared.records.size).toBe(0);
+    expect(reduceOperationalErrors(cleared, { kind: 'clear' })).toBe(cleared);
+  });
+
   it('retains no browser-side history while issuing stable unique identities', () => {
     let state = initialOperationalErrorState();
     for (let index = 0; index < 80; index += 1) {

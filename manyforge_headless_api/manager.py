@@ -97,8 +97,9 @@ def _transaction_body(request: SceneTransactionRequest) -> dict[str, Any]:
     transaction = request.model_dump(mode="json")
     if transaction.get("program_node_evidence") is None:
         transaction.pop("program_node_evidence", None)
-    if transaction["operation"].get("grasp_lost_bound", ...) is None:
-        transaction["operation"].pop("grasp_lost_bound")
+    for optional in ("grasp_lost_bound", "on_grasp_lost"):
+        if transaction["operation"].get(optional, ...) is None:
+            transaction["operation"].pop(optional)
     return transaction
 
 

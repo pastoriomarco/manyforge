@@ -54,11 +54,20 @@ unavailable, even while the carrying condition is false.
 
 - `examples/lite6_pneumatic_mock.scenario` uses a separate Mock I/O device. Its
   delayed valve-to-input echo is synthetic; it does not prove a physical grasp.
-- `examples/lite6_pneumatic_real.scenario` uses a site robot address, a valve
-  output and a separate periodically published Boolean sensor input. Its pin,
-  polarity and topic are illustrative: adapt and verify them for the actual
-  wiring and sensor before using hardware. The example alone does not qualify
-  the real robot or its safety setup.
+- `examples/lite6_pneumatic_real_no_sensor.scenario` is the starting point for
+  a valve-only gripper without a sensor. It uses a site robot address and one
+  valve output on a controller pin. Close completes after its
+  `command_duration_s` dwell; nothing confirms the grasp, and there is no
+  workpiece-loss rule. Its pin and polarity are illustrative: adapt and verify
+  them for the actual wiring before using hardware.
+- `examples/lite6_pneumatic_real.scenario` is the one to adapt when a grasp
+  sensor is wired. It uses a site robot address, a valve output and a
+  separate periodically published Boolean sensor input; Close waits for the
+  input and a workpiece-loss rule watches it while carrying. Its pin, polarity
+  and topic are illustrative: adapt and verify them for the actual wiring and
+  sensor before using hardware.
+
+Neither Real example alone qualifies the real robot or its safety setup.
 
 ## Position without feedback
 

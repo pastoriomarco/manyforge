@@ -815,7 +815,7 @@ readiness_for(const std::vector<core::RuntimeParticipantExecutionRegistration>
          });
 }
 
-[[nodiscard]] bool same_physical_binding(
+[[nodiscard]] bool same_physical_binding_except_collision_bodies(
     const core::RuntimeParticipantBinding &primary,
     const core::RuntimeParticipantBinding &alias,
     const bool permit_supporting_capability_expansion) noexcept {
@@ -837,7 +837,6 @@ readiness_for(const std::vector<core::RuntimeParticipantExecutionRegistration>
          left.model_groups == right.model_groups &&
          left.frame_bindings == right.frame_bindings &&
          left.resources == right.resources &&
-         left.collision_body_bindings == right.collision_body_bindings &&
          left.io_output_binding == right.io_output_binding &&
          left.control_path == right.control_path &&
          left.capability_provider_path == right.capability_provider_path &&
@@ -848,6 +847,40 @@ readiness_for(const std::vector<core::RuntimeParticipantExecutionRegistration>
                left.supporting_capability_provider_paths,
                right.supporting_capability_provider_paths))) &&
          left.runtime_unit_epochs == right.runtime_unit_epochs;
+}
+
+[[nodiscard]] bool same_physical_binding(
+    const core::RuntimeParticipantBinding &primary,
+    const core::RuntimeParticipantBinding &alias,
+    const bool permit_supporting_capability_expansion) noexcept {
+  return same_physical_binding_except_collision_bodies(
+             primary, alias, permit_supporting_capability_expansion) &&
+         primary.value().collision_body_bindings ==
+             alias.value().collision_body_bindings;
+}
+
+// Locates the physical owner of a resolved Program participant. A Program may
+// declare fewer collision bodies than its physical owner (each selected body
+// must match exactly one owner body, as the participant resolver checks); every
+// other field matches as in same_physical_binding.
+[[nodiscard]] bool program_view_within_physical_owner(
+    const core::RuntimeParticipantBinding &physical,
+    const core::RuntimeParticipantBinding &selected) noexcept {
+  const auto &available = physical.value().collision_body_bindings;
+  const auto &bodies = selected.value().collision_body_bindings;
+  return same_physical_binding_except_collision_bodies(physical, selected,
+                                                       true) &&
+         std::all_of(bodies.begin(), bodies.end(), [&](const auto &body) {
+           return std::count_if(
+                      available.begin(), available.end(),
+                      [&](const auto &candidate) {
+                        return candidate.model_instance_id ==
+                                   body.model_instance_id &&
+                               candidate.model_revision == body.model_revision &&
+                               candidate.compiled_collision_body_names ==
+                                   body.compiled_collision_body_names;
+                      }) == 1;
+         });
 }
 
 [[nodiscard]] bool represents_binding(
@@ -999,7 +1032,8 @@ make_kernel_participant_resolver(
     for (const auto &candidate : physical_registrations) {
       if (exact_output
               ? candidate.binding.value() != selected.value()
-              : !same_physical_binding(candidate.binding, selected, true)) {
+              : !program_view_within_physical_owner(candidate.binding,
+                                                    selected)) {
         continue;
       }
       if (physical != nullptr) {

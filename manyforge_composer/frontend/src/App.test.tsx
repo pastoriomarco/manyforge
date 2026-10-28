@@ -228,6 +228,23 @@ describe('Composer shell continuity', () => {
     expect(appSource).not.toContain('dismissRecheckMessage');
   });
 
+  it('counts warnings apart from errors, never auto-opens for them, and clears them at Reset and Close', () => {
+    const appSource = readFileSync(new URL('./App.tsx', import.meta.url), 'utf8');
+    expect(appSource).toContain('<span className="global-attention-count warning" title="Warnings">');
+    expect(appSource).toContain('{warningNotices.length}');
+    const autoOpen = appSource.slice(
+      appSource.indexOf('const runtimeAttentionItems'),
+      appSource.indexOf('const openRuntimeAttention'),
+    );
+    expect(autoOpen).toContain('errorConditions.map');
+    expect(autoOpen).toContain('blockingAlarms(headlessSnapshot?.alarms)');
+    expect(autoOpen).not.toMatch(/clientErrors|warning/i);
+    expect(appSource).toContain('if (resetReachedIdle(previous, cycleStateNow)) setWarningClearEpoch(');
+    expect(appSource).toContain('if (closed !== null) setWarningClearEpoch(');
+    // The red row holds only conditions and blocking alarms.
+    expect(appSource).not.toContain('clientErrors={clientErrors}');
+  });
+
   it('keeps document, deployment, status, and artifact workflows in their owned locations', () => {
     const appSource = readFileSync(new URL('./App.tsx', import.meta.url), 'utf8');
     const controlsSource = readFileSync(

@@ -92,7 +92,7 @@ describe('Program workspace lifecycle controls', () => {
     );
 
     expect(scenarioSource).toContain('New Scenario');
-    expect(scenarioSource).toContain('newScenarioDocument({');
+    expect(scenarioSource).toContain('controller.newScenarioDocument(afterClose.confirmDiscard)');
     expect(source).toContain('Revert to saved');
     expect(source).toContain('Discard changes');
     expect(source).toContain('returns to Applied');

@@ -1099,7 +1099,7 @@ TEST(ClosedSchema, PoseSourceComponentSchemaIsClosedAndBuildQualified) {
       core::SchemaId("manyforge.value_schema.runtime.pose_source.v2"),
       core::SchemaRevision(
           "sha256:"
-          "f386502468c61bdd672f69069327ef013642ce1b30338ecb1a536655c3833e1d"));
+          "a7e77850ee255f3bfc989e5105e1c37ca7c767fa63768160e75e81bb8e6e7173"));
   ASSERT_NE(schema, nullptr);
   const std::string simulation = R"("simulation":{"poll_period_ms":250,
     "source_coordinate_frame_id":"universe","target_frame_id":"universe",
@@ -2182,6 +2182,9 @@ TEST(ClosedSchema, MaintainedRosProfilesDeclareComponentStreamDefaults) {
   for (const auto &profile : member(source.root(), "runtime_restoration_profiles").as_array()) {
     const auto *runtime = profile.find_object_member("ros2_control_runtime");
     if (runtime == nullptr) continue;
+    // E1: a profile added as data carries only its lane selector; its
+    // Deployment authors the streams, which the compiler checks.
+    if (runtime->as_object().size() == 1U) continue;
     ++profiles;
     const bool isaac = runtime->find_object_member("isaac_profile") != nullptr;
     const bool real = runtime->find_object_member("real_profile") != nullptr;

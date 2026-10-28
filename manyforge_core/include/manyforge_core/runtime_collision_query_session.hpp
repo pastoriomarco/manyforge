@@ -117,12 +117,18 @@ class RuntimeCollisionQuerySession final {
       std::shared_ptr<ICollisionQueryEngine> engine, std::string active_contact_policy_id,
       std::int64_t query_timeout_ns);
 
+  /// With keep_admitted_policy, the session keeps initial_bundle's policy (the
+  /// move's admitted operation-local policy) for its whole life, whatever the
+  /// published policy revision; acquire_bundle() pairs it with the latest
+  /// published world. Without it, every tick follows the published bundle.
   [[nodiscard]] std::optional<ErrorDTO> prepare(
-      const RuntimeCollisionQueryBundlePtr& initial_bundle);
+      const RuntimeCollisionQueryBundlePtr& initial_bundle,
+      bool keep_admitted_policy = false);
   [[nodiscard]] RuntimeCollisionTickOutcome tick(const RuntimeCollisionQueryBundlePtr& bundle,
                                                  std::span<const double> observed_positions_rad,
                                                  std::int64_t state_time_ns) noexcept;
-  [[nodiscard]] RuntimeCollisionQueryBundlePtr acquire_bundle() const;
+  /// Single consumer (the monitor tick).
+  [[nodiscard]] RuntimeCollisionQueryBundlePtr acquire_bundle();
   [[nodiscard]] const CollisionEngineCapabilityDescriptor& engine_capability() const noexcept {
     return *capability_;
   }
@@ -165,6 +171,10 @@ class RuntimeCollisionQuerySession final {
   // sub-handles would hide their last-owner transition from NRT bundle
   // retirement and could move destruction onto RuntimeSafety during rebind.
   RuntimeCollisionQueryBundlePtr bound_bundle_;
+  // Admitted operation-local policy and the last bundle built from it with the
+  // latest published world. Empty for moves that follow the published policy.
+  std::shared_ptr<const CollisionPolicySnapshot> admitted_policy_;
+  RuntimeCollisionQueryBundlePtr admitted_policy_bundle_;
   const CollisionPolicySnapshot* bound_policy_ = nullptr;
   const CollisionPolicyIndex* bound_policy_index_ = nullptr;
   const ContactGraspPolicyEntry* active_contact_policy_ = nullptr;

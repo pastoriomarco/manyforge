@@ -28,10 +28,12 @@
 #include <manyforge_core/types/spring_back_return_point.hpp>
 #include <manyforge_core/trajectory/trajectory_sampler.hpp>
 #include <manyforge_core/trajectory/trajectory_splice.hpp>
+#include <manyforge_core/trajectory/validation_sampling.hpp>
 #include <manyforge_core/types/error_code_mapping.hpp>
 #include <manyforge_core/types/kernel_event_factories.hpp>
 #include <manyforge_core/types/reason_codes.hpp>
 #include <manyforge_core/time/stuck_drain_wait.hpp>
+#include <manyforge_core/time/received_sample_age.hpp>
 #include <map>
 #include <memory>
 #include <stdexcept>
@@ -1364,7 +1366,8 @@ bool ExecutionKernel::refresh_published_runtime_collision_snapshot(
 }
 
 ExecutionKernel::CollisionMonitoringStart ExecutionKernel::start_collision_monitoring(
-    std::string reason, const CollisionWorldLeaseInventory* admission_inventory) {
+    std::string reason, const CollisionWorldLeaseInventory* admission_inventory,
+    bool keep_admitted_policy) {
   std::uint64_t reused_generation = 0;
   {
     std::lock_guard<std::mutex> lock(runtime_collision_protection_mutex_);
@@ -1439,7 +1442,12 @@ ExecutionKernel::CollisionMonitoringStart ExecutionKernel::start_collision_monit
         std::move(*projection), *resources.snapshot_publisher, resources.runtime_monitor_engine,
         runtime_collision_monitor_.active_contact_policy_id(),
         static_cast<std::int64_t>(config_.runtime_collision_immediate_query_budget_ns));
-    query_prepare_error = query_session->prepare(initial_bundle);
+    // A move with an admitted operation-local contact policy keeps it for the
+    // whole move, whatever the published policy or world revision; the world
+    // still follows the latest publication. Other moves follow the published
+    // bundle as before.
+    query_prepare_error = query_session->prepare(
+        initial_bundle, keep_admitted_policy && admission_inventory != nullptr);
     if (query_prepare_error) {
       query_session.reset();
     }
@@ -2463,7 +2471,8 @@ ExecutionKernel::ExecuteWorkerDispatchPhaseResult ExecutionKernel::execute_worke
       (request.timeouts.execution_timeout_s > 0)
           ? static_cast<int64_t>(request.timeouts.execution_timeout_s * 1e9)
           : 0;
-  auto monitoring = start_collision_monitoring("execute_dispatch", &scene_snapshot_lease_inventory);
+  auto monitoring = start_collision_monitoring("execute_dispatch", &scene_snapshot_lease_inventory,
+                                               request.resolved_contact_grasp.has_value());
   motion_state.runtime_collision_protection_generation = monitoring.generation;
   if (monitoring.prepare_error) {
     // Never dispatch without a prepared runtime monitor. This is a bug, not an
@@ -7159,10 +7168,8 @@ Result<void> ExecutionKernel::collision_check_tick() {
     return publish_runtime_monitor_fault(CollisionCheckResultDTO{}, std::move(monitor_details));
   }
   const auto publication_budget_ns = observed_view.freshness_budget_ns();
-  const auto observed_age_ns =
-      observed_now_ns >= observed_view.received_timestamp_ns()
-          ? static_cast<std::uint64_t>(observed_now_ns - observed_view.received_timestamp_ns())
-          : 0;
+  const auto observed_age_ns = static_cast<std::uint64_t>(
+      received_sample_age_ns(observed_view.received_timestamp_ns(), observed_now_ns));
   runtime_collision_stop_coverage_.record_observed_source(observed_view.source_kind(),
                                                           observed_age_ns);
   const auto effective_budget_ns =
@@ -7171,11 +7178,12 @@ Result<void> ExecutionKernel::collision_check_tick() {
           ? std::min<std::int64_t>(publication_budget_ns, config_.runtime_observed_state_max_age_ns)
           : config_.runtime_observed_state_max_age_ns;
   const bool observed_timestamp_invalid =
-      effective_budget_ns > 0 && (observed_view.received_timestamp_ns() < 0 ||
-                                  observed_view.received_timestamp_ns() > observed_now_ns);
+      effective_budget_ns > 0 &&
+      (observed_now_ns < 0 || observed_view.received_timestamp_ns() < 0);
   const bool observed_timestamp_stale =
       effective_budget_ns > 0 && !observed_timestamp_invalid &&
-      observed_now_ns - observed_view.received_timestamp_ns() > effective_budget_ns;
+      !received_sample_current(observed_view.received_timestamp_ns(), observed_now_ns,
+                               effective_budget_ns);
   auto append_observed_details = [&](auto& details) {
     details["observed_state_source_id"] = std::string(observed_view.source_id());
     details["observed_state_source_kind"] =
@@ -7772,12 +7780,42 @@ Result<ExecutionKernel::CollisionValidationSuccess> ExecutionKernel::validate_tr
     return Result<CollisionValidationSuccess>::Err(ErrorCode::kValidationCollision);
   }
 
+  // Check the executed curve between the stored waypoints too: samples of the
+  // controller's per-segment polynomial (from the stored P/V/A, before
+  // projection), at most kValidationMaxJointStepRad apart, then projected
+  // (positions only) to the collision model. The returned collision
+  // trajectory, armed for lookahead and state projection, stays the stored
+  // one; failure indexes refer to the sampled copy, and contact windows keep
+  // the stored trajectory's fractions.
+  const auto sampling_deadline =
+      clock_.now() + config_.validation_collision_wall_timeout_ns;
+  auto sampled = sample_for_collision_validation(
+      trajectory, kValidationMaxJointStepRad, kValidationMaxCheckedStates,
+      [&cancel, this, sampling_deadline]() -> const char* {
+        if (cancel->is_cancel_requested()) return "collision_validation_cancelled";
+        if (clock_.now() >= sampling_deadline) return "collision_validation_wall_timeout";
+        return nullptr;
+      });
+  if (!sampled.ok()) {
+    return Result<CollisionValidationSuccess>::Err(std::move(sampled.error()));
+  }
+  const auto& samples = sampled.value();
+  std::optional<TrajectoryDTO> projected_samples;
+  if (samples.inserted > 0) {
+    auto projected = collision_projector_.expand_for_collision(samples.trajectory, current_state);
+    if (!projected.ok()) {
+      return Result<CollisionValidationSuccess>::Err(std::move(projected.error()));
+    }
+    projected_samples = std::move(projected.value());
+  }
   auto collision_trajectory_result =
       collision_projector_.expand_for_collision(trajectory, current_state);
   if (!collision_trajectory_result.ok()) {
     return Result<CollisionValidationSuccess>::Err(std::move(collision_trajectory_result.error()));
   }
   auto collision_trajectory = std::move(collision_trajectory_result.value());
+  const TrajectoryDTO& validation_trajectory =
+      projected_samples ? *projected_samples : collision_trajectory;
 
   int available_validation_engines = 0;
   for (const auto& engine : validation_engines) {
@@ -7832,12 +7870,13 @@ Result<ExecutionKernel::CollisionValidationSuccess> ExecutionKernel::validate_tr
             : static_cast<std::int64_t>(config_.validation_collision_query_timeout_ns);
     cfg.surface = CollisionSurface::kPreExecutionValidation;
     cfg.contact_policy_id = request.contact_policy_id;
+    if (samples.inserted > 0) cfg.original_trajectory_sample_fractions = samples.original_fractions;
 
     AuthoritativeValidationAttempt attempt;
     attempt.world = world_snapshot;
     attempt.policy = active_policy;
     attempt.bundle = collision_validation_worker_pool_->validate_trajectory(
-        world_snapshot, validation_engines, collision_trajectory, cancel, cfg);
+        world_snapshot, validation_engines, validation_trajectory, cancel, cfg);
     attempt.telemetry = collision_validation_worker_pool_->last_telemetry();
     attempt.contact_policy_violation =
         contact_policy_violation_details(attempt.bundle, *active_policy, "block_dispatch");
@@ -7872,7 +7911,7 @@ Result<ExecutionKernel::CollisionValidationSuccess> ExecutionKernel::validate_tr
     }
   }
   if (replacement) trace_moving_core_phase(replacement, "collision_return", collision_started,
-                                          clock_.now(), collision_trajectory.waypoints.size());
+                                          clock_.now(), validation_trajectory.waypoints.size());
   auto bundle = std::move(attempt.bundle);
   auto telemetry = attempt.telemetry;
   auto contact_policy_violation = std::move(attempt.contact_policy_violation);
@@ -7888,12 +7927,12 @@ Result<ExecutionKernel::CollisionValidationSuccess> ExecutionKernel::validate_tr
     details["first_failing_waypoint"] = std::to_string(*bundle.decision.first_failing_waypoint);
     if (*bundle.decision.first_failing_waypoint >= 0 &&
         static_cast<std::size_t>(*bundle.decision.first_failing_waypoint) <
-            collision_trajectory.waypoints.size()) {
+            validation_trajectory.waypoints.size()) {
       const auto first_failure_index =
           static_cast<std::size_t>(*bundle.decision.first_failing_waypoint);
-      const auto& waypoint = collision_trajectory.waypoints[first_failure_index];
+      const auto& waypoint = validation_trajectory.waypoints[first_failure_index];
       details["collision_result_first_failure_joint_names"] =
-          comma_join_strings(collision_trajectory.joint_names);
+          comma_join_strings(validation_trajectory.joint_names);
       details["collision_result_first_failure_positions_rad"] =
           comma_join_doubles(waypoint.positions_rad);
       details["collision_result_first_failure_time_from_start_s"] =
@@ -7949,7 +7988,8 @@ Result<ExecutionKernel::CollisionValidationSuccess> ExecutionKernel::validate_tr
                  std::move(details)});
   }
   if (config_.enable_collision_diagnostic_compare && collision_diagnostic_comparator_ != nullptr) {
-    append_collision_compare_diagnostics(details, bundle, trajectory,
+    append_collision_compare_diagnostics(details, bundle,
+                                         samples.inserted == 0 ? trajectory : samples.trajectory,
                                          *collision_diagnostic_comparator_);
   }
   if (conclusive_collision_failure != nullptr && !contact_policy_violation.has_value() &&

@@ -1,5 +1,6 @@
 #include <gtest/gtest.h>
 
+#include <algorithm>
 #include <array>
 #include <atomic>
 #include <barrier>
@@ -195,6 +196,25 @@ TEST(AddressedObservedStatePublicationTest, RejectsForeignContextAndStaleMeasure
   EXPECT_EQ(stale.error().details.at("reason"), "observation_stale");
 }
 
+TEST(AddressedObservedStatePublicationTest,
+     MeasuredStateStaysCurrentWhenEveryRetainedSampleFollowsTheBoundary) {
+  // Live Real flicker: the readiness boundary is taken first and the
+  // broadcaster then fills every retained slot. The newest sample is current.
+  AddressedObservedStatePublication publication(
+      config(context({CoordinateKind::kAngular}, StateAuthorityClass::kMeasured, 10)));
+  const auto names = publication.query_context().joint_names;
+  const std::array positions{0.0};
+  for (const std::int64_t received : {101, 102, 103, 104, 105}) {
+    ASSERT_TRUE(publication
+                    .publish(ObservedStateSourceKind::kJointState, names, positions,
+                             std::span<const double>{}, received, received)
+                    .published);
+  }
+  const auto state = publication.current_state(publication.query_context(), 100);
+  ASSERT_TRUE(state.ok()) << state.error().message;
+  EXPECT_EQ(state.value().received_timestamp_ns, 105);
+}
+
 TEST(AddressedObservedStatePublicationTest, AsOfCannotResurrectSupersededIncompleteState) {
   AddressedObservedStatePublication publication(config(context(
       {CoordinateKind::kAngular, CoordinateKind::kAngular}, StateAuthorityClass::kMeasured, 10)));
@@ -257,7 +277,9 @@ TEST(AddressedObservedStatePublicationTest,
   EXPECT_FALSE(replacement.current_state(foreign, 112).ok());
 }
 
-TEST(AddressedObservedStatePublicationTest, RebindCannotRefreshAnExpiredOrFutureSourceSample) {
+TEST(AddressedObservedStatePublicationTest, RebindCannotRefreshAnExpiredSourceSample) {
+  // A source sample received after the transition time is current
+  // (received_sample_age.hpp); only an expired one refuses.
   for (const auto transition : {99, 110, 111}) {
     SCOPED_TRACE(transition);
     AddressedObservedStatePublication publication(
@@ -271,8 +293,12 @@ TEST(AddressedObservedStatePublicationTest, RebindCannotRefreshAnExpiredOrFuture
     auto next = original;
     next.control_route_id = ControlRouteId("successor");
     const auto rebound = publication.rebind_route_context(next, transition);
-    EXPECT_EQ(rebound.ok(), transition == 110);
-    if (!rebound.ok()) {
+    EXPECT_EQ(rebound.ok(), transition <= 110);
+    if (rebound.ok()) {
+      // The seed is never stamped before the source sample it copies.
+      EXPECT_EQ(publication.numeric_publication().acquire_latest().received_timestamp_ns(),
+                std::max<std::int64_t>(transition, 100));
+    } else {
       EXPECT_EQ(rebound.error().details.at("reason"),
                 "observed_state_route_rebind_source_not_current");
       EXPECT_EQ(publication.query_context(), original);

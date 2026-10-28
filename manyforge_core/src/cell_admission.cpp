@@ -355,7 +355,9 @@ Result<void> ValidateCellAdmissionClaimIntent(const CellAdmissionClaimIntentDTO&
     }
     // Both recovery offers remain private CCLC/Kernel composition. The route
     // owner retains its observation-only, one-configuration shape; selected
-    // bring-up has the explicitly selected nonempty physical closure. Shape
+    // bring-up has the selected component's physical closure: its resources and
+    // adopted controller configurations, both empty for an input-only provider
+    // component; the CCLC status and the Kernel check them per domain. Shape
     // validation alone never authorizes either operation.
     if (intervention && intent.owner_role == CellAdmissionOwnerRoleDTO::kComponentLifecycleOwner) {
       const bool exact_owner =
@@ -366,8 +368,7 @@ Result<void> ValidateCellAdmissionClaimIntent(const CellAdmissionClaimIntentDTO&
           !evidence.parent_program_cycle_claim_generation.has_value();
       const bool route = intent.owner_transaction_id.starts_with("route-selection.") &&
                          intent.scope.resources.empty() && intent.scope.configurations.size() == 1U;
-      const bool selected = intent.owner_transaction_id.starts_with("selected-lifecycle.") &&
-                            !intent.scope.resources.empty() && !intent.scope.configurations.empty();
+      const bool selected = intent.owner_transaction_id.starts_with("selected-lifecycle.");
       if (!exact_owner || (!route && !selected)) {
         return Invalid<void>(intent.owner_transaction_id.starts_with("selected-lifecycle.")
                                  ? "cclc_selected_recovery_evidence_invalid"

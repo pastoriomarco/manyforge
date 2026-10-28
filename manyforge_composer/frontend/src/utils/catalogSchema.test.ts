@@ -82,4 +82,21 @@ describe('validateCatalogJsonSchemaValue', () => {
       },
     ]);
   });
+
+  it('accepts null through the catalog anyOf nullable schema', () => {
+    const nullableKey: CatalogJsonSchema = {
+      anyOf: [
+        { type: 'string', 'x-manyforge-semantic-type': 'blackboard_key' },
+        { type: 'null' },
+      ],
+    };
+    expect(validateCatalogJsonSchemaValue(nullableKey, null, 'key')).toEqual([]);
+    expect(validateCatalogJsonSchemaValue(nullableKey, 'loss_flag', 'key')).toEqual([]);
+    expect(validateCatalogJsonSchemaValue(nullableKey, 3, 'key')).toEqual([
+      { path: 'key', message: 'key must match at least one allowed schema' },
+    ]);
+    expect(validateCatalogJsonSchemaValue({ type: 'string' }, null, 'key')).toEqual([
+      { path: 'key', message: 'key must be a string' },
+    ]);
+  });
 });

@@ -186,6 +186,26 @@ std::optional<std::string_view> stop_forensic_projection_result_field_error(
   return "stop_forensic_projection_result_invalid";
 }
 
+std::string_view stop_fault_trigger_name(const StopFaultTriggerDTO trigger) noexcept {
+  switch (trigger) {
+    case StopFaultTriggerDTO::kScopePromotion:
+      return "scope_promotion";
+    case StopFaultTriggerDTO::kEscalated:
+      return "escalated";
+    case StopFaultTriggerDTO::kPartial:
+      return "partial";
+    case StopFaultTriggerDTO::kFailedUncontained:
+      return "failed_uncontained";
+    case StopFaultTriggerDTO::kPhysicalRestUnproven:
+      return "physical_rest_unproven";
+    case StopFaultTriggerDTO::kPersistenceDegraded:
+      return "persistence_degraded";
+    case StopFaultTriggerDTO::kPostReserveFenceFailed:
+      return "post_reserve_fence_failed";
+  }
+  return "unknown";
+}
+
 std::optional<std::string_view> stop_fault_latch_field_error(
     const StopFaultLatchDTO& latch) noexcept {
   if (!identity(latch.cell_id) || !identity(latch.stop_id) || !latch.stop_generation.nonzero() ||
@@ -217,9 +237,19 @@ std::optional<std::string_view> stop_fault_latch_field_error(
     case StopFaultTriggerDTO::kFailedUncontained:
     case StopFaultTriggerDTO::kPhysicalRestUnproven:
     case StopFaultTriggerDTO::kPersistenceDegraded:
+    case StopFaultTriggerDTO::kPostReserveFenceFailed:
       break;
     default:
       return "stop_fault_latch_trigger_invalid";
+  }
+  const auto& observed = latch.observed_triggers;
+  if (observed.empty() || observed.size() > kStopFaultTriggerCount ||
+      std::find(observed.begin(), observed.end(), latch.trigger) == observed.end())
+    return "stop_fault_latch_observed_triggers_invalid";
+  for (auto row = observed.begin(); row != observed.end(); ++row) {
+    if (static_cast<std::size_t>(*row) >= kStopFaultTriggerCount ||
+        std::find(observed.begin(), row, *row) != row)
+      return "stop_fault_latch_observed_triggers_invalid";
   }
   switch (latch.state) {
     case StopFaultLatchStateDTO::kLatched:
@@ -416,6 +446,49 @@ std::optional<std::string_view> stop_terminal_projection_field_error(
     return "stop_terminal_projection_outcome_invalid";
   }
   return std::nullopt;
+}
+
+StopTerminalStatusRestDTO TerminalStopStatusRest(const StopStatusDTO& status) {
+  return StopTerminalStatusRestDTO{status.accepted,
+                                   status.current_stages,
+                                   status.acceptance_projection,
+                                   status.terminal_projection,
+                                   status.surveillance_projection,
+                                   status.surveillance};
+}
+
+// I0 (lean Stop record): slice B owns this definition and its tests.
+StopStatusDTO TerminalStopStatusFromCertificate(const StopTerminalStatusRestDTO& rest,
+                                                const StopCertificateDTO& certificate,
+                                                const std::optional<StopFaultLatchDTO>& fault_latch) {
+  const auto state = [&] {
+    switch (certificate.result) {
+      case StopCertificateResultDTO::kSucceededNominal:
+      case StopCertificateResultDTO::kSucceededEscalated:
+        return StopStatusStateDTO::kSucceeded;
+      case StopCertificateResultDTO::kPartial:
+        return StopStatusStateDTO::kPartial;
+      case StopCertificateResultDTO::kFailedUncontained:
+        return StopStatusStateDTO::kFailed;
+    }
+    return StopStatusStateDTO::kFailed;
+  }();
+  return StopStatusDTO{rest.accepted,
+                       state,
+                       certificate.scope_entries,
+                       rest.current_stages,
+                       certificate.attempted_stage_results,
+                       certificate.evidence_items,
+                       certificate.unsettled,
+                       certificate.failed,
+                       rest.acceptance_projection,
+                       rest.terminal_projection,
+                       rest.surveillance_projection,
+                       StopCertificateRefDTO{certificate.stop_certificate_id,
+                                             certificate.stop_certificate_revision,
+                                             certificate.stop_id, certificate.stop_generation},
+                       fault_latch,
+                       rest.surveillance};
 }
 
 }  // namespace manyforge::core

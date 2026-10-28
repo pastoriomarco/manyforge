@@ -10,6 +10,7 @@ from fastapi import APIRouter, HTTPException, Path, Query, Request
 from fastapi.responses import JSONResponse, Response
 from pydantic import BaseModel, ConfigDict, Field, model_validator
 
+from manyforge_headless_api.cell_recover import CELL_RECOVER_REFERENCE_NOTE
 from manyforge_headless_api.client import HeadlessClientError, HeadlessHttpClient
 from manyforge_headless_api.close_wire import LifecycleOwnerSettlementRequest, LifecycleTargetRetirementIntent
 from manyforge_headless_api.execution_control import (
@@ -44,6 +45,7 @@ from manyforge_headless_api.models import (
     RouteSelectionRequest,
     SceneTransactionRequest,
     StopIntentRequest,
+    CellRecoverRequest,
     StopFaultRecoveryRequest,
     ProgramRunStartRequest,
     ProgramRunStopRequest,
@@ -99,7 +101,7 @@ _SCENE_RESULT_FIELDS = {
 
 
 class _SceneWorkspaceIdentity(BaseModel):
-    """The existing composite identity, carried only by Close's Scene cleanup."""
+    """The existing composite identity, carried only by Close's carried-object detach."""
     model_config = ConfigDict(extra="forbid", strict=True)
     workspace_epoch: str = Field(alias="workspaceEpoch", min_length=1, max_length=256)
     workspace_revision: int = Field(alias="workspaceRevision", ge=1, le=_MAXIMUM_SAFE_INTEGER)
@@ -127,8 +129,8 @@ class ComposerSceneTransactionRequest(SceneTransactionRequest):
 
     @model_validator(mode="after")
     def validate_authority_scope(self) -> "ComposerSceneTransactionRequest":
-        if self.expected_authoring_workspace is not None and self.operation.kind not in {"remove_object", "set_collision_policy", "detach_carried_object_at_current_pose"}:
-            raise ValueError("the composite Close fence is only valid for Close Scene cleanup")
+        if self.expected_authoring_workspace is not None and self.operation.kind != "detach_carried_object_at_current_pose":
+            raise ValueError("the composite Close fence is only valid for Close's carried-object detach")
         authored = self.operation.kind in {
             "add_object",
             "upsert_object",
@@ -982,6 +984,16 @@ def create_headless_router(
             )
         )
 
+    @router.post(
+        "/api/execution/cell-recover",
+        openapi_extra={"x-manyforge-reference-note": CELL_RECOVER_REFERENCE_NOTE},
+    )
+    async def execution_cell_recover(body: CellRecoverRequest) -> dict[str, Any]:
+        # Recover cell runs in Headless; Composer forwards only the caller identity.
+        return await control_call(
+            lambda: client.cell_recover(body.model_dump(mode="json"))
+        )
+
     @router.post("/api/execution/runtime-scale-control")
     async def execution_set_runtime_scale_control(
         body: RuntimeScaleControlRequest,
@@ -1070,17 +1082,11 @@ def create_headless_router(
 
             def submit_closed_scene():
                 state.authoring_workspace.require_identity(body.expected_authoring_workspace.identity())
-                if body.expected_draft_id is None:
-                    return commit_owner_scene()
-                return state.draft_session.execute_if_current(
-                    draft_id=body.expected_draft_id,
-                    expected_revision=body.expected_draft_revision,
-                    effect=commit_owner_scene,
-                )
+                return commit_owner_scene()
 
             try:
                 return state.authoring_admission.submit_workspace_fenced(submit_closed_scene)
-            except (AuthoringWorkspaceError, DraftSessionError) as error:
+            except AuthoringWorkspaceError as error:
                 raise HTTPException(error.status_code, detail={"code": error.code, "message": str(error)}) from error
         if body.expected_draft_id is None:
             return commit_owner_scene()

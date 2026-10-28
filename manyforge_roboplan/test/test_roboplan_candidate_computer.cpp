@@ -4,6 +4,7 @@
 #include <Eigen/Geometry>
 #include <algorithm>
 #include <filesystem>
+#include <functional>
 #include <manyforge_core/motion_interrupt/soft_on_path_stop_planner.hpp>
 #include <manyforge_core/trajectory/trajectory_sampler.hpp>
 #include <manyforge_core/time/fake_clock.hpp>
@@ -823,6 +824,116 @@ TEST(RoboPlanCandidateComputerTest,
       fixture.scene->toFullJointPositions("arm", positions), "tool0", "base");
   EXPECT_LE((actual.block<3, 1>(0, 3) - middle.block<3, 1>(0, 3)).norm(),
             candidate_request.tolerances.translation_tol_m);
+}
+
+TEST(RoboPlanCandidateComputerTest,
+     SmallPoseGoalsLandOnTargetNotAtTheRequestToleranceEdge) {
+  // GUI jog tolerances (5 mm / 0.05 rad) stay the acceptance check; the
+  // reached pose must not stop at their edge (or at the seed for sub-mm goals).
+  auto fixture = make_fixture();
+  // This configuration has free +X travel (see the Cartesian return test).
+  fixture.start = fixture.goal;
+  for (const auto profile : {PlanningProfileDTO::kFirstFeasible,
+                             PlanningProfileDTO::kQualityBounded}) {
+    for (const double delta_m : {0.01, 0.0005}) {
+      RoboPlanCandidateComputer computer(
+          fixture.scene, fixture.binding,
+          RoboPlanCandidateComputerConfig{0x4321U, 65'536U, 0.01});
+      Eigen::Matrix4d target =
+          fixture.scene->forwardKinematics(fixture.start, "tool0", "base");
+      target(0, 3) += delta_m;
+      auto input =
+          request(fixture, ResolvedMotionSpecDTO{PoseGoalDTO{pose(target)}});
+      input.tolerances = TolerancesDTO{1.0e-4, 5.0e-3, 5.0e-2};
+      input.planning_profile = profile;
+      const auto result = computer.compute(input);
+      ASSERT_TRUE(result.ok()) << result.error().message << " delta " << delta_m;
+      const auto &final = result.value().waypoints.back().positions_rad;
+      const Eigen::VectorXd positions =
+          Eigen::Map<const Eigen::VectorXd>(final.data(), final.size());
+      const auto reached = fixture.scene->forwardKinematics(
+          fixture.scene->toFullJointPositions("arm", positions), "tool0",
+          "base");
+      EXPECT_LE((reached.block<3, 1>(0, 3) - target.block<3, 1>(0, 3)).norm(),
+                1.0e-4)
+          << "delta " << delta_m;
+      EXPECT_LE(Eigen::AngleAxisd(reached.block<3, 3>(0, 0).transpose() *
+                                  target.block<3, 3>(0, 0))
+                    .angle(),
+                1.0e-3)
+          << "delta " << delta_m;
+    }
+  }
+}
+
+TEST(RoboPlanCandidateComputerTest,
+     PoseGoalRefinementNeverStartsAfterCancellationOrDeadline) {
+  // A Stop or deadline that arrives while the first IK solve runs is seen
+  // right after it: the request ends there and refinement never starts.
+  auto fixture = make_fixture();
+  fixture.start = fixture.goal;
+  Eigen::Matrix4d target =
+      fixture.scene->forwardKinematics(fixture.start, "tool0", "base");
+  target(0, 3) += 0.01;
+  auto input =
+      request(fixture, ResolvedMotionSpecDTO{PoseGoalDTO{pose(target)}});
+  input.tolerances = TolerancesDTO{1.0e-4, 5.0e-3, 5.0e-2};
+  RoboPlanCandidateComputer computer(
+      fixture.scene, fixture.binding,
+      RoboPlanCandidateComputerConfig{0x4321U, 65'536U, 0.01});
+  for (const bool cancel : {true, false}) {
+    SCOPED_TRACE(cancel ? "cancellation" : "deadline");
+    // Each stage polls the control once; trip it from poll `trip` on.
+    const auto stopped_at = [&](std::size_t trip) {
+      std::size_t polls = 0U;
+      const std::function<bool()> tripped = [&polls, trip] {
+        return ++polls >= trip;
+      };
+      const auto result = computer.compute(
+          input, cancel ? RoboPlanCandidateControl{tripped, {}}
+                        : RoboPlanCandidateControl{{}, tripped});
+      if (result.ok()) return std::string("completed");
+      EXPECT_EQ(result.error().details.at("reason"),
+                cancel ? "planning_cancelled_by_interrupt"
+                       : "planning_timeout");
+      return result.error().details.at("failure_stage");
+    };
+    std::size_t before_ik = 0U;
+    for (std::size_t trip = 1U; before_ik == 0U && trip <= 8U; ++trip) {
+      if (stopped_at(trip) == "before_ik") before_ik = trip;
+    }
+    ASSERT_NE(before_ik, 0U);
+    // The next poll is the first one after the first solve.
+    EXPECT_EQ(stopped_at(before_ik + 1U), "before_ik_refinement");
+  }
+}
+
+TEST(RoboPlanCandidateComputerTest,
+     PoseGoalWithNoIkBudgetLeftKeepsTheAcceptedFirstSolve) {
+  // The first solve accepts the seed for a 0.5 mm goal within 5 mm. With the
+  // whole budget spent by then, refinement is skipped and the accepted
+  // solution (the seed) is the result.
+  auto fixture = make_fixture();
+  fixture.start = fixture.goal;
+  for (const auto profile : {PlanningProfileDTO::kFirstFeasible,
+                             PlanningProfileDTO::kQualityBounded}) {
+    SCOPED_TRACE(static_cast<int>(profile));
+    RoboPlanCandidateComputer computer(
+        fixture.scene, fixture.binding,
+        RoboPlanCandidateComputerConfig{0x4321U, 65'536U, 0.01});
+    Eigen::Matrix4d target =
+        fixture.scene->forwardKinematics(fixture.start, "tool0", "base");
+    target(0, 3) += 0.0005;
+    auto input =
+        request(fixture, ResolvedMotionSpecDTO{PoseGoalDTO{pose(target)}});
+    input.tolerances = TolerancesDTO{1.0e-4, 5.0e-3, 5.0e-2};
+    input.planning_profile = profile;
+    input.planning_timeout_s = 1.0e-9;
+    const auto result = computer.compute(input);
+    ASSERT_TRUE(result.ok()) << result.error().message;
+    EXPECT_EQ(result.value().waypoints.back().positions_rad,
+              values(fixture.start));
+  }
 }
 
 TEST(RoboPlanCandidateComputerTest,

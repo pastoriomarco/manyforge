@@ -1,5 +1,6 @@
 #pragma once
 
+#include "execution_event_stream.hpp"
 #include "execution_host_commands.hpp"
 #include "execution_host_posix.hpp"
 #include "ros_host_composition.hpp"
@@ -237,6 +238,18 @@ private:
 
   [[nodiscard]] CanonicalValue EventsResponse(const Command &command) const;
 
+  /// Event stream reads (contract §8.1): the `events` reply facts without
+  /// page and progress, and one page of the same journal read.
+  [[nodiscard]] std::pair<std::string, CanonicalValue> EventStreamState() const;
+  [[nodiscard]] CanonicalValue EventStreamPage(const std::string &owner_epoch,
+                                               std::uint64_t after) const;
+  /// The executing direct-control operations' progress rows, as in the
+  /// `events` reply's `operation_progress`.
+  [[nodiscard]] CanonicalValue EventStreamProgress() const;
+  [[nodiscard]] CanonicalValue
+  OperationProgressValue(core::ResourceAddressedExecutionKernel &owner,
+                         const core::RequestOwnerEpoch &owner_epoch) const;
+
   [[nodiscard]] CanonicalValue
   Execute(const Command &command, Composition &composition,
           const core::ProjectionRevisionDTO &projection,
@@ -364,5 +377,13 @@ private:
   std::exception_ptr reconciliation_lane_failure_;
   DeferredLane submission_ordered_lane_{"execution_submission_lane_busy"};
   DeferredLane scene_read_lane_{"execution_scene_read_lane_busy"};
+  // Event subscriptions: own socket, acceptor and one writer per subscriber.
+  CommandSocket event_stream_socket_;
+  ExecutionEventStream event_stream_{ExecutionEventStreamSource{
+      [this] { return EventStreamState(); },
+      [this](const std::string &owner_epoch, const std::uint64_t after) {
+        return EventStreamPage(owner_epoch, after);
+      },
+      [this] { return EventStreamProgress(); }}};
 };
 } // namespace manyforge::roboplan_backend::host_detail

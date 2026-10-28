@@ -290,7 +290,8 @@ inline constexpr char kDigestC[] =
       1U,
       StopFaultRecoveryStatusDTO::kWaitingForObservation,
       "stop_fault_latched",
-      {}};
+      {},
+      {StopFaultTriggerDTO::kFailedUncontained}};
 }
 
 [[nodiscard]] StopSurveillanceSourcePlanDTO SourcePlan(const StopCertificateDTO& certificate) {

@@ -323,6 +323,34 @@ function posePayload(kind: 'simulation_entity_pose' | 'detection3d_pose') {
       };
 }
 
+function attachedPosePayload() {
+  return {
+    api_version: 'manyforge.ros_pose_observation.v2' as const,
+    kind: 'simulation_entity_pose_with_references.v1' as const,
+    pose: {
+      frame_id: 'cell',
+      frame_kind: 'cell_frame' as const,
+      orientation_xyzw: [0, 0, 0, 1] as [number, number, number, number],
+      position_m: [0.4, 0.2, 0.1] as [number, number, number],
+      source_stamp_ns: 12_000_000_000,
+    },
+    references: [{
+      controllable_component_id: 'robot-1',
+      command_target_id: 'gripper',
+      gripper_link: 'tool',
+      entity: '/World/robot/tool',
+      link: 'tool_base_link',
+      source_header_frame_id: 'tool_header',
+      coherent: true,
+      pose_in_reference: {
+        orientation_xyzw: [0, 0, 0, 1] as [number, number, number, number],
+        position_m: [0.02, -0.01, 0.25] as [number, number, number],
+      },
+    }],
+    source: { entity: '/part' },
+  };
+}
+
 function runtime(sources: SceneRuntimePoseSource[]): SceneRuntimeProjection {
   return {
     api_version: 'manyforge.scene_runtime_source.v1',
@@ -765,6 +793,121 @@ describe('runtime scene presentation', () => {
     expect(presentation.measuredObjects).toHaveLength(1);
     expect(presentation.measuredObjects[0].objectId).toBe('part');
     expect(presentation.attachmentDiagnostics).toEqual([]);
+  });
+
+  it('joins attached pose evidence by object, holder, and carrier frame while preserving freshness', () => {
+    const scene = attachedLogicalScene();
+    const sample = baseSource(attachedPosePayload(), {
+      eligible: true,
+      object_id: 'part',
+      policy_id: 'continuous_relative_to_attached',
+      holder: {
+        controllable_component_id: 'robot-1', command_target_id: 'gripper', gripper_link: 'tool',
+      },
+      measured_against: { entity: '/World/robot/tool', link: 'tool_base_link' },
+      source_header_frame_id: 'tool_header',
+      frame: {
+        kind: 'component',
+        controllable_component_id: 'robot-1',
+        model_instance_id: 'model-instance-1',
+        frame_role_id: 'gripper_tcp',
+      },
+      current_offset: {
+        position_m: { x: 0.02, y: -0.01, z: 0.25 },
+        orientation_xyzw: [0, 0, 0, 1],
+      },
+      baseline_offset: {
+        position_m: { x: 0.01, y: -0.01, z: 0.24 },
+        orientation_xyzw: [0, 0, 0, 1],
+      },
+      drift: { translation_m: 0.0141, rotation_rad: 0.02 },
+    });
+    const presentation = runtimeScenePresentation(
+      runtime([sample]),
+      scene,
+      sourceModel(),
+      manifest(),
+      motionDescriptor(),
+    );
+
+    expect(presentation.attachedObjects[0]?.poseMeasurement).toMatchObject({
+      holder: {
+        controllable_component_id: 'robot-1', command_target_id: 'gripper', gripper_link: 'tool',
+      },
+      measured_against: { entity: '/World/robot/tool', link: 'tool_base_link' },
+      frame: {
+        controllable_component_id: 'robot-1',
+        model_instance_id: 'model-instance-1',
+        frame_role_id: 'gripper_tcp',
+      },
+      current_offset: { position_m: { x: 0.02, y: -0.01, z: 0.25 } },
+      baseline_offset: { position_m: { x: 0.01, y: -0.01, z: 0.24 } },
+      drift: { translation_m: 0.0141, rotation_rad: 0.02 },
+      fresh: true,
+    });
+
+    const stale = runtimeScenePresentation(
+      runtime([{ ...sample, fresh: false }]),
+      scene,
+      sourceModel(),
+      manifest(),
+      motionDescriptor(),
+    );
+    expect(stale.attachedObjects[0]?.poseMeasurement).toMatchObject({
+      current_offset: { position_m: { x: 0.02, y: -0.01, z: 0.25 } },
+      fresh: false,
+    });
+
+    const wrongFrame = runtimeScenePresentation(
+      runtime([{
+        ...sample,
+        frame: {
+          kind: 'component',
+          controllable_component_id: 'robot-1',
+          model_instance_id: 'another-model',
+          frame_role_id: 'gripper_tcp',
+        },
+      }]),
+      scene,
+      sourceModel(),
+      manifest(),
+      motionDescriptor(),
+    );
+    expect(wrongFrame.attachedObjects[0]?.poseMeasurement).toBeNull();
+
+    const continuous = runtimeScenePresentation(
+      runtime([baseSource(posePayload('simulation_entity_pose'), {
+        eligible: true,
+        object_id: 'part',
+        policy_id: 'continuous',
+        measured_against: 'cell frame',
+        frame: {
+          kind: 'component',
+          controllable_component_id: 'robot-1',
+          model_instance_id: 'model-instance-1',
+          frame_role_id: 'gripper_tcp',
+        },
+        current_offset: {
+          position_m: { x: 0.02, y: -0.01, z: 0.25 },
+          orientation_xyzw: [0, 0, 0, 1],
+        },
+        baseline_offset: {
+          position_m: { x: 0.01, y: -0.01, z: 0.24 },
+          orientation_xyzw: [0, 0, 0, 1],
+        },
+        drift: { translation_m: 0.0141, rotation_rad: 0.02 },
+      })]),
+      scene,
+      sourceModel(),
+      manifest(),
+      motionDescriptor(),
+    );
+    expect(continuous.attachedObjects[0]?.poseMeasurement).toMatchObject({
+      measured_against: 'cell frame',
+      current_offset: { position_m: { x: 0.02, y: -0.01, z: 0.25 } },
+      drift: { translation_m: 0.0141, rotation_rad: 0.02 },
+    });
+    expect(continuous.attachedObjects[0]?.poseMeasurement).not.toHaveProperty('holder');
   });
 
   it('follows the exact carrier transform and detaches at the same cell pose without a jump', () => {

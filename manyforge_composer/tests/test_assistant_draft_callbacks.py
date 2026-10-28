@@ -255,6 +255,9 @@ class _AdmissionHeadless:
             "admission_generation": self.generation,
         }
 
+    def program_cycle_status(self) -> dict:
+        return {"state": "idle_after_reset"}
+
     def acquire_authoring_transaction(self, body: dict) -> dict:
         self.claims.append(deepcopy(body))
         acquired_generation = self.generation
@@ -374,7 +377,9 @@ def test_callback_uses_exact_active_context_and_mutates_only_the_draft(
     assert result["success"] is True
     assert result["mutated"] is True
     assert result["draftMutated"] is True
-    assert result["nextAdmissionGeneration"] == 9
+    # A Draft edit takes no Kernel claim, so the generation is unchanged.
+    assert result["nextAdmissionGeneration"] == 7
+    assert state.headless_client.claims == []
     assert result["result"]["draftRevision"] == 2
     assert projection_reads == 2
     assert state.draft_session.snapshot()["applied"] is False
@@ -401,7 +406,7 @@ def test_callback_uses_exact_active_context_and_mutates_only_the_draft(
     )
     assert second.status_code == 200
     assert second.json()["result"]["draftRevision"] == 3
-    assert second.json()["nextAdmissionGeneration"] == 11
+    assert second.json()["nextAdmissionGeneration"] == 7
 
     # Ordinary in-memory edits have no durable replay ledger. A lost-response
     # retry carries the old workspace fence and is rejected as stale instead
@@ -412,8 +417,8 @@ def test_callback_uses_exact_active_context_and_mutates_only_the_draft(
     )
     assert replay.status_code == 409
     assert replay.json()["detail"]["code"] == "composer_workspace_stale"
-    assert len(state.headless_client.claims) == 2
-    assert len(state.headless_client.settlements) == 2
+    assert state.headless_client.claims == []
+    assert state.headless_client.settlements == []
 
     conflicting = deepcopy(body)
     conflicting["arguments"]["scene_resource"]["scene_resource_id"] = "other"
@@ -614,3 +619,158 @@ def test_assistant_projection_verifier_rejects_schema_or_catalog_drift() -> None
         raise AssertionError("stale catalog hash was accepted")
     except RuntimeError as error:
         assert "catalog_hash" in str(error)
+
+
+def test_real_bridge_reports_claimless_draft_edits_and_refuses_a_stale_fence(
+    monkeypatch, tmp_path
+) -> None:
+    """The real bridge loop drives the real Composer callback route."""
+
+    import asyncio
+    import time
+
+    import httpx
+    from manyforge_assistant_bridge.bridge import create_app as create_bridge_app
+    from manyforge_assistant_bridge.catalog import raw_digest
+    from manyforge_assistant_bridge.tests import test_bridge as bridge_fixture
+
+    node_environment = _node_environment()
+    context = _assistant_context(node_environment)
+    environment = build_node_environment()
+    state = ComposerState(
+        node_environment=environment,
+        program=Program(_PROGRAM_PATH, environment.catalog),
+        program_source_path=str(_PROGRAM_PATH),
+        headless_client=_AdmissionHeadless(),  # type: ignore[arg-type]
+    )
+    from manyforge_composer.backend import routes_assistant_draft as route
+
+    monkeypatch.setattr(
+        route, "read_active_assistant_context", lambda _state, *, mode: context
+    )
+    composer = TestClient(create_app(state))
+    template = _body(
+        state, node_environment, context.source_model, context.assistant_mode
+    )
+    callback_bodies: list[dict] = []
+    responses: list[tuple[int, dict]] = []
+
+    async def composer_handler(request: httpx.Request) -> httpx.Response:
+        sent = json.loads(request.content)
+        callback_bodies.append(sent)
+        # The bridge's own fences and identities; the active-context
+        # identities and arguments come from Composer's fixture.
+        body = deepcopy(template)
+        for field in (
+            "draftId", "expectedDraftRevision", "expectedWorkspaceEpoch",
+            "expectedWorkspaceRevision", "expectedAdmissionGeneration",
+            "requestId", "requestOwnerEpoch", "sourceLabel", "correlationId",
+        ):
+            body[field] = sent[field]
+        body["arguments"] = {
+            "scene_resource": _resource(f"bridge-part-{len(callback_bodies)}")
+        }
+        reply = await asyncio.to_thread(
+            composer.post,
+            "/api/assistant/bridge/tools/scene_draft_add_object",
+            json=body,
+        )
+        responses.append((reply.status_code, reply.json()))
+        return httpx.Response(reply.status_code, json=reply.json(), request=request)
+
+    projection = bridge_fixture._projection()
+    schema = {"additionalProperties": False, "properties": {}, "type": "object"}
+    bridge_fixture._append_projection_tool(
+        projection,
+        {
+            "description": "Add one authored scene object.",
+            "effect": "composer_draft_mutating",
+            "input_schema": schema,
+            "input_schema_hash": raw_digest(schema),
+            "tool_id": "scene_draft_add_object",
+        },
+    )
+    turns = 0
+
+    async def upstream(request: httpx.Request) -> httpx.Response:
+        nonlocal turns
+        turns += 1
+        message = {"content": "Done."} if turns % 2 == 0 else {
+            "content": "",
+            "tool_calls": [
+                {
+                    "id": f"call.{turns}.{index}",
+                    "type": "function",
+                    "function": {"name": "scene_draft_add_object", "arguments": "{}"},
+                }
+                for index in range(2)
+            ],
+        }
+        return httpx.Response(
+            200, json={"choices": [{"message": message}]}, request=request
+        )
+
+    def provider_request(request_id: str, draft: dict, workspace) -> dict:
+        body = bridge_fixture._request(projection)
+        body["requestId"] = request_id
+        body["composerDraft"].update(
+            draftId=draft["draft_id"],
+            expectedDraftRevision=draft["draft_revision"],
+            expectedWorkspaceEpoch=workspace.workspace_epoch,
+            expectedWorkspaceRevision=workspace.workspace_revision,
+            expectedAdmissionGeneration=7,
+        )
+        return body
+
+    def terminal(client: TestClient, request_id: str) -> dict:
+        for _ in range(500):
+            status = client.get(f"/v1/manyforge/assistant/{request_id}").json()
+            if status["state"] != "running":
+                return status
+            time.sleep(0.01)
+        raise AssertionError("assistant request did not finish")
+
+    before_draft = state.draft_session.snapshot()
+    before_workspace = state.authoring_workspace.identity()
+    service = bridge_fixture._service(
+        tmp_path, projection, upstream_handler=upstream,
+        composer_handler=composer_handler,
+    )
+    with TestClient(create_bridge_app(service.config, service=service)) as client:
+        assert client.post(
+            "/v1/manyforge/assistant",
+            json=provider_request("request.1", before_draft, before_workspace),
+        ).status_code == 202
+        first = terminal(client, "request.1")
+
+        # Two consecutive claimless edits, both committed and reported.
+        assert first["state"] == "completed", first
+        assert first["response"]["draftMutated"] is True
+        assert [code for code, _ in responses] == [200, 200]
+        assert all(reply["mutated"] is True for _, reply in responses)
+        assert [body["expectedAdmissionGeneration"] for body in callback_bodies] == [7, 7]
+        assert [body["expectedWorkspaceRevision"] for body in callback_bodies] == [
+            before_workspace.workspace_revision,
+            before_workspace.workspace_revision + 1,
+        ]
+        assert state.draft_session.snapshot()["draft_revision"] == (
+            before_draft["draft_revision"] + 2
+        )
+        assert state.authoring_workspace.identity().workspace_revision == (
+            before_workspace.workspace_revision + 2
+        )
+        assert state.headless_client.claims == []
+
+        # A request built on the old workspace is refused by the fence and
+        # changes nothing; the bridge never reports it as committed.
+        after = state.draft_session.snapshot()
+        assert client.post(
+            "/v1/manyforge/assistant",
+            json=provider_request("request.2", before_draft, before_workspace),
+        ).status_code == 202
+        stale = terminal(client, "request.2")
+
+    assert responses[2][0] == 409
+    assert responses[2][1]["detail"]["code"] == "composer_workspace_stale"
+    assert (stale.get("response") or {}).get("draftMutated") is not True, stale
+    assert state.draft_session.snapshot() == after

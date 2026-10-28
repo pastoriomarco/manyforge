@@ -5,7 +5,7 @@ from __future__ import annotations
 from copy import deepcopy
 import hashlib
 from pathlib import Path
-from typing import Any, Literal, NoReturn
+from typing import Any, NoReturn
 import uuid
 
 from fastapi import APIRouter, HTTPException, Query
@@ -31,11 +31,11 @@ from .authoring_admission import (
 from .authoring_forest import (
     AuthoringForestError,
     derive_candidate,
-    empty_authoring,
     validate_invariants,
 )
 from .authoring_identity import canonical_digest
 from .authoring_admission import AuthoringOperationError
+from .authoring_forest import adopt_active_catalog
 from .authoring_workspace import (
     AuthoringWorkspaceError,
     AuthoringWorkspaceIdentity,
@@ -56,14 +56,13 @@ from .routes_draft import _workspace as program_workspace, prepare_program_disca
 from .scenario_artifacts import (
     SCENARIO_NAME_PATTERN,
     SCENARIO_PROJECT_MEMBERS,
+    UNTITLED_SCENARIO_PATH,
     ScenarioArtifactError,
     build_scenario_document,
     capture_scenario_artifact,
     capture_scenario_artifact_with_diagnostics,
     discover_scenario_artifacts,
     export_scenario_artifact,
-    prepare_scenario_artifact,
-    prepared_scenario_source_digest,
     save_scenario_artifact,
     scenario_project_path,
     scenario_project_stem,
@@ -137,14 +136,9 @@ class LoadScenarioDocumentRequest(_ScenarioFence):
 
 
 class NewScenarioDocumentRequest(_ScenarioFence):
-    """Create ``<directory>/<name>.scenario``; the name is also its scenario_id."""
+    """Load the built-in, read-only empty Untitled Scenario."""
 
-    directory: str = Field(min_length=1, max_length=4096)
-    name: str = Field(pattern=SCENARIO_NAME_PATTERN)
     confirm_discard: bool = Field(default=False, alias="confirmDiscard")
-    deployment_choice: Literal["empty"] = Field(alias="deploymentChoice")
-    expected_retained_bundle_id: str = Field(alias="expectedRetainedBundleId", min_length=1)
-    expected_graph_revision: str = Field(alias="expectedGraphRevision", min_length=1)
 
 
 class DiscardScenarioRequest(_ScenarioFence):
@@ -554,68 +548,30 @@ def create_scenario_document_router(state: ComposerState) -> APIRouter:
 
     @router.post("/api/scenario-documents/new")
     def new_document(body: NewScenarioDocumentRequest) -> dict[str, Any]:
-        return activate_document(body)
+        # New is the ordinary Load of the built-in empty Untitled Scenario.
+        return activate_document(LoadScenarioDocumentRequest(
+            **body.model_dump(), path=str(UNTITLED_SCENARIO_PATH)
+        ))
 
-    def activate_document(
-        body: LoadScenarioDocumentRequest | NewScenarioDocumentRequest,
-    ) -> dict[str, Any]:
+    def activate_document(body: LoadScenarioDocumentRequest) -> dict[str, Any]:
         committed_path: str | None = None
-        created_path: str | None = None
         committed_snapshot = None
         activation: dict[str, Any] | None = None
-        creating = isinstance(body, NewScenarioDocumentRequest)
         effects = OperationEffects()
         try:
             _require_fence(state, body)
             captured_workspace = state.authoring_workspace.snapshot()
             _require_captured_workspace_fence(body, captured_workspace.identity)
             authoring_catalog = state.node_catalog
-            if creating:
-                if not body.confirm_discard:
-                    raise ScenarioArtifactError("scenario_discard_confirmation_required",
-                        "New closes the current Scenario and clears its Scene; confirmation is required", status_code=409)
-                new_path = scenario_project_path(body.directory, body.name)
-                if state.headless_client is None:
-                    raise ScenarioArtifactError(
-                        "scenario_activation_unavailable",
-                        "New Scenario requires the configured Manager",
-                        status_code=503,
-                    )
-                _require_scenario_closed(state, state.headless_client.manager_status(), creating=True)
-                deployment = {
-                    "api_version": "manyforge.deployment_intent.v2",
-                    "deployment_artifact_id": "empty_scenario",
-                    "name": "Empty Deployment",
-                    "components": [], "attachments": [], "policies": {},
-                }
-                authoring = empty_authoring(authoring_catalog)
-                authoring["name"] = body.name
-                # One identifier: the new project's folder stem is its id.
-                scenario_document = build_scenario_document(
-                    scenario_id=body.name,
-                    name=body.name, description="", program_draft=authoring,
-                    deployment_draft=deployment,
-                    program_role_assignment={"component_roles": [], "target_roles": []},
-                    manyforge_version=_version(),
-                    last_known_status="incomplete",
-                )
-                scenario_document, target, members, manifest = prepare_scenario_artifact(
-                    scenario_document, new_path, allowed_roots=state.allowed_fs_roots,
-                )
-                if target.exists() or target.is_symlink():
-                    raise ScenarioArtifactError("scenario_destination_exists", "New requires a new project folder", status_code=409)
-                source_path = str(target)
-                source_digest = prepared_scenario_source_digest(members, manifest)
-                source_diagnostics = []
-            else:
-                (scenario_document, source_path, source_digest, source_diagnostics) = capture_scenario_artifact_with_diagnostics(
-                    body.path, allowed_roots=state.allowed_fs_roots)
+            (scenario_document, source_path, source_digest, source_diagnostics) = capture_scenario_artifact_with_diagnostics(
+                body.path, allowed_roots=state.allowed_fs_roots)
             scenario_document_id = scenario_document["scenario_id"]
             authoring = scenario_document["program_draft"]
             deployment = deepcopy(scenario_document["deployment_draft"])
             program: Program | None = None
             diagnostics: list[dict[str, str]] = []
             if authoring is not None:
+                adopt_active_catalog(authoring, authoring_catalog)
                 try:
                     validate_invariants(authoring, authoring_catalog)
                     program, diagnostics = derive_candidate(
@@ -678,11 +634,8 @@ def create_scenario_document_router(state: ComposerState) -> APIRouter:
                 )
             )
             manager_status = state.headless_client.manager_status()
-            _require_scenario_closed(state, manager_status, creating=creating)
+            _require_scenario_closed(state, manager_status)
             bundle, graph, _epoch = state._manager_current(manager_status)
-            if creating and (body.expected_retained_bundle_id != bundle or body.expected_graph_revision != graph):
-                raise ScenarioArtifactError("scenario_activation_preview_changed",
-                    "Applied Deployment changed since New was opened; review the choice again", status_code=409)
             activation_intent: dict[str, Any] = {
                 "scene_initialization": "initialize",
                 "scenario_id": scenario_document["scenario_id"],
@@ -717,18 +670,6 @@ def create_scenario_document_router(state: ComposerState) -> APIRouter:
                 activation_intent, None, apply=True, prepare_only=True,
                 confirmed=True,
             )
-            if creating:
-                # New begins only from the owner-proved canonical empty cell.
-                # Its empty candidate cannot introduce a component effect.
-                preview = activation_preview.get("candidate_preview")
-                impact = preview.get("impact") if isinstance(preview, dict) else None
-                changes = impact.get("components") if isinstance(impact, dict) else None
-                if not isinstance(changes, list) or changes:
-                    raise ScenarioArtifactError(
-                        "scenario_new_impact_changed",
-                        "New requires an empty component impact after Close",
-                        status_code=409,
-                    )
             # Both retained Draft replacements are validated outside every
             # owner lock, and the whole load commits as one workspace
             # replacement: the successor Program and Deployment identities and
@@ -819,13 +760,7 @@ def create_scenario_document_router(state: ComposerState) -> APIRouter:
                 activation_prepared = activation_preview
 
             def commit_load() -> None:
-                nonlocal committed_path, committed_snapshot, created_path
-                if creating:
-                    created_path = save_scenario_artifact(
-                        scenario_document, source_path, allowed_roots=state.allowed_fs_roots,
-                        overwrite=False, expected_source_digest=source_digest,
-                        effects=effects,
-                    )
+                nonlocal committed_path, committed_snapshot
                 committed_snapshot = state.authoring_workspace.replace(
                     expected_identity=captured_workspace.identity,
                     install=install_load,
@@ -838,7 +773,7 @@ def create_scenario_document_router(state: ComposerState) -> APIRouter:
                     notify=False,
                 )
                 committed_path = source_path
-                # An opened or created Scenario supersedes a refused startup project.
+                # An opened Scenario supersedes a refused startup project.
                 state.startup_scenario_notice = None
 
             def submit_load(claim: dict[str, Any]) -> dict[str, Any]:
@@ -859,7 +794,7 @@ def create_scenario_document_router(state: ComposerState) -> APIRouter:
 
             activation = coordinator.execute_external_submission(
                 body.admission_envelope(),
-                operation_kind="new_scenario_document" if creating else "load_scenario_document",
+                operation_kind="load_scenario_document",
                 draft_id=body.draft_id,
                 draft_revision=body.expected_draft_revision,
                 payload={
@@ -887,22 +822,11 @@ def create_scenario_document_router(state: ComposerState) -> APIRouter:
                 "scenario_id": scenario_document_id,
                 "incomplete": False,
                 "workspace": workspace,
-                # The exact composite post-image this Load/New committed, as
+                # The exact composite post-image this Load committed, as
                 # every other authoring route returns it (not its identity).
                 "authoringWorkspace": committed_snapshot.as_dict(),
             }
         except Exception as error:
-            if created_path is None and effects.published_path is not None:
-                created_path = effects.published_path
-            if created_path is not None:
-                raise HTTPException(status_code=503, detail={
-                    "code": "scenario_created_not_activated",
-                    "message": "The new Scenario was saved, but activation was not confirmed. No automatic retry was made.",
-                    "path": created_path,
-                    "cause": error.detail if isinstance(error, HTTPException) else str(error),
-                    "activation": activation,
-                    "workspace": state.authoring_workspace.identity().as_dict(),
-                }) from error
             if committed_path is not None and committed_snapshot is not None:
                 # The local workspace was committed before Manager submission.
                 # Preserve that observable partial result; never report Load as
@@ -1063,9 +987,9 @@ def create_scenario_document_router(state: ComposerState) -> APIRouter:
 
 
 def _require_scenario_closed(
-    state: ComposerState, manager_status: dict[str, Any], *, creating: bool
+    state: ComposerState, manager_status: dict[str, Any]
 ) -> None:
-    """New and every Load start only after the current owner proves Close.
+    """Every Load (also New's) starts only after the current owner proves Close.
 
     The proof comes from the same current Manager head used for preview. A
     Load of the Scenario that is currently applied is no exception: Load
@@ -1076,15 +1000,13 @@ def _require_scenario_closed(
     if type(canonical_empty) is not bool:
         raise ScenarioArtifactError(
             "scenario_load_current_configuration_unavailable",
-            ("New Scenario" if creating else "Scenario Load")
-            + " requires the Manager's current canonical-empty proof",
+            "Scenario Load requires the Manager's current canonical-empty proof",
             status_code=409,
         )
     if not canonical_empty:
         raise ScenarioArtifactError(
             "scenario_close_required",
-            "Close first before creating a new scenario" if creating
-            else "Close first before loading a scenario",
+            "Close first before loading a scenario",
             status_code=409,
         )
 

@@ -1,4 +1,5 @@
 #include <manyforge_core/types/coordinate_state.hpp>
+#include <manyforge_core/time/received_sample_age.hpp>
 
 #include <algorithm>
 #include <cmath>
@@ -101,7 +102,7 @@ Result<void> validate_observed_state_snapshot(
   if (now_ns < 0 || state.sequence == 0U || state.source_id.empty() ||
       state.source_epoch.empty() || state.state_authority_id.empty() ||
       state.authority_generation == 0U || state.received_timestamp_ns < 0 ||
-      state.received_timestamp_ns > now_ns || state.freshness_budget_ns < 0) {
+      state.freshness_budget_ns < 0) {
     return Result<void>::Err(invalid("observation_metadata_invalid"));
   }
   if (state.state_authority_class == StateAuthorityClass::kMeasured &&
@@ -110,7 +111,8 @@ Result<void> validate_observed_state_snapshot(
         invalid("measured_freshness_budget_required"));
   }
   if (state.freshness_budget_ns > 0 &&
-      now_ns - state.received_timestamp_ns > state.freshness_budget_ns) {
+      !received_sample_current(state.received_timestamp_ns, now_ns,
+                               state.freshness_budget_ns)) {
     return Result<void>::Err(invalid("observation_stale"));
   }
   if (state.state_authority_class == StateAuthorityClass::kMeasured &&

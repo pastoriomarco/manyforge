@@ -1049,8 +1049,9 @@ def test_real_assistant_callback_uses_headless_source_facts_and_only_edits_draft
                         raise
             assert accepted["success"] is True
             assert accepted["draftMutated"] is True
+            # A Draft edit takes no Kernel claim: the generation is echoed.
             assert (
-                accepted["nextAdmissionGeneration"] > accepted_body["expectedAdmissionGeneration"]
+                accepted["nextAdmissionGeneration"] == accepted_body["expectedAdmissionGeneration"]
             )
 
             after_accepted = composer.request("GET", "/api/program/draft")

@@ -467,7 +467,7 @@ def headless_client() -> (
         elif path == "/api/cycle/status":
             payload = {
                 "schema_version": "manyforge.program_cycle_status.v1",
-                "state": "idle",
+                "state": "idle_after_reset",
             }
         elif path == "/api/control/state":
             payload = {
@@ -712,6 +712,16 @@ def headless_client() -> (
             }
         elif path.startswith("/api/program/persistent-values"):
             payload = {"forwarded": path}
+        elif path == "/api/execution/cell-recover":
+            payload = {
+                "schema_version": "manyforge.cell_recover_result.v1",
+                "request_id": body["request_context"]["request_id"],
+                "outcome": "done",
+                "acknowledged_incidents": [],
+                "latch_cleared": True,
+                "recovered_components": [],
+                "reason": None,
+            }
         elif path == "/api/program/runs/program-run.7/node-correction-previews":
             payload = {"forwarded": path}
         else:
@@ -1638,6 +1648,11 @@ def test_composer_runtime_scene_transaction_omits_authoring_fences(
             "query": "",
             "body": {
                 **body,
+                "operation": {
+                    **body["operation"],
+                    "grasp_lost_bound": None,
+                    "on_grasp_lost": None,
+                },
                 "expected_admission_generation": None,
                 "program_node_evidence": None,
             },
@@ -1726,6 +1741,10 @@ def test_composer_rejects_draft_and_save_during_an_active_run(
 
         def authoring_admission(self) -> dict[str, Any]:
             return {"authoring_allowed": False, "admission_generation": 7}
+
+        def program_cycle_status(self) -> dict[str, Any]:
+            # A moving run: the held-run rule refuses the Draft edit.
+            return {"state": "running", "program_run_id": None}
 
     program_path = tmp_path / "active.program.yaml"
     program_path.write_bytes(_PROGRAM_PATH.read_bytes())
@@ -2234,161 +2253,43 @@ def test_lifecycle_request_result_proxy_preserves_exact_request_without_submit(r
     assert calls == [body]
 
 
-def _close_default_policy():
-    return {"policy_id": "free_space", "revision": {"revision_id": 1, "content_hash": "sha256:" + "1" * 64},
-        "allowed_static_static_pairs": [], "allowed_touch_link_pairs": [], "support_contacts": [],
-        "contact_grasps": [], "require_full_diagnostics": True}
-
-
-def _completed_close_request(composer, monkeypatch):
-    state = composer._composer_state
-    identity = state.authoring_workspace.identity()
-    publication = {
-        "publication_generation": 3, "durable_public_pointer_content_digest": "pointer.close.3",
-        "projection_revision": {"retained_bundle_id": "bundle.empty", "graph_revision": "graph.empty",
-            "scene_revision": {"scene_id": "scene.empty", "revision_id": 3, "content_hash": "scene.digest"}},
-        "transaction": {"kind": "named_apply", "apply_id": "close.apply.3", "apply_generation": 3},
-    }
-    current = {"source": {"available": True, "freshness": "fresh", "known_gaps": [],
-        "source_owner_id": "manager", "source_owner_epoch": "manager.epoch.1"},
-        "status": {"manager_ready": True, "active": {"canonical_empty": True,
-            "retained_bundle_id": "bundle.empty", "graph_revision": "graph.empty", "publication": publication}}}
-    monkeypatch.setattr(state.headless_client, "manager_status", lambda: copy.deepcopy(current))
-    scene = {"logical_scene": {"available": True, "freshness": "fresh", "known_gaps": [],
-        "source_owner_id": "scene", "source_owner_epoch": "scene.epoch.1", "payload": {
-            "access": {"scene_writes_open": True, "projection_leases_open": True,
-                "active_projection": copy.deepcopy(publication["projection_revision"])},
-            "snapshot": {"objects": [], "carried_object_attachments": [],
-                "configured_collision_policy": _close_default_policy(),
-                "revision": copy.deepcopy(publication["projection_revision"]["scene_revision"])}}}}
-    monkeypatch.setattr(state.headless_client, "scene", lambda: copy.deepcopy(scene))
-    body = {"draftId": identity.program_draft_id, "expectedDraftRevision": identity.program_draft_revision,
-        "expectedWorkspaceEpoch": identity.workspace_epoch, "expectedWorkspaceRevision": identity.workspace_revision,
-        "confirmDiscard": True, "completedClose": {"sceneOwnerId": "scene", "sceneOwnerEpoch": "scene.epoch.1",
-            "sceneProjectionRevision": copy.deepcopy(publication["projection_revision"]), "managerOwnerId": "manager", "managerOwnerEpoch": "manager.epoch.1",
-            "retainedBundleId": "bundle.empty", "graphRevision": "graph.empty", "publication": copy.deepcopy(publication),
-            "deploymentDraftId": identity.deployment_draft_id,
-            "expectedDeploymentDraftRevision": identity.deployment_draft_revision}}
-    return body, current
-
-
-def test_completed_close_clears_both_editors_and_project_once_without_saved_effects(headless_client, monkeypatch):
-    client, requests, _ = headless_client
-    saved = _PROGRAM_PATH.read_bytes()
-    with _composer_with_program(client) as composer:
-        state = composer._composer_state
-        state.authoring_workspace.remember_project(
-            document={"scenario_id": "saved.current", "name": "Saved current", "description": "Saved",
-                "program_draft": {}, "deployment_draft": {},
-                "program_role_assignment": {"component_roles": [{"role": "arm"}], "target_roles": []}},
-            document_path="/projects/saved.current", source_document_digest="saved.digest",
-        )
-        before = state.authoring_workspace.snapshot().as_dict()
-        body, _ = _completed_close_request(composer, monkeypatch)
-        offset = len(requests)
-        response = composer.post("/api/program/new-draft", json=body)
-        assert response.status_code == 200, response.text
-        after = state.authoring_workspace.snapshot().as_dict()
-        assert after["workspaceRevision"] == before["workspaceRevision"] + 1
-        assert after["program"]["draftId"] != before["program"]["draftId"]
-        assert after["deployment"]["draftId"] != before["deployment"]["draftId"]
-        assert after["program"]["authoring"]["forest"] == []
-        assert not after["program"]["authoring"].get("scene")
-        assert after["program"]["saved"]["path"] is None
-        assert after["deployment"]["document"]["components"] == []
-        assert after["deployment"]["savedPath"] is None
-        assert after["deployment"]["savedDocument"] is None
-        assert after["project"]["program_role_assignment"] == {"component_roles": [], "target_roles": []}
-        assert all(value is None or value == [] for key, value in after["project"].items() if key != "program_role_assignment")
-        assert composer.post("/api/program/new-draft", json=body).status_code == 409
-        assert _PROGRAM_PATH.read_bytes() == saved
-        assert all(request["method"] == "GET" for request in _without_authoring_owner_calls(requests[offset:]))
-
-
-@pytest.mark.parametrize("changed", ["owner", "owner_epoch", "publication", "noncanonical", "missing_flag", "malformed",
-    "program_draft", "deployment_draft", "workspace", "confirmation", "under_claim", "install_failure", "admission", "scene_owner", "scene_revision", "scene_nonempty", "scene_attachment", "scene_policy"])
-def test_completed_close_refuses_changed_proof_without_erasing_editors(headless_client, monkeypatch, changed):
-    client, _, _ = headless_client
-    with _composer_with_program(client) as composer:
-        state = composer._composer_state
-        body, current = _completed_close_request(composer, monkeypatch)
-        if changed == "owner": current["source"]["source_owner_id"] = "another"
-        elif changed == "owner_epoch": current["source"]["source_owner_epoch"] = "another"
-        elif changed == "publication": current["status"]["active"]["publication"]["publication_generation"] += 1
-        elif changed == "noncanonical": current["status"]["active"]["canonical_empty"] = 1
-        elif changed == "missing_flag": del current["status"]["active"]["canonical_empty"]
-        elif changed == "malformed": body["completedClose"]["publication"] = {}
-        elif changed == "program_draft": body["draftId"] = "changed"
-        elif changed == "deployment_draft": body["completedClose"]["deploymentDraftId"] = "changed"
-        elif changed == "workspace": body["expectedWorkspaceRevision"] += 1
-        elif changed == "confirmation": body["confirmDiscard"] = False
-        elif changed == "under_claim":
-            original = state.draft_session.prepare_new_replacement
-            def prepare(catalog):
-                prepared = original(catalog)
-                current["status"]["active"]["publication"]["publication_generation"] += 1
-                return prepared
-            monkeypatch.setattr(state.draft_session, "prepare_new_replacement", prepare)
-        elif changed == "install_failure":
-            def fail(*args, **kwargs): raise RuntimeError("injected install failure")
-            monkeypatch.setattr(state.draft_session, "install_prepared_replacement", fail)
-        elif changed in {"scene_owner", "scene_revision", "scene_nonempty", "scene_attachment", "scene_policy"}:
-            scene = state.headless_client.scene()
-            if changed == "scene_owner": scene["logical_scene"]["source_owner_epoch"] = "changed"
-            elif changed == "scene_revision": scene["logical_scene"]["payload"]["access"]["active_projection"]["scene_revision"]["revision_id"] += 1
-            elif changed == "scene_nonempty": scene["logical_scene"]["payload"]["snapshot"]["objects"] = [{"scene_resource_id": "new"}]
-            elif changed == "scene_policy": scene["logical_scene"]["payload"]["snapshot"]["configured_collision_policy"]["require_full_diagnostics"] = False
-            else: scene["logical_scene"]["payload"]["snapshot"]["carried_object_attachments"] = [{"id": "new"}]
-            monkeypatch.setattr(state.headless_client, "scene", lambda: copy.deepcopy(scene))
-        elif changed == "admission":
-            from manyforge_composer.backend.authoring_admission import refused_before_effect
-            def refuse(*args, **kwargs):
-                raise refused_before_effect(409, {"code": "authoring_not_ready", "message": "not idle"})
-            monkeypatch.setattr(state.authoring_admission, "execute_local_mutation", refuse)
-        before = state.authoring_workspace.snapshot().as_dict()
-        program_before = state.draft_session.snapshot()
-        deployment_before = state.deployment_draft_session.snapshot()
-        response = composer.post("/api/program/new-draft", json=body)
-        assert response.status_code in (409, 422, 503), response.text
-        if changed == "install_failure":
-            assert state.draft_session.snapshot() == program_before
-            assert state.deployment_draft_session.snapshot() == deployment_before
-            assert response.json()["detail"]["code"] == "composer_workspace_install_failed"
-        else:
-            assert state.authoring_workspace.snapshot().as_dict() == before
-
-
-def _close_scene_body(kind):
+def _close_detach_body():
     body = _scene_body()
-    if kind == "detach_carried_object_at_current_pose":
-        body.pop("expected_admission_generation")
-        body["operation"] = {"kind": kind, "carried_object_attachment_id": "attachment.1",
-            "expected_carried_object_attachment_revision": "sha256:" + "2" * 64, "expected_scene_resource_id": "part.1",
-            "expected_controllable_component_id": "arm", "expected_command_target_id": "gripper"}
-    elif kind == "set_collision_policy":
-        body["operation"] = {"kind": kind, "configured_policy": _close_default_policy(),
-            "expected_configured_policy_revision": _close_default_policy()["revision"]}
+    body.pop("expected_admission_generation")
+    body["operation"] = {"kind": "detach_carried_object_at_current_pose", "carried_object_attachment_id": "attachment.1",
+        "expected_carried_object_attachment_revision": "sha256:" + "2" * 64, "expected_scene_resource_id": "part.1",
+        "expected_controllable_component_id": "arm", "expected_command_target_id": "gripper"}
     return body
 
 
-@pytest.mark.parametrize("kind", ["remove_object", "set_collision_policy", "detach_carried_object_at_current_pose"])
-def test_close_scene_composite_fence_is_stripped_before_owner_forwarding(headless_client, kind):
+def test_close_detach_composite_fence_is_stripped_before_owner_forwarding(headless_client):
     client, requests, _ = headless_client
     with _composer(client) as composer:
         identity = composer._composer_state.authoring_workspace.identity()
-        body = {**_close_scene_body(kind), "expected_authoring_workspace": identity.as_dict()}
+        body = {**_close_detach_body(), "expected_authoring_workspace": identity.as_dict()}
         response = composer.post("/api/scene/transactions", json=body)
         assert response.status_code == 200, response.text
         owner = [request for request in requests if request["path"] == "/api/scene/transactions"]
         assert len(owner) == 1
         assert "expected_authoring_workspace" not in owner[0]["body"]
         assert "expected_draft_id" not in owner[0]["body"]
-        if kind == "detach_carried_object_at_current_pose":
-            assert owner[0]["body"].get("expected_admission_generation") is None
+        assert owner[0]["body"].get("expected_admission_generation") is None
 
 
-@pytest.mark.parametrize("kind", ["remove_object", "set_collision_policy", "detach_carried_object_at_current_pose"])
-def test_close_scene_rechecks_concurrent_deployment_edit_under_shared_serializer(headless_client, monkeypatch, kind):
+def test_close_composite_fence_is_refused_for_authored_scene_edits(headless_client):
+    client, requests, _ = headless_client
+    with _composer(client) as composer:
+        identity = composer._composer_state.authoring_workspace.identity()
+        response = composer.post("/api/scene/transactions", json={
+            **_scene_body(), "expected_authoring_workspace": identity.as_dict(),
+            "expected_draft_id": identity.program_draft_id,
+            "expected_draft_revision": identity.program_draft_revision,
+        })
+        assert response.status_code == 422, response.text
+        assert not [request for request in requests if request["path"] == "/api/scene/transactions"]
+
+
+def test_close_detach_rechecks_concurrent_deployment_edit_under_shared_serializer(headless_client, monkeypatch):
     from manyforge_composer.backend.authoring_admission import AuthoringMutationEnvelope
 
     client, requests, _ = headless_client
@@ -2396,9 +2297,7 @@ def test_close_scene_rechecks_concurrent_deployment_edit_under_shared_serializer
         state = composer._composer_state
         identity = state.authoring_workspace.identity()
         program_before = state.draft_session.snapshot()
-        body = {**_close_scene_body(kind), "expected_authoring_workspace": identity.as_dict()}
-        if kind != "detach_carried_object_at_current_pose":
-            body.update(expected_draft_id=identity.program_draft_id, expected_draft_revision=identity.program_draft_revision)
+        body = {**_close_detach_body(), "expected_authoring_workspace": identity.as_dict()}
         entered = threading.Event()
         proceed = threading.Event()
         original = state.authoring_admission.submit_workspace_fenced
@@ -2459,33 +2358,10 @@ def test_close_scene_composite_fence_is_strict_before_owner_effect(headless_clie
         assert not [request for request in requests if request["path"] == "/api/scene/transactions"]
 
 
-@pytest.mark.parametrize("field", ["policy_id", "allowed_static_static_pairs", "allowed_touch_link_pairs", "support_contacts", "contact_grasps", "require_full_diagnostics"])
-def test_completed_close_requires_fresh_policy_under_claim(headless_client, monkeypatch, field):
-    client, _, _ = headless_client
-    with _composer_with_program(client) as composer:
-        state = composer._composer_state
-        body, _ = _completed_close_request(composer, monkeypatch)
-        original_scene = state.headless_client.scene
-        original = state.draft_session.prepare_new_replacement
-        def prepare(catalog):
-            prepared = original(catalog)
-            scene = original_scene()
-            policy = scene["logical_scene"]["payload"]["snapshot"]["configured_collision_policy"]
-            policy[field] = "custom" if field == "policy_id" else False if field == "require_full_diagnostics" else [{}]
-            monkeypatch.setattr(state.headless_client, "scene", lambda: scene)
-            return prepared
-        monkeypatch.setattr(state.draft_session, "prepare_new_replacement", prepare)
-        before = state.authoring_workspace.snapshot().as_dict()
-        response = composer.post("/api/program/new-draft", json=body)
-        assert response.status_code == 409, response.text
-        assert response.json()["detail"]["code"] == "composer_close_scene_changed"
-        assert state.authoring_workspace.snapshot().as_dict() == before
-
-
 def test_close_runtime_detach_still_rejects_native_authoring_fences(headless_client):
     client, requests, _ = headless_client
     with _composer(client) as composer:
-        body = _close_scene_body("detach_carried_object_at_current_pose")
+        body = _close_detach_body()
         body["expected_authoring_workspace"] = composer._composer_state.authoring_workspace.identity().as_dict()
         body["expected_admission_generation"] = 7
         response = composer.post("/api/scene/transactions", json=body)
@@ -2577,3 +2453,31 @@ def test_global_io_rule_recovery_variant_is_proxied_unchanged(headless_client) -
         item for item in requests if item["path"] == "/api/execution/stop-fault/recover"
     ]
     assert [item["body"] for item in forwarded] == [recovery]
+
+
+def test_cell_recover_forwards_only_the_caller_identity(headless_client) -> None:
+    client, requests, _node_environment = headless_client
+    body = {
+        "request_context": {
+            "request_id": "request.cell-recover.1",
+            "source_label": "composer_ui",
+            "correlation_id": None,
+        }
+    }
+    with _composer(client) as composer:
+        accepted = composer.post("/api/execution/cell-recover", json=body)
+        echoed = composer.post(
+            "/api/execution/cell-recover",
+            json={
+                "request_context": {
+                    **body["request_context"],
+                    "request_owner_epoch": "execution.epoch.1",
+                },
+                "expected_latch_id": "stop-fault.1",
+            },
+        )
+    assert accepted.status_code == 200, accepted.text
+    assert accepted.json()["outcome"] == "done"
+    assert echoed.status_code == 422
+    forwarded = [item for item in requests if item["path"] == "/api/execution/cell-recover"]
+    assert [item["body"] for item in forwarded] == [body]

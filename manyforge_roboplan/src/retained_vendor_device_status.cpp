@@ -5,6 +5,8 @@
 #include <optional>
 #include <stdexcept>
 #include <stop_token>
+#include <thread>
+#include <chrono>
 #include <string>
 #include <utility>
 #include <vector>
@@ -84,6 +86,11 @@ public:
       port->BeginOwnPrimitive(command(activate));
   }
 
+  void ObserveHardwareActive(const bool hardware_active) override {
+    if (const auto port = started())
+      port->ObserveHardwareActive(hardware_active);
+  }
+
   void SettleHardwareTransition(const bool activate, const bool effect_possible,
                                 const core::TimePoint now_ns) override {
     if (const auto port = started())
@@ -138,12 +145,15 @@ public:
     const auto call = services->Call(
         *vendor_command, xarm_control::kXArmServiceResponseTimeout,
         cancellation);
+    const auto settled_at = clock_now();
     port->SettleOwnPrimitive(
         *vendor_command,
         call.outcome != xarm_control::XArmServiceCallOutcome::kNotSent,
-        clock_now());
+        settled_at);
     switch (call.outcome) {
     case xarm_control::XArmServiceCallOutcome::kSucceeded:
+      if (*vendor_command == XArmLifecycleCommand::kClearError)
+        return VerifyClear(*port, settled_at, cancellation);
       return {RetainedRos2ControlSwitchOutcome::kSucceeded, std::nullopt};
     case xarm_control::XArmServiceCallOutcome::kNotSent:
       return vendor_result(RetainedRos2ControlSwitchOutcome::kNotSent,
@@ -183,6 +193,38 @@ public:
   }
 
 private:
+  // m5.5: an own `clean_error` succeeds only once a report shows the error
+  // cleared. Still present `kXArmClearVerifyNs` after the call (the e-stop
+  // or its input is still open), the step fails typed with the vendor code:
+  // a known failure, never an incident or a latch.
+  [[nodiscard]] RetainedRos2ControlSwitchResult
+  VerifyClear(const xarm_control::XArmBrandLifecyclePort &port,
+              const core::TimePoint settled_at,
+              const std::stop_token cancellation) const {
+    using xarm_control::XArmClearVerification;
+    while (!cancellation.stop_requested()) {
+      switch (port.VerifyOwnClear(settled_at)) {
+      case XArmClearVerification::kCleared:
+        return {RetainedRos2ControlSwitchOutcome::kSucceeded, std::nullopt};
+      case XArmClearVerification::kPersists: {
+        auto error = vendor_error(
+            "xarm_error_persists_after_clear",
+            "the robot still reports its error after it was cleared (is the "
+            "emergency stop or its input still engaged?)");
+        if (const auto code = port.LatestErrorCode(); code > 0)
+          error.details.emplace("vendor_code", "C" + std::to_string(code));
+        return {RetainedRos2ControlSwitchOutcome::kFailed, std::move(error)};
+      }
+      case XArmClearVerification::kPending:
+        break;
+      }
+      std::this_thread::sleep_for(std::chrono::milliseconds(20));
+    }
+    return vendor_result(RetainedRos2ControlSwitchOutcome::kUncertain,
+                         "xarm_clear_verification_cancelled",
+                         "the clear was sent; its verification was cancelled");
+  }
+
   [[nodiscard]] std::shared_ptr<xarm_control::XArmBrandLifecyclePort>
   started() const {
     std::lock_guard lock(mutex_);

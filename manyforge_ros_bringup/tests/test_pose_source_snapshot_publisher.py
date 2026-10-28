@@ -437,9 +437,13 @@ def test_relative_reference_is_read_with_its_object_in_one_batch(
         for intent in dispatcher.intents
         if intent.object_id == "isaac_cheese_box"
     )
-    assert cheese["kind"] == "simulation_entity_pose_with_reference.v1"
+    assert cheese["kind"] == "simulation_entity_pose_with_references.v1"
     assert cheese["pose"]["position_m"] == [1.0, 0.02, 0.25]
-    reference = cheese["reference"]
+    assert len(cheese["references"]) == 1
+    reference = cheese["references"][0]
+    assert reference["controllable_component_id"] == "isaac_ur10e_light_robot"
+    assert reference["command_target_id"] == "gripper"
+    assert reference["gripper_link"] == "robotiq_base_link"
     assert reference["coherent"] is True
     assert reference["link"] == "robotiq_base_link"
     assert reference["pose_in_reference"]["position_m"] == pytest.approx(
@@ -737,13 +741,16 @@ def test_retained_site_configs_preserve_historical_pose_source_contracts() -> No
             ("mac_n_cheese_centered", "universe", "universe"),
         ]
 
-        cheese_reference = ur_config.simulation_entities[1].reference
+        cheese_references = ur_config.simulation_entities[1].references
         if config_name == "isaac_ur10e_light.pose_observer.json":
-            assert cheese_reference is not None
+            assert len(cheese_references) == 1
+            cheese_reference = cheese_references[0]
+            assert cheese_reference.controllable_component_id == "isaac_ur10e_light_robot"
+            assert cheese_reference.command_target_id == "gripper"
             assert cheese_reference.request.entity == rigid_gripper
             assert cheese_reference.link == "robotiq_base_link"
         else:
-            assert cheese_reference is None
+            assert cheese_references == ()
 
     foundation = load_isaac_pose_observer_site_config(
         config_root / "isaac_lite6_trocar_foundationpose.pose_observer.json"

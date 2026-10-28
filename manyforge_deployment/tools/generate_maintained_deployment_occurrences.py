@@ -53,7 +53,7 @@ ROS2_CONTROL_RUNTIME_CONFIGURATION_SCHEMA_ID: Final = (
     "manyforge.value_schema.runtime.ros2_control_execution.v1"
 )
 ROS2_CONTROL_RUNTIME_CONFIGURATION_SCHEMA_REVISION: Final = (
-    "sha256:725d71567d7d2a0d9645cd71e657ed123d6ce8829d71cb2ea20b6eb8b392c4e4"
+    "sha256:65622b6edc95e1cfb416345970a805e77ef2a3dd33a7e1f4c5cf4d9ee9ee9274"
 )
 EMPTY_PROVIDER_CONTRACT_SCHEMA_ID: Final = (
     "manyforge.value_schema.provider_contract.empty.v1"
@@ -77,6 +77,9 @@ ROS2_CONTROL_PROVIDER_ID: Final = "manyforge.provider.ros2_control"
 # R7 package 4: a Real xArm-family arm's ros2_control provider. Same offers as
 # ROS2_CONTROL_PROVIDER_ID; only the lifecycle catalog differs.
 XARM_ROS2_CONTROL_PROVIDER_ID: Final = "manyforge.provider.ros2_control.xarm"
+XARM_ROS2_CONTROL_GRIPPER_PROVIDER_ID: Final = (
+    "manyforge.provider.ros2_control.xarm.gripper"
+)
 
 CAPABILITIES: Final = {
     "io.gpio.set_output": (
@@ -1449,13 +1452,43 @@ def ros2_control_lifecycle_plans() -> list[dict[str, Any]]:
     ]
 
 
+def xarm_ros2_control_gripper_lifecycle_plans() -> list[dict[str, Any]]:
+    """The gripper domain of a Real xArm-family component (mirrors
+    `retained_ros2_control_gripper_lifecycle_plans` in manyforge_roboplan).
+
+    Prepare/Enable/Disable are the shared ros2_control plans, as for a Mock or
+    Isaac gripper. Recover targets `disabled`, the Real arm's Recover target,
+    so the component has one common target; a healthy gripper has nothing to
+    clear, so it is already satisfied and dispatches nothing."""
+    healthy = lifecycle_predicate(
+        ["declared", "prepared", "active", "disabled"],
+        {
+            "external.fault_present": lifecycle_boolean(False),
+            "external.transport_ready": lifecycle_boolean(True),
+        },
+    )
+    return [
+        *(plan for plan in ros2_control_lifecycle_plans() if plan["intent"] != "recover"),
+        {
+            "intent": "recover",
+            "requested_state": "disabled",
+            "recover_target_eligibility": healthy,
+            "requested_postcondition": healthy,
+            "timeout_duration_ns": 30_000_000_000,
+            "transitions": [],
+        },
+    ]
+
+
 def xarm_ros2_control_lifecycle_plans() -> list[dict[str, Any]]:
     """Real xArm-family arm on stock ros2_control plus the driver's
     `clean_error`/`clean_warn` (R7 package 4; mirrors
     `manyforge_xarm_control::make_xarm_ros2_control_lifecycle_plans`).
 
-    Prepare arms through the hardware activation (D1), absorbs the plugin's
-    reactivate-all and marks the arm prepared; Enable activates the trajectory
+    Prepare clears a vendor error left on the unarmed robot (m5.5), arms
+    through the hardware activation (D1), absorbs the plugin's
+    reactivate-all, switches the joint state broadcaster back on when that
+    reactivation left it off, and marks the arm prepared; Enable activates the trajectory
     controller; Disable switches off the controller, then the hardware (D4
     option B); Recover switches both off and clears the vendor error, then the
     warning (D10)."""
@@ -1491,7 +1524,6 @@ def xarm_ros2_control_lifecycle_plans() -> list[dict[str, Any]]:
         unarmed,
         {
             ready_for_commands: boolean(True),
-            broadcaster: boolean(True),
             fault: boolean(False),
             hardware: boolean(True),
             transport: boolean(True),
@@ -1528,7 +1560,8 @@ def xarm_ros2_control_lifecycle_plans() -> list[dict[str, Any]]:
             transport: boolean(True),
         },
     )
-    timeout_ns = 30_000_000_000
+    # m5.5: every Real xArm arm lifecycle step is bounded at 10 s.
+    timeout_ns = 10_000_000_000
     return [
         {
             "intent": "prepare",
@@ -1536,6 +1569,30 @@ def xarm_ros2_control_lifecycle_plans() -> list[dict[str, Any]]:
             "requested_postcondition": prepared,
             "timeout_duration_ns": timeout_ns,
             "transitions": [
+                # m5.5: clear a vendor error left on the unarmed robot first.
+                lifecycle_transition(
+                    "xarm.clear_error",
+                    lifecycle_predicate(
+                        unarmed,
+                        {
+                            error: boolean(True),
+                            controller_active: boolean(False),
+                            fault: boolean(False),
+                            hardware: boolean(False),
+                            transport: boolean(True),
+                        },
+                    ),
+                    lifecycle_predicate(
+                        unarmed,
+                        {
+                            error: boolean(False),
+                            controller_active: boolean(False),
+                            fault: boolean(False),
+                            hardware: boolean(False),
+                            transport: boolean(True),
+                        },
+                    ),
+                ),
                 lifecycle_transition(
                     "ros2_control.hardware.activate",
                     lifecycle_predicate(
@@ -1567,6 +1624,29 @@ def xarm_ros2_control_lifecycle_plans() -> list[dict[str, Any]]:
                             controller_active: boolean(False),
                             fault: boolean(False),
                             hardware: boolean(True),
+                            transport: boolean(True),
+                        },
+                    ),
+                ),
+                lifecycle_transition(
+                    "ros2_control.broadcaster.activate",
+                    lifecycle_predicate(
+                        unarmed,
+                        {
+                            broadcaster: boolean(False),
+                            controller_active: boolean(False),
+                            fault: boolean(False),
+                            hardware: boolean(True),
+                            transport: boolean(True),
+                        },
+                    ),
+                    lifecycle_predicate(
+                        unarmed,
+                        {
+                            broadcaster: boolean(True),
+                            fault: boolean(False),
+                            hardware: boolean(True),
+                            measured: boolean(True),
                             transport: boolean(True),
                         },
                     ),
@@ -1739,11 +1819,10 @@ def ros2_control_provider_manifest(
     planner_capabilities: tuple[str, ...],
     provider_id: str = ROS2_CONTROL_PROVIDER_ID,
 ) -> dict[str, Any]:
-    plans = (
-        xarm_ros2_control_lifecycle_plans()
-        if provider_id == XARM_ROS2_CONTROL_PROVIDER_ID
-        else ros2_control_lifecycle_plans()
-    )
+    plans = {
+        XARM_ROS2_CONTROL_PROVIDER_ID: xarm_ros2_control_lifecycle_plans,
+        XARM_ROS2_CONTROL_GRIPPER_PROVIDER_ID: xarm_ros2_control_gripper_lifecycle_plans,
+    }.get(provider_id, ros2_control_lifecycle_plans)()
     semantic_projection = {
         "api_version": LIFECYCLE_CATALOG_API_VERSION,
         "provider_manifest_id": provider_id,
@@ -2266,6 +2345,15 @@ def catalog_sources(
             ),
             planner_capabilities,
             XARM_ROS2_CONTROL_PROVIDER_ID,
+        ),
+        "ros2_control_xarm_gripper": ros2_control_provider_manifest(
+            tuple(
+                value
+                for value in control_capabilities
+                if value != "execution.runtime_scale.operation_scoped"
+            ),
+            planner_capabilities,
+            XARM_ROS2_CONTROL_GRIPPER_PROVIDER_ID,
         ),
     }
     for key, document in manifests.items():

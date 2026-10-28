@@ -3,12 +3,14 @@
 from __future__ import annotations
 
 from copy import deepcopy
+import threading
 from typing import Any
 
 import pytest
 
 from manyforge_behavior.orchestration_values import ProgramValueError
 from manyforge_headless_api.native import HeadlessApiError
+from manyforge_program_runner.bbkey_publication import ProgramBlackboardPublicationScope
 from manyforge_program_runner.execution_transport import ProgramRunnerExecutionTransport
 from manyforge_program_runner.interrupt_state_mirror import (
     InterruptRuleStateMirror,
@@ -411,6 +413,9 @@ class _CatalogMirror:
     def catalog(self) -> RuleCatalog | None:
         return self.value
 
+    def carried_object_last_losses(self) -> None:
+        return None
+
     def poll(self) -> None:
         self.polls += 1
         if self.arrive is not None:
@@ -425,19 +430,31 @@ def _hook_runtime(catalog: RuleCatalog | None):
 
     runtime = object.__new__(ProgramRuntime)
     runtime._interrupt_state_mirror = _CatalogMirror(catalog)  # noqa: SLF001
+    runtime._grasp_lost_mirror_lock = threading.Lock()  # noqa: SLF001
+    runtime._carried_object_lost_run_id = None  # noqa: SLF001
+    runtime._carried_object_lost_run_active = False  # noqa: SLF001
+    runtime._carried_object_lost_seen_event_ids = set()  # noqa: SLF001
     runtime._applied_condition_keys = ("count", "zone_clear")  # noqa: SLF001
     runtime._bbkey_publishers = {}  # noqa: SLF001
     runtime._bbkey_pending = {}  # noqa: SLF001
     runtime._bbkey_publishers_lock = threading.RLock()  # noqa: SLF001
+    runtime._bbkey_source_lock = threading.RLock()  # noqa: SLF001
     runtime.config = SimpleNamespace(headless_timeout_seconds=5.0)
     return runtime
 
 
 class _Publisher:
     def __init__(self, generation: int) -> None:
-        from types import SimpleNamespace
-
-        self.scope = SimpleNamespace(active_publication_generation=generation)
+        # The real scope type: every scope carries all of its identities.
+        self.scope = ProgramBlackboardPublicationScope(
+            owner_epoch="kernel-owner",
+            program_runner_owner_epoch="runner-owner",
+            claim_generation=None,
+            program_run_id=None,
+            program_binding_id="sha256:" + "d" * 64,
+            active_publication_generation=generation,
+            cycle_generation=7,
+        )
         self.started: tuple[str, ...] | None = None
         self.retired = False
         self.failed: str | None = None
@@ -718,35 +735,321 @@ def test_known_to_unknown_catalog_makes_declared_keys_unavailable() -> None:
             store.read(key)
 
 
-def test_every_scheduled_read_is_a_reading_for_a_gate_wait_even_unchanged() -> None:
+def test_every_stream_message_is_a_reading_for_a_gate_wait_even_unchanged() -> None:
     # Rule 2: a gated motion node re-evaluates only on a newer reading; an
-    # unchanged state still counts, so a short trip seen by no change is not
-    # waited out to the timeout.
-    from types import SimpleNamespace
-    import threading
-
-    kernel = _Kernel()
-    kernel.catalog = _CATALOG_A
-    kernel.baseline = _ready(0, {"door": "clear"})
+    # unchanged state still counts (each heartbeat), so a short trip seen by
+    # no change is not waited out to the timeout.
     program = _store()._program.with_interrupt_state_keys(("door",))  # noqa: SLF001
     store = _store(program)
     runtime: Any = None
+    host = _StreamHost([
+        _snapshot(0, _ready(0, {"door": "clear"}), _CATALOG_A),
+        _stream("heartbeat", cursor=0),
+    ])
     mirror = InterruptRuleStateMirror(
-        owner_epoch=lambda: kernel.owner, read_events=kernel,
+        owner_epoch=lambda: "kernel-1", read_events=_Kernel(), subscribe=host.subscribe,
         on_change=lambda states: runtime._apply_interrupt_states(states),  # noqa: SLF001
     )
     runtime = _state_runtime(mirror, store)
-    runtime._started, runtime._closed = True, False  # noqa: SLF001
-    runtime._host = SimpleNamespace(submit_run_work=lambda work: work())  # noqa: SLF001
-    runtime._interrupt_state_poll_lock = threading.Lock()  # noqa: SLF001
-    runtime._interrupt_state_polling = False  # noqa: SLF001
     readings = []
-    for _poll in range(2):
-        runtime._interrupt_state_poll_due_ns = 0  # noqa: SLF001
-        runtime._schedule_interrupt_state_poll()  # noqa: SLF001
-        readings.append(store.interrupt_state_reading("door"))
+    mirror.follow(
+        threading.Event(),
+        on_read=lambda: (
+            runtime._on_interrupt_state_read(),  # noqa: SLF001
+            readings.append(store.interrupt_state_reading("door")),
+        ),
+    )
     assert readings[0][1] == readings[1][1] == "clear"
     assert readings[1][0] > readings[0][0] > 0
+
+
+# Event subscription (contract §8.1) ------------------------------------------
+
+
+def _stream(kind: str, owner: str = "kernel-1", **fields: Any) -> dict[str, Any]:
+    return {"api_version": "manyforge.execution_event_stream.v1", "owner_epoch": owner,
+            "type": kind, **fields}
+
+
+def _state(baseline: Any, catalog: Any, rows: list[Any] | None = None,
+           last_losses: list[Any] | None = None) -> dict[str, Any]:
+    return {"interrupt_rule_state_baseline": baseline, "interrupt_rule_catalog": catalog,
+            "carried_object_lost_signals": rows or [],
+            "carried_object_last_losses": last_losses or []}
+
+
+def _snapshot(cursor: int, baseline: Any, catalog: Any, **fields: Any) -> dict[str, Any]:
+    return _stream("snapshot", cursor=cursor, reason="subscribed",
+                   state=_state(baseline, catalog, **fields))
+
+
+def _streamed(event: dict[str, Any]) -> dict[str, Any]:
+    return _stream("event", event=event)
+
+
+class _StreamHost:
+    """Scripted subscriptions (one script per connection; an exception in a
+    script drops the link); the follow loop ends when the scripts run out."""
+
+    def __init__(self, *scripts: list[Any]) -> None:
+        self.scripts = list(scripts)
+        self.subscriptions: list[tuple[int, str | None]] = []
+
+    def subscribe(self, after_cursor: int, owner_epoch: str | None):
+        from contextlib import contextmanager
+
+        @contextmanager
+        def opened():
+            self.subscriptions.append((after_cursor, owner_epoch))
+            script = self.scripts.pop(0)
+
+            class _Subscription:
+                def receive(self, stop: Any = None) -> Any:
+                    if not script:
+                        if not host.scripts:
+                            stop.set()
+                            return None
+                        raise HeadlessApiError("execution_owner_unavailable", "closed")
+                    item = script.pop(0)
+                    if isinstance(item, Exception):
+                        raise item
+                    return item
+
+            yield _Subscription()
+
+        host = self
+        return opened()
+
+
+def test_stream_applies_snapshot_then_rows_as_they_arrive() -> None:
+    rows = [_LOSS_ROW]
+    host = _StreamHost([
+        _snapshot(0, _ready(2, {"door": "clear", "zone": "clear"}), _CATALOG_A),
+        _streamed(_event(1, "door", "latched")),  # Covered by the cut (2).
+        _streamed(_event(3, "door", "tripped")),
+        _stream("state", state=_state(_ready(3, {"door": "tripped", "zone": "clear"}),
+                                      _CATALOG_A, rows)),
+        _stream("heartbeat", cursor=3),
+    ])
+    changes: list[Any] = []
+    delivered: list[Any] = []
+    mirror = InterruptRuleStateMirror(
+        owner_epoch=lambda: "kernel-1", read_events=_Kernel(), on_change=changes.append,
+        subscribe=host.subscribe, on_carried_object_lost=delivered.append,
+    )
+    mirror.follow(threading.Event())
+    assert changes == [{"door": "clear", "zone": "clear"}, {"door": "tripped", "zone": "clear"}]
+    # Rows on snapshot, state and heartbeat; unchanged rows are re-offered.
+    assert delivered == [(), tuple(rows), tuple(rows)]
+    assert mirror.carried_object_lost_signals() == tuple(rows)
+    assert host.subscriptions == [(0, None)]
+
+
+_LOSS_ROW = {
+    "carried_object_attachment_id": "a-1", "command_target_id": "gripper",
+    "controllable_component_id": "robot", "lost": True, "loss_event_id": "loss.1",
+    "scene_resource_id": "box", "set_key": "part_lost",
+    "signal_name": "carried_object_lost.gripper",
+}
+
+
+@pytest.mark.parametrize("bad", [
+    {**_LOSS_ROW, "lost": False},
+    {**_LOSS_ROW, "signal_name": "carried_object_lost.other"},
+    {**_LOSS_ROW, "extra": 1},
+    {key: value for key, value in _LOSS_ROW.items() if key != "scene_resource_id"},
+    {**_LOSS_ROW, "command_target_id": ""},
+    {**_LOSS_ROW, "loss_event_id": ""},
+    {**_LOSS_ROW, "set_key": ""},
+    {**_LOSS_ROW, "set_key": 3},
+    {key: value for key, value in _LOSS_ROW.items() if key != "loss_event_id"},
+    "row",
+])
+def test_invalid_loss_rows_are_never_offered(bad: Any) -> None:
+    delivered: list[Any] = []
+    mirror = InterruptRuleStateMirror(
+        owner_epoch=lambda: "kernel-1", read_events=_Kernel(), on_change=lambda _s: None,
+        on_carried_object_lost=delivered.append,
+    )
+    mirror.apply_stream_message(_snapshot(0, _ready(0, {"door": "clear"}), _CATALOG_A,
+                                          rows=[_LOSS_ROW, bad]))
+    assert mirror.carried_object_lost_signals() is None and delivered == []
+    assert mirror.current() == {"door": "clear"}  # The rule states are unaffected.
+
+
+_LAST_LOSS = {"controllable_component_id": "robot", "command_target_id": "gripper",
+              "set_key": "part_lost", "loss_event_id": "loss.1"}
+
+
+def test_last_losses_come_with_every_snapshot_and_state() -> None:
+    # §10 "Coalescing": a loss cleared before any read (no row) still reaches
+    # the Runner through its last loss; a reconnect's snapshot carries it.
+    mirror, _changes = _mirror(_Kernel())
+    assert mirror.carried_object_last_losses() is None  # Unknown before a snapshot.
+    mirror.apply_stream_message(_snapshot(0, _ready(0, {}), _CATALOG_A, last_losses=[_LAST_LOSS]))
+    assert mirror.carried_object_lost_signals() == ()
+    assert mirror.carried_object_last_losses() == (_LAST_LOSS,)
+    later = {**_LAST_LOSS, "loss_event_id": "loss.2"}
+    other_key = {**_LAST_LOSS, "set_key": "other_lost", "loss_event_id": "loss.3"}
+    mirror.apply_stream_message(_stream("state", state=_state(_ready(0, {}), _CATALOG_A,
+                                                              last_losses=[later, other_key])))
+    assert mirror.carried_object_last_losses() == (later, other_key)
+    mirror.apply_stream_message(_stream("gap", "kernel-2", reason="owner_epoch_changed"))
+    assert mirror.carried_object_last_losses() is None
+
+
+@pytest.mark.parametrize("bad", [
+    [{**_LAST_LOSS, "set_key": None}],
+    [{**_LAST_LOSS, "loss_event_id": ""}],
+    [{**_LAST_LOSS, "extra": 1}],
+    [_LAST_LOSS, {**_LAST_LOSS, "loss_event_id": "loss.9"}],  # Same gripper and key twice.
+    "entries",
+])
+def test_invalid_last_losses_make_the_loss_state_unknown(bad: Any) -> None:
+    delivered: list[Any] = []
+    mirror = InterruptRuleStateMirror(
+        owner_epoch=lambda: "kernel-1", read_events=_Kernel(), on_change=lambda _s: None,
+        on_carried_object_lost=delivered.append,
+    )
+    state = _state(_ready(0, {"door": "clear"}), _CATALOG_A, rows=[_LOSS_ROW])
+    state["carried_object_last_losses"] = bad
+    mirror.apply_stream_message(_stream("snapshot", cursor=0, reason="subscribed", state=state))
+    assert mirror.carried_object_last_losses() is None
+    assert mirror.carried_object_lost_signals() is None and delivered == []
+    assert mirror.current() == {"door": "clear"}
+
+
+def test_a_row_without_a_key_is_valid() -> None:
+    delivered: list[Any] = []
+    mirror = InterruptRuleStateMirror(
+        owner_epoch=lambda: "kernel-1", read_events=_Kernel(), on_change=lambda _s: None,
+        on_carried_object_lost=delivered.append,
+    )
+    row = {**_LOSS_ROW, "set_key": None}
+    mirror.apply_stream_message(_snapshot(0, _ready(0, {}), _CATALOG_A, rows=[row]))
+    assert delivered == [(row,)]
+
+
+def test_rows_are_unknown_after_a_gap_or_a_lost_stream_until_the_next_snapshot() -> None:
+    delivered: list[Any] = []
+    mirror = InterruptRuleStateMirror(
+        owner_epoch=lambda: "kernel-1", read_events=_Kernel(), on_change=lambda _s: None,
+        on_carried_object_lost=delivered.append,
+    )
+    mirror.apply_stream_message(_snapshot(0, _ready(0, {}), _CATALOG_A, rows=[_LOSS_ROW]))
+    assert delivered == [(_LOSS_ROW,)]
+    mirror.apply_stream_message(_stream("gap", "kernel-2", reason="owner_epoch_changed"))
+    assert mirror.carried_object_lost_signals() is None
+    assert delivered == [(_LOSS_ROW,)]  # Nothing offered on the gap.
+    mirror.apply_stream_message(_stream("snapshot", "kernel-2", cursor=0, reason="owner_epoch_changed",
+                                        state=_state(None, None)))
+    assert delivered[-1] == () and mirror.carried_object_lost_signals() == ()
+    mirror._stream_lost(RuntimeError("dead link"))  # noqa: SLF001
+    assert mirror.carried_object_lost_signals() is None
+    mirror.apply_stream_message(_stream("heartbeat", "kernel-2", cursor=0))
+    assert delivered[-1] == ()  and len(delivered) == 2  # Still nothing until a snapshot.
+
+
+def test_no_lock_is_held_while_the_stream_waits() -> None:
+    # SX-191: a quiet stream (no rows, no heartbeat yet) blocks only its own
+    # receive; the mirror's readers and Stop settlement stay responsive.
+    import time
+
+    receiving = threading.Event()
+
+    class _Quiet:
+        def __init__(self) -> None:
+            self.script = [_snapshot(0, _ready(0, {"door": "clear"}), _CATALOG_A)]
+
+        def receive(self, stop: Any = None) -> Any:
+            if self.script:
+                return self.script.pop(0)
+            receiving.set()
+            stop.wait()
+            return None
+
+    from contextlib import contextmanager
+
+    @contextmanager
+    def subscribe(after_cursor: int, owner_epoch: str | None):
+        yield _Quiet()
+
+    mirror = InterruptRuleStateMirror(
+        owner_epoch=lambda: "kernel-1", read_events=_Kernel(), on_change=lambda _s: None,
+        subscribe=subscribe,
+    )
+    stop = threading.Event()
+    follower = threading.Thread(target=mirror.follow, args=(stop,))
+    follower.start()
+    try:
+        assert receiving.wait(2.0)
+        started = time.monotonic()
+        assert mirror.current() == {"door": "clear"}
+        assert mirror.catalog() is not None
+        assert mirror.stop_terminal("stop-1", 1) is None
+        assert mirror.carried_object_lost_signals() == ()
+        assert time.monotonic() - started < 0.1
+    finally:
+        stop.set()
+        follower.join(1.0)
+    assert not follower.is_alive()
+
+
+def test_dead_link_is_unavailable_until_the_reconnect_snapshot() -> None:
+    host = _StreamHost(
+        [_snapshot(0, _ready(0, {"door": "latched"}), _CATALOG_A), _streamed(_other(4)),
+         HeadlessApiError("execution_event_stream_dead", "no heartbeat")],
+        [_snapshot(4, _ready(0, {"door": "latched"}), _CATALOG_A)],
+    )
+    changes: list[Any] = []
+    mirror = InterruptRuleStateMirror(
+        owner_epoch=lambda: "kernel-1", read_events=_Kernel(), on_change=changes.append,
+        subscribe=host.subscribe,
+    )
+    mirror.follow(threading.Event())
+    assert changes == [{"door": "latched"}, None, {"door": "latched"}]
+    assert host.subscriptions == [(0, None), (4, "kernel-1")]  # Resumed.
+
+
+def test_streamed_row_is_applied_once_also_after_a_poll_read_it() -> None:
+    kernel = _Kernel()
+    kernel.catalog = _CATALOG_A
+    kernel.baseline = _ready(0, {"door": "clear"})
+    kernel.events = [_event(1, "door", "tripped")]
+    changes: list[Any] = []
+    mirror = InterruptRuleStateMirror(
+        owner_epoch=lambda: kernel.owner, read_events=kernel, on_change=changes.append,
+    )
+    mirror.poll()  # A Run start's one-shot read applies row 1.
+    assert mirror.current() == {"door": "tripped"}
+    mirror.apply_stream_message(_stream("state", state=_state(_ready(0, {"door": "clear"}),
+                                                              _CATALOG_A)))
+    mirror.apply_stream_message(_streamed(_event(1, "door", "latched")))  # Same sequence.
+    assert mirror.current() == {"door": "tripped"}
+    mirror.apply_stream_message(_streamed(_event(2, "door", "clear")))
+    assert mirror.current() == {"door": "clear"}
+
+
+def test_owner_change_snapshot_recaptures_and_a_gap_is_no_error() -> None:
+    mirror, changes = _mirror(_Kernel())
+    mirror.apply_stream_message(_snapshot(0, _ready(0, {"door": "latched"}), _CATALOG_A))
+    mirror.apply_stream_message(_stream("gap", "kernel-2", reason="owner_epoch_changed"))
+    catalog_b = {**_CATALOG_A, "owner_epoch": "kernel-2"}
+    mirror.apply_stream_message(_stream(
+        "snapshot", "kernel-2", cursor=0, reason="owner_epoch_changed",
+        state=_state(_ready(0, {"door": "clear"}, owner_epoch="kernel-2"), catalog_b),
+    ))
+    assert changes == [{"door": "latched"}, {"door": "clear"}]
+
+
+def test_malformed_stream_row_recaptures_and_raises() -> None:
+    mirror, changes = _mirror(_Kernel())
+    mirror.apply_stream_message(_snapshot(0, _ready(0, {"door": "latched"}), _CATALOG_A))
+    bad = _event(1, "door", "latched")
+    bad["payload"]["state"] = "melted"
+    with pytest.raises(Exception):
+        mirror.apply_stream_message(_streamed(bad))
+    assert changes == [{"door": "latched"}, None]
 
 
 def test_pending_source_keeps_its_original_deadline(monkeypatch) -> None:

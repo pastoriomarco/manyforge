@@ -761,6 +761,47 @@ DecodeGraspLostBound(const CanonicalValue &value) {
           Number(Member(value, "rotation_rad"), "grasp-lost rotation_rad")};
 }
 
+/// `on_grasp_lost` is encoded only when it differs from the defaults, so
+/// every older request and attachment keeps its bytes and identity.
+void EmplaceGraspLostResponse(
+    CanonicalValue::Object &object,
+    const std::optional<core::GraspLostResponseDTO> &value) {
+  if (!value || value->is_default()) {
+    return;
+  }
+  object.emplace_back(
+      "on_grasp_lost",
+      CanonicalValue(CanonicalValue::Object{
+          {"detach", CanonicalValue(value->detach)},
+          {"raise_alarm", CanonicalValue(value->raise_alarm)},
+          {"set_key", value->set_key ? CanonicalValue(*value->set_key)
+                                     : CanonicalValue(nullptr)},
+          {"stop_motion", CanonicalValue(value->stop_motion)},
+      }));
+}
+
+/// One canonical form: all four keys, never equal to the defaults, and never
+/// an alarm without the Stop.
+core::GraspLostResponseDTO DecodeGraspLostResponse(const CanonicalValue &value) {
+  ExactObject(value, 4U, "on_grasp_lost");
+  const auto &key = Member(value, "set_key");
+  core::GraspLostResponseDTO result{
+      Boolean(Member(value, "raise_alarm"), "on_grasp_lost.raise_alarm"),
+      Boolean(Member(value, "stop_motion"), "on_grasp_lost.stop_motion"),
+      key.is_null() ? std::nullopt
+                    : std::optional(String(key, "on_grasp_lost.set_key")),
+      Boolean(Member(value, "detach"), "on_grasp_lost.detach"),
+  };
+  if (result.is_default()) {
+    Fail("on_grasp_lost equal to the defaults must be omitted");
+  }
+  if (!result.valid()) {
+    Fail("on_grasp_lost raise_alarm requires stop_motion and set_key must be "
+         "a non-empty key name");
+  }
+  return result;
+}
+
 CanonicalValue Attachment(const core::CarriedObjectAttachmentDTO &value) {
   CanonicalValue::Object result{
       {"carried_object_attachment_id",
@@ -775,13 +816,14 @@ CanonicalValue Attachment(const core::CarriedObjectAttachmentDTO &value) {
       {"scene_resource_id", CanonicalValue(value.scene_resource_id.value())},
       {"touch_body_roles", StrongArray(value.touch_body_roles)},
   };
-  // Absent for attachments without a bound, so older rows encode unchanged.
+  // Absent for attachments without a bound, so older rows encode unchanged;
+  // `on_grasp_lost` only when not the defaults, for the same reason.
   if (value.grasp_lost_check) {
-    result.emplace_back(
-        "grasp_lost_check",
-        CanonicalValue(CanonicalValue::Object{
-            {"bound", GraspLostBound(value.grasp_lost_check->bound)},
-        }));
+    CanonicalValue::Object check{
+        {"bound", GraspLostBound(value.grasp_lost_check->bound)},
+    };
+    EmplaceGraspLostResponse(check, value.grasp_lost_check->on_grasp_lost);
+    result.emplace_back("grasp_lost_check", CanonicalValue(std::move(check)));
   }
   return CanonicalValue(std::move(result));
 }
@@ -791,9 +833,12 @@ core::CarriedObjectAttachmentDTO DecodeAttachment(const CanonicalValue &value) {
   ExactObject(value, check ? 9U : 8U, "carried attachment");
   std::optional<core::CarriedObjectGraspLostCheckDTO> grasp_lost_check;
   if (check) {
-    ExactObject(*check, 1U, "grasp-lost check");
+    const auto *response = check->find_object_member("on_grasp_lost");
+    ExactObject(*check, response ? 2U : 1U, "grasp-lost check");
     grasp_lost_check = core::CarriedObjectGraspLostCheckDTO{
-        DecodeGraspLostBound(Member(*check, "bound"))};
+        DecodeGraspLostBound(Member(*check, "bound")),
+        response ? std::optional(DecodeGraspLostResponse(*response))
+                 : std::nullopt};
   }
   return {
       core::CarriedObjectAttachmentId(
@@ -1024,6 +1069,7 @@ CanonicalValue RequestOperation(const core::SceneOperationRequestDTO &value) {
             object.emplace_back("grasp_lost_bound",
                                 GraspLostBound(*request.grasp_lost_bound));
           }
+          EmplaceGraspLostResponse(object, request.on_grasp_lost);
           return CanonicalValue(std::move(object));
         } else if constexpr (std::is_same_v<
                                  T, core::DetachCarriedObjectRequestDTO>) {
@@ -1135,7 +1181,9 @@ DecodeRequestOperation(const CanonicalValue &value) {
   }
   if (kind == "attach_carried_object") {
     const auto *bound = value.find_object_member("grasp_lost_bound");
-    ExactObject(value, bound ? 9U : 8U, "attach-carried-object request");
+    const auto *response = value.find_object_member("on_grasp_lost");
+    ExactObject(value, 8U + (bound ? 1U : 0U) + (response ? 1U : 0U),
+                "attach-carried-object request");
     return core::AttachCarriedObjectRequestDTO{
         core::CarriedObjectAttachmentId(
             String(Member(value, "carried_object_attachment_id"),
@@ -1155,6 +1203,8 @@ DecodeRequestOperation(const CanonicalValue &value) {
             Member(value, "expected_component_attachment_revisions"),
             "expected_component_attachment_revisions"),
         bound ? std::optional(DecodeGraspLostBound(*bound)) : std::nullopt,
+        response ? std::optional(DecodeGraspLostResponse(*response))
+                 : std::nullopt,
     };
   }
   if (kind == "detach_carried_object") {

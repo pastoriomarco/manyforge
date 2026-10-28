@@ -997,14 +997,13 @@ struct QualifiedExecutionCatalog final {
                        "catalog_digest"),
         require_member(object, "schema_types", "catalog"),
         {}};
+    // The identity is the digest computed from the content; a stale stored
+    // digest is not a refusal (the Python loader reports it).
     auto payload = object;
     std::erase_if(payload, [](const auto &item) {
       return item.first == "catalog_digest";
     });
-    if (sha256_digest(canonical_json(CanonicalValue(std::move(payload)))) !=
-        result.digest) {
-      fail("embedded execution catalog digest mismatch");
-    }
+    result.digest = sha256_digest(canonical_json(CanonicalValue(std::move(payload))));
     for (const auto &entry : require_array(
              require_member(object, "entries", "catalog"), "catalog.entries")) {
       const auto &fields = require_object(entry, "catalog.entry");

@@ -34,7 +34,7 @@ Value Numbers(std::initializer_list<double> values) {
   return Value(std::move(result));
 }
 
-Value Simulation(bool relative = true) {
+Value Simulation(bool relative = false) {
   Object simulation{{"poll_period_ms", Value(250.0)},
                     {"source_coordinate_frame_id", Value("universe")},
                     {"target_frame_id", Value("universe")}};
@@ -263,10 +263,6 @@ TEST(ActivationPoseSource, ModelFreeComponentCompilesToOneProviderDomain) {
           {"local_position_xyz", Numbers({0.0, 0.0, 0.0})},
           {"object_id", Value("cheese_box")},
           {"policy_id", Value("scene")},
-          {"relative_reference",
-           Value(Object{{"entity", Value("/World/robot/tool_base")},
-                        {"link", Value("tool_link")},
-                        {"source_header_frame_id", Value("gripper_frame")}})},
           {"source_coordinate_frame_id", Value("universe")},
           {"source_header_frame_id", Value("cheese_box_frame")},
           {"target_frame_id", Value("universe")}})));
@@ -277,7 +273,7 @@ TEST(ActivationPoseSource, ModelFreeComponentCompilesToOneProviderDomain) {
                 ->as_string(),
             "tcp_frame");
   // Overlay rows never carry the gripper reference.
-  EXPECT_EQ(entities[1].find_object_member("relative_reference"), nullptr);
+  EXPECT_EQ(entities[1].find_object_member("relative_references"), nullptr);
   EXPECT_EQ(contract::find_pose_source(
                 configuration, c::ControllableComponentId("scene_objects")),
             &source);
@@ -305,7 +301,7 @@ TEST(ActivationPoseSource, AbsentJointStateDecodesAsNone) {
                 .find_object_member("simulation_entities")
                 ->as_array()
                 .front()
-                .find_object_member("relative_reference"),
+                .find_object_member("relative_references"),
             nullptr);
 }
 
@@ -360,7 +356,7 @@ TEST(ActivationPoseSource, InvalidLinksAndComponentsAreRefused) {
     const auto message = Refusal(authored);
     EXPECT_NE(message.find(reason), std::string::npos) << message;
   };
-  const auto simulated = [](bool relative = true) {
+  const auto simulated = [](bool relative = false) {
     return Array{PoseSource("scene_objects",
                             Object{{"simulation", Simulation(relative)}})};
   };
@@ -380,6 +376,9 @@ TEST(ActivationPoseSource, InvalidLinksAndComponentsAreRefused) {
   refused(Intent(simulated(false),
                  Array{EntityLink("box", "continuous_relative_to_attached")}),
           "scene_pose_source_relative_reference_missing");
+  // A legacy source-wide reference cannot be mapped without a gripper target.
+  refused(Intent(simulated(true), Array{EntityLink("box", "continuous")}),
+          "scene_pose_source_relative_references_required");
   refused(Intent(detected(),
                  Array{DetectionLink("part", "continuous_relative_to_attached")}),
           "scene_pose_source_relative_requires_simulation");

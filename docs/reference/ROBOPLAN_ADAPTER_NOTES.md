@@ -1,309 +1,259 @@
-# RoboPlan Adapter Runtime Notes
+# RoboPlan adapter notes
 
-> **Current `dev` status:** this is historical baseline behavior until native
-> restoration. `manyforge_roboplan` currently contains only retained-model
-> staging and offline import qualification; its former runtime planner,
-> projection, execution, gripper, Python, and dynamic-collision adapters have
-> been destructively removed.
-> Present-tense adapter behavior below is the captured baseline unless a
-> paragraph explicitly identifies retained offline staging or qualification.
+Developer and advanced reference. It describes how ManyForge uses RoboPlan for
+motion planning, where RoboPlan's own collision checks are used, and which
+behavior belongs to ManyForge rather than to RoboPlan.
 
-This document records backend-specific behavior in the ManyForge RoboPlan
-adapter that affects runtime semantics. It is deployment-facing documentation,
-not a development plan.
+ManyForge pins RoboPlan 0.7.0 (commit
+`099dfa5ccd80b191eb3d6da9f4795f808a63913f`; see
+[`third_party/roboplan/README.md`](../../third_party/roboplan/README.md)).
 
-## Detached Static Object Collision Filter
+## For users: support contacts
 
-Historical baseline status: active temporary workaround in
-`manyforge_roboplan`.
+When the robot picks an object that rests on a support (a table, a tray,
+the ground), the object and its support may touch or overlap slightly at the
+start of the lift. ManyForge allows that contact only while the carried object
+moves away from the support. It does this automatically for contacts it
+finds at the start of a motion. You can also declare a support explicitly for
+an object: select the object in the Composer **Scene** panel and use its
+**Support contacts** card, or add `metadata.support_contacts` to the object in
+the Program's `scene`:
 
-ManyForge scene resources can represent authored world objects that are useful
-for visualization, context, and later behavior-tree actions. Two detached scene
-objects may touch or overlap in the authored scene without making the robot's
-current joint state invalid. For example, a table mesh and a product mesh may
-have tiny contact or penetration at import time; robot motion should still be
-allowed until the robot or an attached object would collide with something.
+```yaml
+metadata:
+  support_contacts:
+    - support_object_id: ground
+      release_evidence_mode: signed_penetration
+      enforce_max_start_penetration: true
+      max_start_penetration_m: 0.03
+```
 
-RoboPlan currently exposes whole-scene collision validation through
-`Scene::hasCollisions(q)`. That query reports every active pair in the Pinocchio
-collision model, including detached object vs detached object pairs. If two
-static authored objects overlap, RoboPlan can reject the robot start state even
-though neither object is moving.
+A support contact is not a general "ignore this collision" switch. Any other
+collision, a new contact, or the object going back into its support still
+fails validation. The modes and fields are described in
+[Support contacts](#support-contacts) below.
 
-Until RoboPlan provides a filtered robot-state collision query or pair policy,
-the ManyForge adapter applies this containment rule:
+## Who decides collisions
 
-- detached scene object vs detached scene object collision pairs are disabled
-  in the RoboPlan collision projection;
-- robot link vs detached scene object pairs remain enabled;
-- attached scene object vs detached scene object pairs remain enabled;
-- attached scene object vs robot link pairs remain controlled by the object's
-  explicit `touch_links` metadata;
-- when an object is attached to a robot link, any disabled static pairs
-  involving that object are re-enabled;
-- when an object is detached back to the world, static pairs involving that
-  object are disabled again.
+`manyforge_collision` is the collision authority. Pre-dispatch trajectory
+validation and runtime monitoring run in ManyForge's own collision engine
+against the published collision world and collision policy. Its result decides
+whether a trajectory is dispatched and whether a running motion is stopped.
 
-This is intentionally an adapter projection rule. It does not change the
-ManyForge semantic scene model, object IDs, authored poses, frame semantics, or
-behavior-tree attach/detach semantics.
+RoboPlan generates candidate trajectories. ManyForge calls RoboPlan's
+`Scene::hasCollisions` only to reject a planner start state or goal state that
+is already in collision (`roboplan_candidate_computer.cpp`). RoboPlan's
+planners also use the same planner scene internally while they search. Neither
+check can admit a trajectory for dispatch: every candidate, including a cached
+one, is validated by `manyforge_collision` first. A cache hit skips planning,
+not validation.
 
-## Frame-Relative Attached Object Placement
+Validation stays strict in these cases:
 
-Historical baseline status: active RoboPlan adapter convention in
-`manyforge_roboplan`.
+- robot links against world objects are always checked;
+- a carried object against world objects is checked, except for a support
+  contact that satisfies its release or bounded-penetration rule;
+- a carried object against robot links is checked, except for the links its
+  attachment declares as touch links.
 
-ManyForge stores scene-object poses in the semantic frame named by the object
-state. For a detached world object, that frame is usually `universe`. For an
-attached object, it can be a robot frame such as `grasp_frame` or a link frame.
-This matches the authoring model used by behavior-tree attach/detach nodes:
-after an object is attached, its tracked pose is relative to the attachment
-frame.
+## Planner scene
 
-RoboPlan's scene API accepts a `parent_frame` name, but the underlying
-Pinocchio `GeometryObject::placement` is evaluated in the parent joint frame,
-not directly in the named frame. A non-root frame can have a fixed offset from
-its parent joint. For example, the UR10e + Robotiq `grasp_frame` is offset from
-the gripper base joint. Passing ManyForge's `T_frame_object` directly to
-`Scene::updateGeometryPlacement(object, "grasp_frame", T_frame_object)` places
-the collision geometry in the wrong RoboPlan world pose.
+Each planning request runs in a separate candidate-worker process
+(`roboplan_candidate_worker_main.cpp`), started by
+`process_contained_candidate_client.cpp`. The worker builds a fresh RoboPlan
+scene for that request from the published ManyForge projection:
 
-The adapter therefore projects non-world object poses as:
+1. it adds every collision geometry to the scene;
+2. it disables, with `Scene::setCollisions(a, b, false)`, the pairs that the
+   effective ManyForge collision policy allows: fixed-object overlap pairs,
+   touch-link pairs, support-contact pairs, and the pairs of the active
+   contact-grasp policy for the current operation;
+3. it places each geometry in its frame (see the next section).
+
+Nothing is re-enabled or restored afterwards. The scene is discarded with the
+worker.
+
+### Frame-relative placement
+
+ManyForge stores an object pose relative to the frame named in its state. A
+fixed object usually uses a cell or component frame; a carried object uses a
+robot frame such as a grasp frame or a link frame.
+
+RoboPlan's scene API accepts a parent frame name, but Pinocchio evaluates
+`GeometryObject::placement` in the frame's parent joint, not in the named frame.
+A non-root frame can have a fixed offset from its parent joint (a grasp frame
+offset from the gripper base joint, for example). Passing the frame-relative
+pose directly would put the collision geometry at the wrong place.
+
+The worker therefore places every geometry as:
 
 ```text
 T_parent_joint_object = T_parent_joint_frame * T_frame_object
 ```
 
-before calling RoboPlan `add*Geometry` or `updateGeometryPlacement`.
+before calling `Scene::updateGeometryPlacement`.
 
-This conversion is load-bearing for collision correctness. Without it, an attached
-object can be checked at a different pose from the one shown in Composer's viewer.
-That can fail closed, as a false gripper/object collision, or fail open, as a
-missed collision between the carried object and an external obstacle.
+This conversion matters for correctness. Without it, a carried object could be
+planned at a different pose from the one Composer shows. That can fail closed,
+as a false gripper/object collision, or fail open, as a missed collision
+between the carried object and an obstacle.
 
-## Support Contacts
+## Fixed-object overlap
 
-Historical baseline status: active temporary workaround in
-`manyforge_roboplan`, implementing a
-backend-neutral ManyForge scene-resource contract.
+Two fixed scene objects may touch or overlap in the authored scene, for
+example a product mesh that slightly penetrates a table at import. That
+overlap should not make the robot's state invalid, because neither object
+moves.
 
-When an attached object is intentionally resting on a support object at the
-start of a release or retreat motion, the adapter discovers that start contact
-from the current collision state. ManyForge scene resources may also declare
-`metadata.support_contacts` as explicit policy hints/overrides. A typical
-Isaac-imported scene has a graspable product mesh with a small collider
-penetration into the table collider. That contact should not reject the start
-state if the object is about to lift away, but it must not become a blanket
-allowed collision.
+This is a general ManyForge collision-policy rule, not a RoboPlan setting.
+When the effective collision policy is projected for a logical-scene revision
+(`RetainedCollisionWorldProjector::project_effective_policy`), ManyForge adds
+these pairs to `allowed_static_static_pairs`:
 
-The release rule only becomes active once the object is attached to a robot
-link. Before attachment, the pair is still a detached scene-object pair and is
-treated as static scene quality. This matters for approach motions: the robot
-may move toward a box that is resting on a table without being required to
-separate the box from the table before the attach step has happened.
+- every pair of collision shapes between two fixed (not carried) scene
+  objects;
+- every pair between a fixed scene object and a static component body, that
+  is, a robot or equipment body that no moving joint carries (a robot base or
+  pedestal, for example).
 
-For `mode: contact_release`, the common semantic rule is:
+The policy is recomputed for each logical-scene revision. When an object is
+attached to the robot it is carried, not fixed, so its pairs are checked
+again; when it is released it becomes fixed again. Robot-link and carried-
+object pairs are never added to this list. `manyforge_collision` and the
+planner scene use the same effective policy.
 
-- an active object/support pair may be in collision at the first
-  validation waypoint;
-- start contact only makes the pair eligible for a release proof; it is not an
-  assumption that the next motion will lift or separate the object;
-- no other collision pair is allowed because of the support-contact phase;
-- no new colliding pair may appear;
-- after separation, re-contact fails validation;
-- the support pair must be separated by the final validation waypoint;
-- when `enforce_max_start_penetration=true`, `max_start_penetration_m` bounds
-  first-waypoint penetration depth if structured signed-distance diagnostics are
-  available;
-- setting `enforce_max_start_penetration=false` disables only that initial-depth
-  envelope, not release, separation, or re-contact validation.
+## Support contacts
 
-The configured evidence mode then selects how progress is proved:
+A support contact applies only while the object is carried. Before the attach
+step the object and its support are both fixed, so their contact is covered by
+the fixed-object rule and an approach motion does not have to separate them.
 
-- `release_evidence_mode: signed_penetration` is the precise policy. For each
-  allowed pair that is currently colliding, it checks penetration depth and
-  rejects worsening/non-improving release as configured.
-- `release_evidence_mode: binary_contact` is the lightweight policy. It checks
-  colliding pair identity/count only, permits no new pair, requires strictly
-  decreasing contact evidence, and requires no contact at the final waypoint.
-  It does not claim to measure worsening depth within an unchanged mesh-feature
-  contact. `enforce_max_start_penetration` must be false in this mode.
+Support contacts reach the collision policy in two ways:
 
-`mode: bounded_penetration` is a third policy, not a release-only exception. It
-allows any explicitly named pair while its penetration is within
-`max_penetration_m`, including a pair that was not colliding at the first
-waypoint. It does not require the pair to separate by the end. Unexpected pairs
-or an authorized pair beyond its bound still fail.
+- **Declared:** `metadata.support_contacts` on the carried object names a
+  `support_object_id` and the mode fields below. The projector expands it to
+  every shape pair of the object and the support.
+- **Discovered:** the execution kernel finds contacts between a carried
+  object and a fixed scene object at the start of a motion and adds them as
+  support contacts with default fields (`execution_kernel.cpp`,
+  `discover_dynamic_carried_start_contacts` and
+  `dynamic_carried_start_contact_pairs`). It does this before planning, from the
+  observed start state, and again after a failed validation, from the
+  trajectory's first waypoint, before validating once more. Declared entries
+  take precedence for the same pair. The defaults are strict: contact at the
+  start is allowed only as touching (zero start penetration), and the pair must
+  separate monotonically and stay separated. Discovery fails the motion if
+  declared plus discovered contacts would exceed 64 pairs.
 
-All modes first obtain the colliding pair set. Signed penetration/distance is
-queried only for pairs already reported colliding, at both pre-dispatch
-validation and runtime monitoring. ManyForge does not perform an all-pairs
-minimum-clearance scan and does not expose the retired all-pairs clearance
-parameter. Its exact v1 spelling remains pinned only in rejection tests and
-historical baseline evidence.
+`mode` selects the rule. Authored files accept `contact_release` (the
+default) and `bounded_penetration`. The Composer card names the choices
+**Precise release**, **Lightweight release** and **Bounded contact**;
+**Contact process** is shown as reserved and is not accepted.
 
-RoboPlan diagnostic output may report raw geometry names instead of ManyForge
-scene-object IDs. During support-contact discovery and trajectory validation,
-ManyForge resolves each raw pair through the active collision-body mapper and
-uses the object-normalized pair only when both bodies are known scene objects.
-This allows raw names such as an attached object's internal shape index to match
-`graspable <-> ground`, while a robot-link collision such as `ground <-> 0`
-remains blocking if `0` normalizes to a robot body or cannot be resolved to the
-configured supported object.
+### `contact_release`
 
-This mirrors the shape of MoveIt-style planning-scene usage: the semantic scene
-is unchanged, while validation applies a request-scoped collision policy. MoveIt
-provides per-query collision checks with an Allowed Collision Matrix and contact
-maps. RoboPlan currently exposes collision pair enablement through scene-level
-`setCollisions(...)`, so the adapter emulates the scoped policy as follows:
+- the pair may be in collision at the first validation waypoint;
+- start contact only makes the pair eligible for release; it does not assume
+  the next motion will separate it;
+- no other collision pair is allowed because of the support contact, and no
+  new colliding pair may appear;
+- with `require_separation_by_end: true` (default) the pair must be separated
+  at the final waypoint;
+- with `allow_recontact: false` (default) contact after the first separation
+  fails;
+- with `enforce_max_start_penetration: true` (default),
+  `max_start_penetration_m` (default 0) bounds the first-waypoint depth.
+  Setting it to `false` disables only that start check, not the release,
+  separation or re-contact checks.
 
-1. When an object is attached, the adapter dynamically discovers its current
-   contacts with detached scene objects. Only those attached-object/support
-   start-contact pairs are disabled in the RoboPlan collision projection so
-   planner start-state and RRT validity checks can begin from the supported
-   state.
-1. Optional `metadata.support_contacts` entries remain as explicit policy
-   hints/overrides for known support objects, but ordinary pick/release
-   behavior should not require hard-coded program pairs.
-1. Trajectory validation temporarily re-enables the discovered support pairs,
-   checks the generated path, and restores the planner projection after the
-   validation scope.
-1. The same validation runs for freshly planned and cached trajectories; cache
-   hits skip planning, not validation.
+`release_evidence_mode` selects how progress is proved:
 
-RoboPlan's scene-level pair enablement is confined to its planner projection.
-Authoritative pre-dispatch validation and runtime monitoring use the independent
-`manyforge_collision` engine with an immutable world-and-policy publication.
-That policy contains the support-contact entries, so the runtime query session
-tracks the selected signed-penetration, binary-contact, or bounded-penetration
-evidence independently of the planner's disabled pair. A future RoboPlan
-request-scoped contact API can remove the planner-projection workaround, but it
-must not replace or weaken these backend-neutral ManyForge admission checks.
+- `signed_penetration` (default, **Precise release**): for each allowed pair
+  that is colliding, the engine measures penetration depth.
+  `release_tolerance_m` (default 1e-5) is the allowed worsening between
+  samples, `min_release_progress_m` (default 0) the required total reduction
+  when `require_strictly_decreasing_penetration` (default true) is set.
+- `binary_contact` (**Lightweight release**): checks only which pairs collide.
+  It permits no new pair, requires the contact evidence to decrease, and
+  measures no depth. The depth fields do not apply: leave them unset or
+  neutral; other values are rejected.
 
-The execution monitor is not a 50 ms "grace period" for support contacts. The
-kernel starts monitoring after a trajectory has passed validation and execution
-has begun; the default monitor tick period is 50 ms / 20 Hz. The first runtime
-observation initializes mode-specific state. Precise release enforces its start
-envelope and penetration progress; lightweight release enforces pair-set/count
-progress without distance; bounded penetration enforces the pair's absolute
-depth bound. Missing or non-finite required penetration evidence fails closed
-as an inconclusive runtime query. The planned trajectory must separately have
-passed the same policy during authoritative pre-dispatch validation.
+### `bounded_penetration`
 
-This is intentionally narrower than `touch_links`. Touch links describe robot
-links that an attached object may touch while grasped. Support contacts describe
-world objects that the carried object must leave. Expanding touch links to hide
-support collisions is not acceptable because it can move a real carried-object
-collision out of the checked world.
+**Bounded contact** allows the named pair while its penetration stays within
+`max_contact_penetration_m`, including a pair that first collides later in the
+trajectory. The pair does not have to separate. Unexpected pairs, or the named
+pair beyond its bound, still fail. The release fields do not apply.
 
-## Execution Boundaries
+### Validation and monitoring
 
-The workaround must not hide collisions involving motion:
+The same policy is used for pre-dispatch validation and for runtime
+monitoring. Signed distance is requested only for selected pairs that are
+already reported colliding; missing or non-finite required depth fails closed
+as an inconclusive result.
 
-- planning still rejects robot link collisions against detached world objects;
-- planning still rejects attached-object collisions against detached world
-  objects unless the pair was dynamically discovered as an attached start
-  support contact, or explicitly declared as support-contact metadata, and the
-  generated trajectory satisfies the support-contact release rule;
-- planning still rejects attached-object collisions against robot links unless
-  they are explicitly listed as touch links;
-- static-static overlap should be handled as a scene-quality diagnostic, not as
-  a hard motion-validity error.
+The runtime monitor starts after the trajectory has passed validation and
+execution has begun. Its default tick is 50 ms (20 Hz,
+`ExecutionKernelConfig::collision_monitor_period_ns`); a Deployment can set
+another value with its **Collision monitor period**
+(`collision_monitor_period_ms`). It is not a grace
+period for support contacts: the first observation initializes each pair's
+state, then precise release enforces its start bound and penetration progress,
+lightweight release enforces pair-set progress, and bounded contact enforces
+the depth bound.
 
-RoboPlan's planner projection does not certify numeric penetration. The
-independent ManyForge collision engine enforces signed progress and bounded
-penetration when selected. RoboPlan request-scoped contact diagnostics remain a
-desirable upstream simplification, not a prerequisite for current authority.
+Support contacts are narrower than touch links. Touch links name robot links
+that a carried object may touch while grasped. Support contacts name world
+objects that the carried object must leave. Using touch links to hide a
+support collision would remove real carried-object collisions from the check.
 
-## Robot Collision Mesh Preservation and AABB Proxy Warnings
+## Robot collision geometry
 
-Historical baseline status: active RoboPlan adapter behavior in
-`manyforge_roboplan`.
+Robot and equipment collision bodies come from the model's URDF `<collision>`
+geometry as loaded by Pinocchio and Coal. The exported descriptors keep the
+loaded shape kind and carry quality labels such as `primitive`, `convex`,
+`collision_mesh` or `backend_compound`. There is no automatic box (AABB)
+fallback for robot links. Turn on **Collision geometry** in the Composer
+viewer to see the geometry that is checked.
 
-Robot collision snapshots preserve backend mesh geometry when the model loader
-can expose a mesh resource. This is the preferred path: the validation and
-runtime-monitoring collision world should represent the URDF `<collision>`
-geometry, not a broad box approximation of thin links such as gripper fingers.
+## Current limits
 
-If the adapter cannot preserve/load a mesh-like geometry and must fall back to a
-conservative AABB proxy, the exported `CollisionGeometryDescriptor` is marked
-with both:
+- Validation checks trajectory waypoints; there is no continuous
+  (swept-volume) collision check.
+- Signed depth is computed only for precise release and bounded contact, and
+  only for colliding pairs.
+- Performance depends on projection and publication of the collision world
+  plus the ManyForge engine; RoboPlan's own checks cannot admit a dispatch.
 
-- `conservative_proxy`
-- `warning_conservative_aabb_proxy`
+## Source locations
 
-Treat that warning as an explicit degraded-geometry signal. A collision reported
-against such a body may be a real collision, but it may also be a false positive
-caused by the proxy being larger than the real collision mesh. Operators should
-enable the Composer collision-mesh overlay and inspect the warning labels before
-tuning poses around a suspected proxy collision. Maintainers should prefer
-fixing mesh preservation or unsupported geometry handling over moving waypoints
-to work around a proxy.
+| Topic | Location |
+|---|---|
+| RoboPlan pin and carried patches | `third_party/roboplan/README.md`, `scripts/setup-docker.sh` (`ROBOPLAN_PINNED_REF`) |
+| Effective collision policy (fixed-object pairs, touch links, declared support contacts) | `manyforge_roboplan/src/retained_collision_world_projector.cpp`, `RetainedCollisionWorldProjector::project_effective_policy` |
+| Static component bodies | `manyforge_collision/src/manyforge_collision_engine.cpp`, `select_retained_static_component_bodies` |
+| Allowed pairs sent to the worker | `manyforge_roboplan/src/process_contained_candidate_client.cpp`, `project_worker_model` |
+| Planner scene build, `setCollisions`, frame-relative placement | `manyforge_roboplan/src/roboplan_candidate_worker_main.cpp`, `make_scene` |
+| Start/goal `hasCollisions` checks | `manyforge_roboplan/src/roboplan_candidate_computer.cpp` |
+| Start-contact discovery | `manyforge_core/src/execution_kernel.cpp`, `discover_dynamic_carried_start_contacts`, `with_dynamic_carried_start_contacts` |
+| Support-contact types and defaults | `manyforge_core/include/manyforge_core/types/collision.hpp` (`SupportContactPolicyEntry`), `manyforge_core/include/manyforge_core/types/scene_edit.hpp` (`SupportContactDTO`) |
+| Authored `metadata.support_contacts` parsing | `manyforge_deployment/src/initial_scene_projection.cpp` |
+| Support-contact field validation | `manyforge_scene/src/logical_scene_owner_transactions.cpp` |
+| Release and bounded-contact evaluation | `manyforge_core/src/collision_policy_evaluator.cpp` |
+| Monitor period | `manyforge_core/include/manyforge_core/execution_kernel.hpp` |
+| Composer card | `manyforge_composer/frontend/src/components/ProgramSupportContactEditor.tsx` |
+| Example | `examples/isaac-lite6-trocar-foundationpose.scenario/program.yaml` |
 
-Current gaps to keep visible:
+## Upstream simplifications
 
-- support-contact release is validated against the planned waypoints, not
-  continuously against swept volumes;
-- runtime monitoring and pre-dispatch validation use the independent
-  `manyforge_collision` engine against immutable authority-published snapshots;
-  RoboPlan collision is diagnostic/planner-internal only;
-- signed depth/progress is required only for precise release and bounded-
-  penetration modes, and only on colliding pairs. Missing required evidence
-  fails closed rather than falling back to RoboPlan diagnostics;
-- performance depends on snapshot projection/publication plus the selected
-  ManyForge collision engine. RoboPlan `hasCollisions(q)` may still guide
-  candidate generation or diagnostic comparison but cannot admit dispatch.
+These RoboPlan features would let ManyForge drop adapter code. They would not
+change the collision authority, which stays with `manyforge_collision`.
 
-## Source Locations
-
-- historical `manyforge_roboplan/src/roboplan_projection_backend.cpp` at
-  `c4b075fa6dfb69e463c61f3efa8cfce8de681e8a` (blob
-  `013f8218298f6ee22f740d1639bae424ae65413e`)
-  - `scene_placement_from_tracked_locked`
-  - `parent_joint_from_frame_matrix_locked`
-  - `apply_static_collision_policy_for_object_locked`
-  - `erase_static_collision_policy_for_object_locked`
-  - `recompute_support_contact_policy_locked`
-  - `set_support_contact_pairs_for_validation_locked`
-  - the historical implementation used RoboPlan 0.5.1's
-    `Scene::addMeshGeometry` API; E1 selected exact RoboPlan 0.6.0 for the I6
-    restoration, whose source and checked patch manifest are recorded in
-    `third_party/roboplan/README.md`
-- historical
-  `manyforge_roboplan/include/manyforge_roboplan/roboplan_projection_backend.hpp`
-  at the same commit
-  - `disabled_static_collision_pairs_`
-  - `disabled_support_contact_pairs_`
-- historical `manyforge_roboplan/test/test_native_backends.cpp` at the same
-  commit
-  - `DetachedStaticObjectOverlapDoesNotBlockRobotState`
-- historical `manyforge_roboplan/test/test_native_e2e.py` at the same commit
-  - `test_attached_object_collision_pose_uses_named_frame_not_parent_joint`
-  - `test_attached_object_still_collides_with_world_obstacles_at_carried_pose`
-  - `test_declared_support_contact_reaches_validation_and_requires_release`
-
-## Removal Criteria
-
-Remove this adapter workaround when all of the following are true:
-
-- RoboPlan exposes an API or collision policy that validates robot/attached
-  motion state without treating detached static object overlap as start-state
-  failure.
-- ManyForge can call that API without manually disabling detached-object pairs.
-- RoboPlan exposes a per-request collision policy equivalent to MoveIt's
-  Allowed Collision Matrix query surface, or a richer API that lets ManyForge
-  allow support pairs only for the start/release phase of one motion.
-- RoboPlan exposes structured contact diagnostics, including stable body pairs
-  and preferably penetration depth, so its planner projection needs fewer
-  temporary pair-policy workarounds. ManyForge remains the dispatch/runtime
-  collision authority even when that API exists.
-- Regression coverage proves that overlapping detached scene objects do not
-  block robot start-state validation, while attached-object and robot-link
-  collisions still block planning.
-- This document, the source comments, and the corresponding specs-repo
-  open-point are updated with the RoboPlan issue or PR reference.
-
-The frame-relative placement conversion can be removed only if RoboPlan exposes
-or documents a frame-relative object update/add API that composes
-`T_parent_joint_frame * T_frame_object` internally. Until then, ManyForge must
-continue to pass parent-joint-relative placements into RoboPlan.
+- A per-request collision policy, equivalent to MoveIt's Allowed Collision
+  Matrix for one query, instead of scene-level `setCollisions` on a
+  per-request scene.
+- Structured contact diagnostics with stable body pairs and penetration depth.
+- A frame-relative geometry add/update API that composes
+  `T_parent_joint_frame * T_frame_object` internally. Until RoboPlan provides
+  or documents one, ManyForge must keep passing parent-joint-relative
+  placements.

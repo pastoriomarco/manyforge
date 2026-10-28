@@ -497,3 +497,73 @@ it('forwards current activation health and the named wait without replacing the 
   await act(async () => { test.runtime.cancelActivationExecute(); await confirmation; });
   expect(test.send).not.toHaveBeenCalled();
 });
+
+// The synthesized failed-run notice: once per run revision, cleared by Reset
+// reaching idle or by another run, never rebuilt after Dismiss or a command.
+function failRun(value: ReturnType<typeof facts>, programRunId = 'run.1', runRevision = 4) {
+  value.snapshot.programCycle = { ...value.snapshot.programCycle,
+    state: 'terminal_awaiting_reset', programRunId, runRevision,
+    allowedCommands: [{ commandKind: 'program_reset', allowed: true, disabledReason: null, semanticTarget: {} }],
+    run: { ...heldRun(), state: 'failed', runRevision, treeStatus: 'failure',
+      nodeStatuses: { move: 'failure' }, activeOperationCount: 0, reason: null,
+      capture: { ...heldRun().capture, programRunId } } };
+}
+function cycleState(
+  value: ReturnType<typeof facts>,
+  state: ComposerHeadlessState['programCycle']['state'],
+) {
+  value.snapshot.programCycle.state = state;
+  if (state === 'idle_after_reset') {
+    value.snapshot.programCycle = { ...value.snapshot.programCycle,
+      programRunId: null, runRevision: null, run: null };
+  }
+}
+
+it('keeps a dismissed failed-run notice dismissed for that run revision', async () => {
+  const test = await mount({ 'robot.z': 'active', 'robot.a': 'active' });
+  await test.observe((value) => failRun(value));
+  expect(test.runtime.state.error).toContain('Program execution failed.');
+  await act(async () => { test.runtime.dismissError(); });
+  expect(test.runtime.state.error).toBeNull();
+  await test.observe(({ snapshot }) => { snapshot.programCycle.executionControlRevision = 2; });
+  await test.observe(({ snapshot }) => { snapshot.programCycle.executionControlRevision = 3; });
+  expect(test.runtime.state.error).toBeNull();
+  // A new revision of the failed run is a new notice.
+  await test.observe((value) => failRun(value, 'run.1', 5));
+  expect(test.runtime.state.error).toContain('run.1: failed, revision 5');
+});
+
+it('clears the failed-run notice when Reset reaches idle and never rebuilds it during Reset', async () => {
+  const test = await mount({ 'robot.z': 'active', 'robot.a': 'active' });
+  // A Reset observed from the owner alone clears the notice at idle.
+  await test.observe((value) => failRun(value));
+  expect(test.runtime.state.error).toContain('Program execution failed.');
+  await test.observe((value) => cycleState(value, 'resetting'));
+  expect(test.runtime.state.error).toContain('Program execution failed.');
+  await test.observe((value) => cycleState(value, 'idle_after_reset'));
+  expect(test.runtime.state.error).toBeNull();
+  // This client's Reset supersedes it at once; the resetting window keeps the
+  // failed run but does not rebuild the notice.
+  await test.observe((value) => failRun(value, 'run.2'));
+  expect(test.runtime.state.error).toContain('run.2: failed');
+  await act(async () => { await test.runtime.reset(); });
+  expect(test.send).toHaveBeenCalledWith('program_reset', expect.anything(), expect.anything());
+  expect(test.runtime.state.error).toBeNull();
+  await test.observe((value) => cycleState(value, 'resetting'));
+  expect(test.runtime.state.error).toBeNull();
+  await test.observe((value) => cycleState(value, 'idle_after_reset'));
+  expect(test.runtime.state.error).toBeNull();
+});
+
+it('clears the failed-run notice when a new Run starts', async () => {
+  const test = await mount({ 'robot.z': 'active', 'robot.a': 'active' });
+  await test.observe((value) => failRun(value));
+  expect(test.runtime.state.error).toContain('Program execution failed.');
+  // Observed without the idle snapshot in between: the next run replaces it.
+  await test.observe(({ snapshot }) => {
+    snapshot.programCycle = { ...snapshot.programCycle, state: 'running', programRunId: 'run.2',
+      runRevision: 1, run: { ...heldRun(), state: 'running', runRevision: 1, nodeStatuses: {},
+        capture: { ...heldRun().capture, programRunId: 'run.2' } } };
+  });
+  expect(test.runtime.state.error).toBeNull();
+});

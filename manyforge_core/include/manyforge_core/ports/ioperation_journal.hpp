@@ -83,12 +83,12 @@ struct EmergencyStopAcceptanceProjectionResultDTO final {
 };
 
 /// Complete durable Stop truth recovered at one owner-epoch boundary. The
-/// acceptance and affected-state capture are always present. Terminal,
-/// fault-latch, and surveillance truth is present only after its corresponding
-/// atomic projection committed.
+/// acceptance is always present. Terminal, fault-latch, and surveillance truth
+/// is present only after its corresponding atomic projection committed. The
+/// affected-state capture stays in the acceptance journal row only (journal
+/// v17); recovery has no reader for it.
 struct RecoveredStopJournalStateDTO final {
   StopAcceptedDTO accepted;
-  EmergencyStopAffectedStateSnapshotDTO affected_state;
   std::optional<StopCertificateDTO> terminal_certificate;
   std::optional<StopFaultLatchDTO> fault_latch;
   std::optional<StopPostTerminalSurveillanceDTO> surveillance;
@@ -187,8 +187,9 @@ class IOperationJournal {
       const RequestOwnerEpoch& owner_epoch, const StopPostTerminalSurveillanceDTO& checkpoint,
       const StopFaultLatchDTO& fault_latch, std::int64_t projected_at_ns) noexcept = 0;
 
-  /// Atomically records the public recovery result, cleared latch, and exact
-  /// resulting terminal status before Kernel may publish clear.
+  /// Atomically records the public recovery intent and result (with the
+  /// cleared latch) before Kernel may publish clear. The exact resulting
+  /// terminal status is checked against durable truth but not stored.
   [[nodiscard]] virtual Result<std::uint64_t> RecordStopFaultCleared(
       const RequestOwnerEpoch& owner_epoch, const StopFaultRecoveryIntentDTO& recovery_intent,
       const StopFaultRecoveryResultDTO& recovery_result, const StopFaultLatchDTO& cleared_latch,

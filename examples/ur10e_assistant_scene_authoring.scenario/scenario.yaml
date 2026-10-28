@@ -9,11 +9,11 @@
   "members": {
     "assignment.yaml": "sha256:fe4fe32b76167ec3c2593aa9afd6643f68b85b3676df142a20e31464eeb4e42e",
     "deployment.yaml": "sha256:7ada474831aceb711ade4c71291b784f9937cd3fdd6aabdbe75efc912728d853",
-    "program.yaml": "sha256:06d2c4dc1240d0354b96d6109ebe69cbce87b928592db87112abd5495065bbb8"
+    "program.yaml": "sha256:7c175abbda4dc05771c00ff0cba93beaad9fdd02c32f55634fba5f7430a97081"
   },
   "name": "ur10e_assistant_scene_authoring",
   "saved_status": {
-    "checked_content_digest": "sha256:dc29c2f5b5a11eb90f76f3cdd4ff81e6d3160b2db9e6c0fe7e2abd3838615ef2",
+    "checked_content_digest": "sha256:40616001fa7872c0f840874e119018ed3b6ec115ecf3a3e746fe6439d6235637",
     "last_known_status": "ready",
     "manyforge_version": "0.1.0"
   },

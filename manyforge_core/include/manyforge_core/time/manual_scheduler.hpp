@@ -51,14 +51,19 @@ class ManualScheduler final : public IScheduler {
   }
 
   /// Cancel a scheduled callback. No-op if already fired or invalid.
-  void cancel(ScheduleHandle handle) override {
+  void cancel(ScheduleHandle handle) override { static_cast<void>(cancel_before_dequeue(handle)); }
+
+  /// True only when the callback was still pending (advance_to dequeues all
+  /// due callbacks before running any of them).
+  bool cancel_before_dequeue(ScheduleHandle handle) override {
     std::lock_guard<std::mutex> lock(mutex_);
     for (auto it = pending_.begin(); it != pending_.end(); ++it) {
       if (it->second.handle == handle) {
         pending_.erase(it);
-        return;
+        return true;
       }
     }
+    return false;
   }
 
   /// Advance time to the given point, firing all callbacks with deadline <= t.

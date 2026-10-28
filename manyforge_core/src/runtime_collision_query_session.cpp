@@ -181,8 +181,23 @@ RuntimeCollisionQuerySession::RuntimeCollisionQuerySession(
       query_timeout_ns_(query_timeout_ns),
       query_positions_rad_(projection_.template_positions_rad) {}
 
-RuntimeCollisionQueryBundlePtr RuntimeCollisionQuerySession::acquire_bundle() const {
-  return publisher_ != nullptr ? publisher_->published_runtime_collision_query_bundle() : nullptr;
+RuntimeCollisionQueryBundlePtr RuntimeCollisionQuerySession::acquire_bundle() {
+  auto published =
+      publisher_ != nullptr ? publisher_->published_runtime_collision_query_bundle() : nullptr;
+  if (!admitted_policy_ || !published || !published->world) {
+    return published;
+  }
+  // The world follows the latest publication (last arrival wins); the policy
+  // stays the one admitted for this move. Rebuild only when the world changes.
+  if (!admitted_policy_bundle_ || admitted_policy_bundle_->world != published->world) {
+    auto rebuilt = build_runtime_collision_query_bundle(
+        CollisionWorldPolicySnapshotBundle{published->world, *admitted_policy_},
+        published->projection_revision);
+    auto own = std::make_shared<RuntimeCollisionQueryBundle>(*rebuilt);
+    own->admitted_operation_policy = true;
+    admitted_policy_bundle_ = std::move(own);
+  }
+  return admitted_policy_bundle_;
 }
 
 namespace {
@@ -206,7 +221,7 @@ bool joint_names_unique(std::span<const std::string> names) noexcept {
 }  // namespace
 
 std::optional<ErrorDTO> RuntimeCollisionQuerySession::prepare(
-    const RuntimeCollisionQueryBundlePtr& initial_bundle) {
+    const RuntimeCollisionQueryBundlePtr& initial_bundle, bool keep_admitted_policy) {
   if (!engine_) {
     return ErrorDTO{kErrorValidationCollision,
                     "Runtime collision query engine is missing",
@@ -284,7 +299,13 @@ std::optional<ErrorDTO> RuntimeCollisionQuerySession::prepare(
                     "Runtime collision bundle lookup order is invalid",
                     {{"reason", "runtime_collision_bundle_lookup_order_invalid"}}};
   }
-  if (!bind_policy(initial_bundle)) {
+  if (keep_admitted_policy && initial_bundle->policy) {
+    auto own = std::make_shared<RuntimeCollisionQueryBundle>(*initial_bundle);
+    own->admitted_operation_policy = true;
+    admitted_policy_ = own->policy;
+    admitted_policy_bundle_ = std::move(own);
+  }
+  if (!bind_policy(admitted_policy_bundle_ ? admitted_policy_bundle_ : initial_bundle)) {
     std::map<std::string, std::string> details{
         {"reason", runtime_collision_tick_reason_name(policy_binding_error_)},
         {"engine_id", capability.engine_id}};

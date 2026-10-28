@@ -1,4 +1,4 @@
-// Copyright 2026 Flexin Group SRL
+// Copyright 2026 Marco Pastorio
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -17,10 +17,62 @@
 #include "scene_projection_worker.hpp"
 #include <manyforge_core/time/stuck_drain_wait.hpp>
 #include <chrono>
+#include <cstdio>
+#include <exception>
+#include <rcpputils/scope_exit.hpp>
 #include <stdexcept>
 #include <utility>
+#include <vector>
 
 namespace manyforge::ros2_control_execution {
+namespace {
+/// rclcpp's MultiThreadedExecutor::spin() (Lyrical 32.0.x, as Jazzy) has no
+/// catch: a throw on a helper thread escapes its std::thread body, and a throw
+/// on the spinning thread unwinds past the still-joinable helper threads; both
+/// call std::terminate. This executor keeps the same thread count and the
+/// stock run() loop (callback groups, wait and dispatch unchanged) but owns
+/// its threads, so each one catches and reports its own failure.
+class ContainedMultiThreadedExecutor final
+    : public rclcpp::executors::MultiThreadedExecutor {
+public:
+  using FaultSink = std::function<void(const char *)>;
+  ContainedMultiThreadedExecutor(const rclcpp::ExecutorOptions &options,
+                                 std::size_t thread_count, FaultSink fault)
+      : MultiThreadedExecutor(options, thread_count), fault_(std::move(fault)) {}
+
+  // Mirrors MultiThreadedExecutor::spin(), with run_contained() in place of
+  // run(). One difference: stock spin() starts its threads while holding the
+  // private wait_mutex_, which a subclass cannot reach. That is harmless:
+  // run() takes wait_mutex_ itself on every iteration.
+  void spin() override {
+    if (spinning.exchange(true))
+      throw std::runtime_error("spin() called while already spinning");
+    RCPPUTILS_SCOPE_EXIT(wait_result_.reset(); this->spinning.store(false););
+    const std::size_t thread_count = get_number_of_threads();
+    std::vector<std::thread> threads;
+    threads.reserve(thread_count - 1U);
+    for (std::size_t id = 0U; id + 1U < thread_count; ++id)
+      threads.emplace_back([this, id] { run_contained(id); });
+    run_contained(thread_count - 1U);
+    for (auto &thread : threads)
+      thread.join();
+  }
+
+private:
+  void run_contained(const std::size_t thread_id) noexcept {
+    try {
+      run(thread_id);
+    } catch (const std::exception &error) {
+      fault_(error.what());
+    } catch (...) {
+      fault_("unknown_non_std_exception");
+    }
+  }
+
+  FaultSink fault_;
+};
+} // namespace
+
 Ros2TransportResources::Ros2TransportResources(
     std::string node_name, std::string node_namespace,
     std::size_t executor_thread_count, ContextProvider context_provider)
@@ -41,8 +93,9 @@ Ros2TransportResources::Ros2TransportResources(
                                          std::move(node_namespace), options);
   rclcpp::ExecutorOptions executor_options;
   executor_options.context = context_;
-  executor_ = std::make_shared<rclcpp::executors::MultiThreadedExecutor>(
-      executor_options, executor_thread_count);
+  executor_ = std::make_shared<ContainedMultiThreadedExecutor>(
+      executor_options, executor_thread_count,
+      [this](const char *exception_text) { record_executor_fault(exception_text); });
   executor_->add_node(node_);
 }
 
@@ -74,6 +127,9 @@ void Ros2TransportResources::start() {
     throw std::logic_error(
         "ROS transport cannot be started twice or after quiescence");
   spin_thread_ = std::thread([this]() {
+    // Every executor thread, this one included, catches its own failure and
+    // records a typed component fault (read by the runtime handle's health)
+    // instead of terminating the process.
     executor_->spin();
     spin_finished_.store(true, std::memory_order_release);
   });
@@ -87,6 +143,36 @@ void Ros2TransportResources::start() {
     throw std::runtime_error("ROS transport executor exited during startup");
   }
   started_.store(true, std::memory_order_release);
+}
+
+void Ros2TransportResources::set_executor_fault_observer(
+    ExecutorFaultObserver observer) {
+  std::lock_guard<std::mutex> lock(lifecycle_mutex_);
+  if (started() || quiesced_)
+    throw std::logic_error(
+        "ROS transport fault observer must be set before start");
+  executor_fault_observer_ = std::move(observer);
+}
+
+std::optional<std::string> Ros2TransportResources::executor_fault() const {
+  std::lock_guard<std::mutex> lock(executor_fault_mutex_);
+  return executor_fault_;
+}
+
+void Ros2TransportResources::record_executor_fault(
+    const char *exception_text) noexcept {
+  (void)std::fprintf(stderr,
+                     "manyforge_fault code=ros_transport_executor_failed "
+                     "exception=%s\n",
+                     exception_text);
+  {
+    std::lock_guard<std::mutex> lock(executor_fault_mutex_);
+    if (executor_fault_)
+      return;
+    executor_fault_ = exception_text;
+  }
+  if (executor_fault_observer_)
+    executor_fault_observer_("ros_transport_executor_failed");
 }
 
 void Ros2TransportResources::quiesce() noexcept {

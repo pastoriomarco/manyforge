@@ -48,6 +48,12 @@ using PreparedActivationOrigin =
 [[nodiscard]] CanonicalValue prepared_activation_origin_value(const PreparedActivationOrigin &origin);
 [[nodiscard]] core::ContentDigest sealed_canonical_empty_capture_digest(
     const PreparedSealedCanonicalEmptyOrigin &origin);
+/// D6: whether a prepared receipt's origin is the Manager-verified sealed
+/// canonical-empty origin of exactly this candidate. Malformed means no.
+[[nodiscard]] bool prepared_receipt_is_canonical_empty_candidate(
+    const CanonicalValue &prepared_receipt, const core::CellId &cell_id,
+    const core::RetainedBundleId &candidate_retained_bundle_id,
+    const core::GraphRevision &candidate_graph_revision) noexcept;
 
 /// Pure projection of the Program outcome in an immutable Apply receipt.
 /// This grants no Applied/currentness authority. Existing Headless ingress

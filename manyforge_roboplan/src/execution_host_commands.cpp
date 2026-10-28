@@ -1450,6 +1450,39 @@ DecodeProgramMockSimulationSignals(const CanonicalValue& rows) {
         std::move(source_epoch), value};
     return decoded;
   }
+  if (command == "set_carried_object_lost") {
+    RequireExactObjectSize(root, 4U, "carried-object-lost signal command");
+    const auto attribution =
+        DecodeRequestAttribution(Member(root, "attribution"));
+    Require(attribution.transport == core::RequestTransportDTO::kInternal &&
+                attribution.assurance ==
+                    core::RequestAssuranceDTO::kUnverified &&
+                !attribution.principal_id.has_value(),
+            "carried-object-lost signal requires internal owner attribution");
+    const auto &request = Member(root, "request");
+    RequireExactObjectSize(request, 7U, "carried-object-lost signal request");
+    CarriedObjectLostSetRequest decoded_request{
+        core::ControllableComponentId(Text(request, "controllable_component_id")),
+        core::CommandTargetId(Text(request, "command_target_id")),
+        Boolean(request, "level"),
+        OptionalText(request, "carried_object_attachment_id"),
+        OptionalText(request, "scene_resource_id"),
+        OptionalText(request, "loss_event_id"),
+        OptionalText(request, "set_key")};
+    const bool identified = decoded_request.carried_object_attachment_id &&
+                            decoded_request.scene_resource_id &&
+                            decoded_request.loss_event_id;
+    const bool anonymous = !decoded_request.carried_object_attachment_id &&
+                           !decoded_request.scene_resource_id &&
+                           !decoded_request.loss_event_id &&
+                           !decoded_request.set_key;
+    Require(decoded_request.level ? identified : anonymous,
+            "carried-object-lost signal names its attachment, object and loss "
+            "event iff the level is true (and a key only then)");
+    Command decoded{CommandKind::kSetCarriedObjectLost};
+    decoded.carried_object_lost_set = std::move(decoded_request);
+    return decoded;
+  }
   if (command == "register_io_watch" || command == "read_io_watch" ||
       command == "release_io_watch") {
     RequireExactObjectSize(root, 4U, "I/O watch command");

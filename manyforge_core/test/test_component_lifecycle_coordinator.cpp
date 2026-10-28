@@ -488,7 +488,7 @@ class FakeBrandPort final : public IBrandLifecyclePort {
          query.controllable_component_id, query.control_domain_id, query.control_domain_revision,
          query.provider_instance_id, query.provider_manifest_id, query.provider_manifest_revision,
          query.provider_runtime_unit_id, query.provider_runtime_epoch, observation_generation,
-         observation_generation, 50, 90, 2'000'000, observations_[index], facts_});
+         observation_generation, 50, 90, fresh_until_ns_.load(), observations_[index], facts_});
   }
 
   [[nodiscard]] BrandLifecyclePrimitiveResultDTO Dispatch(
@@ -553,6 +553,11 @@ class FakeBrandPort final : public IBrandLifecyclePort {
     return dispatch_count_.load(std::memory_order_acquire);
   }
 
+  /// Every later observation stays fresh until this time.
+  void set_fresh_until_ns(std::int64_t fresh_until_ns) noexcept {
+    fresh_until_ns_.store(fresh_until_ns);
+  }
+
   [[nodiscard]] std::size_t observation_count() const {
     std::lock_guard lock(mutex_);
     return observe_count_;
@@ -580,6 +585,7 @@ class FakeBrandPort final : public IBrandLifecyclePort {
   std::atomic<std::size_t> dispatch_count_{0U};
   std::atomic<bool> saw_prepared_status_{false};
   std::optional<LifecyclePrimitiveId> last_dispatched_primitive_id_;
+  std::atomic<std::int64_t> fresh_until_ns_{2'000'000};
 };
 
 class FakeResolver final : public ICCLCBrandLifecyclePortResolver {
@@ -729,6 +735,24 @@ class WaitableManualScheduler final : public IScheduler {
     scheduler_.cancel(handle);
   }
 
+  bool cancel_before_dequeue(ScheduleHandle handle) override {
+    ++cancel_count_;
+    const bool removed = scheduler_.cancel_before_dequeue(handle);
+    if (removed) {
+      {
+        std::lock_guard lock(mutex_);
+        ++proven_cancel_count_;
+      }
+      scheduled_.notify_all();
+    }
+    return removed;
+  }
+
+  [[nodiscard]] bool WaitForProvenCancel(std::chrono::nanoseconds timeout) const {
+    std::unique_lock lock(mutex_);
+    return scheduled_.wait_for(lock, timeout, [&] { return proven_cancel_count_ > 0U; });
+  }
+
   // A failing drain misses its bound once, then completes.
   bool drain_for(SchedulerPriority priority, std::chrono::nanoseconds timeout) override {
     ++drain_count_;
@@ -757,9 +781,149 @@ class WaitableManualScheduler final : public IScheduler {
   mutable std::mutex mutex_;
   mutable std::condition_variable scheduled_;
   std::size_t scheduled_count_ = 0U;
+  std::size_t proven_cancel_count_ = 0U;
   std::atomic<std::size_t> cancel_count_{0U};
   std::atomic<std::size_t> drain_count_{0U};
   std::atomic<bool> fail_drain_{false};
+};
+
+// Loses every callback due before `keep_from` (the observation polls), so
+// only the independent lifecycle deadline can wake a waiting transaction.
+class PollLosingScheduler final : public IScheduler {
+ public:
+  explicit PollLosingScheduler(TimePoint keep_from) : keep_from_(keep_from) {}
+
+  ScheduleHandle schedule(TimePoint deadline, std::function<void()> callback,
+                          SchedulerPriority priority = SchedulerPriority::Lifecycle) override {
+    if (deadline < keep_from_) {
+      {
+        std::lock_guard lock(mutex_);
+        ++lost_count_;
+      }
+      lost_.notify_all();
+      // A lost poll is never delivered: it stays queued (never dequeued), so
+      // DrainFor can still prove its removal with cancel_before_dequeue.
+      return scheduler_.schedule(std::numeric_limits<TimePoint>::max(), [] {}, priority);
+    }
+    return scheduler_.schedule(deadline, std::move(callback), priority);
+  }
+
+  void cancel(ScheduleHandle handle) override { scheduler_.cancel(handle); }
+
+  bool cancel_before_dequeue(ScheduleHandle handle) override {
+    return scheduler_.cancel_before_dequeue(handle);
+  }
+
+  [[nodiscard]] bool WaitForLost(std::size_t count, std::chrono::nanoseconds timeout) const {
+    std::unique_lock lock(mutex_);
+    return lost_.wait_for(lock, timeout, [&] { return lost_count_ >= count; });
+  }
+
+  void AdvanceTo(TimePoint time) { scheduler_.advance_to(time); }
+
+ private:
+  ManualScheduler scheduler_;
+  const TimePoint keep_from_;
+  mutable std::mutex mutex_;
+  mutable std::condition_variable lost_;
+  std::size_t lost_count_ = 0U;
+};
+
+// Holds a dequeued callback due at or after `pause_from` (the lifecycle
+// deadline) inside the scheduler until Release(), like a scheduler worker that
+// has dequeued the callback but not yet returned from it.
+class PausingDeadlineScheduler final : public IScheduler {
+ public:
+  explicit PausingDeadlineScheduler(TimePoint pause_from) : pause_from_(pause_from) {}
+
+  ScheduleHandle schedule(TimePoint deadline, std::function<void()> callback,
+                          SchedulerPriority priority = SchedulerPriority::Lifecycle) override {
+    if (deadline >= pause_from_) {
+      callback = [this, inner = std::move(callback)] {
+        {
+          std::unique_lock lock(mutex_);
+          paused_ = true;
+          in_flight_ = true;
+          changed_.notify_all();
+          changed_.wait(lock, [&] { return released_; });
+        }
+        inner();
+        {
+          std::lock_guard lock(mutex_);
+          in_flight_ = false;
+        }
+        changed_.notify_all();
+      };
+    }
+    const auto handle = scheduler_.schedule(deadline, std::move(callback), priority);
+    {
+      std::lock_guard lock(mutex_);
+      ++scheduled_count_;
+    }
+    changed_.notify_all();
+    return handle;
+  }
+
+  void cancel(ScheduleHandle handle) override { scheduler_.cancel(handle); }
+
+  bool cancel_before_dequeue(ScheduleHandle handle) override {
+    const bool removed = scheduler_.cancel_before_dequeue(handle);
+    {
+      std::lock_guard lock(mutex_);
+      cancel_attempted_ = true;
+    }
+    changed_.notify_all();
+    return removed;
+  }
+
+  // A held callback is a stuck lane: the bounded drain fails at once.
+  bool drain_for(SchedulerPriority, std::chrono::nanoseconds) override {
+    std::lock_guard lock(mutex_);
+    drain_attempted_ = true;
+    return !in_flight_;
+  }
+
+  [[nodiscard]] bool drain_attempted() {
+    std::lock_guard lock(mutex_);
+    return drain_attempted_;
+  }
+
+  [[nodiscard]] bool WaitForCancelAttempt(std::chrono::nanoseconds timeout) {
+    std::unique_lock lock(mutex_);
+    return changed_.wait_for(lock, timeout, [&] { return cancel_attempted_; });
+  }
+
+  [[nodiscard]] bool WaitForScheduled(std::size_t count, std::chrono::nanoseconds timeout) {
+    std::unique_lock lock(mutex_);
+    return changed_.wait_for(lock, timeout, [&] { return scheduled_count_ >= count; });
+  }
+
+  [[nodiscard]] bool WaitForPaused(std::chrono::nanoseconds timeout) {
+    std::unique_lock lock(mutex_);
+    return changed_.wait_for(lock, timeout, [&] { return paused_; });
+  }
+
+  void Release() {
+    {
+      std::lock_guard lock(mutex_);
+      released_ = true;
+    }
+    changed_.notify_all();
+  }
+
+  void AdvanceTo(TimePoint time) { scheduler_.advance_to(time); }
+
+ private:
+  ManualScheduler scheduler_;
+  const TimePoint pause_from_;
+  std::mutex mutex_;
+  std::condition_variable changed_;
+  std::size_t scheduled_count_ = 0U;
+  bool paused_ = false;
+  bool released_ = false;
+  bool in_flight_ = false;
+  bool cancel_attempted_ = false;
+  bool drain_attempted_ = false;
 };
 
 [[nodiscard]] ComponentLifecycleCoordinatorConfig Config() {
@@ -1881,25 +2045,280 @@ TEST(ComponentLifecycleCoordinator,
   EXPECT_EQ(calls.front(), "close");
   EXPECT_EQ(calls.back(), "publish_closed");
   EXPECT_FALSE(readiness.state().command_eligible);
-  // The partial effect leaves no durable current state for restart to
-  // reconstruct as readiness.
+  // The partial effect (the M55 Isaac Lite6 wedge: arm Prepared, gripper not)
+  // records each domain's observed state and the component's least advanced
+  // one, so the next Prepare, Disable or Close can still read the component.
+  ASSERT_EQ(status.value()->domains.size(), 2U);
+  EXPECT_EQ(status.value()->domains.front().current_state, ComponentLifecycleStateDTO::kPrepared);
+  EXPECT_EQ(status.value()->domains.back().current_state, ComponentLifecycleStateDTO::kDeclared);
+  EXPECT_EQ(status.value()->current_state, ComponentLifecycleStateDTO::kDeclared);
+  ASSERT_TRUE(status.value()->error);
+  EXPECT_FALSE(status.value()->error->details.contains("component_state"));
   const auto fact =
       journal.LoadCurrentComponentLifecycleFact(intent.controllable_component_id);
   ASSERT_TRUE(fact.ok());
-  EXPECT_FALSE(fact.value().current_state.has_value());
+  EXPECT_EQ(fact.value().durable_generation,
+            accepted.value().acceptance->component_lifecycle_generation);
+  EXPECT_EQ(fact.value().current_state, ComponentLifecycleStateDTO::kDeclared);
 
   // A restarted owner reading the same durable journal finds a settled
-  // transaction and no current state to reconstruct as command readiness.
+  // transaction and a state that is not command readiness.
   SqliteCCLCJournal reopened(temporary.path() / std::string(kCCLCJournalFilename),
                              CellId("cell.1"), 8U);
   const auto reopened_fact =
       reopened.LoadCurrentComponentLifecycleFact(intent.controllable_component_id);
   ASSERT_TRUE(reopened_fact.ok()) << reopened_fact.error().message;
   EXPECT_TRUE(reopened_fact.value().durable_generation.has_value());
-  EXPECT_FALSE(reopened_fact.value().current_state.has_value());
+  EXPECT_EQ(reopened_fact.value().current_state, ComponentLifecycleStateDTO::kDeclared);
   const auto unsettled = reopened.LoadComponentsWithUnsettledLifecycle();
   ASSERT_TRUE(unsettled.ok()) << unsettled.error().message;
   EXPECT_TRUE(unsettled.value().empty());
+}
+
+struct TwoDomainLifecycleFixture final {
+  ComponentLifecycleCurrentSnapshotDTO snapshot;
+  ResolvedLifecycleProviderOccurrenceDTO second_provider;
+  ComponentLifecycleIntentDTO intent;
+};
+
+// One component with two control domains, like an arm and its gripper.
+[[nodiscard]] TwoDomainLifecycleFixture TwoDomainLifecycle(
+    ComponentLifecycleStateDTO state, const BrandLifecyclePlanCatalogDTO& catalog,
+    ComponentLifecycleIntentKindDTO intent_kind) {
+  auto snapshot = Snapshot("snapshot.two-domains.state", state,
+                           ComponentLifecycleGeneration(3U), catalog);
+  auto second = CurrentDomain();
+  second.control_domain_id = ControlDomainId("domain.2");
+  second.control_domain_revision = ControlDomainRevision("domain-revision.2");
+  second.controller().controller_topology_id = ControllerTopologyId("topology.2");
+  second.controller().topology_revision = TopologyRevision("topology-revision.2");
+  auto& binding = second.controller().current_control_bindings.front();
+  binding.control_binding_id = ControlBindingId("binding.2");
+  binding.control_binding_revision = ControlBindingRevision("binding-revision.2");
+  binding.control_route_id = ControlRouteId("route.2");
+  second.controller().current_resources = {ResourceId("resource.2")};
+  auto second_provider = Provider(catalog);
+  second_provider.control_domain_id = second.control_domain_id;
+  second_provider.control_domain_revision = second.control_domain_revision;
+  second_provider.provider_instance_id = ProviderInstanceId("provider.2");
+  snapshot.domains.push_back(second);
+  snapshot.provider_occurrences.push_back(second_provider);
+  auto intent = PrepareIntent(RequestOwnerEpoch("cclc-owner.1"));
+  intent.intent = intent_kind;
+  auto expected_second = ExpectedDomain();
+  expected_second.control_domain_id = second.control_domain_id;
+  expected_second.control_domain_revision = second.control_domain_revision;
+  expected_second.controller().controller_topology_id = second.controller().controller_topology_id;
+  expected_second.controller().topology_revision = second.controller().topology_revision;
+  expected_second.controller().expected_control_bindings =
+      second.controller().current_control_bindings;
+  intent.expected_control_domains.push_back(expected_second);
+  return {std::move(snapshot), std::move(second_provider), std::move(intent)};
+}
+
+TEST(ComponentLifecycleCoordinator, MultiDomainPartialEnableNeverRetainsActive) {
+  ScopedTemporaryDirectory temporary;
+  SqliteCCLCJournal journal(temporary.path() / std::string(kCCLCJournalFilename), CellId("cell.1"),
+                            8U);
+  CCLCDomainReservationTable reservations;
+  const auto catalog = EnableCatalog();
+  auto fixture = TwoDomainLifecycle(ComponentLifecycleStateDTO::kPrepared, catalog,
+                                    ComponentLifecycleIntentKindDTO::kEnable);
+  FakeSnapshotSource snapshots({fixture.snapshot});
+  FakeCatalogSource catalogs(catalog);
+  auto first_port = std::make_shared<FakeBrandPort>(
+      journal, std::vector<ComponentLifecycleStateDTO>{ComponentLifecycleStateDTO::kPrepared,
+                                                       ComponentLifecycleStateDTO::kActive});
+  auto second_port = std::make_shared<FakeBrandPort>(
+      journal, std::vector<ComponentLifecycleStateDTO>{ComponentLifecycleStateDTO::kPrepared},
+      DispatchMode::kUncertain);
+  DomainPortResolver resolver(fixture.snapshot.provider_occurrences.front(), first_port,
+                              fixture.second_provider, second_port);
+  FakeCellAdmissionPort kernel;
+  FakeClock clock;
+  clock.set(100);
+  ManualScheduler scheduler;
+  ComponentLifecycleCoordinator coordinator(Config(), journal, reservations, snapshots, catalogs,
+                                            resolver, kernel, clock, scheduler);
+  ASSERT_TRUE(coordinator.Start().ok());
+  fixture.intent.request_context.request_owner_epoch = coordinator.request_owner_epoch();
+  const auto accepted = coordinator.SubmitLifecycle(fixture.intent);
+  ASSERT_TRUE(accepted.ok()) << accepted.error().message;
+  ASSERT_TRUE(accepted.value().acceptance.has_value());
+  ASSERT_TRUE(coordinator.DrainFor(std::chrono::seconds(2)));
+  const auto status =
+      coordinator.LoadLifecycleStatus(accepted.value().acceptance->lifecycle_transaction_id);
+  ASSERT_TRUE(status.ok() && status.value().has_value());
+  ASSERT_EQ(status.value()->terminal_result,
+            ComponentLifecycleTerminalResultDTO::kFailedPartialEffect);
+  ASSERT_EQ(status.value()->domains.front().current_state, ComponentLifecycleStateDTO::kActive);
+  EXPECT_EQ(status.value()->domains.back().current_state, ComponentLifecycleStateDTO::kPrepared);
+  EXPECT_EQ(status.value()->current_state, ComponentLifecycleStateDTO::kPrepared);
+  // One domain is Active, the other still Prepared: the component is not
+  // command-ready, and the next Enable can retry from Prepared.
+  const auto fact =
+      journal.LoadCurrentComponentLifecycleFact(fixture.intent.controllable_component_id);
+  ASSERT_TRUE(fact.ok()) << fact.error().message;
+  EXPECT_EQ(fact.value().durable_generation,
+            accepted.value().acceptance->component_lifecycle_generation);
+  EXPECT_EQ(fact.value().current_state, ComponentLifecycleStateDTO::kPrepared);
+}
+
+TEST(ComponentLifecycleCoordinator, PartialEffectWithoutFaultFreeObservationIsReconstructedDeclared) {
+  ScopedTemporaryDirectory temporary;
+  SqliteCCLCJournal journal(temporary.path() / std::string(kCCLCJournalFilename), CellId("cell.1"),
+                            8U);
+  CCLCDomainReservationTable reservations;
+  const auto catalog = PrepareCatalog();
+  auto fixture = TwoDomainLifecycle(ComponentLifecycleStateDTO::kDeclared, catalog,
+                                    ComponentLifecycleIntentKindDTO::kPrepare);
+  FakeSnapshotSource snapshots({fixture.snapshot});
+  FakeCatalogSource catalogs(catalog);
+  auto first_port = std::make_shared<FakeBrandPort>(
+      journal, std::vector<ComponentLifecycleStateDTO>{ComponentLifecycleStateDTO::kDeclared,
+                                                       ComponentLifecycleStateDTO::kPrepared});
+  // The second domain's step has an uncertain outcome and its fresh
+  // reconciliation observation is faulted: no fault-free state to record.
+  auto second_port = std::make_shared<FakeBrandPort>(
+      journal, std::vector<ComponentLifecycleStateDTO>{ComponentLifecycleStateDTO::kDeclared,
+                                                       ComponentLifecycleStateDTO::kFaulted},
+      DispatchMode::kUncertain);
+  DomainPortResolver resolver(fixture.snapshot.provider_occurrences.front(), first_port,
+                              fixture.second_provider, second_port);
+  FakeCellAdmissionPort kernel;
+  FakeClock clock;
+  clock.set(100);
+  ManualScheduler scheduler;
+  ComponentLifecycleCoordinator coordinator(Config(), journal, reservations, snapshots, catalogs,
+                                            resolver, kernel, clock, scheduler);
+  ASSERT_TRUE(coordinator.Start().ok());
+  fixture.intent.request_context.request_owner_epoch = coordinator.request_owner_epoch();
+  testing::internal::CaptureStderr();
+  const auto accepted = coordinator.SubmitLifecycle(fixture.intent);
+  ASSERT_TRUE(accepted.ok()) << accepted.error().message;
+  ASSERT_TRUE(accepted.value().acceptance.has_value());
+  static_cast<void>(coordinator.DrainFor(std::chrono::seconds(2)));
+  const auto output = testing::internal::GetCapturedStderr();
+  const auto status =
+      coordinator.LoadLifecycleStatus(accepted.value().acceptance->lifecycle_transaction_id);
+  ASSERT_TRUE(status.ok() && status.value().has_value());
+  ASSERT_EQ(status.value()->terminal_result,
+            ComponentLifecycleTerminalResultDTO::kFailedPartialEffect)
+      << (status.value()->error ? status.value()->error->code : std::string("no error"));
+  EXPECT_EQ(status.value()->domains.front().current_state, ComponentLifecycleStateDTO::kPrepared);
+  EXPECT_EQ(status.value()->domains.back().current_state, ComponentLifecycleStateDTO::kDeclared);
+  EXPECT_EQ(status.value()->current_state, ComponentLifecycleStateDTO::kDeclared);
+  ASSERT_TRUE(status.value()->error);
+  ASSERT_TRUE(status.value()->error->details.contains("component_state"))
+      << status.value()->error->code << " " << status.value()->error->details.size();
+  EXPECT_EQ(status.value()->error->details.at("component_state"),
+            kComponentLifecycleStateReconstructedCode);
+  EXPECT_NE(output.find("manyforge_cclc_lifecycle_state_reconstructed"), std::string::npos)
+      << output;
+  const auto fact =
+      journal.LoadCurrentComponentLifecycleFact(fixture.intent.controllable_component_id);
+  ASSERT_TRUE(fact.ok()) << fact.error().message;
+  EXPECT_EQ(fact.value().current_state, ComponentLifecycleStateDTO::kDeclared);
+}
+
+// The first domain's success expires before the second domain's failure
+// settles: its Active no longer counts, so the component is reconstructed
+// Declared instead of the second domain's Prepared.
+TEST(ComponentLifecycleCoordinator, ExpiredSucceededDomainAtSettlementIsReconstructedDeclared) {
+  ScopedTemporaryDirectory temporary;
+  SqliteCCLCJournal journal(temporary.path() / std::string(kCCLCJournalFilename), CellId("cell.1"),
+                            8U);
+  CCLCDomainReservationTable reservations;
+  const auto catalog = EnableCatalog();
+  auto fixture = TwoDomainLifecycle(ComponentLifecycleStateDTO::kPrepared, catalog,
+                                    ComponentLifecycleIntentKindDTO::kEnable);
+  FakeSnapshotSource snapshots({fixture.snapshot});
+  FakeCatalogSource catalogs(catalog);
+  FakeClock clock;
+  clock.set(100);
+  auto first_port = std::make_shared<FakeBrandPort>(
+      journal, std::vector<ComponentLifecycleStateDTO>{ComponentLifecycleStateDTO::kPrepared,
+                                                       ComponentLifecycleStateDTO::kActive});
+  // Time passes past the first domain's freshness (2'000'000) during the
+  // second dispatch; the second domain's own evidence stays fresh.
+  auto second_port = std::make_shared<FakeBrandPort>(
+      journal, std::vector<ComponentLifecycleStateDTO>{ComponentLifecycleStateDTO::kPrepared},
+      DispatchMode::kUncertain, 1U, std::vector<LifecycleFactDTO>{},
+      [&clock] { clock.set(3'000'000); });
+  second_port->set_fresh_until_ns(10'000'000);
+  DomainPortResolver resolver(fixture.snapshot.provider_occurrences.front(), first_port,
+                              fixture.second_provider, second_port);
+  FakeCellAdmissionPort kernel;
+  ManualScheduler scheduler;
+  ComponentLifecycleCoordinator coordinator(Config(), journal, reservations, snapshots, catalogs,
+                                            resolver, kernel, clock, scheduler);
+  ASSERT_TRUE(coordinator.Start().ok());
+  fixture.intent.request_context.request_owner_epoch = coordinator.request_owner_epoch();
+  const auto accepted = coordinator.SubmitLifecycle(fixture.intent);
+  ASSERT_TRUE(accepted.ok()) << accepted.error().message;
+  ASSERT_TRUE(accepted.value().acceptance.has_value());
+  static_cast<void>(coordinator.DrainFor(std::chrono::seconds(2)));
+  const auto status =
+      coordinator.LoadLifecycleStatus(accepted.value().acceptance->lifecycle_transaction_id);
+  ASSERT_TRUE(status.ok() && status.value().has_value());
+  ASSERT_EQ(status.value()->terminal_result,
+            ComponentLifecycleTerminalResultDTO::kFailedPartialEffect)
+      << (status.value()->error ? status.value()->error->code : std::string("no error"));
+  EXPECT_EQ(status.value()->domains.front().action_state,
+            ComponentLifecycleDomainActionStateDTO::kSucceeded);
+  EXPECT_EQ(status.value()->domains.front().current_state, ComponentLifecycleStateDTO::kActive);
+  EXPECT_EQ(status.value()->domains.back().current_state, ComponentLifecycleStateDTO::kPrepared);
+  EXPECT_EQ(status.value()->current_state, ComponentLifecycleStateDTO::kDeclared);
+  ASSERT_TRUE(status.value()->error);
+  ASSERT_TRUE(status.value()->error->details.contains("component_state"));
+  EXPECT_EQ(status.value()->error->details.at("component_state"),
+            kComponentLifecycleStateReconstructedCode);
+  const auto fact =
+      journal.LoadCurrentComponentLifecycleFact(fixture.intent.controllable_component_id);
+  ASSERT_TRUE(fact.ok()) << fact.error().message;
+  EXPECT_EQ(fact.value().current_state, ComponentLifecycleStateDTO::kDeclared);
+}
+
+TEST(ComponentLifecycleCoordinator, EnableFromDeclaredWithNoKnownEffectKeepsTheDeclaredFact) {
+  ScopedTemporaryDirectory temporary;
+  SqliteCCLCJournal journal(temporary.path() / std::string(kCCLCJournalFilename), CellId("cell.1"),
+                            8U);
+  CCLCDomainReservationTable reservations;
+  const auto catalog = EnableCatalog();
+  FakeSnapshotSource snapshots({Snapshot("snapshot.enable.declared",
+                                         ComponentLifecycleStateDTO::kDeclared,
+                                         ComponentLifecycleGeneration(3U), catalog)});
+  FakeCatalogSource catalogs(catalog);
+  auto port = std::make_shared<FakeBrandPort>(
+      journal, std::vector<ComponentLifecycleStateDTO>{ComponentLifecycleStateDTO::kDeclared});
+  FakeResolver resolver(port, catalog);
+  FakeCellAdmissionPort kernel;
+  FakeClock clock;
+  clock.set(100);
+  ManualScheduler scheduler;
+  ComponentLifecycleCoordinator coordinator(Config(), journal, reservations, snapshots, catalogs,
+                                            resolver, kernel, clock, scheduler);
+  ASSERT_TRUE(coordinator.Start().ok());
+  auto intent = PrepareIntent(coordinator.request_owner_epoch());
+  intent.intent = ComponentLifecycleIntentKindDTO::kEnable;
+  const auto accepted = coordinator.SubmitLifecycle(intent);
+  ASSERT_TRUE(accepted.ok()) << accepted.error().message;
+  ASSERT_TRUE(accepted.value().acceptance.has_value());
+  ASSERT_TRUE(coordinator.DrainFor(std::chrono::seconds(2)));
+  const auto status =
+      coordinator.LoadLifecycleStatus(accepted.value().acceptance->lifecycle_transaction_id);
+  ASSERT_TRUE(status.ok() && status.value().has_value());
+  EXPECT_EQ(status.value()->terminal_result,
+            ComponentLifecycleTerminalResultDTO::kFailedKnownNoEffect);
+  ASSERT_TRUE(status.value()->error);
+  EXPECT_EQ(status.value()->error->code, "component_lifecycle_transition_missing");
+  EXPECT_EQ(port->dispatch_count(), 0U);
+  // No known effect: the Declared state stays current at the new generation.
+  const auto fact = journal.LoadCurrentComponentLifecycleFact(intent.controllable_component_id);
+  ASSERT_TRUE(fact.ok()) << fact.error().message;
+  EXPECT_EQ(fact.value().durable_generation,
+            accepted.value().acceptance->component_lifecycle_generation);
+  EXPECT_EQ(fact.value().current_state, ComponentLifecycleStateDTO::kDeclared);
 }
 
 // Uses the real journal's target CAS and the existing exact Kernel claim
@@ -3015,7 +3434,7 @@ TEST(ComponentLifecycleCoordinator, ApplyAcceptIsNoEffectAndContinueHoldsUntilEx
     const auto continued = fixture.Continue();
     ASSERT_TRUE(continued.ok()) << continued.error().message << " "
                                << testing::PrintToString(continued.error().details);
-    ASSERT_TRUE(fixture.scheduler.WaitForScheduled(1U, std::chrono::seconds(2)));
+    ASSERT_TRUE(fixture.scheduler.WaitForScheduled(2U, std::chrono::seconds(2)));
     const auto holding = fixture.coordinator.LoadLifecycleStatus(
         accepted.value().acceptance->lifecycle_transaction_id);
     ASSERT_TRUE(holding.ok() && holding.value());
@@ -3070,7 +3489,7 @@ TEST(ComponentLifecycleCoordinator,
   const auto continued = fixture.Continue();
     ASSERT_TRUE(continued.ok()) << continued.error().message << " "
                                << testing::PrintToString(continued.error().details);
-  ASSERT_TRUE(fixture.scheduler.WaitForScheduled(1U, std::chrono::seconds(2)));
+  ASSERT_TRUE(fixture.scheduler.WaitForScheduled(2U, std::chrono::seconds(2)));
   const auto holding = fixture.coordinator.LoadLifecycleStatus(
       accepted.value().acceptance->lifecycle_transaction_id);
   ASSERT_TRUE(holding.ok() && holding.value());
@@ -3147,7 +3566,7 @@ TEST(ComponentLifecycleCoordinator,
             ComponentLifecycleStateDTO::kDeclared);
   EXPECT_EQ(continued.value().status->domains.back().current_state,
             ComponentLifecycleStateDTO::kPrepared);
-  ASSERT_TRUE(fixture.scheduler.WaitForScheduled(1U, std::chrono::seconds(2)));
+  ASSERT_TRUE(fixture.scheduler.WaitForScheduled(2U, std::chrono::seconds(2)));
   const auto holding = fixture.coordinator.LoadLifecycleStatus(
       accepted.value().acceptance->lifecycle_transaction_id);
   ASSERT_TRUE(holding.ok() && holding.value());
@@ -3326,7 +3745,7 @@ TEST(ComponentLifecycleCoordinator,
       const auto continued = fixture.Continue();
     ASSERT_TRUE(continued.ok()) << continued.error().message << " "
                                << testing::PrintToString(continued.error().details);
-      ASSERT_TRUE(fixture.scheduler.WaitForScheduled(1U, std::chrono::seconds(2)));
+      ASSERT_TRUE(fixture.scheduler.WaitForScheduled(2U, std::chrono::seconds(2)));
       if (foreign) {
         auto wrong = fixture.Published();
         wrong.request.private_materialization_content_digest =
@@ -3569,6 +3988,540 @@ TEST(ComponentLifecycleCoordinator, EvidenceAtExactDeadlineCannotCompleteLifecyc
   EXPECT_EQ(status.value()->error->code, "component_lifecycle_verification_timeout");
   EXPECT_EQ(port->dispatch_count(), 1U);
   EXPECT_TRUE(reservations.snapshot().empty());
+}
+
+TEST(ComponentLifecycleCoordinator, LostVerifyPollTimesOutAtTheIndependentDeadline) {
+  ScopedTemporaryDirectory temporary;
+  SqliteCCLCJournal journal(temporary.path() / std::string(kCCLCJournalFilename), CellId("cell.1"),
+                            8U);
+  CCLCDomainReservationTable reservations;
+  FakeSnapshotSource snapshots({Snapshot(), Snapshot()});
+  FakeCatalogSource catalogs(PrepareCatalog());
+  // The postcondition never holds, so verification waits on its poll.
+  auto port = std::make_shared<FakeBrandPort>(
+      journal, std::vector<ComponentLifecycleStateDTO>{ComponentLifecycleStateDTO::kDeclared,
+                                                       ComponentLifecycleStateDTO::kDeclared});
+  FakeResolver resolver(port);
+  TargetRefusalAdmissionPort kernel;
+  FakeClock clock;
+  clock.set(100);
+  constexpr TimePoint kDeadline = 1'000'100;  // accepted_at + plan timeout
+  PollLosingScheduler scheduler(kDeadline);
+  ComponentLifecycleCoordinator coordinator(Config(), journal, reservations, snapshots, catalogs,
+                                            resolver, kernel, clock, scheduler);
+  ASSERT_TRUE(coordinator.Start().ok());
+  const auto accepted =
+      coordinator.SubmitLifecycle(PrepareIntent(coordinator.request_owner_epoch()));
+  ASSERT_TRUE(accepted.ok()) << accepted.error().message;
+  ASSERT_TRUE(accepted.value().acceptance);
+  const auto& id = accepted.value().acceptance->lifecycle_transaction_id;
+  ASSERT_TRUE(scheduler.WaitForLost(1U, std::chrono::seconds(2)));
+  const auto waiting = coordinator.LoadLifecycleStatus(id);
+  ASSERT_TRUE(waiting.ok() && waiting.value());
+  EXPECT_EQ(waiting.value()->phase, ComponentLifecycleTransactionPhaseDTO::kVerifying);
+  EXPECT_FALSE(waiting.value()->terminal_result);
+
+  clock.set(kDeadline);
+  scheduler.AdvanceTo(kDeadline);
+  ASSERT_TRUE(coordinator.DrainFor(std::chrono::seconds(2)));
+  const auto status = coordinator.LoadLifecycleStatus(id);
+  ASSERT_TRUE(status.ok() && status.value());
+  EXPECT_EQ(status.value()->phase, ComponentLifecycleTransactionPhaseDTO::kFailed);
+  EXPECT_EQ(status.value()->terminal_result,
+            ComponentLifecycleTerminalResultDTO::kFailedPartialEffect);
+  ASSERT_TRUE(status.value()->error);
+  EXPECT_EQ(status.value()->error->code, "component_lifecycle_verification_timeout");
+  // Its post-dispatch observation is still fresh: the observed state counts.
+  EXPECT_EQ(status.value()->current_state, ComponentLifecycleStateDTO::kDeclared);
+  EXPECT_FALSE(status.value()->error->details.contains("component_state"));
+  EXPECT_EQ(port->dispatch_count(), 1U);
+  EXPECT_TRUE(reservations.snapshot().empty());
+  EXPECT_EQ(kernel.claim_releases, 1U);
+  ASSERT_TRUE(kernel.last_claim && kernel.last_release);
+  const auto receipt = kernel.GetCellAdmissionRecoveryReceipt(
+      {kernel.last_claim->intent, kernel.last_claim, kernel.last_release});
+  ASSERT_TRUE(receipt.ok());
+  EXPECT_EQ(receipt.value().status, CellAdmissionRecoveryReceiptStatusDTO::kReleasedExact);
+  EXPECT_TRUE(coordinator.accepting_new_requests());
+}
+
+// The failure settles after the last observation expired (fresh_until_ns
+// 2'000'000 in FakeBrandPort): it is not the current state any more.
+TEST(ComponentLifecycleCoordinator, ExpiredEvidenceAtSettlementIsReconstructedDeclared) {
+  ScopedTemporaryDirectory temporary;
+  SqliteCCLCJournal journal(temporary.path() / std::string(kCCLCJournalFilename), CellId("cell.1"),
+                            8U);
+  CCLCDomainReservationTable reservations;
+  FakeSnapshotSource snapshots({Snapshot(), Snapshot()});
+  FakeCatalogSource catalogs(PrepareCatalog());
+  auto port = std::make_shared<FakeBrandPort>(
+      journal, std::vector<ComponentLifecycleStateDTO>{ComponentLifecycleStateDTO::kDeclared,
+                                                       ComponentLifecycleStateDTO::kDeclared});
+  FakeResolver resolver(port);
+  TargetRefusalAdmissionPort kernel;
+  FakeClock clock;
+  clock.set(100);
+  constexpr TimePoint kDeadline = 1'000'100;
+  PollLosingScheduler scheduler(kDeadline);
+  ComponentLifecycleCoordinator coordinator(Config(), journal, reservations, snapshots, catalogs,
+                                            resolver, kernel, clock, scheduler);
+  ASSERT_TRUE(coordinator.Start().ok());
+  const auto accepted =
+      coordinator.SubmitLifecycle(PrepareIntent(coordinator.request_owner_epoch()));
+  ASSERT_TRUE(accepted.ok() && accepted.value().acceptance);
+  const auto& id = accepted.value().acceptance->lifecycle_transaction_id;
+  ASSERT_TRUE(scheduler.WaitForLost(1U, std::chrono::seconds(2)));
+
+  clock.set(3'000'000);
+  testing::internal::CaptureStderr();
+  scheduler.AdvanceTo(kDeadline);
+  ASSERT_TRUE(coordinator.DrainFor(std::chrono::seconds(2)));
+  const auto output = testing::internal::GetCapturedStderr();
+  const auto status = coordinator.LoadLifecycleStatus(id);
+  ASSERT_TRUE(status.ok() && status.value());
+  ASSERT_EQ(status.value()->terminal_result,
+            ComponentLifecycleTerminalResultDTO::kFailedPartialEffect);
+  EXPECT_EQ(status.value()->current_state, ComponentLifecycleStateDTO::kDeclared);
+  ASSERT_TRUE(status.value()->error);
+  ASSERT_TRUE(status.value()->error->details.contains("component_state"));
+  EXPECT_EQ(status.value()->error->details.at("component_state"),
+            kComponentLifecycleStateReconstructedCode);
+  EXPECT_NE(output.find("manyforge_cclc_lifecycle_state_reconstructed"), std::string::npos)
+      << output;
+  const auto fact = journal.LoadCurrentComponentLifecycleFact(ControllableComponentId("component.1"));
+  ASSERT_TRUE(fact.ok()) << fact.error().message;
+  EXPECT_EQ(fact.value().current_state, ComponentLifecycleStateDTO::kDeclared);
+}
+
+TEST(ComponentLifecycleCoordinator, CompletedTransactionLeavesNoPendingDeadline) {
+  ScopedTemporaryDirectory temporary;
+  SqliteCCLCJournal journal(temporary.path() / std::string(kCCLCJournalFilename), CellId("cell.1"),
+                            8U);
+  CCLCDomainReservationTable reservations;
+  FakeSnapshotSource snapshots({Snapshot(), Snapshot()});
+  FakeCatalogSource catalogs(PrepareCatalog());
+  auto port = std::make_shared<FakeBrandPort>(
+      journal, std::vector<ComponentLifecycleStateDTO>{ComponentLifecycleStateDTO::kDeclared,
+                                                       ComponentLifecycleStateDTO::kPrepared});
+  FakeResolver resolver(port);
+  FakeCellAdmissionPort kernel;
+  FakeClock clock;
+  clock.set(100);
+  WaitableManualScheduler scheduler;
+  ComponentLifecycleCoordinator coordinator(Config(), journal, reservations, snapshots, catalogs,
+                                            resolver, kernel, clock, scheduler);
+  ASSERT_TRUE(coordinator.Start().ok());
+  const auto accepted =
+      coordinator.SubmitLifecycle(PrepareIntent(coordinator.request_owner_epoch()));
+  ASSERT_TRUE(accepted.ok()) << accepted.error().message;
+  // Complete itself removes the never-dequeued deadline (before any drain),
+  // so owner settlement (read by the target driver) does not wait for it.
+  ASSERT_TRUE(scheduler.WaitForProvenCancel(std::chrono::seconds(2)));
+  EXPECT_EQ(scheduler.pending_count(SchedulerPriority::Lifecycle), 0U);
+  ASSERT_TRUE(coordinator.DrainFor(std::chrono::seconds(2)));
+  EXPECT_TRUE(coordinator.ReadLifecycleOwnerSettlement().ok());
+  const auto status =
+      coordinator.LoadLifecycleStatus(accepted.value().acceptance->lifecycle_transaction_id);
+  ASSERT_TRUE(status.ok() && status.value());
+  EXPECT_EQ(status.value()->terminal_result, ComponentLifecycleTerminalResultDTO::kSucceeded);
+}
+
+// The Real xArm arm's Recover shape: target `disabled`, a postcondition that
+// admits either unarmed resting state, and one vendor clear.
+[[nodiscard]] BrandLifecyclePlanCatalogDTO UnarmedRecoverCatalog(
+    LifecyclePredicateDTO eligibility = Predicate(ComponentLifecycleStateDTO::kFaulted)) {
+  auto plans = PrepareCatalog().plans;
+  const LifecyclePredicateDTO unarmed{
+      {ComponentLifecycleStateDTO::kDeclared, ComponentLifecycleStateDTO::kDisabled}, {}};
+  plans.push_back({ComponentLifecycleIntentKindDTO::kRecover,
+                   ComponentLifecycleStateDTO::kDisabled,
+                   std::move(eligibility),
+                   unarmed,
+                   1'000'000,
+                   {{LifecyclePrimitiveId("clear_error"),
+                     Predicate(ComponentLifecycleStateDTO::kFaulted), unarmed}}});
+  auto catalog = MakeBrandLifecyclePlanCatalog(
+      ProviderManifestId("manifest.1"), ProviderManifestRevision(Sha('1')), std::move(plans));
+  if (!catalog.ok()) {
+    ADD_FAILURE() << catalog.error().code << ": " << catalog.error().message;
+    throw std::runtime_error("failed to construct unarmed Recover catalog");
+  }
+  return std::move(catalog.value());
+}
+
+struct UnarmedRecoverRun final {
+  std::optional<ComponentLifecycleStatusDTO> status;
+  std::size_t dispatches = 0U;
+  std::size_t claim_releases = 0U;
+  bool reservations_empty = false;
+  bool accepting = false;
+  std::string stderr_output;
+  std::optional<ComponentLifecycleStateDTO> persisted_state;
+};
+
+// Live 2026-10-28 (Real Lite 6): a Prepare blocked by an emergency-stop error
+// left the arm Declared; after the operator's Recover the target driver's
+// Recover cleared the error and the arm reported Declared again.
+[[nodiscard]] UnarmedRecoverRun RunUnarmedRecover(
+    DispatchMode mode,
+    std::vector<ComponentLifecycleStateDTO> observations = {ComponentLifecycleStateDTO::kFaulted,
+                                                           ComponentLifecycleStateDTO::kDeclared},
+    const BrandLifecyclePlanCatalogDTO& catalog = UnarmedRecoverCatalog()) {
+  UnarmedRecoverRun run;
+  ScopedTemporaryDirectory temporary;
+  SqliteCCLCJournal journal(temporary.path() / std::string(kCCLCJournalFilename), CellId("cell.1"),
+                            8U);
+  CCLCDomainReservationTable reservations;
+  FakeSnapshotSource snapshots({Snapshot("snapshot.recover", ComponentLifecycleStateDTO::kDeclared,
+                                         ComponentLifecycleGeneration(3U), catalog)});
+  FakeCatalogSource catalogs(catalog);
+  auto port = std::make_shared<FakeBrandPort>(journal, std::move(observations), mode);
+  FakeResolver resolver(port, catalog);
+  TargetRefusalAdmissionPort kernel;
+  FakeClock clock;
+  clock.set(100);
+  ManualScheduler scheduler;
+  ComponentLifecycleCoordinator coordinator(Config(), journal, reservations, snapshots, catalogs,
+                                            resolver, kernel, clock, scheduler);
+  if (!coordinator.Start().ok()) {
+    ADD_FAILURE() << "coordinator did not start";
+    return run;
+  }
+  auto intent = PrepareIntent(coordinator.request_owner_epoch());
+  intent.intent = ComponentLifecycleIntentKindDTO::kRecover;
+  testing::internal::CaptureStderr();
+  const auto accepted = coordinator.SubmitLifecycle(intent);
+  if (!accepted.ok() || !accepted.value().acceptance) {
+    run.stderr_output = testing::internal::GetCapturedStderr();
+    ADD_FAILURE() << (accepted.ok() ? "no acceptance" : accepted.error().message);
+    return run;
+  }
+  const auto& id = accepted.value().acceptance->lifecycle_transaction_id;
+  static_cast<void>(coordinator.DrainFor(std::chrono::milliseconds(500)));
+  // The fixed deadline passes: a transaction left pending would stay so.
+  clock.set(1'000'100);
+  scheduler.advance_to(1'000'100);
+  static_cast<void>(coordinator.DrainFor(std::chrono::milliseconds(500)));
+  run.stderr_output = testing::internal::GetCapturedStderr();
+  const auto status = coordinator.LoadLifecycleStatus(id);
+  if (status.ok() && status.value()) run.status = *status.value();
+  run.dispatches = port->dispatch_count();
+  run.claim_releases = kernel.claim_releases;
+  run.reservations_empty = reservations.snapshot().empty();
+  run.accepting = coordinator.accepting_new_requests();
+  const auto fact = journal.LoadCurrentComponentLifecycleFact(intent.controllable_component_id);
+  if (fact.ok()) run.persisted_state = fact.value().current_state;
+  return run;
+}
+
+TEST(ComponentLifecycleCoordinator, RecoverFromDeclaredRecordsTheObservedRestingState) {
+  const auto run = RunUnarmedRecover(DispatchMode::kKnownSuccess);
+  EXPECT_EQ(run.stderr_output.find("manyforge_cclc_lifecycle_stall"), std::string::npos)
+      << run.stderr_output;
+  ASSERT_TRUE(run.status);
+  EXPECT_EQ(run.status->phase, ComponentLifecycleTransactionPhaseDTO::kSucceeded);
+  EXPECT_EQ(run.status->terminal_result, ComponentLifecycleTerminalResultDTO::kSucceeded);
+  EXPECT_EQ(run.status->requested_state.state, ComponentLifecycleStateDTO::kDisabled);
+  ASSERT_EQ(run.status->domains.size(), 1U);
+  // The provider's observation, not the requested target, in the domain,
+  // the component aggregate and the durable current fact.
+  EXPECT_EQ(run.status->domains.front().current_state, ComponentLifecycleStateDTO::kDeclared);
+  EXPECT_EQ(run.status->current_state, ComponentLifecycleStateDTO::kDeclared);
+  EXPECT_EQ(run.persisted_state, ComponentLifecycleStateDTO::kDeclared);
+  EXPECT_EQ(run.status->domains.front().effect, ComponentLifecycleDomainEffectDTO::kEffectObserved);
+  EXPECT_EQ(run.dispatches, 1U);
+  EXPECT_EQ(run.claim_releases, 1U);
+  EXPECT_TRUE(run.reservations_empty);
+  EXPECT_TRUE(run.accepting);
+}
+
+TEST(ComponentLifecycleCoordinator, UncertainRecoverReconciledAtDeclaredSucceedsWithItsEvidence) {
+  const auto run = RunUnarmedRecover(DispatchMode::kUncertain);
+  EXPECT_EQ(run.stderr_output.find("manyforge_cclc_lifecycle_stall"), std::string::npos)
+      << run.stderr_output;
+  ASSERT_TRUE(run.status);
+  EXPECT_EQ(run.status->terminal_result, ComponentLifecycleTerminalResultDTO::kSucceeded);
+  ASSERT_EQ(run.status->domains.size(), 1U);
+  const auto& domain = run.status->domains.front();
+  EXPECT_EQ(domain.current_state, ComponentLifecycleStateDTO::kDeclared);
+  ASSERT_TRUE(domain.reconciliation_evidence);
+  EXPECT_EQ(domain.reconciliation_evidence->observed_state, ComponentLifecycleStateDTO::kDeclared);
+  EXPECT_EQ(run.status->current_state, ComponentLifecycleStateDTO::kDeclared);
+  EXPECT_EQ(run.persisted_state, ComponentLifecycleStateDTO::kDeclared);
+  EXPECT_EQ(run.claim_releases, 1U);
+  EXPECT_TRUE(run.accepting);
+}
+
+// Already satisfied at Initialize: no primitive runs, and the observed
+// resting state (Declared, accepted by the plan) is kept, not the target.
+TEST(ComponentLifecycleCoordinator, AlreadySatisfiedRecoverKeepsTheObservedRestingState) {
+  const auto run = RunUnarmedRecover(
+      DispatchMode::kKnownSuccess, {ComponentLifecycleStateDTO::kDeclared},
+      UnarmedRecoverCatalog({{ComponentLifecycleStateDTO::kDeclared,
+                              ComponentLifecycleStateDTO::kFaulted,
+                              ComponentLifecycleStateDTO::kDisabled},
+                             {}}));
+  ASSERT_TRUE(run.status);
+  EXPECT_EQ(run.status->terminal_result, ComponentLifecycleTerminalResultDTO::kSucceeded);
+  EXPECT_EQ(run.status->requested_state.state, ComponentLifecycleStateDTO::kDisabled);
+  ASSERT_EQ(run.status->domains.size(), 1U);
+  EXPECT_EQ(run.status->domains.front().current_state, ComponentLifecycleStateDTO::kDeclared);
+  EXPECT_EQ(run.status->domains.front().effect, ComponentLifecycleDomainEffectDTO::kKnownNoEffect);
+  EXPECT_EQ(run.status->current_state, ComponentLifecycleStateDTO::kDeclared);
+  EXPECT_EQ(run.persisted_state, ComponentLifecycleStateDTO::kDeclared);
+  EXPECT_EQ(run.dispatches, 0U);
+  EXPECT_EQ(run.claim_releases, 1U);
+}
+
+// The Real xArm gripper's Recover plan accepts any healthy state: a gripper
+// still Active is already satisfied. Its domain keeps Active; the component
+// records Prepared (a Recover never makes it command-ready).
+TEST(ComponentLifecycleCoordinator, AlreadySatisfiedRecoverAtActiveRecordsPreparedComponent) {
+  auto plans = PrepareCatalog().plans;
+  const LifecyclePredicateDTO healthy{
+      {ComponentLifecycleStateDTO::kDeclared, ComponentLifecycleStateDTO::kPrepared,
+       ComponentLifecycleStateDTO::kActive, ComponentLifecycleStateDTO::kDisabled},
+      {}};
+  plans.push_back({ComponentLifecycleIntentKindDTO::kRecover,
+                   ComponentLifecycleStateDTO::kDisabled, healthy, healthy, 1'000'000, {}});
+  auto made = MakeBrandLifecyclePlanCatalog(ProviderManifestId("manifest.1"),
+                                            ProviderManifestRevision(Sha('1')), std::move(plans));
+  ASSERT_TRUE(made.ok()) << made.error().message;
+  const auto run = RunUnarmedRecover(DispatchMode::kKnownSuccess,
+                                     {ComponentLifecycleStateDTO::kActive}, made.value());
+  EXPECT_EQ(run.stderr_output.find("manyforge_cclc_lifecycle_stall"), std::string::npos)
+      << run.stderr_output;
+  ASSERT_TRUE(run.status);
+  EXPECT_EQ(run.status->terminal_result, ComponentLifecycleTerminalResultDTO::kSucceeded);
+  ASSERT_EQ(run.status->domains.size(), 1U);
+  EXPECT_EQ(run.status->domains.front().current_state, ComponentLifecycleStateDTO::kActive);
+  EXPECT_EQ(run.status->current_state, ComponentLifecycleStateDTO::kPrepared);
+  EXPECT_EQ(run.persisted_state, ComponentLifecycleStateDTO::kPrepared);
+  EXPECT_EQ(run.dispatches, 0U);
+}
+
+TEST(ComponentLifecycleStatus, OnlyRecoverSucceedsAtAnotherRestingState) {
+  const auto run = RunUnarmedRecover(DispatchMode::kKnownSuccess);
+  ASSERT_TRUE(run.status);
+  EXPECT_TRUE(run.status->locally_valid());
+  // The same succeeded status under a Disable: valid only at Disabled.
+  auto disable = *run.status;
+  disable.accepted_intent.intent = ComponentLifecycleIntentKindDTO::kDisable;
+  EXPECT_FALSE(disable.locally_valid());
+  disable.domains.front().current_state = ComponentLifecycleStateDTO::kDisabled;
+  EXPECT_TRUE(disable.locally_valid());
+  // A healthy domain may settle Active (Real xArm gripper); never faulted.
+  auto active = *run.status;
+  active.domains.front().current_state = ComponentLifecycleStateDTO::kActive;
+  EXPECT_TRUE(active.locally_valid());
+  auto faulted = *run.status;
+  faulted.domains.front().current_state = ComponentLifecycleStateDTO::kFaulted;
+  EXPECT_FALSE(faulted.locally_valid());
+}
+
+// A Prepare whose plan postcondition admits a state other than Prepared: the
+// verified progress is not a valid status. It fails typed and releases its
+// claim instead of a journal refusal that leaves it pending.
+TEST(ComponentLifecycleCoordinator, UnrecordableProgressFailsClosedInsteadOfStayingPending) {
+  auto plans = PrepareCatalog().plans;
+  const LifecyclePredicateDTO armed{
+      {ComponentLifecycleStateDTO::kPrepared, ComponentLifecycleStateDTO::kActive}, {}};
+  plans.front().requested_postcondition = armed;
+  plans.front().transitions.front().postcondition_predicate = armed;
+  auto made = MakeBrandLifecyclePlanCatalog(ProviderManifestId("manifest.1"),
+                                            ProviderManifestRevision(Sha('1')), std::move(plans));
+  ASSERT_TRUE(made.ok()) << made.error().message;
+  const auto catalog = made.value();
+  ScopedTemporaryDirectory temporary;
+  SqliteCCLCJournal journal(temporary.path() / std::string(kCCLCJournalFilename), CellId("cell.1"),
+                            8U);
+  CCLCDomainReservationTable reservations;
+  FakeSnapshotSource snapshots({Snapshot("snapshot.prepare", ComponentLifecycleStateDTO::kDeclared,
+                                         ComponentLifecycleGeneration(3U), catalog)});
+  FakeCatalogSource catalogs(catalog);
+  auto port = std::make_shared<FakeBrandPort>(
+      journal, std::vector<ComponentLifecycleStateDTO>{ComponentLifecycleStateDTO::kDeclared,
+                                                       ComponentLifecycleStateDTO::kActive});
+  FakeResolver resolver(port, catalog);
+  TargetRefusalAdmissionPort kernel;
+  FakeClock clock;
+  clock.set(100);
+  ManualScheduler scheduler;
+  ComponentLifecycleCoordinator coordinator(Config(), journal, reservations, snapshots, catalogs,
+                                            resolver, kernel, clock, scheduler);
+  ASSERT_TRUE(coordinator.Start().ok());
+  testing::internal::CaptureStderr();
+  const auto accepted =
+      coordinator.SubmitLifecycle(PrepareIntent(coordinator.request_owner_epoch()));
+  ASSERT_TRUE(accepted.ok() && accepted.value().acceptance);
+  static_cast<void>(coordinator.DrainFor(std::chrono::milliseconds(500)));
+  const auto output = testing::internal::GetCapturedStderr();
+  EXPECT_EQ(output.find("reason=progress_journal_refused"), std::string::npos) << output;
+  const auto status =
+      coordinator.LoadLifecycleStatus(accepted.value().acceptance->lifecycle_transaction_id);
+  ASSERT_TRUE(status.ok() && status.value());
+  EXPECT_EQ(status.value()->phase, ComponentLifecycleTransactionPhaseDTO::kFailed);
+  EXPECT_EQ(status.value()->terminal_result,
+            ComponentLifecycleTerminalResultDTO::kFailedPartialEffect);
+  ASSERT_TRUE(status.value()->error);
+  EXPECT_EQ(status.value()->error->code, "component_lifecycle_progress_status_invalid");
+  EXPECT_EQ(port->dispatch_count(), 1U);
+  EXPECT_EQ(kernel.claim_releases, 1U);
+  EXPECT_TRUE(reservations.snapshot().empty());
+}
+
+TEST(ComponentLifecycleCoordinator, DequeuedDeadlineCallbackKeepsOwnerSettlementOpenUntilItReturns) {
+  ScopedTemporaryDirectory temporary;
+  SqliteCCLCJournal journal(temporary.path() / std::string(kCCLCJournalFilename), CellId("cell.1"),
+                            8U);
+  CCLCDomainReservationTable reservations;
+  FakeSnapshotSource snapshots({Snapshot(), Snapshot()});
+  FakeCatalogSource catalogs(PrepareCatalog());
+  // First verification is unsatisfied (poll); the polled observation succeeds.
+  auto port = std::make_shared<FakeBrandPort>(
+      journal, std::vector<ComponentLifecycleStateDTO>{ComponentLifecycleStateDTO::kDeclared,
+                                                       ComponentLifecycleStateDTO::kDeclared,
+                                                       ComponentLifecycleStateDTO::kPrepared});
+  FakeResolver resolver(port);
+  FakeCellAdmissionPort kernel;
+  FakeClock clock;
+  clock.set(100);
+  constexpr TimePoint kDeadline = 1'000'100;
+  PausingDeadlineScheduler scheduler(kDeadline);
+  ComponentLifecycleCoordinator coordinator(Config(), journal, reservations, snapshots, catalogs,
+                                            resolver, kernel, clock, scheduler);
+  ASSERT_TRUE(coordinator.Start().ok());
+  const auto accepted =
+      coordinator.SubmitLifecycle(PrepareIntent(coordinator.request_owner_epoch()));
+  ASSERT_TRUE(accepted.ok() && accepted.value().acceptance);
+  const auto& id = accepted.value().acceptance->lifecycle_transaction_id;
+  ASSERT_TRUE(scheduler.WaitForScheduled(2U, std::chrono::seconds(2)));  // deadline + poll
+
+  // One advance dequeues both callbacks before running either: the poll
+  // completes the transaction while the deadline callback is held dequeued.
+  auto advancer = std::async(std::launch::async, [&] { scheduler.AdvanceTo(kDeadline); });
+  ASSERT_TRUE(scheduler.WaitForPaused(std::chrono::seconds(2)));
+  // Barrier: Complete attempted the cancel after the callback was dequeued.
+  ASSERT_TRUE(scheduler.WaitForCancelAttempt(std::chrono::seconds(2)));
+  // The held callback stays tracked, so settlement is unavailable on every
+  // read while it is held (also once the worker tail has returned).
+  for (int read = 0; read < 10'000; ++read) {
+    ASSERT_FALSE(coordinator.ReadLifecycleOwnerSettlement().ok()) << read;
+    std::this_thread::yield();
+  }
+
+  scheduler.Release();
+  advancer.get();
+  ASSERT_TRUE(coordinator.DrainFor(std::chrono::seconds(2)));
+  EXPECT_TRUE(coordinator.ReadLifecycleOwnerSettlement().ok());
+  const auto status = coordinator.LoadLifecycleStatus(id);
+  ASSERT_TRUE(status.ok() && status.value());
+  EXPECT_EQ(status.value()->terminal_result, ComponentLifecycleTerminalResultDTO::kSucceeded);
+  EXPECT_EQ(port->dispatch_count(), 1U);
+}
+
+TEST(ComponentLifecycleCoordinator, FailedDrainKeepsADequeuedDeadlineCallbackTracked) {
+  ScopedTemporaryDirectory temporary;
+  SqliteCCLCJournal journal(temporary.path() / std::string(kCCLCJournalFilename), CellId("cell.1"),
+                            8U);
+  CCLCDomainReservationTable reservations;
+  FakeSnapshotSource snapshots({Snapshot(), Snapshot()});
+  FakeCatalogSource catalogs(PrepareCatalog());
+  auto port = std::make_shared<FakeBrandPort>(
+      journal, std::vector<ComponentLifecycleStateDTO>{ComponentLifecycleStateDTO::kDeclared,
+                                                       ComponentLifecycleStateDTO::kDeclared,
+                                                       ComponentLifecycleStateDTO::kPrepared});
+  FakeResolver resolver(port);
+  FakeCellAdmissionPort kernel;
+  FakeClock clock;
+  clock.set(100);
+  constexpr TimePoint kDeadline = 1'000'100;
+  PausingDeadlineScheduler scheduler(kDeadline);
+  ComponentLifecycleCoordinator coordinator(Config(), journal, reservations, snapshots, catalogs,
+                                            resolver, kernel, clock, scheduler);
+  ASSERT_TRUE(coordinator.Start().ok());
+  const auto accepted =
+      coordinator.SubmitLifecycle(PrepareIntent(coordinator.request_owner_epoch()));
+  ASSERT_TRUE(accepted.ok() && accepted.value().acceptance);
+  ASSERT_TRUE(scheduler.WaitForScheduled(2U, std::chrono::seconds(2)));  // deadline + poll
+  auto advancer = std::async(std::launch::async, [&] { scheduler.AdvanceTo(kDeadline); });
+  ASSERT_TRUE(scheduler.WaitForPaused(std::chrono::seconds(2)));
+  ASSERT_TRUE(scheduler.WaitForCancelAttempt(std::chrono::seconds(2)));
+
+  // DrainFor reaches its cancel and Lifecycle-lane drain (worker idle, no
+  // active transaction); the held callback makes the drain fail.
+  EXPECT_FALSE(coordinator.DrainFor(std::chrono::seconds(2)));
+  ASSERT_TRUE(scheduler.drain_attempted());
+  // The failed drain must not have forgotten the dequeued callback.
+  EXPECT_FALSE(coordinator.ReadLifecycleOwnerSettlement().ok());
+
+  scheduler.Release();
+  advancer.get();
+  ASSERT_TRUE(coordinator.DrainFor(std::chrono::seconds(2)));
+  EXPECT_TRUE(coordinator.ReadLifecycleOwnerSettlement().ok());
+  const auto status =
+      coordinator.LoadLifecycleStatus(accepted.value().acceptance->lifecycle_transaction_id);
+  ASSERT_TRUE(status.ok() && status.value());
+  EXPECT_EQ(status.value()->terminal_result, ComponentLifecycleTerminalResultDTO::kSucceeded);
+}
+
+TEST(ComponentLifecycleCoordinator, RefusedTerminalReadinessIsLoggedAndTheDeadlineDoesNotAct) {
+  ScopedTemporaryDirectory temporary;
+  SqliteCCLCJournal journal(temporary.path() / std::string(kCCLCJournalFilename), CellId("cell.1"),
+                            8U);
+  CCLCDomainReservationTable reservations;
+  const auto catalog = EnableCatalog();
+  FakeSnapshotSource snapshots({Snapshot("snapshot.enable", ComponentLifecycleStateDTO::kPrepared,
+                                         ComponentLifecycleGeneration(3U), catalog)});
+  FakeCatalogSource catalogs(catalog);
+  auto port = std::make_shared<FakeBrandPort>(
+      journal, std::vector<ComponentLifecycleStateDTO>{ComponentLifecycleStateDTO::kPrepared,
+                                                       ComponentLifecycleStateDTO::kActive});
+  FakeResolver resolver(port, catalog);
+  TargetRefusalAdmissionPort kernel;
+  FakeClock clock;
+  clock.set(100);
+  ManualScheduler scheduler;
+  FakeReadinessPort readiness;
+  // Neither the enabled nor the closed terminal result is read back.
+  readiness.FailNextPublications(2U);
+  ComponentLifecycleCoordinator coordinator(Config(), journal, reservations, snapshots, catalogs,
+                                            resolver, kernel, clock, scheduler, std::nullopt,
+                                            &readiness);
+  ASSERT_TRUE(coordinator.Start().ok());
+  auto intent = PrepareIntent(coordinator.request_owner_epoch());
+  intent.intent = ComponentLifecycleIntentKindDTO::kEnable;
+  testing::internal::CaptureStderr();
+  const auto accepted = coordinator.SubmitLifecycle(intent);
+  ASSERT_TRUE(accepted.ok() && accepted.value().acceptance);
+  const auto& id = accepted.value().acceptance->lifecycle_transaction_id;
+  // The worker goes idle; the unverified transaction stays active.
+  EXPECT_FALSE(coordinator.DrainFor(std::chrono::milliseconds(200)));
+  const auto stalled = coordinator.LoadLifecycleStatus(id);
+  ASSERT_TRUE(stalled.ok() && stalled.value());
+  clock.set(1'000'100);
+  scheduler.advance_to(1'000'100);
+  EXPECT_FALSE(coordinator.DrainFor(std::chrono::milliseconds(200)));
+  const auto output = testing::internal::GetCapturedStderr();
+
+  const std::string line = "manyforge_cclc_lifecycle_stall transaction=" + id.value() +
+                           " generation=" +
+                           std::to_string(
+                               accepted.value().acceptance->lifecycle_transaction_generation.value()) +
+                           " reason=terminal_readiness_refused error=invalid_state_transition\n";
+  const auto first = output.find(line);
+  ASSERT_NE(first, std::string::npos) << output;
+  EXPECT_EQ(output.find(line, first + line.size()), std::string::npos) << output;
+  // Fail closed: no terminal row, claim held, admission closed; the deadline
+  // pass does not act on the refused, unrecorded result.
+  const auto after = coordinator.LoadLifecycleStatus(id);
+  ASSERT_TRUE(after.ok() && after.value());
+  EXPECT_FALSE(after.value()->terminal_result);
+  EXPECT_EQ(after.value()->status_sequence, stalled.value()->status_sequence);
+  EXPECT_EQ(readiness.calls(), (std::vector<std::string>{"close", "publish_open", "publish_closed"}));
+  EXPECT_EQ(port->dispatch_count(), 1U);
+  EXPECT_EQ(kernel.claim_releases, 0U);
+  EXPECT_FALSE(coordinator.accepting_new_requests());
 }
 
 TEST(ComponentLifecycleCoordinator, UnrepresentableDeadlineFailsBeforeDurableAcceptance) {
@@ -3906,11 +4859,11 @@ TEST(ComponentLifecycleCoordinator, DrainDoesNotCancelAnActivePollOrAdvanceTheOw
   const auto accepted = coordinator.SubmitLifecycle(PrepareIntent(coordinator.request_owner_epoch()));
   ASSERT_TRUE(accepted.ok());
   ASSERT_TRUE(accepted.value().acceptance);
-  ASSERT_TRUE(scheduler.WaitForScheduled(1U, std::chrono::seconds(2)));
-  EXPECT_EQ(scheduler.pending_count(SchedulerPriority::Lifecycle), 1U);
+  ASSERT_TRUE(scheduler.WaitForScheduled(2U, std::chrono::seconds(2)));
+  EXPECT_EQ(scheduler.pending_count(SchedulerPriority::Lifecycle), 2U);
   EXPECT_FALSE(coordinator.DrainFor(std::chrono::nanoseconds::zero()));
   EXPECT_EQ(scheduler.cancel_count(), 0U);
-  EXPECT_EQ(scheduler.pending_count(SchedulerPriority::Lifecycle), 1U);
+  EXPECT_EQ(scheduler.pending_count(SchedulerPriority::Lifecycle), 2U);
   EXPECT_FALSE(reservations.snapshot().empty());
   const auto pending = coordinator.LoadLifecycleStatus(accepted.value().acceptance->lifecycle_transaction_id);
   ASSERT_TRUE(pending.ok());
@@ -4342,7 +5295,7 @@ TEST(ComponentLifecycleCoordinator,
   const auto accepted =
       coordinator->SubmitLifecycle(PrepareIntent(coordinator->request_owner_epoch()));
   ASSERT_TRUE(accepted.ok());
-  ASSERT_TRUE(scheduler.WaitForScheduled(1U, std::chrono::seconds(2)));
+  ASSERT_TRUE(scheduler.WaitForScheduled(2U, std::chrono::seconds(2)));
 
   testing::internal::CaptureStderr();
   coordinator.reset();
@@ -5136,7 +6089,7 @@ TEST(ComponentLifecycleCoordinator,
 
   const auto first_continued = fixture.Continue(first);
   ASSERT_TRUE(first_continued.ok()) << first_continued.error().message;
-  ASSERT_TRUE(fixture.base.scheduler.WaitForScheduled(1U, std::chrono::seconds(2)));
+  ASSERT_TRUE(fixture.base.scheduler.WaitForScheduled(2U, std::chrono::seconds(2)));
   const auto first_holding = fixture.base.journal.LoadRetainedLifecycleStatus(
       first_accepted.value().acceptance->lifecycle_transaction_id);
   ASSERT_TRUE(first_holding.ok() && first_holding.value());
@@ -5162,7 +6115,7 @@ TEST(ComponentLifecycleCoordinator,
 
   const auto second_continued = fixture.Continue(second);
   ASSERT_TRUE(second_continued.ok()) << second_continued.error().message;
-  ASSERT_TRUE(fixture.base.scheduler.WaitForScheduled(2U, std::chrono::seconds(2)));
+  ASSERT_TRUE(fixture.base.scheduler.WaitForScheduled(4U, std::chrono::seconds(2)));
   const auto second_holding = fixture.base.journal.LoadRetainedLifecycleStatus(
       second_accepted.value().acceptance->lifecycle_transaction_id);
   ASSERT_TRUE(second_holding.ok() && second_holding.value());
@@ -5253,7 +6206,7 @@ TEST(ComponentLifecycleCoordinator,
     if (phase != ComponentLifecycleTransactionPhaseDTO::kAccepted) {
       ASSERT_TRUE(fixture.Continue(fixture.base.data).ok());
       if (phase == ComponentLifecycleTransactionPhaseDTO::kVerifying) {
-        ASSERT_TRUE(fixture.base.scheduler.WaitForScheduled(1U, std::chrono::seconds(2)));
+        ASSERT_TRUE(fixture.base.scheduler.WaitForScheduled(2U, std::chrono::seconds(2)));
         ASSERT_TRUE(fixture.base.WaitForPinnedActions(4U));
       } else {
         ASSERT_TRUE(fixture.base.WaitForPinnedActions(4U));
@@ -5990,6 +6943,44 @@ TEST(ComponentLifecycleCoordinator, GroupedReadinessUsesExactPureHealthWithoutIn
   fixture.ExpectNoExecutionEffects();
 }
 
+// A journal written before partial effects kept a state: numbered, no fact.
+TEST(ComponentLifecycleCoordinator, MissingCurrentFactReadsHealthOrWarnsReconstructed) {
+  GroupedReadinessFixture fixture;
+  fixture.clock.set(123);
+  sqlite3* raw = nullptr;
+  ASSERT_EQ(sqlite3_open((fixture.temporary.path() / std::string(kCCLCJournalFilename)).c_str(),
+                         &raw),
+            SQLITE_OK);
+  ASSERT_EQ(sqlite3_exec(raw,
+                         "INSERT INTO lifecycle_component_watermarks("
+                         "controllable_component_id,component_lifecycle_generation) "
+                         "VALUES('component.1',3)",
+                         nullptr, nullptr, nullptr),
+            SQLITE_OK);
+  ASSERT_EQ(sqlite3_close(raw), SQLITE_OK);
+  const auto fact =
+      fixture.journal.LoadCurrentComponentLifecycleFact(ControllableComponentId("component.1"));
+  ASSERT_TRUE(fact.ok() && fact.value().durable_generation && !fact.value().current_state);
+
+  // Fresh fault-free health: the read carries no warning.
+  auto read = fixture.Read();
+  ASSERT_TRUE(read.ok()) << read.error().message;
+  EXPECT_TRUE(read.value().readiness.ready);
+  EXPECT_FALSE(read.value().readiness.error);
+
+  // No health: Declared with the typed warning, never a failed read.
+  fixture.resolver.health_error = ErrorDTO{"lifecycle_health_unavailable", "no health", {}};
+  read = fixture.Read();
+  ASSERT_TRUE(read.ok()) << read.error().message;
+  EXPECT_FALSE(read.value().readiness.ready);
+  ASSERT_TRUE(read.value().readiness.error);
+  EXPECT_EQ(read.value().readiness.error->code, kComponentLifecycleStateReconstructedCode);
+  EXPECT_EQ(read.value().readiness.error->details.at("reason"), "current_state_fact_missing");
+  EXPECT_EQ(read.value().readiness.error->details.at("blocking_code"),
+            "lifecycle_health_unavailable");
+  fixture.ExpectNoExecutionEffects();
+}
+
 TEST(ComponentLifecycleCoordinator,
      MissingMeasuredStateWarnsWithoutBlockingLifecycleReadiness) {
   GroupedReadinessFixture fixture(true);
@@ -6649,13 +7640,13 @@ TEST(ComponentLifecycleCoordinator, ProductExchangeDoesNotCancelActiveObservatio
   const auto owner = coordinator.request_owner_epoch();
   const auto accepted = coordinator.SubmitLifecycle(PrepareIntent(owner));
   ASSERT_TRUE(accepted.ok());
-  ASSERT_TRUE(scheduler.WaitForScheduled(1U, std::chrono::seconds(2)));
+  ASSERT_TRUE(scheduler.WaitForScheduled(2U, std::chrono::seconds(2)));
   const auto pending =
       coordinator.TryExchangeProductContext(old_context, new_context, owner, previous);
   ASSERT_TRUE(pending.ok());
   EXPECT_EQ(pending.value().phase, ComponentLifecycleProductExchangePhase::kPending);
   EXPECT_EQ(scheduler.cancel_count(), 0U);
-  EXPECT_EQ(scheduler.pending_count(SchedulerPriority::Lifecycle), 1U);
+  EXPECT_EQ(scheduler.pending_count(SchedulerPriority::Lifecycle), 2U);
   EXPECT_EQ(clock.now(), 100);
 }
 

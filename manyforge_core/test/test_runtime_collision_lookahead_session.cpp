@@ -14,7 +14,9 @@
 #include <limits>
 #include <mutex>
 #include <optional>
+#include <stdexcept>
 #include <string>
+#include <string_view>
 #include <thread>
 #include <utility>
 #include <vector>
@@ -320,6 +322,35 @@ RuntimeCollisionLookaheadSession::AuthorityCallback accept_test_authority() {
     return RuntimeCollisionLookaheadAuthorityDisposition::kAccepted;
   };
 }
+
+// Schedules through ManualScheduler and records the host containment that a
+// production scheduler would hand to the addressed Kernel.
+class FaultRecordingScheduler final : public IScheduler {
+ public:
+  ScheduleHandle schedule(TimePoint deadline, std::function<void()> callback,
+                          SchedulerPriority priority = SchedulerPriority::Lifecycle) override {
+    return inner.schedule(deadline, std::move(callback), priority);
+  }
+  void cancel(ScheduleHandle handle) override { inner.cancel(handle); }
+  void contain_safety_path_fault(std::string_view reason_code) noexcept override {
+    std::lock_guard<std::mutex> lock(mutex);
+    reasons.emplace_back(reason_code);
+    cv.notify_all();
+  }
+
+  std::vector<std::string> wait_for_reasons(std::size_t count) {
+    std::unique_lock<std::mutex> lock(mutex);
+    if (!cv.wait_for(lock, std::chrono::seconds(2), [&] { return reasons.size() >= count; })) {
+      ADD_FAILURE() << "lookahead fault containment timed out";
+    }
+    return reasons;
+  }
+
+  ManualScheduler inner;
+  std::mutex mutex;
+  std::condition_variable cv;
+  std::vector<std::string> reasons;
+};
 
 TrajectoryDTO dense_trajectory(std::size_t waypoint_count,
                                double step_s = 0.01) {
@@ -2059,6 +2090,83 @@ TEST(RuntimeCollisionLookaheadSessionTest, BundleRefusalRetainsOnlyObservedBundl
   EXPECT_FALSE(result.selection_computed);
   EXPECT_FALSE(result.validation_completed);
   EXPECT_EQ(engine->check_calls.load(), 0U);
+}
+
+TEST(RuntimeCollisionLookaheadSessionTest,
+     ThrowingAuthorityCallbackIsContainedInsteadOfTerminating) {
+  FakeClock clock;
+  clock.set(1'000'000'000);
+  FaultRecordingScheduler scheduler;
+  TestPublisher publisher;
+  publisher.bundle = make_bundle(10);
+  ExecutionProgressPublication progress(
+      ExecutionProgressSourceKind::kBackendCommanded,
+      ExecutionProgressAuthorityProfile::kCommandedSimulation, "isaac", 0);
+  ASSERT_TRUE(progress.publish(9, 0, clock.now(), clock.now()).published);
+  auto engine = std::make_shared<TestLookaheadEngine>("lookahead-authority-throws");
+  engine->collision_local_waypoint = 0;
+  std::atomic<int> observer_calls{0};
+  RuntimeCollisionLookaheadSession::Config config;
+  config.workers = 1;
+  config.max_samples = 2;
+  config.horizon_ns = 1;
+  {
+    RuntimeCollisionLookaheadSession session(
+        config, clock, scheduler, publisher, progress, {engine},
+        [&observer_calls](const RuntimeCollisionLookaheadSession*,
+                          RuntimeCollisionLookaheadResult) {
+          observer_calls.fetch_add(1, std::memory_order_relaxed);
+        },
+        [](const RuntimeCollisionLookaheadSession*,
+           RuntimeCollisionLookaheadResult&) -> RuntimeCollisionLookaheadAuthorityDisposition {
+          throw std::runtime_error("addressed Stop handoff failed");
+        });
+    session.arm(7, 9, std::make_shared<const TrajectoryDTO>(trajectory()), "");
+    ASSERT_TRUE(request_until_started(session, clock, publisher));
+
+    EXPECT_EQ(scheduler.wait_for_reasons(1U),
+              std::vector<std::string>{"runtime_collision_lookahead_authority_exception"});
+    EXPECT_FALSE(session.status().accepting_clear_permits);
+  }  // Joins the worker, which survived the throw.
+  EXPECT_EQ(observer_calls.load(std::memory_order_relaxed), 0);
+}
+
+TEST(RuntimeCollisionLookaheadSessionTest,
+     ThrowingResultObserverAfterAuthorityIsContainedInsteadOfTerminating) {
+  FakeClock clock;
+  clock.set(1'000'000'000);
+  FaultRecordingScheduler scheduler;
+  TestPublisher publisher;
+  publisher.bundle = make_bundle(10);
+  ExecutionProgressPublication progress(
+      ExecutionProgressSourceKind::kBackendCommanded,
+      ExecutionProgressAuthorityProfile::kCommandedSimulation, "isaac", 0);
+  ASSERT_TRUE(progress.publish(9, 0, clock.now(), clock.now()).published);
+  auto engine = std::make_shared<TestLookaheadEngine>("lookahead-observer-throws");
+  engine->collision_local_waypoint = 0;
+  std::atomic<int> authority_calls{0};
+  RuntimeCollisionLookaheadSession::Config config;
+  config.workers = 1;
+  config.max_samples = 2;
+  config.horizon_ns = 1;
+  {
+    RuntimeCollisionLookaheadSession session(
+        config, clock, scheduler, publisher, progress, {engine},
+        [](const RuntimeCollisionLookaheadSession*, RuntimeCollisionLookaheadResult) {
+          throw std::runtime_error("evidence emission failed");
+        },
+        [&authority_calls](const RuntimeCollisionLookaheadSession*,
+                           RuntimeCollisionLookaheadResult&) {
+          authority_calls.fetch_add(1, std::memory_order_relaxed);
+          return RuntimeCollisionLookaheadAuthorityDisposition::kAccepted;
+        });
+    session.arm(7, 9, std::make_shared<const TrajectoryDTO>(trajectory()), "");
+    ASSERT_TRUE(request_until_started(session, clock, publisher));
+
+    EXPECT_EQ(scheduler.wait_for_reasons(1U),
+              std::vector<std::string>{"runtime_collision_lookahead_result_observer_exception"});
+  }  // Joins the worker, which survived the throw.
+  EXPECT_EQ(authority_calls.load(std::memory_order_relaxed), 1);
 }
 
 }  // namespace manyforge::core

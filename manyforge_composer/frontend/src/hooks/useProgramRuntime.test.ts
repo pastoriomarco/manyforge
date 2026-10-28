@@ -671,6 +671,23 @@ describe('Program runtime authority requests', () => {
       settlement_evidence_digest: terminalReference,
       reload_initial_scene: false, reset_robot_position: false,
     });
+    // D6 (SX-324): a failed Close Reset continues with its retained
+    // keep_stop_fault; an ordinary call cannot drop it.
+    const retainedClose = {
+      ...terminalSnapshot,
+      programCycle: {
+        ...terminalSnapshot.programCycle,
+        state: 'recovery_required' as const,
+        currentCommandKind: 'program_reset' as const,
+        resetOptions: { reloadInitialScene: false, resetRobotPosition: false, keepStopFault: true },
+      },
+    };
+    expect(buildProgramResetRequest(retainedClose, 'composer-program-owner.fixture', 'reset.retry'))
+      .toMatchObject({ keep_stop_fault: true, reload_initial_scene: false, reset_robot_position: false });
+    expect(buildProgramResetRequest(terminalSnapshot, 'composer-program-owner.fixture', 'reset.close',
+      'reset.close', { keepStopFault: true })).toMatchObject({ keep_stop_fault: true });
+    expect(buildProgramResetRequest(terminalSnapshot, 'composer-program-owner.fixture', 'reset.plain'))
+      .not.toHaveProperty('keep_stop_fault');
     expect(buildProgramResetRequest(
       {
         ...terminalSnapshot,

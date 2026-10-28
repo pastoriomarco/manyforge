@@ -3,7 +3,7 @@
   Regenerate with:
     cd <repository-root>
     python3 scripts/regen-public-contracts.py headless-rest
-  Last regenerated: 2026-10-16 11:06:17 UTC
+  Last regenerated: 2026-10-28 10:30:20 UTC
   Generator source: scripts/regen-public-contracts.py:gen_headless_rest_api
 -->
 
@@ -54,6 +54,7 @@ OpenAPI version: `3.1.0`. Title: `ManyForge Headless Runtime API`.
 | `GET` | `/api/execution/alarms/metrics` |  | Alarm Metrics |
 | `POST` | `/api/execution/alarms/{condition_id}/acknowledge` |  | Acknowledge Alarm |
 | `POST` | `/api/execution/capability-command-previews` |  | Execution Preview Capability Command |
+| `POST` | `/api/execution/cell-recover` |  | Execution Cell Recover |
 | `GET` | `/api/execution/control-state` |  | Execution Control State |
 | `GET` | `/api/execution/diagnostics` |  | Execution Diagnostics |
 | `POST` | `/api/execution/full-stop` |  | Execution Full Stop |
@@ -65,6 +66,8 @@ OpenAPI version: `3.1.0`. Title: `ManyForge Headless Runtime API`.
 | `POST` | `/api/execution/history/reconcile` |  | Historian Reconcile |
 | `GET` | `/api/execution/history/{sequence}` |  | History Detail |
 | `GET` | `/api/execution/identity` |  | Execution Identity |
+| `POST` | `/api/execution/io-signals/mock-input` |  | Execution Set Mock Io Input |
+| `POST` | `/api/execution/io-signals/read` |  | Execution Read Io Signal |
 | `POST` | `/api/execution/manual-handover` |  | Execution Read Manual Handover |
 | `POST` | `/api/execution/motion-previews` |  | Execution Preview Motion |
 | `POST` | `/api/execution/operations` |  | Execution Submit |
@@ -100,6 +103,10 @@ OpenAPI version: `3.1.0`. Title: `ManyForge Headless Runtime API`.
 | `POST` | `/api/program/diagnostics` |  | Program Diagnostic |
 | `GET` | `/api/program/diagnostics/health` |  | Program Diagnostic Health |
 | `POST` | `/api/program/model-attempts` |  | Program Model Attempt |
+| `GET` | `/api/program/persistent-values` |  | Program Persistent Values |
+| `POST` | `/api/program/persistent-values` |  | Set Program Persistent Value |
+| `POST` | `/api/program/persistent-values/clear` |  | Clear Program Persistent Values |
+| `POST` | `/api/program/persistent-values/reset` |  | Reset Program Persistent Value |
 | `GET` | `/api/program/runs` |  | Program Runs |
 | `POST` | `/api/program/runs` |  | Program Run Start |
 | `GET` | `/api/program/runs/{program_run_id}` |  | Program Run Read |
@@ -115,10 +122,6 @@ OpenAPI version: `3.1.0`. Title: `ManyForge Headless Runtime API`.
 | `POST` | `/api/program/runs/{program_run_id}/resume-motion` |  | Program Run Motion Resume |
 | `GET` | `/api/program/runs/{program_run_id}/runtime-controls` |  | Program Runtime Controls |
 | `POST` | `/api/program/runs/{program_run_id}/stop` |  | Program Run Stop |
-| `GET` | `/api/program/scenarios/{scenario_id}/persistent-values` |  | Program Persistent Values |
-| `POST` | `/api/program/scenarios/{scenario_id}/persistent-values` |  | Set Program Persistent Value |
-| `POST` | `/api/program/scenarios/{scenario_id}/persistent-values/clear` |  | Clear Program Persistent Values |
-| `POST` | `/api/program/scenarios/{scenario_id}/persistent-values/reset` |  | Reset Program Persistent Value |
 | `POST` | `/api/program/scene-preparations` |  | Program Scene Prepare |
 | `GET` | `/api/runtime` |  | Runtime |
 | `GET` | `/api/scene` |  | Scene |
@@ -131,3 +134,9 @@ OpenAPI version: `3.1.0`. Title: `ManyForge Headless Runtime API`.
 | `GET` | `/api/source-model-context` |  | Source Model Context |
 | `GET` | `/api/viewer-model/resource` |  | Viewer Model Resource |
 | `GET` | `/api/viewer-model/urdf` |  | Viewer Model Urdf |
+
+## Route notes
+
+### `POST /api/execution/cell-recover`
+
+Recover cell, one server-side composite. Send only `request_context` with `request_id`, `source_label` and an optional `correlation_id`; every fence is read from the current owners. It acknowledges open component incidents, attempts the current cell Stop-fault latch recovery, and submits Recover for components whose previously recovered cause was still reported at the press and remains so. It then tries to enable again each component whose Active target an incident retired (Recover, Prepare, Enable; `component_rearm_*` reasons, for example the emergency stop still engaged), listing it in `recovered_components` on success. It is also the re-arm of a robot moved from its own interface on an idle cell: Execute and Run (`operation_start`, `program_run`) are refused `component_rearm_required` (no effect; `details.components`, and `details.in_motion` while it still moves) until it is re-armed. Clients call this route, wait until the component is `active` (`GET /api/cclc/components/{id}`, no `moved_externally:*` reason), then re-send the command with fresh fences; a robot still moving is refused `component_rearm_required` here too. A refused recovery still returns a JSON result: read `outcome` (`done` or `not_recovered`), `reason.code`, `acknowledged_incidents`, `latch_cleared` and `recovered_components` rather than treating HTTP success as recovery. Example reason codes (not exhaustive): `stop_fault_recovery_unavailable`, `stop_fault_recovery_closing` (Scenario Close keeps the latch; the latch recovery was refused, but incident acknowledgements earlier in the same press may already have happened), `stop_fault_latch_replaced`, `cell_state_unavailable`, `cell_recover_in_progress` and `cell_recover_outcome_unknown` (a step may have reached its owner: inspect and reconcile, do not assume nothing happened). `done` does not prove that every robot is ready to move. Repeating a `request_id` returns the stored result, or `cell_recover_in_progress`, without reading state again; this replay is in memory per Headless process, bounded, and lost on restart or eviction. Use a new `request_id` for each new press.

@@ -1267,8 +1267,6 @@ TEST(SelectedBringUpCodec, RefusesOrdinaryRouteAndMalformedSelectedClaimShapes) 
   };
   check_invalid([](auto& value) { value.owner_transaction_id = "selected-lifecycle.04";
     value.intervention_evidence->offer_transaction_id = value.owner_transaction_id; });
-  check_invalid([](auto& value) { value.scope.resources.clear(); });
-  check_invalid([](auto& value) { value.scope.configurations.clear(); });
   check_invalid([](auto& value) { value.request_payload_digest = ContentDigest(std::string(64U, 'b')); });
   check_invalid([](auto& value) { value.intervention_evidence->parent_program_cycle_claim_generation =
       CellAdmissionClaimGeneration(1U); });
@@ -1304,6 +1302,9 @@ TEST(SelectedBringUpStatus, RefusesBrokenClaimFenceOccurrenceAndCandidateJoins) 
       RequestOwnerEpoch("other"); });
   check_invalid([](auto& value) { value.selected_bring_up->selected_claim.claim_generation =
       CellAdmissionClaimGeneration(0U); });
+  // A fenced controller domain needs its adopted predecessor configuration.
+  check_invalid([](auto& value) { value.selected_bring_up->selected_claim.intent.scope.configurations.clear(); });
+  check_invalid([](auto& value) { value.selected_bring_up->selected_claim.intent.scope.resources.clear(); });
   check_invalid([](auto& value) { value.selected_bring_up->selected_claim.acquired_admission_generation =
       AdmissionGeneration(2U); });
   check_invalid([](auto& value) { value.selected_bring_up->accepted_fence.captured_scope.resources =

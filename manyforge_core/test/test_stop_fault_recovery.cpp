@@ -84,7 +84,8 @@ inline constexpr char kDigestE[] =
       1U,
       StopFaultRecoveryStatusDTO::kWaitingForObservation,
       "stop_fault_latched",
-      {}};
+      {},
+      {StopFaultTriggerDTO::kScopePromotion}};
 }
 
 [[nodiscard]] StopStatusDTO Status() {
@@ -205,16 +206,61 @@ TEST(StopFaultRecoveryTest, AssessmentUsesFailClosedPredicatePriority) {
   EXPECT_EQ(assessed.value().recovery_status, StopFaultRecoveryStatusDTO::kWaitingForConfiguration);
 }
 
+TEST(StopFaultRecoveryTest, ObservedTriggersAreDistinctBoundedAndContainThePrimary) {
+  auto latch = *Status().fault_latch;
+  EXPECT_FALSE(stop_fault_latch_field_error(latch).has_value());
+  latch.observed_triggers = {StopFaultTriggerDTO::kPartial, StopFaultTriggerDTO::kScopePromotion};
+  EXPECT_FALSE(stop_fault_latch_field_error(latch).has_value());
+  for (const auto& invalid : std::vector<std::vector<StopFaultTriggerDTO>>{
+           {},
+           {StopFaultTriggerDTO::kPartial},
+           {StopFaultTriggerDTO::kScopePromotion, StopFaultTriggerDTO::kScopePromotion},
+           {StopFaultTriggerDTO::kScopePromotion, static_cast<StopFaultTriggerDTO>(7)}}) {
+    latch.observed_triggers = invalid;
+    EXPECT_EQ(stop_fault_latch_field_error(latch),
+              std::optional<std::string_view>("stop_fault_latch_observed_triggers_invalid"));
+  }
+}
+
 // Q32: a component-incident containment is released once its Stop finished
 // as the controller/backend reported; an unsettled or unavailable measured-rest
 // observation no longer holds it.
 TEST(StopFaultRecoveryTest, IncidentContainmentIsNotGatedOnMeasuredRest) {
   auto status = Status();
   status.fault_latch->trigger = StopFaultTriggerDTO::kPhysicalRestUnproven;
+  status.fault_latch->observed_triggers = {StopFaultTriggerDTO::kPhysicalRestUnproven};
   status.fault_latch->reason_code = "stop_physical_rest_unproven";
   auto unsettled_facts = Facts(status);
   unsettled_facts.resource_facts.front().state = StopFaultRecoveryResourceStateDTO::kUnsettled;
   auto assessed = AssessStopFaultRecovery(status, unsettled_facts);
+  ASSERT_TRUE(assessed.ok()) << assessed.error().message;
+  EXPECT_EQ(assessed.value().recovery_status, StopFaultRecoveryStatusDTO::kReady);
+}
+
+// A degraded fence (primary post_reserve_fence_failed) followed by a
+// failed_uncontained certificate keeps failed_uncontained's external
+// reconciliation gate although it is not the primary trigger.
+TEST(StopFaultRecoveryTest, FenceFailureThenFailedUncontainedWaitsForExternalReconciliation) {
+  auto status = Status();
+  status.fault_latch->trigger = StopFaultTriggerDTO::kPostReserveFenceFailed;
+  status.fault_latch->observed_triggers = {StopFaultTriggerDTO::kPostReserveFenceFailed,
+                                           StopFaultTriggerDTO::kFailedUncontained};
+  status.fault_latch->reason_code = "stop_post_reserve_fence_failed";
+  auto facts = Facts(status);
+  auto assessed = AssessStopFaultRecovery(status, facts);
+  ASSERT_TRUE(assessed.ok()) << assessed.error().message;
+  EXPECT_EQ(assessed.value().recovery_status,
+            StopFaultRecoveryStatusDTO::kWaitingForExternalReconciliation);
+
+  facts.external_reconciliation_facts = {facts.resource_facts.front()};
+  assessed = AssessStopFaultRecovery(status, facts);
+  ASSERT_TRUE(assessed.ok()) << assessed.error().message;
+  EXPECT_EQ(assessed.value().recovery_status, StopFaultRecoveryStatusDTO::kReady);
+
+  // Without the observed failed_uncontained, the fence-failed primary alone
+  // has no external reconciliation obligation.
+  status.fault_latch->observed_triggers = {StopFaultTriggerDTO::kPostReserveFenceFailed};
+  assessed = AssessStopFaultRecovery(status, Facts(status));
   ASSERT_TRUE(assessed.ok()) << assessed.error().message;
   EXPECT_EQ(assessed.value().recovery_status, StopFaultRecoveryStatusDTO::kReady);
 }
@@ -310,6 +356,7 @@ TEST(StopFaultRecoveryTest, LatchWithoutCapturedResourcesIsAssessableAndClearabl
   // assessed and cleared, never rejected as incomplete.
   auto status = Status();
   status.fault_latch->trigger = StopFaultTriggerDTO::kPersistenceDegraded;
+  status.fault_latch->observed_triggers = {StopFaultTriggerDTO::kPersistenceDegraded};
   status.fault_latch->persistence_degraded = true;
   status.fault_latch->captured_resources.clear();
   auto facts = Facts(status);

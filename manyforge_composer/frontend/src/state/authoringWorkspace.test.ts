@@ -67,6 +67,7 @@ function workspaceSnapshot(
     },
     project: {
       documentPath: '/workspace/cell',
+      readOnly: false,
       documentId: 'cell',
       documentName: 'Cell',
       documentDescription: 'Fixture',
@@ -218,6 +219,24 @@ describe('authoringWorkspace', () => {
       installed,
       headlessState(6, {}, { ...running, heldRunDraftEditAllowed: true }),
     )).toBe('The displayed workspace is still synchronizing with the backend.');
+    // Closed Kernel admission (a running run) does not open the held-run gate.
+    expect(draftEditUnavailableReason(
+      installed,
+      headlessState(5, {}, {
+        ...running, heldRunDraftEditAllowed: false,
+        authoringAdmission: { authoringAllowed: false, admissionGeneration: 7 },
+      }),
+    )).toContain('editing requires Idle or all Program motion stopped');
+  });
+
+  it('never makes an Idle Draft edit wait for Kernel authoring admission', () => {
+    const installed = published(workspaceSnapshot(5, 3, 4));
+    // Another client's Apply claim or a manual operation closes admission.
+    const locked = headlessState(5, {}, {
+      authoringAdmission: { authoringAllowed: false, admissionGeneration: 7 },
+    });
+    expect(authoringUnavailableReason(installed, locked)).toBe('Authoring is currently locked by the backend.');
+    expect(draftEditUnavailableReason(installed, locked)).toBeNull();
   });
 
   it('explains only live manual operations and keeps owner faults visible', () => {

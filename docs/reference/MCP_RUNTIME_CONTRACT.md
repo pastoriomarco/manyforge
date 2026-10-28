@@ -3,7 +3,7 @@
   Regenerate with:
     cd <repository-root>
     python3 scripts/regen-public-contracts.py mcp
-  Last regenerated: 2026-10-16 11:05:37 UTC
+  Last regenerated: 2026-10-28 02:15:47 UTC
   Generator source: scripts/regen-public-contracts.py:gen_mcp_api
 -->
 
@@ -183,10 +183,30 @@ Thin ManyForge API adapter. Submit once; observe owner state. Bodies use the unc
             "title": "Frame Role Id",
             "type": "string"
           },
+          "grasp_lost_bound": {
+            "anyOf": [
+              {
+                "$ref": "#/$defs/CarriedObjectGraspLostBound"
+              },
+              {
+                "type": "null"
+              }
+            ]
+          },
           "kind": {
             "const": "attach_carried_object",
             "title": "Kind",
             "type": "string"
+          },
+          "on_grasp_lost": {
+            "anyOf": [
+              {
+                "$ref": "#/$defs/CarriedObjectGraspLostResponse"
+              },
+              {
+                "type": "null"
+              }
+            ]
           },
           "scene_resource_id": {
             "title": "Scene Resource Id",
@@ -266,6 +286,65 @@ Thin ManyForge API adapter. Submit once; observe owner state. Bodies use the unc
           "source_label"
         ],
         "title": "CallerAttributionRequest",
+        "type": "object"
+      },
+      "CarriedObjectGraspLostBound": {
+        "additionalProperties": false,
+        "description": "Attach-node bound around the attach-time carried offset.",
+        "properties": {
+          "rotation_rad": {
+            "exclusiveMinimum": 0.0,
+            "title": "Rotation Rad",
+            "type": "number"
+          },
+          "translation_m": {
+            "exclusiveMinimum": 0.0,
+            "title": "Translation M",
+            "type": "number"
+          }
+        },
+        "required": [
+          "translation_m",
+          "rotation_rad"
+        ],
+        "title": "CarriedObjectGraspLostBound",
+        "type": "object"
+      },
+      "CarriedObjectGraspLostResponse": {
+        "additionalProperties": false,
+        "description": "Attach-node loss response (grasp-lost contract section 6).\n\nSent only when it differs from the defaults; all four keys are present.\nThe scene owner refuses a default-equal member and an alarm without Stop.",
+        "properties": {
+          "detach": {
+            "title": "Detach",
+            "type": "boolean"
+          },
+          "raise_alarm": {
+            "title": "Raise Alarm",
+            "type": "boolean"
+          },
+          "set_key": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Set Key"
+          },
+          "stop_motion": {
+            "title": "Stop Motion",
+            "type": "boolean"
+          }
+        },
+        "required": [
+          "raise_alarm",
+          "stop_motion",
+          "set_key",
+          "detach"
+        ],
+        "title": "CarriedObjectGraspLostResponse",
         "type": "object"
       },
       "CellSceneFrameRequest": {
@@ -1424,7 +1503,7 @@ Thin ManyForge API adapter. Submit once; observe owner state. Bodies use the unc
       },
       "_SceneWorkspaceIdentity": {
         "additionalProperties": false,
-        "description": "The existing composite identity, carried only by Close's Scene cleanup.",
+        "description": "The existing composite identity, carried only by Close's carried-object detach.",
         "properties": {
           "deploymentDraftId": {
             "maxLength": 256,
@@ -1590,16 +1669,6 @@ Thin ManyForge API adapter. Submit once; observe owner state. Bodies use the unc
       "NewDraftRequest": {
         "additionalProperties": false,
         "properties": {
-          "completedClose": {
-            "anyOf": [
-              {
-                "$ref": "#/$defs/_CompletedCloseContext"
-              },
-              {
-                "type": "null"
-              }
-            ]
-          },
           "confirmDiscard": {
             "default": false,
             "title": "Confirmdiscard",
@@ -1728,83 +1797,6 @@ Thin ManyForge API adapter. Submit once; observe owner state. Bodies use the unc
           "path"
         ],
         "title": "OpenDraftRequest",
-        "type": "object"
-      },
-      "_CompletedCloseContext": {
-        "additionalProperties": false,
-        "properties": {
-          "deploymentDraftId": {
-            "maxLength": 256,
-            "minLength": 1,
-            "title": "Deploymentdraftid",
-            "type": "string"
-          },
-          "expectedDeploymentDraftRevision": {
-            "maximum": 9007199254740991.0,
-            "minimum": 0.0,
-            "title": "Expecteddeploymentdraftrevision",
-            "type": "integer"
-          },
-          "graphRevision": {
-            "maxLength": 256,
-            "minLength": 1,
-            "title": "Graphrevision",
-            "type": "string"
-          },
-          "managerOwnerEpoch": {
-            "maxLength": 256,
-            "minLength": 1,
-            "title": "Managerownerepoch",
-            "type": "string"
-          },
-          "managerOwnerId": {
-            "maxLength": 256,
-            "minLength": 1,
-            "title": "Managerownerid",
-            "type": "string"
-          },
-          "publication": {
-            "additionalProperties": true,
-            "title": "Publication",
-            "type": "object"
-          },
-          "retainedBundleId": {
-            "maxLength": 256,
-            "minLength": 1,
-            "title": "Retainedbundleid",
-            "type": "string"
-          },
-          "sceneOwnerEpoch": {
-            "maxLength": 256,
-            "minLength": 1,
-            "title": "Sceneownerepoch",
-            "type": "string"
-          },
-          "sceneOwnerId": {
-            "maxLength": 256,
-            "minLength": 1,
-            "title": "Sceneownerid",
-            "type": "string"
-          },
-          "sceneProjectionRevision": {
-            "additionalProperties": true,
-            "title": "Sceneprojectionrevision",
-            "type": "object"
-          }
-        },
-        "required": [
-          "sceneOwnerId",
-          "sceneOwnerEpoch",
-          "sceneProjectionRevision",
-          "managerOwnerId",
-          "managerOwnerEpoch",
-          "retainedBundleId",
-          "graphRevision",
-          "publication",
-          "deploymentDraftId",
-          "expectedDeploymentDraftRevision"
-        ],
-        "title": "_CompletedCloseContext",
         "type": "object"
       }
     },
@@ -2489,7 +2481,8 @@ Thin ManyForge API adapter. Submit once; observe owner state. Bodies use the unc
               "retry_after_scene_repair",
               "replan_from_stopped_state",
               "retry_runtime_step",
-              "reset_cycle"
+              "reset_cycle",
+              "continue_with_failure"
             ],
             "title": "Action Id",
             "type": "string"
@@ -4869,7 +4862,7 @@ Thin ManyForge API adapter. Submit once; observe owner state. Bodies use the unc
             "properties": {
               "kind": {
                 "default": "program",
-                "pattern": "^(program|deployment|mesh)$",
+                "pattern": "^(program|deployment|mesh|scenario)$",
                 "title": "Kind",
                 "type": "string"
               },
@@ -4883,6 +4876,11 @@ Thin ManyForge API adapter. Submit once; observe owner state. Bodies use the unc
                   }
                 ],
                 "title": "Path"
+              },
+              "roots_only": {
+                "default": false,
+                "title": "Roots Only",
+                "type": "boolean"
               }
             },
             "required": [],
@@ -5263,6 +5261,7 @@ Thin ManyForge API adapter. Submit once; observe owner state. Bodies use the unc
       },
       "CCLCExpectedControlDomainRequest": {
         "additionalProperties": false,
+        "description": "Expected controller domain; `kind` is required (no kindless legacy shape).",
         "properties": {
           "control_domain_id": {
             "title": "Control Domain Id",
@@ -5288,12 +5287,18 @@ Thin ManyForge API adapter. Submit once; observe owner state. Bodies use the unc
             "title": "Expected Control Bindings",
             "type": "array"
           },
+          "kind": {
+            "const": "controller",
+            "title": "Kind",
+            "type": "string"
+          },
           "topology_revision": {
             "title": "Topology Revision",
             "type": "string"
           }
         },
         "required": [
+          "kind",
           "control_domain_id",
           "control_domain_revision",
           "controller_topology_id",
@@ -5302,6 +5307,105 @@ Thin ManyForge API adapter. Submit once; observe owner state. Bodies use the unc
           "expected_control_bindings"
         ],
         "title": "CCLCExpectedControlDomainRequest",
+        "type": "object"
+      },
+      "CCLCExpectedProviderDomainRequest": {
+        "additionalProperties": false,
+        "description": "Existing Core expected provider domain: no topology, bindings or routes.",
+        "properties": {
+          "control_domain_id": {
+            "title": "Control Domain Id",
+            "type": "string"
+          },
+          "control_domain_revision": {
+            "title": "Control Domain Revision",
+            "type": "string"
+          },
+          "expected_active_control_configuration": {
+            "$ref": "#/$defs/CCLCExpectedActiveConfigurationRequest"
+          },
+          "kind": {
+            "const": "io_provider",
+            "title": "Kind",
+            "type": "string"
+          },
+          "provider": {
+            "$ref": "#/$defs/CCLCProviderControlDomainRequest"
+          }
+        },
+        "required": [
+          "kind",
+          "control_domain_id",
+          "control_domain_revision",
+          "provider",
+          "expected_active_control_configuration"
+        ],
+        "title": "CCLCExpectedProviderDomainRequest",
+        "type": "object"
+      },
+      "CCLCProviderControlDomainRequest": {
+        "additionalProperties": false,
+        "description": "Existing Core provider-domain proof, echoed verbatim from the component snapshot.",
+        "properties": {
+          "controllable_component_id": {
+            "title": "Controllable Component Id",
+            "type": "string"
+          },
+          "lifecycle_command_timeout_ns": {
+            "maximum": 3600000000000.0,
+            "minimum": 1.0,
+            "title": "Lifecycle Command Timeout Ns",
+            "type": "integer"
+          },
+          "lifecycle_plan_catalog_digest": {
+            "pattern": "^sha256:[0-9a-f]{64}$",
+            "title": "Lifecycle Plan Catalog Digest",
+            "type": "string"
+          },
+          "provider_instance_id": {
+            "title": "Provider Instance Id",
+            "type": "string"
+          },
+          "provider_manifest_id": {
+            "title": "Provider Manifest Id",
+            "type": "string"
+          },
+          "provider_manifest_revision": {
+            "pattern": "^sha256:[0-9a-f]{64}$",
+            "title": "Provider Manifest Revision",
+            "type": "string"
+          },
+          "provider_runtime_unit_id": {
+            "title": "Provider Runtime Unit Id",
+            "type": "string"
+          },
+          "signal_configuration_digest": {
+            "pattern": "^sha256:[0-9a-f]{64}$",
+            "title": "Signal Configuration Digest",
+            "type": "string"
+          },
+          "signal_names": {
+            "items": {
+              "type": "string"
+            },
+            "maxItems": 4096,
+            "minItems": 1,
+            "title": "Signal Names",
+            "type": "array"
+          }
+        },
+        "required": [
+          "controllable_component_id",
+          "provider_runtime_unit_id",
+          "provider_instance_id",
+          "provider_manifest_id",
+          "provider_manifest_revision",
+          "lifecycle_plan_catalog_digest",
+          "signal_configuration_digest",
+          "signal_names",
+          "lifecycle_command_timeout_ns"
+        ],
+        "title": "CCLCProviderControlDomainRequest",
         "type": "object"
       },
       "CCLCRouteComponentExpectationRequest": {
@@ -5418,7 +5522,21 @@ Thin ManyForge API adapter. Submit once; observe owner state. Bodies use the unc
           },
           "expected_control_domains": {
             "items": {
-              "$ref": "#/$defs/CCLCExpectedControlDomainRequest"
+              "discriminator": {
+                "mapping": {
+                  "controller": "#/components/schemas/CCLCExpectedControlDomainRequest",
+                  "io_provider": "#/components/schemas/CCLCExpectedProviderDomainRequest"
+                },
+                "propertyName": "kind"
+              },
+              "oneOf": [
+                {
+                  "$ref": "#/$defs/CCLCExpectedControlDomainRequest"
+                },
+                {
+                  "$ref": "#/$defs/CCLCExpectedProviderDomainRequest"
+                }
+              ]
             },
             "maxItems": 256,
             "minItems": 1,
@@ -5712,6 +5830,20 @@ Thin ManyForge API adapter. Submit once; observe owner state. Bodies use the unc
       "RevertDeploymentRequest": {
         "additionalProperties": false,
         "properties": {
+          "confirmationToken": {
+            "anyOf": [
+              {
+                "maxLength": 71,
+                "minLength": 71,
+                "pattern": "^sha256:[0-9a-f]{64}$",
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Confirmationtoken"
+          },
           "draftId": {
             "maxLength": 256,
             "minLength": 1,
@@ -5741,6 +5873,32 @@ Thin ManyForge API adapter. Submit once; observe owner state. Bodies use the unc
             "minimum": 1.0,
             "title": "Expectedworkspacerevision",
             "type": "integer"
+          },
+          "preparationRequestId": {
+            "anyOf": [
+              {
+                "maxLength": 256,
+                "minLength": 1,
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Preparationrequestid"
+          },
+          "preparationRequestOwnerEpoch": {
+            "anyOf": [
+              {
+                "maxLength": 256,
+                "minLength": 1,
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Preparationrequestownerepoch"
           },
           "requestId": {
             "maxLength": 256,
@@ -6658,12 +6816,34 @@ Thin ManyForge API adapter. Submit once; observe owner state. Bodies use the unc
             "type": "string"
           },
           "command_value": {
-            "$ref": "#/$defs/GripperPositionCommandValueRequest"
+            "discriminator": {
+              "mapping": {
+                "gripper_position": "#/components/schemas/GripperPositionCommandValueRequest",
+                "io_signal_write": "#/components/schemas/IoSignalWriteCommandValueRequest"
+              },
+              "propertyName": "kind"
+            },
+            "oneOf": [
+              {
+                "$ref": "#/$defs/GripperPositionCommandValueRequest"
+              },
+              {
+                "$ref": "#/$defs/IoSignalWriteCommandValueRequest"
+              }
+            ],
+            "title": "Command Value"
           },
           "completion_timeout_s": {
-            "exclusiveMinimum": 0.0,
-            "title": "Completion Timeout S",
-            "type": "number"
+            "anyOf": [
+              {
+                "exclusiveMinimum": 0.0,
+                "type": "number"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Completion Timeout S"
           },
           "kind": {
             "const": "capability_command",
@@ -6676,7 +6856,6 @@ Thin ManyForge API adapter. Submit once; observe owner state. Bodies use the unc
           "command_schema_id",
           "command_schema_revision",
           "command_value",
-          "completion_timeout_s",
           "caller_options"
         ],
         "title": "CapabilityCommandParticipantRequest",
@@ -6943,6 +7122,32 @@ Thin ManyForge API adapter. Submit once; observe owner state. Bodies use the unc
         "title": "InlinePoseReferenceRequest",
         "type": "object"
       },
+      "IoSignalWriteCommandValueRequest": {
+        "additionalProperties": false,
+        "description": "One typed boolean output write (contract 53); no provider/readback data.",
+        "properties": {
+          "kind": {
+            "const": "io_signal_write",
+            "title": "Kind",
+            "type": "string"
+          },
+          "resource_role_id": {
+            "title": "Resource Role Id",
+            "type": "string"
+          },
+          "value": {
+            "title": "Value",
+            "type": "boolean"
+          }
+        },
+        "required": [
+          "kind",
+          "resource_role_id",
+          "value"
+        ],
+        "title": "IoSignalWriteCommandValueRequest",
+        "type": "object"
+      },
       "JointDynamicsLimitRequest": {
         "additionalProperties": false,
         "properties": {
@@ -7094,6 +7299,26 @@ Thin ManyForge API adapter. Submit once; observe owner state. Bodies use the unc
           "selection_revision"
         ],
         "title": "ManualProgramHandoverContext",
+        "type": "object"
+      },
+      "MotionEndpointReferenceRequest": {
+        "additionalProperties": false,
+        "description": "One portable TCP selection; the native owner verifies its sealed binding.",
+        "properties": {
+          "frame_role_id": {
+            "title": "Frame Role Id",
+            "type": "string"
+          },
+          "target_role_id": {
+            "title": "Target Role Id",
+            "type": "string"
+          }
+        },
+        "required": [
+          "target_role_id",
+          "frame_role_id"
+        ],
+        "title": "MotionEndpointReferenceRequest",
         "type": "object"
       },
       "MotionParticipantRequest": {
@@ -7307,9 +7532,8 @@ Thin ManyForge API adapter. Submit once; observe owner state. Bodies use the unc
             ],
             "title": "Target Reference"
           },
-          "tcp_frame_role_id": {
-            "title": "Tcp Frame Role Id",
-            "type": "string"
+          "tcp_endpoint": {
+            "$ref": "#/$defs/MotionEndpointReferenceRequest"
           },
           "timeouts": {
             "$ref": "#/$defs/MotionTimeoutsRequest"
@@ -7322,7 +7546,7 @@ Thin ManyForge API adapter. Submit once; observe owner state. Bodies use the unc
           "kind",
           "move_id",
           "base_frame_role_id",
-          "tcp_frame_role_id",
+          "tcp_endpoint",
           "tolerances",
           "speed_profile",
           "timeouts",
@@ -7417,42 +7641,6 @@ Thin ManyForge API adapter. Submit once; observe owner state. Bodies use the unc
           "rotation_tol_rad"
         ],
         "title": "MotionTolerancesRequest",
-        "type": "object"
-      },
-      "OperationControlRequest": {
-        "additionalProperties": false,
-        "properties": {
-          "expected_operation_revision": {
-            "maximum": 9007199254740991.0,
-            "minimum": 1.0,
-            "title": "Expected Operation Revision",
-            "type": "integer"
-          },
-          "operation_id": {
-            "title": "Operation Id",
-            "type": "string"
-          },
-          "reason": {
-            "anyOf": [
-              {
-                "type": "string"
-              },
-              {
-                "type": "null"
-              }
-            ],
-            "title": "Reason"
-          },
-          "request_context": {
-            "$ref": "#/$defs/CallerAttributionRequest"
-          }
-        },
-        "required": [
-          "request_context",
-          "operation_id",
-          "expected_operation_revision"
-        ],
-        "title": "OperationControlRequest",
         "type": "object"
       },
       "OperationIntentRequest": {
@@ -7590,6 +7778,59 @@ Thin ManyForge API adapter. Submit once; observe owner state. Bodies use the unc
           "payload"
         ],
         "title": "OperationParticipantRequest",
+        "type": "object"
+      },
+      "OperationResetRequest": {
+        "additionalProperties": false,
+        "description": "Targeted operation Reset (contract 66).\n\n``acknowledged_uncertain_outputs`` lists only this operation's own retained\nacceptance_unknown output(s) the operator explicitly acknowledged (\"a write\nalready queued in the remote device may still act\"); sorted and unique.\nOmitted when absent, so an ordinary Reset keeps its exact wire bytes. The\nowner refuses a Reset that would release an unlisted unknown output.",
+        "properties": {
+          "acknowledged_uncertain_outputs": {
+            "anyOf": [
+              {
+                "items": {
+                  "$ref": "#/$defs/UncertainOutputAcknowledgementRequest"
+                },
+                "maxItems": 64,
+                "minItems": 1,
+                "type": "array"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Acknowledged Uncertain Outputs"
+          },
+          "expected_operation_revision": {
+            "maximum": 9007199254740991.0,
+            "minimum": 1.0,
+            "title": "Expected Operation Revision",
+            "type": "integer"
+          },
+          "operation_id": {
+            "title": "Operation Id",
+            "type": "string"
+          },
+          "reason": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Reason"
+          },
+          "request_context": {
+            "$ref": "#/$defs/CallerAttributionRequest"
+          }
+        },
+        "required": [
+          "request_context",
+          "operation_id",
+          "expected_operation_revision"
+        ],
+        "title": "OperationResetRequest",
         "type": "object"
       },
       "Pose3Request": {
@@ -8030,6 +8271,28 @@ Thin ManyForge API adapter. Submit once; observe owner state. Bodies use the unc
         "title": "StopResourceTargetRequest",
         "type": "object"
       },
+      "UncertainOutputAcknowledgementRequest": {
+        "additionalProperties": false,
+        "description": "One retained acceptance_unknown output the operator acknowledged.",
+        "properties": {
+          "operation_id": {
+            "title": "Operation Id",
+            "type": "string"
+          },
+          "operation_revision": {
+            "maximum": 9007199254740991.0,
+            "minimum": 1.0,
+            "title": "Operation Revision",
+            "type": "integer"
+          }
+        },
+        "required": [
+          "operation_id",
+          "operation_revision"
+        ],
+        "title": "UncertainOutputAcknowledgementRequest",
+        "type": "object"
+      },
       "Vector3Request": {
         "additionalProperties": false,
         "properties": {
@@ -8204,7 +8467,7 @@ Thin ManyForge API adapter. Submit once; observe owner state. Bodies use the unc
             "type": "string"
           },
           "body": {
-            "$ref": "#/$defs/OperationControlRequest"
+            "$ref": "#/$defs/OperationResetRequest"
           },
           "path": {
             "additionalProperties": false,

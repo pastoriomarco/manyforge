@@ -51,6 +51,10 @@ struct RuntimeCollisionQueryBundle {
   /// Publication-time proof that world bodies are sorted and unique by body
   /// id, enabling allocation-free lookup per tick.
   bool lookup_order_valid = false;
+  /// Set only on a runtime-query session's own bundle: the latest published
+  /// world paired with the move's admitted operation-local policy. Never set by
+  /// a publisher.
+  bool admitted_operation_policy = false;
 };
 
 using RuntimeCollisionQueryBundlePtr =

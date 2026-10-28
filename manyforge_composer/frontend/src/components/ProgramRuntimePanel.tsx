@@ -179,6 +179,12 @@ const AUTOMATIC_RETRY_CAUSE_LABELS: Readonly<Record<string, string>> = {
   planning_no_effect: 'planning failed',
 };
 
+/** The Stop fault's other latched causes, so none is hidden behind the primary. */
+function alsoObservedTriggers(fault: { trigger: string; observedTriggers: string[] }): string {
+  const others = fault.observedTriggers.filter((trigger) => trigger !== fault.trigger);
+  return others.length > 0 ? ` Also observed: ${others.map(humanizeReasonCode).join(', ')}.` : '';
+}
+
 /** The cause as words; an unnamed cause is humanised like any stable code. */
 function automaticRetryCauseLabel(cause: string): string {
   return AUTOMATIC_RETRY_CAUSE_LABELS[cause] ?? humanizeReasonCode(cause);
@@ -1096,6 +1102,7 @@ export function deriveTransportGuidance({
   onReviewProgramRecovery,
   globalRuleLatches = [],
   onClearGlobalRuleLatch,
+  onReset,
 }: {
   enabled: boolean;
   program: ProgramRuntimeController;
@@ -1107,6 +1114,8 @@ export function deriveTransportGuidance({
   /** Latched global rules (contracts 78/86) from the owner's recovery offers. */
   globalRuleLatches?: readonly GlobalRuleLatch[];
   onClearGlobalRuleLatch?: (latch: GlobalRuleLatch) => void;
+  /** The Program-panel Reset (same path and enabled state); null when unavailable. */
+  onReset?: { run: () => void; disabled: boolean };
 }): WorkbenchNotice[] {
   const notices: WorkbenchNotice[] = [];
   const phase = observationTransport?.phase;
@@ -1221,6 +1230,14 @@ export function deriveTransportGuidance({
       message: program.cycleFailure === null
         ? 'Use Reset in the Program controls before another Execute.'
         : facts.programRecoveryMessage,
+      // Red blocks the next Run until Reset, so it carries Reset.
+      actions: program.cycleFailure === null || onReset === undefined ? undefined : [{
+        id: 'reset',
+        label: 'Reset',
+        title: 'Reset the Program cycle, as Reset in the Program controls.',
+        disabled: onReset.disabled,
+        run: onReset.run,
+      }],
     });
   } else if (facts.cellFault === null && facts.manualRecovery.length === 0
     && program.commandDisabledReason('program_run') === PROGRAM_RESET_READINESS_MESSAGE) {
@@ -1898,6 +1915,7 @@ export function ProgramTransportControls({
     },
     globalRuleLatches: globalRuleRecovery.latches,
     onClearGlobalRuleLatch: globalRuleRecovery.clear,
+    onReset: { run: () => { void requestProgramReset(); }, disabled: !canReset || resetIntent !== null },
   }));
   // Keep the control panels at their established sizes. Only the center
   // guidance track is elastic; additional Motion groups widen the left panel
@@ -2241,6 +2259,7 @@ export function ProgramTransportControls({
             <h4 id="program-stop-fault-title">Stop fault: motion is blocked</h4>
             <p className="inline-message severity-error" role="alert">
               A stop did not complete cleanly ({humanizeReasonCode(fullCellStop.fault.reasonCode)}).
+              {alsoObservedTriggers(fullCellStop.fault)}
               {fullCellStop.fault.recoveryStatus === 'ready'
                 ? ' The cell can be recovered.'
                 : ' The cell stays blocked until the backend confirms it is safe.'}

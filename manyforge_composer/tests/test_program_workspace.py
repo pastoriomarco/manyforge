@@ -35,7 +35,7 @@ from manyforge_composer.backend.deployment_draft import (
     DeploymentDraftSession,
 )
 from manyforge_composer.backend.routes_draft import _observed_scene_arguments
-from manyforge_composer.backend.security import SecurityConfig
+from manyforge_composer.backend.security import SecurityConfig, UNTITLED_SCENARIO_PATH
 from manyforge_composer.backend.state import ComposerState
 from manyforge_headless_api.client import HeadlessClientError
 
@@ -1318,6 +1318,42 @@ def test_examples_open_read_only_and_save_as_is_confined_to_program_workspace(
     assert saved.json()["saved"]["path"] == str(
         (workspace_root / "saved.program.yaml").resolve()
     )
+
+
+def test_program_save_as_never_writes_into_the_built_in_untitled_scenario(
+    tmp_path: Path,
+) -> None:
+    # A write root that contains the package still never reaches Untitled.
+    package = str(UNTITLED_SCENARIO_PATH.parent)
+    client = _client(
+        tmp_path,
+        allowed_fs_roots=[str(_ROOT / "examples"), str(tmp_path), package],
+        allowed_program_write_roots=[str(tmp_path), package],
+    )
+    untitled_files = {path.name: path.read_bytes() for path in UNTITLED_SCENARIO_PATH.iterdir()}
+    empty = client.get("/api/program/workspace").json()
+    opened = client.post(
+        "/api/program/open-draft",
+        json={**_fence(empty), "path": str(_SOURCE_PROGRAM), "confirmDiscard": False},
+    )
+    assert opened.status_code == 200, opened.text
+    before = client.get("/api/program/workspace").json()
+    for path in (UNTITLED_SCENARIO_PATH / "extra", UNTITLED_SCENARIO_PATH / "program.yaml"):
+        refused = client.post(
+            "/api/program/save-as",
+            json={**_fence(before), "path": str(path), "confirmOverwrite": True},
+        )
+        assert refused.status_code == 409, refused.text
+        assert refused.json()["detail"]["code"] == "scenario_project_read_only"
+        assert client.get("/api/program/workspace").json() == before
+    assert {path.name: path.read_bytes() for path in UNTITLED_SCENARIO_PATH.iterdir()} == untitled_files
+
+    saved = client.post(
+        "/api/program/save-as",
+        json={**_fence(before), "path": str(tmp_path / "saved"), "confirmOverwrite": False},
+    )
+    assert saved.status_code == 200, saved.text
+    assert saved.json()["saved"]["path"] == str((tmp_path / "saved.program.yaml").resolve())
 
 
 @pytest.mark.parametrize("route", ["save", "save-as"])

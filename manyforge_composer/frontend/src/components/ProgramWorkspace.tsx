@@ -14,6 +14,7 @@ import type {
 } from '../types/api';
 import type { ManualControlMotionDescriptor } from '../types/robotControl';
 import { globalRuleIds, interruptConditionKeyUses, type TargetStopChain } from '../utils/interruptAuthoring';
+import type { CarriedObjectLostSignalChoice } from '../utils/systemSignalAuthoring';
 import {
   deriveProgramMotionConfiguration,
   flattenProgramForest,
@@ -73,6 +74,8 @@ interface ProgramWorkspaceProps {
   environment: StructuralResourceState<NodeEnvironmentResponse>;
   sourceModel: StructuralResourceState<SourceModelProjection>;
   deploymentWorkspace?: DeploymentWorkspaceResponse | null;
+  systemSignalChoices?: readonly CarriedObjectLostSignalChoice[];
+  systemSignalsNeedApply?: boolean;
   /** The scenario's Program role assignment (authoring workspace project facts). */
   programRoleAssignment?: Record<string, JsonValue> | null;
   motionDescriptors?: ManualControlMotionDescriptor[];
@@ -107,6 +110,8 @@ export function ProgramWorkspace({
   environment,
   sourceModel,
   deploymentWorkspace = null,
+  systemSignalChoices = [],
+  systemSignalsNeedApply = false,
   programRoleAssignment = null,
   motionDescriptors = [],
   stopChains,
@@ -730,6 +735,8 @@ export function ProgramWorkspace({
                       ? null
                       : sourceModel.message}
                   deploymentWorkspace={deploymentWorkspace}
+                  systemSignalChoices={systemSignalChoices}
+                  systemSignalsNeedApply={systemSignalsNeedApply}
                   programRoleAssignment={programRoleAssignment}
                   motionDescriptors={motionDescriptors}
                   stopChains={stopChains}

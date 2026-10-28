@@ -1,6 +1,6 @@
 api_version: manyforge.closed_schema.v1
 schema_id: manyforge.value_schema.runtime.ros2_control_execution.v1
-schema_revision: sha256:725d71567d7d2a0d9645cd71e657ed123d6ce8829d71cb2ea20b6eb8b392c4e4
+schema_revision: sha256:65622b6edc95e1cfb416345970a805e77ef2a3dd33a7e1f4c5cf4d9ee9ee9274
 schema_purpose: value
 root_definition_id: ros2_control_execution_runtime_configuration
 definitions:
@@ -1189,49 +1189,92 @@ definitions:
                                 value: 1
                               - kind: "max_length"
                                 value: 256
-                        - field_id: "relative_reference"
+                        - field_id: "relative_references"
                           presence: "optional"
                           default:
                             kind: "absent"
                           value_schema:
-                            kind: "object"
-                            fields:
-                              - field_id: "entity"
-                                presence: "required"
-                                default:
-                                  kind: "absent"
-                                value_schema:
-                                  kind: "scalar"
-                                  scalar_type: "string"
-                                  constraints:
-                                    - kind: "min_length"
-                                      value: 1
-                                    - kind: "max_length"
-                                      value: 1024
-                              - field_id: "link"
-                                presence: "required"
-                                default:
-                                  kind: "absent"
-                                value_schema:
-                                  kind: "scalar"
-                                  scalar_type: "string"
-                                  constraints:
-                                    - kind: "min_length"
-                                      value: 1
-                                    - kind: "max_length"
-                                      value: 256
-                              - field_id: "source_header_frame_id"
-                                presence: "required"
-                                default:
-                                  kind: "absent"
-                                value_schema:
-                                  kind: "scalar"
-                                  scalar_type: "string"
-                                  constraints:
-                                    - kind: "min_length"
-                                      value: 1
-                                    - kind: "max_length"
-                                      value: 1024
+                            kind: "array"
+                            min_items: 1
+                            max_items: 128
+                            collection:
+                              kind: "keyed_record_set"
+                              key_paths:
+                                - - "controllable_component_id"
+                                - - "command_target_id"
+                            item_schema:
+                              kind: "object"
+                              fields:
+                                - field_id: "command_target_id"
+                                  presence: "required"
+                                  default:
+                                    kind: "absent"
+                                  value_schema:
+                                    kind: "scalar"
+                                    scalar_type: "string"
+                                    constraints:
+                                      - kind: "min_length"
+                                        value: 1
+                                      - kind: "max_length"
+                                        value: 256
+                                - field_id: "controllable_component_id"
+                                  presence: "required"
+                                  default:
+                                    kind: "absent"
+                                  value_schema:
+                                    kind: "scalar"
+                                    scalar_type: "string"
+                                    constraints:
+                                      - kind: "string_format"
+                                        value: "portable_id"
+                                - field_id: "entity"
+                                  presence: "required"
+                                  default:
+                                    kind: "absent"
+                                  value_schema:
+                                    kind: "scalar"
+                                    scalar_type: "string"
+                                    constraints:
+                                      - kind: "min_length"
+                                        value: 1
+                                      - kind: "max_length"
+                                        value: 1024
+                                - field_id: "gripper_link"
+                                  presence: "required"
+                                  default:
+                                    kind: "absent"
+                                  value_schema:
+                                    kind: "scalar"
+                                    scalar_type: "string"
+                                    constraints:
+                                      - kind: "min_length"
+                                        value: 1
+                                      - kind: "max_length"
+                                        value: 256
+                                - field_id: "link"
+                                  presence: "required"
+                                  default:
+                                    kind: "absent"
+                                  value_schema:
+                                    kind: "scalar"
+                                    scalar_type: "string"
+                                    constraints:
+                                      - kind: "min_length"
+                                        value: 1
+                                      - kind: "max_length"
+                                        value: 256
+                                - field_id: "source_header_frame_id"
+                                  presence: "required"
+                                  default:
+                                    kind: "absent"
+                                  value_schema:
+                                    kind: "scalar"
+                                    scalar_type: "string"
+                                    constraints:
+                                      - kind: "min_length"
+                                        value: 1
+                                      - kind: "max_length"
+                                        value: 1024
                         - field_id: "source_coordinate_frame_id"
                           presence: "required"
                           default:

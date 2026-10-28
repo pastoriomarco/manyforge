@@ -20,6 +20,7 @@ import {
   interruptKeyInitialProblem,
   newGlobalRule,
   nodeConditionChoices,
+  operandId,
   unguardedNodeOutcomeKeys,
   commonStopStages,
   operatorsFor,
@@ -137,6 +138,67 @@ describe('interrupt condition authoring', () => {
     expect(successThroughStages(stages, undefined).map((stage) => stage.id)).toEqual(['one', 'two', 'three']);
     expect(successThroughStages(stages, 'two').map((stage) => stage.id)).toEqual(['two', 'three']);
     expect(successThroughStages(stages, 'unknown')).toEqual([]);
+  });
+});
+
+describe('generated carried-object-lost operands (DX-2574)', () => {
+  const systemSignal = {
+    controllableComponentId: 'robot', commandTargetId: 'gripper',
+    signalName: 'carried_object_lost.gripper', resourceRoleId: 'carried_object_lost',
+    direction: 'input', valueType: 'bool',
+  } as const;
+
+  it('offers the generated input to a required Program target role before a binding exists', () => {
+    const programWithGripper = {
+      ...program,
+      target_roles: { gripper: { component_role: 'tool', required_resource_roles: ['carried_object_lost'] } },
+    } as unknown as ProgramAuthoringDocument;
+    const assignment = {
+      component_roles: [{ component_role_id: 'tool', controllable_component_id: 'robot' }],
+      target_roles: [{ target_role_id: 'gripper', command_target_id: 'gripper' }],
+    } as unknown as Record<string, JsonValue>;
+    const choices = nodeConditionChoices(programWithGripper, null, [], null, assignment, [systemSignal]);
+
+    expect(choices.filter((choice) => choice.key === '').map((choice) => choice.label)).toEqual([
+      'gripper · carried_object_lost (carried_object_lost.gripper, input)',
+    ]);
+    expect(conditionProblem(compare({ signal: { target_role: 'gripper', resource_role: 'carried_object_lost' } }, '==', true), choices))
+      .toBeNull();
+    const appliedChoices = nodeConditionChoices(
+      programWithGripper, null, [], null, assignment, [{ ...systemSignal, provenance: 'last_apply' }],
+    );
+    expect(appliedChoices.find((choice) => choice.key === '')?.label)
+      .toContain('from last Apply');
+  });
+
+  it('offers the generated named signal to a global rule without change-only liveness refusal', () => {
+    const choices = globalRuleChoices({}, [], undefined, [systemSignal]);
+    const choice = choices.find((row) => row.label === 'robot · carried_object_lost.gripper (input)');
+    expect(choice?.operand).toEqual({ signal: {
+      controllable_component_id: 'robot', signal_name: 'carried_object_lost.gripper',
+    } });
+    expect(conditionProblem(compare(choice?.operand ?? null, '==', true), choices)).toBeNull();
+
+    const applied = globalRuleChoices({}, [], undefined, [{ ...systemSignal, provenance: 'last_apply' }]);
+    expect(applied.find((row) => row.id === choice?.id)?.label)
+      .toBe('robot · carried_object_lost.gripper (input) · from last Apply');
+  });
+
+  it('drops an Applied system row when the current Draft target identity changed', () => {
+    const programWithGripper = {
+      ...program,
+      target_roles: { gripper: { component_role: 'tool', required_resource_roles: ['carried_object_lost'] } },
+    } as unknown as ProgramAuthoringDocument;
+    const staleBinding = {
+      target_role_bindings: [{ target_role_id: 'gripper', controllable_component_id: 'old_robot',
+        command_target_id: 'old_gripper', signal_role_bindings: [{ resource_role_id: 'carried_object_lost',
+          signal_name: 'carried_object_lost.old_gripper', value_type: 'bool', direction: 'input' }] }],
+    } as unknown as ProgramBindingDocument;
+    const choices = nodeConditionChoices(programWithGripper, staleBinding, [], null, null, [systemSignal]);
+
+    expect(choices.some((choice) => choice.id === operandId({
+      signal: { target_role: 'gripper', resource_role: 'carried_object_lost' },
+    }))).toBe(false);
   });
 });
 

@@ -9,11 +9,11 @@
   "members": {
     "assignment.yaml": "sha256:a0331144128edc4cae7f59ef4bf68bd0bc192d8fbfa1a9bb9de97b1025dcd098",
     "deployment.yaml": "sha256:87312bb63f101c304edaac2d1a1f65cac48ca92639ed2461c61a7d3e7e6acb51",
-    "program.yaml": "sha256:794c490149338e49f437862f47dd85fb330b80f830006843e78be58e9763b9d2"
+    "program.yaml": "sha256:f295688ee784568a21b5ada7179c914dbb2fd63048ab0a968f528408e212194c"
   },
   "name": "isaac-ur10e-light-scene-collision",
   "saved_status": {
-    "checked_content_digest": "sha256:a2aeb879a142f0bc2548efec8d32c9826c378e81d4080b5b06ab868884f46779",
+    "checked_content_digest": "sha256:5499a62d647efcb0828c16b1c547dac3d334fcbf8e03d0555ad2a87929570fa1",
     "last_known_status": "ready",
     "manyforge_version": "0.1.0"
   },

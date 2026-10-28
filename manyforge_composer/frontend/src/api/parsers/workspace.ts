@@ -442,7 +442,7 @@ function parseAuthoringWorkspaceProjectFacts(
 ): AuthoringWorkspaceProjectFacts {
   const record = objectAt(value, path);
   exactKeysAt(record, [
-    'document_path', 'document_id', 'document_name', 'document_description',
+    'document_path', 'read_only', 'document_id', 'document_name', 'document_description',
     'source_diagnostics', 'source_document_digest', 'program_role_assignment',
     'source_program_digest', 'source_deployment_digest',
   ], path);
@@ -454,6 +454,7 @@ function parseAuthoringWorkspaceProjectFacts(
       );
   return {
     documentPath: nullableStringAt(record.document_path, `${path}.document_path`),
+    readOnly: booleanAt(record.read_only, `${path}.read_only`),
     documentId: nullableStringAt(record.document_id, `${path}.document_id`),
     documentName: nullableStringAt(record.document_name, `${path}.document_name`),
     documentDescription: nullableStringAt(
@@ -469,8 +470,8 @@ function parseAuthoringWorkspaceProjectFacts(
       const selected = objectAt(diagnostic, diagnosticPath);
       exactKeysAt(selected, ['code', 'message', 'source_id'], diagnosticPath);
       const code = stringAt(selected.code, `${diagnosticPath}.code`);
-      if (code !== 'scenario_source_changed') {
-        return fail(`${diagnosticPath}.code`, 'scenario_source_changed');
+      if (code !== 'scenario_source_changed' && code !== 'edited_outside_manyforge') {
+        return fail(`${diagnosticPath}.code`, 'scenario_source_changed or edited_outside_manyforge');
       }
       return {
         code,
@@ -738,14 +739,14 @@ export function parseScenarioDocumentLoadResponse(
         const selected = objectAt(diagnostic, diagnosticPath);
         exactKeysAt(selected, ['code', 'message', 'source_id'], diagnosticPath);
         const code = stringAt(selected.code, `${diagnosticPath}.code`);
-        if (code !== 'scenario_source_changed') {
-          return fail(`${diagnosticPath}.code`, 'scenario_source_changed');
+        if (code !== 'scenario_source_changed' && code !== 'edited_outside_manyforge') {
+          return fail(`${diagnosticPath}.code`, 'scenario_source_changed or edited_outside_manyforge');
         }
         return {
-          code: 'scenario_source_changed' as const,
+          code,
           sourceId: stringAt(selected.source_id, `${diagnosticPath}.source_id`),
           message: stringAt(selected.message, `${diagnosticPath}.message`),
-        };
+        } as const;
       },
     ),
     workspace: parseProgramWorkspaceResponse(record.workspace),

@@ -9,11 +9,11 @@
   "members": {
     "assignment.yaml": "sha256:84e103dc895e6da75d430d5d08f69583126910c832efc100b1f652524690cb46",
     "deployment.yaml": "sha256:3e8d28f583d34f4ad6fbefea52a0563ea50a76266190594dd6d6114d3f2a65bf",
-    "program.yaml": "sha256:f57d954213659ebab70c1741ff1918d3e9d306876a73f5dc3c34bf4946afd515"
+    "program.yaml": "sha256:cd8564a4006fcff932368c55dec167b017996ac27fe09a710e7a1ab8faab4b14"
   },
   "name": "lite6_pneumatic_mock",
   "saved_status": {
-    "checked_content_digest": "sha256:18a840b436f6ef03b0bbce70fbc253867114c6d355ab52ea2f477eff41080a71",
+    "checked_content_digest": "sha256:0e20568c7499c5500a24326bf21d326778b65d1d28d5cefa06c228345b14da19",
     "last_known_status": "unknown",
     "manyforge_version": "0.1.0"
   },

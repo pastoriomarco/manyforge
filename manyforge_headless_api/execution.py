@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+from collections import deque
 import hashlib
 import logging
 import math
@@ -55,6 +56,7 @@ from .private_transport import (
     PinnedRunRoot,
     PrivateTransportCapabilityError,
 )
+from .execution_event_stream import follow_execution_events, open_event_subscription
 
 
 EXECUTION_SOCKET_FILE = "execution-command.sock"
@@ -249,6 +251,8 @@ class ExecutionPort(Protocol):
     def observation(self) -> dict[str, Any]: ...
 
     def open_observation_session(self) -> "ExecutionObservationSession": ...
+
+    def subscribe_events(self, after_cursor: int, owner_epoch: str | None) -> Any: ...
 
     def submit(
         self,
@@ -840,6 +844,12 @@ class ExecutionCommandClient:
             )
         return response
 
+    def subscribe_events(self, after_cursor: int, owner_epoch: str | None):
+        """Open the event subscription stream strictly after ``after_cursor``
+        (contract §8.1); a context manager yielding the subscription."""
+
+        return open_event_subscription(self._run_root, after_cursor, owner_epoch)
+
     def _exchange(self, command: dict[str, Any]) -> dict[str, Any]:
         return self._exchange_on(command, self._socket_path)
 
@@ -1262,7 +1272,8 @@ class ExecutionCommandClient:
             or owner_epoch != expected_owner_epoch
             or type(response.get("execution_owner_ready")) is not bool
             or not isinstance(faults, dict)
-            or set(faults) != {"operation_journal_write_fault", "program_runner_loss"}
+            or set(faults)
+            != {"operation_journal_write_fault", "program_runner_loss", "kernel_internal_fault"}
             or any(
                 fact is not None
                 and (
@@ -1304,10 +1315,23 @@ class ExecutionCommandClient:
                 "owner_epoch": owner_epoch,
             }
         )
-        runtime_snapshot = self._event_runtime_fault_snapshot(response, owner_epoch)
+        return self.parse_events_reply(response, owner_epoch, after_sequence, limit)
+
+    @classmethod
+    def parse_events_reply(
+        cls,
+        response: dict[str, Any],
+        owner_epoch: str,
+        after_sequence: int,
+        limit: int,
+    ) -> dict[str, Any]:
+        """Validate one ``events`` reply (also one the event stream rebuilt)
+        and return its page with the reply's facts."""
+
+        runtime_snapshot = cls._event_runtime_fault_snapshot(response, owner_epoch)
         try:
             if response.get("ok") is not True:
-                self._raise_error_response(response)
+                cls._raise_error_response(response)
             page = response.get("event_page")
             admission_generation = response.get("admission_generation")
             if (
@@ -2159,6 +2183,7 @@ class ExecutionCommandClient:
             "graph_revision",
             "latch_generation",
             "latch_id",
+            "observed_triggers",
             "persistence_degraded",
             "reason_code",
             "recovery_assessment_revision",
@@ -2197,6 +2222,8 @@ class ExecutionCommandClient:
             return False
         if (
             type(latch.get("persistence_degraded")) is not bool
+            or not isinstance(latch.get("observed_triggers"), list)
+            or latch.get("trigger") not in latch.get("observed_triggers", [])
             or not isinstance(latch.get("captured_operation_ids"), list)
             or not isinstance(latch.get("captured_resources"), list)
             or not isinstance(latch.get("evidence_refs"), list)
@@ -2468,6 +2495,150 @@ class ExecutionCommandClient:
         return response
 
 
+class StreamedExecutionEvents:
+    """The event pump's source on the subscription stream (contract §8.1).
+
+    One follower thread keeps the subscription (reconnect from the last
+    cursor, dead link after three missed heartbeats) and buffers its rows;
+    the latest ``state`` and ``progress`` are kept as received. ``identity``
+    and ``events`` answer from that buffer in the shapes of the request/reply
+    commands, so the pump's ingestion is unchanged and no command is polled;
+    ``wait`` returns as soon as a new message arrived. A row stays buffered
+    until a later ``events`` call names a cursor at or after it, so a failed
+    ingestion re-reads it. The buffer is bounded: a full buffer holds the
+    follower (the host then drops and the follower resumes the subscription,
+    losing nothing).
+    """
+
+    MAX_BUFFERED_EVENTS = 4_096
+
+    def __init__(self, subscribe: Callable[[int, str | None], Any], stop: threading.Event) -> None:
+        self._subscribe = subscribe
+        self._stop = stop
+        self._changed = threading.Condition()
+        self._owner_epoch: str | None = None
+        self._state: dict[str, Any] | None = None
+        self._progress: list[Any] = []
+        self._events: deque[dict[str, Any]] = deque()
+        self._connected = False
+        self._version = 0
+        self._seen_version = 0
+        self._thread: threading.Thread | None = None
+
+    def start(self) -> None:
+        self._thread = threading.Thread(
+            target=follow_execution_events,
+            args=(self._subscribe, self._on_message, self._stop),
+            kwargs={"on_disconnect": self._on_disconnect},
+            name="manyforge-operation-event-stream",
+            # Holds no durable work (the pump owns ingestion and joins it on
+            # shutdown); a leaked follower never blocks interpreter exit.
+            daemon=True,
+        )
+        self._thread.start()
+
+    def join(self, timeout: float) -> None:
+        thread = self._thread
+        if thread is not None:
+            thread.join(timeout=timeout)
+        self._thread = None
+
+    def _on_message(self, message: dict[str, Any]) -> None:
+        with self._changed:
+            kind = message["type"]
+            if kind == "snapshot":
+                if message["owner_epoch"] != self._owner_epoch:
+                    self._events.clear()
+                self._owner_epoch = message["owner_epoch"]
+                self._state = message["state"]
+                self._progress = []
+                self._connected = True
+            elif kind == "state":
+                self._state = message["state"]
+            elif kind == "progress":
+                self._progress = message["operation_progress"]
+            elif kind == "event":
+                while len(self._events) >= self.MAX_BUFFERED_EVENTS:
+                    if self._stop.is_set():
+                        return
+                    self._changed.wait(0.1)
+                self._events.append(message["event"])
+            self._version += 1
+            self._changed.notify_all()
+
+    def _on_disconnect(self, _error: BaseException) -> None:
+        with self._changed:
+            self._connected = False
+            self._version += 1
+            self._changed.notify_all()
+
+    def _require_connected(self) -> tuple[str, dict[str, Any]]:
+        if not self._connected or self._owner_epoch is None or self._state is None:
+            raise HeadlessApiError(
+                "execution_owner_unavailable", "execution event stream is not connected"
+            )
+        return self._owner_epoch, self._state
+
+    def identity(self) -> dict[str, Any]:
+        """The stream's owner in the ``identity`` reply shapes the pump reads
+        (ready: the identity; no product: ``execution_owner_not_ready``)."""
+
+        with self._changed:
+            owner_epoch, state = self._require_connected()
+            if state.get("execution_owner_ready") is True:
+                return {"ok": True, "identity": {"owner_epoch": owner_epoch}}
+            return {
+                "ok": False,
+                "error": {
+                    "code": "execution_owner_not_ready",
+                    "message": "the managed execution owner has no active physical product",
+                    "details": {"owner_epoch": owner_epoch},
+                },
+            }
+
+    def events(self, owner_epoch: str, after_sequence: int, *, limit: int = 16) -> dict[str, Any]:
+        """The buffered rows strictly after ``after_sequence`` as one validated
+        ``events`` page with the latest stream facts."""
+
+        with self._changed:
+            current_epoch, state = self._require_connected()
+            if current_epoch != owner_epoch:
+                raise HeadlessApiError(
+                    "execution_owner_unavailable", "execution event stream changed its owner"
+                )
+            while self._events and self._events[0]["sequence"] <= after_sequence:
+                self._events.popleft()
+            self._changed.notify_all()  # Room for a held follower.
+            rows = [self._events[index] for index in range(min(limit, len(self._events)))]
+            has_more = len(self._events) > limit
+            response = {
+                **state,
+                "api_version": EXECUTION_RESPONSE_VERSION,
+                "command": "events",
+                "event_page": {
+                    "events": rows,
+                    "has_more": has_more,
+                    "next_after_sequence": rows[-1]["sequence"] if rows else after_sequence,
+                    "owner_epoch": owner_epoch,
+                    "schema_version": "manyforge.execution_event_page.v1",
+                },
+                "ok": True,
+                "operation_progress": list(self._progress),
+                "owner_epoch": owner_epoch,
+            }
+        return ExecutionCommandClient.parse_events_reply(response, owner_epoch, after_sequence, limit)
+
+    def wait(self, timeout: float) -> None:
+        """Until a new stream message, ``stop`` or ``timeout``."""
+
+        with self._changed:
+            self._changed.wait_for(
+                lambda: self._version != self._seen_version or self._stop.is_set(),
+                timeout=timeout,
+            )
+            self._seen_version = self._version
+
+
 class ExecutionEventPump:
     """Move durable native facts to the C++ historian without owning truth."""
 
@@ -2493,9 +2664,12 @@ class ExecutionEventPump:
         self._core = core
         self._execution = execution
         self._poll_seconds = poll_seconds
+        self._stop = threading.Event()
+        # Contract §8.1: identity, pages and wake-ups come from the event
+        # subscription; the request/reply `events` command is never polled.
+        self._stream = StreamedExecutionEvents(execution.subscribe_events, self._stop)
         self._condition_poll_seconds = condition_poll_seconds
         self._page_limit = page_limit
-        self._stop = threading.Event()
         self._thread: threading.Thread | None = None
         self._last_error: str | None = None
         self._health_lock = threading.Lock()
@@ -2879,6 +3053,7 @@ class ExecutionEventPump:
         if self._thread is not None:
             return
         self._stop.clear()
+        self._stream.start()
         self._thread = threading.Thread(
             target=self._run,
             name="manyforge-operation-event-pump",
@@ -2887,6 +3062,7 @@ class ExecutionEventPump:
 
     def shutdown(self) -> None:
         self._stop.set()
+        self._stream.join(timeout=1.0)
         thread = self._thread
         if thread is not None:
             thread.join(timeout=1.5)
@@ -3073,6 +3249,7 @@ class ExecutionEventPump:
         control_projection_changed = False
         admission_generation: int | None = None
         source_mode = "active"
+        source = self._stream
 
         def condition_snapshot_kwargs(
             source_owner_epoch: str, through_source_sequence: int
@@ -3114,7 +3291,7 @@ class ExecutionEventPump:
             self._record_cclc_incident_events()
             try:
                 if owner_epoch is None:
-                    identity_response = self._execution.identity()
+                    identity_response = source.identity()
                     if identity_response.get("ok") is not True:
                         next_epoch = self._idle_owner_epoch(identity_response)
                         if next_epoch is None:
@@ -3144,7 +3321,7 @@ class ExecutionEventPump:
                     else:
                         after_sequence = source_high_water
                     owner_epoch = next_epoch
-                page = self._execution.events(
+                page = source.events(
                     owner_epoch,
                     after_sequence,
                     limit=self._page_limit,
@@ -3223,7 +3400,9 @@ class ExecutionEventPump:
                         self._notify_change()
                     if source_mode == "idle":
                         owner_epoch = None
-                    self._stop.wait(self._poll_seconds)
+                    # Wakes on the next stream message; the other sources
+                    # this loop observes keep the period.
+                    self._stream.wait(self._poll_seconds)
                 elif page_had_events:
                     # Do not delay a sparse lifecycle/Stop/fault transition
                     # behind a larger History catch-up.  The downstream cold
@@ -3270,4 +3449,5 @@ __all__ = [
     "ExecutionEventPump",
     "ExecutionObservationSession",
     "ExecutionPort",
+    "StreamedExecutionEvents",
 ]

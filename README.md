@@ -14,12 +14,15 @@ a simulated run does not qualify a physical robot.
 ## Start the workbench
 
 Follow the [workbench guide](docs/operations/DEVELOPMENT_WORKBENCH.md) for
-host prerequisites and the matching ROS image. Once the image is available,
-start from the repository root:
+host prerequisites. From the repository root, build the ROS image once (and
+again after Dockerfile changes), then start:
 
 ```bash
+./scripts/compose-dev.sh build
 ./scripts/compose-dev.sh start --project examples/lite6_pick_and_place.scenario
 ```
+
+The first build and the first start take a while; later starts are incremental.
 
 Open **http://localhost:3000**. Omit `--project` to start with an empty
 workspace. Use `./scripts/compose-dev.sh status` to inspect the workbench and
@@ -36,8 +39,9 @@ and stream status before executing.
 
 A Scenario project contains the Program, Deployment, assignment and referenced
 assets. **Save** persists authored changes; **Apply** makes the selected
-configuration available to the runtime. Loading or applying a Scenario does not
-execute its Program. Inspect component readiness and Runtime/history before
+configuration available to the runtime. **New** opens an empty, read-only
+"Untitled" Scenario: compose and Apply at once, then **Save As** to name and
+place it. Loading or applying a Scenario does not execute its Program. Inspect component readiness and Runtime/history before
 issuing motion, and do not infer command success from a lost connection.
 
 Configured host project folders appear in Composer as `/projects/<name>`. Use

@@ -9,11 +9,11 @@
   "members": {
     "assignment.yaml": "sha256:f4dd3bfffcc14e0cb446f820e79e2405f4477ecbc470ca9fdc127dce17086e06",
     "deployment.yaml": "sha256:a614a45510354367405b6353bfd0f063267c60f5ecc5d94bcc1f9b09bdf2da84",
-    "program.yaml": "sha256:f0c95212c3f3c230df9a344a085be6e463c38b19a162907aeaf8785080c0cc2f"
+    "program.yaml": "sha256:7f25cea5b88a245d22048f2fcd427cee3aa7c6ecf6676d0873ca3a00b924a9fa"
   },
   "name": "lite6_real_arm_observation",
   "saved_status": {
-    "checked_content_digest": "sha256:9e2b790df5e9c639b270abbdd6161160b8998f078d77a46e265aa39492c9ce2c",
+    "checked_content_digest": "sha256:888d56c924614f03e77f78b6ae62d1966fd60567f5a271a06a54846105827c89",
     "last_known_status": "unknown",
     "manyforge_version": "0.1.0"
   },

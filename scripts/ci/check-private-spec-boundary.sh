@@ -53,7 +53,6 @@ MAX_GREP_OUTPUT_BLOCKS=2048
 ALLOWLIST=(
   "AGENTS.md" # dual-purpose entrypoint: dev section legitimately names specs
   "docs/operations/STACK_SETUP.md" # boundary-describing doc: explicitly states specs is dev-only / not-required
-  "docs/operations/ORIN_STACK_SETUP.md" # boundary-describing doc: marks the specs clone optional/maintainer-only
   "scripts/dev-agent-session-start.sh" # dev-only: seeds an OpenClaw agent sandbox with specs context
   "scripts/regen-public-contracts.py" # mentions specs in its own docstring (explaining why mirrors exist)
   "scripts/ci/check-private-spec-boundary.sh" # this file (mentions manyforge_specs in its own docstring/messages)

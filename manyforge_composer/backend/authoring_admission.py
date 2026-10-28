@@ -363,17 +363,21 @@ class AuthoringAdmissionCoordinator:
                 409, {"code": "stale_generation", "message": "admission changed"}
             )
 
-    def _held_run_draft_edit_allowed(self) -> bool:
-        """Apply the published held-run rule to the owners' current facts.
+    def _draft_edit_allowed(self) -> bool:
+        """Idle, or the published held-run rule applied to the owners' facts.
 
-        The same function computes the control-state fact the browser reads;
-        any read failure is "not editable".
+        Kernel authoring admission (its claims and generation) is not read: a
+        Draft edit has no external effect. The held-run function is the one
+        that computes the control-state fact the browser reads; any read
+        failure is "not editable".
         """
 
         try:
+            cycle = self._client.program_cycle_status()
+            if isinstance(cycle, Mapping) and cycle.get("state") == "idle_after_reset":
+                return True
             return held_run_draft_edit_allowed(
-                self._client.program_cycle_status(),
-                self._client.execution_control_state(),
+                cycle, self._client.execution_control_state()
             )
         except Exception:
             return False
@@ -577,13 +581,17 @@ class AuthoringAdmissionCoordinator:
     ) -> LocalAuthoringCommit:
         """Commit one edit that changes only the Draft; it takes no cell claim.
 
-        A Draft edit has no external effect, so it needs no Kernel authoring
-        claim. It is admitted when authoring is Idle or when a held Program run
-        has all its motion confirmed stopped (Headless ``held_run_authoring``),
-        at the client's displayed admission generation. The commit is
-        serialized with execution starts and external submissions by the same
-        lock, so Execute, Run, Resume and Retry observe either the old or the
-        new Draft.
+        A Draft edit has no external effect, so it takes no Kernel authoring
+        claim and is not fenced by the admission generation: another client's
+        Apply, a manual operation or a component change never refuses it. It
+        is admitted when the Program cycle is Idle or when a held Program run
+        has all its motion confirmed stopped (Headless ``held_run_authoring``).
+        The commit is serialized with Composer-mediated execution starts and
+        external submissions by the same process-local lock, so Execute, Run,
+        Resume and Retry sent through Composer observe either the old or the
+        new Draft. A Run or resume sent to Headless directly does not take this
+        lock (as before); it is admitted by Headless/Runner, which compare the
+        caller's Draft revision with Applied, and only Applied ever runs.
         """
 
         if session not in {"program", "deployment", "scenario"}:
@@ -594,11 +602,7 @@ class AuthoringAdmissionCoordinator:
             self._require_workspace_open(workspace)
             self._settle_pending_local_claim()
             self._require_mutation_ready()
-            admission = self._client.authoring_admission()
-            self._require_admission_generation(admission, envelope)
-            if admission.get("authoring_allowed") is not True and not (
-                self._held_run_draft_edit_allowed()
-            ):
+            if not self._draft_edit_allowed():
                 raise refused_before_effect(
                     409,
                     {

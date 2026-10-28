@@ -11,6 +11,7 @@ from typing import Any
 import pytest
 import rfc8785
 
+from manyforge_headless_api.tests.paged_event_stream import paged_subscription
 from manyforge_headless_api.execution import (
     RETRY_ELIGIBILITY_REASONS,
     ExecutionCommandClient,
@@ -233,7 +234,11 @@ def _page(owner_epoch: str, events: list[dict[str, Any]]) -> dict[str, Any]:
         "command": "events",
         "owner_epoch": owner_epoch,
         "execution_owner_ready": True,
-        "runtime_faults": {"operation_journal_write_fault": None, "program_runner_loss": None},
+        "runtime_faults": {
+            "operation_journal_write_fault": None,
+            "program_runner_loss": None,
+            "kernel_internal_fault": None,
+        },
         "event_page": {
             "events": events,
             "has_more": False,
@@ -680,6 +685,7 @@ def test_execution_client_projects_scoped_full_and_fault_recovery_commands(
         "graph_revision": "sha256:" + "2" * 64,
         "latch_generation": 1,
         "latch_id": "stop-fault.1",
+        "observed_triggers": ["scope_promotion"],
         "persistence_degraded": False,
         "reason_code": "stop_fault_recovery_ready",
         "recovery_assessment_revision": 2,
@@ -1303,6 +1309,10 @@ class _RecordingCore:
 
 
 class _PagedExecution:
+    def subscribe_events(self, after_cursor: int, owner_epoch: str | None):
+        # The pump reads the subscription only (contract §8.1).
+        return paged_subscription(self, after_cursor, owner_epoch)
+
     def __init__(self) -> None:
         self.owner_epoch = "execution-host.epoch.pump"
         self.admission_generation = 1
@@ -1330,7 +1340,11 @@ class _PagedExecution:
         events = [] if after_sequence else [self.event]
         return {
             "execution_owner_ready": True,
-            "runtime_faults": {"operation_journal_write_fault": None, "program_runner_loss": None},
+            "runtime_faults": {
+                "operation_journal_write_fault": None,
+                "program_runner_loss": None,
+                "kernel_internal_fault": None,
+            },
             "operation_progress": self.progress,
             "admission_generation": self.admission_generation,
             "events": events,
@@ -1372,7 +1386,11 @@ class _StreamingExecution(_PagedExecution):
         next_sequence = events[-1]["sequence"] if events else after_sequence
         return {
             "execution_owner_ready": True,
-            "runtime_faults": {"operation_journal_write_fault": None, "program_runner_loss": None},
+            "runtime_faults": {
+                "operation_journal_write_fault": None,
+                "program_runner_loss": None,
+                "kernel_internal_fault": None,
+            },
             "operation_progress": self.progress,
             "admission_generation": self.admission_generation,
             "events": events,
@@ -1409,6 +1427,7 @@ def _active_stop_fault_offer() -> dict[str, Any]:
             "graph_revision": "sha256:" + "2" * 64,
             "latch_generation": 1,
             "latch_id": "stop-fault.test.idle",
+            "observed_triggers": ["physical_rest_unproven"],
             "persistence_degraded": False,
             "reason_code": "stop_fault_latched",
             "recovery_assessment_revision": 1,
@@ -1429,6 +1448,10 @@ def _active_stop_fault_offer() -> dict[str, Any]:
 
 
 class _IdleExecution:
+    def subscribe_events(self, after_cursor: int, owner_epoch: str | None):
+        # The pump reads the subscription only (contract §8.1).
+        return paged_subscription(self, after_cursor, owner_epoch)
+
     def __init__(
         self,
         *,
@@ -1465,7 +1488,11 @@ class _IdleExecution:
         assert _owner_epoch == self.owner_epoch
         return {
             "owner_epoch": self.owner_epoch, "execution_owner_ready": False,
-            "runtime_faults": {"operation_journal_write_fault": None, "program_runner_loss": None},
+            "runtime_faults": {
+                "operation_journal_write_fault": None,
+                "program_runner_loss": None,
+                "kernel_internal_fault": None,
+            },
             "events": [], "has_more": False, "next_after_sequence": _after_sequence,
             "operation_progress": [], "admission_generation": self.admission_generation,
         }
@@ -1713,15 +1740,17 @@ def test_event_pump_reconciles_typed_idle_owner_through_stable_events() -> None:
     pump.start()
     assert core.completed.wait(timeout=1.0)
     for _ in range(100):
-        if execution.status_calls >= 4:
+        if len(core.completed_calls) >= 4:
             break
         threading.Event().wait(0.01)
     pump.shutdown()
 
     assert pump.last_error is None
-    assert execution.status_calls >= 1
+    # The idle owner is read once by the subscription, never polled; the
+    # pump keeps completing idle snapshots from the stream (contract §8.1).
+    assert execution.status_calls == 1
     assert execution.events_calls >= 1
-    assert execution.status_calls >= 4
+    assert len(core.completed_calls) >= 4
     assert wakes == [None]
     assert core.completed_calls[0] == {
         "current_stop_fault_json": "null",
@@ -1897,8 +1926,10 @@ def test_event_pump_rejects_untyped_idle_owner_response() -> None:
         deadline.wait(0.01)
     pump.shutdown()
 
+    # The owner epoch comes only from the subscription's snapshot (§8.1): an
+    # owner that names none never connects, so nothing completes.
     assert pump.last_error is not None
-    assert "execution_owner_not_ready" in pump.last_error
+    assert "execution_owner_unavailable" in pump.last_error
     assert not core.completed.is_set()
 
 
@@ -1953,8 +1984,9 @@ def test_event_pump_marks_a_lost_current_source_unknown() -> None:
     assert core.unknown.wait(timeout=1.0)
     pump.shutdown()
 
+    # A lost source is a lost subscription (§8.1).
     assert pump.last_error is not None
-    assert "execution_command_unavailable" in pump.last_error
+    assert "execution_owner_unavailable" in pump.last_error
 
 
 def test_operation_settled_classifies_rest_states_and_terminal_stop() -> None:
@@ -2841,17 +2873,14 @@ def test_stable_event_readiness_tracks_active_idle_active_same_kernel() -> None:
         changed.clear()
         execution.ready = False
         assert changed.wait(timeout=1.0)
-        for _ in range(100):
-            if execution.identities >= 2:
-                break
-            threading.Event().wait(0.01)
-        assert execution.identities >= 2
         changed.clear()
         execution.ready = True
         assert changed.wait(timeout=1.0)
     finally:
         pump.shutdown()
     assert pump.last_error is None
+    # Readiness follows the stream's state; the owner is read once (§8.1).
+    assert execution.identities == 1
     assert wakes == [True, False, True]
     assert len(core.ingested) == 1  # The same journal cursor survives mode changes.
     assert all(call["source_owner_epoch"] == execution.owner_epoch
@@ -2882,12 +2911,18 @@ def test_page_parse_errors_keep_runtime_fault_context_for_pump(
     assert snapshot["runtime_faults"]["operation_journal_write_fault"] == fault
 
     class FailedExecution(_PagedExecution):
+        """Streams the same malformed row with the same runtime fault: the
+        pump's page parse fails with the fault context (§8.1)."""
+
         def __init__(self) -> None:
             super().__init__()
             self.owner_epoch = epoch
+            self.event = response["event_page"]["events"][0]
 
-        def events(self, _owner_epoch: str, _after_sequence: int, *, limit: int = 16) -> dict[str, Any]:
-            raise failed.value
+        def events(self, owner_epoch: str, after_sequence: int, *, limit: int = 16) -> dict[str, Any]:
+            page = super().events(owner_epoch, after_sequence, limit=limit)
+            page["runtime_faults"] = response["runtime_faults"]
+            return page
 
     core = _RecordingCore()
     pump = ExecutionEventPump(core, FailedExecution(), poll_seconds=0.01, page_limit=1)  # type: ignore[arg-type]

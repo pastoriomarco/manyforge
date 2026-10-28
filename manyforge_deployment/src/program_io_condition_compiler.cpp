@@ -503,7 +503,7 @@ compile_program_io_conditions(const ProgramBindingContract &program,
       fail("program_capture_product_mismatch",
            "Condition compiler requires exact sealed inputs");
     const auto signals =
-        ResolveRetainedIoSignalCatalog(retained_bundle.value().cell_graph);
+        ResolveCompiledIoSignalCatalog(retained_bundle.value().cell_graph);
     if (!signals.ok())
       return core::Result<core::ProgramIoConditionProjectionDTO>::Err(
           signals.error());

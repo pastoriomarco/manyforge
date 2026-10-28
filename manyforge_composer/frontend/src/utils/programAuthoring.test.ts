@@ -348,6 +348,49 @@ describe('Program parameter binding continuity', () => {
     expect(programSemanticExpectedAccess(semanticEntry, 'output_key')).toBe('write');
   });
 
+  it('offers the attach node grasp-lost key as a writable bool key', () => {
+    const attach: CatalogEntry = {
+      ...entry,
+      id: 'scene.attach_carried_object',
+      parameters: [parameter('on_grasp_lost', 'string', 'blackboard_key')],
+    };
+    const selected = tree({
+      node_id: 'scene.attach_carried_object',
+      parameters: { on_grasp_lost: { raise_alarm: false, stop_motion: false, set_key: null, detach: true } },
+    });
+    const program: ProgramAuthoringDocument = {
+      api_version: 'manyforge.program.v2',
+      program_id: 'grasp_lost_test',
+      program_profile: 'composable-cell-v1',
+      name: 'Grasp lost test',
+      catalog: { api_version: 'manyforge.node_catalog.v2', content_version: '2.7.0' },
+      component_roles: {},
+      target_roles: {},
+      blackboard: {
+        namespaces: [],
+        keys: [
+          { key: 'computed_lost', type: 'bool', access: 'read', persistence: 'run', expression: 'true' },
+          { key: 'count', type: 'int64', access: 'read_write', persistence: 'run' },
+          { key: 'part_lost', type: 'bool', access: 'read_write', persistence: 'run' },
+          { key: 'read_only', type: 'bool', access: 'read', persistence: 'run' },
+          { key: 'sink', type: 'bool', access: 'write', persistence: 'run' },
+        ],
+      },
+      schema_version: 'manyforge.composer_authoring_forest.v1',
+      forest: [selected],
+      positions: {},
+    };
+    expect(programSemanticChoices(
+      attach.parameters[0]!.schema,
+      selected,
+      attach,
+      'on_grasp_lost',
+      program,
+    ).map((choice) => choice.value)).toEqual(['part_lost', 'sink']);
+    expect(programSemanticExpectedType(attach, 'on_grasp_lost', 'blackboard_key')).toBe('bool');
+    expect(programSemanticExpectedAccess(attach, 'on_grasp_lost')).toBe('read_write');
+  });
+
   it('derives motion settings from catalog-field bindings with arbitrary parameter names', () => {
     const motionEntry: CatalogEntry = {
       ...entry,

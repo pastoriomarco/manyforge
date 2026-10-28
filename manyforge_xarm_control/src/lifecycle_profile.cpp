@@ -1,4 +1,4 @@
-// Copyright 2026 Flexin Group SRL
+// Copyright 2026 Marco Pastorio
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -36,6 +36,9 @@ using core::LifecyclePredicateDTO;
 using core::LifecyclePrimitiveId;
 
 constexpr std::int64_t kPlanTimeoutNs = 30'000'000'000LL;
+// m5.5: every Real xArm arm lifecycle step (Prepare, Enable, Disable,
+// Recover) is bounded at 10 s: arming takes 3-4 s, the rest covers a clear.
+constexpr std::int64_t kRealArmPlanTimeoutNs = 10'000'000'000LL;
 
 [[nodiscard]] LifecycleFactValueDTO boolean_value(const bool value) {
   return {LifecycleFactValueKindDTO::kBoolean, value, std::nullopt,
@@ -118,11 +121,12 @@ constexpr std::string_view kTransportReady = "external.transport_ready";
        b(kControllerActive, false), b(kControllerLoaded, true),
        b(kFaultPresent, false), b(kHardwareActive, true),
        b(kMeasuredJointsValid, true), b(kTransportReady, true)});
-  // Armed by the vendor activation, before ManyForge marks it prepared.
+  // Armed by the vendor activation, before ManyForge marks it prepared. The
+  // broadcaster may still be off: the plugin's deactivate-all can leave it
+  // inactive, and the broadcaster step below turns it back on.
   const auto armed = predicate(
-      unarmed, {b(kReadyForCommands, true), b(kBroadcasterActive, true),
-                b(kFaultPresent, false), b(kHardwareActive, true),
-                b(kTransportReady, true)});
+      unarmed, {b(kReadyForCommands, true), b(kFaultPresent, false),
+                b(kHardwareActive, true), b(kTransportReady, true)});
   const auto active = predicate(
       {State::kActive},
       {b(kReadyForCommands, true), b(kControllerReady, true),
@@ -146,13 +150,27 @@ constexpr std::string_view kTransportReady = "external.transport_ready";
       "ros2_control.controller.activate";
   constexpr std::string_view kControllerDeactivate =
       "ros2_control.controller.deactivate";
+  constexpr std::string_view kBroadcasterActivate =
+      "ros2_control.broadcaster.activate";
   return {
       {Intent::kPrepare,
        State::kPrepared,
        std::nullopt,
        prepared,
-       kPlanTimeoutNs,
-       {// D1: arming; never over an unacknowledged vendor error.
+       kRealArmPlanTimeoutNs,
+       {// m5.5: a vendor error left on the unarmed robot (C2 after an
+        // emergency stop) is cleared first; the clear is verified by the
+        // adapter (an error still reported afterwards is an incident).
+        {primitive(kXArmClearErrorPrimitiveId),
+         predicate(unarmed, {b(kError, true), b(kControllerActive, false),
+                             b(kFaultPresent, false), b(kHardwareActive, false),
+                             b(kTransportReady, true)}),
+         predicate(unarmed, {b(kError, false), b(kControllerActive, false),
+                             b(kFaultPresent, false), b(kHardwareActive, false),
+                             b(kTransportReady, true)})},
+        // D1: arming (the plugin's activation clears the warning, enables the
+        // motors, selects servo mode and the ready state); never over a
+        // vendor error.
         {primitive(kHardwareActivate),
          predicate(unarmed, {b(kError, false), b(kControllerSpawned, true),
                              b(kFaultPresent, false), b(kHardwareActive, false),
@@ -166,6 +184,17 @@ constexpr std::string_view kTransportReady = "external.transport_ready";
          predicate({State::kDisabled},
                    {b(kControllerActive, false), b(kFaultPresent, false),
                     b(kHardwareActive, true), b(kTransportReady, true)})},
+        // The plugin's reactivate-all did not bring the broadcaster back:
+        // switch it on alone, then wait for its first post-activation sample.
+        {primitive(kBroadcasterActivate),
+         predicate(unarmed,
+                   {b(kBroadcasterActive, false), b(kControllerActive, false),
+                    b(kFaultPresent, false), b(kHardwareActive, true),
+                    b(kTransportReady, true)}),
+         predicate(unarmed,
+                   {b(kBroadcasterActive, true), b(kFaultPresent, false),
+                    b(kHardwareActive, true), b(kMeasuredJointsValid, true),
+                    b(kTransportReady, true)})},
         {primitive(kControllerPrepare),
          predicate(unarmed,
                    {b(kReadyForCommands, true), b(kBroadcasterActive, true),
@@ -177,7 +206,7 @@ constexpr std::string_view kTransportReady = "external.transport_ready";
        State::kActive,
        std::nullopt,
        active,
-       kPlanTimeoutNs,
+       kRealArmPlanTimeoutNs,
        {{primitive(kControllerActivate),
          predicate({State::kPrepared},
                    {b(kReadyForCommands, true), b(kBroadcasterActive, true),
@@ -189,7 +218,7 @@ constexpr std::string_view kTransportReady = "external.transport_ready";
        State::kDisabled,
        std::nullopt,
        disabled,
-       kPlanTimeoutNs,
+       kRealArmPlanTimeoutNs,
        {// D4 option B: the controller first, then the hardware.
         {primitive(kControllerDeactivate),
          predicate({State::kPrepared, State::kActive, State::kDegraded},
@@ -206,7 +235,7 @@ constexpr std::string_view kTransportReady = "external.transport_ready";
        State::kDisabled,
        predicate({State::kDegraded, State::kFaulted}, {b(kTransportReady, true)}),
        recovered,
-       kPlanTimeoutNs,
+       kRealArmPlanTimeoutNs,
        {// Each step only while its precondition holds (§3.1, D10).
         {primitive(kControllerDeactivate),
          predicate(any, {b(kControllerActive, true), b(kTransportReady, true)}),

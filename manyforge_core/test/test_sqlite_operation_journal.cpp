@@ -10,17 +10,24 @@
 #include <condition_variable>
 #include <cstdint>
 #include <filesystem>
+#include <fstream>
 #include <functional>
 #include <future>
+#include <iterator>
 #include <manyforge_content_identity/canonical_value.hpp>
 #include <manyforge_content_identity/content_identity.hpp>
 #include <manyforge_core/io_rule_outcome_codec.hpp>
+#include <manyforge_core/prepared_participant_stop_plan_codec.hpp>
+#include <manyforge_core/resolved_stop_base_plan_codec.hpp>
+#include <manyforge_core/runtime_participant_binding.hpp>
 #include <manyforge_core/sqlite_operation_journal.hpp>
 #include <manyforge_core/stop_journal_projection_codec.hpp>
 #include <manyforge_core/stop_scope_resolver.hpp>
+#include <manyforge_core/stop_terminal_reducer.hpp>
 #include <mutex>
 #include <optional>
 #include <set>
+#include <sstream>
 #include <stdexcept>
 #include <string>
 #include <system_error>
@@ -310,9 +317,10 @@ class ScopedTemporaryDirectory final {
   return StopJournalTerminalProjectionDTO{std::move(status), std::move(certificate), std::nullopt};
 }
 
-[[nodiscard]] StopJournalTerminalProjectionDTO MonitoringTerminalProjection(
-    const StopAcceptedDTO& accepted, const ResourceId& resource) {
-  auto projection = EmptyTerminalProjection(accepted);
+/// Adds a monitoring fault latch (scope promotion) to any terminal projection.
+[[nodiscard]] StopJournalTerminalProjectionDTO WithMonitoringLatch(
+    StopJournalTerminalProjectionDTO projection, const ResourceId& resource) {
+  const auto& accepted = projection.stop_status.accepted;
   const StopCertificateRefDTO reference{
       projection.certificate.stop_certificate_id, projection.certificate.stop_certificate_revision,
       projection.certificate.stop_id, projection.certificate.stop_generation};
@@ -337,13 +345,19 @@ class ScopedTemporaryDirectory final {
       1U,
       StopFaultRecoveryStatusDTO::kWaitingForObservation,
       "stop_fault_latched",
-      {}};
+      {},
+      {StopFaultTriggerDTO::kScopePromotion}};
   projection.stop_status.fault_latch = latch;
   projection.fault_latch = std::move(latch);
   EXPECT_FALSE(stop_terminal_projection_field_error(projection.stop_status, projection.certificate,
                                                     projection.fault_latch)
                    .has_value());
   return projection;
+}
+
+[[nodiscard]] StopJournalTerminalProjectionDTO MonitoringTerminalProjection(
+    const StopAcceptedDTO& accepted, const ResourceId& resource) {
+  return WithMonitoringLatch(EmptyTerminalProjection(accepted), resource);
 }
 
 [[nodiscard]] StopPostTerminalSurveillanceDTO MonitoringCheckpoint(
@@ -483,9 +497,10 @@ TEST(SqliteOperationJournalTest, ExactLongServiceTimesSurviveOperationStopAndRes
 }
 
 TEST(SqliteOperationJournalTest, EarlierJournalFormatsAreRefusedAndLeftUntouched) {
-  // Earlier Stop/controller-only/common-goal formats are refused, never
-  // converted, and their retained bytes stay as they were.
-  for (const int version : {9, 10, 11, 12, 13, 14, 15}) {
+  // Earlier Stop/controller-only/common-goal and v16 (Stop payload copies)
+  // formats are refused, never converted, and their retained bytes stay as
+  // they were.
+  for (const int version : {9, 10, 11, 12, 13, 14, 15, 16}) {
     SCOPED_TRACE(version);
     ScopedTemporaryDirectory directory;
     const auto database = directory.path() / "journal.sqlite3";
@@ -529,8 +544,8 @@ TEST(SqliteOperationJournalTest, EarlierJournalFormatsAreRefusedAndLeftUntouched
       SqliteOperationJournal refused(database, cell);
       ADD_FAILURE() << "an earlier journal format was opened";
     } catch (const std::runtime_error& error) {
-      EXPECT_NE(std::string(error.what()).find("common command identity format"), std::string::npos)
-          << error.what();
+      EXPECT_EQ(std::string(error.what()),
+                "operation journal predates the lean Stop record (v17) and is not converted");
     }
     EXPECT_EQ(retained(), before);
     sqlite3_stmt* user_version = nullptr;
@@ -3928,7 +3943,6 @@ TEST(SqliteOperationJournalTest, ForensicTakeoverCandidateNeverBecomesAPhysicalS
   EXPECT_FALSE(stored_candidate->motion_takeover);
   EXPECT_EQ(stored_candidate->participants.front().resources, resources);
   ASSERT_EQ(recovered.value().recovered_stops.size(), 1U);
-  EXPECT_EQ(recovered.value().recovered_stops.front().affected_state, affected);
   EXPECT_EQ(recovered.value().recovered_stops.front().accepted.affected_operation_revisions.size(),
             1U);
   EXPECT_EQ(recovered.value().unreconciled_resources, resources);
@@ -4017,6 +4031,871 @@ TEST(SqliteOperationJournalTest, AcceptedMotionRecordsItsRequiredOwnerQualifiedT
     EXPECT_EQ(bytes.find("tcp_frame_role_id"), std::string::npos);
   }
   EXPECT_NE(events.value().events[1].payload_digest, events.value().events[2].payload_digest);
+}
+
+}  // namespace
+
+// ---- Lean Stop record (operation journal v17) ------------------------------
+namespace {
+
+// Real-plan Stop fixtures. The shapes follow test_stop_terminal_reducer.cpp:
+// the golden resolved base plan, prepared once per participant, so every
+// attempt of one participant embeds the same plan (one digest).
+[[nodiscard]] ResolvedStopBasePlanDTO GoldenStopBasePlan() {
+  const auto path =
+      std::filesystem::path(__FILE__).parent_path() / "golden" / "resolved_stop_base_plan.v1.json";
+  std::ifstream stream(path, std::ios::binary);
+  std::ostringstream bytes;
+  bytes << stream.rdbuf();
+  auto value = bytes.str();
+  if (!value.empty() && value.back() == '\n') value.pop_back();
+  auto decoded = DecodeResolvedStopBasePlan(value);
+  EXPECT_TRUE(decoded.ok());
+  auto base = std::move(decoded.value());
+  auto& nominal = base.escalation_stages.front();
+  const ProviderContractRefDTO contract{
+      ProviderContractRoleId("stop_contract"),
+      SchemaId(std::string(kMotionControlledStopContractSchemaId)),
+      SchemaRevision(std::string(kMotionControlledStopContractSchemaRevision))};
+  nominal.containment_command.provider_contract_ref = contract;
+  if (nominal.command_qualification.controlled_substitution_contract)
+    nominal.command_qualification.controlled_substitution_contract->provider_contract_ref =
+        contract;
+  JsonValueDTO::Array limits;
+  for (const auto* id : {"joint.1", "joint.2"}) {
+    limits.emplace_back(JsonObjectDTO{
+        {"resource_id", JsonValueDTO{std::string(id)}},
+        {"max_deceleration",
+         JsonValueDTO{JsonObjectDTO{{"coordinate_kind", JsonValueDTO{"angular_rad_s2"}},
+                                    {"value_rad_s2", JsonValueDTO{2.0}}}}},
+        {"settle_velocity_threshold",
+         JsonValueDTO{JsonObjectDTO{{"coordinate_kind", JsonValueDTO{"angular_rad_s"}},
+                                    {"value_rad_s", JsonValueDTO{0.02}}}}},
+    });
+  }
+  nominal.default_contract_parameters = JsonObjectDTO{
+      {"stop_mode", JsonValueDTO{"soft_on_path"}},
+      {"deceleration_time_s", JsonValueDTO{0.5}},
+      {"jerk_limits_enabled", JsonValueDTO{false}},
+      {"allow_natural_completion_on_short_path", JsonValueDTO{true}},
+      {"per_resource_limits", JsonValueDTO{std::move(limits)}},
+  };
+  auto current = MakeResolvedStopBasePlan(std::move(base));
+  EXPECT_TRUE(current.ok()) << current.error().message;
+  return std::move(current.value());
+}
+
+[[nodiscard]] RuntimeParticipantBinding GoldenBinding(const ResolvedStopBasePlanDTO& base) {
+  const auto& target = base.escalation_stages.front().command_target;
+  RuntimeParticipantBindingDTO value{
+      ProgramId("program.1"),
+      ProgramRevision(Digest('a').value()),
+      ProgramBindingId(Digest('b').value()),
+      base.retained_bundle_id,
+      base.graph_revision,
+      ComponentRoleId("robot"),
+      TargetRoleId("arm"),
+      ControllableComponentId("robot.1"),
+      ComponentTypeId("robot.type"),
+      ComponentTypeRevision("robot.type.revision"),
+      CommandTargetId("arm"),
+      CapabilityId("execution.trajectory.execute"),
+      CapabilityDefinitionRevision("capability.revision"),
+      std::nullopt,
+      {ProgramModelRoleBindingDTO{ModelRoleId("body"), ModelInstanceId("robot.model"),
+                                  ModelRevision("model.revision")}},
+      {},
+      {ProgramFrameRoleBindingDTO{FrameRoleId("base"), ModelInstanceId("robot.model"),
+                                  ModelRevision("model.revision"), "robot_base"}},
+      {RuntimeResourceBindingDTO{ResourceRoleId("joint.1"), ResourceId("joint.1"),
+                                 std::string("joint_1"), "joint_1", CoordinateKind::kAngular},
+       RuntimeResourceBindingDTO{ResourceRoleId("joint.2"), ResourceId("joint.2"),
+                                 std::string("joint_2"), "joint_2", CoordinateKind::kAngular}},
+      {},
+      RuntimeControlPathDTO{base.control_domain_id,
+                            base.control_domain_revision,
+                            base.control_binding_id,
+                            base.control_binding_revision,
+                            ControlInterfaceContractId("control.interface"),
+                            ControlInterfaceRevision("control.interface.revision"),
+                            base.controller_topology_id,
+                            base.topology_revision,
+                            base.control_route_id,
+                            base.activation_set_id,
+                            base.active_control_configuration_id,
+                            base.active_control_configuration_generation,
+                            target.provider_instance_id,
+                            target.provider_manifest_id,
+                            target.provider_manifest_revision,
+                            target.runtime_unit_id,
+                            target.provider_runtime_epoch,
+                            StateAuthorityId("state.measured"),
+                            StateAuthorityClass::kMeasured,
+                            base.stop_evidence_policy_id,
+                            base.stop_evidence_policy_revision,
+                            ContainmentGranularity::kResource,
+                            std::nullopt},
+      std::nullopt,
+      {},
+      {RuntimeUnitEpochBindingDTO{target.runtime_unit_id, target.runtime_unit_epoch}},
+      {}};
+  auto binding = verify_runtime_participant_binding(std::move(value));
+  EXPECT_TRUE(binding.ok());
+  return std::move(binding.value());
+}
+
+/// One successful stage attempt of participant `participant` of `accepted`'s
+/// Stop. The participant's plan is prepared from its own operation and
+/// participant identity, so each participant has its own plan digest.
+[[nodiscard]] ParticipantStopStageResultDTO RealPlanStageResult(const StopAcceptedDTO& accepted,
+                                                                const std::size_t participant,
+                                                                const std::size_t stage_index) {
+  const auto base = GoldenStopBasePlan();
+  const auto binding = GoldenBinding(base);
+  const auto suffix = std::to_string(participant);
+  auto plan = MakePreparedParticipantStopPlan(
+      base,
+      PreparedParticipantStopPlanContextDTO{
+          OperationId("operation.stop." + suffix), OperationRevision(4U),
+          OperationParticipantId("participant.stop." + suffix), binding.value().program_id,
+          binding.value().program_revision, binding.value().program_binding_id,
+          ProgramRunId("program-run.1"), std::nullopt, ParticipantStopProfilePurposeDTO::kOrdinary,
+          std::nullopt, MotionInterruptNodeCategory::kGeneric},
+      binding.value().resources,
+      std::vector<HardStopResourceLimitDTO>{{ResourceId("joint.1"), AngularVelocityDTO{0.02}},
+                                            {ResourceId("joint.2"), AngularVelocityDTO{0.02}}});
+  EXPECT_TRUE(plan.ok()) << plan.error().message;
+  const auto selected = plan.value().stage_commands.at(stage_index).resolved_stage;
+  ResolvedParticipantStopStageDTO stage{accepted.stop_id,
+                                        accepted.stop_generation,
+                                        plan.value().operation_id,
+                                        plan.value().operation_revision,
+                                        plan.value().participant_id,
+                                        ControllerGoalId("goal." + suffix),
+                                        ControllerGoalGeneration(3U),
+                                        binding.value().controllable_component_id,
+                                        binding.value().command_target_id,
+                                        binding.value().capability_id,
+                                        base.control_domain_id,
+                                        base.control_domain_revision,
+                                        base.control_binding_id,
+                                        base.control_binding_revision,
+                                        base.active_control_configuration_id,
+                                        base.active_control_configuration_generation,
+                                        base.controller_topology_id,
+                                        base.topology_revision,
+                                        base.control_route_id,
+                                        std::nullopt,
+                                        std::nullopt,
+                                        selected.command_target.provider_runtime_epoch,
+                                        {ResourceId("joint.1"), ResourceId("joint.2")},
+                                        selected.containment_granularity,
+                                        base.stop_evidence_policy_id,
+                                        base.stop_evidence_policy_revision,
+                                        std::move(plan.value()),
+                                        stage_index,
+                                        Digest('c')};
+  ParticipantStopStageResultDTO result{std::move(stage),
+                                       StopStageAttemptDispositionDTO::kDispatched,
+                                       ParticipantStopStageOutcomeDTO::kSucceeded,
+                                       std::nullopt,
+                                       std::nullopt,
+                                       3U,
+                                       RuntimeEpoch("provider.epoch"),
+                                       9U,
+                                       10'000'000,
+                                       {},
+                                       std::nullopt};
+  if (stage_index == 0U) {
+    result.actual_provider_contract_mode = MotionControlledStopMode::kSoftOnPath;
+  }
+  result.source_epoch = selected.command_target.provider_runtime_epoch;
+  for (const auto& requirement : selected.evidence_requirements) {
+    result.evidence_items.push_back(StopEvidenceItemDTO{
+        requirement.requirement.evidence_item_id, requirement.requirement.evidence_kind,
+        StopEvidenceItemStateDTO::kSatisfied, requirement.resolved_source,
+        requirement.resolved_source.runtime_target.provider_runtime_epoch, 9U, 1'000'000,
+        JsonValueDTO{true}, std::nullopt});
+  }
+  return result;
+}
+
+[[nodiscard]] StopScopeEntryDTO RealPlanScopeEntry(const ResolvedParticipantStopStageDTO& stage,
+                                                   const std::int64_t accepted_at_ns) {
+  return StopScopeEntryDTO{
+      StopScopeEntryKeyDTO{stage.stop_id, stage.stop_generation,
+                           StopParticipantScopeKeyDTO{stage.operation_id, stage.participant_id}},
+      StopParticipantScopeFactsDTO{
+          OperationRevision(stage.operation_revision.value() + 1U), stage.controllable_component_id,
+          stage.command_target_id, stage.capability_id, stage.control_domain_id,
+          stage.control_domain_revision, stage.control_binding_id, stage.control_binding_revision,
+          stage.controller_goal_id, stage.controller_goal_generation,
+          stage.active_control_configuration_id, stage.active_control_configuration_generation,
+          stage.controller_topology_id, stage.topology_revision, stage.control_route_id,
+          stage.provider_runtime_epoch, stage.resources, ContainmentGranularity::kControllerSet,
+          StopParticipantScopeFactsDTO::TerminalSettlementState::kSettled},
+      StopScopeEntryDispositionDTO::kStoppable,
+      StopScopeDispatchStateDTO::kDispatched,
+      stage.stop_evidence_policy_id,
+      stage.stop_evidence_policy_revision,
+      stage.participant_stop_plan.participant_stop_invocation_plan_digest,
+      accepted_at_ns};
+}
+
+/// A reduced Full Stop terminal for `accepted`: `participants` real-plan
+/// participants, each with stage 0 and, when `escalated`, stage 1 (both
+/// authoritative, so the certificate is succeeded_escalated and each plan is
+/// shared by two attempts). `predecessors` are merged (origin-tagged).
+[[nodiscard]] StopJournalTerminalProjectionDTO RealPlanTerminal(
+    const StopAcceptedDTO& accepted, const std::size_t participants, const bool escalated,
+    const std::vector<StopCertificateDTO>& predecessors = {}) {
+  std::vector<StopScopeEntryDTO> entries;
+  std::vector<StopAttemptedStageResultDTO> attempts;
+  std::vector<StopAffectedOperationRevisionDTO> fenced;
+  std::uint64_t result_sequence = 0U;
+  for (std::size_t participant = 1U; participant <= participants; ++participant) {
+    for (std::size_t stage_index = 0U; stage_index <= (escalated ? 1U : 0U); ++stage_index) {
+      auto result = RealPlanStageResult(accepted, participant, stage_index);
+      auto entry = RealPlanScopeEntry(result.request, accepted.accepted_at_ns);
+      const auto key = entry.key;
+      if (stage_index == 0U) {
+        fenced.push_back(StopAffectedOperationRevisionDTO{
+            result.request.operation_id,
+            OperationRevision(result.request.operation_revision.value() + 1U)});
+        entries.push_back(std::move(entry));
+      }
+      ++result_sequence;
+      attempts.push_back(StopAttemptedStageResultDTO{
+          key, result_sequence, accepted.accepted_at_ns + static_cast<std::int64_t>(result_sequence),
+          StopStageResultAuthorityDTO::kAuthoritative, std::move(result)});
+    }
+  }
+  std::vector<StopPredecessorAcceptanceRefDTO> predecessor_refs;
+  for (const auto& predecessor : predecessors) {
+    predecessor_refs.push_back(StopPredecessorAcceptanceRefDTO{
+        predecessor.stop_id, predecessor.stop_generation, Digest('b')});
+  }
+  std::vector<ResourceId> captured_resources;
+  if (participants > 0U) captured_resources = {ResourceId("joint.1"), ResourceId("joint.2")};
+  const StopTerminalReductionInputDTO input{
+      StopCertificateId("certificate:" + accepted.stop_id.value() + ":" +
+                        std::to_string(accepted.stop_generation.value())),
+      StopCertificateRevision(1U),
+      accepted.stop_id,
+      accepted.stop_generation,
+      StopRequestedSelectorSnapshotDTO{StopRequestedSelectorKindDTO::kExplicitFull,
+                                       accepted.requested_selector_digest, std::nullopt,
+                                       std::nullopt},
+      accepted.resolution_disposition,
+      accepted.resolution_reason,
+      accepted.stale_diagnostics,
+      {StopScopeCaptureHistoryDTO{1U, accepted.resolution_disposition, accepted.resolution_reason,
+                                  accepted.captured_scope_digest, std::move(predecessor_refs),
+                                  std::move(fenced), std::move(captured_resources)}},
+      predecessors,
+      std::move(entries),
+      std::move(attempts),
+      std::nullopt,
+      std::nullopt,
+      std::nullopt,
+      accepted.accepted_at_ns + 1000,
+      std::nullopt};
+  auto certificate = ReduceStopTerminal(input);
+  EXPECT_TRUE(certificate.ok()) << certificate.error().message;
+  EXPECT_EQ(certificate.value().result, escalated ? StopCertificateResultDTO::kSucceededEscalated
+                                                  : StopCertificateResultDTO::kSucceededNominal);
+  const StopCertificateRefDTO reference{
+      certificate.value().stop_certificate_id, certificate.value().stop_certificate_revision,
+      certificate.value().stop_id, certificate.value().stop_generation};
+  StopStatusDTO status{accepted,
+                       StopStatusStateDTO::kSucceeded,
+                       certificate.value().scope_entries,
+                       {},
+                       certificate.value().attempted_stage_results,
+                       certificate.value().evidence_items,
+                       certificate.value().unsettled,
+                       certificate.value().failed,
+                       StopDurableProjectionStatusDTO{StopDurableProjectionStateDTO::kRecorded,
+                                                      std::nullopt, std::nullopt},
+                       StopDurableProjectionStatusDTO{StopDurableProjectionStateDTO::kPending,
+                                                      std::nullopt, std::nullopt},
+                       StopDurableProjectionStatusDTO{StopDurableProjectionStateDTO::kNotApplicable,
+                                                      std::nullopt, std::nullopt},
+                       reference,
+                       std::nullopt,
+                       std::nullopt};
+  EXPECT_FALSE(
+      stop_terminal_projection_field_error(status, certificate.value(), std::nullopt).has_value());
+  return StopJournalTerminalProjectionDTO{std::move(status), std::move(certificate.value()),
+                                          std::nullopt};
+}
+
+/// The projection exactly as RecordStopTerminal stores it.
+[[nodiscard]] StopJournalTerminalProjectionDTO RecordedTerminal(
+    StopJournalTerminalProjectionDTO projection) {
+  const StopDurableProjectionStatusDTO recorded{StopDurableProjectionStateDTO::kRecorded,
+                                                std::nullopt, std::nullopt};
+  projection.stop_status.terminal_projection = recorded;
+  if (projection.fault_latch.has_value()) projection.fault_latch->terminal_projection = recorded;
+  projection.stop_status.fault_latch = projection.fault_latch;
+  return projection;
+}
+
+[[nodiscard]] StopAcceptedDTO RecordFullStopAcceptance(
+    SqliteOperationJournal& journal, const RequestOwnerEpoch& epoch, const std::string& request_id,
+    const std::string& stop_id, const std::int64_t accepted_at_ns,
+    const EmergencyStopAcceptancePathDTO path = EmergencyStopAcceptancePathDTO::kFreshReserved) {
+  const FullStopIntentDTO intent{
+      PublicRequestContextDTO{RequestId(request_id), epoch, "journal-test", std::nullopt},
+      StopGeneration(0U), RequestAttributionDTO{}};
+  auto acceptance = StopAcceptanceRecord(epoch, request_id, stop_id, 1U, accepted_at_ns,
+                                         StopResolutionDispositionDTO::kExact, path);
+  acceptance.normalized_request_digest = ComputeNormalizedStopIntentDigest(intent).value();
+  const EmergencyStopProjectedIntentDTO projected(intent);
+  const auto affected = StopAffectedState({}, {});
+  auto accepted = StopAcceptedProjection(acceptance, projected, affected);
+  const auto recorded = journal.RecordStopAccepted(epoch, acceptance, projected, accepted, affected);
+  EXPECT_EQ(recorded.projection_state, EmergencyStopProjectionStateDTO::kRecorded)
+      << (recorded.error.has_value() ? recorded.error->message : std::string{});
+  return accepted;
+}
+
+struct LeanStopClear final {
+  StopFaultRecoveryIntentDTO intent;
+  StopFaultRecoveryResultDTO result;
+  StopFaultLatchDTO cleared_latch;
+  StopStatusDTO resulting_status;
+};
+
+/// The exact clear the writer accepts after `checkpoint` (recorded) joined the
+/// recorded terminal: the latch is cleared and the status carries the checkpoint.
+[[nodiscard]] LeanStopClear ClearAfterCheckpoint(const StopJournalTerminalProjectionDTO& terminal,
+                                                 const StopPostTerminalSurveillanceDTO& checkpoint,
+                                                 const RequestOwnerEpoch& epoch,
+                                                 const std::string& request_id) {
+  auto cleared_latch = *terminal.fault_latch;
+  cleared_latch.clear_projection = StopDurableProjectionStatusDTO{
+      StopDurableProjectionStateDTO::kRecorded, std::nullopt, std::nullopt};
+  cleared_latch.state = StopFaultLatchStateDTO::kCleared;
+  cleared_latch.recovery_assessment_revision = 3U;
+  cleared_latch.recovery_status = StopFaultRecoveryStatusDTO::kCleared;
+  cleared_latch.reason_code = "stop_fault_recovery_cleared";
+  cleared_latch.evidence_refs = {
+      StopFaultRecoveryEvidenceRefDTO{StopFaultRecoveryEvidenceKindDTO::kSettlement, Digest('e')}};
+  StopFaultRecoveryIntentDTO intent{
+      PublicRequestContextDTO{RequestId(request_id), epoch, "journal-test", std::nullopt},
+      cleared_latch.latch_id,
+      cleared_latch.latch_generation,
+      2U,
+      terminal.certificate.stop_certificate_id,
+      terminal.certificate.stop_certificate_revision,
+      cleared_latch.cell_id,
+      cleared_latch.retained_bundle_id,
+      cleared_latch.graph_revision,
+      {StopFaultRecoveryConfigurationExpectationDTO{
+          ControlDomainId("domain.1"), ActiveControlConfigurationId("configuration.1"),
+          ActiveControlConfigurationGeneration(1U)}},
+      std::string("operator verified cell")};
+  StopFaultRecoveryResultDTO result{intent.request_context.request_id,
+                                    RequestReplayStatusDTO::kAcceptedNew, true, cleared_latch,
+                                    std::nullopt};
+  auto status = terminal.stop_status;
+  status.surveillance = checkpoint;
+  status.surveillance_projection = checkpoint.checkpoint_projection;
+  status.fault_latch = cleared_latch;
+  return LeanStopClear{std::move(intent), std::move(result), std::move(cleared_latch),
+                       std::move(status)};
+}
+
+/// Plain sqlite3 reader for test evidence (no writes).
+class RawJournal final {
+ public:
+  explicit RawJournal(const std::filesystem::path& path) {
+    if (sqlite3_open(path.c_str(), &database_) != SQLITE_OK) {
+      sqlite3_close(database_);
+      throw std::runtime_error("test journal open failed");
+    }
+  }
+  ~RawJournal() { sqlite3_close(database_); }
+  RawJournal(const RawJournal&) = delete;
+  RawJournal& operator=(const RawJournal&) = delete;
+
+  /// Every row of `sql` as text columns (NULL is nullopt); `text` binds ?1.
+  [[nodiscard]] std::vector<std::vector<std::optional<std::string>>> Rows(
+      const std::string& sql, const std::optional<std::string>& text = std::nullopt) const {
+    sqlite3_stmt* statement = nullptr;
+    if (sqlite3_prepare_v2(database_, sql.c_str(), -1, &statement, nullptr) != SQLITE_OK) {
+      sqlite3_finalize(statement);
+      throw std::runtime_error("test query failed: " + sql);
+    }
+    if (text.has_value()) {
+      sqlite3_bind_text(statement, 1, text->data(), static_cast<int>(text->size()),
+                        SQLITE_TRANSIENT);
+    }
+    std::vector<std::vector<std::optional<std::string>>> rows;
+    while (sqlite3_step(statement) == SQLITE_ROW) {
+      auto& row = rows.emplace_back();
+      for (int column = 0; column < sqlite3_column_count(statement); ++column) {
+        if (sqlite3_column_type(statement, column) == SQLITE_NULL) {
+          row.emplace_back(std::nullopt);
+        } else {
+          row.emplace_back(std::string(
+              reinterpret_cast<const char*>(sqlite3_column_text(statement, column)),
+              static_cast<std::size_t>(sqlite3_column_bytes(statement, column))));
+        }
+      }
+    }
+    sqlite3_finalize(statement);
+    return rows;
+  }
+
+  /// The single stored terminal payload of one Stop, read through the index.
+  [[nodiscard]] std::string TerminalPayload(const std::string& stop_id) const {
+    const auto rows = Rows(
+        "SELECT t.payload_json FROM stop_projections p "
+        "JOIN journal_records t ON t.sequence=p.terminal_sequence WHERE p.stop_id=?1",
+        stop_id);
+    if (rows.size() != 1U || !rows.front().front().has_value()) {
+      throw std::runtime_error("test Stop has no single terminal row");
+    }
+    return *rows.front().front();
+  }
+
+  /// Rows in any user table column whose text contains `needle`.
+  [[nodiscard]] std::size_t Occurrences(const std::string& needle) const {
+    std::size_t total = 0U;
+    for (const auto& table :
+         Rows("SELECT name FROM sqlite_master WHERE type='table' AND name NOT LIKE 'sqlite_%'")) {
+      for (const auto& column : Rows("SELECT name FROM pragma_table_info('" + *table.front() +
+                                     "')")) {
+        total += std::stoull(*Rows("SELECT COUNT(*) FROM \"" + *table.front() +
+                                       "\" WHERE instr(CAST(\"" + *column.front() +
+                                       "\" AS TEXT),?1)>0",
+                                   needle)
+                                  .front()
+                                  .front());
+      }
+    }
+    return total;
+  }
+
+ private:
+  sqlite3* database_{nullptr};
+};
+
+[[nodiscard]] std::string FileSha256(const std::filesystem::path& path) {
+  std::ifstream stream(path, std::ios::binary);
+  const std::string bytes((std::istreambuf_iterator<char>(stream)),
+                          std::istreambuf_iterator<char>());
+  return manyforge::content_identity::sha256_digest(bytes);
+}
+
+struct LeanRoundTripCase final {
+  const char* name;
+  std::size_t participants;
+  bool escalated;
+  bool predecessor;
+};
+
+// Plan §5.2 tests 2 and 3: acceptance -> latched terminal -> 3 checkpoints
+// (retention 2) -> clear, then reopen on a new owner epoch.
+TEST(SqliteOperationJournalTest, LeanStopRecordRecoversExactTruthFromSingleStoredCopies) {
+  for (const auto& test_case :
+       {LeanRoundTripCase{"one participant nominal", 1U, false, false},
+        LeanRoundTripCase{"four participants escalated", 4U, true, false},
+        LeanRoundTripCase{"predecessor merge", 0U, false, true}}) {
+    SCOPED_TRACE(test_case.name);
+    ScopedTemporaryDirectory temporary;
+    const auto database = temporary.path() / std::string(kOperationJournalFilename);
+    const CellId cell_id("cell.1");
+    const RequestOwnerEpoch epoch("execution-host.epoch.lean-round-trip");
+    const ResourceId resource("joint.1");
+    const std::vector<ResourceId> inventory{ResourceId("joint.1"), ResourceId("joint.2")};
+    std::optional<StopJournalTerminalProjectionDTO> predecessor;
+    std::optional<StopJournalTerminalProjectionDTO> terminal;
+    std::optional<StopPostTerminalSurveillanceDTO> latest;
+    std::optional<LeanStopClear> clear;
+    {
+      SqliteOperationJournal journal(database, cell_id, 8U);
+      ASSERT_TRUE(journal.BeginOwnerEpoch(epoch, 1, 8U, inventory).ok());
+      std::vector<StopCertificateDTO> predecessors;
+      if (test_case.predecessor) {
+        const auto accepted = RecordFullStopAcceptance(journal, epoch, "request.lean.predecessor",
+                                                       "stop.lean.predecessor", 10);
+        predecessor = RealPlanTerminal(accepted, 1U, false);
+        const auto recorded = journal.RecordStopTerminal(
+            epoch, predecessor->stop_status, predecessor->certificate, predecessor->fault_latch);
+        ASSERT_EQ(recorded.state, StopForensicProjectionStateDTO::kRecorded)
+            << (recorded.error.has_value() ? recorded.error->message : std::string{});
+        predecessors.push_back(predecessor->certificate);
+      }
+      const auto accepted = RecordFullStopAcceptance(journal, epoch, "request.lean", "stop.lean", 20);
+      terminal = WithMonitoringLatch(
+          RealPlanTerminal(accepted, test_case.participants, test_case.escalated, predecessors),
+          resource);
+      const auto recorded = journal.RecordStopTerminal(epoch, terminal->stop_status,
+                                                       terminal->certificate, terminal->fault_latch);
+      ASSERT_EQ(recorded.state, StopForensicProjectionStateDTO::kRecorded)
+          << (recorded.error.has_value() ? recorded.error->message : std::string{});
+      terminal = RecordedTerminal(*terminal);
+
+      for (std::uint64_t generation = 1U; generation <= 3U; ++generation) {
+        auto checkpoint =
+            MonitoringCheckpoint(*terminal, *terminal->fault_latch, resource, generation, 2U);
+        checkpoint.owner_epoch = epoch;
+        const auto projected = journal.RecordStopSurveillanceCheckpoint(
+            epoch, checkpoint, *terminal->fault_latch, static_cast<std::int64_t>(100U + generation));
+        ASSERT_EQ(projected.state, StopForensicProjectionStateDTO::kRecorded)
+            << (projected.error.has_value() ? projected.error->message : std::string{});
+        checkpoint.checkpoint_projection = StopDurableProjectionStatusDTO{
+            StopDurableProjectionStateDTO::kRecorded, std::nullopt, std::nullopt};
+        latest = std::move(checkpoint);
+      }
+      const auto blocked = journal.CloseOwnerEpoch(epoch, 200);
+      ASSERT_FALSE(blocked.ok());
+      EXPECT_EQ(blocked.error().code, "operation_journal_owner_close_blocked");
+
+      clear = ClearAfterCheckpoint(*terminal, *latest, epoch, "request.lean.clear");
+      const auto cleared = journal.RecordStopFaultCleared(
+          epoch, clear->intent, clear->result, clear->cleared_latch, clear->resulting_status);
+      ASSERT_TRUE(cleared.ok()) << cleared.error().message;
+      const auto replay = journal.RecordStopFaultCleared(
+          epoch, clear->intent, clear->result, clear->cleared_latch, clear->resulting_status);
+      ASSERT_TRUE(replay.ok()) << replay.error().message;
+      EXPECT_EQ(replay.value(), cleared.value());
+      const auto closed = journal.CloseOwnerEpoch(epoch, 300);
+      ASSERT_TRUE(closed.ok()) << closed.error().message;
+      journal.Close();
+    }
+
+    SqliteOperationJournal replacement(database, cell_id, 8U);
+    const auto recovered = replacement.BeginOwnerEpoch(
+        RequestOwnerEpoch("execution-host.epoch.lean-round-trip.2"), 400, 8U, inventory);
+    ASSERT_TRUE(recovered.ok()) << recovered.error().message;
+    const auto& stops = recovered.value().recovered_stops;
+    ASSERT_EQ(stops.size(), test_case.predecessor ? 2U : 1U);
+    const auto find = [&](const StopId& stop_id) {
+      return std::find_if(stops.begin(), stops.end(),
+                          [&](const auto& stop) { return stop.accepted.stop_id == stop_id; });
+    };
+    const auto stop = find(terminal->certificate.stop_id);
+    ASSERT_NE(stop, stops.end());
+    EXPECT_EQ(stop->accepted, terminal->stop_status.accepted);
+    EXPECT_EQ(stop->terminal_certificate, terminal->certificate);
+    EXPECT_EQ(stop->fault_latch, clear->cleared_latch);
+    EXPECT_EQ(stop->surveillance, latest);
+
+    const RawJournal raw(database);
+    const auto bytes = raw.TerminalPayload(terminal->certificate.stop_id.value());
+    const auto decoded = DecodeStopJournalTerminalProjection(bytes);
+    ASSERT_TRUE(decoded.ok()) << decoded.error().message;
+    EXPECT_EQ(decoded.value(), *terminal);
+    // Test 3: the index holds sequences only and every terminal payload is
+    // stored exactly once in the whole database.
+    EXPECT_EQ(raw.Occurrences(bytes), 1U);
+    std::vector<std::string> columns;
+    for (const auto& row : raw.Rows("SELECT name FROM pragma_table_info('stop_projections')")) {
+      columns.push_back(*row.front());
+    }
+    EXPECT_EQ(columns, (std::vector<std::string>{"stop_id", "stop_generation",
+                                                 "acceptance_sequence", "accepted_payload",
+                                                 "accepted_digest", "terminal_sequence", "surveillance_sequence",
+                                                 "clear_sequence"}));
+    if (test_case.predecessor) {
+      const auto merged = find(predecessor->certificate.stop_id);
+      ASSERT_NE(merged, stops.end());
+      EXPECT_EQ(merged->terminal_certificate, predecessor->certificate);
+      EXPECT_FALSE(merged->fault_latch.has_value());
+      EXPECT_FALSE(merged->surveillance.has_value());
+      const auto predecessor_bytes = raw.TerminalPayload(predecessor->certificate.stop_id.value());
+      const auto decoded_predecessor = DecodeStopJournalTerminalProjection(predecessor_bytes);
+      ASSERT_TRUE(decoded_predecessor.ok()) << decoded_predecessor.error().message;
+      EXPECT_EQ(decoded_predecessor.value(), RecordedTerminal(*predecessor));
+      EXPECT_EQ(raw.Occurrences(predecessor_bytes), 1U);
+    }
+  }
+}
+
+// Plan §5.2 test 4: history capacity 8, 20 operations, 3 owner epochs, joined
+// receipts and checkpoint retention keep every index reference valid.
+TEST(SqliteOperationJournalTest, LeanStopIndexKeepsEveryReferenceAcrossPruningAndOwnerEpochs) {
+  ScopedTemporaryDirectory temporary;
+  const auto database = temporary.path() / std::string(kOperationJournalFilename);
+  const CellId cell_id("cell.1");
+  const ResourceId resource("robot.gripper");
+  const std::vector<ResourceId> inventory{resource};
+  std::vector<StopJournalTerminalProjectionDTO> terminals;
+  std::optional<LeanStopClear> clear;
+  std::optional<StopPostTerminalSurveillanceDTO> latest;
+  std::size_t operations = 0U;
+  for (std::size_t epoch_index = 1U; epoch_index <= 3U; ++epoch_index) {
+    SCOPED_TRACE(epoch_index);
+    const auto suffix = std::to_string(epoch_index);
+    const auto base_time = static_cast<std::int64_t>(epoch_index * 1000U);
+    const RequestOwnerEpoch epoch("execution-host.epoch.lean-prune." + suffix);
+    SqliteOperationJournal journal(database, cell_id, 8U);
+    const auto begun = journal.BeginOwnerEpoch(epoch, base_time, 16U, inventory);
+    ASSERT_TRUE(begun.ok()) << begun.error().message;
+    EXPECT_EQ(begun.value().recovered_stops.size(), terminals.size());
+    for (std::size_t index = 0U; index < (epoch_index == 3U ? 6U : 7U); ++index, ++operations) {
+      const auto at = base_time + 10 + static_cast<std::int64_t>(index * 2U);
+      auto state = OperationState("operation.lean-prune." + suffix + "." + std::to_string(index),
+                                  OperationStateKind::kExecuting, at);
+      const auto command = CommandIntent(
+          "request.lean-prune." + suffix + "." + std::to_string(index), epoch.value());
+      ASSERT_TRUE(
+          journal.RecordOperationAccepted(epoch, command, Acceptance(command, state), state).ok());
+      state.updated_at_ns = at + 1;
+      state.operation_revision = OperationRevision(2U);
+      state.state = OperationStateKind::kCompleted;
+      state.participants.front().state = OperationStateKind::kCompleted;
+      ASSERT_TRUE(
+          journal.RecordOperationState(epoch, state, nullptr, "subordinate_completed").ok());
+    }
+    const auto stop_id = "stop.lean-prune." + suffix;
+    const auto accepted = RecordFullStopAcceptance(journal, epoch, "request.stop." + suffix,
+                                                   stop_id, base_time + 100);
+    for (std::size_t joined = 0U; joined < 4U; ++joined) {
+      (void)RecordFullStopAcceptance(journal, epoch,
+                                     "request.stop." + suffix + ".joined." + std::to_string(joined),
+                                     stop_id, base_time + 101 + static_cast<std::int64_t>(joined),
+                                     EmergencyStopAcceptancePathDTO::kJoinedResident);
+    }
+    const bool latched = epoch_index == 2U;
+    auto terminal = latched ? MonitoringTerminalProjection(accepted, resource)
+                            : EmptyTerminalProjection(accepted);
+    ASSERT_EQ(journal
+                  .RecordStopTerminal(epoch, terminal.stop_status, terminal.certificate,
+                                      terminal.fault_latch)
+                  .state,
+              StopForensicProjectionStateDTO::kRecorded);
+    terminals.push_back(RecordedTerminal(std::move(terminal)));
+    if (latched) {
+      const auto& recorded = terminals.back();
+      for (std::uint64_t generation = 1U; generation <= 3U; ++generation) {
+        auto checkpoint =
+            MonitoringCheckpoint(recorded, *recorded.fault_latch, resource, generation, 2U);
+        checkpoint.owner_epoch = epoch;
+        ASSERT_EQ(journal
+                      .RecordStopSurveillanceCheckpoint(
+                          epoch, checkpoint, *recorded.fault_latch,
+                          base_time + 200 + static_cast<std::int64_t>(generation))
+                      .state,
+                  StopForensicProjectionStateDTO::kRecorded);
+        checkpoint.checkpoint_projection = StopDurableProjectionStatusDTO{
+            StopDurableProjectionStateDTO::kRecorded, std::nullopt, std::nullopt};
+        latest = std::move(checkpoint);
+      }
+      clear = ClearAfterCheckpoint(recorded, *latest, epoch, "request.stop." + suffix + ".clear");
+      const auto cleared = journal.RecordStopFaultCleared(
+          epoch, clear->intent, clear->result, clear->cleared_latch, clear->resulting_status);
+      ASSERT_TRUE(cleared.ok()) << cleared.error().message;
+    }
+
+    // The host event pump decodes every Stop record of this epoch.
+    std::size_t decoded_terminals = 0U;
+    std::uint64_t after = 0U;
+    for (bool more = true; more;) {
+      const auto page = journal.ReadOperationalEvents(epoch, after, kMaximumOperationJournalEventPage);
+      ASSERT_TRUE(page.ok()) << page.error().message;
+      for (const auto& event : page.value().events) {
+        if (event.record_kind == "stop_terminal_projected") {
+          const auto decoded = DecodeStopJournalTerminalProjection(event.payload_json);
+          ASSERT_TRUE(decoded.ok()) << decoded.error().message;
+          EXPECT_EQ(decoded.value(), terminals.back());
+          ++decoded_terminals;
+        } else if (event.record_kind == "stop_fault_cleared") {
+          const auto decoded = DecodeStopJournalFaultClearProjection(event.payload_json);
+          ASSERT_TRUE(decoded.ok()) << decoded.error().message;
+          EXPECT_EQ(decoded.value(),
+                    (StopJournalFaultClearProjectionDTO{clear->intent, clear->result}));
+        }
+      }
+      after = page.value().next_after_sequence;
+      more = page.value().has_more;
+    }
+    EXPECT_EQ(decoded_terminals, 1U);
+    const auto closed = journal.CloseOwnerEpoch(epoch, base_time + 900);
+    ASSERT_TRUE(closed.ok()) << closed.error().message;
+    journal.Close();
+  }
+  EXPECT_EQ(operations, 20U);
+
+  {
+    SqliteOperationJournal replacement(database, cell_id, 8U);
+    const auto recovered = replacement.BeginOwnerEpoch(
+        RequestOwnerEpoch("execution-host.epoch.lean-prune.4"), 5000, 16U, inventory);
+    ASSERT_TRUE(recovered.ok()) << recovered.error().message;
+    EXPECT_LE(recovered.value().historical_operations.size(), 8U);
+    const auto& stops = recovered.value().recovered_stops;
+    ASSERT_EQ(stops.size(), terminals.size());
+    for (std::size_t index = 0U; index < stops.size(); ++index) {
+      EXPECT_EQ(stops[index].accepted, terminals[index].stop_status.accepted);
+      EXPECT_EQ(stops[index].terminal_certificate, terminals[index].certificate);
+    }
+    ASSERT_TRUE(clear.has_value());
+    EXPECT_EQ(stops[1].fault_latch, clear->cleared_latch);
+    EXPECT_EQ(stops[1].surveillance, latest);
+    replacement.Close();
+  }
+
+  const RawJournal raw(database);
+  EXPECT_TRUE(raw.Rows("PRAGMA foreign_key_check").empty());
+  for (const auto& terminal : terminals) {
+    const auto decoded =
+        DecodeStopJournalTerminalProjection(raw.TerminalPayload(terminal.certificate.stop_id.value()));
+    ASSERT_TRUE(decoded.ok()) << decoded.error().message;
+    EXPECT_EQ(decoded.value(), terminal);
+  }
+  // 3 creating acceptances stay indexed; of the 12 unanchored joined receipts
+  // of closed epochs the newest 8 (history capacity) are retained.
+  EXPECT_EQ(*raw.Rows("SELECT COUNT(*) FROM journal_records "
+                      "WHERE record_kind='stop_acceptance_projected'")
+                 .front()
+                 .front(),
+            "11");
+  // Only the retained latest checkpoint survives the prune of closed epochs.
+  EXPECT_EQ(*raw.Rows("SELECT COUNT(*) FROM journal_records "
+                      "WHERE record_kind='stop_surveillance_checkpoint'")
+                 .front()
+                 .front(),
+            "1");
+}
+
+// Plan §5.2 test 5: a v16 journal (Stop payload copies) is refused with the
+// explicit message and its file bytes stay unchanged.
+TEST(SqliteOperationJournalTest, V16JournalIsRefusedAndItsFileBytesStayUnchanged) {
+  ScopedTemporaryDirectory temporary;
+  const auto database = temporary.path() / std::string(kOperationJournalFilename);
+  const CellId cell_id("cell.1");
+  const RequestOwnerEpoch epoch("execution-host.epoch.v16");
+  {
+    SqliteOperationJournal journal(database, cell_id, 8U);
+    ASSERT_TRUE(journal.BeginOwnerEpoch(epoch, 1, 8U, {}).ok());
+    const auto accepted = RecordFullStopAcceptance(journal, epoch, "request.v16", "stop.v16", 10);
+    const auto terminal = EmptyTerminalProjection(accepted);
+    ASSERT_EQ(journal
+                  .RecordStopTerminal(epoch, terminal.stop_status, terminal.certificate,
+                                      terminal.fault_latch)
+                  .state,
+              StopForensicProjectionStateDTO::kRecorded);
+    journal.Close();
+  }
+  sqlite3* legacy = nullptr;
+  ASSERT_EQ(sqlite3_open(database.c_str(), &legacy), SQLITE_OK);
+  ASSERT_EQ(sqlite3_exec(legacy,
+                         "PRAGMA user_version=16; UPDATE journal_metadata SET schema_version=16,"
+                         "schema_id='manyforge.internal.execution.operation-journal.o1.5.v16' "
+                         "WHERE singleton=1;",
+                         nullptr, nullptr, nullptr),
+            SQLITE_OK);
+  ASSERT_EQ(sqlite3_close(legacy), SQLITE_OK);
+  const auto before = FileSha256(database);
+  // The constructor reports operation_journal_format_unsupported as a
+  // std::runtime_error whose text is the refusal message.
+  try {
+    SqliteOperationJournal refused(database, cell_id, 8U);
+    ADD_FAILURE() << "a v16 journal was opened";
+  } catch (const std::runtime_error& error) {
+    EXPECT_EQ(std::string(error.what()),
+              "operation journal predates the lean Stop record (v17) and is not converted");
+  }
+  EXPECT_EQ(FileSha256(database), before);
+}
+
+TEST(SqliteOperationJournalTest, ChangedValidAcceptedPayloadFailsNonterminalStopRecovery) {
+  // The lean acceptance keeps its own digest: valid but changed accepted bytes
+  // with the original digest are refused before the Stop is adopted.
+  ScopedTemporaryDirectory temporary;
+  const auto database = temporary.path() / std::string(kOperationJournalFilename);
+  const CellId cell_id("cell.1");
+  const RequestOwnerEpoch epoch("execution-host.epoch.lean-accepted");
+  {
+    SqliteOperationJournal journal(database, cell_id, 8U);
+    ASSERT_TRUE(journal.BeginOwnerEpoch(epoch, 1, 8U, {}).ok());
+    static_cast<void>(RecordFullStopAcceptance(journal, epoch, "request.lean-accepted",
+                                               "stop.lean-accepted", 10));
+    journal.Close();
+  }
+  sqlite3* raw = nullptr;
+  ASSERT_EQ(sqlite3_open(database.c_str(), &raw), SQLITE_OK);
+  std::unique_ptr<sqlite3, decltype(&sqlite3_close)> owned(raw, sqlite3_close);
+  std::string original;
+  std::string digest;
+  {
+    sqlite3_stmt* select = nullptr;
+    ASSERT_EQ(sqlite3_prepare_v2(raw,
+                                 "SELECT accepted_payload,accepted_digest FROM stop_projections "
+                                 "WHERE terminal_sequence IS NULL",
+                                 -1, &select, nullptr),
+              SQLITE_OK);
+    std::unique_ptr<sqlite3_stmt, decltype(&sqlite3_finalize)> guard(select, sqlite3_finalize);
+    ASSERT_EQ(sqlite3_step(select), SQLITE_ROW);
+    original = reinterpret_cast<const char*>(sqlite3_column_text(select, 0));
+    digest = reinterpret_cast<const char*>(sqlite3_column_text(select, 1));
+    ASSERT_EQ(sqlite3_step(select), SQLITE_DONE);
+  }
+  EXPECT_EQ(digest, manyforge::content_identity::sha256_digest(original));
+  auto changed = DecodeStopJournalAcceptanceProjection(original);
+  ASSERT_TRUE(changed.ok()) << changed.error().message;
+  changed.value().accepted.accepted_at_ns += 1;
+  const auto changed_bytes = EncodeStopJournalAcceptanceProjection(changed.value());
+  ASSERT_TRUE(changed_bytes.ok()) << changed_bytes.error().message;
+  ASSERT_NE(changed_bytes.value(), original);
+  ASSERT_TRUE(DecodeStopJournalAcceptanceProjection(changed_bytes.value()).ok());
+  {
+    sqlite3_stmt* update = nullptr;
+    ASSERT_EQ(sqlite3_prepare_v2(raw, "UPDATE stop_projections SET accepted_payload=?", -1,
+                                 &update, nullptr),
+              SQLITE_OK);
+    std::unique_ptr<sqlite3_stmt, decltype(&sqlite3_finalize)> guard(update, sqlite3_finalize);
+    ASSERT_EQ(sqlite3_bind_text(update, 1, changed_bytes.value().c_str(), -1, SQLITE_TRANSIENT),
+              SQLITE_OK);
+    ASSERT_EQ(sqlite3_step(update), SQLITE_DONE);
+    EXPECT_EQ(sqlite3_changes(raw), 1);
+  }
+  owned.reset();
+
+  SqliteOperationJournal replacement(database, cell_id, 8U);
+  const auto recovered = replacement.BeginOwnerEpoch(
+      RequestOwnerEpoch("execution-host.epoch.lean-accepted.2"), 20, 8U, {});
+  ASSERT_FALSE(recovered.ok());
+  EXPECT_EQ(recovered.error().code, "operation_journal_corrupt");
+  EXPECT_EQ(recovered.error().message,
+            "Stop acceptance recovery projection digest does not match its bytes");
+}
+
+TEST(SqliteOperationJournalTest, CorruptTerminalRowDigestFailsLeanStopRecovery) {
+  ScopedTemporaryDirectory temporary;
+  const auto database = temporary.path() / std::string(kOperationJournalFilename);
+  const CellId cell_id("cell.1");
+  const RequestOwnerEpoch epoch("execution-host.epoch.lean-digest");
+  {
+    SqliteOperationJournal journal(database, cell_id, 8U);
+    ASSERT_TRUE(journal.BeginOwnerEpoch(epoch, 1, 8U, {}).ok());
+    const auto accepted =
+        RecordFullStopAcceptance(journal, epoch, "request.lean-digest", "stop.lean-digest", 10);
+    const auto terminal = EmptyTerminalProjection(accepted);
+    ASSERT_EQ(journal
+                  .RecordStopTerminal(epoch, terminal.stop_status, terminal.certificate,
+                                      terminal.fault_latch)
+                  .state,
+              StopForensicProjectionStateDTO::kRecorded);
+    journal.Close();
+  }
+  sqlite3* corrupt = nullptr;
+  ASSERT_EQ(sqlite3_open(database.c_str(), &corrupt), SQLITE_OK);
+  const auto update = "UPDATE journal_records SET payload_digest='" + Digest('0').value() +
+                      "' WHERE record_kind='stop_terminal_projected'";
+  ASSERT_EQ(sqlite3_exec(corrupt, update.c_str(), nullptr, nullptr, nullptr), SQLITE_OK);
+  EXPECT_EQ(sqlite3_changes(corrupt), 1);
+  ASSERT_EQ(sqlite3_close(corrupt), SQLITE_OK);
+
+  SqliteOperationJournal replacement(database, cell_id, 8U);
+  const auto recovered =
+      replacement.BeginOwnerEpoch(RequestOwnerEpoch("execution-host.epoch.lean-digest.2"), 20, 8U, {});
+  ASSERT_FALSE(recovered.ok());
+  EXPECT_EQ(recovered.error().code, "operation_journal_corrupt");
 }
 
 }  // namespace

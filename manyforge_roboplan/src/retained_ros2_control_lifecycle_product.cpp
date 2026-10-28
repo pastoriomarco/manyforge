@@ -31,6 +31,30 @@ namespace {
          xarm_control::kXArmRos2ControlLifecycleProviderManifestId;
 }
 
+// Its gripper domain's provider: the shared plans, Recover aligned to the arm.
+[[nodiscard]] bool real_xarm_gripper_provider(const core::ProviderManifestId &id) {
+  return id.value() == kXArmRos2ControlGripperLifecycleProviderManifestId;
+}
+
+// The catalog of `plans`, anchored by its own provider manifest.
+[[nodiscard]] core::Result<core::BrandLifecyclePlanCatalogDTO>
+anchored_catalog(const core::ProviderManifestDTO &manifest,
+                 std::vector<core::LifecycleIntentPlanDTO> plans) {
+  auto catalog = core::MakeBrandLifecyclePlanCatalog(
+      manifest.provider_manifest_id, manifest.provider_manifest_revision,
+      std::move(plans));
+  if (!catalog.ok()) {
+    return catalog;
+  }
+  const auto anchored = core::VerifyBrandLifecyclePlanCatalogManifestAnchor(
+      manifest, catalog.value());
+  if (!anchored.ok()) {
+    return core::Result<core::BrandLifecyclePlanCatalogDTO>::Err(
+        anchored.error());
+  }
+  return catalog;
+}
+
 } // namespace
 
 core::Result<core::BrandLifecyclePlanCatalogDTO>
@@ -38,12 +62,21 @@ make_retained_physical_ros2_control_lifecycle_catalog(
     const core::ProviderManifestDTO &manifest) {
   if (real_xarm_provider(manifest.provider_manifest_id))
     return xarm_control::make_xarm_ros2_control_lifecycle_catalog(manifest);
+  if (real_xarm_gripper_provider(manifest.provider_manifest_id))
+    return anchored_catalog(manifest,
+                            retained_ros2_control_gripper_lifecycle_plans());
   return make_retained_ros2_control_lifecycle_catalog(manifest);
 }
 
 std::vector<core::LifecycleIntentPlanDTO>
 retained_ros2_control_lifecycle_plans() {
   return detail::ros2_control_lifecycle_plans_internal::retained_ros2_control_lifecycle_plans();
+}
+
+std::vector<core::LifecycleIntentPlanDTO>
+retained_ros2_control_gripper_lifecycle_plans() {
+  return detail::ros2_control_lifecycle_plans_internal::
+      retained_ros2_control_gripper_lifecycle_plans();
 }
 
 core::Result<core::BrandLifecyclePlanCatalogDTO>
@@ -56,19 +89,7 @@ make_retained_ros2_control_lifecycle_catalog(
         "the provider manifest is not the retained ROS control product",
         "provider_manifest_id_unsupported"));
   }
-  auto catalog = core::MakeBrandLifecyclePlanCatalog(
-      manifest.provider_manifest_id, manifest.provider_manifest_revision,
-      retained_ros2_control_lifecycle_plans());
-  if (!catalog.ok()) {
-    return catalog;
-  }
-  const auto anchored = core::VerifyBrandLifecyclePlanCatalogManifestAnchor(
-      manifest, catalog.value());
-  if (!anchored.ok()) {
-    return core::Result<core::BrandLifecyclePlanCatalogDTO>::Err(
-        anchored.error());
-  }
-  return catalog;
+  return anchored_catalog(manifest, retained_ros2_control_lifecycle_plans());
 }
 
 RetainedHostLifecycleProduct::RetainedHostLifecycleProduct(
@@ -275,7 +296,8 @@ RetainedHostLifecycleProduct::Create(
     // physical factory's fixed provider requirement.
     if (selected_path->provider_manifest_id.value() !=
             kRos2ControlLifecycleProviderManifestId &&
-        !real_xarm_provider(selected_path->provider_manifest_id))
+        !real_xarm_provider(selected_path->provider_manifest_id) &&
+        !real_xarm_gripper_provider(selected_path->provider_manifest_id))
       return core::Result<std::unique_ptr<RetainedHostLifecycleProduct>>::Err(
           product_error(
               "ros2_control_lifecycle_product_unsupported",

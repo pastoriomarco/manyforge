@@ -14,6 +14,7 @@
 #include <manyforge_component_manager/manager_liveness_transport.hpp>
 #include <manyforge_component_manager/manager_named_apply_coordinator.hpp>
 #include <manyforge_deployment/initial_scene_projection.hpp>
+#include <manyforge_deployment/io_signal_catalog.hpp>
 #include <manyforge_deployment/apply_component_delta.hpp>
 #include <manyforge_deployment/prepared_activation_repository.hpp>
 #include <manyforge_deployment/program_binding_outcome.hpp>
@@ -67,6 +68,7 @@
 #include <string_view>
 #include <system_error>
 #include <thread>
+#include <type_traits>
 #include <tuple>
 #include <utility>
 #include <variant>
@@ -1718,6 +1720,67 @@ CanonicalValue Pose(const core::Pose3DTO &value) {
   });
 }
 
+CanonicalValue SceneRuntimeFrame(
+    const core::ComponentSceneFrameRefDTO &value) {
+  return CanonicalValue(CanonicalValue::Object{
+      {"controllable_component_id",
+       CanonicalValue(value.controllable_component_id.value())},
+      {"frame_role_id", CanonicalValue(value.frame_role_id.value())},
+      {"kind", CanonicalValue("component")},
+      {"model_instance_id", CanonicalValue(value.model_instance_id.value())},
+  });
+}
+
+CanonicalValue SceneRuntimePoseDistanceValue(
+    const SceneRuntimePoseDistance &value) {
+  return CanonicalValue(CanonicalValue::Object{
+      {"rotation_rad", CanonicalValue(value.rotation_rad)},
+      {"translation_m", CanonicalValue(value.translation_m)},
+  });
+}
+
+void AppendSceneRuntimePoseMeasurement(
+    CanonicalValue::Object &row,
+    const SceneRuntimePoseMeasurement &measurement) {
+  if (measurement.holder) {
+    row.emplace_back(
+        "holder",
+        CanonicalValue(CanonicalValue::Object{
+            {"command_target_id",
+             CanonicalValue(measurement.holder->command_target_id.value())},
+            {"controllable_component_id",
+             CanonicalValue(
+                 measurement.holder->controllable_component_id.value())},
+            {"gripper_link", CanonicalValue(measurement.holder->gripper_link)},
+        }));
+  }
+  const auto measured_against = std::visit(
+      [](const auto &value) -> CanonicalValue {
+        using T = std::decay_t<decltype(value)>;
+        if constexpr (std::is_same_v<T, std::string>) {
+          return CanonicalValue(value);
+        } else {
+          return CanonicalValue(CanonicalValue::Object{
+              {"entity", CanonicalValue(value.entity)},
+              {"link", CanonicalValue(value.link)},
+          });
+        }
+      },
+      measurement.measured_against);
+  row.emplace_back("measured_against", measured_against);
+  row.emplace_back("frame", SceneRuntimeFrame(measurement.frame));
+  row.emplace_back("current_offset", Pose(measurement.current_offset));
+  if (measurement.source_header_frame_id) {
+    row.emplace_back("source_header_frame_id",
+                     CanonicalValue(*measurement.source_header_frame_id));
+  }
+  if (measurement.baseline_offset && measurement.drift) {
+    row.emplace_back("baseline_offset", Pose(*measurement.baseline_offset));
+    row.emplace_back("drift",
+                     SceneRuntimePoseDistanceValue(*measurement.drift));
+  }
+}
+
 CanonicalValue ScenePoseResponse(
     const core::ProjectionRevisionDTO &projection_revision,
     const std::vector<std::pair<core::SceneResourceId, core::Pose3DTO>>
@@ -2794,13 +2857,13 @@ public:
   }
 
   // Fixed pose of an attachment carrier frame in a source-local link of the
-  // carrier's model instance, from the retained model map and the compiled
-  // planning URDF. Only successful resolutions are cached.
-  [[nodiscard]] core::Result<core::Pose3DTO>
+  // carrier's model instance, plus the carrier's source link name. Only
+  // successful resolutions are cached.
+  [[nodiscard]] core::Result<SceneRuntimeReferenceLinkResolution>
   CarrierInReferenceLink(const core::RetainedBundleId &retained_bundle_id,
                          const core::ComponentSceneFrameRefDTO &carrier,
                          const std::string &reference_link) const {
-    using Reply = core::Result<core::Pose3DTO>;
+    using Reply = core::Result<SceneRuntimeReferenceLinkResolution>;
     const auto refused = [&](std::string code, std::string message) {
       return Reply::Err(core::ErrorDTO{
           std::move(code), std::move(message),
@@ -2846,13 +2909,19 @@ public:
             frame->frame_role_id == carrier.frame_role_id)
           carrier_links.push_back(&frame->compiled_frame_name);
       std::vector<const std::string *> reference_links;
+      std::vector<const std::string *> carrier_source_links;
       for (const auto &symbol : model_map->symbols())
         if (symbol.source.model_instance_id == carrier.model_instance_id &&
             symbol.source.kind == deployment::OccurrenceSymbolKind::kLink &&
-            symbol.source.scope_name.empty() &&
-            symbol.source.source_name == reference_link)
-          reference_links.push_back(&symbol.compiled_name);
-      if (carrier_links.size() != 1U || reference_links.size() != 1U)
+            symbol.source.scope_name.empty()) {
+          if (symbol.source.source_name == reference_link)
+            reference_links.push_back(&symbol.compiled_name);
+          if (carrier_links.size() == 1U &&
+              symbol.compiled_name == *carrier_links.front())
+            carrier_source_links.push_back(&symbol.source.source_name);
+        }
+      if (carrier_links.size() != 1U || reference_links.size() != 1U ||
+          carrier_source_links.size() != 1U)
         return refused("scene_runtime_pose_reference_link_unknown",
                        "reference link or carrier frame is not one retained "
                        "model link");
@@ -2863,18 +2932,20 @@ public:
       if (!urdf.has_value())
         return refused("scene_runtime_pose_reference_unresolved",
                        "retained planning URDF is unavailable");
-      auto result = SceneRuntimeFixedLinkTransform(
+      auto transform = SceneRuntimeFixedLinkTransform(
           deployment::parse_model_documents_for_projection(urdf->bytes(),
                                                            std::nullopt)
               .urdf,
           *reference_links.front(), *carrier_links.front());
-      if (result.ok()) {
-        std::lock_guard lock(mutex_);
-        if (carrier_reference_poses_.size() >= 16U)
-          carrier_reference_poses_.clear();
-        carrier_reference_poses_.emplace(key, result.value());
-      }
-      return result;
+      if (!transform.ok())
+        return Reply::Err(transform.error());
+      SceneRuntimeReferenceLinkResolution result{
+          transform.value(), *carrier_source_links.front()};
+      std::lock_guard lock(mutex_);
+      if (carrier_reference_poses_.size() >= 16U)
+        carrier_reference_poses_.clear();
+      carrier_reference_poses_.emplace(key, result);
+      return Reply::Ok(std::move(result));
     } catch (const std::exception &error) {
       return refused("scene_runtime_pose_reference_unresolved", error.what());
     }
@@ -2897,7 +2968,7 @@ private:
       runtime_products_;
   mutable std::map<std::tuple<std::string, std::string, std::string,
                               std::string, std::string>,
-                   core::Pose3DTO>
+                   SceneRuntimeReferenceLinkResolution>
       carrier_reference_poses_;
 };
 
@@ -3075,6 +3146,10 @@ public:
             },
             [this](const SceneRuntimeCarriedObjectLoss &loss) {
               return RequestCarrierStop(loss);
+            },
+            [this](const SceneRuntimeCarriedObjectLoss &loss) {
+              return PublishCarriedObjectLostLevel(
+                  loss.controllable_component_id, loss.command_target_id, loss);
             }),
         plan_source_(stores_.active_bundle_publication_store(),
                      stores_.apply_journal(),
@@ -4060,6 +4135,7 @@ private:
     last_submitted_readiness_ = snapshot;
     if (snapshot.program_cycle_status_current && snapshot.program_cycle_status)
       established_program_cycle_status_ = snapshot.program_cycle_status;
+    ClearCarriedObjectLostOnReset(snapshot);
   }
 
   void RetainRunnerContactFailure(const std::string_view predicate,
@@ -4780,10 +4856,89 @@ private:
   }
 
   std::uint64_t PublishSceneRuntime(const std::int64_t observed_at) {
+    const auto runtime_snapshot = scene_runtime_owner_.Snapshot();
     auto payload = BuildSceneRuntimeSourcePayload(
-        admission_.cell_id().value(), scene_runtime_owner_.Snapshot());
+        admission_.cell_id().value(), runtime_snapshot);
     {
       std::lock_guard lock(manager_source_mutex_);
+      auto payload_object =
+          std::get<CanonicalValue::Object>(payload.storage());
+      const auto state = std::find_if(
+          payload_object.begin(), payload_object.end(), [](const auto &field) {
+            return field.first == "state";
+          });
+      if (state != payload_object.end() &&
+          runtime_snapshot.runtime_identity) {
+        auto state_object =
+            std::get<CanonicalValue::Object>(state->second.storage());
+        const auto sources = std::find_if(
+            state_object.begin(), state_object.end(), [](const auto &field) {
+              return field.first == "pose_sources";
+            });
+        if (sources != state_object.end()) {
+          auto rows =
+              std::get<CanonicalValue::Array>(sources->second.storage());
+          const auto text_field = [](const CanonicalValue::Object &object,
+                                     const std::string_view name)
+              -> const std::string * {
+            const auto field = std::find_if(
+                object.begin(), object.end(), [&](const auto &entry) {
+                  return entry.first == name;
+                });
+            return field != object.end() && field->second.is_string()
+                       ? &field->second.as_string()
+                       : nullptr;
+          };
+          const auto number_field = [](const CanonicalValue::Object &object,
+                                       const std::string_view name)
+              -> const double * {
+            const auto field = std::find_if(
+                object.begin(), object.end(), [&](const auto &entry) {
+                  return entry.first == name;
+                });
+            return field == object.end()
+                       ? nullptr
+                       : std::get_if<double>(&field->second.storage());
+          };
+          for (auto &source : rows) {
+            if (!source.is_object())
+              continue;
+            auto row = source.as_object();
+            const auto *source_id = text_field(row, "source_id");
+            const auto *object_id = text_field(row, "object_id");
+            const auto *policy_id = text_field(row, "policy_id");
+            const auto *source_epoch = text_field(row, "source_epoch");
+            const auto *source_epoch_order =
+                number_field(row, "source_epoch_order");
+            const auto *source_sequence = number_field(row, "source_sequence");
+            if (source_id == nullptr || object_id == nullptr ||
+                policy_id == nullptr || source_epoch == nullptr ||
+                source_epoch_order == nullptr || source_sequence == nullptr)
+              continue;
+            const PoseObservationKey key{*source_id, *object_id, *policy_id};
+            const auto replay = pose_observation_replays_.find(key);
+            if (replay == pose_observation_replays_.end())
+              continue;
+            const auto &observation = replay->second.observation;
+            if (replay->second.runtime_identity !=
+                    *runtime_snapshot.runtime_identity ||
+                observation.source_epoch != *source_epoch ||
+                static_cast<double>(observation.source_epoch_order) !=
+                    *source_epoch_order ||
+                static_cast<double>(observation.source_sequence) !=
+                    *source_sequence ||
+                !replay->second.application ||
+                !replay->second.application->valid() ||
+                !replay->second.application->pose_measurement)
+              continue;
+            AppendSceneRuntimePoseMeasurement(
+                row, *replay->second.application->pose_measurement);
+            source = CanonicalValue(std::move(row));
+          }
+          sources->second = CanonicalValue(std::move(rows));
+        }
+        state->second = CanonicalValue(std::move(state_object));
+      }
       CanonicalValue::Array joint_states;
       for (const auto &source : configured_pose_sources_) {
         if (!source.joint_state)
@@ -4796,10 +4951,9 @@ private:
             {"topic", CanonicalValue(source.joint_state->topic)},
         });
       }
-      auto object = std::get<CanonicalValue::Object>(payload.storage());
-      object.emplace_back("configured_joint_states",
-                          CanonicalValue(std::move(joint_states)));
-      payload = CanonicalValue(std::move(object));
+      payload_object.emplace_back("configured_joint_states",
+                                  CanonicalValue(std::move(joint_states)));
+      payload = CanonicalValue(std::move(payload_object));
     }
     return scene_runtime_channel_
         .Publish("scene_runtime", scene_runtime_owner_id_,
@@ -5121,6 +5275,152 @@ private:
     }
   }
 
+  // Publishes one gripper's `carried_object_lost.<target>` system signal level
+  // into the execution host's signal ingress, on the same control socket and
+  // envelope as the loss Stop (contract §8.4). `loss` (attachment, object,
+  // loss event id, stored key; §10) is present iff the level is `true`. The
+  // host records the level even while no composition holds the signal.
+  std::optional<core::ErrorDTO> PublishCarriedObjectLostLevel(
+      const core::ControllableComponentId &component,
+      const core::CommandTargetId &target,
+      const std::optional<SceneRuntimeCarriedObjectLoss> &loss) {
+    try {
+      const auto response = ExchangeLocalPacket(
+          config_.execution_run_root / "execution-control.sock",
+          CanonicalValue(CanonicalValue::Object{
+              {"api_version", CanonicalValue("manyforge.execution_command.v1")},
+              {"attribution",
+               CanonicalValue(CanonicalValue::Object{
+                   {"assurance", CanonicalValue("unverified")},
+                   {"principal_id", CanonicalValue(nullptr)},
+                   {"transport", CanonicalValue("internal")}})},
+              {"command", CanonicalValue("set_carried_object_lost")},
+              {"request",
+               CanonicalValue(CanonicalValue::Object{
+                   {"carried_object_attachment_id",
+                    loss ? CanonicalValue(loss->carried_object_attachment_id.value())
+                         : CanonicalValue(nullptr)},
+                   {"command_target_id", CanonicalValue(target.value())},
+                   {"controllable_component_id",
+                    CanonicalValue(component.value())},
+                   {"level", CanonicalValue(loss.has_value())},
+                   {"loss_event_id", loss ? CanonicalValue(loss->loss_event_id)
+                                          : CanonicalValue(nullptr)},
+                   {"scene_resource_id",
+                    loss ? CanonicalValue(loss->scene_resource_id.value())
+                         : CanonicalValue(nullptr)},
+                   {"set_key", loss && loss->set_key
+                                   ? CanonicalValue(*loss->set_key)
+                                   : CanonicalValue(nullptr)}})}}),
+          "Kernel carried-object-lost signal",
+          {kMaximumKernelStopResponseBytes, 32U});
+      const auto *ok = response.find_object_member("ok");
+      if (ok == nullptr || !ok->is_bool() || !ok->as_bool()) {
+        const auto *error = response.find_object_member("error");
+        const auto *code =
+            error != nullptr ? error->find_object_member("code") : nullptr;
+        return core::ErrorDTO{code != nullptr && code->is_string()
+                                  ? code->as_string()
+                                  : "carried_object_lost_signal_refused",
+                              "execution host refused the signal level",
+                              {}};
+      }
+      // Recorded; a composition that does not hold the signal yet reports it.
+      const auto *publication = response.find_object_member("publication_error");
+      const auto *code = publication != nullptr && publication->is_object()
+                             ? publication->find_object_member("code")
+                             : nullptr;
+      if (code != nullptr && code->is_string())
+        return core::ErrorDTO{code->as_string(),
+                              "signal level recorded but not yet delivered",
+                              {}};
+      return std::nullopt;
+    } catch (const std::exception &error) {
+      return core::ErrorDTO{"carried_object_lost_signal_unavailable",
+                            error.what(), {}};
+    }
+  }
+
+  // `false` for one gripper: its next attach, a Program detach, or Reset.
+  // Best effort; a refusal is logged (the host keeps the last level).
+  void ClearCarriedObjectLost(const core::ControllableComponentId &component,
+                              const core::CommandTargetId &target) noexcept {
+    try {
+      if (const auto refused =
+              PublishCarriedObjectLostLevel(component, target, std::nullopt);
+          refused && refused->code != "io_signal_service_unavailable")
+        std::cerr << "carried-object-lost signal was not cleared for "
+                  << component.value() << "/" << target.value() << ": "
+                  << refused->code << '\n';
+    } catch (...) {
+    }
+  }
+
+  // Program scene commits that replace a gripper's attachment clear its
+  // signal: an attach by that gripper, a Program detach.
+  void ClearCarriedObjectLostAfterCommit(
+      const core::SceneTransactionRequestDTO &transaction,
+      const std::optional<std::pair<core::ControllableComponentId,
+                                    core::CommandTargetId>> &detached) {
+    if (const auto *attach = std::get_if<core::AttachCarriedObjectRequestDTO>(
+            &transaction.operation)) {
+      ClearCarriedObjectLost(attach->controllable_component_id,
+                             attach->command_target_id);
+    } else if (detached) {
+      ClearCarriedObjectLost(detached->first, detached->second);
+    }
+  }
+
+  // The holder of the attachment a detach request names, read before commit.
+  std::optional<std::pair<core::ControllableComponentId, core::CommandTargetId>>
+  DetachedHolder(const core::SceneTransactionRequestDTO &transaction) {
+    std::optional<core::CarriedObjectAttachmentId> id;
+    if (const auto *detach = std::get_if<core::DetachCarriedObjectRequestDTO>(
+            &transaction.operation))
+      id = detach->carried_object_attachment_id;
+    else if (const auto *here =
+                 std::get_if<core::DetachCarriedObjectAtCurrentPoseRequestDTO>(
+                     &transaction.operation))
+      id = here->carried_object_attachment_id;
+    if (!id)
+      return std::nullopt;
+    const auto snapshot = scene_owner_.LogicalSnapshot();
+    if (!snapshot)
+      return std::nullopt;
+    for (const auto &row : snapshot->carried_object_attachments)
+      if (row.carried_object_attachment_id == *id)
+        return std::pair{row.controllable_component_id, row.command_target_id};
+    return std::nullopt;
+  }
+
+  // Cell Reset clears every gripper's signal of the active bundle.
+  void ClearCarriedObjectLostOnReset(
+      const core::CellAdmissionReadinessSnapshotDTO &snapshot) noexcept {
+    try {
+      if (!snapshot.program_cycle_status_current ||
+          !snapshot.program_cycle_status ||
+          !snapshot.program_cycle_status->accepted_reset)
+        return;
+      const auto &reset = *snapshot.program_cycle_status->accepted_reset;
+      if (cleared_reset_request_id_ == reset.request_id.value())
+        return;
+      cleared_reset_request_id_ = reset.request_id.value();
+      const auto bundle = verified_package_.get_verified(
+          scene_owner_.CurrentProjectionRevision().retained_bundle_id);
+      if (bundle == nullptr)
+        return;
+      const auto catalog =
+          deployment::ResolveCompiledIoSignalCatalog(bundle->value().cell_graph);
+      if (!catalog.ok())
+        return;
+      for (const auto &row : catalog.value())
+        if (row.provider.profile == deployment::kSystemCarriedObjectProfile)
+          ClearCarriedObjectLost(row.descriptor.signal_id.controllable_component_id,
+                                 row.command_target_id);
+    } catch (...) {
+    }
+  }
+
   core::Result<SceneRuntimePoseApplicationResult>
   ResolvePoseApplication(const SceneRuntimeIdentity &runtime_identity,
                          const PoseSourceObservation &observation,
@@ -5129,7 +5429,8 @@ private:
         [](const SceneRuntimePoseApplicationStatus status) {
           return core::Result<SceneRuntimePoseApplicationResult>::Ok(
               SceneRuntimePoseApplicationResult{status, std::nullopt,
-                                                std::nullopt, std::nullopt});
+                                                std::nullopt, std::nullopt,
+                                                std::nullopt});
         };
     if (!observation.eligible ||
         observation.payload_quality != PoseSourceQuality::kGood || !acceptance.fresh) {
@@ -5210,11 +5511,24 @@ private:
     if (application.ok() ||
         application.error().code != core::kCarriedObjectLostReason)
       return;
-    // Stopped and detached by the projector; publish the detach and the
-    // event for the operator alarm.
+    // Handled by the projector per `on_grasp_lost`; publish the scene and the
+    // event for the operator alarm (`raise_alarm`).
     const auto &details = application.error().details;
+    const auto set_key = details.find("set_key");
+    const auto signal_error = details.find("signal_error");
     scene_runtime_owner_.RecordCarriedObjectLoss(
-        {details.at("event_id"), object_id, application.error().message});
+        {details.at("event_id"), object_id, application.error().message,
+         details.at("carried_object_attachment_id"),
+         details.at("controllable_component_id"),
+         details.at("command_target_id"),
+         core::GraspLostResponseDTO{
+             details.at("raise_alarm") == "true",
+             details.at("stop_motion") == "true",
+             set_key == details.end() ? std::nullopt
+                                      : std::optional(set_key->second),
+             details.at("detach") == "true"},
+         signal_error == details.end() ? std::nullopt
+                                       : std::optional(signal_error->second)});
     TryPublishLogicalScene();
   }
 
@@ -5991,10 +6305,13 @@ private:
       case CommandKind::kSceneCommit: {
         Require(command.scene_transaction.has_value(),
                 "decoded scene command lacks its transaction");
+        const auto detached = DetachedHolder(*command.scene_transaction);
         const auto result = detail::CommitSceneWithAdmissionObservation(
             scene_owner_, *command.scene_transaction,
             scene_admission_reconciled_);
         if (result.success) {
+          ClearCarriedObjectLostAfterCommit(*command.scene_transaction,
+                                            detached);
           // The durable scene result remains authoritative if this projection
           // write fails. Periodic reconciliation republishes it, and exact
           // request replay returns the same owner result without a second
@@ -6535,6 +6852,8 @@ private:
   // Alarm evidence only, serialized with the existing renewal attempt. It does not
   // alter readiness selection, retry budgets, lease expiry or containment.
   std::optional<core::ProgramCycleStatusDTO> established_program_cycle_status_;
+  /// The accepted Reset whose carried-object-lost signals were cleared.
+  std::string cleared_reset_request_id_;
   std::optional<core::ProgramRunnerContactLossDTO> program_runner_contact_loss_;
   std::mutex apply_progress_lane_mutex_;
   std::condition_variable apply_progress_lane_condition_;

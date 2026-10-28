@@ -29,7 +29,7 @@ namespace {
 using content_identity::CanonicalValue;
 
 constexpr int kHistorianApplicationId = 0x4D464548;
-constexpr int kHistorianUserVersion = 4;
+constexpr int kHistorianUserVersion = 6;
 /// A maximal record (256-KiB payload plus its bounded envelope) always fits
 /// one capture, so a trigger is never dropped for its size.
 constexpr std::int64_t kMinimumCaptureBytes = 512LL * 1024LL;
@@ -78,7 +78,6 @@ CREATE INDEX historian_events_type_idx
 )sql";
 
 // Secondary indexes live with the immutable event, never in another service.
-// External-content FTS retains no second copy of payload_json.
 constexpr std::string_view kQueryIndexSchema = R"sql(
 ALTER TABLE historian_metadata ADD COLUMN prior_pruning_known INTEGER NOT NULL DEFAULT 0;
 ALTER TABLE historian_events ADD COLUMN occurred_at_utc_ns INTEGER;
@@ -106,11 +105,6 @@ CREATE TABLE historian_event_keys (
   PRIMARY KEY(sequence,kind,value)
 ) STRICT, WITHOUT ROWID;
 CREATE INDEX historian_event_keys_lookup_idx ON historian_event_keys(kind,value,sequence DESC);
-CREATE VIEW historian_search_content AS
-  SELECT sequence,component,event_type,payload_json AS details FROM historian_events;
-CREATE VIRTUAL TABLE historian_search USING fts5(
-  component,event_type,details,content='historian_search_content',content_rowid='sequence',tokenize='trigram'
-);
 )sql";
 
 // Storage revision 4: failure capture protects already-durable rows by
@@ -161,6 +155,32 @@ constexpr std::string_view kCorrelationNames =
     "'program_run_id','operation_id','action_span_id','node_instance_id','node_attempt_id',"
     "'intervention_session_id','contact_policy_id','incident_id','condition_id','alarm_condition_id',"
     "'activation_id','stop_id','resource_id','source_owner_epoch','phase','parent_node_attempt_id'";
+// Error and reason codes at any depth are keyed for search only (revision 5;
+// revision 6 adds the incident cause and closure codes); they are not
+// correlation filters or discovery kinds.
+constexpr std::string_view kSearchCodeNames = "'code','reason','reason_code','cause_class','closure_reason'";
+const std::string kIndexedKeyNames = std::string(kCorrelationNames) + "," + std::string(kSearchCodeNames);
+// Storage revisions 5-6: search covers only human-readable text, never the
+// payload JSON. Its trigram index was most of the database; kind, subject and
+// time filters use the b-tree indexes above. External content keeps no copy:
+// ``details`` is derived from fixed message/subject paths and the indexed
+// identities and codes (inserted before, deleted after the text row).
+const std::string kSearchSchema = [] {
+  std::string details;
+  // ``details.reason`` covers Program diagnostics, whose keys are top-level only.
+  // ``details.vendor_codes`` is a component incident's vendor code list (revision 6).
+  for (const auto *path : {"$.message", "$.title", "$.incident_kind", "$.definition_id", "$.source_label",
+                           "$.subject.subject_id", "$.subject.resource_ids", "$.details.reason", "$.details.reasons",
+                           "$.details.vendor_codes"}) {
+    details += std::string("ifnull(CASE WHEN json_type(e.payload_json,'") + path + "') IN ('text','array') "
+               "THEN json_extract(e.payload_json,'" + path + "')||char(10) END,'')||";
+  }
+  return "CREATE VIEW historian_search_content AS SELECT e.sequence,e.component,e.event_type," + details +
+         "ifnull((SELECT group_concat(k.value,char(10)) FROM historian_event_keys k WHERE k.sequence=e.sequence),'') "
+         "AS details FROM historian_events e;"
+         "CREATE VIRTUAL TABLE historian_search USING fts5(component,event_type,details,"
+         "content='historian_search_content',content_rowid='sequence',tokenize='trigram');";
+}();
 // SQL list of retained Program diagnostic versions whose correlation
 // attribution is producer-level only.
 const std::string kProgramDiagnosticSchemaList = [] {
@@ -963,8 +983,9 @@ public:
         }
         return phrase + '"';
       };
-      // Search original fields and JSON string contents without materializing
-      // another decoded text copy. Quoting prevents FTS query syntax injection.
+      // Scalar text is indexed decoded; the selected arrays (reasons,
+      // resource ids) keep their JSON string escapes. Quoting prevents FTS
+      // query syntax injection.
       auto phrase = quote(query.search);
       const auto encoded = content_identity::canonical_json(CanonicalValue(query.search));
       const auto escaped = encoded.substr(1, encoded.size() - 2);
@@ -1231,7 +1252,7 @@ private:
                    "INSERT OR IGNORE INTO historian_event_keys(sequence,kind,value) "
                    "SELECT ?1,key,value FROM json_tree(?2) WHERE type='text' AND key IN "
                    "(" +
-                       std::string(kCorrelationNames) +
+                       kIndexedKeyNames +
                        ") AND length(CAST(value AS BLOB)) BETWEEN 1 AND 1024 "
                        "AND "
                        "(COALESCE(json_extract(?2,'$.schema_version'),'') NOT IN (" +
@@ -1865,6 +1886,7 @@ private:
               "historian_storage_foreign", "legacy historian metadata is invalid");
       const auto loss = ReclaimLegacyIndexSpace();
       Exec(database_, std::string(kQueryIndexSchema));
+      Exec(database_, kSearchSchema);
       for (std::size_t partition = 0; partition < loss.size(); ++partition) {
         Statement record_loss(database_, "UPDATE historian_retention SET pruned_count=?,pruned_bytes=?,last_pruned_sequence=? WHERE partition=?");
         record_loss.Bind(1, loss[partition].count);
@@ -1892,12 +1914,12 @@ private:
         "index:historian_events_prune_idx", "table:historian_captures",
         "table:historian_capture_triggers", "table:historian_capture_retention"};
     const auto stored_version = ScalarInteger(database_, "PRAGMA user_version");
-    if (stored_version == kHistorianUserVersion) expected.insert(capture_objects.begin(), capture_objects.end());
+    if (stored_version >= 4) expected.insert(capture_objects.begin(), capture_objects.end());
     Require(SchemaObjectNames(database_) == expected,
             "historian_storage_foreign",
             "historian database contains an unexpected schema");
     Require(ScalarInteger(database_, "PRAGMA application_id") == kHistorianApplicationId &&
-                (stored_version == 2 || stored_version == 3 || stored_version == kHistorianUserVersion),
+                stored_version >= 2 && stored_version <= kHistorianUserVersion,
             "historian_storage_foreign", "historian SQLite identity is invalid");
     Statement metadata(database_,
                        "SELECT schema_id,schema_version,record_retention "
@@ -1918,7 +1940,7 @@ private:
            "ALTER TABLE historian_events ADD COLUMN summary_digest "
            "TEXT NOT NULL DEFAULT '';");
     }
-    if (stored_version != kHistorianUserVersion) {
+    if (stored_version < 4) {
       // Revision 4 adds only derived protection columns/tables. Original
       // event bytes, digests and cumulative prune facts are unchanged.
       Exec(database_, std::string(kCaptureSchema));
@@ -1949,7 +1971,7 @@ private:
         "SELECT DISTINCT e.sequence,j.key,j.value FROM historian_events "
         "e,json_tree(e.payload_json) j "
         "WHERE j.type='text' AND j.key IN (" +
-        std::string(kCorrelationNames) + ") AND length(CAST(j.value AS BLOB)) BETWEEN 1 AND 1024 ";
+        kIndexedKeyNames + ") AND length(CAST(j.value AS BLOB)) BETWEEN 1 AND 1024 ";
     const auto validate_keys = [&](bool producer_only) {
       const std::string expected_keys =
           all_keys + (producer_only
@@ -1966,6 +1988,30 @@ private:
                 "historian correlation index differs from original records");
       }
     };
+    const auto check_search = [&] {
+      try {
+        Exec(database_, "INSERT INTO historian_search(historian_search,rank) VALUES('integrity-check',1)");
+      } catch (const EventHistorianError &error) {
+        if (error.code() == "historian_storage_full") throw;
+        StoreFail("historian_storage_corrupt", "historian search index differs from original records: " + std::string(error.what()));
+      }
+    };
+    const bool migrate_search = version != 1 && stored_version != kHistorianUserVersion;
+    if (migrate_search) {
+      // Revisions 5 and 6 replace only the derived search text. Verify the
+      // old index as before, then drop it first: its pages are reused by the
+      // code keys and the new index, so a history near its page ceiling still
+      // migrates.
+      check_search();
+      Exec(database_, "DROP TABLE historian_search; DROP VIEW historian_search_content;");
+      // Revision 5 keys codes for search (revision 6 adds incident cause and
+      // closure codes). Derive only the code kinds here, with the predicate
+      // this revision's validation below expects; existing rows are kept.
+      Exec(database_, "INSERT OR IGNORE INTO historian_event_keys(sequence,kind,value) " + all_keys +
+                          "AND j.key IN (" + std::string(kSearchCodeNames) + ") " +
+                          (version == 2 ? "" : "AND (COALESCE(json_extract(e.payload_json,'$.schema_version'),'')"
+                                               " NOT IN (" + kProgramDiagnosticSchemaList + ") OR j.path='$')"));
+    }
     if (version == 2) {
       // Committed v2 indexed nested diagnostic values as identities. Validate
       // that historical derivation before changing only this derived subset.
@@ -1981,12 +2027,11 @@ private:
                           kProgramDiagnosticSchemaList + ") AND j.path='$'");
     }
     validate_keys(true);
-    try {
-      Exec(database_, "INSERT INTO historian_search(historian_search,rank) VALUES('integrity-check',1)");
-    } catch (const EventHistorianError &error) {
-      if (error.code() == "historian_storage_full") throw;
-      StoreFail("historian_storage_corrupt", "historian search index differs from original records: " + std::string(error.what()));
+    if (migrate_search) {
+      Exec(database_, kSearchSchema);
+      Exec(database_, "INSERT INTO historian_search(historian_search) VALUES('rebuild')");
     }
+    check_search();
     static_cast<void>(Retention());
     if (stored_version != kHistorianUserVersion) {
       Exec(database_,

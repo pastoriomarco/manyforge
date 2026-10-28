@@ -5,6 +5,7 @@ import {
   type NoticeSeverity,
   type WorkbenchNotice,
 } from '../state/workbenchNotices';
+import { acknowledgeActions } from '../state/warningNotices';
 
 const SEVERITY_LABEL: Record<NoticeSeverity, string> = {
   error: 'Errors',
@@ -122,8 +123,9 @@ export function NoticeItem({ notice, children }: { notice: WorkbenchNotice; chil
 }
 
 /**
- * A warning or activity row. It exists only while it has notices, has no
- * acknowledgement, and expands independently of every other row.
+ * A warning or activity row. It exists only while it has notices and expands
+ * independently of every other row. Warnings that carry Acknowledge can be
+ * acknowledged all at once, without confirmation: none of them blocks.
  */
 export function NoticeRow({
   severity,
@@ -135,6 +137,7 @@ export function NoticeRow({
   const [expanded, setExpanded] = useState(false);
   if (notices.length === 0) return null;
   const single = notices.length === 1 ? notices[0] : undefined;
+  const acknowledgeAll = severity === 'warning' ? acknowledgeActions(notices) : [];
   const summary = noticeRowSummary(notices, severity === 'warning'
     ? { one: 'warning', many: 'warnings' }
     : { one: 'activity', many: 'activities' });
@@ -149,7 +152,17 @@ export function NoticeRow({
         busy={notices.some((notice) => notice.busy)}
         actions={single !== undefined && !expanded
           ? <NoticeActions notice={single} />
-          : undefined}
+          : acknowledgeAll.length > 1
+            ? (
+              <button
+                type="button"
+                title="Acknowledge every warning listed. Nothing is blocked by them and execution does not change."
+                onClick={() => acknowledgeAll.forEach((action) => action.run())}
+              >
+                Acknowledge all
+              </button>
+            )
+            : undefined}
         expanded={expanded}
         onToggle={single !== undefined && single.message.length < 90
           && (single.actions?.length ?? 0) === 0

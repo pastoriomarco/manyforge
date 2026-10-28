@@ -1,4 +1,4 @@
-# Copyright 2026 ManyForge contributors
+# Copyright 2026 Marco Pastorio
 # SPDX-License-Identifier: Apache-2.0
 # One capture, one detection pass, serial instances. See package README.
 string request_id

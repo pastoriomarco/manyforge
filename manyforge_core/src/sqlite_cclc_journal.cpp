@@ -3286,12 +3286,9 @@ void SqliteCCLCJournal::Impl::RetainCurrentComponentLifecycleFact(
     return;
   }
 
-  // A settled partial effect leaves no single coherent component state: the
-  // retained predecessor state must not survive as current (restart would
-  // otherwise reconstruct it as command readiness). The fact stays absent
-  // until an explicit later transition or authorized Apply establishes one.
-  if (!status.current_state.has_value() ||
-      status.terminal_result == ComponentLifecycleTerminalResultDTO::kFailedPartialEffect) {
+  // A status with no state yet (a delegated Apply bring-up, or a Disable of
+  // an unresolved component) leaves the fact absent until it settles one.
+  if (!status.current_state.has_value()) {
     Statement erase(database_,
                     "DELETE FROM lifecycle_component_current_facts "
                     "WHERE controllable_component_id=?");
@@ -3310,7 +3307,22 @@ void SqliteCCLCJournal::Impl::RetainCurrentComponentLifecycleFact(
                    "component_lifecycle_state=excluded.component_lifecycle_state");
   retain.Bind(1, component_id.value());
   retain.Bind(2, static_cast<std::int64_t>(generation));
-  retain.Bind(3, static_cast<std::int64_t>(*status.current_state));
+  // A settled partial effect carries the coordinator's observed state. A
+  // reconstructed one (no fresh fault-free observation, e.g. after owner
+  // replacement) is Declared, and the predecessor never survives as Active:
+  // restart would otherwise reconstruct it as command readiness.
+  auto state = *status.current_state;
+  if (status.terminal_result == ComponentLifecycleTerminalResultDTO::kFailedPartialEffect) {
+    const auto reconstructed = [&] {
+      if (!status.error) return false;
+      const auto warning = status.error->details.find("component_state");
+      return warning != status.error->details.end() &&
+             warning->second == kComponentLifecycleStateReconstructedCode;
+    };
+    if (reconstructed() || state == ComponentLifecycleStateDTO::kActive)
+      state = ComponentLifecycleStateDTO::kDeclared;
+  }
+  retain.Bind(3, static_cast<std::int64_t>(state));
   Require(!retain.Step(), "component_lifecycle_journal_corrupt",
           "current component lifecycle fact replacement returned an unexpected row");
 }
@@ -6270,8 +6282,8 @@ NativeApplyPlanDTO SqliteCCLCJournal::Impl::PlanNativeApply(
         state = *delegated->second.requested_state.state;
       } else if (retained) {
         // The retained runtime keeps its exact lifecycle fact. A component
-        // with no coherent current state (e.g. after a settled partial
-        // effect) cannot be retained: that needs restoration, not reuse.
+        // with no current state (a transaction that never settled one)
+        // cannot be retained: that needs restoration, not reuse.
         Require(current_fact.has_value(), "component_lifecycle_native_apply_retained_fact_missing",
                 "native Apply retains " + component.value() +
                     " but it has no coherent current lifecycle state");

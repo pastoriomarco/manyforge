@@ -641,7 +641,7 @@ require_string_member(const deployment::CanonicalValue &root,
 
 [[nodiscard]] std::vector<std::filesystem::path>
 source_files(const std::filesystem::path &directory,
-             std::size_t expected_count) {
+             std::optional<std::size_t> expected_count) {
   if (std::filesystem::is_symlink(directory) ||
       !std::filesystem::is_directory(directory)) {
     throw std::invalid_argument(
@@ -654,7 +654,8 @@ source_files(const std::filesystem::path &directory,
     }
   }
   std::sort(result.begin(), result.end());
-  if (result.size() != expected_count) {
+  if (expected_count.has_value() ? result.size() != *expected_count
+                                  : result.empty()) {
     throw std::invalid_argument(
         "maintained catalog directory has the wrong exact source count: " +
         directory.string());
@@ -1625,13 +1626,13 @@ qualify_catalog(const std::filesystem::path &root,
     throw std::logic_error(
         "maintained component closure has the wrong target-capability count");
   }
-  // Five native component types plus the fixed-scale ROS type of every
-  // family with an Isaac or offline mock controller profile (Q63-Q68), and the
-  // arm-only fixed-scale type of every family with a Real profile (CP8 step 1).
-  constexpr std::size_t kMaintainedComponentTypeCount = 10U;
+  // One native component type per model family plus the fixed-scale ROS type
+  // of every family with an Isaac or offline mock controller profile
+  // (Q63-Q68), and the arm-only fixed-scale type of every family with a Real
+  // profile (CP8 step 1). E1: generated per family, so no fixed count; each
+  // file is still fully qualified and the compiler requires what it selects.
   for (const auto &path :
-       source_files(catalog_root / "component_type",
-                    kMaintainedComponentTypeCount)) {
+       source_files(catalog_root / "component_type", std::nullopt)) {
     const std::string bytes = read_file(path);
     const auto reference =
         make_reference<core::ComponentTypeCatalogRecordRefDTO>(bytes);
@@ -1716,8 +1717,9 @@ qualify_catalog(const std::filesystem::path &root,
   bool found_xarm_gripper_lifecycle_manifest = false;
   bool found_ros2_control_lifecycle_manifest = false;
   bool found_xarm_ros2_control_lifecycle_manifest = false;
+  bool found_xarm_ros2_control_gripper_lifecycle_manifest = false;
   for (const auto &path :
-       source_files(catalog_root / "provider_manifest", 11U)) {
+       source_files(catalog_root / "provider_manifest", 12U)) {
     const std::string bytes = read_file(path);
     const auto reference =
         make_reference<core::ProviderManifestCatalogRecordRefDTO>(bytes);
@@ -1781,6 +1783,24 @@ qualify_catalog(const std::filesystem::path &root,
       }
       found_xarm_ros2_control_lifecycle_manifest = true;
     } else if (manifest.value().provider_manifest_id.value() ==
+               "manyforge.provider.ros2_control.xarm.gripper") {
+      // A Real xArm gripper domain's provider: the shared provider's offers
+      // and contracts; only its lifecycle catalog (Recover target) differs.
+      if (found_xarm_ros2_control_gripper_lifecycle_manifest ||
+          !manifest.value().lifecycle_plan_catalog.has_value() ||
+          manifest.value()
+                  .lifecycle_plan_catalog->catalog_api_version.value() !=
+              core::kBrandLifecyclePlanCatalogApiVersion ||
+          manifest.value().offered_capabilities.size() != 25U ||
+          manifest.value().provider_contracts.size() != 3U ||
+          !has_contract_role("gripper_logical_cancel") ||
+          !has_contract_role("software_hard_stop") ||
+          !has_contract_role("stop_contract")) {
+        throw std::logic_error("maintained Real xArm gripper ROS control "
+                               "provider manifest is not exact");
+      }
+      found_xarm_ros2_control_gripper_lifecycle_manifest = true;
+    } else if (manifest.value().provider_manifest_id.value() ==
                "manyforge.provider.ros2_control") {
       if (found_ros2_control_lifecycle_manifest ||
           !manifest.value().lifecycle_plan_catalog.has_value() ||
@@ -1805,7 +1825,8 @@ qualify_catalog(const std::filesystem::path &root,
   if (!found_xarm_arm_lifecycle_manifest ||
       !found_xarm_gripper_lifecycle_manifest ||
       !found_ros2_control_lifecycle_manifest ||
-      !found_xarm_ros2_control_lifecycle_manifest) {
+      !found_xarm_ros2_control_lifecycle_manifest ||
+      !found_xarm_ros2_control_gripper_lifecycle_manifest) {
     throw std::logic_error(
         "maintained lifecycle provider manifest closure is missing");
   }
@@ -1988,7 +2009,7 @@ void verify_scenarios(const std::filesystem::path &root,
              "maintained_deployment_sources.v1.json");
   if (deployment::sha256_digest(description_bytes) !=
       "sha256:"
-      "38cbea3f756a8e17852ea963c594ee00a9786caa4f47a12b67880e06865b6c8c") {
+      "bdf402bfa2ab540d6c3c1f4187f2dc4350477e1a550bff3a9c948d9a3e9ebb1c") {
     throw std::invalid_argument(
         "maintained runtime input source differs from its qualified source pin");
   }
@@ -2728,7 +2749,8 @@ PreparedActivationMaterialization materialize_prepared_activation(
                                               catalog.capabilities);
   // Pose sources and AI models reuse the model-free derived-type pipeline.
   for (auto &prepared : prepare_activation_pose_source_types(
-           intent, component_profiles, catalog.capabilities))
+           intent, component_profiles, prepared_models,
+           catalog.capabilities))
     io_types.push_back(std::move(prepared));
   for (auto &prepared : prepare_activation_ai_model_types(
            intent, component_profiles, catalog.capabilities))

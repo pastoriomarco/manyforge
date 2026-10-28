@@ -1,402 +1,328 @@
-# ManyForge operator runbook
+# Operator launcher (advanced)
 
-> **Historical operator reference:** the `native` CLI profile name and dated
-> O1 records below are retained as restoration inputs (DX-753); the native
-> simulator executable is removed. Current ROS development uses
-> [`DEVELOPMENT_WORKBENCH.md`](DEVELOPMENT_WORKBENCH.md). Workbench empty-ready
-> and mock Phase A `qualified-live02` do not qualify these installed-launcher
-> commands, the full Compose wrapper, an observed GUI journey, Isaac or hardware.
+`manyforge-operator` starts, checks and stops one ManyForge stack from a
+materialized, digest-checked package, and serves Composer on the network at
+port 9000. It keeps a launch record so that `status` and `stop` act only on the
+processes or container it started.
 
-## 1. Preconditions and identity
+For everyday use, follow the
+[workbench guide](DEVELOPMENT_WORKBENCH.md) instead. The workbench builds from
+your checkout, serves Composer with hot reload at `http://localhost:3000`,
+covers the Mock, Isaac and Real lanes, and needs no package preparation. This
+page covers only what differs for the operator launcher.
 
-Run the operator on the selected ManyForge runtime host. Orin is the default
-native runtime/UI host; the source checkout, installed dependencies, manager
-executable, catalogs, and all state paths below must be on that host. Use
-absolute paths. The source must be clean: the launcher collects
-`manyforge.source_identity.v1` and rejects a dirty checkout.
+Use the operator launcher when you need one of these:
 
-The exact clean source, package, compiler, and environment identities are
-source-matched inputs and must be copied from the dated O1 evidence for the
-commit being qualified. Do not reuse the historical values from an older
-runbook revision or invent placeholders for a live launch.
+- ManyForge runs on a separate Docker host, Isaac Sim runs on another machine,
+  and you control both from one machine (`isaac` profile);
+- the stack must run from a fixed package root whose aggregate digest is
+  checked at start, with Composer reachable from the LAN at port 9000;
+- `status` and `stop` must be authenticated against a recorded launch (exact
+  container ID, image and labels, or exact process identities).
 
-| Input | Value |
+ManyForge Stops are not safety-rated. The software Stop is not an emergency
+stop; a robot installation needs its own safety system.
+
+## Profiles
+
+| Profile | Where the stack runs | Requirements |
+|---|---|---|
+| `isaac` | In a container on a remote runtime host, started over SSH through `scripts/compose-dev.sh` in operator mode. Isaac Sim runs on its own host; ManyForge attaches to it. | Docker on the runtime host; the `manyforge-ros-lyrical-full` image (ROS 2 Lyrical) built there; SSH key login. No ROS install on either host. |
+| `native` | As host processes on the machine that runs the command. | **A host ROS 2 install** matching the build, a host build of ManyForge, and systemd journald. |
+
+The `native` profile needs ROS on the host: the Manager starts the ROS
+execution host and controllers as host processes. If you do not want ROS on
+the host, use the workbench or the `isaac` profile.
+
+## What it starts
+
+Both profiles start the same five processes. The Manager in turn owns the ROS
+execution host and the planning worker.
+
+| Process | Port | Bound to |
+|---|---|---|
+| Composer (built frontend, no Vite) | 9000 | all interfaces |
+| Headless API | 9010 | loopback |
+| Program runner | 9011 | loopback |
+| Assistant bridge | 8100 | loopback |
+| Manager | none (local sockets) | |
+
+All four ports must be free; ports are fixed. The workbench uses 3000 and 9020
+for its frontend and Composer instead of 9000. Composer has no login: expose
+port 9000 only on a trusted network.
+
+`start` waits until the owners report ready and leaves the stack idle. It does
+not Load a Scenario, Apply or Run.
+
+## Prerequisites
+
+- A clean Git checkout (no modified or untracked files). Start refuses a dirty
+  source. For `isaac`, the runtime host needs a clean checkout of the same
+  commit; the two source identities must match exactly.
+- Python 3.11 or later with `pydantic` 2 and `rfc8785`. Either install the
+  tool with `pip install ./manyforge_operator`, which provides the
+  `manyforge-operator` command, or run `python3 -m manyforge_operator` from the
+  repository root.
+- A package root (next section) and the node and alarm catalogs:
+  `manyforge_behavior/resources/node_catalog.yaml` and
+  `manyforge_headless/resources/operator-alarm-catalog.v1.yaml`.
+
+## Prepare the package root
+
+The package is produced by the maintained materializer
+`manyforge_maintained_deployment_occurrences`, built with `manyforge_deployment`.
+It requires one prepared model root for each of the five maintained robot
+families. A `manyforge_deployment` build configured with `BUILD_TESTING`
+creates them under `generated/<family>_structural` in its build directory.
+
+| Family ID | Robot and gripper |
 |---|---|
-| ManyForge commit/tree/fingerprint | See the exact dated O1 evidence for the qualified freeze |
-| Package/compiler/environment digests | See the source-matched package record named by that evidence |
-
-The three artifact identity inputs are mandatory and must come from the
-source-matched build/package record; do not invent or reuse values:
-`package_aggregate_sha256`, `compiler_build_manifest_sha256`, and
-`node_environment_sha256`. O1.3 native records a `mounted_install`, not a
-container image, so no container image ID is supplied to this native command.
-The split Isaac profile also records its exact full ROS container image and
-container ID alongside the mounted remote package and local world. Its exact
-source/package/image/world identity must be published in dated qualification
-evidence before live use.
-
-### Prepare the immutable package root
-
-Prepare the package root from the same clean source and pinned container used
-for the selected build. The maintained all-row production materializer is the
-only preparation path: it requires all three prepared model families and
-validates their semantic runtime contracts. Runtime Stop behavior remains
-covered by the normal component and integration test suites; standard package
-creation does not consume test reports or executable hashes.
+| `lite6_lite_gripper` | UFactory Lite 6, Lite gripper |
+| `uf850_xarm_gripper` | UFactory UF850, xArm gripper |
+| `ur10e_robotiq_2f_140` | UR10e, Robotiq 2F-140 |
+| `ur5_roboplan` | UR5 (RoboPlan example model) |
+| `ur5e_robotiq_2f_85` | UR5e, Robotiq 2F-85 |
 
 ```bash
-MANYFORGE_ROOT=/absolute/path/to/manyforge
 PACKAGE_ROOT=/absolute/path/to/new-empty-package-root
-MATERIALIZER=/absolute/path/to/manyforge_maintained_deployment_occurrences
-PREPARED_LITE6=/absolute/path/to/lite6_lite_gripper_structural
-PREPARED_UR5=/absolute/path/to/ur5_roboplan_structural
-PREPARED_UR10E=/absolute/path/to/ur10e_robotiq_2f_140_structural
-if [ -e "$PACKAGE_ROOT" ]; then
-  printf 'PACKAGE_ROOT must be a new destination: %s\n' "$PACKAGE_ROOT" >&2
-  exit 1
-fi
-mkdir "$PACKAGE_ROOT" || exit 1
-
+mkdir "$PACKAGE_ROOT"
 "$MATERIALIZER" --check \
   --workspace-root "$MANYFORGE_ROOT" --package-root "$PACKAGE_ROOT" \
-  --prepared "lite6_lite_gripper=$PREPARED_LITE6" \
-  --prepared "ur5_roboplan=$PREPARED_UR5" \
-  --prepared "ur10e_robotiq_2f_140=$PREPARED_UR10E"
+  --prepared "lite6_lite_gripper=$GENERATED/lite6_lite_gripper_structural" \
+  --prepared "uf850_xarm_gripper=$GENERATED/uf850_xarm_gripper_structural" \
+  --prepared "ur10e_robotiq_2f_140=$GENERATED/ur10e_robotiq_2f_140_structural" \
+  --prepared "ur5_roboplan=$GENERATED/ur5_roboplan_structural" \
+  --prepared "ur5e_robotiq_2f_85=$GENERATED/ur5e_robotiq_2f_85_structural"
+PACKAGE_SHA256=$(python3 -m manyforge_operator.package_aggregate \
+  --package-root "$PACKAGE_ROOT")
 ```
 
-The command must complete successfully before the root is usable. Discard a
-failed or partial root. Capture the package-root aggregate only after
-successful materialization:
+Discard a root whose materialization failed. Do not change a root after
+taking its digest: `start` recomputes the aggregate and refuses a mismatch.
+The package holds one empty-cell admission file per cell,
+`canonical-empty-admission.<cell_id>.json`. Pass one of them with
+`--canonical-empty-admission-filename` and the same cell with `--cell-id`.
 
-```bash
-PACKAGE_SHA256="$(
-  python3 -m manyforge_operator.package_aggregate --package-root "$PACKAGE_ROOT"
-)" || exit 1
-```
+`--compiler-build-manifest-sha256` and `--node-environment-sha256` are
+recorded as provenance in the launch record. The launcher checks only that
+they are 64 lowercase hex characters; take them from your build record.
 
-The command emits one lowercase SHA-256 digest. The native `start` below
-independently recomputes that aggregate and rejects an unavailable, changed,
-or mismatched root before state creation, port probes, or process effects.
-The digest is provenance/integrity evidence only; it does not alter component
-compatibility or admission semantics. Independently reload the successful
-root through Manager `start`, then keep that root read-only for the entire
-Manager generation. Do not select a root while materialization is running,
-mutate it after reload, or add a second generator mode.
+## Commands
 
-Before starting, reserve the frozen ports: Composer `9000`, Headless
-loopback `9010`, and Program runner loopback `9011`. Keep the runtime host
-reachable from the laptop on a trusted LAN. Composer has no bearer-token
-semantics in this boundary; do not expose it beyond that trusted network.
-
-## 2. Historical topology and commands
-
-The operator owns four processes on one runtime host: **Manager**, **Headless
-API**, **Program runner**, and **Composer**. Manager owns runtime convergence
-and, from the exact admitted retained bundle, owns the ROS execution-host
-child and its private runtime channel. The operator does not fork or adopt
-that child separately. Headless and Program runner expose owner facts and
-intents; Composer is a stateless client. Composer binds `0.0.0.0:9000`;
-Headless and Program runner bind loopback only.
-
-Set these to the actual source-matched installation. Every path is required
-by `start`; the hash values must be full lowercase SHA-256 strings. `MANAGER`
-must be colocated with the source-matched `manyforge_ros2_control_execution_host`
-and `manyforge_roboplan_candidate_worker` targets because Manager resolves
-those owned runtime targets from its executable directory. The admission
-filename is package-relative and selects the exact idle cell; it must exist
-under `PACKAGE_ROOT`.
-
-```bash
-MANYFORGE_ROOT=/absolute/path/to/manyforge
-MANYFORGE_COMMIT=<qualified-manyforge-commit>
-MANYFORGE_TREE=<qualified-manyforge-tree>
-SOURCE_FINGERPRINT=<qualified-source-fingerprint>
-STATE_ROOT=/absolute/path/to/operator-state
-INSTANCE_ID=native
-ADVERTISED_HOST=orion-hostname-or-address
-CELL_ID=lite6_pick_place_cell
-ADMISSION_FILENAME=canonical-empty-admission.lite6_pick_place_cell.json
-MANAGER=/absolute/path/to/manyforge-manager
-PACKAGE_ROOT=/absolute/path/to/package-root
-NODE_CATALOG=/absolute/path/to/node_catalog.yaml
-ALARM_CATALOG=/absolute/path/to/alarm_catalog.yaml
-COMPOSER_STATIC_DIR=/absolute/path/to/composer-dist
-PACKAGE_SHA256=<package-aggregate-sha256>
-COMPILER_SHA256=<compiler-build-manifest-sha256>
-NODE_ENV_SHA256=<node-environment-sha256>
-```
-
-The exact current start shape is:
-
-```bash
-python3 -m manyforge_operator \
-  --state-root "$STATE_ROOT" --instance-id "$INSTANCE_ID" --json \
-  start --profile native \
-  --source-root "$MANYFORGE_ROOT" --manager-executable "$MANAGER" \
-  --install-root "$PACKAGE_ROOT" --node-catalog-path "$NODE_CATALOG" \
-  --alarm-catalog-path "$ALARM_CATALOG" \
-  --composer-static-dir "$COMPOSER_STATIC_DIR" \
-  --canonical-empty-admission-filename "$ADMISSION_FILENAME" \
-  --cell-id "$CELL_ID" \
-  --package-aggregate-sha256 "$PACKAGE_SHA256" \
-  --compiler-build-manifest-sha256 "$COMPILER_SHA256" \
-  --node-environment-sha256 "$NODE_ENV_SHA256" \
-  --advertised-host "$ADVERTISED_HOST" \
-  --expected-source-fingerprint "$SOURCE_FINGERPRINT" \
-  --expected-head-commit "$MANYFORGE_COMMIT" \
-  --expected-head-tree "$MANYFORGE_TREE" \
-  --readiness-timeout-s 60 --poll-interval-s 0.25 \
-  --reconciliation-period-ms 500 --manager-timeout-s 60
-```
-
-`--readiness-timeout-s`, `--poll-interval-s`, and
-`--reconciliation-period-ms` are shown with their current defaults.
-Manager verifies immutable bundle/product inputs once per Manager package
-generation and reuses those typed values. The 500 ms reconciliation loop
-therefore checks only changing process, liveness, readiness, graph and outcome
-facts; it does not repeatedly hash package files. An actual native launch still
-opens and digest-checks its protected executable. Replacing the package remains
-a complete Manager-stack restart, which drops the verified package view.
-The operator creates and validates one strict cell layout at
-`$STATE_ROOT/$INSTANCE_ID`. Durable Manager, execution, Program-selection,
-Program-runner, scene, historian, Composer-authoring, and operator state lives
-under its `state/` subtree. Sockets, locks, native planning stages, and other
-rebuildable process material live under its separate `run/` subtree. Artifact
-and projection roots are also launcher-owned. These are deliberately not
-independent CLI inputs: a marked layout is validation-only on reopen and the
-launcher will not repair, merge, or reinterpret caller-assembled roots.
-`start` waits for owner-issued readiness and leaves the stack idle. It does
-not select a scenario, Apply a graph, or Run a Program. A compatible running
-instance returns `already_running`; an incompatible instance is not adopted.
-
-Use the same state root and instance ID for the exact status/stop shapes:
-
-```bash
-python3 -m manyforge_operator \
-  --state-root "$STATE_ROOT" --instance-id "$INSTANCE_ID" --json status
-
-python3 -m manyforge_operator \
-  --state-root "$STATE_ROOT" --instance-id "$INSTANCE_ID" --json stop
-```
-
-Open the stable URL from the runtime host or a trusted-LAN laptop browser:
-`http://<advertised-host>:9000/`. The laptop is only a client; it does not
-start the runtime. `/api/health`, `/api/manager/status`, `/api/runtime`, and
-`/openapi.json` are useful inspection surfaces. The generated
-[`REST_API.md`](../reference/REST_API.md) is the route contract.
-
-## 3. Deliberate Composer operation
-
-### Saved Program authoring
-
-Native `start` deterministically creates one instance-owned writable Program
-workspace:
+Global options come before the command:
 
 ```text
-$STATE_ROOT/$INSTANCE_ID/program-workspace
+manyforge-operator [--state-root DIR] [--instance-id ID] [--json] {start,status,stop}
 ```
 
-Composer alone receives that directory in addition to the immutable
-`PACKAGE_ROOT`. Manager, Headless, and Program runner retain package-only
-filesystem access. The workspace path is also recorded in the launch record's
-internal mechanical `paths` metadata; it does not add a launcher option or
-change the public status DTO.
+- `--state-root`: where launch records live (default
+  `.manyforge-var/operator` under the current directory).
+- `--instance-id`: one launch instance (default `native`). Use the same
+  value for `status` and `stop`.
+- `--json`: print one `manyforge.operator_command_result.v1` JSON object.
 
-To derive an editable Saved Program from maintained package content:
+`status` and `stop` read the profile from the saved record and take no other
+options.
 
-1. Open the packaged Program as a Draft in Composer.
-2. Choose **Save as** and select a new `*.program.yaml` path under the
-   instance `program-workspace`.
-3. Continue editing and use **Save** for that workspace copy.
-4. Stop and restart the native stack with the same `STATE_ROOT` and
-   `INSTANCE_ID`, then reopen the Saved Program from `program-workspace`.
+### `isaac` profile
 
-The package is immutable reference content and is never a Save or Save As
-destination. Stop, failed child recovery, operator CLI restart, and complete
-stack restart perform process cleanup only and preserve workspace authoring
-content. Back up or remove that content only through a separate deliberate
-operator action; the launcher never deletes or replaces the workspace.
+Run on the machine you control from. Example:
 
-1. Start native and wait for `ready`; inspect health, runtime, graph, alarms,
-   and the current desired/active revisions.
-2. Select a maintained single-cell input or compose the current desired graph.
-   Use Composer's Preview/Validate and inspect the diff/revision before any
-   mutation. Resolve validation or admission failures; do not treat a preview
-   as execution.
-3. Explicitly choose **Apply**. Confirm the owner-issued Manager and Applied
-   status and the resulting revision.
-4. Only after Apply is confirmed, explicitly choose **Program Run**. Follow
-   the owner-issued run status through its terminal state; use the explicit
-   Program Stop or execution Stop when required. A browser reload is safe:
-   Composer does not own or cancel the run.
+```bash
+manyforge-operator --state-root "$STATE_ROOT" --instance-id isaac --json \
+  start --profile isaac --source-root "$MANYFORGE_ROOT" \
+  --remote-target USER@RUNTIME_HOST \
+  --advertised-host RUNTIME_HOST \
+  --simulator-host ISAAC_HOST \
+  --static-peer ISAAC_HOST --static-peer RUNTIME_HOST \
+  --remote-source-root "$R/manyforge" \
+  --remote-container-image-id "$IMAGE_ID" \
+  --remote-container-name manyforge-operator-isaac \
+  --remote-cache-root "$R/cache" \
+  --remote-runtime-root "$R/runtime" \
+  --remote-evidence-root "$R/evidence" \
+  --remote-install-root "$R/package" \
+  --remote-node-catalog-path "$R/manyforge/manyforge_behavior/resources/node_catalog.yaml" \
+  --remote-alarm-catalog-path "$R/manyforge/manyforge_headless/resources/operator-alarm-catalog.v1.yaml" \
+  --remote-simulation-control-config "$R/manyforge/manyforge_ros_bringup/config/isaac_program_simulation_site.json" \
+  --remote-manager-executable "$R/unused/manyforge_manager_daemon" \
+  --remote-state-root "$R/operator-state" \
+  --remote-bridge-state-root "$R/bridge-state" \
+  --remote-ros-setup-script /opt/ros/lyrical/setup.bash \
+  --remote-ros-environment-script "$R/unused/ros_env.sh" \
+  --cell-id isaac_ur10e_light_cell \
+  --canonical-empty-admission-filename canonical-empty-admission.isaac_ur10e_light_cell.json \
+  --package-aggregate-sha256 "$PACKAGE_SHA256" \
+  --compiler-build-manifest-sha256 "$COMPILER_SHA256" \
+  --node-environment-sha256 "$NODE_ENV_SHA256"
+```
 
-Apply and Run are separate operator decisions. Composer start never performs
-either action, and Composer never becomes the authority for runtime, scene,
-execution, lifecycle, alarm, or Stop truth. The API Stop surface is not a
-machinery E-stop; use the independent safety system/E-stop for a hazardous
-physical cell. Real-robot, tool-attachment, repeated-instance, and mixed-cell
-lanes remain deferred (I10/I11/I12/R).
+`R` stands for an absolute directory on the runtime host. Get the image ID on
+the runtime host with
+`docker image inspect --format '{{.Id}}' manyforge-ros-lyrical-full`.
 
-## 4. Truthful status and recovery
+| Option | Meaning |
+|---|---|
+| `--source-root` | Required. Local clean checkout. |
+| `--remote-target` | Required: your runtime host, as an SSH target (`user@host`). Key login must work without a prompt. |
+| `--advertised-host` | Required: your runtime host's address. Composer is at `http://<advertised-host>:9000/`. |
+| `--simulator-host` | Required: your Isaac host. Recorded in the launch identity. |
+| `--static-peer` | Required, repeatable: your Isaac host and your runtime host. Becomes `ROS_STATIC_PEERS`. |
+| `--remote-source-root` | Required. Clean checkout on the runtime host, same commit as `--source-root`. |
+| `--remote-container-image-id` | Required. Full `sha256:<64 hex>` ID of the Lyrical image on the runtime host. The launcher neither pulls nor builds images. |
+| `--remote-container-name` | Required. Docker container name. |
+| `--remote-cache-root`, `--remote-runtime-root`, `--remote-evidence-root` | Required absolute paths: build cache, persistent runtime state (not `/tmp`, `/run` or tmpfs), evidence exports. |
+| `--remote-install-root` | Required. Package root on the runtime host; mounted read-only. Its aggregate is checked again in the container. |
+| `--remote-node-catalog-path`, `--remote-alarm-catalog-path` | Required. Catalog files on the runtime host. |
+| `--remote-simulation-control-config` | Required. Isaac simulation-control site file. |
+| `--cell-id`, `--canonical-empty-admission-filename` | Set both to a cell in the package. |
+| `--package-aggregate-sha256`, `--compiler-build-manifest-sha256`, `--node-environment-sha256` | Required digests (see above). |
+| `--remote-composer-static-dir` | Optional. Built frontend with `index.html`; default is the one in the image. |
+| `--remote-python-executable` | Python on the runtime host, used for the source check (default `python3`). |
+| `--remote-manager-executable`, `--remote-state-root`, `--remote-bridge-state-root`, `--remote-ros-setup-script`, `--remote-ros-environment-script` | Required absolute paths that are validated and recorded but not used by the container, which builds and stages its own runtime and gets ROS from the image. Pass paths on your runtime host. |
+| `--control-host` | Recorded name of the controlling machine (default: its hostname). |
+| `--joint-commands-topic` | Recorded in the launch identity only. |
+| `--readiness-timeout-s` (60, max 600), `--poll-interval-s` (0.25), `--manager-timeout-s` (60, max 60) | Timeouts. |
 
-The shown `status` invocation with global `--json` reports the persisted
-launch instance and owner readiness.
-The only instance/readiness states are:
+The ROS topology is fixed: `ROS_DOMAIN_ID=0`, `rmw_fastrtps_cpp`,
+`ROS_AUTOMATIC_DISCOVERY_RANGE=LOCALHOST`, and the static peers above. Isaac
+Sim's ROS bridge must use the same settings.
+
+Isaac Sim is attach-only. The launcher does not start, stop or play it. Start
+Isaac Sim on the Isaac host and open the scene before you Load the Scenario.
+
+`start` checks the local and remote source identities, starts the container
+(the call allows about 15 minutes, including the incremental build), waits
+for Manager, Headless, Program runner and Composer to report ready, and checks
+the remote source again. The container carries the labels
+`manyforge.launch-instance` and `manyforge.launch-input-digest`; `status` and
+`stop` act only on the recorded container ID with that image and those labels.
+`stop` exports evidence as described in the workbench guide, then removes the
+container.
+
+### `native` profile
+
+Requires a host ROS 2 install (see [Profiles](#profiles)). Run in a shell where
+that ROS environment is sourced and where `manyforge_headless_api`,
+`manyforge_program_runner`, `manyforge_composer` and
+`manyforge_assistant_bridge` import from `python3`.
+
+```bash
+manyforge-operator --state-root "$STATE_ROOT" --instance-id native --json \
+  start --profile native --source-root "$MANYFORGE_ROOT" \
+  --manager-executable "$BUILD/manyforge_manager_daemon" \
+  --install-root "$PACKAGE_ROOT" \
+  --node-catalog-path "$MANYFORGE_ROOT/manyforge_behavior/resources/node_catalog.yaml" \
+  --alarm-catalog-path "$MANYFORGE_ROOT/manyforge_headless/resources/operator-alarm-catalog.v1.yaml" \
+  --cell-id lite6_pick_place_cell \
+  --canonical-empty-admission-filename canonical-empty-admission.lite6_pick_place_cell.json \
+  --advertised-host RUNTIME_HOST \
+  --package-aggregate-sha256 "$PACKAGE_SHA256" \
+  --compiler-build-manifest-sha256 "$COMPILER_SHA256" \
+  --node-environment-sha256 "$NODE_ENV_SHA256"
+```
+
+| Option | Meaning |
+|---|---|
+| `--manager-executable` | Required. Built `manyforge_manager_daemon`. The built `manyforge_ros2_control_execution_host` and `manyforge_roboplan_candidate_worker` must be in the same directory. |
+| `--install-root` | Required. Package root. |
+| `--node-catalog-path`, `--alarm-catalog-path` | Required. |
+| digests | Required (see above). |
+| `--cell-id`, `--canonical-empty-admission-filename` | Set both to a cell in the package. |
+| `--advertised-host` | Address used in the Composer URL (default `localhost`). |
+| `--composer-static-dir` | Optional built frontend with `index.html`. |
+| `--simulation-control-config` | Optional simulation-control site file for the Program runner. |
+| `--expected-source-fingerprint`, `--expected-head-commit`, `--expected-head-tree` | Optional; start refuses a source that differs. Also accepted by `isaac`. |
+| `--readiness-timeout-s` (60, max 300), `--poll-interval-s` (0.25), `--reconciliation-period-ms` (500), `--manager-timeout-s` (60, max 60) | Timeouts. |
+
+The launcher keeps all state under `$STATE_ROOT/$INSTANCE_ID/`: durable state
+in `state/` (the launch record is `state/operator/launch_instance.json`),
+sockets and rebuildable files in `run/`. It creates and checks this layout
+itself; paths cannot be overridden. Output goes to journald: read it with
+`journalctl -t manyforge-<instance-id>-<component>` (`manager`, `headless`,
+`program_runner`, `assistant_bridge`, `composer`).
+
+## Using Composer
+
+Open `http://<advertised-host>:9000/` once `start` or `status` reports
+`ready`. The Composer flow is the same as with the workbench:
+
+1. **Load Scenario** to open a Scenario, or **New** to open the empty
+   Untitled Scenario. Both close the current Scenario first; the result loads
+   as a Draft. Close can proceed with a latched Stop fault when the required
+   effects and teardown are confirmed: it acknowledges open component
+   incidents (recorded in History), disables eligible components without a
+   recovery and stops their processes; a faulted component, or one whose
+   Disable is confirmed to have no effect, is only process-stopped. An unknown
+   output or operation effect, or another unresolved condition, refuses Close.
+   Close keeps an open cell Stop fault; **Recover cell** cannot clear that latch
+   while Close is in progress (component acknowledgements in the same press may
+   still happen). After Close, load a Scenario with the robots the fault names,
+   then press **Recover cell** when its reported conditions, including any
+   required rest proof, are satisfied (right after Load it may report that
+   the configuration is not installed yet; press again shortly). No robot
+   moves until then.
+2. Review the Draft. **Discard** drops unapplied changes; **Revert** returns
+   to the saved files.
+3. **Apply** makes the Draft the running configuration.
+4. Start the Program with **Run**; use **Stop**, **Resume** and **Reset** as
+   needed.
+5. **Save Scenario** or **Save Scenario as** to keep your changes. The
+   Untitled Scenario is read-only: **Save Scenario** is disabled for it and
+   **Save Scenario as** names and places it, then continues in the saved
+   project. Unsaved Untitled changes are lost when Composer restarts.
+
+Where Scenarios can be loaded and saved depends on the profile:
+
+- `native`: Composer can read the checkout's `examples/`, the package root and
+  the instance workspace
+  `$STATE_ROOT/$INSTANCE_ID/state/composer-authoring/program-workspace`. Only
+  that workspace is writable, so use **Save Scenario as** into it. It survives
+  `stop` and `start`.
+- `isaac`: Composer shows the runtime host checkout's `examples/` folder. A
+  Save there changes that checkout, and the next `start` refuses the dirty
+  source. Commit or move the saved files before starting again.
+
+## Status and failures
 
 | State | Meaning |
 |---|---|
-| `unavailable` | An owner/readiness observation cannot be obtained. |
-| `starting` | Owned processes are being brought up and readiness is pending. |
-| `ready` | All three owner health checks report ready. |
-| `degraded` | A process, port, or owner health/readiness observation is missing or failed. |
-| `stopping` | Bounded owner-safe shutdown is in progress. |
-| `stopped` | Absence of the recorded owned processes was observed. |
+| `starting` | Processes are starting; readiness is pending. |
+| `ready` | Every owned process or the container is present and every owner reports ready. |
+| `degraded` | A process, the container, or an owner readiness check is missing or failed. |
+| `stopping` | Shutdown is in progress. |
+| `stopped` | The recorded processes or container were observed absent. |
+| `unavailable` | No readiness observation could be obtained. |
 
-Process or port presence alone is never semantic readiness. A missing state
-record returns `instance_unavailable`; repeat `stop` is harmless when a
-persisted instance is already `stopped`. Start failure records compact
-failure reasons. In particular:
+`start` on a `ready` instance with the same configuration reports
+`already_running`; on a `degraded` instance it first cleans up what the record
+owns. Repeating `stop` on a stopped instance reports `already_stopped`.
 
-- `source_dirty` or `source_identity_mismatch`: restore the exact clean source
-  anchor and matching expected identity; do not bypass the check.
-- `port_occupied`: free the named `9000`, `9010`, or `9011` conflict without
-  killing an unrelated process. Ports are frozen; do not silently remap them.
-- `stale_launch_record` or `incompatible_owner`: do not adopt the processes;
-  inspect the recorded instance locally and use its matching identity.
-- Loss of the Manager-owned managed child is recovered by Manager's
-  observe-first reconciliation. It must receive a fresh runtime epoch and a
-  fresh selected/observed offer-digest correlation before commands reopen; it
-  never adopts an arbitrary process.
-- Loss of Manager, Headless, Program runner, or Composer is outer-stack loss,
-  not child recovery. Use the supported complete-stack `stop` followed by
-  `start` with the same desired configuration and immutable package root.
-- Replacing the package root requires complete-stack `stop`/`start`. Manager
-  performs no live mixed-package upgrade and has no component-level version
-  compatibility path.
-- Normal Manager shutdown stops launch groups in parallel and waits for actual
-  host exit. Each group's existing SIGINT grace and KILL escalation remains;
-  worker, projection and owner destruction has no automatic total kill timer.
-  Shutdown logs name the current phase and actual completed milestones.
-  If progress stalls, the log says `shutdown stuck at <phase>; to force:
-  manyforge-operator stop`. Run the existing `manyforge-operator stop` with the
-  same `--state-root` and `--instance-id` shown above to force the recorded
-  instance's bounded TERM/wait/KILL cleanup. This is an explicit operator
-  action; a responsive status reply alone does not prove teardown progress.
-- Stop asks Manager for semantic shutdown, then performs bounded authenticated
-  process cleanup. Only the recorded launch instance may be terminated; a
-  deadline failure is `cleanup_deadline_exceeded`, not success.
-- If Orin or the runtime host is unreachable, a laptop browser cannot recover
-  it. Native status/stop must be run on the runtime host; split Isaac status/
-  stop reports the remote-unavailable condition when it cannot prove a stopped
-  record absent. Restore the host, then use the matching `status`/`stop`/`start`
-  flow. Do not use broad process-name kills or SSH recipes.
+| Code | What to do |
+|---|---|
+| `operator_configuration_invalid` | A flag is missing or invalid; the message names it. |
+| `source_dirty`, `source_identity_mismatch` | Use a clean checkout; for `isaac`, the same commit on both hosts. |
+| `package_aggregate_mismatch`, `package_aggregate_unavailable` | Recompute the digest of the exact package root; do not edit the root. |
+| `port_occupied` | Free 9000, 9010, 9011 or 8100. Ports cannot be remapped. |
+| `journald_unavailable` | `native` needs `systemd-cat` and the journald socket. |
+| `readiness_timeout`, `isaac_readiness_timeout`, `runtime_container_unready` | Read the logs (`journalctl` or `docker logs <container-id>`). |
+| `runtime_host_unavailable`, `remote_protocol_invalid` | SSH or the runtime host failed. Absence cannot be proved; restore the host, then run `status`. |
+| `container_identity_mismatch` | Another container has that name. It is not adopted. |
+| `incompatible_owner`, `stale_launch_record` | The instance has a different configuration or still owns resources. `stop` it, or use another `--instance-id`. |
+| `status_record_invalid` | The record is unreadable, or it is an `isaac` record from an older launcher that started Isaac Sim itself. Stop the old runtime, then use a new instance. |
+| `cleanup_deadline_exceeded` | `stop` could not prove everything stopped. Investigate, then run `stop` again. |
+| `instance_unavailable` | No record exists for this state root and instance ID. |
 
-## 5. Split Isaac topology and other unavailable lanes
+If the Manager logs `shutdown stuck at <phase>; to force: manyforge-operator
+stop`, run `stop` with the same `--state-root` and `--instance-id`. It ends
+only the recorded processes (TERM, then KILL). Never kill ManyForge processes
+by name.
 
-The Isaac profile keeps the outer lifecycle on the laptop and starts one
-source-matched full ROS image container on the remote ROS machine through the
-existing `scripts/compose-dev.sh` / `scripts/dev-workbench.py` route. Manager,
-ROS execution host and cell pose observer share that container; components
-remain managed processes. ROS is not installed or sourced on either host.
-Isaac Sim stays on the laptop, using its bundled ROS environment and existing
-`isaacsim.ros2.bridge` / `isaacsim.ros2.sim_control` extensions.
+To replace the package root, `stop` and `start` again; there is no live
+package upgrade.
 
-The container retains Headless on port9010 and Runner on9011 (loopback), and
-Composer with its built static frontend on port9000 (all interfaces). It does
-not start Vite or run `npm ci`. Normal developer Workbench defaults are
-unchanged. G READY requires its authenticated Sim, fresh Manager-ready status
-and actual service health. It does not certify Apply/CCLC convergence, fresh
-poses, Program execution or motion permission. Build time and readiness time
-are reported separately; this source wiring is not live qualification.
+## Inspection
 
-When a site file is configured, G forwards its explicit path and the verified
-absolute observer executable from the same built overlay to Manager. The
-Manager-owned check/observer path uses the retained site snapshot before world
-effects; it creates no host ROS dependency or second observer owner.
-
-The temporary Isaac qualification hold records Jazzy setup paths as compatibility
-inputs; neither host sources these paths. ROS runs inside the qualified image.
-`HELD_ISAAC_ROS_IMAGE_ID` must identify the exact qualified image on the remote
-host; the common Lyrical image is not a substitute. The current Orin inventory
-has no qualified arm64 held Jazzy full image (the preserved laptop image is
-amd64), so this recipe is unavailable there until one is
-explicitly supplied and qualified.
-
-Use the same global state root/instance ID and provide every source-matched
-remote path and digest. The command shape is:
-
-```bash
-python3 -m manyforge_operator \
-  --state-root "$STATE_ROOT" --instance-id isaac --json \
-  start --profile isaac --source-root "$MANYFORGE_ROOT" \
-  --isaac-executable "${HOME}/isaac-sim/isaac-sim.sh" \
-  --world-path "${HOME}/workspaces/isaac_ros-dev/src/isaac_sim_custom_examples/Scenario/IsaacManipulator/UniversalRobots/isaac_manipulator_scene_light.usda" \
-  --local-ros-setup-script /opt/ros/jazzy/setup.bash \
-  --local-ros-environment-script "$MANYFORGE_ROOT/config/ros/isaac_i9.env.sh" \
-  --remote-target tndlux@192.168.1.68 \
-  --remote-source-root /mnt/nova_ssd/codex-manyforge/runners/manyforge \
-  --remote-container-image-id "$HELD_ISAAC_ROS_IMAGE_ID" \
-  --remote-container-name manyforge-isaac-runtime \
-  --remote-cache-root /mnt/nova_ssd/codex-manyforge/cache/isaac-runtime \
-  --remote-runtime-root /mnt/nova_ssd/codex-manyforge/state/isaac-runtime \
-  --remote-evidence-root /mnt/nova_ssd/codex-manyforge/evidence/isaac-runtime \
-  --remote-manager-executable /mnt/nova_ssd/codex-manyforge/builds/current/package/bin/manyforge_manager_daemon \
-  --remote-install-root /mnt/nova_ssd/codex-manyforge/builds/current/package \
-  --remote-node-catalog-path /mnt/nova_ssd/codex-manyforge/builds/current/package/share/node_catalog.yaml \
-  --remote-alarm-catalog-path /mnt/nova_ssd/codex-manyforge/builds/current/package/share/alarm_catalog.yaml \
-  --remote-state-root /mnt/nova_ssd/codex-manyforge/runners/cells \
-  --remote-bridge-state-root /mnt/nova_ssd/codex-manyforge/runners/isaac-bridge \
-  --remote-simulation-control-config /mnt/nova_ssd/codex-manyforge/runners/manyforge/manyforge_ros_bringup/config/isaac_program_simulation_site.json \
-  --remote-ros-setup-script /opt/ros/jazzy/setup.bash \
-  --remote-ros-environment-script /mnt/nova_ssd/codex-manyforge/runners/manyforge/config/ros/isaac_i9.env.sh \
-  --package-aggregate-sha256 "$PACKAGE_SHA256" \
-  --compiler-build-manifest-sha256 "$COMPILER_SHA256" \
-  --node-environment-sha256 "$NODE_ENV_SHA256" \
-  --expected-source-fingerprint "$SOURCE_FINGERPRINT" \
-  --expected-head-commit "$MANYFORGE_COMMIT" \
-  --expected-head-tree "$MANYFORGE_TREE"
-```
-
-`HELD_ISAAC_ROS_IMAGE_ID` is the full immutable `sha256:<64 lowercase hex>` ID of
-an already present, qualified full ROS image. G does not pull or build an image.
-The qualified package/admission and catalogs are mounted read-only at their
-explicit absolute paths. An optional `--remote-composer-static-dir` overrides
-the image's existing built frontend. The older executable/state/setup path
-arguments remain recorded compatibility inputs; the Workbench builds and stages
-its resident runtime from the verified source and image. Host ROS setup paths
-are not sourced. The topology inputs remain the existing explicit domain, RMW,
-discovery range and static peers, forwarded into the same container. The
-example's site file must be an actual configured source, not a placeholder.
-
-The runtime root must be persistent absolute host storage, outside `/tmp`,
-`/run` and tmpfs. Manager, Scene, cycle and incident journals survive container
-removal and reboot. Build caches and existing Composer/Runner persistent values
-are retained separately. Status and stop authenticate the original full
-container ID, immutable image and launch labels; replacement names are not
-ownership proof. A failed inspection or unreachable Docker/SSH endpoint is
-unknown, not proof of absence.
-
-G keeps Docker's `json-file` logs at50MiB ×3 and records the exact
-`docker logs <full-container-id>` reference. Its plain stop and reuse of an
-exited owned container first export through the existing `stop_with_evidence`
-path into the one configured evidence root. Export failure retains the
-container and its logs. Failed startup first leaves the exact container
-available to G: if usable, G requests SimulationStop only for its authenticated
-own Sim, then stops/exports/removes the container. If unusable or unknown it
-reports that limitation; it does not create a temporary ROS client or claim
-Sim Stop succeeded. Existing owned local Sim process cleanup remains bounded.
-
-The global size/count policy for exported bundles, failed-export retained
-containers, ROS home logs and per-launch records is still pending. Do not add
-an automatic rotator or delete uncaptured evidence. Explicit `status` and
-`stop` use the persisted profile and identity; Isaac never auto-plays, selects
-a Scenario, Applies a graph or Runs a Program. Startup/cleanup failure and
-host/Sim loss remain typed stopped/degraded outcomes. Restore an unavailable
-host before reconciling the matching record; never use broad process kills,
-an unowned Sim or historical launchers as a fallback.
-
-The physical ROS/real-robot lane, assistant-provider bring-up, packaged
-installation, historical aggregate launchers, and old Isaac recipes are not
-current operator surfaces. In particular, never use or restore historical
-`scripts/launch.sh` or `scripts/lib/isaac.sh`; they are forbidden fallback
-entrypoints, not alternatives to `manyforge-operator`.
+Composer serves `/api/health`, `/api/manager/status`, `/api/runtime` and
+`/openapi.json`. See the [Composer REST API](../reference/REST_API.md) and the
+[Headless REST API](../reference/HEADLESS_REST_API.md).

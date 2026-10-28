@@ -4,6 +4,7 @@
 #include <array>
 #include <gtest/gtest.h>
 #include <limits>
+#include <manyforge_core/stop_surveillance.hpp>
 #include <manyforge_roboplan/retained_stop_surveillance_owner.hpp>
 #include <stdexcept>
 
@@ -166,7 +167,8 @@ IdleCellWideStatus(const core::RuntimeParticipantBinding &binding) {
           1U,
           core::StopFaultRecoveryStatusDTO::kWaitingForObservation,
           "stop_scope_promoted",
-          {}},
+          {},
+          {core::StopFaultTriggerDTO::kScopePromotion}},
       std::nullopt};
 }
 
@@ -215,6 +217,36 @@ TEST(RetainedStopSurveillanceOwnerTest,
   ASSERT_FALSE(rejected.ok());
   EXPECT_EQ(rejected.error().code,
             core::kStopFaultRecoveryInstalledConfigurationInvalid);
+}
+
+TEST(RetainedStopSurveillanceOwnerTest,
+     SampleReceivedAfterTheEvaluationTimeIsNotStopEvidence) {
+  // Every retained sample is newer than the query (the read-boundary race):
+  // the owner reports the source unavailable as in M3, never an available
+  // item with a negative age, and the sample field validator accepts it.
+  const auto binding = make_binding();
+  auto channel = std::make_shared<StateChannel>(binding);
+  const auto source = ObservationSource(binding);
+  RetainedStopSurveillanceOwner owner(
+      {RetainedStopSurveillanceSourceInput{binding, channel, {source}, {}}});
+  ASSERT_TRUE(channel
+                  ->publish_state({std::array<double, 2U>{0.0, 0.0}},
+                                  {std::array<double, 2U>{0.0, 0.0}}, 105, 105)
+                  .applied());
+  const auto query = Query(source, 100);
+  const auto sample = owner.Observe(query);
+  EXPECT_EQ(sample.availability,
+            core::StopSurveillanceSourceAvailabilityDTO::kUnavailable);
+  EXPECT_FALSE(sample.evaluated_evidence.has_value());
+  ASSERT_TRUE(sample.error.has_value());
+  EXPECT_EQ(sample.error->code, "stop_surveillance_source_unavailable");
+  EXPECT_EQ(core::stop_surveillance_observation_sample_field_error(query, sample),
+            std::nullopt);
+  // At the receipt time the same sample is evidence again.
+  const auto at_receipt = owner.Observe(Query(source, 105));
+  ASSERT_EQ(at_receipt.availability,
+            core::StopSurveillanceSourceAvailabilityDTO::kAvailable);
+  EXPECT_EQ(at_receipt.evaluated_evidence->source_age_at_evaluation_ns, 0);
 }
 
 TEST(RetainedStopSurveillanceOwnerTest,

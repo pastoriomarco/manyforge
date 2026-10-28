@@ -200,28 +200,35 @@ std::string apply_worker_os_config(const SchedulerWorkerOsConfig& config) {
 #endif
 }
 
-bool scheduler_priority_terminates_on_exception(
-    core::SchedulerPriority priority) {
+// Typed containment reason for a throwing callback on a Stop/safety-path
+// lane; empty for the lanes that only log and continue.
+std::string_view safety_path_fault_reason(core::SchedulerPriority priority) {
   switch (priority) {
     case core::SchedulerPriority::ControllerCommand:
+      return "scheduler_controller_command_callback_exception";
     case core::SchedulerPriority::RuntimeSafety:
+      return "scheduler_runtime_safety_callback_exception";
     case core::SchedulerPriority::StopControl:
-      return true;
+      return "scheduler_stop_control_callback_exception";
     case core::SchedulerPriority::Lifecycle:
     case core::SchedulerPriority::Monitoring:
     case core::SchedulerPriority::Background:
-      return false;
+      return {};
   }
-  return true;
+  return "scheduler_unknown_lane_callback_exception";
 }
 
+// Written for the first throw per lane only, so a repeating throw cannot grow
+// the log. A contained lane's later throws are counted by the Kernel internal
+// fault (`later_count` in the runtime-fault status).
 void log_scheduler_callback_exception(core::SchedulerPriority priority,
                                       const char* exception_text,
-                                      bool terminating) {
+                                      bool contained) {
   std::cerr << "manyforge_scheduler_callback_exception"
             << " priority=" << core::scheduler_priority_name(priority)
-            << " terminating=" << (terminating ? "true" : "false")
-            << " exception=" << exception_text << std::endl;
+            << " contained=" << (contained ? "true" : "false")
+            << " exception=" << exception_text
+            << " later_throws=not_logged" << std::endl;
 }
 
 }  // namespace
@@ -444,23 +451,46 @@ core::ScheduleHandle SimpleScheduler::schedule(
 }
 
 void SimpleScheduler::cancel(core::ScheduleHandle handle) {
+  static_cast<void>(cancel_before_dequeue(handle));
+}
+
+bool SimpleScheduler::cancel_before_dequeue(core::ScheduleHandle handle) {
   core::SchedulerPriority priority;
   {
     std::lock_guard<std::mutex> registry_lock(registry_mutex_);
     auto it = handle_to_priority_.find(handle);
     if (it == handle_to_priority_.end()) {
-      return;  // already fired or never scheduled
+      return false;  // already fired or never scheduled
     }
     priority = it->second;
     handle_to_priority_.erase(it);
   }
   Worker& w = worker_for(priority);
+  bool removed = false;
   {
     std::lock_guard<std::mutex> lock(w.mutex);
     ++w.queue_generation;
-    w.tasks.erase(handle);
+    // Zero when the worker already dequeued it (the registry entry is erased
+    // only after the dequeue), so a running callback is never reported removed.
+    removed = w.tasks.erase(handle) == 1U;
   }
   w.cv.notify_all();
+  return removed;
+}
+
+void SimpleScheduler::set_safety_path_fault_sink(
+    std::function<void(std::string_view)> sink) {
+  std::lock_guard<std::mutex> lock(safety_path_fault_sink_mutex_);
+  safety_path_fault_sink_ = std::move(sink);
+}
+
+void SimpleScheduler::contain_safety_path_fault(
+    std::string_view reason_code) noexcept {
+  std::lock_guard<std::mutex> lock(safety_path_fault_sink_mutex_);
+  if (!safety_path_fault_sink_) {
+    std::terminate();
+  }
+  safety_path_fault_sink_(reason_code);
 }
 
 void SimpleScheduler::Worker::drain() {
@@ -587,26 +617,32 @@ void SimpleScheduler::Worker::worker_loop(std::stop_token st) {
     };
 
     if (callback) {
+      // A throw on a Stop/safety-path lane is contained by the host (motion
+      // admission closed, Full Stop attempted); the lane keeps running.
+      // finish_callback() runs before the containment on purpose: draining
+      // while holding the Kernel lock must not wait on this worker. So
+      // "drained" means the callback returned, not that this worker is idle;
+      // nothing may rely on drain() to order after the containment.
       try {
         callback();
       } catch (const std::exception& e) {
         finish_callback();
-        const bool terminating =
-            scheduler_priority_terminates_on_exception(priority);
-        log_scheduler_callback_exception(priority, e.what(), terminating);
-        if (terminating) {
-          std::terminate();
+        const auto fault = safety_path_fault_reason(priority);
+        if (callback_exceptions++ == 0U)
+          log_scheduler_callback_exception(priority, e.what(), !fault.empty());
+        if (!fault.empty()) {
+          owner->contain_safety_path_fault(fault);
         }
         continue;
       } catch (...) {
         finish_callback();
-        const bool terminating =
-            scheduler_priority_terminates_on_exception(priority);
-        log_scheduler_callback_exception(priority,
-                                         "unknown_non_std_exception",
-                                         terminating);
-        if (terminating) {
-          std::terminate();
+        const auto fault = safety_path_fault_reason(priority);
+        if (callback_exceptions++ == 0U)
+          log_scheduler_callback_exception(priority,
+                                           "unknown_non_std_exception",
+                                           !fault.empty());
+        if (!fault.empty()) {
+          owner->contain_safety_path_fault(fault);
         }
         continue;
       }

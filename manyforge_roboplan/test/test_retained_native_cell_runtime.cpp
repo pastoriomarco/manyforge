@@ -7,6 +7,7 @@
 #include <filesystem>
 #include <fstream>
 #include <functional>
+#include <future>
 #include <iterator>
 #include <memory>
 #include <mutex>
@@ -536,7 +537,8 @@ StopReadinessFor(const core::RuntimeParticipantBinding &binding,
       1U,
       core::StopFaultRecoveryStatusDTO::kWaitingForObservation,
       "stop_fault_latched",
-      {}};
+      {},
+      {core::StopFaultTriggerDTO::kPersistenceDegraded}};
   return status;
 }
 
@@ -860,6 +862,46 @@ TEST(RetainedNativeCellRuntimeTest,
   observer_handle.reset();
   EXPECT_TRUE(clock_lifetime.expired());
 
+  RemoveJournalFiles(journal_path);
+}
+
+TEST(RetainedNativeCellRuntimeTest,
+     ThrowingStopControlCallbackIsContainedByTheCellKernelInsteadOfTerminating) {
+  auto scheduler = std::make_shared<SimpleScheduler>();
+  auto input = EmptyCellInput();
+  input.clock = std::make_shared<WallClock>();
+  input.scheduler = scheduler;
+  input.operation_journal_path = TemporaryJournalPath();
+  const auto journal_path = input.operation_journal_path;
+
+  {
+    RetainedNativeCellRuntime cell(std::move(input));
+    auto followup = std::make_shared<std::promise<void>>();
+    auto followed = followup->get_future();
+    testing::internal::CaptureStderr();
+    const auto now = cell.clock()->now();
+    scheduler->schedule(
+        now, [] { throw std::runtime_error("stop stage failed"); },
+        core::SchedulerPriority::StopControl);
+    scheduler->schedule(
+        now + 1'000'000, [followup] { followup->set_value(); },
+        core::SchedulerPriority::StopControl);
+    const bool lane_continued =
+        followed.wait_for(std::chrono::seconds(2)) == std::future_status::ready;
+    const auto output = testing::internal::GetCapturedStderr();
+    ASSERT_TRUE(lane_continued);
+    // The cell Kernel contained it: the idle cell accepted the internal Full
+    // Stop, and the typed cause holds motion admission closed.
+    EXPECT_NE(output.find("manyforge_fault code=scheduler_stop_control_callback_exception "
+                          "state=contained\n"),
+              std::string::npos)
+        << output;
+    const auto fault = cell.addressed_kernel().get_internal_fault();
+    ASSERT_TRUE(fault.has_value());
+    EXPECT_EQ(fault->reason_code, "scheduler_stop_control_callback_exception");
+    EXPECT_TRUE(fault->stop_accepted);
+    EXPECT_EQ(fault->later_count, 0U);
+  }
   RemoveJournalFiles(journal_path);
 }
 
@@ -2181,6 +2223,67 @@ TEST(RetainedNativeCellRuntimeTest,
       core::verify_runtime_participant_binding(std::move(crossed));
   ASSERT_TRUE(crossed_binding.ok()) << crossed_binding.error().message;
   const auto rejected = resolve(crossed_binding.value());
+  ASSERT_FALSE(rejected.ok());
+  EXPECT_EQ(rejected.error().details.at("reason"),
+            "runtime_participant_stop_port_missing");
+}
+
+TEST(RetainedNativeCellRuntimeTest,
+     ProgramResolverAcceptsAProgramViewWithFewerCollisionBodiesThanItsOwner) {
+  const auto body = [](const char *role, const char *name) {
+    return core::ProgramCollisionBodyRoleBindingDTO{
+        core::CollisionBodyRoleId(role), core::ModelInstanceId("robot.model"),
+        core::ModelRevision("model-revision"), {name}};
+  };
+  auto physical_value = qualification_fixture::make_binding().value();
+  physical_value.collision_body_bindings = {
+      body("arm_collision", "arm_body"), body("tool_collision", "tool_body")};
+  const auto physical_binding =
+      core::verify_runtime_participant_binding(std::move(physical_value));
+  ASSERT_TRUE(physical_binding.ok()) << physical_binding.error().message;
+  auto program_value = physical_binding.value().value();
+  program_value.program_id = core::ProgramId("program.arm-only");
+  program_value.program_revision = core::ProgramRevision("arm-only-revision");
+  program_value.program_binding_id =
+      core::ProgramBindingId("arm-only-program-binding");
+  program_value.collision_body_bindings = {body("arm_collision", "arm_body")};
+  const auto program_binding =
+      core::verify_runtime_participant_binding(std::move(program_value));
+  ASSERT_TRUE(program_binding.ok()) << program_binding.error().message;
+  CellTestExecutionEngine engine;
+  const auto physical = TestRegistration(physical_binding.value(), &engine);
+  const core::OperationIntentDTO intent{
+      {core::RequestId("request.arm-only"),
+       core::RequestOwnerEpoch("owner.resolver"), "test", std::nullopt},
+      program_binding.value().value().program_id,
+      program_binding.value().value().program_revision,
+      program_binding.value().value().program_binding_id,
+      core::ProgramRunId("run.arm-only"),
+      physical_binding.value().value().graph_revision,
+      physical_binding.value().value().retained_bundle_id,
+      std::nullopt,
+      {}};
+  const auto resolve = [&](const core::RuntimeParticipantBinding &selected) {
+    auto resolver = make_retained_cell_kernel_participant_resolver(
+        [selected](const core::OperationIntentDTO &, std::size_t) {
+          return core::Result<RetainedResolvedParticipant>::Ok(
+              {selected, false});
+        },
+        {physical});
+    return resolver(intent, 0U);
+  };
+  const auto resolved = resolve(program_binding.value());
+  ASSERT_TRUE(resolved.ok()) << resolved.error().message;
+  EXPECT_EQ(resolved.value().engine, &engine);
+  EXPECT_EQ(resolved.value().binding.value(), program_binding.value().value());
+
+  // A body the owner does not declare widens the view: no owner matches.
+  auto widened = program_binding.value().value();
+  widened.collision_body_bindings = {body("arm_collision", "another_body")};
+  const auto widened_binding =
+      core::verify_runtime_participant_binding(std::move(widened));
+  ASSERT_TRUE(widened_binding.ok()) << widened_binding.error().message;
+  const auto rejected = resolve(widened_binding.value());
   ASSERT_FALSE(rejected.ok());
   EXPECT_EQ(rejected.error().details.at("reason"),
             "runtime_participant_stop_port_missing");

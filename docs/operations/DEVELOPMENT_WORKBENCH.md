@@ -110,13 +110,9 @@ ROS graph and stages the Manager-owned installed targets. Starting without a
 project uses the canonical-empty ROS producer. `--project` requests ordinary
 startup Load/Apply; `--bootstrap-project` derives an empty predecessor from the
 intended Scenario and opens an empty workspace. The two project options remain
-mutually exclusive.
-
-The ROS Workbench empty bootstrap has reached ready. The combined mock Phase A
-session `qualified-live02` passed the existing API/owner workflow. Neither result
-qualifies Isaac or physical execution, the complete Compose wrapper, or an
-observed GUI journey. The final M1 mock milestone including gripper-only remains
-pending. Earlier diagnostic receipts describe superseded development candidates.
+mutually exclusive. Either accepts a Scenario with at least one ros2_control
+execution component; I/O provider, pose source and AI model components may sit
+next to it. Startup refuses any other component kind.
 
 For example, with the built image:
 
@@ -221,8 +217,8 @@ container on its own. Durable journals, incidents and runtime files remain on
 the host as evidence. Every full development workbench restart creates a fresh
 empty cell; previous runtime state is never adopted or replayed. An explicitly
 supplied `--project` still uses the ordinary startup Load path. Without it, Load
-the Saved Scenario in Composer when ready; no Activate, Execute or Reset is
-submitted automatically.
+the Saved Scenario in Composer when ready, or press New for an empty Untitled
+Scenario; no Activate, Execute or Reset is submitted automatically.
 
 Runtime owners use `current/` below the mounted state root. Before they start,
 the launcher atomically moves the previous `current/` into
@@ -397,11 +393,10 @@ container. Its ordinary host location is
 `.manyforge-dev/runtime/<container-name>/`, under `MANYFORGE_DEV_CACHE_BASE` when
 configured. It is shared across image updates for that workspace and container
 name. Set `MANYFORGE_DEV_RUNTIME_STATE_ROOT` to override it with an absolute host
-directory; the operator-managed path already requires an explicit persistent
 directory. A start refuses a state root bound by another running ManyForge
-container. Give concurrent container names separate roots. On an Orin, place
-`MANYFORGE_DEV_CACHE_BASE` or the explicit runtime root under `/mnt/nova_ssd`,
-so these files stay on the SSD rather than the eMMC home.
+container. Give concurrent container names separate roots. On a Jetson that boots from eMMC, place
+`MANYFORGE_DEV_CACHE_BASE` or the explicit runtime root on an SSD mount, so
+these files stay on the SSD rather than the eMMC home.
 
 The binding takes effect when creating a container. An already running container
 keeps its existing mounts until an explicit stop/start; the launcher does not
@@ -457,15 +452,16 @@ needed value into the Program default and recreate the project. Save updates aut
 references; Save As creates another project without copying referenced external
 sources. Missing/invalid sources block preparation, while changed compatible
 sources are reported for review rather than silently pinned to an old vendor
-copy. Use Export when a portable project is required: it copies the admitted
-source/asset closure and rewrites only the exported references. Do not use Save
-As as an asset-collection operation.
+copy. New closes the current Scenario and opens the built-in, read-only
+Untitled Scenario (empty Program, Scene and Deployment) through the same Load
+path, so composing and Apply work at once. Save is disabled for it; Save As
+writes it to a project folder and continues there. Unsaved Untitled changes
+are not recovered after a Composer restart. Use Export when a portable project
+is required: it copies the admitted source/asset closure and rewrites only the
+exported references. Do not use Save As as an asset-collection operation.
 
-UA2A qualifies this project and preparation workflow, not the new live
-activation lifecycle. Until UA3–UA7 replace and qualify the current Manager/
-Scene consumers, treat Apply/Revert behavior as development work in progress and
-follow Runtime/history rather than assuming that successful preparation means a
-completed live transition. Discard remains draft-only.
+Follow Runtime/history rather than assuming that successful preparation means a
+completed live transition. Discard changes only the Draft.
 
 Inspect before restarting:
 
@@ -519,22 +515,21 @@ reload does not start a Program or authorize motion automatically.
 
 Ordinary Scenario Load remains a Manager Apply and does not restart the
 workbench. These commands are a development-workbench fallback for a runtime
-that deliberately retained its restrictions; the future installed GUI
-affordance belongs to the installed lifecycle supervisor, not this script.
+that deliberately retained its restrictions.
 
 This procedure is only for the simulated development workbench. It is not a
 containment or recovery procedure for physical equipment.
 
 | Symptom | Action |
 | --- | --- |
-| Image missing | Prepare dependencies and build `dev` using the commands above. |
+| Image missing | Run `./scripts/compose-dev.sh build` (see [Install](#install-one-build-one-start)). |
 | Project source missing, invalid or changed | Preserve the diagnostic, inspect the named project/source path, and review changes before retrying. Do not bypass identity checks or delete caches blindly. |
 | Port occupied | Identify the listener on 3000/9010/9011/9020; do not kill an unrelated process. |
 | Different or unhealthy workbench already running | Read status/logs first. Stop only with authorization before switching scenarios; do not spawn another stack to hide the failure. |
 | Slow first start | Inspect build output. Lower `MANYFORGE_DEV_BUILD_JOBS` if compilation exhausts memory; avoid repeated startup attempts. |
 | `status` says stopped after a failed start | The launcher removed the container it created, with its logs. Read the start output you kept (`tee`), or start again with its output captured. |
 | `Scenario project is outside allowed roots` (exit 69) | Pass a project folder inside `examples/`, the only root startup accepts; a scratch folder such as `.manyforge-dev/` is refused. |
-| Start refuses with `… assistant instrument source is invalid or stale` or `… node environment manifest is stale` | A generated source is out of date after a catalog or covered source change. Regenerate with the owner tools, in order: `manyforge_behavior/scripts/generate_effective_node_catalog.py` (an intentional catalog change also updates the pinned digest in `manyforge_behavior/manyforge_behavior/catalog.py`), `manyforge_behavior/scripts/generate_node_environment_manifest.py`, then `manyforge_deployment/tools/generate_assistant_instrument_registry.py`. Run them in the workbench image; each has `--check`. |
+| Start refuses with `… assistant instrument source is invalid or stale` or `… node environment manifest is stale` | A generated source is out of date after a catalog or covered source change. Run `python3 scripts/regen.py --update` in the workbench image, review the diff, then `python3 scripts/regen.py --check` ([Identities and pins](../reference/IDENTITY_AND_PINNING.md)). |
 | Error-looking `Execution event pump unavailable` lines during start | Expected before the ROS host is up; see the everyday workflow. Investigate only if they continue after the start reports ready. |
 | Page stale or disconnected after a restart | Refresh the tab. |
 | Stale viewer or failed command | Inspect Runtime/history and owner status. Do not infer rejection from a lost response or resend motion/Apply automatically. |
@@ -553,34 +548,5 @@ or appropriate firewall/access controls; do not expose this workbench publicly.
 When a project is active, `status` reports its owner-issued current identity and
 convergence. It reports a `development_workbench` using repository source, while
 `physical_execution_authorized` remains false. The Workbench prepares ROS
-execution adapters and does not authorize physical equipment. Installed delivery and official
-AMD64/ARM64 packages are separate release/distribution work.
-
-
-## Operator-managed Isaac container
-
-The split Isaac operator reuses this same launcher and resident Workbench in
-one full ROS image on the remote ROS machine. It passes an explicit immutable
-image ID, launch identity/digest, qualified package/admission, DDS topology,
-site path and persistent runtime/evidence roots. This G startup mode keeps its
-existing built-static Composer endpoint at port9000, without Vite/npm startup;
-ordinary commands in this runbook keep their current defaults.
-
-Manager, execution host and observer run together inside that container. The
-observer executable is resolved and verified from the existing built overlay,
-then forwarded to the Manager-owned site check and observer launch. No host
-ROS setup or second component-container launcher is introduced. G readiness
-reads fresh Manager and service health plus the owned Sim; it does not grant
-motion permission or certify all configured components active.
-
-G's runtime-state bind is persistent host storage (not `/tmp` or tmpfs), so
-journals survive removal and reboot. Its plain stop, exited-container reuse
-and owner-controlled failed-start cleanup all preserve runtime evidence and
-Docker logs before removing the exact owned container. An export failure keeps
-the container/logs. Failed startup returns exact metadata to G while retaining
-the ROS client for authenticated own-Sim cleanup, rather than removing it in
-the developer failed-start trap. Both paths use the bounded capture and Q99
-retention policy above. Docker logs retain the independent existing
-`max-size=50m`, `max-file=3` bound. See the
-[operator runbook](MANYFORGE_OPERATOR_RUNBOOK.md#5-split-isaac-topology-and-other-unavailable-lanes)
-for complete inputs, identity and qualification limits.
+execution adapters and does not authorize physical equipment. There is no
+installer or official AMD64/ARM64 package; the workbench runs from source.

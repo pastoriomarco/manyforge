@@ -43,6 +43,7 @@ from .models import (
     StopFaultRecoveryRequest,
     StopIntentRequest,
 )
+from .component_rearm import require_no_external_move
 from .native import HeadlessApiError
 from .service import HeadlessService, TrustedAttribution
 
@@ -356,8 +357,12 @@ class HeadlessExecutionControlDispatch:
             selected = {
                 "reload_initial_scene": model.reload_initial_scene,
                 "reset_robot_position": model.reset_robot_position,
+                "keep_stop_fault": model.keep_stop_fault,
             }
-            if cycle.get("reset_options") != selected:
+            accepted = cycle.get("reset_options")
+            if not isinstance(accepted, dict) or {
+                "keep_stop_fault": False, **accepted
+            } != selected:
                 disposition, code = "rejected", "program_run_request_conflict"
             else:
                 disposition, code = "joined", "program_reset_already_current"
@@ -376,6 +381,31 @@ class HeadlessExecutionControlDispatch:
             disposition=disposition,
             code=code,
         ), {"program_cycle": dict(cycle)}
+
+    def _rearm_before_motion(
+        self, request: ExecutionCommandRequestDTO
+    ) -> tuple[ExecutionIngressResult, Mapping[str, Any]] | None:
+        """m5.5: every transport's Execute/Run/jog/Move-to, after the ingress's
+        freshness and busy checks, the Program availability check and the
+        command's own request validation, before the owner: while a robot
+        reports a move from its own interface the command is refused
+        `component_rearm_required`, with no effect (FIX5). Also in a runner-less
+        (standalone) Headless: the check acts only on a CCLC-managed cell."""
+
+        try:
+            require_no_external_move(self._service)
+        except HeadlessApiError as error:
+            return self._addressed_result(
+                request, disposition="rejected", code=error.code
+            ), {
+                "ok": False,
+                "error": {
+                    "code": error.code,
+                    "message": str(error),
+                    "details": dict(error.details),
+                },
+            }
+        return None
 
     def __call__(
         self,
@@ -440,9 +470,10 @@ class HeadlessExecutionControlDispatch:
         try:
             kind = envelope.command_kind
             if kind == "program_run":
-                result = self._service.program_run_start(
-                    ProgramRunStartRequest.model_validate({**payload, **context})
-                )
+                model = ProgramRunStartRequest.model_validate({**payload, **context})
+                if (refused := self._rearm_before_motion(request)) is not None:
+                    return refused
+                result = self._service.program_run_start(model)
             elif kind in {
                 "program_motion_stop",
                 "program_full_stop",
@@ -516,12 +547,12 @@ class HeadlessExecutionControlDispatch:
                     model.program_run_id, "manual-result", model
                 )
             elif kind == "operation_start":
-                result = self._service.execution_submit(
-                    OperationIntentRequest.model_validate(
-                        {**payload, "request_context": context}
-                    ),
-                    attribution,
+                model = OperationIntentRequest.model_validate(
+                    {**payload, "request_context": context}
                 )
+                if (refused := self._rearm_before_motion(request)) is not None:
+                    return refused
+                result = self._service.execution_submit(model, attribution)
             elif kind in {
                 "operation_reset",
                 "operation_acknowledge_completed",

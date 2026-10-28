@@ -575,14 +575,6 @@
   background: var(--mf-bg-neutral-12);
 }
 
-.runtime-observability-surface.has-attention.attention-warning {
-  border-color: var(--mf-border-warning-35b);
-}
-
-.runtime-observability-surface.has-attention.attention-warning .runtime-observability-rail {
-  background: var(--mf-bg-warning-13);
-}
-
 .runtime-observability-surface.has-attention.attention-error {
   border-color: var(--mf-border-danger-45);
 }

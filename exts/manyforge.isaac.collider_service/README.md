@@ -275,11 +275,12 @@ decide how owner-issued evidence carries the equivalent pose and scale; the old
 report and mesh-transfer status are not compatibility contracts.
 
 Historical example, importing the collider approximation for an Isaac object
-into a program-local mesh folder (unavailable on current `dev`):
+into a program-local mesh folder (unavailable on current `dev`; `MANYFORGE_ROOT`
+is the ManyForge checkout):
 
 ```bash
 docker run --rm --network host \
-  -v /home/tndlux/workspaces/dev_ws/src/manyforge:/workspace \
+  -v "${MANYFORGE_ROOT}":/workspace \
   -w /workspace ${MANYFORGE_ISAAC_ROS_IMAGE:-manyforge-ros-jazzy-full:q44-20261010} \
   bash -lc 'source /opt/ros/${ROS_DISTRO}/setup.bash;
     export PYTHONPATH=/workspace:/workspace/manyforge_ros:${PYTHONPATH};

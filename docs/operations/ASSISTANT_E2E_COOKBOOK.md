@@ -108,6 +108,15 @@ unknown alias or a component that is not an `ai_model`, gives
 The launcher always starts the bridge on `127.0.0.1:8100` and passes
 `--assistant-bridge-url` to Composer. Nothing else needs configuring.
 
+Program model requests that attach an image require a connected Composer
+native 3D viewer. Both Program runner launch paths provide the Composer
+`/api/scene/snapshot/render` URL automatically. Open the viewer before running
+a vision Scenario and keep it connected so the request can obtain a
+generation-matched frame. If Composer has no generation-matched viewer frame,
+capture fails with `model_snapshot_observer_unavailable`; if the Composer
+snapshot endpoint is unreachable, it fails with
+`model_snapshot_image_source_unavailable`.
+
 With the default `endpoint` stream setting (warning, auto), Prepare and Enable never refuse because of the model server. While the
 Deployment runs, each endpoint is supervised as the component stream
 `endpoint` of the `ai_model` component: it is probed every 2 s, and its
@@ -151,6 +160,59 @@ curl -fsS http://127.0.0.1:3000/api/assistant/modes # ai_model_component_id set
 - The model never receives the MCP operator adapter, and it cannot save,
   Apply, run a Program or move a robot.
 - Cancel stops an in-flight request. New conversation clears the history.
+
+## 5. Run the Mock smoke scripts
+
+Use a Mock Scenario with an applied assistant Deployment and a loaded Program
+Draft, such as `examples/ur10e_assistant_scene_authoring.scenario`. Keep the
+Composer and ManyForge services on the same host where the smoke command runs.
+For the local setup above, configure the chat component's `base_url` as
+`http://127.0.0.1:8000/v1` and set its `model` to the exact served name.
+
+If the component uses a token, export its `MANYFORGE_AI_*` variable in the host
+shell before starting the workbench. The launcher forwards these variables by
+name; do not put the token on a command line. The smoke scripts read the active
+chat alias projection and check that `{base_url}/models` lists the component's
+`model` before sending an assistant request.
+
+First run the read-only provider and tool-callback check:
+
+```bash
+python3 scripts/smoke-assistant-provider-bridge.py
+```
+
+It restricts the model to `program_read` and verifies that the Composer Draft
+snapshots before and after the request match. A changed snapshot can reflect a
+concurrent Draft edit, so run this check against an isolated Mock Draft. The
+complete check adds one uniquely named box through
+`scene_draft_add_object`:
+
+```bash
+python3 scripts/smoke-assistant-e2e.py --confirm-draft-only
+# Equivalent entry point:
+scripts/demo-assistant-known-good.sh --confirm-draft-only
+```
+
+The scene-only check is also available:
+
+```bash
+python3 scripts/smoke-assistant-scene-authoring.py --confirm-draft-only
+```
+
+All scripts accept `--composer-url` (default `http://127.0.0.1:3000`, the
+Composer frontend proxy; the internal Composer API defaults to port 9020),
+`--expected-component-id` to check a multi-model chat alias mapping, and
+`--timeout-seconds` (1–900, default 180). For example, if
+`assistant_model` maps to `chat_model`, pass
+`--expected-component-id chat_model`.
+
+The full check leaves its new object in the Program Draft. It verifies that
+Saved and Applied identities stay the same; it never Saves, Applies, Discards,
+runs a Program, or sends a robot command. Review the Draft in Composer and
+choose Apply or Discard/Revert yourself. Run it against an isolated Mock Draft,
+not while another operator is editing the same Draft. If a request times out or
+its result is unclear, inspect request status and the Draft before rerunning;
+the scripts submit each request once and do not retry an uncertain outcome.
 
 ## Recipes
 

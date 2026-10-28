@@ -1749,8 +1749,7 @@ void PutProgramNode(Writer& writer, const ProgramNodeAdmissionEvidenceDTO& value
   if (!ValidateCellAdmissionClaimIntent(intent).ok() ||
       intent.claim_kind != CellAdmissionClaimKindDTO::kInterventionOrRecovery ||
       intent.owner_role != CellAdmissionOwnerRoleDTO::kComponentLifecycleOwner ||
-      !intent.owner_transaction_id.starts_with(prefix) || intent.scope.resources.empty() ||
-      intent.scope.configurations.empty() || intent.program_cycle_evidence ||
+      !intent.owner_transaction_id.starts_with(prefix) || intent.program_cycle_evidence ||
       intent.program_node_evidence || !intent.intervention_evidence ||
       intent.intervention_evidence->parent_program_cycle_claim_generation) return false;
   const std::string_view suffix(intent.owner_transaction_id.data() + prefix.size(),

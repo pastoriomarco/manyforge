@@ -169,22 +169,22 @@ def test_endpoints_enforce_frozen_placement_and_url_rules():
         service=ServiceKind.COMPOSER,
         bind_host="0.0.0.0",
         port=9000,
-        advertised_host="orion",
-        url="https://orion:9000/",
+        advertised_host="runtime-host",
+        url="https://runtime-host:9000/",
     )
-    assert endpoint.url == "https://orion:9000/"
+    assert endpoint.url == "https://runtime-host:9000/"
     for url in (
-        "ftp://orion:9000/",
-        "http://user:pass@orion:9000/",
-        "http://orion:9000/health",
-        "http://orion:9000/?query=1",
+        "ftp://runtime-host:9000/",
+        "http://user:pass@runtime-host:9000/",
+        "http://runtime-host:9000/health",
+        "http://runtime-host:9000/?query=1",
     ):
         with pytest.raises(ValidationError):
             ServiceEndpoint(
                 service=ServiceKind.COMPOSER,
                 bind_host="0.0.0.0",
                 port=9000,
-                advertised_host="orion",
+                advertised_host="runtime-host",
                 url=url,
             )
     with pytest.raises(ValidationError):
@@ -192,8 +192,8 @@ def test_endpoints_enforce_frozen_placement_and_url_rules():
             service=ServiceKind.COMPOSER,
             bind_host="127.0.0.1",
             port=9000,
-            advertised_host="orion",
-            url="http://orion:9000/",
+            advertised_host="runtime-host",
+            url="http://runtime-host:9000/",
         )
 
 
@@ -339,7 +339,7 @@ def test_strict_extra_wrong_type_and_bounded_inputs(source_factory):
         HostIdentity(
             host_id="runtime",
             role=HostRole.RUNTIME,
-            hostname_or_address="orion",
+            hostname_or_address="runtime-host",
             boot_id=222,
         )
     with pytest.raises(ValidationError):
@@ -347,8 +347,8 @@ def test_strict_extra_wrong_type_and_bounded_inputs(source_factory):
             service="not-a-service",
             bind_host="0.0.0.0",
             port="9000",
-            advertised_host="orion",
-            url="http://orion:9000/",
+            advertised_host="runtime-host",
+            url="http://runtime-host:9000/",
         )
     with pytest.raises(ValidationError):
         SourceIdentityV1(
@@ -377,8 +377,8 @@ def test_source_digest_and_host_url_digest_bounds(source_factory):
             service=ServiceKind.COMPOSER,
             bind_host="0.0.0.0",
             port=9000,
-            advertised_host="orion",
-            url="http://orion/",
+            advertised_host="runtime-host",
+            url="http://runtime-host/",
         )
     with pytest.raises(ValidationError):
         RuntimeArtifactIdentity(

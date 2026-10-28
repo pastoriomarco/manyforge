@@ -1,4 +1,4 @@
-import { useState } from 'react';
+import { useEffect, useRef, useState } from 'react';
 import type { ReactNode } from 'react';
 
 import type { DeploymentWorkspaceController } from '../hooks/useDeploymentWorkspace';
@@ -16,6 +16,7 @@ import {
   type PoseSourceComponent,
 } from '../utils/poseSourceAuthoring';
 import { DraftTextInput } from './common/DraftInputs';
+import { pneumaticGripperDrafts } from '../utils/pneumaticGripperAuthoring';
 
 const text = (value: JsonValue | undefined) => (typeof value === 'string' ? value : '');
 const numbers = (value: JsonValue | undefined) => (Array.isArray(value) ? value.join(', ') : '');
@@ -29,6 +30,64 @@ const range = (minimum: number, maximum: number) => (value: string) => {
   return value.trim() !== '' && parsed >= minimum && parsed <= maximum
     ? null : `Enter a number from ${minimum} to ${maximum}.`;
 };
+
+interface RelativeReference {
+  controllable_component_id: string;
+  command_target_id: string;
+  gripper_link: string;
+  entity: string;
+  link: string;
+  source_header_frame_id: string;
+}
+
+interface RelativeReferenceDraft {
+  key: string;
+  value: RelativeReference;
+}
+
+interface RelativeReferenceDraftState {
+  configurationKey: string;
+  rows: RelativeReferenceDraft[];
+}
+
+function relativeReferences(value: JsonValue | undefined): RelativeReference[] {
+  if (!Array.isArray(value)) return [];
+  return value.flatMap((item) => {
+    const row = jsonObject(item);
+    return row === null ? [] : [{
+      controllable_component_id: text(row.controllable_component_id),
+      command_target_id: text(row.command_target_id),
+      gripper_link: text(row.gripper_link),
+      entity: text(row.entity),
+      link: text(row.link),
+      source_header_frame_id: text(row.source_header_frame_id),
+    }];
+  });
+}
+
+function completeRelativeReferences(
+  rows: readonly RelativeReferenceDraft[],
+  gripperTargets: readonly { componentId: string; targetId: string }[],
+): boolean {
+  const identities = rows.map(({ value }) => JSON.stringify([
+    value.controllable_component_id.trim(),
+    value.command_target_id.trim(),
+  ]));
+  return rows.every(({ value }) => (
+    value.controllable_component_id.trim() !== ''
+    && value.command_target_id.trim() !== ''
+    && gripperTargets.some((target) => (
+      target.componentId === value.controllable_component_id.trim()
+      && target.targetId === value.command_target_id.trim()
+    ))
+  ))
+    && new Set(identities).size === identities.length
+    && rows.every(({ value }) => [
+      value.entity,
+      value.link,
+      value.source_header_frame_id,
+    ].every((field) => field.trim() !== ''));
+}
 
 function Field({ label, prefix, value, disabled, validate, type, onCommit }: {
   label: string;
@@ -82,15 +141,18 @@ function OptionalBlock({ label, prefix, stored, initial, complete, disabled, onW
   );
 }
 
-function PoseSourceComponentForm({ controller, component, robotIds, links }: {
+function PoseSourceComponentForm({ controller, component, robotIds, gripperTargets, links }: {
   controller: DeploymentWorkspaceController;
   component: PoseSourceComponent;
   robotIds: string[];
+  gripperTargets: Array<{ componentId: string; targetId: string }>;
   links: PoseLink[];
 }) {
   const configuration = component.runtimeConfiguration;
   const prefix = component.componentId;
+  const gripperComponentIds = [...new Set(gripperTargets.map((target) => target.componentId))];
   const [error, setError] = useState<string | null>(null);
+  const nextRelativeReferenceKey = useRef(0);
   const disabled = !controller.mutationAvailable || controller.busy || controller.loading;
   const write = async (next: JsonObject) => {
     const result = await controller.mutate(
@@ -111,6 +173,38 @@ function PoseSourceComponentForm({ controller, component, robotIds, links }: {
   };
   const budgetNs = typeof configuration.stream_budget_ns === 'number' ? configuration.stream_budget_ns : null;
   const overlay = jsonObject(configuration.robot_overlay);
+  const simulation = jsonObject(configuration.simulation) ?? {};
+  const storedReferences = relativeReferences(simulation.relative_references);
+  const hasLegacyRelativeReference = Object.prototype.hasOwnProperty.call(
+    simulation,
+    'relative_reference',
+  );
+  const relativeReferencesKey = JSON.stringify(simulation.relative_references ?? null);
+  const [relativeReferencesDraft, setRelativeReferencesDraft] = useState<RelativeReferenceDraftState | null>(null);
+  useEffect(() => { setRelativeReferencesDraft(null); }, [component.componentId, relativeReferencesKey]);
+  const relativeReferenceRows = relativeReferencesDraft?.configurationKey === relativeReferencesKey
+    ? relativeReferencesDraft.rows
+    : storedReferences.map((value, index) => ({
+      key: `stored-${index}-${value.controllable_component_id}-${value.command_target_id}`,
+      value,
+    }));
+  const addRelativeReference = () => {
+    const rows = [
+      ...relativeReferenceRows,
+      {
+        key: `pending-${nextRelativeReferenceKey.current++}`,
+        value: {
+          controllable_component_id: '',
+          command_target_id: '',
+          gripper_link: '',
+          entity: '',
+          link: '',
+          source_header_frame_id: '',
+        },
+      },
+    ];
+    setRelativeReferencesDraft({ configurationKey: relativeReferencesKey, rows });
+  };
 
   return (
     <section className="deployment-pose-source" aria-label={`${prefix} pose source`}>
@@ -124,7 +218,58 @@ function PoseSourceComponentForm({ controller, component, robotIds, links }: {
         initial={{ poll_period_ms: 250, source_coordinate_frame_id: '', target_frame_id: '' }}
         complete={(value) => text(value.source_coordinate_frame_id) !== '' && text(value.target_frame_id) !== ''}
         onWrite={block('simulation')}>
-        {(simulation, set) => (
+        {(simulation, set) => {
+          const commitRelativeReferences = (rows: readonly RelativeReferenceDraft[]) => {
+            const nextSimulation = { ...simulation };
+            if (rows.length === 0) {
+              delete nextSimulation.relative_references;
+            } else if (completeRelativeReferences(rows, gripperTargets)) {
+              nextSimulation.relative_references = rows.map(({ value }) => ({
+                controllable_component_id: value.controllable_component_id.trim(),
+                command_target_id: value.command_target_id.trim(),
+                ...(value.gripper_link.trim() === ''
+                  ? {}
+                  : { gripper_link: value.gripper_link.trim() }),
+                entity: value.entity.trim(),
+                link: value.link.trim(),
+                source_header_frame_id: value.source_header_frame_id.trim(),
+              }));
+              delete nextSimulation.relative_reference;
+            } else {
+              return;
+            }
+            set(nextSimulation);
+          };
+          const updateRelativeReference = (
+            index: number,
+            field: keyof RelativeReference,
+            value: string,
+          ) => {
+            const rows = relativeReferenceRows.map((row, rowIndex) => rowIndex === index
+              ? {
+                  ...row,
+                  value: {
+                    ...row.value,
+                    [field]: value,
+                    ...(field === 'controllable_component_id'
+                      && value !== row.value.controllable_component_id
+                      ? { command_target_id: '', gripper_link: '' }
+                      : {}),
+                    ...(field === 'command_target_id' && value !== row.value.command_target_id
+                      ? { gripper_link: '' }
+                      : {}),
+                  },
+                }
+              : row);
+            setRelativeReferencesDraft({ configurationKey: relativeReferencesKey, rows });
+            commitRelativeReferences(rows);
+          };
+          const removeRelativeReference = (index: number) => {
+            const rows = relativeReferenceRows.filter((_, rowIndex) => rowIndex !== index);
+            setRelativeReferencesDraft({ configurationKey: relativeReferencesKey, rows });
+            commitRelativeReferences(rows);
+          };
+          return (
           <>
             <Field label="Poll period (ms)" prefix={prefix} type="number" disabled={disabled}
               value={Number(simulation.poll_period_ms ?? 250)} validate={range(20, 60000)}
@@ -134,26 +279,129 @@ function PoseSourceComponentForm({ controller, component, robotIds, links }: {
               onCommit={(value) => set({ ...simulation, source_coordinate_frame_id: value.trim() })} />
             <Field label="Target frame" prefix={prefix} disabled={disabled} value={text(simulation.target_frame_id)}
               onCommit={(value) => set({ ...simulation, target_frame_id: value.trim() })} />
-            <OptionalBlock label="Relative reference (gripper)" prefix={prefix} disabled={disabled}
-              stored={jsonObject(simulation.relative_reference)}
-              initial={{ entity: '', link: '', source_header_frame_id: '' }}
-              complete={(value) => text(value.entity) !== '' && text(value.link) !== ''
-                && text(value.source_header_frame_id) !== ''}
-              onWrite={member(simulation, set, 'relative_reference')}>
-              {(reference, setReference) => (
-                <>
-                  <Field label="Reference entity" prefix={prefix} disabled={disabled} value={text(reference.entity)}
-                    onCommit={(value) => setReference(withEntity(reference, value.trim()))} />
-                  <Field label="Reference header frame" prefix={prefix} disabled={disabled}
-                    value={text(reference.source_header_frame_id)}
-                    onCommit={(value) => setReference({ ...reference, source_header_frame_id: value.trim() })} />
-                  <Field label="Reference link" prefix={prefix} disabled={disabled} value={text(reference.link)}
-                    onCommit={(value) => setReference({ ...reference, link: value.trim() })} />
-                </>
+            <fieldset className="deployment-pose-source-block" aria-label={`${prefix} relative references`}>
+              <legend>Relative references by gripper target</legend>
+              {hasLegacyRelativeReference && (
+                <p className="field-help" role="status">
+                  legacy single reference: migrated at Apply only if the cell has exactly one gripper target; otherwise set per-target references
+                </p>
               )}
-            </OptionalBlock>
+              <p className="field-help">
+                Match the attached object&apos;s robot and configured gripper target to the rigid body pose source.
+                Use the gripper base body link for the measured body, never a finger; the owner validates it against the model.
+              </p>
+              {relativeReferenceRows.map((row, index) => {
+                const rowPrefix = `${prefix} relative reference ${index + 1}`;
+                const selectedTargetsElsewhere = new Set(relativeReferenceRows.flatMap((candidate, candidateIndex) => (
+                  candidateIndex !== index
+                  && candidate.value.controllable_component_id !== ''
+                  && candidate.value.command_target_id !== ''
+                    ? [JSON.stringify([
+                        candidate.value.controllable_component_id,
+                        candidate.value.command_target_id,
+                      ])]
+                    : []
+                )));
+                const targetOptions = gripperTargets.filter((target) => (
+                  target.componentId === row.value.controllable_component_id
+                ));
+                return (
+                  <div className="deployment-pose-source-block" key={row.key}>
+                    <label className="deployment-focused-field">
+                      <span>Robot component</span>
+                      <select
+                        aria-label={`${rowPrefix} robot component`}
+                        value={row.value.controllable_component_id}
+                        disabled={disabled}
+                        onChange={(event) => updateRelativeReference(
+                          index, 'controllable_component_id', event.target.value,
+                        )}
+                      >
+                        <option value="">Select a robot</option>
+                        {gripperComponentIds.map((id) => (
+                          <option key={id} value={id}>{id}</option>
+                        ))}
+                        {row.value.controllable_component_id !== ''
+                          && !gripperComponentIds.includes(row.value.controllable_component_id) && (
+                          <option value={row.value.controllable_component_id}>
+                            {row.value.controllable_component_id} (no configured gripper target in this Draft)
+                          </option>
+                        )}
+                      </select>
+                    </label>
+                    <label className="deployment-focused-field">
+                      <span>Gripper command target</span>
+                      <select
+                        aria-label={`${rowPrefix} gripper command target`}
+                        value={row.value.command_target_id}
+                        disabled={disabled || row.value.controllable_component_id === ''}
+                        onChange={(event) => updateRelativeReference(
+                          index, 'command_target_id', event.target.value,
+                        )}
+                      >
+                        <option value="">Select a configured gripper target</option>
+                        {targetOptions.map((target) => {
+                          const identity = JSON.stringify([target.componentId, target.targetId]);
+                          return (
+                            <option
+                              key={identity}
+                              value={target.targetId}
+                              disabled={target.targetId !== row.value.command_target_id
+                                && selectedTargetsElsewhere.has(identity)}
+                            >{target.targetId}</option>
+                          );
+                        })}
+                        {row.value.command_target_id !== ''
+                          && !targetOptions.some((target) => target.targetId === row.value.command_target_id) && (
+                          <option value={row.value.command_target_id}>
+                            {row.value.command_target_id} (not in this Draft&apos;s gripper targets)
+                          </option>
+                        )}
+                      </select>
+                    </label>
+                    <Field label="Gripper base link (optional)" prefix={rowPrefix} disabled={disabled}
+                      value={row.value.gripper_link}
+                      onCommit={(value) => updateRelativeReference(index, 'gripper_link', value.trim())} />
+                    <p className="field-help">
+                      Leave the base link blank for the owner to derive it from this target; any explicit link is validated against the model.
+                    </p>
+                    <Field label="Measured entity" prefix={rowPrefix} disabled={disabled}
+                      value={row.value.entity}
+                      onCommit={(value) => updateRelativeReference(index, 'entity', value.trim())} />
+                    <Field label="Measured body link" prefix={rowPrefix} disabled={disabled}
+                      value={row.value.link}
+                      onCommit={(value) => updateRelativeReference(index, 'link', value.trim())} />
+                    <Field label="Source header frame" prefix={rowPrefix} disabled={disabled}
+                      value={row.value.source_header_frame_id}
+                      onCommit={(value) => updateRelativeReference(
+                        index, 'source_header_frame_id', value.trim(),
+                      )} />
+                    <button
+                      type="button"
+                      aria-label={`Remove ${rowPrefix}`}
+                      disabled={disabled}
+                      onClick={() => removeRelativeReference(index)}
+                    >Remove reference</button>
+                  </div>
+                );
+              })}
+              <button
+                type="button"
+                aria-label={`${prefix} add gripper target reference`}
+                disabled={disabled || gripperTargets.length === 0}
+                onClick={addRelativeReference}
+              >Add gripper target reference</button>
+              {gripperTargets.length === 0 && (
+                <p className="muted">Configure a gripper target in this Deployment before adding a reference.</p>
+              )}
+              {relativeReferenceRows.length > 0
+                && !completeRelativeReferences(relativeReferenceRows, gripperTargets) && (
+                <p className="muted">Complete all required fields, select a configured target, and use a unique robot plus command-target pair for each reference before it is stored.</p>
+              )}
+            </fieldset>
           </>
-        )}
+          );
+        }}
       </OptionalBlock>
       <OptionalBlock label="3D detections" prefix={prefix} disabled={disabled}
         stored={jsonObject(configuration.detection3d)}
@@ -271,6 +519,10 @@ export function PoseSourceComponentSection({ controller, programSceneIds }: {
       && !['pose_source', 'ai_model'].includes(String(jsonObject(item?.configuration)?.runtime_kind))
       ? [id] : [];
   });
+  const gripperTargets = [...new Map(pneumaticGripperDrafts(document).map((target) => {
+    const value = { componentId: target.componentId, targetId: target.targetId };
+    return [JSON.stringify([value.componentId, value.targetId]), value] as const;
+  })).values()];
   const disabled = !controller.mutationAvailable || controller.busy || controller.loading;
   const remove = async (sceneResourceId: string) => {
     const result = await savePoseLink(controller, sceneResourceId, null);
@@ -282,7 +534,8 @@ export function PoseSourceComponentSection({ controller, programSceneIds }: {
       <div className="deployment-focused-body">
         {components.map((component) => (
           <PoseSourceComponentForm key={component.componentId} controller={controller} component={component}
-            robotIds={robotIds} links={links.filter((link) => link.source_id === component.componentId)} />
+            robotIds={robotIds} gripperTargets={gripperTargets}
+            links={links.filter((link) => link.source_id === component.componentId)} />
         ))}
         {orphans.length > 0 && (
           <section aria-label="Pose links to objects not in the Program">

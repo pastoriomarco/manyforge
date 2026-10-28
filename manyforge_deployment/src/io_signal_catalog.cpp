@@ -2,6 +2,7 @@
 
 #include <algorithm>
 #include <cmath>
+#include <cstddef>
 #include <limits>
 #include <manyforge_content_identity/content_identity.hpp>
 #include <manyforge_core/io_signal_descriptor.hpp>
@@ -507,6 +508,71 @@ ResolveRetainedIoSignalCatalog(
                        "Retained I/O signal configuration is invalid",
                        {{"reason", error.what()}}});
   }
+}
+
+std::string CarriedObjectLostSignalName(const std::string_view command_target_id) {
+  return std::string(kCarriedObjectLostSignalPrefix) +
+         std::string(command_target_id);
+}
+
+core::Result<std::vector<RetainedIoSignalConfiguration>>
+ResolveCompiledIoSignalCatalog(const core::CellGraphDTO &graph) {
+  using Reply = core::Result<std::vector<RetainedIoSignalConfiguration>>;
+  auto authored = ResolveRetainedIoSignalCatalog(graph);
+  if (!authored.ok())
+    return authored;
+  auto result = std::move(authored.value());
+  // Only authored rows can collide with a system row; the generated rows
+  // share the reserved source by design (SX-205).
+  const auto authored_count = static_cast<std::ptrdiff_t>(result.size());
+  std::set<std::pair<core::ControllableComponentId, core::CommandTargetId>>
+      grippers;
+  for (const auto &binding : graph.control_bindings) {
+    if (binding.capability_id.value() != kGripperCommandCapabilityId ||
+        !grippers.emplace(binding.controllable_component_id,
+                          binding.command_target_id)
+             .second)
+      continue;
+    core::IoSignalDescriptorDTO descriptor{
+        {binding.controllable_component_id,
+         CarriedObjectLostSignalName(binding.command_target_id.value())},
+        core::InterruptSourceId(std::string(kCarriedObjectLostSourceId)),
+        core::IoSignalValueType::kBoolean,
+        core::IoSignalDirection::kInput,
+        core::IoSignalUpdateMode::kChangeOnly,
+        core::IoTransitionCapability::kSampledOnly,
+        {core::IoFreshnessMode::kProviderValidity, {}},
+        {}};
+    descriptor.liveness = core::IoSignalLivenessMode::kInProcess;
+    const bool conflict = std::any_of(
+        result.begin(), result.begin() + authored_count, [&](const auto &row) {
+          return row.descriptor.signal_id == descriptor.signal_id ||
+                 row.descriptor.source_id == descriptor.source_id ||
+                 (row.descriptor.signal_id.controllable_component_id ==
+                      binding.controllable_component_id &&
+                  row.command_target_id == binding.command_target_id &&
+                  row.resource_role_id.value() ==
+                      kCarriedObjectLostResourceRole);
+        });
+    if (conflict || !core::ComputeIoSignalDescriptorDigest(descriptor).ok())
+      return Reply::Err({"invalid_request",
+                         "Retained I/O signal configuration is invalid",
+                         {{"reason", "io_system_signal_conflict"}}});
+    result.push_back(
+        {binding.provider_runtime_unit_id, binding.command_target_id,
+         core::ResourceRoleId(std::string(kCarriedObjectLostResourceRole)),
+         std::move(descriptor),
+         IoSignalProviderConfiguration{
+             std::string(kSystemCarriedObjectProfile), {}, {}, {},
+             kCarriedObjectLostIngressDepth}});
+  }
+  std::sort(result.begin(), result.end(), [](const auto &a, const auto &b) {
+    return std::tie(a.descriptor.signal_id.controllable_component_id,
+                    a.command_target_id, a.resource_role_id) <
+           std::tie(b.descriptor.signal_id.controllable_component_id,
+                    b.command_target_id, b.resource_role_id);
+  });
+  return Reply::Ok(std::move(result));
 }
 
 core::Result<void> MaterializeRetainedIoProviderDevices(

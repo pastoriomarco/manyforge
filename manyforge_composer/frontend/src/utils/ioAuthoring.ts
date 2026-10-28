@@ -2,13 +2,29 @@ import type {
   CatalogJsonSchema, JsonValue, ProgramAuthoringDocument, ProgramBindingDocument,
 } from '../types/api';
 import type { ProgramSemanticChoice } from './programAuthoring';
-import { resolvedTargetRoleBindings } from './targetRoleResolution';
+import { resolvedTargetRoleBindings, resolvedTargetRoles } from './targetRoleResolution';
+import {
+  CARRIED_OBJECT_LOST_RESOURCE_ROLE,
+  systemSignalOriginSuffix,
+  type CarriedObjectLostSignalChoice,
+} from './systemSignalAuthoring';
 
 /** The authored Draft facts that resolve target roles while the binding is null. */
 export interface TargetRoleDraftFacts {
   program: Pick<ProgramAuthoringDocument, 'target_roles'>;
   roleAssignment: Record<string, JsonValue> | null | undefined;
   deploymentDocument: Record<string, JsonValue> | null | undefined;
+}
+
+interface IoTargetRoleRow {
+  target_role_id: string;
+  controllable_component_id: string;
+  command_target_id: string;
+  signal_role_bindings?: Array<{
+    resource_role_id: string;
+    signal_name: string;
+    direction: 'input' | 'output';
+  }>;
 }
 
 /** The executable io nodes that read one input signal. */
@@ -35,23 +51,75 @@ export function ioSignalRoleChoices(
   targetRole: JsonValue | undefined,
   binding: ProgramBindingDocument | null | undefined,
   draftFacts?: TargetRoleDraftFacts,
+  systemSignals: readonly CarriedObjectLostSignalChoice[] = [],
 ): ProgramSemanticChoice[] | null {
   const direction = IO_INPUT_NODE_IDS.has(nodeId) ? 'input'
     : nodeId === 'io.set_output' ? 'output' : null;
   if (direction === null || typeof targetRole !== 'string') return null;
-  const targets = binding != null ? binding.target_role_bindings
-    : draftFacts === undefined ? null
-      : resolvedTargetRoleBindings(draftFacts.program, draftFacts.roleAssignment, draftFacts.deploymentDocument);
+  let targets: IoTargetRoleRow[] | null = binding != null ? binding.target_role_bindings : null;
+  if (targets === null && draftFacts !== undefined) {
+    if (draftFacts.deploymentDocument == null) {
+      // With no Deployment signal catalog, retain the old null result for
+      // ordinary inputs/outputs. Only synthesize a target for this generated
+      // input when the Program requires it and its current role assignment
+      // exactly matches an Applied system-signal row.
+      if (direction !== 'input') return null;
+      const targetRows = resolvedTargetRoles(draftFacts.program, draftFacts.roleAssignment);
+      const relevant = targetRows.filter((target) => {
+        const role = draftFacts.program.target_roles?.[target.target_role_id];
+        const required = role !== null && typeof role === 'object' && !Array.isArray(role)
+          && Array.isArray(role.required_resource_roles)
+          && role.required_resource_roles.includes(CARRIED_OBJECT_LOST_RESOURCE_ROLE);
+        return required && systemSignals.some((signal) => (
+          signal.controllableComponentId === target.controllable_component_id
+          && signal.commandTargetId === target.command_target_id
+        ));
+      });
+      if (relevant.length === 0) return null;
+      targets = relevant.map((target) => ({ ...target, signal_role_bindings: [] }));
+    } else {
+      targets = resolvedTargetRoleBindings(
+        draftFacts.program, draftFacts.roleAssignment, draftFacts.deploymentDocument,
+      );
+    }
+  }
   if (targets === null) return null;
   const target = targets.find((row) => row.target_role_id === targetRole);
   if (target === undefined) return null;
-  return (target.signal_role_bindings ?? [])
+  const systemSignal = systemSignals.find((row) => (
+    row.controllableComponentId === target.controllable_component_id
+    && row.commandTargetId === target.command_target_id
+  ));
+  const programTarget = draftFacts?.program.target_roles?.[target.target_role_id];
+  const requiredRoles = programTarget !== null && typeof programTarget === 'object' && !Array.isArray(programTarget)
+    ? programTarget.required_resource_roles : undefined;
+  const requiresCarriedObjectLost = Array.isArray(requiredRoles)
+    ? requiredRoles.includes(CARRIED_OBJECT_LOST_RESOURCE_ROLE)
+    : (target.signal_role_bindings ?? []).some((row) => (
+      row.resource_role_id === CARRIED_OBJECT_LOST_RESOURCE_ROLE
+    ));
+  const choices = (target.signal_role_bindings ?? [])
     .filter((row) => row.direction === direction)
-    .map((row) => ({
-      value: row.resource_role_id,
-      label: `${row.resource_role_id} · ${row.signal_name} (${direction})`,
-      group: `${targetRole} ${direction} signals`,
-    }));
+    .filter((row) => row.resource_role_id !== CARRIED_OBJECT_LOST_RESOURCE_ROLE
+      || (direction === 'input' && requiresCarriedObjectLost && systemSignal?.signalName === row.signal_name))
+    .map((row) => {
+      const originSuffix = row.resource_role_id === CARRIED_OBJECT_LOST_RESOURCE_ROLE
+        ? systemSignalOriginSuffix(systemSignal) : '';
+      return {
+        value: row.resource_role_id,
+        label: `${row.resource_role_id} · ${row.signal_name} (${direction})${originSuffix}`,
+        group: `${targetRole} ${direction} signals`,
+      };
+    });
+  if (direction === 'input' && requiresCarriedObjectLost && systemSignal !== undefined
+    && !choices.some((choice) => choice.value === CARRIED_OBJECT_LOST_RESOURCE_ROLE)) {
+    choices.push({
+      value: CARRIED_OBJECT_LOST_RESOURCE_ROLE,
+      label: `${CARRIED_OBJECT_LOST_RESOURCE_ROLE} · ${systemSignal.signalName} (input)${systemSignalOriginSuffix(systemSignal)}`,
+      group: `${targetRole} input signals`,
+    });
+  }
+  return choices;
 }
 
 /** The enum values validation refuses for this parameter (edge modes other than level). */

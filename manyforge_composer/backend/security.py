@@ -70,6 +70,31 @@ class SecurityConfig:
         )
 
 
+# The built-in Untitled Scenario (package data): New opens it, Load may read it
+# outside the allowed roots, and no write may ever land inside it.
+UNTITLED_SCENARIO_PATH = Path(__file__).resolve().parent / "resources" / "Untitled.scenario"
+SCENARIO_PROJECT_READ_ONLY_MESSAGE = (
+    "The Untitled Scenario is read-only; use Save As to save it in a folder"
+)
+
+
+def inside_untitled_scenario(target: Path) -> bool:
+    """Whether a write to *target* lands in the built-in Untitled Scenario.
+
+    *target* is the destination (its parent already resolved); an existing
+    symlink at the destination is followed as well.
+    """
+    candidates = [target]
+    try:
+        candidates.append(target.resolve())
+    except (OSError, RuntimeError, ValueError):
+        pass
+    return any(
+        path == UNTITLED_SCENARIO_PATH or UNTITLED_SCENARIO_PATH in path.parents
+        for path in candidates
+    )
+
+
 def is_path_within_roots(path: Path, roots: list[str]) -> bool:
     """Return True if *path* (after resolve) is inside one of *roots*."""
     try:

@@ -6,7 +6,6 @@ from copy import deepcopy
 from dataclasses import dataclass
 import hashlib
 import math
-import uuid
 from pathlib import Path
 from typing import Any, Callable, Literal, NoReturn
 
@@ -177,26 +176,8 @@ class OpenDraftRequest(_LocalDraftFence):
     confirm_discard: bool = Field(default=False, alias="confirmDiscard")
 
 
-class _CompletedCloseContext(BaseModel):
-    model_config = ConfigDict(**{**_DTO_CONFIG, "strict": True})
-
-    scene_owner_id: str = Field(alias="sceneOwnerId", min_length=1, max_length=256)
-    scene_owner_epoch: str = Field(alias="sceneOwnerEpoch", min_length=1, max_length=256)
-    scene_projection_revision: dict[str, Any] = Field(alias="sceneProjectionRevision")
-    manager_owner_id: str = Field(alias="managerOwnerId", min_length=1, max_length=256)
-    manager_owner_epoch: str = Field(alias="managerOwnerEpoch", min_length=1, max_length=256)
-    retained_bundle_id: str = Field(alias="retainedBundleId", min_length=1, max_length=256)
-    graph_revision: str = Field(alias="graphRevision", min_length=1, max_length=256)
-    publication: dict[str, Any]
-    deployment_draft_id: str = Field(alias="deploymentDraftId", min_length=1, max_length=256)
-    expected_deployment_draft_revision: int = Field(
-        alias="expectedDeploymentDraftRevision", ge=0, le=9_007_199_254_740_991
-    )
-
-
 class NewDraftRequest(_LocalDraftFence):
     confirm_discard: bool = Field(default=False, alias="confirmDiscard")
-    completed_close: _CompletedCloseContext | None = Field(default=None, alias="completedClose")
 
 
 class ValidateProgramSourceRequest(BaseModel):
@@ -1439,117 +1420,6 @@ def create_draft_router(state: ComposerState) -> APIRouter:
     @router.post("/api/program/new-draft")
     def new_draft(body: NewDraftRequest) -> dict[str, Any]:
         try:
-            if body.completed_close is not None:
-                closed = body.completed_close
-                if body.confirm_discard is not True:
-                    raise DraftSessionError(
-                        "composer_draft_discard_confirmation_required",
-                        "Close clears the Program and Scene; discard confirmation is required",
-                        status_code=409,
-                    )
-                captured = state.authoring_workspace.identity()
-                body.require_workspace_fence(captured)
-                if (captured.program_draft_id != body.draft_id
-                    or captured.program_draft_revision != body.expected_draft_revision
-                    or captured.deployment_draft_id != closed.deployment_draft_id
-                    or captured.deployment_draft_revision != closed.expected_deployment_draft_revision):
-                    raise DraftSessionError(
-                        "composer_workspace_stale", "The confirmed Drafts changed after Close", status_code=409
-                    )
-
-                def validate_close() -> None:
-                    if state.headless_client is None:
-                        raise DraftSessionError("manager_projection_unavailable", "Manager is unavailable", status_code=503)
-                    current = state.headless_client.manager_status()
-                    bundle, graph, epoch = state._manager_current(current)
-                    active = current["status"]["active"]
-                    publication = closed.publication
-                    transaction = publication.get("transaction")
-                    revision = publication.get("projection_revision")
-                    scene = revision.get("scene_revision") if isinstance(revision, dict) else None
-                    positive = lambda value: type(value) is int and 0 < value <= 9_007_199_254_740_991
-                    nonempty = lambda value: isinstance(value, str) and bool(value)
-                    if (current["source"].get("source_owner_id") != closed.manager_owner_id
-                        or epoch != closed.manager_owner_epoch
-                        or bundle != closed.retained_bundle_id or graph != closed.graph_revision
-                        or active.get("canonical_empty") is not True
-                        or not positive(publication.get("publication_generation"))
-                        or not nonempty(publication.get("durable_public_pointer_content_digest"))
-                        or not isinstance(transaction, dict) or transaction.get("kind") != "named_apply"
-                        or not nonempty(transaction.get("apply_id")) or not positive(transaction.get("apply_generation"))
-                        or not isinstance(revision, dict) or revision.get("retained_bundle_id") != bundle
-                        or revision.get("graph_revision") != graph or not isinstance(scene, dict)
-                        or not nonempty(scene.get("scene_id")) or not positive(scene.get("revision_id"))
-                        or not nonempty(scene.get("content_hash"))
-                        or canonical_json_bytes(active.get("publication")) != canonical_json_bytes(publication)):
-                        raise DraftSessionError(
-                            "composer_close_publication_changed",
-                            "The exact completed Close publication is no longer current; editors were not cleared",
-                            status_code=409,
-                        )
-
-                    # Scene cleanup uses ordinary owner transactions, whose Scene
-                    # revisions advance independently from the immutable Close
-                    # Manager publication. Recheck its final proof under this
-                    # same claim before the authoring workspace can change.
-                    scene_projection = state.headless_client.scene()
-                    scene_source = scene_projection.get("logical_scene", {})
-                    payload = scene_source.get("payload", {})
-                    access = payload.get("access", {}) if isinstance(payload, dict) else {}
-                    snapshot = payload.get("snapshot") if isinstance(payload, dict) else None
-                    expected_scene = closed.scene_projection_revision
-                    policy = snapshot.get("configured_collision_policy") if isinstance(snapshot, dict) else None
-                    if (scene_source.get("available") is not True or scene_source.get("freshness") != "fresh"
-                        or scene_source.get("known_gaps") != []
-                        or scene_source.get("source_owner_id") != closed.scene_owner_id
-                        or scene_source.get("source_owner_epoch") != closed.scene_owner_epoch
-                        or not isinstance(access, dict) or access.get("scene_writes_open") is not True
-                        or access.get("projection_leases_open") is not True
-                        or expected_scene.get("retained_bundle_id") != bundle
-                        or expected_scene.get("graph_revision") != graph
-                        or canonical_json_bytes(access.get("active_projection")) != canonical_json_bytes(expected_scene)
-                        or not isinstance(snapshot, dict) or snapshot.get("objects") != []
-                        or snapshot.get("carried_object_attachments") != []
-                        or not isinstance(policy, dict) or policy.get("policy_id") != "free_space"
-                        or policy.get("require_full_diagnostics") is not True
-                        or any(policy.get(field) != [] for field in ("allowed_static_static_pairs",
-                            "allowed_touch_link_pairs", "support_contacts", "contact_grasps"))
-                        or canonical_json_bytes(snapshot.get("revision")) != canonical_json_bytes(expected_scene.get("scene_revision"))):
-                        raise DraftSessionError(
-                            "composer_close_scene_changed",
-                            "The exact empty logical Scene proof is no longer current; editors were not cleared",
-                            status_code=409,
-                        )
-
-                program = state.draft_session.prepare_new_replacement(_active_catalog(state))
-                deployment = state.deployment_draft_session.prepare_load_replacement({
-                    "schema_version": "manyforge.composer_deployment_draft_state.v2",
-                    "draft_id": "deployment-draft-" + uuid.uuid4().hex, "draft_revision": 1,
-                    "document": {"api_version": "manyforge.deployment_intent.v2",
-                        "deployment_artifact_id": "empty_scenario", "name": "Empty Deployment",
-                        "components": [], "attachments": [], "policies": {}},
-                    "saved_path": None, "saved_document": None,
-                }, source_project_root=None)
-                project = scenario_project_facts(None)
-                project["program_role_assignment"] = {"component_roles": [], "target_roles": []}
-
-                def install_empty() -> bool:
-                    program_changed = state.draft_session.install_prepared_replacement(
-                        program, expected_draft_id=body.draft_id, expected_revision=body.expected_draft_revision
-                    )
-                    deployment_changed = state.deployment_draft_session.install_prepared_replacement(
-                        deployment, expected_draft_id=closed.deployment_draft_id,
-                        expected_revision=closed.expected_deployment_draft_revision,
-                    )
-                    return program_changed or deployment_changed
-
-                commit_local_authoring(
-                    state, body, operation_kind="new_draft", session="whole-workspace",
-                    captured_identity=captured, validate_under_claim=validate_close,
-                    install=install_empty, project=project,
-                )
-                return _workspace(state)
-
             def applied_revision() -> str | None:
                 context, _reason = _applied_context(state)
                 return context.program_revision if context is not None else None

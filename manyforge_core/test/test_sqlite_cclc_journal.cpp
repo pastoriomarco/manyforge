@@ -2138,6 +2138,8 @@ TEST(SqliteCCLCJournal,
     status.terminal_result =
         ComponentLifecycleTerminalResultDTO::kFailedPartialEffect;
     status.error = cause;
+    // A stale predecessor Active state, as a replacement owner would keep it.
+    status.current_state = ComponentLifecycleStateDTO::kActive;
     status.latest_updated_at_ns += 10;
     status.remaining_duration_ns = 0;
     ASSERT_TRUE(status.locally_valid());
@@ -2149,7 +2151,8 @@ TEST(SqliteCCLCJournal,
     ASSERT_TRUE(after_failure.ok());
     EXPECT_EQ(after_failure.value().durable_generation,
               acceptance.component_lifecycle_generation);
-    EXPECT_FALSE(after_failure.value().current_state.has_value());
+    // A partial effect never retains Active: Declared, readable on reopen.
+    EXPECT_EQ(after_failure.value().current_state, ComponentLifecycleStateDTO::kDeclared);
     journal.Close();
   }
 
@@ -2157,12 +2160,13 @@ TEST(SqliteCCLCJournal,
   const auto recovered = reopened.LoadCurrentComponentLifecycleFact(component_id);
   ASSERT_TRUE(recovered.ok());
   EXPECT_EQ(recovered.value().durable_generation, accepted_component_generation);
-  EXPECT_FALSE(recovered.value().current_state.has_value());
+  EXPECT_EQ(recovered.value().current_state, ComponentLifecycleStateDTO::kDeclared);
   const auto coherent = reopened.LoadCurrentSnapshotFacts(
       {component_id}, {ControlDomainId("domain.1")});
   ASSERT_TRUE(coherent.ok()) << coherent.error().message;
   ASSERT_EQ(coherent.value().components.size(), 1U);
-  EXPECT_FALSE(coherent.value().components.front().current_state.has_value());
+  EXPECT_EQ(coherent.value().components.front().current_state,
+            ComponentLifecycleStateDTO::kDeclared);
 }
 
 TEST(SqliteCCLCJournal, UnresolvedContainmentRetainsGenerationWithoutInventingState) {

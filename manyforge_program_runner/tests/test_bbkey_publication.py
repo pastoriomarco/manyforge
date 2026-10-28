@@ -5,6 +5,7 @@ from __future__ import annotations
 from collections.abc import Callable
 from copy import deepcopy
 from pathlib import Path
+import itertools
 import threading
 from typing import Any
 
@@ -443,12 +444,16 @@ def test_a_late_reply_for_a_source_the_runner_retired_is_recorded_only(reply) ->
 def test_unknown_or_stale_reply_for_the_current_source_still_latches() -> None:
     events: list[Any] = []
     store = _store()
-    host = _Host(fail_with=HeadlessApiError("program_bbkey_publication_stale", "stale"))
+    host = _Host(fail_with=HeadlessApiError(
+        "stale_generation", "stale", details={"reason": "program_bb_scope_stale"}
+    ))
     queue = _Queue()
     publisher = _publisher(host, queue, events=events)
     publisher.start(store, ("count",))
     queue.run()
     assert [event[0] for event in events] == ["stop", "fault"]
+    # The owner's typed code and sub-reason stay visible in the fault.
+    assert "code=stale_generation reason=program_bb_scope_stale" in events[1][1]["message"]
 
 
 def test_source_not_ready_is_retried_within_the_budget_then_latches() -> None:
@@ -696,9 +701,10 @@ def test_superseded_reply_retires_only_that_obligation() -> None:
     assert publisher.fault is None and publisher.pending_sequences() == ()
 
 
-def test_between_run_baseline_start_failure_with_keys_latches_the_fault(
+def test_between_run_baseline_start_failure_keeps_the_source_without_fence(
     tmp_path: Path,
 ) -> None:
+    # F-2: a between-Runs start failure changes no source and never fences.
     receiver, _clock, _losses, _reconciliations = _receiver(tmp_path)
     receiver._handle(_heartbeat())  # noqa: SLF001
     runtime = object.__new__(ProgramRuntime)
@@ -706,7 +712,10 @@ def test_between_run_baseline_start_failure_with_keys_latches_the_fault(
     runtime._bbkey_publishers = {}  # noqa: SLF001
     runtime._bbkey_idle_store = None  # noqa: SLF001
     runtime._bbkey_publishers_lock = threading.RLock()  # noqa: SLF001
+    runtime._bbkey_source_lock = threading.RLock()  # noqa: SLF001
     runtime._interrupt_state_mirror = None  # noqa: SLF001
+    previous = _publisher(_Host(), _inline, between_runs=True)
+    runtime._bbkey_publishers[None] = previous  # noqa: SLF001
 
     def fail_start(*, keys: tuple[str, ...]) -> None:
         raise RuntimeError("Applied Program unreadable")
@@ -715,14 +724,14 @@ def test_between_run_baseline_start_failure_with_keys_latches_the_fault(
     runtime._cell_bbkey_union = lambda: ()  # type: ignore[method-assign]  # noqa: SLF001
     runtime._follow_cell_bbkey_source()  # noqa: SLF001
     assert receiver._handle(_heartbeat(sequence=2))["publisher_fault"] is None  # noqa: SLF001
+    assert runtime._bbkey_publishers[None] is previous  # noqa: SLF001
     runtime._cell_bbkey_union = lambda: ("count",)  # type: ignore[method-assign]  # noqa: SLF001
     runtime._follow_cell_bbkey_source()  # noqa: SLF001
     acknowledgement = receiver._handle(_heartbeat(sequence=3))  # noqa: SLF001
-    assert acknowledgement["publisher_fault"]["code"] == FAULT_CODE
-    assert "Applied Program unreadable" in acknowledgement["publisher_fault"]["message"]
-    assert acknowledgement["command_fenced"] is True
-    with pytest.raises(ProgramRunnerLivenessError):
-        receiver.require_current()
+    assert acknowledgement["publisher_fault"] is None
+    assert acknowledgement["command_fenced"] is False
+    assert runtime._bbkey_publishers[None] is previous  # noqa: SLF001
+    receiver.require_current()
 
 
 # Runtime wiring: between-Runs source identity (bb-wire-shapes03) -----------
@@ -784,8 +793,18 @@ def _runtime(applied: _Applied, journal: _Journal) -> tuple[ProgramRuntime, list
     runtime._bbkey_publishers = {}  # noqa: SLF001
     runtime._bbkey_idle_store = None  # noqa: SLF001
     runtime._bbkey_publishers_lock = threading.RLock()  # noqa: SLF001
+    runtime._bbkey_source_lock = threading.RLock()  # noqa: SLF001
+    runtime._bbkey_fence_lock = threading.Lock()  # noqa: SLF001
+    runtime._bbkey_open_losses = {}  # noqa: SLF001
+    runtime._bbkey_fence_reference = None  # noqa: SLF001
+    runtime._bbkey_fence_permanent = False  # noqa: SLF001
+    runtime._bbkey_source_ordinals = itertools.count(1)  # noqa: SLF001
     runtime._interrupt_state_mirror = None  # noqa: SLF001
     runtime._interrupt_state_run_id = None  # noqa: SLF001
+    runtime._grasp_lost_mirror_lock = threading.Lock()  # noqa: SLF001
+    runtime._carried_object_lost_run_id = None  # noqa: SLF001
+    runtime._carried_object_lost_run_active = False  # noqa: SLF001
+    runtime._carried_object_lost_seen_event_ids = set()  # noqa: SLF001
     runtime._applied_condition_keys = ()  # noqa: SLF001
     runtime._journal = journal  # type: ignore[assignment]  # noqa: SLF001
     runtime._persistent_keys = _Register()  # type: ignore[assignment]  # noqa: SLF001
@@ -830,7 +849,8 @@ def test_every_new_applied_publication_is_a_new_between_run_source() -> None:
     (first,) = hosts
     assert first.frames[0]["active_publication_generation"] == 5
     assert {row["name"]: row["value"] for row in first.frames[0]["values"]} == {
-        "door": None, "total": "4",
+        # Run-scoped key: its declared initial between Runs (D-M4-2).
+        "door": False, "total": "4",
     }
     runtime._follow_cell_bbkey_source()  # The same publication notice: no-op.
     assert len(hosts) == 1
@@ -838,6 +858,27 @@ def test_every_new_applied_publication_is_a_new_between_run_source() -> None:
     runtime._follow_cell_bbkey_source()  # noqa: SLF001
     assert len(hosts) == 2 and hosts[1].frames[0]["active_publication_generation"] == 6
     assert runtime._bbkey_publishers[None].scope.active_publication_generation == 6  # noqa: SLF001
+
+
+def test_unchanged_identity_keeps_its_source_and_never_resends_its_baseline() -> None:
+    # F-2 root: a repeated notice whose catalog read transiently proves no
+    # key (W0) must not retire a source of an unchanged identity; otherwise
+    # the next notice sends the same scope's baseline again.
+    applied, journal = _Applied(), _Journal()
+    runtime, hosts = _runtime(applied, journal)
+    runtime._applied_condition_keys = ("door",)  # noqa: SLF001
+    runtime._follow_cell_bbkey_source()  # noqa: SLF001
+    (first,) = hosts
+    source = runtime._bbkey_publishers[None]  # noqa: SLF001
+    runtime._applied_condition_keys = ()  # W0: no Program key, no rule key.  # noqa: SLF001
+    runtime._follow_cell_bbkey_source()  # noqa: SLF001
+    runtime._applied_condition_keys = ("door",)  # noqa: SLF001
+    runtime._follow_cell_bbkey_source()  # noqa: SLF001
+    assert hosts == [first] and runtime._bbkey_publishers[None] is source  # noqa: SLF001
+    assert [frame["message_sequence"] for frame in first.frames] == ["1"]
+    journal.cycle_generation = 8  # A Reset: a new identity, a new source.
+    runtime._follow_cell_bbkey_source()  # noqa: SLF001
+    assert len(hosts) == 2 and hosts[1].frames[0]["cycle_generation"] == 8
 
 
 def test_host_status_for_another_applied_occurrence_waits_for_its_notice() -> None:
@@ -898,3 +939,334 @@ def test_manager_loss_and_publisher_fault_keep_each_cause(tmp_path: Path) -> Non
     assert status["command_fenced"] is True
     assert receiver.manager_fault_reference == losses[0]
     assert losses[0] != status["fault_reference"]
+
+
+# F-2: a refused between-Runs publication never fences the Runner -----------
+
+
+_SEQUENCE_STALE = HeadlessApiError(
+    "stale_generation",
+    "I/O signal identity is no longer current",
+    details={"reason": "program_bb_sequence_stale"},
+)
+
+
+def _fencing_runtime(
+    tmp_path: Path, host: _Host
+) -> tuple[ProgramRuntime, _Applied, _Journal, Any, list[str]]:
+    """The real publisher wiring (`_new_bbkey_publisher`) on a live receiver."""
+
+    receiver, _clock, _losses, _reconciliations = _receiver(tmp_path)
+    receiver._handle(_heartbeat())  # noqa: SLF001
+    applied, journal = _Applied(), _Journal()
+    runtime, _hosts = _runtime(applied, journal)
+    del runtime._new_bbkey_publisher  # noqa: SLF001
+    stops: list[str] = []
+    runtime._liveness = receiver  # noqa: SLF001
+    runtime._bbkey_pending = {}  # noqa: SLF001
+    runtime.config = type("Config", (), {"headless_timeout_seconds": 30.0})()  # type: ignore[assignment]
+    runtime._stop_for_bbkey_publication_fault = stops.append  # type: ignore[method-assign]  # noqa: SLF001
+    runtime._execution_transport = type(  # type: ignore[assignment]  # noqa: SLF001
+        "Transport", (), {"publish_program_bbkeys": staticmethod(host)}
+    )()
+    return runtime, applied, journal, receiver, stops
+
+
+_SEQUENCE_GAP = HeadlessApiError(
+    "stale_generation",
+    "I/O signal identity is no longer current",
+    details={"reason": "program_bb_sequence_gap"},
+)
+_SCOPE_STALE = HeadlessApiError(
+    "stale_generation",
+    "I/O signal identity is no longer current",
+    details={"reason": "program_bb_scope_stale"},
+)
+
+
+class _ScriptedHost(_Host):
+    """Answers each frame with the next scripted error, then accepts."""
+
+    def __init__(self, *errors: Exception) -> None:
+        super().__init__()
+        self.errors = list(errors)
+
+    def __call__(self, request: dict[str, Any]) -> dict[str, Any]:
+        self.fail_with = self.errors.pop(0) if self.errors else None
+        return super().__call__(request)
+
+
+def test_refused_between_run_baseline_is_declared_lost_without_fence(
+    tmp_path: Path, caplog: pytest.LogCaptureFixture
+) -> None:
+    # F-2 / SX-527: the refused sender is dropped and its Kernel source is
+    # made unavailable (exact-sender gap), so BB-backed gates fail closed;
+    # the Runner itself is not fenced.
+    host = _ScriptedHost(_SEQUENCE_STALE, _SEQUENCE_GAP)
+    runtime, _applied, journal, receiver, stops = _fencing_runtime(tmp_path, host)
+    runtime._applied_condition_keys = ("door",)  # noqa: SLF001
+    with caplog.at_level("WARNING"):
+        runtime._follow_cell_bbkey_source()  # noqa: SLF001
+    baseline, loss = host.frames
+    assert baseline["message_sequence"] == "1"
+    assert (loss["kind"], loss["message_sequence"], loss["previous_sequence"]) == (
+        "update", str(2**64 - 1), str(2**64 - 2),
+    )
+    assert {key: loss[key] for key in ("program_run_id", "cycle_generation")} == {
+        "program_run_id": None, "cycle_generation": 7,
+    }
+    assert loss["program_binding_id"] == baseline["program_binding_id"]
+    assert loss["active_publication_generation"] == baseline["active_publication_generation"]
+    assert None not in runtime._bbkey_publishers  # noqa: SLF001
+    assert runtime._bbkey_idle_store is None  # No edit lands in a dead store.  # noqa: SLF001
+    assert stops == []
+    acknowledgement = receiver._handle(_heartbeat(sequence=2))  # noqa: SLF001
+    assert acknowledgement["publisher_fault"] is None
+    assert acknowledgement["command_fenced"] is False
+    receiver.require_current()
+    senders = [r.getMessage() for r in caplog.records if "BB baseline sender" in r.getMessage()]
+    assert len(senders) == 1 and "run=None" in senders[0] and "cycle=7" in senders[0]
+    errors = [r.getMessage() for r in caplog.records if r.levelname == "ERROR"]
+    assert len(errors) == 1 and "program_bb_sequence_stale" in errors[0]
+    assert any("declared lost" in r.getMessage() for r in caplog.records)
+
+    # SX-536: a repeated notice of the same scope is not a recovery; it is
+    # refused and declared lost again, still without a fence.
+    host.errors = [_SEQUENCE_STALE, _SEQUENCE_GAP]
+    runtime._follow_cell_bbkey_source()  # noqa: SLF001
+    assert None not in runtime._bbkey_publishers  # noqa: SLF001
+    assert receiver._handle(_heartbeat(sequence=3))["publisher_fault"] is None  # noqa: SLF001
+
+    # The next Reset (a new Idle cycle) establishes a fresh, accepted source.
+    journal.cycle_generation = 8
+    runtime._follow_cell_bbkey_source()  # noqa: SLF001
+    fresh = runtime._bbkey_publishers[None]  # noqa: SLF001
+    assert fresh.scope.cycle_generation == 8 and fresh.fault is None
+    assert fresh.pending_sequences() == ()
+    assert host.frames[-1]["cycle_generation"] == 8
+    assert host.frames[-1]["message_sequence"] == "1"
+    assert receiver._handle(_heartbeat(sequence=4))["publisher_fault"] is None  # noqa: SLF001
+
+
+def test_between_run_loss_not_confirmed_by_the_kernel_fences_as_before(
+    tmp_path: Path,
+) -> None:
+    # Fail closed: without the Kernel's typed loss the source may still be
+    # usable, so the Runner fences itself as before F-2.
+    host = _ScriptedHost(_SEQUENCE_STALE, _SCOPE_STALE)
+    runtime, _applied, _journal, receiver, stops = _fencing_runtime(tmp_path, host)
+    runtime._applied_condition_keys = ("door",)  # noqa: SLF001
+    runtime._follow_cell_bbkey_source()  # noqa: SLF001
+    assert len(host.frames) == 2 and stops == []
+    acknowledgement = receiver._handle(_heartbeat(sequence=2))  # noqa: SLF001
+    assert acknowledgement["publisher_fault"]["code"] == FAULT_CODE
+    assert "program_bb_sequence_stale" in acknowledgement["publisher_fault"]["message"]
+    assert acknowledgement["command_fenced"] is True
+    with pytest.raises(ProgramRunnerLivenessError, match="publication fault"):
+        receiver.require_current()
+
+
+class _QueuedPool:
+    """Run work only when drained (never inline), like the Runner pool."""
+
+    def __init__(self) -> None:
+        self.queue = _Queue()
+
+    def submit_run_work(self, work: Callable[[], None]) -> None:
+        self.queue(work)
+
+
+def _queued_fencing_runtime(
+    tmp_path: Path, host: _Host
+) -> tuple[ProgramRuntime, _Journal, Any, _Queue]:
+    runtime, _applied, journal, receiver, _stops = _fencing_runtime(tmp_path, host)
+    pool = _QueuedPool()
+    runtime._host = pool  # type: ignore[assignment]  # noqa: SLF001
+    runtime._applied_condition_keys = ("door",)  # noqa: SLF001
+    return runtime, journal, receiver, pool.queue
+
+
+def test_between_run_fault_fences_until_the_kernel_confirms_the_loss(
+    tmp_path: Path,
+) -> None:
+    # SX-543 (1): with queued (not inline) work, the window between the
+    # refusal and the Kernel's confirmed loss is fenced: nothing gated by the
+    # previous value can be admitted meanwhile.
+    host = _ScriptedHost(_SEQUENCE_STALE, _SEQUENCE_GAP)
+    runtime, _journal, receiver, queue = _queued_fencing_runtime(tmp_path, host)
+    runtime._follow_cell_bbkey_source()  # noqa: SLF001
+    assert host.frames == []  # The baseline is still queued.
+    queue.work.pop(0)()  # The baseline is refused; containment is queued.
+    assert [frame["message_sequence"] for frame in host.frames] == ["1"]
+    assert len(queue.work) == 1
+    fenced = receiver._handle(_heartbeat(sequence=2))  # noqa: SLF001
+    assert fenced["publisher_fault"]["code"] == FAULT_CODE
+    assert fenced["command_fenced"] is True
+    with pytest.raises(ProgramRunnerLivenessError, match="publication fault"):
+        receiver.require_current()
+    queue.run()  # The loss frame: the Kernel confirms the exact-sender gap.
+    assert host.frames[-1]["message_sequence"] == str(2**64 - 1)
+    released = receiver._handle(_heartbeat(sequence=3))  # noqa: SLF001
+    assert released["publisher_fault"] is None and released["command_fenced"] is False
+    receiver.require_current()
+
+
+def test_late_reply_for_a_superseded_between_run_source_releases_the_fence(
+    tmp_path: Path,
+) -> None:
+    # SX-543 (2) / SX-547 (1): a Reset installs a newer source before the old
+    # loss is processed. The old scope-stale reply alone keeps the fence; the
+    # Kernel's ACK of the newer baseline releases it.
+    host = _ScriptedHost(_SEQUENCE_STALE, _SCOPE_STALE)
+    runtime, journal, receiver, queue = _queued_fencing_runtime(tmp_path, host)
+    runtime._follow_cell_bbkey_source()  # noqa: SLF001
+    queue.work.pop(0)()  # Old baseline refused; its containment is queued.
+    journal.cycle_generation = 8  # Reset: a new Idle cycle.
+    runtime._follow_cell_bbkey_source()  # noqa: SLF001
+    newer = runtime._bbkey_publishers[None]  # noqa: SLF001
+    assert newer.scope.cycle_generation == 8
+    queue.work.pop(0)()  # Old loss frame: scope stale, the newer one pending.
+    held = receiver._handle(_heartbeat(sequence=2))  # noqa: SLF001
+    assert held["publisher_fault"]["code"] == FAULT_CODE and held["command_fenced"] is True
+    assert not newer.baseline_accepted
+    queue.run()  # The newer baseline is ACKed.
+    assert [(f["cycle_generation"], f["message_sequence"]) for f in host.frames] == [
+        (7, "1"), (7, str(2**64 - 1)), (8, "1"),
+    ]
+    assert newer.fault is None and newer.pending_sequences() == ()
+    assert newer.baseline_accepted
+    released = receiver._handle(_heartbeat(sequence=3))  # noqa: SLF001
+    assert released["publisher_fault"] is None and released["command_fenced"] is False
+    receiver.require_current()
+
+
+def test_unacked_successor_does_not_release_the_fence(tmp_path: Path) -> None:
+    # SX-547 (1): a successor inserted locally whose baseline is still pending
+    # (and an old gap reply that never confirms) is no proof: fence kept.
+    host = _ScriptedHost(_SEQUENCE_STALE, _SCOPE_STALE, _SEQUENCE_STALE, _SCOPE_STALE)
+    runtime, journal, receiver, queue = _queued_fencing_runtime(tmp_path, host)
+    runtime._follow_cell_bbkey_source()  # noqa: SLF001
+    queue.work.pop(0)()  # Old baseline refused; containment queued.
+    journal.cycle_generation = 8
+    runtime._follow_cell_bbkey_source()  # noqa: SLF001
+    successor = runtime._bbkey_publishers[None]  # noqa: SLF001
+    queue.work.pop(0)()  # Old loss: scope stale; successor pending.
+    assert not successor.baseline_accepted
+    with pytest.raises(ProgramRunnerLivenessError, match="publication fault"):
+        receiver.require_current()
+    queue.run()  # The successor's baseline is refused too: never ACKed.
+    assert not successor.baseline_accepted
+    held = receiver._handle(_heartbeat(sequence=2))  # noqa: SLF001
+    assert held["publisher_fault"]["code"] == FAULT_CODE and held["command_fenced"] is True
+    assert len(runtime._bbkey_open_losses) == 2  # noqa: SLF001
+
+
+def test_fence_waits_for_every_unconfirmed_loss(tmp_path: Path) -> None:
+    # SX-547 (2): A and B both fault; A's confirmed loss alone does not lift
+    # the fence while B's gap reply is still delayed.
+    host = _ScriptedHost(_SEQUENCE_STALE, _SEQUENCE_STALE, _SEQUENCE_GAP, _SEQUENCE_GAP)
+    runtime, journal, receiver, queue = _queued_fencing_runtime(tmp_path, host)
+    runtime._follow_cell_bbkey_source()  # noqa: SLF001
+    queue.work.pop(0)()  # A's baseline refused: [contain A].
+    journal.cycle_generation = 8
+    runtime._follow_cell_bbkey_source()  # noqa: SLF001
+    queue.work.pop(1)()  # B's baseline refused: [contain A, contain B].
+    assert len(queue.work) == 2
+    queue.work.pop(0)()  # A's gap is confirmed; B's is still delayed.
+    held = receiver._handle(_heartbeat(sequence=2))  # noqa: SLF001
+    assert held["publisher_fault"]["code"] == FAULT_CODE and held["command_fenced"] is True
+    with pytest.raises(ProgramRunnerLivenessError, match="publication fault"):
+        receiver.require_current()
+    queue.run()  # B's gap is confirmed: no loss left unconfirmed.
+    assert [frame["cycle_generation"] for frame in host.frames] == [7, 8, 7, 8]
+    released = receiver._handle(_heartbeat(sequence=3))  # noqa: SLF001
+    assert released["publisher_fault"] is None and released["command_fenced"] is False
+    receiver.require_current()
+
+
+def test_late_ack_of_a_replaced_sender_leaves_the_newer_loss_open(tmp_path: Path) -> None:
+    # SX-554: A's baseline ACK is delayed; meanwhile a Reset installs B, whose
+    # baseline is refused. A's late ACK callback must not settle B's loss.
+    frames: list[dict[str, Any]] = []
+    holder: dict[str, Any] = {}
+
+    def host(request: dict[str, Any]) -> dict[str, Any]:
+        frames.append(deepcopy(dict(request)))
+        if request["cycle_generation"] == 8:
+            raise _SEQUENCE_STALE if request["message_sequence"] == "1" else _SCOPE_STALE
+        # A's baseline is in flight: Reset installs B and B faults first.
+        runtime, journal, queue = holder["runtime"], holder["journal"], holder["queue"]
+        journal.cycle_generation = 8
+        runtime._follow_cell_bbkey_source()  # noqa: SLF001
+        queue.work.pop(0)()  # B's baseline: refused; B's containment queued.
+        return _Host()(request)  # Only now is A's baseline ACKed.
+
+    runtime, journal, receiver, queue = _queued_fencing_runtime(tmp_path, host)  # type: ignore[arg-type]
+    holder.update(runtime=runtime, journal=journal, queue=queue)
+    runtime._follow_cell_bbkey_source()  # noqa: SLF001
+    queue.work.pop(0)()  # A's drain: its ACK callback runs after B's fault.
+    assert [(f["cycle_generation"], f["message_sequence"]) for f in frames] == [
+        (7, "1"), (8, "1"),
+    ]
+    assert len(runtime._bbkey_open_losses) == 1  # B's loss stays open.  # noqa: SLF001
+    held = receiver._handle(_heartbeat(sequence=2))  # noqa: SLF001
+    assert held["publisher_fault"]["code"] == FAULT_CODE and held["command_fenced"] is True
+    queue.run()  # B's own gap reply is unavailable: the fence stays.
+    with pytest.raises(ProgramRunnerLivenessError, match="publication fault"):
+        receiver.require_current()
+
+
+def test_concurrent_followers_of_one_scope_create_one_sender() -> None:
+    # SX-529: A and B both find no current source before either installs;
+    # serialized creation leaves one sender and one baseline.
+    applied, journal = _Applied(), _Journal()
+    runtime, hosts = _runtime(applied, journal)
+    runtime._applied_condition_keys = ("door",)  # noqa: SLF001
+    create = runtime._new_bbkey_publisher  # noqa: SLF001
+    first_inside = threading.Event()
+    release_first = threading.Event()
+    calls: list[str] = []
+
+    def held_create(scope: ProgramBlackboardPublicationScope) -> ProgramBlackboardKeyPublisher:
+        calls.append(threading.current_thread().name)
+        if len(calls) == 1:
+            first_inside.set()
+            assert release_first.wait(5.0)
+        return create(scope)
+
+    runtime._new_bbkey_publisher = held_create  # type: ignore[method-assign]  # noqa: SLF001
+    first = threading.Thread(target=runtime._follow_cell_bbkey_source, name="A")  # noqa: SLF001
+    second = threading.Thread(target=runtime._follow_cell_bbkey_source, name="B")  # noqa: SLF001
+    first.start()
+    assert first_inside.wait(5.0)
+    second.start()
+    second.join(0.2)  # B now waits for A's creation, before its own check.
+    assert second.is_alive() and calls == ["A"]
+    release_first.set()
+    first.join(5.0)
+    second.join(5.0)
+    assert not first.is_alive() and not second.is_alive()
+    assert calls == ["A"]
+    (host,) = hosts
+    assert [frame["message_sequence"] for frame in host.frames] == ["1"]
+    assert runtime._bbkey_publishers[None].fault is None  # noqa: SLF001
+
+
+def test_refused_run_publication_still_stops_the_run_and_fences(tmp_path: Path) -> None:
+    host = _Host(fail_with=_SEQUENCE_STALE)
+    runtime, _applied, _journal, receiver, stops = _fencing_runtime(tmp_path, host)
+    publisher = runtime._new_bbkey_publisher(  # noqa: SLF001
+        ProgramBlackboardPublicationScope(
+            "kernel-owner", "runner-owner", 3, "run-1", "sha256:" + "d" * 64, 5, 7
+        )
+    )
+    runtime._bbkey_publishers["run-1"] = publisher  # noqa: SLF001
+    publisher.start(_store(), ("count",))
+    assert stops == ["run-1"]
+    assert publisher.fault is not None
+    acknowledgement = receiver._handle(_heartbeat(sequence=2))  # noqa: SLF001
+    assert acknowledgement["publisher_fault"]["code"] == FAULT_CODE
+    assert "program_bb_sequence_stale" in acknowledgement["publisher_fault"]["message"]
+    assert acknowledgement["command_fenced"] is True
+    with pytest.raises(ProgramRunnerLivenessError, match="publication fault"):
+        receiver.require_current()

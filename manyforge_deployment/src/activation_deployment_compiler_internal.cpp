@@ -295,12 +295,23 @@ source_joints(const ActivationComponentProfile &profile,
 // lifecycle catalog (arming at Prepare, D4 Disable, D10 Recover); it offers
 // what the shared provider offers. Mock and Isaac keep the shared provider.
 // Every Real profile is xArm-family today (`lite6_real`); another vendor's
-// row adds its own provider here.
+// row adds its own provider here. A Real gripper domain has its own provider:
+// the shared gripper plans, with Recover aligned to the arm's `disabled`
+// target (one common Recover target, spec 210 section 3.17).
 [[nodiscard]] std::string ros2_control_provider_id(
-    const ActivationComponentProfile &profile) {
-  return real_controller_profile(profile)
-             ? "manyforge.provider.ros2_control.xarm"
-             : "manyforge.provider.ros2_control";
+    const ActivationComponentProfile &profile, std::string_view target) {
+  if (!real_controller_profile(profile)) return "manyforge.provider.ros2_control";
+  return target == "gripper" ? "manyforge.provider.ros2_control.xarm.gripper"
+                             : "manyforge.provider.ros2_control.xarm";
+}
+
+// One provider instance selects one manifest pair (spec 240), so a Real
+// gripper's provider is its own instance; Mock and Isaac keep one instance.
+[[nodiscard]] std::string ros2_control_provider_instance_id(
+    const ActivationDeploymentComponent &component,
+    const ActivationComponentProfile &profile, std::string_view target) {
+  return component.component_id + ".ros2_control" +
+         (real_controller_profile(profile) && target == "gripper" ? ".gripper" : "");
 }
 
 // Do not infer a gripper from passive Real model geometry. A Real gripper is
@@ -591,7 +602,8 @@ void validate_mapped_pneumatic_presets(
     const ActivationDeploymentComponent &component,
     const ActivationComponentProfile &profile,
     const ActivationPreparedModel &model, CatalogSelection &catalog,
-    std::string_view runtime_unit_id) {
+    std::string_view runtime_unit_id,
+    std::span<const QualifiedProviderManifest> provider_manifests) {
   if (!component.root_pose_in_cell || !component.model_source)
     fail("physical component projection requires its actual captured model and "
          "pose");
@@ -733,6 +745,27 @@ void validate_mapped_pneumatic_presets(
   // The Real arm is measured; its pneumatic gripper has only commanded
   // expected-position display until a physical feedback source is configured.
   const bool real = real_controller_profile(profile);
+  const std::string arm_provider_id = ros2_control_provider_id(profile, "arm");
+  const auto &arm_provider_ref = catalog.require(
+      core::CatalogRecordKind::kProviderManifest, arm_provider_id);
+  const auto arm_provider_manifest = std::find_if(
+      provider_manifests.begin(), provider_manifests.end(),
+      [&](const auto &manifest) {
+        return manifest.value().provider_manifest_id.value() == arm_provider_id &&
+               manifest.value().provider_manifest_revision.value() ==
+                   revision(arm_provider_ref);
+      });
+  if (arm_provider_manifest == provider_manifests.end())
+    fail(arm_provider_id + " manifest has no exact qualified source");
+  // The manifest's whole offer closure is part of the selected compiler
+  // catalog even when this arm-only model does not instantiate a gripper.
+  for (const auto &offer : arm_provider_manifest->value().offered_capabilities) {
+    const auto selected = selector(catalog, offer.capability_id.value());
+    if (member(selected, "capability_definition_revision", "capability")
+            .as_string() != offer.capability_definition_revision.value())
+      fail(arm_provider_id +
+           " manifest capability differs from its exact qualified definition");
+  }
   // The selected ROS provider manifest still offers the gripper capabilities;
   // its offer closure needs their exact definitions without a gripper target.
   if (!has_gripper)
@@ -760,7 +793,7 @@ void validate_mapped_pneumatic_presets(
         core::CatalogRecordKind::kStopEvidencePolicy,
         target == "arm" ? "manyforge.arm_motion_controlled_stop"
                         : gripper_stop_policy_id(component, runtime_configuration));
-    const std::string provider_id = ros2_control_provider_id(profile);
+    const std::string provider_id = ros2_control_provider_id(profile, target);
     const auto &provider = catalog.require(
         core::CatalogRecordKind::kProviderManifest, provider_id);
     domains.emplace_back(Object{
@@ -826,11 +859,10 @@ void validate_mapped_pneumatic_presets(
                     CanonicalValue(Array{CanonicalValue("state")})},
                })})},
               // One selected execution provider serves this component's
-              // domains.
+              // domains (a Real gripper's is its own, see above).
               {"provider_instance_id",
-               CanonicalValue(
-                   component.component_id +
-                   (".ros2_control"))},
+               CanonicalValue(ros2_control_provider_instance_id(
+                   component, profile, target))},
               {"provider_runtime_unit_id",
                CanonicalValue(std::string(runtime_unit_id))},
               {"provider_manifest_id", CanonicalValue(provider_id)},
@@ -1220,7 +1252,8 @@ CanonicalValue compile_activation_deployment(
     } else {
       projections.push_back(
           project_component(component, component_profiles[index],
-                            prepared_model(index), catalog, runtime_id));
+                            prepared_model(index), catalog, runtime_id,
+                            provider_manifests));
     }
   }
 
@@ -1432,7 +1465,8 @@ CanonicalValue compile_activation_deployment(
       const auto &component_ref = catalog.require(
           core::CatalogRecordKind::kComponentType,
           component_type_id(profile, has_gripper_target(component, profile)));
-      const std::string planning_provider_id = ros2_control_provider_id(profile);
+      const std::string planning_provider_id =
+          ros2_control_provider_id(profile, target);
       const auto &planning =
           catalog.require(core::CatalogRecordKind::kProviderManifest,
                           planning_provider_id);
@@ -1470,9 +1504,8 @@ CanonicalValue compile_activation_deployment(
                       CanonicalValue(anchor_revision)},
                  })},
                 {"provider_instance_id",
-                 CanonicalValue(
-                     component.component_id +
-                     (".ros2_control"))},
+                 CanonicalValue(ros2_control_provider_instance_id(
+                     component, profile, target))},
                 {"provider_manifest_id", CanonicalValue(planning_provider_id)},
                 {"provider_manifest_revision",
                  CanonicalValue(revision(planning))},

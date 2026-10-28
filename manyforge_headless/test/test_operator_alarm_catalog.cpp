@@ -102,11 +102,11 @@ TEST(OperatorAlarmCatalog,
 TEST(OperatorAlarmCatalog, LoadsThePackagedDigestVerifiedClosedCatalog) {
   const auto catalog = OperatorAlarmCatalog::Load(PackagedCatalog());
   EXPECT_EQ(catalog.schema_version(), "manyforge.operator_alarm_catalog.v1");
-  EXPECT_EQ(catalog.catalog_version(), "2.7.0");
+  EXPECT_EQ(catalog.catalog_version(), "2.8.0");
   EXPECT_EQ(catalog.descriptor_digest(),
             "sha256:"
-            "eae2f502411ddcb0aacb0d71cf73716ecb833dbf5d0496d5cb2d5cfe292b6049");
-  ASSERT_EQ(catalog.definitions().size(), 13U);
+            "267c161200260de6c51198b872f2da7a53239847979bdf39fac0d462dabe7a68");
+  ASSERT_EQ(catalog.definitions().size(), 14U);
   // The dedicated carried-object alarm repeats its error row's compact text,
   // needs acknowledgement and gates no motion.
   const auto *lost = catalog.Find(manyforge::core::kCarriedObjectLostRow.code);
@@ -116,7 +116,8 @@ TEST(OperatorAlarmCatalog, LoadsThePackagedDigestVerifiedClosedCatalog) {
   EXPECT_TRUE(lost->acknowledgement_required);
   EXPECT_FALSE(lost->requires_motion_attention);
   for (const auto name : {"manyforge.runtime.program_runner_loss",
-                          "manyforge.runtime.operation_journal_write_fault"}) {
+                          "manyforge.runtime.operation_journal_write_fault",
+                          "manyforge.runtime.kernel_internal_fault"}) {
     const auto* fault = catalog.Find(name);
     ASSERT_NE(fault, nullptr);
     EXPECT_EQ(fault->priority, "high");
@@ -125,6 +126,9 @@ TEST(OperatorAlarmCatalog, LoadsThePackagedDigestVerifiedClosedCatalog) {
     EXPECT_EQ(fault->adapter_id, "manyforge.alarm_adapter.runtime_fault_condition");
     EXPECT_EQ(fault->max_evidence_refs, 1U);
   }
+  // Neutral: the details say whether its containment Full Stop was accepted.
+  EXPECT_EQ(catalog.Find("manyforge.runtime.kernel_internal_fault")->title,
+            "Internal fault");
   const auto *collision = catalog.Find("manyforge.motion.runtime_collision");
   ASSERT_NE(collision, nullptr);
   EXPECT_EQ(collision->priority, "critical");
@@ -156,7 +160,7 @@ TEST(OperatorAlarmCatalog,
   const auto parsed = deployment::parse_strict_json_model_yaml(source);
   const auto canonical_json = content_identity::canonical_json(parsed.root());
   EXPECT_EQ(OperatorAlarmCatalog::Decode(canonical_json).definitions().size(),
-            13U);
+            14U);
 
   auto tampered = source;
   const auto title = tampered.find("Runtime collision stop");

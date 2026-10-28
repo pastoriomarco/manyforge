@@ -1,5 +1,10 @@
 import { useEffect, useRef, useState, useSyncExternalStore } from 'react';
-import { resolveStructuralAssetUrl } from '../api/client';
+import { api, resolveStructuralAssetUrl } from '../api/client';
+import {
+  MotionIntentGate, narrowRearm, rearmRequiredFromResult, sendWithRearm,
+  type NarrowRearmPorts, type RobotRearmPorts,
+} from '../state/robotRearm';
+import { cclcRequestOwnerEpoch, lifecycleRequestFromSnapshot, requestContext } from './useCCLC';
 import { viewerModelRefreshKey } from '../state/nodeEnvironmentRefresh';
 import { commandRefusalText, receiptRefusal } from '../state/commandRefusal';
 import { structuredErrorText } from '../state/structuredError';
@@ -22,6 +27,8 @@ import type {
   AuthoringWorkspaceIdentity,
   ComposerHeadlessState,
 } from '../types/headless';
+import type { CCLCOwnerIdentity } from '../types/cclc';
+import type { ExecutionIdentity } from '../types/robotControl';
 import type {
   ExecutionObservationFrame,
   ExecutionObservationTarget,
@@ -895,7 +902,76 @@ export class HeadlessStateSource implements ExecutionObservationReader {
   readonly getPresentedRuntimeFrame = (): RuntimeFrameIdentity | null =>
     this.presentedFrame === null ? null : { ...this.presentedFrame };
 
+  /** m5.5: "Re-arming robot…" while a motion command re-arms a moved robot. */
+  private rearmStatus: string | null = null;
+  private readonly rearmStatusListeners = new Set<Listener>();
+  readonly subscribeRearmStatus = (listener: Listener) => {
+    this.rearmStatusListeners.add(listener);
+    return () => this.rearmStatusListeners.delete(listener);
+  };
+  readonly getRearmStatus = (): string | null => this.rearmStatus;
+
+  /**
+   * m5.5 FIX6: every command but runtime scale (Stop, Reset, a newer motion
+   * command) and Close supersede a motion command waiting for its re-arm.
+   */
+  private readonly motionIntents = new MotionIntentGate();
+  /** Close and the "Re-arming robot…" notice's Cancel: nothing is re-sent. */
+  readonly cancelPendingMotionIntent = () => { this.motionIntents.cancel(); };
+
+  /** The narrow re-arm's owner reads and its fenced component Recover. */
+  private readonly narrowRearmPorts: NarrowRearmPorts<ExecutionIdentity, CCLCOwnerIdentity> = {
+    identity: () => api.execution.identity(),
+    owner: () => api.cclc.owner(),
+    component: (id) => api.cclc.component(id),
+    admission: () => this.latest?.authoringAdmission ?? null,
+    submit: (snapshot, execution, owner, admissionGeneration) => api.cclc.submitLifecycle(
+      lifecycleRequestFromSnapshot(
+        snapshot,
+        'recover',
+        requestContext(
+          cclcRequestOwnerEpoch(owner, snapshot, execution),
+          `rearm:${snapshot.controllableComponentId}`,
+        ),
+        admissionGeneration,
+      ),
+    ),
+  };
+
+  private rearmPorts(): RobotRearmPorts {
+    return {
+      rearmComponent: (id, isCurrent) => narrowRearm(this.narrowRearmPorts, id, isCurrent),
+      component: (id) => api.cclc.component(id),
+      sleep: (ms) => new Promise((resolve) => { setTimeout(resolve, ms); }),
+      now: () => Date.now(),
+      onStatus: (status) => {
+        this.rearmStatus = status;
+        for (const listener of this.rearmStatusListeners) listener();
+      },
+    };
+  }
+
+  /**
+   * One press (m5.5): a motion command refused `component_rearm_required`
+   * re-arms the robot with Recover cell, waits until it is active and is sent
+   * once more with the then-current fences (`robotRearm.ts`).
+   */
   readonly sendExecutionCommand = (
+    commandKind: ExecutionControlCommandKind,
+    payload: Record<string, unknown>,
+    correlationId: string,
+  ): Promise<ExecutionCommandReceipt> => {
+    // Synchronously, before anything is sent: the Stop lane is not delayed.
+    const isCurrent = this.motionIntents.issue(commandKind);
+    return sendWithRearm(
+      commandKind,
+      () => this.sendExecutionCommandOnce(commandKind, payload, correlationId),
+      this.rearmPorts(),
+      () => this.enabled && isCurrent(),
+    );
+  };
+
+  private readonly sendExecutionCommandOnce = (
     commandKind: ExecutionControlCommandKind,
     payload: Record<string, unknown>,
     correlationId: string,
@@ -1020,9 +1096,11 @@ export class HeadlessStateSource implements ExecutionObservationReader {
           }
           acknowledged = true;
           if (value.disposition === 'rejected') {
-            throw new Error(commandRefusalText(
+            const text = commandRefusalText(
               receiptRefusal(value.code as string, record.result), { withCode: true },
-            ));
+            );
+            throw rearmRequiredFromResult(value.code as string, record.result, text)
+              ?? new Error(text);
           }
           return {
             correlationId,
@@ -1583,9 +1661,10 @@ export class HeadlessStateSource implements ExecutionObservationReader {
                 && (cause as Record<string, unknown>).code === code
                 && (cause as Record<string, unknown>).correlation_id === correlationId
                 && typeof (cause as Record<string, unknown>).message === 'string';
-              pending.reject(new Error(commandRefusalText(
+              const text = commandRefusalText(
                 receiptRefusal(code, addressed ? cause : null), { withCode: true },
-              )));
+              );
+              pending.reject(rearmRequiredFromResult(code, record.result, text) ?? new Error(text));
             } else {
               pending.resolve(parsed);
             }

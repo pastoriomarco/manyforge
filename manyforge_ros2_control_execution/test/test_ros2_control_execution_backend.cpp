@@ -14,6 +14,7 @@
 #include <memory>
 #include <mutex>
 #include <stdexcept>
+#include <string_view>
 #include <thread>
 #include <utility>
 #include <vector>
@@ -980,6 +981,61 @@ TEST(Ros2TransportResources, TransportOnlyRunsCallbacksWithoutSceneProjection) {
   EXPECT_FALSE(
       resources.node()->get_node_base_interface()->get_context()->is_valid());
   EXPECT_THROW(resources.start(), std::logic_error);
+  resources.quiesce();
+}
+
+// Production layout: the host builds every transport with 3 executor threads.
+// A throwing callback ends only the thread that ran it; the others keep
+// serving callbacks and the fault is typed instead of std::terminate.
+TEST(Ros2TransportResources, ExecutorCallbackThrowIsAContainedTypedFaultWithThreeThreads) {
+  Ros2TransportResources resources("executor_fault_transport_test",
+                                   "/executor_fault_test", 3);
+  std::atomic<int> observed{0};
+  resources.set_executor_fault_observer([&](std::string_view reason) {
+    EXPECT_EQ(reason, "ros_transport_executor_failed");
+    ++observed;
+  });
+  EXPECT_FALSE(resources.executor_fault().has_value());
+  resources.start();
+  const auto node = resources.node();
+  const auto throwing_group =
+      node->create_callback_group(rclcpp::CallbackGroupType::MutuallyExclusive);
+  const auto healthy_group =
+      node->create_callback_group(rclcpp::CallbackGroupType::MutuallyExclusive);
+  std::atomic<bool> thrown{false};
+  std::atomic<int> ticks{0};
+  const auto throwing = node->create_wall_timer(
+      1ms,
+      [&] {
+        if (!thrown.exchange(true))
+          throw std::runtime_error("executor callback failed");
+      },
+      throwing_group);
+  const auto healthy = node->create_wall_timer(1ms, [&] { ++ticks; }, healthy_group);
+  ASSERT_TRUE(wait_until([&] { return resources.executor_fault().has_value(); }));
+  EXPECT_EQ(resources.executor_fault(),
+            std::optional<std::string>("executor callback failed"));
+  const int after_fault = ticks.load();
+  ASSERT_TRUE(wait_until([&] { return ticks.load() > after_fault + 5; }));
+  EXPECT_TRUE(JtcExecutionPortTestPeer::executor_is_spinning(resources));
+  EXPECT_EQ(observed.load(), 1);
+  resources.quiesce();
+}
+
+// A callback that throws every time ends all 3 threads in turn, the spinning
+// thread included: still no terminate, one recorded fault, one notification.
+TEST(Ros2TransportResources, RepeatedExecutorThrowsEndEveryThreadWithoutTerminating) {
+  Ros2TransportResources resources("executor_fault_repeat_test",
+                                   "/executor_fault_test", 3);
+  std::atomic<int> observed{0};
+  resources.set_executor_fault_observer([&](std::string_view) { ++observed; });
+  resources.start();
+  const auto timer = resources.node()->create_wall_timer(
+      1ms, [] { throw std::runtime_error("executor wait failed"); });
+  ASSERT_TRUE(wait_until(
+      [&] { return !JtcExecutionPortTestPeer::executor_is_spinning(resources); }));
+  EXPECT_EQ(resources.executor_fault(), std::optional<std::string>("executor wait failed"));
+  EXPECT_EQ(observed.load(), 1);
   resources.quiesce();
 }
 

@@ -244,11 +244,28 @@ template <typename Value, typename Less>
   return true;
 }
 
+// The fault-free states a Recover domain may settle in. Its plan
+// postcondition decides which (the Real xArm arm: declared or disabled; a
+// healthy Real xArm gripper: declared, prepared, active or disabled).
+[[nodiscard]] constexpr bool recover_settled_state(ComponentLifecycleStateDTO state) noexcept {
+  return state == ComponentLifecycleStateDTO::kDeclared ||
+         state == ComponentLifecycleStateDTO::kPrepared ||
+         state == ComponentLifecycleStateDTO::kActive ||
+         state == ComponentLifecycleStateDTO::kDisabled;
+}
+
+// A succeeded domain carries its observed state. It is the requested state,
+// except after a Recover whose plan postcondition admits another settled
+// state; the status check below allows that difference for Recover alone.
+// The coordinator's plan evaluation, not this check, establishes that the
+// observed state satisfies the provider's plan.
 [[nodiscard]] bool domain_requested_postcondition_satisfied(
     const ComponentLifecycleDomainStatusDTO& domain) noexcept {
   if (domain.requested_state.presence != ComponentLifecycleRequestedStatePresenceDTO::kResolved ||
       !domain.requested_state.state.has_value() || !domain.current_state.has_value() ||
-      *domain.current_state != *domain.requested_state.state) {
+      (*domain.current_state != *domain.requested_state.state &&
+       !(recover_settled_state(*domain.requested_state.state) &&
+         recover_settled_state(*domain.current_state)))) {
     return false;
   }
   return !domain.reconciliation_evidence.has_value() ||
@@ -1638,6 +1655,12 @@ bool ComponentLifecycleStatusDTO::locally_valid() const noexcept {
 
   for (const auto& domain : domains) {
     if (!domain.locally_valid() || domain.requested_state != requested_state) {
+      return false;
+    }
+    // Only a Recover may succeed at a settled state other than the requested one.
+    if (accepted_intent.intent != ComponentLifecycleIntentKindDTO::kRecover &&
+        domain.action_state == ComponentLifecycleDomainActionStateDTO::kSucceeded &&
+        domain.current_state != requested_state.state) {
       return false;
     }
     if (domain.current_scope.has_value()) {

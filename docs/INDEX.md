@@ -12,11 +12,13 @@ workbench.
 | Use Program data | [Blackboard keys](authoring/BLACKBOARD_KEYS.md) and [Expressions](authoring/EXPRESSIONS.md) |
 | Author signal and interrupt rules | [Interrupts](authoring/INTERRUPTS.md) |
 | Understand gripper position without feedback | [Grippers](authoring/GRIPPERS.md) |
+| Add a robot to the Mock lane | [Adding a robot](authoring/ADDING_A_ROBOT.md) |
 | Choose a controlled Stop profile | [Controlled Stop profiles](operations/STOP_PROFILES.md) |
 | Set up the AI assistant | [Assistant cookbook](operations/ASSISTANT_E2E_COOKBOOK.md) |
 | Review the model-server interface | [Assistant provider contract](reference/ASSISTANT_PROVIDER_CONTRACT.md) |
 | Integrate with Composer | [Composer REST API](reference/REST_API.md) |
 | Integrate with Headless | [Headless REST API](reference/HEADLESS_REST_API.md) |
+| Regenerate generated files and digests | [Identities and pins](reference/IDENTITY_AND_PINNING.md) |
 | Contribute | [CONTRIBUTING.md](../CONTRIBUTING.md) |
 
 ManyForge's software Stops and motion controls are not safety-rated. A robot

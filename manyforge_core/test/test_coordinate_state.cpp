@@ -1,6 +1,7 @@
 #include <gtest/gtest.h>
 
 #include <limits>
+#include <manyforge_core/time/received_sample_age.hpp>
 #include <manyforge_core/types/coordinate_state.hpp>
 
 namespace manyforge::core {
@@ -135,6 +136,37 @@ TEST(CoordinateState, ObservedStateEnforcesAuthorityAndFreshness) {
                 .error()
                 .details.at("reason"),
             "source_authority_class_mismatch");
+}
+
+TEST(CoordinateState, SampleReceivedAfterTheBoundaryIsCurrent) {
+  auto measured = observed_from(angular_state());
+  measured.source_kind = ObservedStateSourceKind::kJointState;
+  measured.state_authority_class = StateAuthorityClass::kMeasured;
+  measured.freshness_budget_ns = 100;
+  measured.received_timestamp_ns = 505;
+  // A boundary taken a few ns before the receipt: current, not invalid.
+  EXPECT_TRUE(validate_observed_state_snapshot(measured, 500).ok());
+  EXPECT_TRUE(validate_observed_state_snapshot(measured, 605).ok());
+  EXPECT_EQ(validate_observed_state_snapshot(measured, 606).error().details.at("reason"),
+            "observation_stale");
+  measured.received_timestamp_ns = -1;
+  EXPECT_EQ(validate_observed_state_snapshot(measured, 500).error().details.at("reason"),
+            "observation_metadata_invalid");
+  // A negative boundary stays invalid, even with an extreme receipt.
+  measured.received_timestamp_ns = std::numeric_limits<std::int64_t>::max();
+  EXPECT_EQ(validate_observed_state_snapshot(measured, -2).error().details.at("reason"),
+            "observation_metadata_invalid");
+}
+
+TEST(CoordinateState, ReceivedSampleAgeComparesBeforeSubtracting) {
+  constexpr auto kMax = std::numeric_limits<std::int64_t>::max();
+  constexpr auto kMin = std::numeric_limits<std::int64_t>::min();
+  static_assert(received_sample_age_ns(kMax, -2) == 0);
+  static_assert(received_sample_age_ns(kMax, kMin) == 0);
+  static_assert(received_sample_age_ns(100, 150) == 50);
+  static_assert(received_sample_age_ns(150, 100) == 0);
+  static_assert(received_sample_current(150, 250, 100));
+  static_assert(!received_sample_current(150, 251, 100));
 }
 
 }  // namespace

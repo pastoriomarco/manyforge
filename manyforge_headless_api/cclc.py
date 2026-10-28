@@ -35,6 +35,16 @@ MAX_CCLC_RESPONSE_BYTES = 8 * 1024 * 1024
 _RESPONSE_FIELDS = frozenset({"api_version", "command", "error", "ok", "result"})
 
 
+class CCLCOwnerRefusal(HeadlessApiError):
+    """A validated CCLC ``ok: false`` reply: the owner received the request.
+
+    It proves no effect only when the owner says so: ``details.effect ==
+    "not_started"`` (CCLC's known-unstarted rejection). Every other
+    ``HeadlessApiError`` from the exchange is a send, receive or
+    response-validation failure, after which the owner's outcome is unknown.
+    """
+
+
 class CCLCOpenPort(Protocol):
     """Caller-neutral lifecycle/route surface; implementations own no truth."""
 
@@ -958,7 +968,7 @@ class CCLCOpenRequestClient:
                     "cclc_open_response_invalid",
                     "CCLC error response is invalid",
                 )
-            raise HeadlessApiError(
+            raise CCLCOwnerRefusal(
                 error["code"], error["message"], details=error["details"]
             )
         if response.get("error") is not None:

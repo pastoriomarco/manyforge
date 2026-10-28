@@ -6,13 +6,21 @@ import { samePose } from './poseTransforms';
 import { cartesianMoveOffsetsFromTarget, DEFAULT_MOVE_TO_OPTIONS } from './moveTo';
 
 const start: PoseTuple = { position: [0.123, -0.237, 0.344], quaternion: new Quaternion().setFromEuler(new Euler(0.1, 0.2, 0.7)).toArray() };
-describe('drag-relative gizmo steps', () => {
-  it('preserves off-grid anchors and positive/negative increments', () => {
+describe('gizmo snapping', () => {
+  it('lands moved world axes on the grid and keeps untouched axes', () => {
     const settings = { ...DEFAULT_GIZMO_SETTINGS, snap: true };
     expect(snapGizmoPose(start, start, settings)).toEqual(start);
-    expect(snapGizmoPose(start, { ...start, position: [0.139, -0.251, 0.344] }, settings).position)
-      .toEqual([0.143, -0.247, 0.344]);
+    const snapped = snapGizmoPose(start, { ...start, position: [0.139, -0.251, 0.344] }, settings).position;
+    expect(snapped[0]).toBeCloseTo(0.14, 12);
+    expect(snapped[1]).toBeCloseTo(-0.25, 12);
+    expect(snapped[2]).toBe(0.344);
     expect(snapGizmoPose(start, start, DEFAULT_GIZMO_SETTINGS)).toBe(start);
+  });
+  it('a small drag from an off-grid start still lands on the nearest grid position', () => {
+    const settings = { ...DEFAULT_GIZMO_SETTINGS, snap: true };
+    const snapped = snapGizmoPose(start, { ...start, position: [0.126, -0.237, 0.344] }, settings).position;
+    expect(snapped[0]).toBeCloseTo(0.13, 12);
+    expect(samePose({ ...start, position: snapped }, start)).toBe(false);
   });
   it('snaps local translation before resolving non-grid source offsets', () => {
     const delta = new Vector3(0.016, 0, 0).applyQuaternion(new Quaternion(...start.quaternion));

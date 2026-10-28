@@ -1188,18 +1188,14 @@ class BridgeService:
                 "assistant_callback_invalid",
                 "Composer callback result detail must be an object",
             )
+        # A Draft callback takes no Kernel claim, so it echoes the admission
+        # generation it was sent, committed or not. It is not a fence: a
+        # concurrent Kernel update neither refuses the edit nor shows here.
+        # The workspace revision below is what proves a committed edit.
         next_generation = result["nextAdmissionGeneration"]
         if (
             type(next_generation) is not int
-            or not 1 <= next_generation <= MAXIMUM_SAFE_INTEGER
-            or (
-                result["mutated"] is True
-                and next_generation <= expected_admission_generation
-            )
-            or (
-                result["mutated"] is False
-                and next_generation != expected_admission_generation
-            )
+            or next_generation != expected_admission_generation
         ):
             raise BridgeRunError(
                 "assistant_callback_invalid",

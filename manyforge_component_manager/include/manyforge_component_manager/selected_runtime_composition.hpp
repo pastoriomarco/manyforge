@@ -247,6 +247,32 @@ struct ManagerComponentProcessOccurrenceDTO final {
 
 /// Uses the existing MFNSRC4 collection bound, never a truncated union.
 inline constexpr std::size_t kMaximumComponentProcessInventoryEntries = 4096U;
+
+/// D6 (D-M4-4b, SX-365/374): an Apply of the verified canonical-empty
+/// candidate, from any caller, may remove a component that still reads Active
+/// (its provider is gone, so no Disable step is eligible) only when it has
+/// launch processes and every one is a drained process group (cleanup-proven,
+/// not merely an exited leader). No process (for example a processless I/O
+/// owner), any I/O provider domain (its I/O effects are not proven settled),
+/// a local no-output owner, any other candidate, or a replacement keeps M3's
+/// "deactivate first".
+[[nodiscard]] inline bool ActiveComponentRemovableWithoutLiveProcess(
+    const manyforge::deployment::ApplyComponentChangeDTO &change,
+    const std::vector<ManagerComponentProcessOccurrenceDTO> &occurrences,
+    const bool canonical_empty_candidate, const bool has_io_provider_domain) noexcept {
+  if (!canonical_empty_candidate || has_io_provider_domain ||
+      change.disposition != manyforge::deployment::ApplyComponentDisposition::kRemove)
+    return false;
+  bool any = false;
+  for (const auto &row : occurrences) {
+    if (row.controllable_component_id != change.controllable_component_id) continue;
+    if (row.process_owner_kind != ManagerComponentProcessOwnerKindDTO::kControllerLaunch ||
+        row.cleanup_state != manyforge::core::ControllerLaunchCleanupState::kDrained)
+      return false;
+    any = true;
+  }
+  return any;
+}
 /// Current installed CCLC facts, bound to the inventory's exact predecessor.
 /// These are observation only, never permission to deactivate or replace.
 struct ManagerComponentLifecycleObservationDTO final {

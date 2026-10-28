@@ -1097,14 +1097,14 @@ CanonicalValue HeadlessApiCore::ObserveRuntimeFaultConditions(
               source_owner_epoch.size() <= native_identity_bytes &&
               content_identity::is_utf8_nfc(source_owner_epoch),
           code, "runtime fault source owner is invalid");
-  closed(current_runtime_faults,
-         {"operation_journal_write_fault", "program_runner_loss"});
+  closed(current_runtime_faults, {"operation_journal_write_fault",
+                                  "program_runner_loss", "kernel_internal_fault"});
   Require(content_identity::canonical_json(current_runtime_faults).size() <=
               kMaximumRuntimeFaultSnapshotBytes,
           code, "runtime fault snapshot exceeds its bound");
   // Validate the complete snapshot before submitting either condition.
-  for (const auto kind :
-       {"operation_journal_write_fault", "program_runner_loss"}) {
+  for (const auto kind : {"operation_journal_write_fault",
+                          "program_runner_loss", "kernel_internal_fault"}) {
     const auto &fact = RequiredMember(current_runtime_faults, kind);
     if (fact.is_null())
       continue;
@@ -1136,6 +1136,17 @@ CanonicalValue HeadlessApiCore::ObserveRuntimeFaultConditions(
         static_cast<void>(text(scope, "node_instance_id", 128U));
         static_cast<void>(text(scope, "node_attempt_id", 512U));
       }
+    } else if (std::string_view(kind) == "kernel_internal_fault") {
+      closed(fact, {"request_owner_epoch", "reason_code", "stop_accepted",
+                    "stop_refusal_code", "later_count"});
+      static_cast<void>(text(fact, "reason_code", 128U));
+      // A refusal code exactly when the containment Full Stop was refused.
+      const bool stop_accepted = RequiredBool(fact, "stop_accepted");
+      Require(RequiredMember(fact, "stop_refusal_code").is_null() == stop_accepted,
+              code, "internal fault containment outcome is invalid");
+      if (!stop_accepted)
+        static_cast<void>(text(fact, "stop_refusal_code", 128U));
+      static_cast<void>(RequiredCounter(fact, "later_count", 0U));
     } else {
       closed(fact, {"request_owner_epoch", "manager_owner_epoch",
                     "manager_runtime_epoch", "established_cycle",
@@ -1171,8 +1182,8 @@ CanonicalValue HeadlessApiCore::ObserveRuntimeFaultConditions(
   std::lock_guard lock(mutex_);
   Require(!shutdown_, "headless_api_closed", "headless API core is closed");
   bool changed = false;
-  for (const auto kind :
-       {"operation_journal_write_fault", "program_runner_loss"}) {
+  for (const auto kind : {"operation_journal_write_fault",
+                          "program_runner_loss", "kernel_internal_fault"}) {
     const auto &fact = RequiredMember(current_runtime_faults, kind);
     if (fact.is_null() || active_runtime_fault_kinds_.contains(kind))
       continue;
@@ -4463,24 +4474,31 @@ void HeadlessApiCore::RefreshSceneAdapterLocked(
                                       scene_adapter_.source_epoch,
                                       AlarmConditionQuality::kGood);
 
-  // Each new carried-object-lost event raises its dedicated alarm once. It
-  // returns at once and stays listed until acknowledged; nothing is blocked.
+  // Each new carried-object-lost event whose attachment has
+  // `on_grasp_lost.raise_alarm` raises its dedicated alarm once. It returns at
+  // once and stays listed until acknowledged; nothing is blocked.
   RegisterAdapterEpochLocked(scene_pose_adapter_, *source_epoch);
   std::set<std::string> published;
   if (const auto *losses = state.find_object_member("carried_object_losses")) {
     for (const auto &loss : losses->as_array()) {
       const auto event_id = RequiredString(loss, "event_id");
       published.insert(event_id);
-      if (raised_carried_object_losses_.contains(event_id)) {
+      if (raised_carried_object_losses_.contains(event_id) ||
+          !RequiredBool(RequiredMember(loss, "on_grasp_lost"),
+                        "raise_alarm")) {
         continue;
       }
       const AlarmSubject subject{"scene_resource",
                                  RequiredString(loss, "scene_resource_id"), {}};
-      const CanonicalValue loss_details(CanonicalValue::Object{
+      CanonicalValue::Object loss_fields{
           {"code", RequiredMember(loss, "code")},
           {"event_id", CanonicalValue(event_id)},
           {"full_text", RequiredMember(loss, "full_text")},
-      });
+      };
+      // The typed publication error of a fail-closed loss (SX-204).
+      if (const auto *signal_error = loss.find_object_member("signal_error"))
+        loss_fields.emplace_back("signal_error", *signal_error);
+      const CanonicalValue loss_details(std::move(loss_fields));
       for (const bool active : {true, false}) {
         const auto raised = SubmitAdapterUpdateLocked(
             scene_pose_adapter_,
@@ -4866,7 +4884,7 @@ void HeadlessApiCore::ReconcileStopFaultLocked(
 
 void HeadlessApiCore::ObserveCurrentStopFaultLocked(
     const CanonicalValue &fault_latch, const std::uint64_t native_sequence) {
-  Require(fault_latch.is_object() && fault_latch.as_object().size() == 19U,
+  Require(fault_latch.is_object() && fault_latch.as_object().size() == 20U,
           "headless_operation_event_invalid",
           "current Stop-fault condition has an invalid envelope");
   const auto latch_id = RequiredString(fault_latch, "latch_id");
@@ -4893,13 +4911,16 @@ void HeadlessApiCore::ObserveCurrentStopFaultLocked(
           (trigger == "scope_promotion" || trigger == "escalated" ||
            trigger == "partial" || trigger == "failed_uncontained" ||
            trigger == "physical_rest_unproven" ||
-           trigger == "persistence_degraded") &&
+           trigger == "persistence_degraded" ||
+           trigger == "post_reserve_fence_failed") &&
           RequiredCounter(fault_latch, "latch_generation", 1U) != 0U &&
           RequiredCounter(fault_latch, "recovery_assessment_revision", 1U) !=
               0U &&
           RequiredMember(fault_latch, "captured_operation_ids").is_array() &&
           RequiredMember(fault_latch, "captured_resources").is_array() &&
           RequiredMember(fault_latch, "evidence_refs").is_array() &&
+          RequiredMember(fault_latch, "observed_triggers").is_array() &&
+          !RequiredMember(fault_latch, "observed_triggers").as_array().empty() &&
           RequiredMember(fault_latch, "terminal_projection").is_object() &&
           RequiredMember(fault_latch, "clear_projection").is_object() &&
           std::holds_alternative<bool>(

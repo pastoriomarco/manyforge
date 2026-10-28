@@ -118,6 +118,12 @@ class IKernelCellAdmissionPort {
   }
   [[nodiscard]] virtual Result<CellAdmissionClaimDTO> AcquireCellAdmissionClaim(
       const CellAdmissionClaimIntentDTO& intent) = 0;
+  /// Existing CCLC owner only: the ordinary lifecycle claim with its exact
+  /// intent, so the Kernel can tell Close's Disable from Prepare/Enable (D6).
+  [[nodiscard]] virtual Result<CellAdmissionClaimDTO> AcquireComponentLifecycleClaim(
+      const CellAdmissionClaimIntentDTO& intent, const ComponentLifecycleIntentDTO&) {
+    return AcquireCellAdmissionClaim(intent);
+  }
   /// Existing CCLC owner only: exact local Disable/Prepare/Enable while its
   /// own retained nonmoving output remains acceptance_unknown. Kernel must
   /// qualify the actual resident owner; no transport exposes this exception.

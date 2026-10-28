@@ -9,6 +9,7 @@ from typing import Annotated, Any, Literal, Protocol
 import json
 import re
 import threading
+import time
 import uuid
 
 from fastapi import (
@@ -24,9 +25,17 @@ from fastapi import (
 from fastapi.exception_handlers import request_validation_exception_handler
 from fastapi.exceptions import RequestValidationError
 from fastapi.responses import JSONResponse, Response
+from pydantic import ValidationError
 from starlette.types import ASGIApp, Message, Receive, Scope, Send
 
 from .cclc import CCLCOpenPort, CCLCOpenRequestClient
+from .cell_recover import (
+    CELL_RECOVER_REFERENCE_NOTE,
+    CellRecoverLedger,
+    CellRecoverPorts,
+    recover_cell_once,
+)
+from .component_rearm import ComponentRearmPorts, reenable_components
 from .execution import ExecutionCommandClient, ExecutionEventPump
 from .control_dispatch import (
     HeadlessExecutionControlDispatch,
@@ -59,6 +68,7 @@ from .close_wire import LifecycleOwnerSettlementRequest, LifecycleTargetRetireme
 from .models import (
     AcknowledgeAlarmRequest,
     AcknowledgeAllAlarmsRequest,
+    CellRecoverRequest,
     ComponentLifecycleRequest,
     ComponentProcessStopBody,
     ActivationPreparationRequest,
@@ -106,6 +116,7 @@ from .models import (
     RouteSelectionRequestResultQuery,
     SceneResourcePoseQuery,
     SceneTransactionRequest,
+    StopFaultRecoveryIntentRequest,
     StopFaultRecoveryRequest,
     StopIntentRequest,
 )
@@ -369,6 +380,18 @@ def _error_status(code: str) -> int:
             "unacknowledged_operator_alarms",
             "component_lifecycle_close_incident_mismatch",
             "request_result_expired",
+            # Typed refusals before any effect: Close needs settled work, and
+            # Close keeps the cell Stop fault while it runs (D6).
+            "cell_close_operation_nonterminal",
+            "cell_close_containment_uncertain",
+            "stop_fault_recovery_closing",
+            # Another CCLC transaction holds the control domain; nothing started.
+            "cclc_domain_busy",
+            # m5.5: motion while a robot needs re-arming; a re-arm refused.
+            "component_rearm_refused",
+            "component_rearm_failed",
+            "component_rearm_timeout",
+            "component_rearm_required",
         }
     ):
         return 409
@@ -615,8 +638,13 @@ def create_app(
         payload: dict[str, Any],
         request_context: Any,
         transport_request: Request,
+        rejection_as_result: bool = False,
     ) -> dict[str, Any]:
-        """Adapt a named REST route to the one semantic command ingress."""
+        """Adapt a named REST route to the one semantic command ingress.
+
+        ``rejection_as_result`` returns an ingress rejection (refused before
+        the owner was called) as an ``ok: false`` reply instead of raising.
+        """
 
         if is_stop_command(command_kind):
             # Stop must reach its reserved lane without first waiting on an
@@ -666,6 +694,12 @@ def create_app(
         if submission.receipt.disposition == "rejected" and not (
             isinstance(submission.result, dict) and submission.result.get("ok") is False
         ):
+            if rejection_as_result:
+                return {
+                    "ok": False,
+                    "error": {"code": submission.receipt.code},
+                    "ingress_rejected": True,
+                }
             raise HeadlessApiError(
                 submission.receipt.code,
                 "execution command was rejected by its current owner",
@@ -1789,6 +1823,110 @@ def create_app(
                 transport_request=request,
             )
         )
+
+    cell_recover_ledger = CellRecoverLedger()
+
+    def _authoring_admission_generation() -> int:
+        generation = service.authoring_admission().get("admission_generation")
+        if type(generation) is not int:
+            raise HeadlessApiError(
+                "authoring_admission_unavailable",
+                "current authoring admission generation is unavailable",
+            )
+        return generation
+
+    def _submit_component_lifecycle(payload: dict[str, Any]) -> dict[str, Any]:
+        try:
+            intent = ComponentLifecycleRequest.model_validate(payload)
+        except ValidationError as error:
+            raise HeadlessApiError(
+                "cclc_open_response_invalid",
+                "CCLC snapshot does not form a valid lifecycle request",
+            ) from error
+        return service.component_lifecycle_submit(intent)
+
+    def _thread(callback):
+        return lambda *args: asyncio.to_thread(callback, *args)
+
+    def _component_rearm_ports() -> ComponentRearmPorts:
+        return ComponentRearmPorts(
+            component_ids=_thread(lambda: []),  # unused by the re-enable
+            component_snapshot=_thread(lambda cid: cclc_port().component_snapshot(cid)),
+            cclc_owner_epoch=_thread(
+                lambda: cclc_port().owner_identity()["request_owner_epoch"]
+            ),
+            admission_generation=_thread(_authoring_admission_generation),
+            submit_lifecycle=_thread(_submit_component_lifecycle),
+            lifecycle_status=_thread(lambda tid: cclc_port().lifecycle_status(tid)),
+            monotonic=time.monotonic,
+            sleep=asyncio.sleep,
+        )
+
+
+    @app.post(
+        "/api/execution/cell-recover",
+        openapi_extra={"x-manyforge-reference-note": CELL_RECOVER_REFERENCE_NOTE},
+    )
+    async def execution_cell_recover(
+        body: CellRecoverRequest,
+        request: Request,
+    ) -> JSONResponse:
+        """Recover cell (design 0.3): every fence is read here, not echoed."""
+
+        admission_generation = _authoring_admission_generation
+        submit_lifecycle = _submit_component_lifecycle
+
+        async def submit_stop_recovery(payload: dict[str, Any]) -> dict[str, Any]:
+            try:
+                intent = StopFaultRecoveryIntentRequest.model_validate(payload)
+            except ValidationError as error:
+                raise HeadlessApiError(
+                    "execution_command_response_invalid",
+                    "Stop-fault offer does not form a valid recovery request",
+                ) from error
+            return await rest_execution_command(
+                command_kind="stop_recovery",
+                payload=intent.model_dump(mode="json"),
+                request_context=intent.request_context,
+                transport_request=request,
+                rejection_as_result=True,
+            )
+
+        def thread(callback):
+            return lambda *args: asyncio.to_thread(callback, *args)
+
+        context = body.request_context
+        ports = CellRecoverPorts(
+            execution_identity=thread(service.execution_identity),
+            execution_targets=thread(service.execution_targets),
+            cclc_owner_epoch=thread(
+                lambda: cclc_port().owner_identity()["request_owner_epoch"]
+            ),
+            component_snapshot=thread(lambda cid: cclc_port().component_snapshot(cid)),
+            admission_generation=thread(admission_generation),
+            submit_lifecycle=thread(submit_lifecycle),
+            stop_fault=thread(service.execution_stop_fault),
+            submit_stop_recovery=submit_stop_recovery,
+            monotonic=time.monotonic,
+            sleep=asyncio.sleep,
+            reenable=lambda component_ids, moved: reenable_components(
+                _component_rearm_ports(),
+                component_ids,
+                request_id=context.request_id,
+                source_label=context.source_label,
+                moved=moved,
+            ),
+        )
+        result, replayed = await recover_cell_once(
+            cell_recover_ledger,
+            ports,
+            request_id=context.request_id,
+            source_label=context.source_label,
+            correlation_id=context.correlation_id,
+        )
+        if not replayed:
+            control_state_source.notify_cold()
+        return JSONResponse(content=result)
 
     @app.post("/api/execution/runtime-scale-control")
     async def execution_set_runtime_scale_control(

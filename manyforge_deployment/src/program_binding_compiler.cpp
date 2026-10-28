@@ -1146,12 +1146,23 @@ namespace {
 using IoSignalRoles =
     std::map<std::pair<core::TargetRoleId, core::ResourceRoleId>,
              core::IoSignalDirection>;
+// Every Program-contract requirement of one capability on one target role
+// (all catalog entries): the resource roles read when each requirement is a
+// Get/Check/Wait Input read of its own input capability on that role; nullopt
+// when any requirement comes from another node.
+using IoInputReads =
+    std::map<std::pair<core::TargetRoleId, core::CapabilityId>,
+             std::optional<std::set<core::ResourceRoleId>>>;
 
 // Signal requirements retain their authored resource association; target-level
 // capability unions may also contain unrelated coordinate roles.
 IoSignalRoles
-require_supported_io_signal_roles(const ProgramBindingContract &contract) {
+require_supported_io_signal_roles(const ProgramBindingContract &contract,
+                                  IoInputReads *input_reads = nullptr) {
   IoSignalRoles roles;
+  // Input-read node instance -> (target role, input capability, resource role).
+  std::map<std::string, std::tuple<std::string, std::string, std::string>>
+      read_operands;
   const auto *tree =
       contract.normalized_program_root().find_object_member("tree");
   if (tree == nullptr)
@@ -1186,6 +1197,14 @@ require_supported_io_signal_roles(const ProgramBindingContract &contract) {
       const auto direction = id->as_string() == "io.set_output"
                                  ? core::IoSignalDirection::kOutput
                                  : core::IoSignalDirection::kInput;
+      const auto *instance = node->find_object_member("instance_id");
+      if (direction == core::IoSignalDirection::kInput && instance &&
+          instance->is_string())
+        read_operands[instance->as_string()] = {
+            target->as_string(),
+            id->as_string() == "io.wait_for_input" ? "io.gpio.wait_for_input"
+                                                   : "io.gpio.get_input",
+            resource->as_string()};
       if (direction == core::IoSignalDirection::kOutput) {
         const auto *sources = node->find_object_member("value_sources");
         if (sources && (sources->find_object_member("target_role") ||
@@ -1254,6 +1273,23 @@ require_supported_io_signal_roles(const ProgramBindingContract &contract) {
         pending.push_back(&child);
     }
   }
+  if (input_reads) {
+    for (const auto &node : contract.execution_table().nodes)
+      for (const auto &effect : node.target_effects) {
+        auto &reads = input_reads
+                          ->try_emplace({effect.target_role_id,
+                                         effect.capability_id},
+                                        std::set<core::ResourceRoleId>{})
+                          .first->second;
+        const auto read = read_operands.find(node.instance_id.value());
+        if (reads && read != read_operands.end() &&
+            std::get<0>(read->second) == effect.target_role_id.value() &&
+            std::get<1>(read->second) == effect.capability_id.value())
+          reads->insert(core::ResourceRoleId(std::get<2>(read->second)));
+        else
+          reads.reset();
+      }
+  }
   return roles;
 }
 
@@ -1271,7 +1307,8 @@ compile_program_binding_contract(
     const VerifiedRetainedModelMap &retained_model_map,
     const ICatalogArtifactSource &catalog_artifact_store,
     UnresolvedRoleCollector *collector = nullptr,
-    const IoSignalRoles *io_signal_roles = nullptr) {
+    const IoSignalRoles *io_signal_roles = nullptr,
+    const IoInputReads *io_input_reads = nullptr) {
   try {
     if (!verify_retained_bundle_identity(retained_bundle) ||
         retained_model_map.query().retained_bundle_id !=
@@ -1279,7 +1316,7 @@ compile_program_binding_contract(
       fail("binding compiler inputs do not share one verified retained bundle");
     }
     const auto& bundle = retained_bundle.value();
-    const auto io_catalog = ResolveRetainedIoSignalCatalog(bundle.cell_graph);
+    const auto io_catalog = ResolveCompiledIoSignalCatalog(bundle.cell_graph);
     if (!io_catalog.ok())
       fail(io_catalog.error().details.at("reason"));
     if (program_contract.node_environment != bundle.catalogs.node_environment) {
@@ -1446,8 +1483,26 @@ compile_program_binding_contract(
 
         std::vector<core::ProgramResourceRoleBindingDTO> resources;
         std::vector<core::ProgramSignalRoleBindingDTO> signals;
+        std::set<core::ResourceRoleId> system_signal_roles;
         for (const auto& role : requirement.required_resource_roles) {
-          if (std::none_of(target_type.resource_roles.begin(),
+          // A compiled system signal (`carried_object_lost` on a gripper
+          // target) is a resource role the component type does not declare;
+          // it is exempt only when the Program reads it as a signal.
+          const bool read_as_signal =
+              io_signal_roles &&
+              io_signal_roles->contains({requirement.target_role_id, role});
+          const bool system_signal = read_as_signal && std::any_of(
+              io_catalog.value().begin(), io_catalog.value().end(),
+              [&](const auto &value) {
+                return value.provider.profile == kSystemCarriedObjectProfile &&
+                       value.descriptor.signal_id.controllable_component_id ==
+                           component.controllable_component_id &&
+                       value.command_target_id ==
+                           target_assignment.command_target_id &&
+                       value.resource_role_id == role;
+              });
+          if (!system_signal &&
+              std::none_of(target_type.resource_roles.begin(),
                            target_type.resource_roles.end(), [&](const auto& value) {
                              return core::resource_role_id(value) == role;
                            })) {
@@ -1455,8 +1510,7 @@ compile_program_binding_contract(
                         "target role requires a resource absent from its "
                         "component type");
           }
-          if (io_signal_roles &&
-              io_signal_roles->contains({requirement.target_role_id, role})) {
+          if (read_as_signal) {
             const auto direction =
                 io_signal_roles->at({requirement.target_role_id, role});
             const auto declared = std::find_if(
@@ -1465,8 +1519,10 @@ compile_program_binding_contract(
                   return core::resource_role_id(value) == role;
                 });
             const auto *local =
-                std::get_if<core::ComponentTypeLocalResourceRoleDTO>(
-                    &*declared);
+                declared == target_type.resource_roles.end()
+                    ? nullptr
+                    : std::get_if<core::ComponentTypeLocalResourceRoleDTO>(
+                          &*declared);
             const auto resolved =
                 std::find_if(io_catalog.value().begin(),
                              io_catalog.value().end(), [&](const auto &value) {
@@ -1476,7 +1532,7 @@ compile_program_binding_contract(
                                           target_assignment.command_target_id &&
                                       value.resource_role_id == role;
                              });
-            if (!local || local->coordinate_kind ||
+            if ((!system_signal && (!local || local->coordinate_kind)) ||
                 resolved == io_catalog.value().end())
               unavailable(ProgramBindingUnresolvedReason::kTargetIncompatible,
                           direction == core::IoSignalDirection::kInput
@@ -1500,6 +1556,8 @@ compile_program_binding_contract(
                                resolved->descriptor.direction,
                                resolved->descriptor.transition_capability,
                                digest.value()});
+            if (system_signal)
+              system_signal_roles.insert(role);
             continue;
           }
           resources.push_back(resolve_resource_role(
@@ -1558,6 +1616,31 @@ compile_program_binding_contract(
 
         std::vector<core::ProgramCapabilityBindingDTO> capabilities;
         for (const auto& capability : requirement.required_capabilities) {
+          // A target that does not offer the capability is accepted only
+          // when every Program requirement of it on this role is an input
+          // read whose operand resolves to a compiled system signal (e.g.
+          // `carried_object_lost.<target>`, never authored): that signal
+          // serves the read through the ordinary signal path. Every other
+          // case resolves, and refuses, exactly as before.
+          const bool target_offers = std::any_of(
+              target_type.capabilities.begin(), target_type.capabilities.end(),
+              [&](const auto &value) {
+                return value.capability_id == capability.capability_id &&
+                       value.capability_definition_revision ==
+                           capability.capability_definition_revision;
+              });
+          // A system-signal read needs no retained capability definition:
+          // the read is served through `signal_role_bindings` only.
+          if (!target_offers && io_input_reads) {
+            const auto reads = io_input_reads->find(
+                {requirement.target_role_id, capability.capability_id});
+            if (reads != io_input_reads->end() && reads->second &&
+                std::all_of(reads->second->begin(), reads->second->end(),
+                            [&](const auto &role) {
+                              return system_signal_roles.contains(role);
+                            }))
+              continue;
+          }
           auto resolved = resolve_capability(
               capability, target_type, component, bundle.cell_graph, bundle,
               catalog, retained_model_map);
@@ -2128,11 +2211,13 @@ std::shared_ptr<const ProgramBinding> compile_program_binding(
     const RetainedBundle& retained_bundle,
     const VerifiedRetainedModelMap& retained_model_map,
     const ICatalogArtifactSource& catalog_artifact_store) {
+  IoInputReads io_input_reads;
   const auto io_signal_roles =
-      require_supported_io_signal_roles(program_contract);
+      require_supported_io_signal_roles(program_contract, &io_input_reads);
   return compile_program_binding_contract(
       program_contract.value(), std::move(role_assignment), retained_bundle,
-      retained_model_map, catalog_artifact_store, nullptr, &io_signal_roles);
+      retained_model_map, catalog_artifact_store, nullptr, &io_signal_roles,
+      &io_input_reads);
 }
 
 ProgramBindingOutcome compile_program_binding_outcome(
@@ -2142,11 +2227,13 @@ ProgramBindingOutcome compile_program_binding_outcome(
     const VerifiedRetainedModelMap& retained_model_map,
     const ICatalogArtifactSource& catalog_artifact_store) {
   UnresolvedRoleCollector collector;
+  IoInputReads io_input_reads;
   const auto io_signal_roles =
-      require_supported_io_signal_roles(program_contract);
+      require_supported_io_signal_roles(program_contract, &io_input_reads);
   auto binding = compile_program_binding_contract(
       program_contract.value(), std::move(role_assignment), retained_bundle,
-      retained_model_map, catalog_artifact_store, &collector, &io_signal_roles);
+      retained_model_map, catalog_artifact_store, &collector, &io_signal_roles,
+      &io_input_reads);
   if (binding != nullptr) {
     if (!collector.rows.empty()) {
       fail("Program Binding outcome is both bound and unresolved");

@@ -71,6 +71,12 @@ export interface WorkbenchNotice {
   expectedDuringTransition?: boolean;
   incidentKind?: ViewerIncidentKind;
   /**
+   * A warning that blocks nothing and stays until the operator acknowledges
+   * it (locally, per browser session), or until Reset or Scenario Close. Its
+   * own `acknowledge` action, if any, runs on acknowledgement.
+   */
+  acknowledgeable?: boolean;
+  /**
    * performance.now() when a held viewer condition began; set once it has
    * lasted past the hold time and is presented (and reported) as an error.
    */

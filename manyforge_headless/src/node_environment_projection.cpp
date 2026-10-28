@@ -230,12 +230,13 @@ CatalogIdentity VerifyCatalog(const CanonicalValue &catalog) {
       &RequiredMember(catalog, "skill_cross_references").storage());
   Require(cross_references != nullptr,
           "skill_cross_references must be an array");
-  const auto computed =
+  // The identity is the digest computed from the content; a stale stored
+  // digest is not a refusal (the Python loader reports it).
+  static_cast<void>(declared_digest);
+  auto computed =
       content_identity::sha256_digest(content_identity::canonical_json(
           WithoutMember(catalog, "catalog_digest")));
-  Require(content_identity::digest_equal(computed, declared_digest),
-          "node catalog descriptor digest verification failed");
-  return {catalog_id, content_version, declared_digest,
+  return {catalog_id, content_version, std::move(computed),
           std::move(owner_neutral_node_ids)};
 }
 

@@ -40,6 +40,17 @@ ResourceAddressedExecutionKernel::get_operation_journal_write_fault() const {
   return operation_journal_write_fault_;
 }
 
+std::optional<KernelInternalFaultDTO> ResourceAddressedExecutionKernel::get_internal_fault()
+    const {
+  std::lock_guard state_lock(state_mutex_);
+  // The alarm is raised from the first observation, so it must already name
+  // the containment Stop outcome; the request is still in progress until then.
+  if (internal_fault_ && !internal_fault_->stop_accepted &&
+      !internal_fault_->stop_refusal_code)
+    return std::nullopt;
+  return internal_fault_;
+}
+
 void ResourceAddressedExecutionKernel::retain_operation_journal_write_fault_locked(
     std::string_view write_kind, const ErrorDTO& failure, const OperationStateDTO* state,
     std::optional<RequestId> request_id) {
@@ -435,13 +446,19 @@ ResourceAddressedExecutionKernel::ResourceAddressedExecutionKernel(
         return validate_program_node_claim(evidence);
       },
       [this] {
+        // Whether the latch closes cell admission; a carried latch does not.
         std::lock_guard state_lock(state_mutex_);
-        return is_active_stop_fault_latch(active_stop_fault_latch_);
+        const auto scope = stop_fault_admission_scope_locked();
+        return scope == StopFaultAdmissionScope::kCell || scope == StopFaultAdmissionScope::kClosing;
       },
       config_.cell_admission_program_reset_status_source,
       [this](std::shared_ptr<IIoSignalService>* affected_service) {
         std::lock_guard state_lock(state_mutex_);
         return retire_program_blackboard_source_locked(affected_service);
+      },
+      [this] {
+        std::lock_guard state_lock(state_mutex_);
+        return stop_fault_admission_scope_locked();
       });
   refresh_execution_claims();  // construction is single-threaded
   if (recovery.value().recovered_stops.size() > kMaximumResidentStopTerminalRecords) {

@@ -6,6 +6,7 @@ import {
   buildPoseMotionIntent,
   buildPreviewIntent,
   initialRobotControlState,
+  poseDragNotice,
   ROBOT_CONTROL_AUTHOR_DEBOUNCE_MS,
   robotControlCandidatePresentationAllowed,
   robotControlPreviewApprovable,
@@ -192,6 +193,36 @@ describe('addressed Robot Control state', () => {
     const refreshed = robotControlReducer(dragging, { type: 'status_refreshed', status: structuredClone(dragging.status!) });
     expect(refreshed.poseDragging).toBe(true);
     expect(refreshed.generation).toBe(dragging.generation);
+  });
+  it('never discards a gizmo release silently', () => {
+    const ready = { ...readyState(), mode: 'pose_goal' as const };
+    const dragging = robotControlReducer(ready, { type: 'begin_pose_drag' });
+    expect(dragging.ownerNotice).toBeNull();
+    const finish = (discard?: 'no_change' | 'snapped_no_change' | 'context_changed', pose = null as typeof dragging.draftPose | null) =>
+      robotControlReducer(dragging, { type: 'finish_pose_drag', generation: dragging.generation, pose, discard });
+    // Zero-change releases keep the unchanged evidence and say "No change".
+    for (const reason of ['no_change', 'snapped_no_change'] as const) {
+      const released = finish(reason);
+      expect(released.poseDragging).toBe(false);
+      expect(released.preview).toBe(ready.preview);
+      expect(released.ownerNotice).toBe(poseDragNotice(reason));
+      expect(released.ownerNotice).toMatch(/^No change/);
+    }
+    expect(finish(undefined, dragging.draftPose).ownerNotice).toBe(poseDragNotice('no_change'));
+    // An interrupted drag (Escape, hidden tab) stays silent.
+    expect(finish().ownerNotice).toBeNull();
+    // The robot moved during the drag: the draft is discarded and that is said.
+    const moved = finish('context_changed');
+    expect(moved).toMatchObject({ poseDragging: false, phase: 'idle', preview: null, ghost: null, intent: null });
+    expect(moved.ownerNotice).toBe(poseDragNotice('context_changed'));
+    // A refresh replaced the target during the drag: the stale release resets
+    // the panel (no stuck "Unvalidated target") and says so.
+    const replaced = { ...dragging, generation: dragging.generation + 1 };
+    const stale = robotControlReducer(replaced, { type: 'finish_pose_drag', generation: dragging.generation, pose: null });
+    expect(stale.poseDragging).toBe(false);
+    expect(stale.ownerNotice).toBe(poseDragNotice('stale'));
+    // The next drag clears the notice.
+    expect(robotControlReducer({ ...ready, ownerNotice: 'x' }, { type: 'begin_pose_drag' }).ownerNotice).toBeNull();
   });
   it('invalidates a Move To preview when its semantic source kind changes at the same pose', () => {
     let state = robotControlReducer(initialRobotControlState, { type: 'status_resolved', status: statusFixture() });

@@ -19,14 +19,18 @@ from manyforge_operator.orchestrator import LauncherError
 
 def _remote(tmp_path: Path) -> RemoteNativeConfig:
     return RemoteNativeConfig(
-        source_root="/mnt/nova_ssd/codex-manyforge/runners/manyforge",
+        target="operator@runtime-host",
+        advertised_host="runtime-host",
+        source_root="/srv/manyforge/manyforge",
         manager_executable="/opt/manyforge/bin/manyforge_manager_daemon",
-        install_root="/mnt/nova_ssd/codex-manyforge/builds/current/package",
+        install_root="/srv/manyforge/package",
         node_catalog_path="/opt/manyforge/share/node_catalog.yaml",
         alarm_catalog_path="/opt/manyforge/share/alarm_catalog.yaml",
-        state_root="/mnt/nova_ssd/codex-manyforge/runners/state/operator",
-        simulation_control_config="/mnt/nova_ssd/codex-manyforge/runners/manyforge/manyforge_ros_bringup/config/isaac_program_simulation_site.json",
-        ros_environment_script="/mnt/nova_ssd/codex-manyforge/runners/manyforge/config/ros/isaac_i9.env.sh",
+        state_root="/srv/manyforge/operator-state",
+        simulation_control_config="/srv/manyforge/manyforge/manyforge_ros_bringup/config/isaac_program_simulation_site.json",
+        bridge_state_root="/srv/manyforge/bridge-state",
+        ros_setup_script="/opt/ros/lyrical/setup.bash",
+        ros_environment_script="/srv/manyforge/ros_env.sh",
         package_aggregate_sha256="a" * 64,
         compiler_build_manifest_sha256="b" * 64,
         node_environment_sha256="c" * 64,
@@ -43,6 +47,8 @@ def _config(tmp_path: Path) -> IsaacLauncherConfig:
         source_root=source,
         state_root=tmp_path / "state",
         remote=_remote(tmp_path),
+        simulator_host="isaac-host",
+        static_peers=("isaac-host", "runtime-host"),
         ssh_executable=ssh,
     )
 
@@ -56,29 +62,60 @@ def _container_config(tmp_path: Path) -> IsaacLauncherConfig:
 
 
 
-def test_held_remote_isaac_setup_defaults_to_jazzy_and_explicit_input_wins(tmp_path, monkeypatch):
-    config = _container_config(tmp_path)
-    assert config.remote.ros_setup_script == "/opt/ros/jazzy/setup.bash"
-    arguments = _parser().parse_args(
-        ["start", "--profile", "isaac", "--source-root", str(config.source_root)]
-    )
-    arguments.source_root = config.source_root
+def _isaac_arguments(config: IsaacLauncherConfig) -> list[str]:
+    remote = config.remote
+    arguments = [
+        "start", "--profile", "isaac", "--source-root", str(config.source_root),
+        "--remote-target", remote.target,
+        "--advertised-host", remote.advertised_host,
+        "--simulator-host", config.simulator_host,
+    ]
+    for peer in config.static_peers:
+        arguments += ["--static-peer", peer]
     for field in ("source_root", "container_image_id", "container_name", "cache_root",
                   "runtime_root", "evidence_root", "manager_executable", "install_root",
                   "node_catalog_path", "alarm_catalog_path", "state_root",
-                  "simulation_control_config", "ros_environment_script"):
-        setattr(arguments, "remote_" + field, getattr(config.remote, field))
+                  "simulation_control_config", "bridge_state_root", "ros_setup_script",
+                  "ros_environment_script"):
+        arguments += ["--remote-" + field.replace("_", "-"), getattr(remote, field)]
     for field in ("package_aggregate_sha256", "compiler_build_manifest_sha256",
                   "node_environment_sha256"):
-        setattr(arguments, field, getattr(config.remote, field))
+        arguments += ["--" + field.replace("_", "-"), getattr(remote, field)]
+    return arguments
+
+
+def test_isaac_hosts_and_paths_are_explicit_inputs(tmp_path, monkeypatch):
+    config = _container_config(tmp_path)
     captured = []
     monkeypatch.setattr("manyforge_operator.cli.IsaacLauncherConfig",
                         lambda **kwargs: captured.append(kwargs))
-    _isaac_config(arguments)
-    assert captured[-1]["remote"].ros_setup_script == "/opt/ros/jazzy/setup.bash"
-    arguments.remote_ros_setup_script = "/custom/qualified/setup.bash"
-    _isaac_config(arguments)
-    assert captured[-1]["remote"].ros_setup_script == "/custom/qualified/setup.bash"
+    _isaac_config(_parser().parse_args(_isaac_arguments(config)))
+    remote = captured[-1]["remote"]
+    assert remote.target == "operator@runtime-host"
+    assert remote.advertised_host == "runtime-host"
+    assert remote.bridge_state_root == "/srv/manyforge/bridge-state"
+    assert remote.ros_setup_script == "/opt/ros/lyrical/setup.bash"
+    assert captured[-1]["simulator_host"] == "isaac-host"
+    assert captured[-1]["static_peers"] == ("isaac-host", "runtime-host")
+
+
+@pytest.mark.parametrize(
+    "flag",
+    ["--remote-target", "--advertised-host", "--simulator-host", "--static-peer",
+     "--remote-source-root", "--remote-bridge-state-root", "--remote-ros-setup-script"],
+)
+def test_isaac_start_without_host_or_path_refuses_with_typed_error(tmp_path, capsys, flag):
+    arguments = _isaac_arguments(_container_config(tmp_path))
+    while flag in arguments:
+        index = arguments.index(flag)
+        del arguments[index:index + 2]
+    exit_code = main(["--state-root", str(tmp_path / "state"), "--json", *arguments])
+    result = json.loads(capsys.readouterr().out)
+    assert exit_code == 64
+    assert result["outcome"] == "failed"
+    assert result["error"]["code"] == "operator_configuration_invalid"
+    assert flag.removeprefix("--") in result["error"]["message"]
+    assert not (tmp_path / "state" / "native").exists()
 
 
 def test_remote_native_command_keeps_optional_source_identity_absent(tmp_path: Path):

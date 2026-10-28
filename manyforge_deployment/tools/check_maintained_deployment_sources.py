@@ -1536,10 +1536,18 @@ def _validate_model_semantics(
         collision_bindings[collision_role] = tuple(link_names)
     _canonical_unique(collision_roles, path=f"{path}.collision_body_role_bindings")
 
-    expected = _EXPECTED_MODEL_FAMILIES[family_id]
     root_frame_role = _identifier(
         semantics["root_frame_role_id"], path=f"{path}.root_frame_role_id"
     )
+    # E1: a family added as data has no pin; its roles are checked against its
+    # URDF/SRDF by scripts/robots/check_robot.py.
+    expected = _EXPECTED_MODEL_FAMILIES.get(family_id)
+    if expected is None:
+        if root_frame_role not in frame_roles:
+            raise SourceDescriptionError(
+                f"{path}.root_frame_role_id names no frame role binding"
+            )
+        return
     if (
         frame_bindings != expected["frames"]
         or group_bindings != expected["groups"]
@@ -1551,6 +1559,63 @@ def _validate_model_semantics(
         raise SourceDescriptionError(
             f"{path} changes the accepted source-local family role contract"
         )
+
+
+def _mock_controller_profile_ids(root: Path) -> set[str]:
+    """The Mock controller rows a profile added as data may select (E1)."""
+    sys.path.insert(0, str(root / "scripts" / "robots"))
+    try:
+        import mock_controller_profiles
+    finally:
+        sys.path.pop(0)
+    try:
+        rows = mock_controller_profiles.load(
+            root / mock_controller_profiles.DEFAULT_PATH
+        )
+    except (OSError, mock_controller_profiles.MockControllerProfileError) as error:
+        raise SourceDescriptionError(str(error)) from error
+    return {row.mock_profile for row in rows}
+
+
+def _validate_data_profile(
+    profile: dict[str, Any], *, family_ids: list[str], root: Path, path: str
+) -> str:
+    """A component profile added as data (E1): Mock only, minimal row.
+
+    Only the family and the lane selector are read at Apply; the Deployment
+    authors everything else, so the other members stay empty.
+    """
+    family_id = _identifier(profile.get("model_family_id"), path=f"{path}.model_family_id")
+    if family_id not in family_ids:
+        raise SourceDescriptionError(
+            f"{path}.model_family_id names no model family ({family_id})"
+        )
+    runtime = _object(
+        profile.get("ros2_control_runtime"), path=f"{path}.ros2_control_runtime"
+    )
+    if set(runtime) != {"mock_profile"}:
+        raise SourceDescriptionError(
+            f"{path}.ros2_control_runtime of a profile added as data must be exactly "
+            "{mock_profile: <Mock controller row>}"
+        )
+    mock_profile = _identifier(
+        runtime["mock_profile"], path=f"{path}.ros2_control_runtime.mock_profile"
+    )
+    if mock_profile not in _mock_controller_profile_ids(root):
+        raise SourceDescriptionError(
+            f"{path}.ros2_control_runtime.mock_profile {mock_profile} has no row in "
+            "manyforge_ros_bringup/config/mock_controller_profiles.yaml"
+        )
+    if (
+        profile["source_fields"] != {}
+        or profile["stop_profiles"] != {}
+        or profile["acceptance_obligations"] != []
+    ):
+        raise SourceDescriptionError(
+            f"{path} added as data keeps source_fields and stop_profiles empty and "
+            "acceptance_obligations []"
+        )
+    return family_id
 
 
 def _program_roles(program_path: Path) -> tuple[set[str], dict[str, str]]:
@@ -1776,11 +1841,34 @@ def _validate_pose_source(
             f"{path}.runtime_configuration.robot_overlay must name the robot component"
         )
     # Every authored Isaac entity names its header frame explicitly.
+    simulation = configuration.get("simulation", {})
     entities = [
         ("simulation.relative_reference",
-         configuration.get("simulation", {}).get("relative_reference")),
+         simulation.get("relative_reference")),
         ("robot_overlay.tcp_entity", (overlay or {}).get("tcp_entity")),
     ]
+    entities += [
+        (f"simulation.relative_references[{index}]", row)
+        for index, row in enumerate(simulation.get("relative_references", []))
+    ]
+    for index, row in enumerate(simulation.get("relative_references", [])):
+        reference = _object(
+            row,
+            path=f"{path}.runtime_configuration.simulation.relative_references[{index}]",
+        )
+        if not isinstance(reference.get("controllable_component_id"), str) or not isinstance(
+            reference.get("command_target_id"), str
+        ):
+            raise SourceDescriptionError(
+                f"{path}.runtime_configuration.simulation.relative_references[{index}] "
+                "must name a controllable component and gripper target"
+            )
+        gripper_link = reference.get("gripper_link")
+        if gripper_link is not None and not isinstance(gripper_link, str):
+            raise SourceDescriptionError(
+                f"{path}.runtime_configuration.simulation.relative_references[{index}].gripper_link "
+                "must be a string when present"
+            )
     entities += [
         (f"scene_pose_sources[{index}].source_key.simulation_entity",
          row.get("source_key", {}).get("simulation_entity"))
@@ -1923,9 +2011,9 @@ def validate(source: Path, root: Path) -> None:
         model_asset_id = _identifier(
             family["model_asset_id"], path=f"{path}.model_asset_id"
         )
-        if model_asset_id != family_id or family_id not in _EXPECTED_MODEL_FAMILIES:
+        if model_asset_id != family_id:
             raise SourceDescriptionError(
-                f"{path} changes the exact maintained model-family set"
+                f"{path}.model_asset_id must equal its model_family_id"
             )
         expected_catalog_source = (
             f"manyforge_deployment/resources/maintained/model_assets/"
@@ -1982,7 +2070,12 @@ def validate(source: Path, root: Path) -> None:
             model_source["srdf_projection_kind"],
             path=f"{path}.source.srdf_projection_kind",
         )
-        expected_source = _EXPECTED_MODEL_FAMILIES[family_id]["source"]
+        pinned_family = family_id in _EXPECTED_MODEL_FAMILIES
+        expected_source = (
+            _EXPECTED_MODEL_FAMILIES[family_id]["source"]
+            if pinned_family
+            else {"srdf_projection_kind": "identity", "urdf_projection_kind": "identity"}
+        )
         if projection_kind != expected_source["srdf_projection_kind"]:
             raise SourceDescriptionError(
                 f"{path}.source.srdf_projection_kind changes the accepted projection"
@@ -2021,14 +2114,14 @@ def validate(source: Path, root: Path) -> None:
             "urdf_path": urdf_path,
             "urdf_projection_kind": urdf_projection_kind,
         }
-        if actual_source != expected_source:
+        if pinned_family and actual_source != expected_source:
             raise SourceDescriptionError(
                 f"{path}.source changes the accepted model-family source closure"
             )
     if (
         family_ids != sorted(family_ids)
         or len(set(family_ids)) != len(family_ids)
-        or set(family_ids) != set(_EXPECTED_MODEL_FAMILIES)
+        or not set(_EXPECTED_MODEL_FAMILIES) <= set(family_ids)
     ):
         raise SourceDescriptionError(
             "$.model_families must contain the canonical-sorted maintained families"
@@ -2084,6 +2177,14 @@ def validate(source: Path, root: Path) -> None:
             path=f"{path}.runtime_restoration_profile_id",
         )
         runtime_profile_ids.append(profile_id)
+        if (
+            model_free_runtime is None
+            and profile_id not in _EXPECTED_RUNTIME_RESTORATION_PROFILE_DIGESTS
+        ):
+            runtime_profile_families[profile_id] = _validate_data_profile(
+                profile, family_ids=family_ids, root=root, path=path
+            )
+            continue
         expected_digest = _EXPECTED_RUNTIME_RESTORATION_PROFILE_DIGESTS.get(profile_id)
         profile_digest = hashlib.sha256(
             json.dumps(
@@ -2187,9 +2288,9 @@ def validate(source: Path, root: Path) -> None:
                 f"{path}.model_family_id is absent from the maintained model closure"
             )
         runtime_profile_families[profile_id] = family_id
-    if runtime_profile_ids != sorted(runtime_profile_ids) or set(
-        runtime_profile_ids
-    ) != set(_EXPECTED_RUNTIME_RESTORATION_PROFILE_DIGESTS):
+    if runtime_profile_ids != sorted(runtime_profile_ids) or not set(
+        _EXPECTED_RUNTIME_RESTORATION_PROFILE_DIGESTS
+    ) <= set(runtime_profile_ids):
         raise SourceDescriptionError(
             "$.runtime_restoration_profiles must exactly cover the "
             "canonical-sorted pinned profiles"

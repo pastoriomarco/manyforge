@@ -442,3 +442,136 @@ def test_classifier_never_mistakes_uncheckpointed_wal_for_closed_owner_facts(tmp
     before = {p.name: p.read_bytes() for p in tmp_path.iterdir() if p.is_file()}
     assert sessions.classify_effects(tmp_path) == "unknown"
     assert {p.name: p.read_bytes() for p in tmp_path.iterdir() if p.is_file()} == before
+
+
+# Owner columns read by the kernel_operation classifier. stop_projections is the
+# v16 layout (payload copies, CHECK-paired with each sequence) or the v17
+# sequences-only layout; the classifier predicate reads only *_sequence.
+KERNEL_COMMON_DDL = """
+    CREATE TABLE journal_records(sequence INTEGER PRIMARY KEY, owner_epoch TEXT NOT NULL,
+      record_kind TEXT NOT NULL, payload_json TEXT NOT NULL, payload_digest TEXT NOT NULL,
+      occurred_at_ns INTEGER NOT NULL, effect_pending INTEGER NOT NULL);
+    CREATE TABLE owner_epochs(owner_epoch TEXT PRIMARY KEY, active INTEGER NOT NULL,
+      closed_at_ns INTEGER, close_sequence INTEGER);
+    CREATE TABLE operation_snapshots(operation_id TEXT PRIMARY KEY, state TEXT NOT NULL, disposition TEXT);
+    CREATE TABLE cell_admission_claims(claim_id TEXT PRIMARY KEY, release_owner_role TEXT, reconciled_sequence INTEGER);
+"""
+STOP_PROJECTIONS_V16 = """
+    CREATE TABLE stop_projections(stop_id TEXT NOT NULL, stop_generation INTEGER NOT NULL,
+      acceptance_sequence INTEGER NOT NULL UNIQUE, acceptance_payload TEXT NOT NULL, acceptance_digest TEXT NOT NULL,
+      terminal_sequence INTEGER UNIQUE, terminal_payload TEXT, terminal_digest TEXT,
+      surveillance_sequence INTEGER UNIQUE, surveillance_payload TEXT, surveillance_digest TEXT,
+      clear_sequence INTEGER UNIQUE, clear_request_id TEXT, clear_payload TEXT, clear_digest TEXT,
+      CHECK ((terminal_sequence IS NULL) = (terminal_payload IS NULL)),
+      CHECK ((terminal_sequence IS NULL) = (terminal_digest IS NULL)),
+      CHECK ((surveillance_sequence IS NULL) = (surveillance_payload IS NULL)),
+      CHECK ((surveillance_sequence IS NULL) = (surveillance_digest IS NULL)),
+      CHECK ((clear_sequence IS NULL) = (clear_request_id IS NULL)),
+      CHECK ((clear_sequence IS NULL) = (clear_payload IS NULL)),
+      CHECK ((clear_sequence IS NULL) = (clear_digest IS NULL)),
+      PRIMARY KEY(stop_id, stop_generation),
+      FOREIGN KEY(acceptance_sequence) REFERENCES journal_records(sequence),
+      FOREIGN KEY(terminal_sequence) REFERENCES journal_records(sequence),
+      FOREIGN KEY(surveillance_sequence) REFERENCES journal_records(sequence),
+      FOREIGN KEY(clear_sequence) REFERENCES journal_records(sequence)) STRICT;
+"""
+STOP_PROJECTIONS_V17 = """
+    CREATE TABLE stop_projections(stop_id TEXT NOT NULL, stop_generation INTEGER NOT NULL,
+      acceptance_sequence INTEGER NOT NULL UNIQUE, accepted_payload TEXT NOT NULL,
+      accepted_digest TEXT NOT NULL,
+      terminal_sequence INTEGER UNIQUE, surveillance_sequence INTEGER UNIQUE, clear_sequence INTEGER UNIQUE,
+      PRIMARY KEY(stop_id, stop_generation),
+      FOREIGN KEY(acceptance_sequence) REFERENCES journal_records(sequence),
+      FOREIGN KEY(terminal_sequence) REFERENCES journal_records(sequence),
+      FOREIGN KEY(surveillance_sequence) REFERENCES journal_records(sequence),
+      FOREIGN KEY(clear_sequence) REFERENCES journal_records(sequence)) STRICT;
+"""
+
+
+def kernel_archive(folder: Path, version: int, stop: str) -> Path:
+    import hashlib
+
+    path = folder / "execution-state/operation-journal.sqlite3"
+    path.parent.mkdir(parents=True, exist_ok=True)
+    recorded = {"accepted": (2,), "terminal": (2, 3), "surveillance": (2, 3, 4), "cleared": (2, 3, 4, 5)}[stop]
+    acceptance, terminal, surveillance, clear = (recorded + (None,) * 4)[:4]
+    with closing(sqlite3.connect(path)) as database, database:
+        database.executescript(KERNEL_COMMON_DDL + (STOP_PROJECTIONS_V16 if version == 16 else STOP_PROJECTIONS_V17))
+        database.execute(f"PRAGMA application_id={0x4D46454A}")
+        database.execute(f"PRAGMA user_version={version}")
+        close = json.dumps({"closed_at_ns": 100, "owner_epoch": "epoch.1"}, sort_keys=True, separators=(",", ":"))
+        database.execute("INSERT INTO journal_records VALUES(1,'epoch.1','owner_epoch_closed',?,?,100,0)",
+                         (close, hashlib.sha256(close.encode()).hexdigest()))
+        for sequence in recorded:
+            database.execute("INSERT INTO journal_records VALUES(?,'epoch.1','stop','{}','digest',1,0)", (sequence,))
+        database.execute("INSERT INTO owner_epochs VALUES('epoch.1',0,100,1)")
+        if version == 16:
+            payload = lambda sequence: None if sequence is None else "{}"
+            database.execute("INSERT INTO stop_projections VALUES('stop.1',1,?,'{}','d',?,?,?,?,?,?,?,?,?,?)",
+                (acceptance, terminal, payload(terminal), payload(terminal), surveillance, payload(surveillance),
+                 payload(surveillance), clear, payload(clear), payload(clear), payload(clear)))
+        else:
+            database.execute("INSERT INTO stop_projections VALUES('stop.1',1,?,'{}','d',?,?,?)",
+                             (acceptance, terminal, surveillance, clear))
+    return path
+
+
+@pytest.mark.parametrize("version", [16, 17])
+@pytest.mark.parametrize("stop,expected", [
+    ("accepted", "unresolved"), ("terminal", "closed"), ("surveillance", "unresolved"), ("cleared", "closed"),
+])
+def test_classifier_reads_v16_and_v17_kernel_stop_records_alike(tmp_path, version, stop, expected):
+    path = kernel_archive(tmp_path, version, stop)
+    original = path.read_bytes()
+    _, unknown, unresolved = sessions._effect_observations(tmp_path)
+    assert "kernel_operation" not in unknown
+    assert ("unresolved" if "kernel_operation" in unresolved else "closed") == expected
+    assert path.read_bytes() == original
+
+
+@pytest.mark.parametrize("version", [15, 18])
+def test_classifier_keeps_other_kernel_journal_versions_unknown(tmp_path, version):
+    path = kernel_archive(tmp_path, 17, "terminal")
+    with closing(sqlite3.connect(path)) as database:
+        database.execute(f"PRAGMA user_version={version}")
+    _, unknown, _ = sessions._effect_observations(tmp_path)
+    assert "kernel_operation" in unknown
+
+
+@pytest.mark.parametrize("version,known", [(21, True), (19, False)])
+def test_classifier_accepts_current_cclc_journal(tmp_path, version, known):
+    path = tmp_path / "execution-state/cclc-journal.sqlite3"
+    path.parent.mkdir(parents=True)
+    # Columns read by the cclc predicates; all exist in the v21 owner DDL.
+    with closing(sqlite3.connect(path)) as database, database:
+        database.executescript("""
+            CREATE TABLE lifecycle_transactions(transaction_sequence INTEGER PRIMARY KEY, terminal INTEGER NOT NULL);
+            CREATE TABLE route_selection_transactions(transaction_sequence INTEGER PRIMARY KEY, terminal INTEGER NOT NULL);
+            CREATE TABLE cclc_effect_attempts(attempt_sequence INTEGER PRIMARY KEY, completed_attempt_blob BLOB);
+            CREATE TABLE cclc_route_effect_attempts(attempt_sequence INTEGER PRIMARY KEY, completed_attempt_blob BLOB);
+            CREATE TABLE cclc_lifecycle_cell_claims(claim_sequence INTEGER PRIMARY KEY, release_receipt_recorded INTEGER NOT NULL);
+            CREATE TABLE cclc_native_apply_reservations(reservation_id TEXT PRIMARY KEY);
+            CREATE TABLE cclc_component_incidents(incident_id TEXT PRIMARY KEY, acknowledged INTEGER);
+        """)
+        database.execute(f"PRAGMA application_id={0x4D464C4A}")
+        database.execute(f"PRAGMA user_version={version}")
+    _, unknown, unresolved = sessions._effect_observations(tmp_path)
+    assert ("cclc" not in unknown) is known
+    assert "cclc" not in unresolved
+
+
+@pytest.mark.parametrize("version,known", [(19, True), (17, False)])
+def test_classifier_accepts_current_manager_apply_journal(tmp_path, version, known):
+    # The Manager owners' own resource DDL, including their SQLite identity.
+    resources = Path(__file__).resolve().parents[1] / "manyforge_component_manager/resources"
+    (tmp_path / "manager").mkdir()
+    for name, resource in (("manager-bootstrap-journal", "001_manager_bootstrap_journal"),
+                           ("active-bundle-publication", "002_active_bundle_publication_store"),
+                           ("manager-apply-journal", "003_manager_apply_journal")):
+        with closing(sqlite3.connect(tmp_path / "manager" / (name + ".sqlite3"))) as database:
+            database.executescript((resources / (resource + ".sql")).read_text())
+    with closing(sqlite3.connect(tmp_path / "manager/manager-apply-journal.sqlite3")) as database:
+        database.execute(f"PRAGMA user_version={version}")
+    _, unknown, unresolved = sessions._effect_observations(tmp_path)
+    assert ("manager" not in unknown) is known
+    assert "manager" not in unresolved

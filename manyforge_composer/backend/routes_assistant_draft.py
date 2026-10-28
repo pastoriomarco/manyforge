@@ -36,7 +36,7 @@ from .authoring_workspace import (
     AuthoringWorkspaceIdentity,
 )
 from .authoring_workspace_fence import (
-    commit_local_authoring,
+    commit_draft_edit,
     require_captured_workspace_identity,
 )
 
@@ -499,11 +499,11 @@ def create_assistant_draft_router(state: ComposerState) -> APIRouter:
                     catalog=validated_catalog,
                     draft_id=body.draft_id,
                 )
-                commit = commit_local_authoring(
+                commit = commit_draft_edit(
                     state,
                     body,
                     operation_kind=f"assistant_{tool_id}",
-                    validate_under_claim=lambda: validate_mutation_context(
+                    validate=lambda: validate_mutation_context(
                         validation_as_result=False
                     ),
                     install=lambda: state.draft_session.install_prepared_mutation(

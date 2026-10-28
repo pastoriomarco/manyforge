@@ -1,4 +1,4 @@
-// Copyright 2026 Flexin Group SRL
+// Copyright 2026 Marco Pastorio
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -21,8 +21,10 @@
 #include <manyforge_core/time/iclock.hpp>
 #include <memory>
 #include <mutex>
+#include <optional>
 #include <rclcpp/rclcpp.hpp>
 #include <string>
+#include <string_view>
 #include <thread>
 
 namespace manyforge::ros2_control_execution {
@@ -61,10 +63,21 @@ public:
   bool started() const noexcept {
     return started_.load(std::memory_order_acquire);
   }
+  /// Called once, with `ros_transport_executor_failed`, when the first
+  /// executor thread fails. Set before start(); used by a transport that has
+  /// no health reader of its own (the host's generic I/O transport).
+  using ExecutorFaultObserver = std::function<void(std::string_view reason_code)>;
+  void set_executor_fault_observer(ExecutorFaultObserver observer);
   void start();
   void quiesce() noexcept;
+  /// The exception text of the first executor thread that failed (a callback
+  /// throw or an rclcpp/rcl failure). That thread stops; the remaining
+  /// executor threads keep serving callbacks. Empty while healthy.
+  std::optional<std::string> executor_fault() const;
 
 private:
+  void record_executor_fault(const char *exception_text) noexcept;
+
   friend class JtcExecutionPortTestPeer;
   std::shared_ptr<rclcpp::Context> context_;
   bool owns_private_context_ = true;
@@ -75,6 +88,9 @@ private:
   std::atomic<bool> spin_finished_{false};
   std::mutex lifecycle_mutex_;
   bool quiesced_ = false;
+  mutable std::mutex executor_fault_mutex_;
+  std::optional<std::string> executor_fault_;
+  ExecutorFaultObserver executor_fault_observer_;
   std::thread spin_thread_;
 };
 } // namespace manyforge::ros2_control_execution
